@@ -38,14 +38,6 @@
 
 ---
 
-## Preliminary Benchmark Results
-
-Preliminary AgentCanary benchmark results show Gensee Crate improving defense
-rate across memory poisoning, long-horizon, and prompt-injection threat types
-with low runtime overhead.
-
-![Preliminary AgentCanary benchmark results](docs/images/preliminary-agentcanary-benchmark.png)
-
 ## Why Gensee Crate?
 
 Gensee Crate helps you:
@@ -61,6 +53,14 @@ Gensee Crate helps you:
 - **Seamless integration with your current workflow.** Run `gensee watch` beside an
   agent or launch an agent in a sandbox with `gensee run` with additional safety.
   Manage policy with `gensee policy` and inspect activity in the local dashboard.
+
+## Preliminary Benchmark Results
+
+Preliminary AgentCanary benchmark results show Gensee Crate improving defense
+rate across memory poisoning, long-horizon, and prompt-injection threat types
+with low runtime overhead.
+
+![Preliminary AgentCanary benchmark results](docs/images/preliminary-agentcanary-benchmark.png)
 
 ## Quick start
 
