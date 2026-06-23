@@ -229,11 +229,20 @@ The local dashboard reads the same `GENSEE_HOME` store as `watch`, hooks, and
 request lineage, and the active policy document; users can record review
 verdicts and edit validated policy settings from the browser.
 
-Launch it against your active store:
+Launch it from the repository checkout against your active store:
 
 ```bash
-GENSEE_HOME="$PWD/.gensee-dev" npm --prefix dashboards/web run dev
+cd /path/to/agent-shield
+GENSEE_HOME="$PWD/.gensee-dev" npm --prefix "$PWD/dashboards/web" run dev
 # open http://localhost:5173
+```
+
+If you launch it from another directory, use absolute paths and the same
+`GENSEE_HOME` that your hooks or `gensee watch` use:
+
+```bash
+REPO=/path/to/agent-shield
+GENSEE_HOME="$REPO/.gensee-dev" npm --prefix "$REPO/dashboards/web" run dev
 ```
 
 See [`dashboards/web/README.md`](dashboards/web/README.md) for requirements,
