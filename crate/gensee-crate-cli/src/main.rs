@@ -1,0 +1,1858 @@
+pub(crate) use gensee_crate_attribution::process_tree::ProcessTree;
+pub(crate) use gensee_crate_core::{
+    extract_apply_patch_input, normalize_agent_path, parse_apply_patch_changes,
+    parse_mcp_file_intents, redact_text, redact_value, AgentHookEvent, AgentSession, FileIntent,
+    ProcessObservation, SystemEvent, WorkspaceEffect,
+};
+pub(crate) use gensee_crate_rules::policy::{self, Policy};
+pub(crate) use gensee_crate_store::{
+    daemon_socket_path, default_root, AlertRecord, ArtifactObservationInput, ArtifactRiskTagInput,
+    ArtifactRiskTagRecord, EventStore, PolicyAlert,
+};
+pub(crate) use serde_json::{json, Value};
+pub(crate) use sha2::{Digest, Sha256};
+pub(crate) use std::collections::{BTreeMap, HashMap, HashSet};
+pub(crate) use std::env;
+pub(crate) use std::ffi::OsString;
+#[cfg(target_os = "macos")]
+pub(crate) use std::ffi::{c_char, c_void, CStr, CString};
+pub(crate) use std::fs;
+pub(crate) use std::io::{self, BufRead, Read, Write};
+pub(crate) use std::path::{Path, PathBuf};
+pub(crate) use std::process::{Command, Stdio};
+pub(crate) use std::sync::mpsc;
+pub(crate) use std::thread;
+pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub(crate) const PROCESS_SAMPLE_WINDOW_MS: u64 = 15_000;
+pub(crate) const PROCESS_SAMPLE_INTERVAL_MS: u64 = 25;
+pub(crate) const STARTED_TOOL_WINDOW_MS: u64 = 15_000;
+pub(crate) const TOOL_WINDOW_TOLERANCE_MS: u64 = 250;
+pub(crate) const PREEXEC_CONTENT_READ_LIMIT_BYTES: u64 = 64 * 1024;
+pub(crate) const ARTIFACT_CONTENT_READ_TIMEOUT_MS: u64 = 150;
+pub(crate) const ARTIFACT_FACT_RECENT_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+pub(crate) const TIMELINE_PROCESS_DISPLAY_LIMIT: usize = 20;
+pub(crate) const PROVIDER_CLAUDE_CODE: &str = "claude-code";
+pub(crate) const PROVIDER_CODEX: &str = "codex";
+
+pub(crate) fn is_supported_provider(provider: &str) -> bool {
+    matches!(provider, PROVIDER_CLAUDE_CODE | PROVIDER_CODEX)
+}
+
+mod policy_eval;
+pub(crate) use policy_eval::*;
+mod preexec;
+pub(crate) use preexec::*;
+mod command_parse;
+pub(crate) use command_parse::*;
+mod resource_governance;
+pub(crate) use resource_governance::*;
+mod run;
+pub(crate) use run::*;
+mod watch;
+pub(crate) use watch::*;
+mod timeline;
+pub(crate) use timeline::*;
+mod daemon;
+pub(crate) use daemon::*;
+
+#[cfg(feature = "bench")]
+mod bench;
+
+#[cfg(test)]
+mod tests;
+
+fn main() {
+    if let Err(error) = run_cli() {
+        eprintln!("gensee: {error}");
+        std::process::exit(1);
+    }
+}
+
+pub(crate) fn run_cli() -> io::Result<()> {
+    let mut args = env::args_os().skip(1).collect::<Vec<_>>();
+
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("run") => {
+            args.remove(0);
+            if args.first().and_then(|arg| arg.to_str()) == Some("list") {
+                args.remove(0);
+                return list_runs();
+            }
+            if args.first().and_then(|arg| arg.to_str()) == Some("discard") {
+                args.remove(0);
+                return discard_run(args);
+            }
+            run_agent(RunConfig::parse(args)?)
+        }
+        Some("watch") => {
+            args.remove(0);
+            watch_workspace(WatchConfig::parse(args)?)
+        }
+        Some("session") => {
+            args.remove(0);
+            match args.first().and_then(|arg| arg.to_str()) {
+                Some("list") => list_runs(),
+                _ => {
+                    print_usage();
+                    Ok(())
+                }
+            }
+        }
+        Some("timeline") => {
+            args.remove(0);
+            show_timeline(args)
+        }
+        Some("hook") => {
+            args.remove(0);
+            handle_hook(args)
+        }
+        Some("setup") => {
+            args.remove(0);
+            handle_setup(args)
+        }
+        Some("daemon") => {
+            args.remove(0);
+            run_daemon()
+        }
+        Some("verify-log") => {
+            args.remove(0);
+            verify_log()
+        }
+        Some("policy") => {
+            args.remove(0);
+            handle_policy(args)
+        }
+        Some("feedback") => {
+            args.remove(0);
+            handle_feedback(args)
+        }
+        Some("dashboard-state") => {
+            args.remove(0);
+            dashboard_state()
+        }
+        Some("ingest") => {
+            args.remove(0);
+            handle_ingest(args)
+        }
+        Some("observe-tool-window") => {
+            args.remove(0);
+            observe_tool_window(args)
+        }
+        #[cfg(feature = "bench")]
+        Some("bench") => {
+            args.remove(0);
+            bench::run_bench(args)
+        }
+        Some("help") | Some("--help") | Some("-h") | None => {
+            print_usage();
+            Ok(())
+        }
+        Some(other) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown command: {other}"),
+        )),
+    }
+}
+
+pub(crate) fn handle_hook(args: Vec<OsString>) -> io::Result<()> {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("claude-code") => handle_agent_hook(PROVIDER_CLAUDE_CODE),
+        Some("codex") => handle_agent_hook(PROVIDER_CODEX),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee hook <claude-code|codex>",
+        )),
+    }
+}
+
+pub(crate) fn handle_setup(args: Vec<OsString>) -> io::Result<()> {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("claude-code") => setup_claude_code(args[1..].to_vec()),
+        Some("codex") => setup_codex(args[1..].to_vec()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee setup <claude-code|codex> [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
+        )),
+    }
+}
+
+fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let mut settings_path = home.join(".claude").join("settings.json");
+    let mut gensee_home = env::var_os("GENSEE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(default_root()?);
+    let mut bin_path = env::current_exe()?;
+
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
+        })?;
+        match arg {
+            "--yes" => {
+                index += 1;
+            }
+            "--gensee-home" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "setup: --gensee-home requires a path",
+                    )
+                })?;
+                gensee_home = PathBuf::from(value);
+                index += 2;
+            }
+            "--settings" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "setup: --settings requires a path",
+                    )
+                })?;
+                settings_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--bin" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "setup: --bin requires a path")
+                })?;
+                bin_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: gensee setup claude-code [--gensee-home <path>] [--settings <path>] [--bin <path>]"
+                );
+                return Ok(());
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("setup: unknown argument `{arg}`"),
+                ));
+            }
+        }
+    }
+
+    gensee_home = absolutize_for_hook(&gensee_home)?;
+    bin_path = absolutize_for_hook(&bin_path)?;
+    let command = claude_code_hook_command(&gensee_home, &bin_path);
+    write_claude_code_settings(&settings_path, &command)?;
+
+    println!(
+        "gensee setup: configured Claude Code hooks in {}",
+        settings_path.display()
+    );
+    println!("gensee setup: hook command: {command}");
+    println!("gensee setup: fully restart Claude Code before testing enforcement.");
+    Ok(())
+}
+
+fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let mut hooks_path = home.join(".codex").join("hooks.json");
+    let mut gensee_home = env::var_os("GENSEE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(default_root()?);
+    let mut bin_path = env::current_exe()?;
+
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
+        })?;
+        match arg {
+            "--yes" => {
+                index += 1;
+            }
+            "--gensee-home" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "setup: --gensee-home requires a path",
+                    )
+                })?;
+                gensee_home = PathBuf::from(value);
+                index += 2;
+            }
+            "--hooks" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "setup: --hooks requires a path",
+                    )
+                })?;
+                hooks_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--bin" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "setup: --bin requires a path")
+                })?;
+                bin_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: gensee setup codex [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                );
+                return Ok(());
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("setup: unknown argument `{arg}`"),
+                ));
+            }
+        }
+    }
+
+    gensee_home = absolutize_for_hook(&gensee_home)?;
+    bin_path = absolutize_for_hook(&bin_path)?;
+    let command = codex_hook_command(&gensee_home, &bin_path);
+    write_codex_hook_settings(&hooks_path, &command)?;
+
+    println!(
+        "gensee setup: configured Codex hooks in {}",
+        hooks_path.display()
+    );
+    println!("gensee setup: hook command: {command}");
+    println!("gensee setup: open /hooks in Codex to review and trust this hook command.");
+    println!("gensee setup: re-trust the hook whenever the command or binary path changes.");
+    Ok(())
+}
+
+fn write_claude_code_settings(settings_path: &Path, command: &str) -> io::Result<()> {
+    let mut root = if settings_path.exists() {
+        let contents = fs::read_to_string(settings_path)?;
+        if contents.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&contents).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not valid JSON: {err}", settings_path.display()),
+                )
+            })?
+        }
+    } else {
+        json!({})
+    };
+    apply_claude_code_hook_settings(&mut root, command)?;
+
+    if let Some(parent) = settings_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if settings_path.exists() {
+        let backup = backup_path(settings_path)?;
+        fs::copy(settings_path, &backup)?;
+        println!(
+            "gensee setup: backed up previous settings to {}",
+            backup.display()
+        );
+    }
+    let serialized = serde_json::to_string_pretty(&root)?;
+    fs::write(settings_path, format!("{serialized}\n"))?;
+    Ok(())
+}
+
+fn write_codex_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()> {
+    let mut root = if hooks_path.exists() {
+        let contents = fs::read_to_string(hooks_path)?;
+        if contents.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&contents).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not valid JSON: {err}", hooks_path.display()),
+                )
+            })?
+        }
+    } else {
+        json!({})
+    };
+    apply_codex_hook_settings(&mut root, command)?;
+
+    if let Some(parent) = hooks_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if hooks_path.exists() {
+        let backup = backup_path(hooks_path)?;
+        fs::copy(hooks_path, &backup)?;
+        println!(
+            "gensee setup: backed up previous hooks to {}",
+            backup.display()
+        );
+    }
+    let serialized = serde_json::to_string_pretty(&root)?;
+    fs::write(hooks_path, format!("{serialized}\n"))?;
+    Ok(())
+}
+
+fn apply_claude_code_hook_settings(root: &mut Value, command: &str) -> io::Result<()> {
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Claude Code settings must be a JSON object",
+        )
+    })?;
+    let hooks = root_object
+        .entry("hooks".to_string())
+        .or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let hooks_object = hooks.as_object_mut().expect("hooks is an object");
+    let hook_entry = json!([
+        {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command
+                }
+            ]
+        }
+    ]);
+    for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
+        hooks_object.insert(event_name.to_string(), hook_entry.clone());
+    }
+    Ok(())
+}
+
+fn apply_codex_hook_settings(root: &mut Value, command: &str) -> io::Result<()> {
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex hooks must be a JSON object",
+        )
+    })?;
+    let hooks = root_object
+        .entry("hooks".to_string())
+        .or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let hooks_object = hooks.as_object_mut().expect("hooks is an object");
+    let hook_entry = json!([
+        {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "statusMessage": "Checking Gensee policy",
+                    "timeout": 30
+                }
+            ]
+        }
+    ]);
+    for event_name in [
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "Stop",
+    ] {
+        hooks_object.insert(event_name.to_string(), hook_entry.clone());
+    }
+    Ok(())
+}
+
+fn claude_code_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
+    format!(
+        "GENSEE_HOME={} {} hook claude-code",
+        shell_quote(&gensee_home.display().to_string()),
+        shell_quote(&bin_path.display().to_string())
+    )
+}
+
+fn codex_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
+    format!(
+        "GENSEE_HOME={} {} hook codex",
+        shell_quote(&gensee_home.display().to_string()),
+        shell_quote(&bin_path.display().to_string())
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "/._-+=".contains(ch))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn absolutize_for_hook(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(env::current_dir()?.join(path))
+    }
+}
+
+fn backup_path(path: &Path) -> io::Result<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| io::Error::other(err.to_string()))?
+        .as_secs();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    Ok(path.with_file_name(format!("{file_name}.bak.{timestamp}")))
+}
+
+/// `gensee policy <print-default|path|validate <file>|init [--force]>` — inspect,
+/// validate, and scaffold the policy document (the user-facing policy interface).
+pub(crate) fn handle_policy(args: Vec<OsString>) -> io::Result<()> {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("print-default") => {
+            print!("{}", policy::default_policy_json());
+            Ok(())
+        }
+        Some("path") => {
+            let (path, label) = policy::resolved_policy_source();
+            match path {
+                Some(path) => println!("active policy: {} [{label}]", path.display()),
+                None => println!("active policy: (bundled default) [{label}]"),
+            }
+            if let Some(user_path) = policy::user_policy_path() {
+                println!("user policy path: {}", user_path.display());
+            }
+            Ok(())
+        }
+        Some("validate") => {
+            let file = args.get(1).and_then(|arg| arg.to_str()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "usage: gensee policy validate <file>",
+                )
+            })?;
+            let contents = fs::read_to_string(file)?;
+            match Policy::from_json(&contents) {
+                Ok(_) => {
+                    println!(
+                        "gensee policy: {file} is valid (schema_version {})",
+                        policy::POLICY_SCHEMA_VERSION
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!("gensee policy: {file} is INVALID: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("init") => {
+            let force = has_arg(&args, "--force");
+            let path = policy::user_policy_path().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cannot determine user policy path (set GENSEE_HOME or HOME)",
+                )
+            })?;
+            if path.exists() && !force {
+                eprintln!(
+                    "gensee policy: {} already exists (use --force to overwrite)",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, policy::default_policy_json())?;
+            println!("gensee policy: wrote default policy to {}", path.display());
+            println!(
+                "edit it (auto-loaded when GENSEE_POLICY_FILE is unset), then \
+                 `gensee policy validate {}` to check.",
+                path.display()
+            );
+            Ok(())
+        }
+        Some("setup") => policy_setup(args[1..].to_vec()),
+        Some("get") => {
+            let key = args.get(1).and_then(|arg| arg.to_str()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "usage: gensee policy get <key>")
+            })?;
+            let (source, _) = policy::resolved_policy_source();
+            let text = match source {
+                Some(path) => fs::read_to_string(path)?,
+                None => policy::default_policy_json().to_string(),
+            };
+            let root: Value = serde_json::from_str(&text)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+            match policy_value_get(&root, key) {
+                Some(value) => {
+                    println!("{}", serde_json::to_string_pretty(value)?);
+                    Ok(())
+                }
+                None => {
+                    eprintln!("gensee policy: key not set: {key}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("set") => {
+            let (Some(key), Some(raw)) = (
+                args.get(1).and_then(|arg| arg.to_str()),
+                args.get(2).and_then(|arg| arg.to_str()),
+            ) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "usage: gensee policy set <key> <value>",
+                ));
+            };
+            // Only the configuration knobs are settable via `set`; a typo'd key
+            // (e.g. `egress.requireProx`) is rejected here rather than silently
+            // written and ignored. Rule sections are edited as JSON.
+            if !SETTABLE_POLICY_KEYS.contains(&key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unknown policy key `{key}`. settable keys: {}",
+                        SETTABLE_POLICY_KEYS.join(", ")
+                    ),
+                ));
+            }
+            let path = policy::user_policy_path().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cannot determine user policy path (set GENSEE_HOME or HOME)",
+                )
+            })?;
+            // Edit the user file in place, or materialize the full default first
+            // (a valid document needs all required sections present).
+            let mut root: Value = if path.exists() {
+                serde_json::from_str(&fs::read_to_string(&path)?).map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("existing policy is not valid JSON: {err}"),
+                    )
+                })?
+            } else {
+                serde_json::from_str(policy::default_policy_json()).expect("default is valid")
+            };
+            policy_value_set(&mut root, key, coerce_policy_value(key, raw))
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            let serialized = serde_json::to_string_pretty(&root)?;
+            // Reject a change that would make the document invalid, before writing.
+            Policy::from_json(&serialized).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("set would make the policy invalid: {err}"),
+                )
+            })?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, format!("{serialized}\n"))?;
+            println!("gensee policy: set {key} in {}", path.display());
+            Ok(())
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee policy <print-default | path | validate <file> | init [--force] | setup | get <key> | set <key> <value>>",
+        )),
+    }
+}
+
+fn policy_setup(args: Vec<OsString>) -> io::Result<()> {
+    if has_arg(&args, "--help") || has_arg(&args, "-h") {
+        println!("usage: gensee policy setup");
+        return Ok(());
+    }
+    if !args.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee policy setup",
+        ));
+    }
+
+    let path = policy::user_policy_path().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "cannot determine user policy path (set GENSEE_HOME or HOME)",
+        )
+    })?;
+    let mut root: Value = if path.exists() {
+        serde_json::from_str(&fs::read_to_string(&path)?).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("existing policy is not valid JSON: {err}"),
+            )
+        })?
+    } else {
+        serde_json::from_str(policy::default_policy_json()).expect("default is valid")
+    };
+
+    let tty = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty");
+    match tty {
+        Ok(mut tty) => {
+            let reader = tty.try_clone()?;
+            let mut reader = io::BufReader::new(reader);
+            run_policy_setup(&mut root, &mut reader, &mut tty)?;
+        }
+        Err(_) => {
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            let mut reader = stdin.lock();
+            let mut writer = stdout.lock();
+            run_policy_setup(&mut root, &mut reader, &mut writer)?;
+        }
+    }
+
+    let serialized = serde_json::to_string_pretty(&root)?;
+    Policy::from_json(&serialized).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("setup would make the policy invalid: {err}"),
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, format!("{serialized}\n"))?;
+    println!("gensee policy: wrote setup policy to {}", path.display());
+    println!(
+        "gensee policy: validate it with `gensee policy validate {}`",
+        path.display()
+    );
+    Ok(())
+}
+
+fn run_policy_setup<R: BufRead, W: Write>(
+    root: &mut Value,
+    input: &mut R,
+    output: &mut W,
+) -> io::Result<()> {
+    writeln!(output, "Gensee policy setup")?;
+    writeln!(
+        output,
+        "Press Enter to keep the current value shown in brackets."
+    )?;
+
+    for group in POLICY_SETUP_GROUPS {
+        writeln!(output)?;
+        writeln!(output, "{}", group.name)?;
+        if !group.hint.is_empty() {
+            writeln!(output, "{}", group.hint)?;
+        }
+        for item in group.items {
+            prompt_policy_setup_item(root, item, input, output)?;
+        }
+    }
+    prompt_artifact_definitions(root, input, output)?;
+    prompt_decision_rules(root, input, output)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+fn prompt_policy_setup_item<R: BufRead, W: Write>(
+    root: &mut Value,
+    item: &PolicySetupItem,
+    input: &mut R,
+    output: &mut W,
+) -> io::Result<()> {
+    let current = policy_value_get(root, item.key).unwrap_or(&Value::Null);
+    let current_display = policy_setup_value_display(current);
+    write!(
+        output,
+        "{} - {} [{}]: ",
+        item.label, item.help, current_display
+    )?;
+    output.flush()?;
+
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let value = parse_policy_setup_value(item, trimmed)?;
+    policy_value_set(root, item.key, value)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{}: {err}", item.key)))
+}
+
+fn parse_policy_setup_value(item: &PolicySetupItem, raw: &str) -> io::Result<Value> {
+    let lowered = raw.to_ascii_lowercase();
+    match item.value_type {
+        PolicySetupValueType::Bool => match lowered.as_str() {
+            "y" | "yes" | "true" | "1" | "on" => Ok(json!(true)),
+            "n" | "no" | "false" | "0" | "off" => Ok(json!(false)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} expects y/n", item.key),
+            )),
+        },
+        PolicySetupValueType::List => {
+            if matches!(lowered.as_str(), "none" | "unset" | "empty" | "[]") {
+                return Ok(json!([]));
+            }
+            Ok(json!(raw
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()))
+        }
+        PolicySetupValueType::Int => {
+            if item.allow_null && matches!(lowered.as_str(), "none" | "unset" | "null") {
+                return Ok(Value::Null);
+            }
+            raw.parse::<i64>().map(|value| json!(value)).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} expects an integer", item.key),
+                )
+            })
+        }
+        PolicySetupValueType::Float => raw.parse::<f64>().map(|value| json!(value)).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} expects a number", item.key),
+            )
+        }),
+        PolicySetupValueType::String => {
+            if item.allow_null && matches!(lowered.as_str(), "none" | "unset" | "null") {
+                Ok(Value::Null)
+            } else {
+                Ok(json!(raw))
+            }
+        }
+    }
+}
+
+fn policy_setup_value_display(value: &Value) -> String {
+    match value {
+        Value::Null => "unset".to_string(),
+        Value::Array(items) if items.is_empty() => "empty".to_string(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(ToString::to_string))
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::String(value) => value.clone(),
+        _ => value.to_string(),
+    }
+}
+
+fn prompt_artifact_definitions<R: BufRead, W: Write>(
+    root: &mut Value,
+    input: &mut R,
+    output: &mut W,
+) -> io::Result<()> {
+    writeln!(output)?;
+    writeln!(output, "Artifact definitions")?;
+    writeln!(
+        output,
+        "What Gensee treats as executable, memory, skill, or control-plane files."
+    )?;
+
+    for def in ARTIFACT_SETUP_DEFS {
+        writeln!(output)?;
+        writeln!(output, "{}", def.title)?;
+        writeln!(output, "{}", def.help)?;
+        for field in MATCHER_SETUP_FIELDS {
+            let key = format!("artifact_registries.{}.{}", def.key, field.key);
+            prompt_policy_setup_list(root, &key, field.label, input, output)?;
+        }
+    }
+    Ok(())
+}
+
+fn prompt_policy_setup_list<R: BufRead, W: Write>(
+    root: &mut Value,
+    key: &str,
+    label: &str,
+    input: &mut R,
+    output: &mut W,
+) -> io::Result<()> {
+    let current = policy_value_get(root, key).unwrap_or(&Value::Null);
+    let current_display = policy_setup_value_display(current);
+    write!(output, "{} [{}]: ", label, current_display)?;
+    output.flush()?;
+
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let value = parse_policy_setup_list_value(trimmed);
+    policy_value_set(root, key, value)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{key}: {err}")))
+}
+
+fn parse_policy_setup_list_value(raw: &str) -> Value {
+    let lowered = raw.to_ascii_lowercase();
+    if matches!(lowered.as_str(), "none" | "unset" | "empty" | "[]") {
+        return json!([]);
+    }
+    json!(raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>())
+}
+
+fn prompt_decision_rules<R: BufRead, W: Write>(
+    root: &mut Value,
+    input: &mut R,
+    output: &mut W,
+) -> io::Result<()> {
+    let groups = collect_policy_rule_groups(root);
+    if groups.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(output)?;
+    writeln!(output, "Decision rules")?;
+    writeln!(
+        output,
+        "Choose each rule action: deny blocks, ask prompts, allow lets it through."
+    )?;
+
+    for (group, rules) in groups {
+        writeln!(output)?;
+        writeln!(output, "{} ({})", group, rules.len())?;
+        for rule in rules {
+            prompt_decision_rule(root, &rule, input, output)?;
+        }
+    }
+    Ok(())
+}
+
+fn prompt_decision_rule<R: BufRead, W: Write>(
+    root: &mut Value,
+    rule: &DecisionRule,
+    input: &mut R,
+    output: &mut W,
+) -> io::Result<()> {
+    let current = root
+        .pointer(&rule.pointer)
+        .and_then(|node| node.get("action"))
+        .and_then(Value::as_str)
+        .unwrap_or("allow");
+    let current_display = policy_action_display(current);
+    let summary = if rule.summary.is_empty() {
+        String::new()
+    } else {
+        format!(" - {}", rule.summary)
+    };
+    write!(
+        output,
+        "{}{} [deny/ask/allow; current {}]: ",
+        rule.name, summary, current_display
+    )?;
+    output.flush()?;
+
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let action = parse_policy_action(trimmed)?;
+    let node = root.pointer_mut(&rule.pointer).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("missing rule path {}", rule.pointer),
+        )
+    })?;
+    let object = node.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("rule path {} is not an object", rule.pointer),
+        )
+    })?;
+    object.insert("action".to_string(), json!(action));
+    Ok(())
+}
+
+fn parse_policy_action(raw: &str) -> io::Result<&'static str> {
+    match raw.to_ascii_lowercase().as_str() {
+        "deny" | "block" => Ok("block"),
+        "ask" => Ok("ask"),
+        "allow" => Ok("allow"),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "action must be deny, ask, or allow",
+        )),
+    }
+}
+
+fn policy_action_display(action: &str) -> &str {
+    match action {
+        "block" => "deny",
+        other => other,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DecisionRule {
+    name: String,
+    pointer: String,
+    summary: String,
+}
+
+fn collect_policy_rule_groups(root: &Value) -> Vec<(String, Vec<DecisionRule>)> {
+    let mut file_rules = Vec::new();
+    if let Some(node) = root.pointer("/secret_paths/protected") {
+        file_rules.push(DecisionRule {
+            name: "Protected secrets".to_string(),
+            pointer: "/secret_paths/protected".to_string(),
+            summary: summarize_rule_node(node),
+        });
+    }
+    if let Some(node) = root.pointer("/persistence_writes") {
+        file_rules.push(DecisionRule {
+            name: "Persistence / startup writes".to_string(),
+            pointer: "/persistence_writes".to_string(),
+            summary: summarize_rule_node(node),
+        });
+    }
+    if let Some(categories) = root.get("categories").and_then(Value::as_object) {
+        let mut ordered = BTreeMap::new();
+        for (key, node) in categories {
+            ordered.insert(key, node);
+        }
+        for (key, node) in ordered {
+            file_rules.push(DecisionRule {
+                name: key.replace('_', " "),
+                pointer: format!("/categories/{}", json_pointer_escape(key)),
+                summary: summarize_rule_node(node),
+            });
+        }
+    }
+
+    let command_rules = collect_array_rules(root, "command_rules", "Command rule");
+    let content_rules = collect_array_rules(root, "content_rules", "Content rule");
+    let url_rules = collect_array_rules(root, "url_rules", "URL rule");
+
+    let mut groups = Vec::new();
+    if !file_rules.is_empty() {
+        groups.push(("File access rules".to_string(), file_rules));
+    }
+    if !command_rules.is_empty() {
+        groups.push(("Command rules".to_string(), command_rules));
+    }
+    if !content_rules.is_empty() {
+        groups.push(("Executable-content rules".to_string(), content_rules));
+    }
+    if !url_rules.is_empty() {
+        groups.push(("Network / URL rules".to_string(), url_rules));
+    }
+    groups
+}
+
+fn collect_array_rules(root: &Value, key: &str, fallback_prefix: &str) -> Vec<DecisionRule> {
+    root.get(key)
+        .and_then(Value::as_array)
+        .map(|rules| {
+            rules
+                .iter()
+                .enumerate()
+                .map(|(index, node)| DecisionRule {
+                    name: node
+                        .get("id")
+                        .or_else(|| node.get("rule_id"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("{} {}", fallback_prefix, index + 1)),
+                    pointer: format!("/{key}/{index}"),
+                    summary: summarize_rule_node(node),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn summarize_rule_node(node: &Value) -> String {
+    const SUMMARY_FIELDS: &[&str] = &[
+        "patterns",
+        "all_of",
+        "commands",
+        "bare_commands",
+        "arg_any",
+        "arg_all",
+        "raw_all",
+        "hosts",
+        "host_substrings",
+        "url_substrings",
+        "segments",
+        "filenames",
+        "filename_suffixes",
+        "path_contains",
+        "exact_paths",
+    ];
+    let mut parts = Vec::new();
+    for field in SUMMARY_FIELDS {
+        if let Some(values) = node.get(*field).and_then(Value::as_array) {
+            parts.extend(
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string),
+            );
+        }
+    }
+    if parts.is_empty() {
+        return node
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
+    let shown = parts.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+    if parts.len() > 4 {
+        format!("{shown} ... (+{})", parts.len() - 4)
+    } else {
+        shown
+    }
+}
+
+fn json_pointer_escape(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+struct PolicySetupGroup {
+    name: &'static str,
+    hint: &'static str,
+    items: &'static [PolicySetupItem],
+}
+
+struct PolicySetupItem {
+    key: &'static str,
+    value_type: PolicySetupValueType,
+    label: &'static str,
+    help: &'static str,
+    allow_null: bool,
+}
+
+struct ArtifactSetupDef {
+    key: &'static str,
+    title: &'static str,
+    help: &'static str,
+}
+
+struct MatcherSetupField {
+    key: &'static str,
+    label: &'static str,
+}
+
+#[derive(Clone, Copy)]
+enum PolicySetupValueType {
+    Bool,
+    Float,
+    Int,
+    List,
+    String,
+}
+
+const RESOURCE_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[
+    PolicySetupItem {
+        key: "resource_governance.max_read_bytes",
+        value_type: PolicySetupValueType::Int,
+        label: "Max read bytes",
+        help: "Largest single file read the shield allows",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "resource_governance.max_file_subjects_per_tool",
+        value_type: PolicySetupValueType::Int,
+        label: "Max file subjects / tool",
+        help: "File paths a single tool call may touch",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "resource_governance.max_shell_segments_per_tool",
+        value_type: PolicySetupValueType::Int,
+        label: "Max shell segments / tool",
+        help: "Chained commands per Bash call",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "resource_governance.max_tool_calls_per_session",
+        value_type: PolicySetupValueType::Int,
+        label: "Max tool calls / session",
+        help: "Total tool calls before the session is throttled",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "resource_governance.max_network_egress_per_session",
+        value_type: PolicySetupValueType::Int,
+        label: "Max network egress / session",
+        help: "Outbound network operations per session",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "resource_governance.max_file_accessed_rate_per_min",
+        value_type: PolicySetupValueType::Float,
+        label: "Max file access rate / min",
+        help: "File operations per minute before flagging",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "resource_governance.max_network_rate_per_min",
+        value_type: PolicySetupValueType::Float,
+        label: "Max network rate / min",
+        help: "Network operations per minute before flagging",
+        allow_null: false,
+    },
+];
+
+const EGRESS_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[
+    PolicySetupItem {
+        key: "egress.allow_hosts",
+        value_type: PolicySetupValueType::List,
+        label: "Allowed hosts",
+        help: "Comma-separated hosts the agent may connect to; empty means unrestricted",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "egress.proxy_url",
+        value_type: PolicySetupValueType::String,
+        label: "Proxy URL",
+        help: "Egress proxy URL, or none to unset",
+        allow_null: true,
+    },
+    PolicySetupItem {
+        key: "egress.require_proxy",
+        value_type: PolicySetupValueType::Bool,
+        label: "Require proxy",
+        help: "Deny direct egress that bypasses the proxy",
+        allow_null: false,
+    },
+];
+
+const RUNTIME_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[PolicySetupItem {
+    key: "runtime.max_runtime_seconds",
+    value_type: PolicySetupValueType::Int,
+    label: "Max runtime seconds",
+    help: "Wall-clock cap for a guarded run, or none to unset",
+    allow_null: true,
+}];
+
+const ENFORCEMENT_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[PolicySetupItem {
+    key: "enforcement.noninteractive",
+    value_type: PolicySetupValueType::Bool,
+    label: "Non-interactive fail-closed",
+    help: "Escalate medium+ asks to deny when no human can answer",
+    allow_null: false,
+}];
+
+const WATCH_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[PolicySetupItem {
+    key: "watch.system_events",
+    value_type: PolicySetupValueType::String,
+    label: "System events",
+    help: "System-event backend for gensee watch: eslogger or none",
+    allow_null: false,
+}];
+
+const ALLOWLIST_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[PolicySetupItem {
+    key: "allow_path_prefixes",
+    value_type: PolicySetupValueType::List,
+    label: "Allowed path prefixes",
+    help: "Comma-separated absolute path prefixes exempt from sensitive checks",
+    allow_null: false,
+}];
+
+const POLICY_SETUP_GROUPS: &[PolicySetupGroup] = &[
+    PolicySetupGroup {
+        name: "Resource governance",
+        hint: "Per-tool and per-session quotas.",
+        items: RESOURCE_POLICY_SETUP_ITEMS,
+    },
+    PolicySetupGroup {
+        name: "Network egress",
+        hint: "Where the agent may connect, and whether it must use a proxy.",
+        items: EGRESS_POLICY_SETUP_ITEMS,
+    },
+    PolicySetupGroup {
+        name: "Runtime",
+        hint: "Run supervisor limits.",
+        items: RUNTIME_POLICY_SETUP_ITEMS,
+    },
+    PolicySetupGroup {
+        name: "Enforcement",
+        hint: "How policy behaves when no human can approve an ask decision.",
+        items: ENFORCEMENT_POLICY_SETUP_ITEMS,
+    },
+    PolicySetupGroup {
+        name: "Watch",
+        hint: "Sidecar watch defaults.",
+        items: WATCH_POLICY_SETUP_ITEMS,
+    },
+    PolicySetupGroup {
+        name: "Allowlisted paths",
+        hint: "Paths that should always be trusted.",
+        items: ALLOWLIST_POLICY_SETUP_ITEMS,
+    },
+];
+
+const ARTIFACT_SETUP_DEFS: &[ArtifactSetupDef] = &[
+    ArtifactSetupDef {
+        key: "executable",
+        title: "Executable artifacts",
+        help: "Runnable files such as scripts, skills, plugins, and git hooks.",
+    },
+    ArtifactSetupDef {
+        key: "memory",
+        title: "Memory files",
+        help: "Agent memory files Gensee tracks for poisoning across turns or sessions.",
+    },
+    ArtifactSetupDef {
+        key: "skill",
+        title: "Skill / plugin locations",
+        help: "Where agent skill and plugin definitions live.",
+    },
+    ArtifactSetupDef {
+        key: "control_plane",
+        title: "Control-plane files",
+        help: "Gensee's own files, such as the local database and safety policy.",
+    },
+];
+
+const MATCHER_SETUP_FIELDS: &[MatcherSetupField] = &[
+    MatcherSetupField {
+        key: "segments",
+        label: "Path segments (directory names)",
+    },
+    MatcherSetupField {
+        key: "filenames",
+        label: "Exact filenames",
+    },
+    MatcherSetupField {
+        key: "filename_prefixes",
+        label: "Filename prefixes",
+    },
+    MatcherSetupField {
+        key: "filename_suffixes",
+        label: "Filename suffixes / extensions",
+    },
+    MatcherSetupField {
+        key: "filename_contains",
+        label: "Filename contains",
+    },
+    MatcherSetupField {
+        key: "path_suffixes",
+        label: "Path ends with",
+    },
+    MatcherSetupField {
+        key: "path_contains",
+        label: "Path contains",
+    },
+];
+
+/// Configuration keys settable via `gensee policy set` — the env-knob
+/// replacements. Rule sections (secret_paths, command_rules, …) are edited as
+/// JSON, not via `set`.
+const SETTABLE_POLICY_KEYS: &[&str] = &[
+    "resource_governance.max_read_bytes",
+    "resource_governance.max_file_subjects_per_tool",
+    "resource_governance.max_shell_segments_per_tool",
+    "resource_governance.max_tool_calls_per_session",
+    "resource_governance.max_network_egress_per_session",
+    "resource_governance.max_file_accessed_rate_per_min",
+    "resource_governance.max_network_rate_per_min",
+    "egress.allow_hosts",
+    "egress.proxy_url",
+    "egress.require_proxy",
+    "runtime.max_runtime_seconds",
+    "enforcement.noninteractive",
+    "watch.system_events",
+    "allow_path_prefixes",
+];
+
+/// Look up a dotted key (e.g. `egress.require_proxy`) in a policy JSON value.
+fn policy_value_get<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for part in key.split('.') {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+/// Set a dotted key in a policy JSON value, creating intermediate objects.
+fn policy_value_set(root: &mut Value, key: &str, value: Value) -> Result<(), String> {
+    let parts: Vec<&str> = key.split('.').collect();
+    let mut current = root;
+    for (index, part) in parts.iter().enumerate() {
+        let object = current
+            .as_object_mut()
+            .ok_or_else(|| format!("`{}` is not an object", parts[..index].join(".")))?;
+        if index == parts.len() - 1 {
+            object.insert((*part).to_string(), value);
+            return Ok(());
+        }
+        current = object
+            .entry((*part).to_string())
+            .or_insert_with(|| json!({}));
+    }
+    Ok(())
+}
+
+/// Coerce a CLI string value to JSON: known list keys split on `,`; otherwise
+/// bool / null / integer / float / string by inspection. Type correctness is
+/// enforced afterward by re-validating the whole document.
+fn coerce_policy_value(key: &str, raw: &str) -> Value {
+    const LIST_KEYS: &[&str] = &["egress.allow_hosts", "allow_path_prefixes"];
+    if LIST_KEYS.contains(&key) {
+        return Value::Array(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| json!(item))
+                .collect(),
+        );
+    }
+    match raw {
+        "true" => json!(true),
+        "false" => json!(false),
+        "null" => Value::Null,
+        _ => raw
+            .parse::<i64>()
+            .map(|n| json!(n))
+            .or_else(|_| raw.parse::<f64>().map(|n| json!(n)))
+            .unwrap_or_else(|_| json!(raw)),
+    }
+}
+
+pub(crate) fn handle_ingest(args: Vec<OsString>) -> io::Result<()> {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("eslogger") => ingest_eslogger(),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee ingest eslogger",
+        )),
+    }
+}
+
+/// Verify the tamper-evident alert hash chain (T8). Exits 0 if intact, 2 if a
+/// row was inserted, deleted, reordered, or modified.
+pub(crate) fn verify_log() -> io::Result<()> {
+    let store = EventStore::default_local()?;
+    let result = store.verify_alert_chain()?;
+    if result.is_valid() {
+        println!(
+            "gensee verify-log: OK — {} chained alert(s), no tampering detected",
+            result.checked
+        );
+        Ok(())
+    } else {
+        let location = result
+            .broken_at
+            .map(|id| format!("alert_id {id}"))
+            .unwrap_or_else(|| "the tail".to_string());
+        eprintln!(
+            "gensee verify-log: TAMPERING DETECTED — chain broke at {} after {} valid entr{}: {}",
+            location,
+            result.checked,
+            if result.checked == 1 { "y" } else { "ies" },
+            result.reason.as_deref().unwrap_or("unknown"),
+        );
+        std::process::exit(2);
+    }
+}
+
+pub(crate) fn handle_feedback(args: Vec<OsString>) -> io::Result<()> {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("record") => feedback_record(args[1..].to_vec()),
+        Some("list") => feedback_list(args[1..].to_vec()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] \
+[--event-key <k>] [--tool-use-id <id>] [--session <s>] [--rule <r>] [--path <p>] [--label <l>] [--note <n>]\n\
+       gensee feedback list [--json] [--limit <n>]",
+        )),
+    }
+}
+
+/// Parse `--key value` pairs into a map. Every flag requires a value.
+fn parse_feedback_flags(
+    args: &[OsString],
+) -> io::Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let key = args[index].to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "feedback: non-UTF8 argument")
+        })?;
+        let name = key.strip_prefix("--").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("feedback: unexpected argument '{key}'"),
+            )
+        })?;
+        let value = args
+            .get(index + 1)
+            .and_then(|arg| arg.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("feedback: missing value for --{name}"),
+                )
+            })?;
+        map.insert(name.to_string(), value.to_string());
+        index += 2;
+    }
+    Ok(map)
+}
+
+/// Derive the FP/FN/confirmed label from the shield action and human verdict
+/// (mirrors the dashboard's verdictLabel so both write the same taxonomy).
+fn derive_feedback_label(gensee: Option<&str>, verdict: &str) -> String {
+    let gensee = gensee.unwrap_or("");
+    match verdict {
+        "agree" => "confirmed",
+        "allow" if matches!(gensee, "deny" | "block" | "ask" | "warn") => "false_positive",
+        "deny" if matches!(gensee, "allow" | "watch") => "false_negative",
+        _ => "override",
+    }
+    .to_string()
+}
+
+fn feedback_record(args: Vec<OsString>) -> io::Result<()> {
+    let opts = parse_feedback_flags(&args)?;
+    let verdict = opts.get("verdict").cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "feedback record: --verdict <agree|allow|deny> is required",
+        )
+    })?;
+    if !matches!(verdict.as_str(), "agree" | "allow" | "deny") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "feedback record: --verdict must be agree, allow, or deny",
+        ));
+    }
+    let gensee_action = opts.get("gensee").cloned();
+    let label = opts
+        .get("label")
+        .cloned()
+        .unwrap_or_else(|| derive_feedback_label(gensee_action.as_deref(), &verdict));
+
+    let store = EventStore::default_local()?;
+    let id = store.record_human_feedback(
+        opts.get("event-key").cloned(),
+        opts.get("tool-use-id").cloned(),
+        opts.get("session").cloned(),
+        gensee_action,
+        verdict,
+        Some(label),
+        opts.get("rule").cloned(),
+        opts.get("path").cloned(),
+        opts.get("note").cloned(),
+        unix_millis()?,
+    )?;
+    println!("gensee feedback: recorded verdict #{id}");
+    Ok(())
+}
+
+fn feedback_list(args: Vec<OsString>) -> io::Result<()> {
+    let mut json = false;
+    let mut limit: i64 = 50;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].to_str() {
+            Some("--json") => {
+                json = true;
+                index += 1;
+            }
+            Some("--limit") => {
+                limit = args
+                    .get(index + 1)
+                    .and_then(|arg| arg.to_str())
+                    .and_then(|value| value.parse().ok())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "feedback list: --limit needs a number",
+                        )
+                    })?;
+                index += 2;
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "feedback list: unexpected argument {:?}",
+                        other.unwrap_or("")
+                    ),
+                ))
+            }
+        }
+    }
+
+    let store = EventStore::default_local()?;
+    let rows = store.human_feedback(limit)?;
+    if json {
+        let array = rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "feedback_id": row.feedback_id,
+                    "event_key": row.event_key,
+                    "tool_use_id": row.tool_use_id,
+                    "session_id": row.session_id,
+                    "gensee_action": row.gensee_action,
+                    "human_verdict": row.human_verdict,
+                    "label": row.label,
+                    "rule_id": row.rule_id,
+                    "path": row.path,
+                    "note": row.note,
+                    "created_at": row.created_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string(&array)?);
+    } else if rows.is_empty() {
+        println!("gensee feedback: no verdicts recorded");
+    } else {
+        for row in &rows {
+            println!(
+                "#{} {} -> {} [{}] {} {}",
+                row.feedback_id,
+                row.gensee_action.as_deref().unwrap_or("-"),
+                row.human_verdict,
+                row.label.as_deref().unwrap_or("-"),
+                row.path.as_deref().or(row.rule_id.as_deref()).unwrap_or(""),
+                row.note.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn dashboard_state() -> io::Result<()> {
+    let store = EventStore::default_local()?;
+    println!("{}", serde_json::to_string(&store.dashboard_state()?)?);
+    Ok(())
+}
+
+pub(crate) fn ingest_eslogger() -> io::Result<()> {
+    let store = EventStore::default_local()?;
+    let mut count = 0_u64;
+    let stdin = io::stdin();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with('{') {
+            continue;
+        }
+
+        let event = system_event_from_eslogger_line(line, unix_millis()?);
+        store.append_system_event(&event)?;
+        count += 1;
+    }
+
+    eprintln!("gensee: ingested {count} eslogger event(s)");
+    Ok(())
+}
+
+pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
+    let mut payload = String::new();
+    io::stdin().read_to_string(&mut payload)?;
+
+    let event = build_hook_event(&payload, provider)?;
+
+    // Fast path: if the warm daemon is up, hand off over its socket — PreToolUse
+    // waits for the decision (warm eval, no per-call store open), observational
+    // events fire-and-forget off the critical path. Falls through to the
+    // in-process path if the daemon is unreachable, so enforcement never
+    // silently disappears.
+    if dispatch_via_daemon(&payload, &event) {
+        return Ok(());
+    }
+
+    let store = EventStore::default_local()?;
+    if let Some(decision_json) = process_hook_event(&payload, &event, &store)? {
+        print!("{decision_json}");
+    }
+    Ok(())
+}
+
+/// Core per-event processing shared by the in-process path and the daemon.
+/// Returns hook stdout JSON when the event produces output — the PreToolUse
+/// decision, or a UserPromptSubmit `additionalContext` counter-instruction when
+/// the memory/skill integrity scan finds poison — and `None` for events that
+/// only record into the lineage store (PostToolUse, clean UserPromptSubmit, Stop).
+pub(crate) fn process_hook_event(
+    payload: &str,
+    event: &AgentHookEvent,
+    store: &EventStore,
+) -> io::Result<Option<String>> {
+    store.append_hook_event(event)?;
+
+    if matches!(
+        event.hook_event_name.as_deref(),
+        Some("PreToolUse" | "PermissionRequest")
+    ) {
+        // Parse intents from the original (un-redacted) command so the redaction
+        // placeholder cannot inject shell metacharacters into the parse; the
+        // stored source_command is still the redacted form.
+        let original_command = original_bash_command(payload);
+        let file_intents = file_intents_from_hook(event, original_command.as_deref());
+        for intent in &file_intents {
+            store.append_file_intent(intent)?;
+        }
+        let decision = adapt_decision_for_provider(
+            evaluate_pretool_policy_with_store(event, &file_intents, Some(store)),
+            &event.provider,
+        );
+        for finding in &decision.findings {
+            store.append_policy_alert(&finding.to_policy_alert(event))?;
+        }
+        if should_start_process_sampler(&decision) {
+            start_process_sampler(event)?;
+        }
+        Ok(decision_json_for_provider(
+            &decision,
+            &event.provider,
+            event.hook_event_name.as_deref().unwrap_or("PreToolUse"),
+        ))
+    } else if event.hook_event_name.as_deref() == Some("PostToolUse") {
+        let original_command = original_bash_command(payload);
+        record_write_time_artifact_observations(
+            payload,
+            event,
+            original_command.as_deref(),
+            store,
+        )?;
+        Ok(None)
+    } else if event.hook_event_name.as_deref() == Some("UserPromptSubmit") {
+        // Session-integrity scan for context-injected poison. The framework
+        // auto-loads CLAUDE.md/MEMORY.md/SOUL.md and skills into the prompt
+        // without a tool call, so PreToolUse can't see it; scan those files
+        // directly before the turn runs. Non-blocking: RETURN a counter-
+        // instruction (additionalContext) so the turn still runs and the
+        // PreToolUse rules hard-block the actual harmful action downstream.
+        // Returning it (vs printing) lets the daemon path serve it too.
+        let findings = memory_integrity_findings(event);
+        let already_notified = event
+            .session_id
+            .as_deref()
+            .map(|session_id| store.session_has_alert(session_id, "policy_memory_poison_detected"))
+            .transpose()?
+            .unwrap_or(false);
+        if already_notified {
+            return Ok(None);
+        }
+        if findings.is_empty() {
+            Ok(None)
+        } else {
+            for finding in &findings {
+                store.append_policy_alert(&finding.to_policy_alert(event))?;
+            }
+            Ok(Some(userprompt_poison_context_json()))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn required_arg_value(args: &[OsString], name: &str) -> io::Result<String> {
+    arg_value(args, name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("missing required argument {name}"),
+        )
+    })
+}
+
+pub(crate) fn optional_arg_u64(args: &[OsString], name: &str) -> Option<u64> {
+    arg_value(args, name)?.parse().ok()
+}
+
+pub(crate) fn arg_value(args: &[OsString], name: &str) -> Option<String> {
+    args.windows(2).find_map(|window| {
+        if window[0].to_str() == Some(name) {
+            window[1].to_str().map(ToString::to_string)
+        } else {
+            None
+        }
+    })
+}
+
+pub(crate) fn arg_values(args: &[OsString], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter_map(|window| {
+            if window[0].to_str() == Some(name) {
+                window[1].to_str().map(ToString::to_string)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn has_arg(args: &[OsString], name: &str) -> bool {
+    args.iter().any(|arg| arg.to_str() == Some(name))
+}
+
+pub(crate) fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(path) = current {
+        if path.join(".git").exists() {
+            return Some(path.to_path_buf());
+        }
+        current = path.parent();
+    }
+    None
+}
+
+pub(crate) fn unix_millis() -> io::Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    Ok(duration.as_millis() as u64)
+}
+
+pub(crate) fn one_line(value: &str) -> String {
+    let text = value.replace('\n', "\\n").replace('\r', "\\r");
+    const DISPLAY_CHARS: usize = 160;
+    const ELLIPSIS: &str = "...";
+
+    if text.chars().count() > DISPLAY_CHARS {
+        let mut shortened = text
+            .chars()
+            .take(DISPLAY_CHARS - ELLIPSIS.chars().count())
+            .collect::<String>();
+        shortened.push_str(ELLIPSIS);
+        shortened
+    } else {
+        text
+    }
+}
+
+pub(crate) fn option_u32_display(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+pub(crate) fn print_usage() {
+    println!(
+        "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n\nCOMPATIBILITY:\n  gensee session list"
+    );
+}

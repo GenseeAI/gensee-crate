@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+<defs>
+<marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+<path d="M0,0 L0,6 L9,3 z" fill="#374151"/>
+</marker>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;fill:#111827}.small{font-size:20px;fill:#374151}.tiny{font-size:16px;fill:#4b5563}.boxtext{font-size:20px}.title{font-size:34px;font-weight:700}.note{font-size:21px;fill:#374151}</style>
+</defs>
+<rect width="1600" height="900" fill="white"/>
+<text class="title" x="48" y="62">Gensee Database Design: Capture, Persistence, Retrieval</text>
+<rect x="60" y="125" width="245" height="130" rx="14" fill="#dbeafe" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="182.5" y="134.0" font-weight="700">Agent hooks</text>
+<text class="boxtext" text-anchor="middle" x="182.5" y="162.0">UserPromptSubmit</text>
+<text class="boxtext" text-anchor="middle" x="182.5" y="190.0">PreToolUse</text>
+<text class="boxtext" text-anchor="middle" x="182.5" y="218.0">PostToolUse</text>
+<text class="boxtext" text-anchor="middle" x="182.5" y="246.0">Stop</text>
+<rect x="60" y="310" width="245" height="90" rx="14" fill="#dbeafe" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="182.5" y="341.0" font-weight="700">Bash parser</text>
+<text class="boxtext" text-anchor="middle" x="182.5" y="369.0">file intents</text>
+<rect x="60" y="455" width="245" height="95" rx="14" fill="#dbeafe" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="182.5" y="488.5" font-weight="700">Native file tools</text>
+<text class="boxtext" text-anchor="middle" x="182.5" y="516.5">Read / Write / Edit</text>
+<rect x="60" y="600" width="245" height="95" rx="14" fill="#dbeafe" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="182.5" y="633.5" font-weight="700">Workspace / FSEvents</text>
+<text class="boxtext" text-anchor="middle" x="182.5" y="661.5">file effects</text>
+<rect x="60" y="735" width="245" height="95" rx="14" fill="#dbeafe" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="182.5" y="768.5" font-weight="700">EndpointSecurity</text>
+<text class="boxtext" text-anchor="middle" x="182.5" y="796.5">eslogger events</text>
+<rect x="455" y="130" width="245" height="105" rx="14" fill="#dcfce7" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="577.5" y="154.5" font-weight="700">sessions</text>
+<text class="boxtext" text-anchor="middle" x="577.5" y="182.5">agent runtime</text>
+<text class="boxtext" text-anchor="middle" x="577.5" y="210.5">session ownership</text>
+<rect x="455" y="300" width="245" height="120" rx="14" fill="#dcfce7" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="577.5" y="332.0" font-weight="700">requests</text>
+<text class="boxtext" text-anchor="middle" x="577.5" y="360.0">human intent</text>
+<text class="boxtext" text-anchor="middle" x="577.5" y="388.0">prompt + response</text>
+<rect x="455" y="485" width="245" height="125" rx="14" fill="#dcfce7" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="577.5" y="519.5" font-weight="700">agent_events</text>
+<text class="boxtext" text-anchor="middle" x="577.5" y="547.5">agent/tool intent</text>
+<text class="boxtext" text-anchor="middle" x="577.5" y="575.5">hooks + file_intent</text>
+<rect x="455" y="690" width="245" height="125" rx="14" fill="#dcfce7" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="577.5" y="724.5" font-weight="700">system_events</text>
+<text class="boxtext" text-anchor="middle" x="577.5" y="752.5">observed impact</text>
+<text class="boxtext" text-anchor="middle" x="577.5" y="780.5">filesystem/process</text>
+<rect x="865" y="310" width="250" height="125" rx="14" fill="#fef3c7" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="990.0" y="344.5" font-weight="700">artifacts</text>
+<text class="boxtext" text-anchor="middle" x="990.0" y="372.5">files/resources</text>
+<text class="boxtext" text-anchor="middle" x="990.0" y="400.5">kind + uri + digest</text>
+<rect x="865" y="555" width="250" height="145" rx="14" fill="#ede9fe" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="990.0" y="585.5" font-weight="700">relations</text>
+<text class="boxtext" text-anchor="middle" x="990.0" y="613.5">lineage edges</text>
+<text class="boxtext" text-anchor="middle" x="990.0" y="641.5">produced, consumed_by</text>
+<text class="boxtext" text-anchor="middle" x="990.0" y="669.5">derived_from, caused</text>
+<rect x="1260" y="260" width="250" height="105" rx="14" fill="#fee2e2" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="1385.0" y="298.5" font-weight="700">Safety policy</text>
+<text class="boxtext" text-anchor="middle" x="1385.0" y="326.5">allow / ask / deny</text>
+<rect x="1260" y="455" width="250" height="120" rx="14" fill="#fee2e2" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="1385.0" y="487.0" font-weight="700">alerts</text>
+<text class="boxtext" text-anchor="middle" x="1385.0" y="515.0">severity + action</text>
+<text class="boxtext" text-anchor="middle" x="1385.0" y="543.0">rule_id + evidence</text>
+<rect x="1260" y="665" width="250" height="125" rx="14" fill="#e0f2fe" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="1385.0" y="699.5" font-weight="700">gensee timeline</text>
+<text class="boxtext" text-anchor="middle" x="1385.0" y="727.5">prompts, tools</text>
+<text class="boxtext" text-anchor="middle" x="1385.0" y="755.5">effects, alerts</text>
+<path d="M305.0,190.0 L455.0,182.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="297.5" y="166.2" width="165" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="380.0" y="186.2" fill="#374151">creates/updates</text>
+<path d="M305.0,190.0 L455.0,360.0" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="297.5" y="255.0" width="165" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="380.0" y="275.0" fill="#374151">prompt/response</text>
+<path d="M305.0,190.0 L455.0,547.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="319.5" y="348.8" width="121" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="380.0" y="368.8" fill="#374151">hook events</text>
+<path d="M305.0,355.0 L455.0,547.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="319.5" y="431.2" width="121" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="380.0" y="451.2" fill="#374151">file_intent</text>
+<path d="M305.0,502.5 L455.0,547.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="325.0" y="505.0" width="110" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="380.0" y="525.0" fill="#374151">tool event</text>
+<path d="M305.0,647.5 L455.0,752.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="292.0" y="680.0" width="176" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="380.0" y="700.0" fill="#374151">workspace effect</text>
+<path d="M305.0,782.5 L455.0,752.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="336.0" y="747.5" width="88" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="380.0" y="767.5" fill="#374151">OS event</text>
+<path d="M700.0,360.0 L865.0,372.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="744.0" y="346.2" width="77" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="782.5" y="366.2" fill="#374151">acts on</text>
+<path d="M700.0,547.5 L865.0,372.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="716.5" y="440.0" width="132" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="782.5" y="460.0" fill="#374151">reads/writes</text>
+<path d="M700.0,752.5 L865.0,372.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="738.5" y="542.5" width="88" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="782.5" y="562.5" fill="#374151">observes</text>
+<path d="M700.0,360.0 L865.0,627.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="744.0" y="473.8" width="77" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="782.5" y="493.8" fill="#374151">lineage</text>
+<path d="M700.0,547.5 L865.0,627.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="700.0" y="567.5" width="165" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="782.5" y="587.5" fill="#374151">caused/observed</text>
+<path d="M700.0,752.5 L865.0,627.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="722.0" y="670.0" width="121" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="782.5" y="690.0" fill="#374151">impact edge</text>
+<path d="M990.0,435.0 L990.0,555.0" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="902.0" y="475.0" width="176" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="990.0" y="495.0" fill="#374151">artifact lineage</text>
+<path d="M700.0,547.5 L1260.0,312.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="925.0" y="410.0" width="110" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="980.0" y="430.0" fill="#374151">PreToolUse</text>
+<path d="M1385.0,365.0 L1385.0,455.0" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="1346.5" y="390.0" width="77" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="1385.0" y="410.0" fill="#374151">finding</text>
+<path d="M1260.0,312.5 L305.0,190.0" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="738.5" y="231.2" width="88" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="782.5" y="251.2" fill="#374151">decision</text>
+<path d="M1385.0,575.0 L1385.0,665.0" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="1341.0" y="600.0" width="88" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="1385.0" y="620.0" fill="#374151">rendered</text>
+<path d="M1115.0,627.5 L1260.0,727.5" fill="none" stroke="#374151" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="1149.0" y="657.5" width="77" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="1187.5" y="677.5" fill="#374151">queried</text>
+<rect x="60" y="805" width="22" height="22" rx="5" fill="#dbeafe" stroke="#203040" stroke-width="1"/>
+<text class="tiny" x="94" y="823">Capture inputs</text>
+<rect x="60" y="839" width="22" height="22" rx="5" fill="#dcfce7" stroke="#203040" stroke-width="1"/>
+<text class="tiny" x="94" y="857">Intent / impact tables</text>
+<rect x="60" y="873" width="22" height="22" rx="5" fill="#fef3c7" stroke="#203040" stroke-width="1"/>
+<text class="tiny" x="94" y="891">Durable object table</text>
+<rect x="60" y="907" width="22" height="22" rx="5" fill="#ede9fe" stroke="#203040" stroke-width="1"/>
+<text class="tiny" x="94" y="925">Lineage graph</text>
+<rect x="60" y="941" width="22" height="22" rx="5" fill="#fee2e2" stroke="#203040" stroke-width="1"/>
+<text class="tiny" x="94" y="959">Policy and alerts</text>
+<rect x="60" y="975" width="22" height="22" rx="5" fill="#e0f2fe" stroke="#203040" stroke-width="1"/>
+<text class="tiny" x="94" y="993">Retrieval surfaces</text>
+</svg>

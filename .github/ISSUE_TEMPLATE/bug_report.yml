@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible problem in Gensee Crate.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do not include secrets, private telemetry, or exploit details for security vulnerabilities. Use SECURITY.md for sensitive reports.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Include commands, config, and a minimal example when possible.
+      placeholder: |
+        1. Run ...
+        2. Configure ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: "v0.1.0 or git commit"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - Policy engine
+        - Claude Code integration
+        - Dashboard
+        - Storage / SQLite
+        - macOS runtime
+        - Documentation
+        - Other
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact paths, commands, tokens, credentials, and private telemetry before posting.
+      render: shell

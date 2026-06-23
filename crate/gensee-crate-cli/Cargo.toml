@@ -1,0 +1,26 @@
+[package]
+name = "gensee-crate-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gensee"
+path = "src/main.rs"
+
+[features]
+# Off by default: production `cargo build` compiles none of the bench harness.
+# `bench` adds the `gensee bench` subcommand + in-process driver (the e2e path
+# runs the production pipeline unmodified). `bench-breakdown` is reserved for
+# finer intra-evaluate phase markers and implies `bench`.
+bench = []
+bench-breakdown = ["bench"]
+
+[dependencies]
+gensee-crate-attribution = { path = "../gensee-crate-attribution" }
+gensee-crate-core = { path = "../gensee-crate-core" }
+gensee-crate-rules = { path = "../gensee-crate-rules" }
+gensee-crate-store = { path = "../gensee-crate-store" }
+serde_json = { workspace = true }
+sha2 = "0.10"

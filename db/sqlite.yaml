@@ -1,0 +1,65 @@
+sqlite:
+  # WARNING: populate_agent_events.py deletes and recreates whatever file
+  # this points at (plus its -wal/-shm sidecars). Never point this at a
+  # production or otherwise important database before running that script.
+  path: ./gensee-crate.db
+
+  # How SQLite manages transaction journals.
+  # Options: delete | truncate | persist | memory | wal | off
+  #   wal    — write-ahead log; fastest, safe under concurrent reads/writes (recommended)
+  #   delete — default; rollback journal deleted after each transaction
+  #   memory — journal kept in memory only; fastest but unsafe on crash
+  journal_mode: wal
+
+  # How aggressively SQLite flushes writes to disk.
+  # Options: off | normal | full | extra
+  #   normal — syncs at critical moments; safe with wal, good balance of speed and durability
+  #   full   — syncs after every transaction; safest, slowest
+  #   off    — never syncs; fastest, data loss possible on crash
+  synchronous: full
+
+  # Whether SQLite reclaims unused pages automatically.
+  # Options: none | full | incremental
+  #   full        — reclaims pages on every commit; keeps file size minimal
+  #   incremental — reclaims pages on demand via PRAGMA incremental_vacuum
+  #   none        — never reclaims; file only grows until VACUUM is run manually
+  auto_vacuum: full
+
+  # Share page and schema cache across all connections to the same database.
+  # Options: true | false
+  #   true  — reduces memory and I/O when multiple connections open the same file
+  #   false — each connection maintains its own independent cache; recommended for
+  #           a single-writer embedded DB (shared cache + WAL can cause locking
+  #           surprises and is discouraged by SQLite for new code)
+  shared_cache: false
+
+bench:
+  # Which tables to benchmark inserts against. All tables in db/schema.sql are
+  # created regardless; this list controls which ones get insert/row benchmarks.
+  # Options: sessions | requests | agent_events | system_events
+  tables:
+    - sessions
+    - requests
+    - agent_events
+    - system_events
+
+  # Which read queries to benchmark (see queries.sql for the SQL).
+  # Options: request_agent_events | request_system_events
+  queries:
+    - request_agent_events
+    - request_system_events
+
+  # Which evaluations to run.
+  # Options: latency | throughput | query_latency | query_latency_cold | query_throughput
+  #   latency            — CDF of single-request insert latency (db/output/latency.png)
+  #   throughput         — Poisson arrival simulation, completed inserts/s (db/output/throughput.png)
+  #   query_latency      — CDF of single-query latency, warm cache (db/output/query_latency.png)
+  #   query_latency_cold — same, but PRAGMA shrink_memory drops SQLite's page
+  #                        cache before every query (db/output/query_latency_cold.png)
+  #   query_throughput   — Poisson arrival simulation, completed queries/s (db/output/query_throughput.png)
+  evaluations:
+    - latency
+    - throughput
+    - query_latency
+    - query_latency_cold
+    - query_throughput

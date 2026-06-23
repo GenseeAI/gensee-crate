@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - open-source-prep
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Build workspace
+        run: cargo check --workspace --all-targets
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace
+
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboards/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check dashboard JavaScript
+        run: npm run check

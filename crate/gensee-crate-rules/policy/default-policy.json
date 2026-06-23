@@ -1,0 +1,465 @@
+{
+  "schema_version": 1,
+  "version": "2026-06-13",
+  "description": "Gensee Crate default policy for coding agents on a single endpoint. Use `gensee policy` or the local dashboard to set and view policy settings.",
+
+  "source_file_extensions": [
+    "c", "cc", "cpp", "css", "go", "h", "hpp", "java", "js", "jsx",
+    "kt", "m", "mm", "py", "rb", "rs", "scss", "sh", "swift", "ts", "tsx"
+  ],
+  "wildcard_chars": ["*", "?", "["],
+
+  "operations": {
+    "read": ["read", "copy_source"],
+    "destructive": ["delete", "unlink", "remove"],
+    "metadata": [
+      "metadata", "chmod", "chown", "chgrp",
+      "setmode", "setowner", "setflags", "setacl", "setextattr", "deleteextattr"
+    ],
+    "mutating_extra": ["write", "create", "copy_dest", "edit", "multi_edit", "metadata"]
+  },
+
+  "secret_paths": {
+    "rule_id": "policy_sensitive_file_access",
+    "protected": {
+      "action": "block",
+      "severity": "critical",
+      "message_read": "Protected secret read: {path}",
+      "message_mutate": "Protected secret mutation: {path}",
+      "segments": [".ssh", ".aws", ".azure", ".gnupg", ".kube", ".docker"],
+      "filenames": [
+        ".npmrc", ".netrc", ".pypirc", ".env",
+        "id_rsa", "id_ed25519", ".git-credentials",
+        ".bash_history", ".zsh_history", ".pgpass", ".my.cnf"
+      ],
+      "filename_prefixes": [".env."],
+      "filename_suffixes": [],
+      "filename_contains": ["private_key"],
+      "path_suffixes": ["/gh/hosts.yml", "/docker/config.json", "/kube/config"],
+      "exact_paths": ["/etc/shadow", "/etc/gshadow", "/etc/master.passwd", "/etc/sudoers", "/etc/passwd",
+        "/var/run/secrets/kubernetes.io/serviceaccount/token", "/run/secrets/kubernetes.io/serviceaccount/token"],
+      "path_contains": ["/.config/gcloud/", "/.config/gh/"],
+      "allow_filename_suffixes": [".example", ".sample", ".template"]
+    },
+    "credential_hint": {
+      "action": "ask",
+      "severity": "medium",
+      "message": "Credential-like file path access: {path}",
+      "filename_words": ["token", "tokens", "secret", "secrets", "credential", "credentials"]
+    }
+  },
+
+  "persistence_writes": {
+    "rule_id": "policy_persistence_write",
+    "action": "ask",
+    "severity": "medium",
+    "message": "Persistence/startup file write: {path}",
+    "segments": [],
+    "filenames": [
+      ".bashrc", ".zshrc", ".profile", ".gitconfig",
+      "crontab"
+    ],
+    "filename_prefixes": [],
+    "filename_suffixes": [],
+    "filename_contains": [],
+    "path_suffixes": ["/.vscode/tasks.json"],
+    "path_contains": [
+      "/.git/hooks/",
+      "/library/launchagents/",
+      "/library/launchdaemons/",
+      "/.config/autostart/",
+      "/.claude/plugins/",
+      "/.claude/skills/",
+      "/.codex/plugins/",
+      "/.codex/skills/"
+    ]
+  },
+
+  "artifact_registries": {
+    "executable": {
+      "segments": [],
+      "filenames": ["makefile"],
+      "filename_prefixes": [],
+      "filename_suffixes": [
+        ".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".rb", ".pl"
+      ],
+      "filename_contains": [],
+      "path_suffixes": [],
+      "path_contains": [
+        "/.git/hooks/",
+        "/.claude/plugins/",
+        "/.claude/skills/",
+        "/.codex/plugins/",
+        "/.codex/skills/"
+      ]
+    },
+    "memory": {
+      "segments": [],
+      "filenames": ["memory.md", "soul.md", "claude.md", "agents.md"],
+      "filename_prefixes": [],
+      "filename_suffixes": [],
+      "filename_contains": [],
+      "path_suffixes": [],
+      "path_contains": []
+    },
+    "skill": {
+      "segments": [],
+      "filenames": [],
+      "filename_prefixes": [],
+      "filename_suffixes": [],
+      "filename_contains": [],
+      "path_suffixes": [],
+      "path_contains": [
+        "/.claude/skills/",
+        "/.codex/skills/",
+        "/.claude/plugins/",
+        "/.codex/plugins/"
+      ]
+    },
+    "control_plane": {
+      "segments": [],
+      "filenames": [],
+      "filename_prefixes": [],
+      "filename_suffixes": [],
+      "filename_contains": [],
+      "path_suffixes": ["/.gensee/gensee.db"],
+      "path_contains": ["/gensee-crate-rules/policy/default-policy.json"]
+    }
+  },
+
+  "content_rules": [
+    {
+      "id": "credential-file-read",
+      "rule_id": "policy_dangerous_executable_content",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executable artifact reads protected credentials: {match}",
+      "applies_to": ["executable"],
+      "patterns": ["cat ~/.ssh/id_rsa", "cat ~/.ssh/id_ed25519", "cat ~/.aws/credentials", "cat /etc/shadow"]
+    },
+    {
+      "id": "reverse-shell",
+      "rule_id": "policy_dangerous_executable_content",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executable artifact contains reverse-shell behavior: {match}",
+      "applies_to": ["executable"],
+      "patterns": ["/dev/tcp/", "bash -i >&", "nc -e ", "ncat -e "]
+    },
+    {
+      "id": "resource-overload",
+      "rule_id": "policy_dangerous_executable_content",
+      "action": "block",
+      "severity": "high",
+      "message": "Executable artifact contains resource-overload behavior: {match}",
+      "applies_to": ["executable"],
+      "patterns": [":(){", "fork bomb", "while true; do", "yes >"]
+    },
+    {
+      "id": "memory-integrity",
+      "rule_id": "policy_memory_integrity",
+      "action": "ask",
+      "severity": "medium",
+      "message": "Memory artifact contains policy-altering instruction: {match}",
+      "applies_to": ["memory"],
+      "patterns": [
+        "ignore safety",
+        "ignore security",
+        "skip confirmation",
+        "skip approval",
+        "no approval needed",
+        "without asking",
+        "always forward",
+        "automatically forward",
+        "whenever user asks",
+        "whenever the user asks",
+        "also send",
+        "also run",
+        "disable gensee",
+        "disable gensee-crate",
+        "bypass gensee",
+        "bypass policy"
+      ]
+    },
+    {
+      "id": "skill-integrity",
+      "rule_id": "policy_skill_integrity",
+      "action": "ask",
+      "severity": "medium",
+      "message": "Skill/plugin manifest contains policy-altering or covert instruction: {match}",
+      "applies_to": ["skill"],
+      "patterns": [
+        "ignore safety",
+        "ignore security",
+        "ignore previous instructions",
+        "skip confirmation",
+        "skip approval",
+        "no approval needed",
+        "without asking",
+        "without telling the user",
+        "without informing the user",
+        "do not tell the user",
+        "do not mention",
+        "always forward",
+        "automatically forward",
+        "also send",
+        "also run",
+        "exfiltrate",
+        "send all files",
+        "upload all",
+        "disable gensee",
+        "disable gensee-crate",
+        "bypass gensee",
+        "bypass policy"
+      ]
+    },
+    {
+      "id": "exec-recon-hostname-beacon",
+      "rule_id": "policy_skill_supply_chain_exec",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executed script beacons system identity to a remote host: {match}",
+      "applies_to": ["executable"],
+      "patterns": [],
+      "all_of": ["curl", "$hostname"]
+    },
+    {
+      "id": "exec-recon-whoami-beacon",
+      "rule_id": "policy_skill_supply_chain_exec",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executed script exfiltrates command output to a remote host: {match}",
+      "applies_to": ["executable"],
+      "patterns": [],
+      "all_of": ["curl", "$(whoami)"]
+    },
+    {
+      "id": "exec-fetch-pipe-curl-sh",
+      "rule_id": "policy_skill_supply_chain_exec",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executed script pipes a remote download into a shell: {match}",
+      "applies_to": ["executable"],
+      "patterns": [],
+      "all_of": ["curl", "|sh"]
+    },
+    {
+      "id": "exec-fetch-pipe-curl-bash",
+      "rule_id": "policy_skill_supply_chain_exec",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executed script pipes a remote download into a shell: {match}",
+      "applies_to": ["executable"],
+      "patterns": [],
+      "all_of": ["curl", "|bash"]
+    },
+    {
+      "id": "exec-fetch-pipe-wget-sh",
+      "rule_id": "policy_skill_supply_chain_exec",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executed script pipes a remote download into a shell: {match}",
+      "applies_to": ["executable"],
+      "patterns": [],
+      "all_of": ["wget", "|sh"]
+    },
+    {
+      "id": "exec-git-hook-exfil",
+      "rule_id": "policy_skill_supply_chain_exec",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executed script installs a git hook that contacts a remote host: {match}",
+      "applies_to": ["executable"],
+      "patterns": [],
+      "all_of": [".git/hooks/", "http"]
+    },
+    {
+      "id": "exec-rc-backdoor-bashrc",
+      "rule_id": "policy_skill_supply_chain_exec",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executed script plants a network call in a shell profile (.bashrc): {match}",
+      "applies_to": ["executable"],
+      "patterns": [],
+      "all_of": [".bashrc", "curl"]
+    },
+    {
+      "id": "exec-rc-backdoor-zshrc",
+      "rule_id": "policy_skill_supply_chain_exec",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executed script plants a network call in a shell profile (.zshrc): {match}",
+      "applies_to": ["executable"],
+      "patterns": [],
+      "all_of": [".zshrc", "curl"]
+    },
+    {
+      "id": "exec-rc-backdoor-profile",
+      "rule_id": "policy_skill_supply_chain_exec",
+      "action": "block",
+      "severity": "critical",
+      "message": "Executed script plants a network call in a shell profile (.profile): {match}",
+      "applies_to": ["executable"],
+      "patterns": [],
+      "all_of": [".profile", "curl"]
+    }
+  ],
+
+  "categories": {
+    "destructive": {
+      "rule_id": "policy_destructive_file_operation",
+      "action": "block",
+      "severity": "high",
+      "message": "Destructive file operation: {path}"
+    },
+    "write_outside_workspace": {
+      "rule_id": "policy_write_outside_workspace",
+      "action": "ask",
+      "severity": "high",
+      "message": "Write outside workspace: {path}"
+    },
+    "metadata": {
+      "rule_id": "policy_metadata_file_operation",
+      "action": "ask",
+      "severity": "medium",
+      "message": "Permission or ownership change: {path}"
+    },
+    "wildcard": {
+      "rule_id": "policy_wildcard_file_path",
+      "action": "ask",
+      "severity": "medium",
+      "message": "Wildcard file path: {path}"
+    },
+    "control_plane": {
+      "rule_id": "policy_control_plane_write",
+      "action": "block",
+      "severity": "critical",
+      "message": "Blocked write to Gensee control-plane path: {path}"
+    }
+  },
+
+  "url_rules": [
+    {
+      "id": "cloud-metadata-endpoints",
+      "rule_id": "policy_blocked_url",
+      "action": "block",
+      "severity": "high",
+      "message": "Blocked request to cloud metadata endpoint: {match}",
+      "host_substrings": ["169.254.169.254", "100.100.100.200", "metadata.google.internal"]
+    }
+  ],
+
+  "command_rules": [
+    {
+      "id": "environment-dump",
+      "rule_id": "policy_environment_dump",
+      "action": "ask",
+      "severity": "medium",
+      "message": "Ask before dumping environment variables ({match}); secrets may be exfiltrated",
+      "commands": ["printenv"],
+      "bare_commands": ["env"]
+    },
+    {
+      "id": "fork-bomb",
+      "rule_id": "policy_fork_bomb",
+      "action": "block",
+      "severity": "critical",
+      "message": "Blocked fork-bomb pattern in command",
+      "raw_all": [":(){", ":|:"]
+    },
+    {
+      "id": "firewall-flush",
+      "rule_id": "policy_firewall_disable",
+      "action": "block",
+      "severity": "high",
+      "message": "Blocked firewall flush/disable ({match})",
+      "commands": ["iptables", "ip6tables", "nft", "pfctl", "ufw", "socketfilterfw", "firewall-cmd"],
+      "arg_any": ["-F", "--flush", "-X", "-d", "disable", "--setglobalstate", "off"]
+    },
+    {
+      "id": "firewall-accept-all",
+      "rule_id": "policy_firewall_disable",
+      "action": "block",
+      "severity": "high",
+      "message": "Blocked firewall default-policy set to ACCEPT ({match})",
+      "commands": ["iptables", "ip6tables"],
+      "arg_all": ["-P", "ACCEPT"]
+    },
+    {
+      "id": "kill-all-processes",
+      "rule_id": "policy_kill_all_processes",
+      "action": "block",
+      "severity": "high",
+      "message": "Blocked attempt to SIGKILL all processes ({match} -9 -1)",
+      "commands": ["kill"],
+      "arg_all": ["-9", "-1"]
+    },
+    {
+      "id": "broad-process-kill",
+      "rule_id": "policy_broad_process_kill",
+      "action": "ask",
+      "severity": "medium",
+      "message": "Ask before broad process termination ({match})",
+      "commands": ["pkill", "killall"]
+    },
+    {
+      "id": "filesystem-immutability",
+      "rule_id": "policy_filesystem_immutability",
+      "action": "ask",
+      "severity": "medium",
+      "message": "Ask before changing file immutability flags ({match}); may lock files or hide tampering",
+      "commands": ["chattr"],
+      "arg_any": ["+i", "-i", "+a", "-a"]
+    },
+    {
+      "id": "privilege-escalation",
+      "rule_id": "policy_privilege_escalation",
+      "action": "ask",
+      "severity": "medium",
+      "message": "Ask before privilege escalation ({match})",
+      "commands": ["sudo", "doas"]
+    },
+    {
+      "id": "container-privileged",
+      "rule_id": "policy_container_privileged",
+      "action": "ask",
+      "severity": "high",
+      "message": "Ask before launching a privileged container ({match} run --privileged)",
+      "commands": ["docker", "podman"],
+      "arg_all": ["run", "--privileged"]
+    },
+    {
+      "id": "dns-tamper",
+      "rule_id": "policy_dns_tamper",
+      "action": "ask",
+      "severity": "medium",
+      "message": "Ask before changing DNS resolver configuration ({match})",
+      "commands": ["networksetup"],
+      "arg_any": ["-setdnsservers"]
+    }
+  ],
+  "resource_governance": {
+    "max_read_bytes": 10485760,
+    "max_file_subjects_per_tool": 50,
+    "max_shell_segments_per_tool": 25,
+    "max_tool_calls_per_session": 500,
+    "max_network_egress_per_session": 100,
+    "max_file_accessed_rate_per_min": 120.0,
+    "max_network_rate_per_min": 30.0
+  },
+  "egress": {
+    "allow_hosts": [],
+    "proxy_url": null,
+    "require_proxy": false
+  },
+  "runtime": {
+    "max_runtime_seconds": null
+  },
+  "enforcement": {
+    "noninteractive": false
+  },
+  "watch": {
+    "system_events": "eslogger"
+  },
+  "allow_path_prefixes": []
+}

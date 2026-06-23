@@ -1,0 +1,7 @@
+{
+  "session_id": "codex-smoke",
+  "hook_event_name": "PermissionRequest",
+  "cwd": "__CWD__",
+  "command": "cat ~/.ssh/config",
+  "available_decisions": ["allow", "deny"]
+}

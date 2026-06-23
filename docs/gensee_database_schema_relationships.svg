@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+<defs>
+<marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+<path d="M0,0 L0,6 L9,3 z" fill="#374151"/>
+</marker>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;fill:#111827}.small{font-size:20px;fill:#374151}.tiny{font-size:16px;fill:#4b5563}.boxtext{font-size:20px}.title{font-size:34px;font-weight:700}.note{font-size:21px;fill:#374151}</style>
+</defs>
+<rect width="1600" height="900" fill="white"/>
+<text class="title" x="48" y="62">Gensee Database Design: Tables and Relationships</text>
+<rect x="90" y="165" width="315" height="120" rx="14" fill="#eef2ff" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="247.5" y="197.0" font-weight="700">sessions</text>
+<text class="boxtext" text-anchor="middle" x="247.5" y="225.0">PK session_id</text>
+<text class="boxtext" text-anchor="middle" x="247.5" y="253.0">agent_id, first/last_event_at</text>
+<rect x="640" y="155" width="315" height="140" rx="14" fill="#eef2ff" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="797.5" y="183.0" font-weight="700">requests</text>
+<text class="boxtext" text-anchor="middle" x="797.5" y="211.0">PK request_id</text>
+<text class="boxtext" text-anchor="middle" x="797.5" y="239.0">FK session_id</text>
+<text class="boxtext" text-anchor="middle" x="797.5" y="267.0">prompt, final_response</text>
+<rect x="365" y="405" width="315" height="140" rx="14" fill="#eef2ff" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="522.5" y="433.0" font-weight="700">agent_events</text>
+<text class="boxtext" text-anchor="middle" x="522.5" y="461.0">PK event_id</text>
+<text class="boxtext" text-anchor="middle" x="522.5" y="489.0">FK request_id</text>
+<text class="boxtext" text-anchor="middle" x="522.5" y="517.0">tool JSON</text>
+<rect x="900" y="405" width="315" height="140" rx="14" fill="#eef2ff" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="1057.5" y="433.0" font-weight="700">system_events</text>
+<text class="boxtext" text-anchor="middle" x="1057.5" y="461.0">PK event_id</text>
+<text class="boxtext" text-anchor="middle" x="1057.5" y="489.0">FK request_id</text>
+<text class="boxtext" text-anchor="middle" x="1057.5" y="517.0">args JSON</text>
+<rect x="90" y="665" width="315" height="145" rx="14" fill="#fef3c7" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="247.5" y="695.5" font-weight="700">artifacts</text>
+<text class="boxtext" text-anchor="middle" x="247.5" y="723.5">PK artifact_id</text>
+<text class="boxtext" text-anchor="middle" x="247.5" y="751.5">UNIQUE kind, uri, digest</text>
+<text class="boxtext" text-anchor="middle" x="247.5" y="779.5">metadata JSON</text>
+<rect x="640" y="650" width="355" height="170" rx="14" fill="#fef3c7" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="817.5" y="693.0" font-weight="700">relations</text>
+<text class="boxtext" text-anchor="middle" x="817.5" y="721.0">src_kind/src_id -&gt; dst_kind/dst_id</text>
+<text class="boxtext" text-anchor="middle" x="817.5" y="749.0">relation_type + confidence</text>
+<text class="boxtext" text-anchor="middle" x="817.5" y="777.0">JSON evidence</text>
+<rect x="1190" y="650" width="315" height="170" rx="14" fill="#fee2e2" stroke="#203040" stroke-width="2"/>
+<text class="boxtext" text-anchor="middle" x="1347.5" y="693.0" font-weight="700">alerts</text>
+<text class="boxtext" text-anchor="middle" x="1347.5" y="721.0">request_id optional entity ref</text>
+<text class="boxtext" text-anchor="middle" x="1347.5" y="749.0">severity/action/rule_id</text>
+<text class="boxtext" text-anchor="middle" x="1347.5" y="777.0">path + evidence JSON</text>
+<text class="note" x="90" y="112">Ownership is direct: sessions -&gt; requests -&gt; events. Relations are reserved for lineage and causality.</text>
+<path d="M405.0,225.0 L640.0,225.0" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="487.5" y="205.0" width="70" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="522.5" y="225.0" fill="#2563eb">1:N</text>
+<path d="M797.5,295.0 L522.5,405.0" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="625.0" y="330.0" width="70" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="660.0" y="350.0" fill="#2563eb">1:N</text>
+<path d="M797.5,295.0 L1057.5,405.0" fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="892.5" y="330.0" width="70" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="927.5" y="350.0" fill="#2563eb">1:N</text>
+<path d="M955.0,225.0 Q1151.2,517.5 1347.5,650.0" fill="none" stroke="#dc2626" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="1116.2" y="457.5" width="70" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="1151.2" y="477.5" fill="#dc2626">0:N</text>
+<path d="M797.5,295.0 L817.5,650.0" fill="none" stroke="#7c3aed" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="763.5" y="452.5" width="88" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="807.5" y="472.5" fill="#7c3aed">node ref</text>
+<path d="M522.5,545.0 L640.0,735.0" fill="none" stroke="#7c3aed" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="537.2" y="620.0" width="88" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="581.2" y="640.0" fill="#7c3aed">node ref</text>
+<path d="M1057.5,545.0 L817.5,650.0" fill="none" stroke="#7c3aed" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="893.5" y="577.5" width="88" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="937.5" y="597.5" fill="#7c3aed">node ref</text>
+<path d="M405.0,737.5 L640.0,735.0" fill="none" stroke="#7c3aed" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="478.5" y="716.2" width="88" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="522.5" y="736.2" fill="#7c3aed">node ref</text>
+<path d="M1190.0,735.0 Q935.0,530.0 680.0,475.0" fill="none" stroke="#dc2626" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="852.5" y="547.5" width="165" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="935.0" y="567.5" fill="#dc2626">optional entity</text>
+<path d="M1190.0,735.0 Q1202.5,675.0 1215.0,475.0" fill="none" stroke="#dc2626" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="1120.0" y="620.0" width="165" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="1202.5" y="640.0" fill="#dc2626">optional entity</text>
+<path d="M1190.0,735.0 Q797.5,846.2 405.0,737.5" fill="none" stroke="#dc2626" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="715.0" y="771.2" width="165" height="28" rx="8" fill="white" opacity="0.9"/>
+<text class="tiny" text-anchor="middle" x="797.5" y="791.2" fill="#dc2626">optional entity</text>
+<text class="small" x="90" y="855">Known limit: artifacts usually dedupe by path today because digest is often empty, so content versions are not yet distinct.</text>
+</svg>

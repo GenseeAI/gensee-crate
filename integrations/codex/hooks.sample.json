@@ -1,0 +1,69 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GENSEE_HOME=/absolute/gensee-home /absolute/path/to/gensee hook codex",
+            "statusMessage": "Checking Gensee policy",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GENSEE_HOME=/absolute/gensee-home /absolute/path/to/gensee hook codex",
+            "statusMessage": "Checking Gensee policy",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GENSEE_HOME=/absolute/gensee-home /absolute/path/to/gensee hook codex",
+            "statusMessage": "Checking Gensee policy",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GENSEE_HOME=/absolute/gensee-home /absolute/path/to/gensee hook codex",
+            "statusMessage": "Checking Gensee policy",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GENSEE_HOME=/absolute/gensee-home /absolute/path/to/gensee hook codex",
+            "statusMessage": "Checking Gensee policy",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

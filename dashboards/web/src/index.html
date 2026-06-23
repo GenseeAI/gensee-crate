@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Gensee Crate Dashboard</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Dashboard navigation">
+        <div class="brand">
+          <div class="brand-mark">
+            <img src="./eye-only.png" alt="Gensee" />
+          </div>
+          <div>
+            <p class="eyebrow">GenseeAI</p>
+            <h1>Gensee Crate</h1>
+          </div>
+        </div>
+
+        <nav class="nav-list" aria-label="Primary">
+          <button class="nav-item active" type="button" data-view="activity" aria-current="page">
+            Activity
+          </button>
+          <button class="nav-item" type="button" data-view="lineage">
+            Lineage
+          </button>
+          <button class="nav-item" type="button" data-view="provenance">
+            Multi-turn
+          </button>
+          <button class="nav-item" type="button" data-view="policy">
+            Policy
+          </button>
+        </nav>
+
+        <div class="endpoint">
+          <div class="endpoint-row">
+            <span class="status-dot online" id="endpoint-status" aria-hidden="true"></span>
+            <span id="endpoint-name">Local endpoint</span>
+          </div>
+          <p id="endpoint-cwd">Waiting for session data</p>
+          <p id="endpoint-store">Local store: ~/.gensee</p>
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <section class="view active" id="view-activity" aria-labelledby="activity-title">
+          <div class="view-heading activity-heading">
+            <h3 id="activity-title">System Activity</h3>
+            <div class="activity-controls">
+              <div class="filter-row" role="group" aria-label="Filter by decision">
+                <button class="filter selected" type="button" data-filter="all">All</button>
+                <button class="filter" type="button" data-filter="allow">Allow</button>
+                <button class="filter" type="button" data-filter="ask">Ask</button>
+                <button class="filter" type="button" data-filter="warn">Warn</button>
+                <button class="filter" type="button" data-filter="deny">Deny</button>
+              </div>
+              <div class="range-controls">
+                <div class="segmented" role="group" aria-label="Time range">
+                  <button type="button" class="selected" data-range="live">Live</button>
+                  <button type="button" data-range="1h">1h</button>
+                  <button type="button" data-range="24h">24h</button>
+                  <button type="button" data-range="custom" id="range-custom">Custom</button>
+                </div>
+                <div class="custom-range" id="custom-range" hidden>
+                  <label class="sr-only" for="range-from">From</label>
+                  <input type="text" id="range-from" inputmode="text" placeholder="Start, e.g. 06/23/2026, 07:30 AM" />
+                  <span aria-hidden="true">&rarr;</span>
+                  <label class="sr-only" for="range-to">To</label>
+                  <input type="text" id="range-to" inputmode="text" placeholder="End, e.g. 06/23/2026, 11:00 AM" />
+                  <button class="secondary-action" type="button" id="range-apply">Apply</button>
+                </div>
+                <p class="range-status" id="range-status">Showing all loaded events</p>
+              </div>
+            </div>
+          </div>
+
+          <section class="kpi-strip" aria-label="Decision summary">
+            <div class="kpi-tile total">
+              <span class="kpi-label">Events</span>
+              <strong class="kpi-value" id="event-total">0</strong>
+            </div>
+            <div class="kpi-tile allow">
+              <span class="kpi-label">Allowed</span>
+              <strong class="kpi-value" id="allow-count">0</strong>
+            </div>
+            <div class="kpi-tile ask">
+              <span class="kpi-label">Needs review</span>
+              <strong class="kpi-value" id="ask-count">0</strong>
+            </div>
+            <div class="kpi-tile warn">
+              <span class="kpi-label">Flagged</span>
+              <strong class="kpi-value" id="warn-count">0</strong>
+            </div>
+            <div class="kpi-tile deny">
+              <span class="kpi-label">Denied</span>
+              <strong class="kpi-value" id="deny-count">0</strong>
+            </div>
+            <div class="kpi-ratio">
+              <div class="ratio-bar" role="img" aria-label="Decision distribution">
+                <span class="ratio-allow" id="ratio-allow"></span>
+                <span class="ratio-ask" id="ratio-ask"></span>
+                <span class="ratio-warn" id="ratio-warn"></span>
+                <span class="ratio-deny" id="ratio-deny"></span>
+              </div>
+              <div class="ratio-legend">
+                <span><i class="dot allow"></i>Allow</span>
+                <span><i class="dot ask"></i>Ask</span>
+                <span><i class="dot warn"></i>Warn</span>
+                <span><i class="dot deny"></i>Deny</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="events-chart-panel" aria-label="Events over time">
+            <div class="chart-head">
+              <h4>Events over time</h4>
+              <div class="chart-legend">
+                <span><i class="dot allow"></i>Allow</span>
+                <span><i class="dot ask"></i>Ask</span>
+                <span><i class="dot warn"></i>Warn</span>
+                <span><i class="dot deny"></i>Deny</span>
+                <span class="chart-bucket">Buckets</span>
+              </div>
+            </div>
+            <div class="events-chart" id="events-chart"></div>
+          </section>
+
+          <div class="activity-grid">
+            <ol class="timeline-list" id="timeline-list"></ol>
+
+            <div class="activity-side">
+              <aside class="timeline-inspector" aria-label="Event inspector">
+                <h4>Selected event</h4>
+                <p class="inspector-lede" id="timeline-selected-title">No event selected</p>
+                <dl>
+                  <div>
+                    <dt>Decision</dt>
+                    <dd id="inspect-decision">-</dd>
+                  </div>
+                  <div>
+                    <dt>Command</dt>
+                    <dd id="inspect-command" class="inspect-command">-</dd>
+                  </div>
+                  <div>
+                    <dt>In Claude Code</dt>
+                    <dd id="inspect-outcome">-</dd>
+                  </div>
+                  <div>
+                    <dt>Request</dt>
+                    <dd id="timeline-selected-request">-</dd>
+                  </div>
+                  <div>
+                    <dt>Artifact</dt>
+                    <dd id="timeline-selected-artifact">-</dd>
+                  </div>
+                  <div>
+                    <dt>Policy</dt>
+                    <dd id="timeline-selected-confidence">-</dd>
+                  </div>
+                </dl>
+
+                <div class="verdict-block" aria-label="Human review">
+                  <div class="verdict-head">
+                    <p class="verdict-title">Human review</p>
+                    <span class="verdict-current" id="verdict-current">Not reviewed</span>
+                  </div>
+                  <div class="verdict-actions" role="group" aria-label="Record verdict">
+                    <button type="button" class="verdict-btn agree" id="verdict-agree">Agree</button>
+                    <button type="button" class="verdict-btn allow" id="verdict-allow">Override &rarr; Allow</button>
+                    <button type="button" class="verdict-btn deny" id="verdict-deny">Override &rarr; Deny</button>
+                  </div>
+                  <input type="text" id="verdict-note" class="verdict-note" placeholder="Optional note (why?)" />
+                  <button type="button" class="text-button" id="verdict-clear">Clear verdict</button>
+                  <p class="verdict-hint">Recorded to the local store as labeled feedback (false-positive / false-negative) for policy tuning. Does not change the shield's past decision — that was already enforced inline by the agent.</p>
+                </div>
+
+                <button class="secondary-action" type="button" id="open-lineage">Open lineage</button>
+              </aside>
+
+              <section class="surface-panel" aria-labelledby="surface-title">
+                <div class="panel-title">
+                  <h4 id="surface-title">Watched surfaces</h4>
+                  <span id="surfaces-active">0 active</span>
+                </div>
+                <div class="surface-list" id="surface-list"></div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-lineage" aria-labelledby="lineage-title">
+          <div class="view-heading">
+            <div>
+              <p class="eyebrow">Lineage</p>
+              <h3 id="lineage-title">Artifact provenance graph</h3>
+            </div>
+            <label class="search-box">
+              <span class="sr-only">Search artifact</span>
+              <input type="search" id="lineage-search" placeholder="Search artifact URI" />
+            </label>
+          </div>
+
+          <div class="lineage-grid">
+            <section class="graph-panel" aria-label="Lineage graph">
+              <svg class="lineage-graph" viewBox="0 0 820 440" role="img" aria-labelledby="graph-title graph-desc">
+                <title id="graph-title">Lineage graph</title>
+                <desc id="graph-desc">Recent artifact facts from the local Gensee store.</desc>
+                <g id="lineage-graph-content"></g>
+              </svg>
+            </section>
+
+            <aside class="fact-panel" aria-label="Artifact facts">
+              <h4>Artifact facts</h4>
+              <dl>
+                <div>
+                  <dt>URI</dt>
+                  <dd id="fact-uri">-</dd>
+                </div>
+                <div>
+                  <dt>Last modifier</dt>
+                  <dd id="fact-modifier">-</dd>
+                </div>
+                <div>
+                  <dt>Registry</dt>
+                  <dd id="fact-registry">-</dd>
+                </div>
+                <div>
+                  <dt>Current risk</dt>
+                  <dd id="fact-risk">-</dd>
+                </div>
+              </dl>
+              <div class="fact-actions">
+                <button class="secondary-action" type="button" id="show-sql">Show SQL</button>
+                <button class="secondary-action" type="button" id="copy-uri">Copy URI</button>
+              </div>
+              <pre class="sql-panel" id="sql-panel" hidden></pre>
+            </aside>
+          </div>
+
+        </section>
+
+        <section class="view" id="view-provenance" aria-labelledby="provenance-title">
+          <div class="view-heading">
+            <div>
+              <p class="eyebrow">Long-horizon provenance</p>
+              <h3 id="provenance-title">Multi-turn provenance</h3>
+            </div>
+          </div>
+          <p class="mtp-lede">
+            Attack patterns the per-event views miss, placed on a time axis: a
+            read&nbsp;&rarr;&nbsp;exfil or memory-poison sequence within one
+            session, and the same artifact targeted across runs. Each box is one
+            decision; its position is its clock time.
+          </p>
+          <div class="mtp-timeline" id="mtp-timeline"></div>
+        </section>
+
+        <section class="view" id="view-policy" aria-labelledby="policy-title">
+          <div class="view-heading">
+            <div>
+              <p class="eyebrow">Policy</p>
+              <h3 id="policy-title">Policy settings</h3>
+            </div>
+            <div class="policy-doc-actions">
+              <button class="secondary-action" type="button" id="policy-settings-reload">Reload</button>
+              <button class="primary-action" type="button" id="policy-settings-save">Save settings</button>
+            </div>
+          </div>
+          <p class="policy-doc-hint">
+            <span id="policy-doc-source">Loading…</span> — settings write to
+            $GENSEE_HOME/policy.json; the shield re-validates and fails closed if a
+            change is invalid. Rule lists (secret paths, command rules, …) are
+            edited as raw JSON in Advanced below.
+          </p>
+          <p class="policy-doc-status" id="policy-settings-status" role="status" aria-live="polite"></p>
+
+          <div class="policy-settings" id="policy-settings"></div>
+          <div class="policy-artifacts" id="policy-artifacts"></div>
+          <div class="policy-rules" id="policy-rules"></div>
+
+          <details class="policy-doc-panel" id="policy-advanced">
+            <summary>Advanced — raw policy JSON</summary>
+            <div class="policy-doc-actions policy-doc-actions-inline">
+              <button class="secondary-action" type="button" id="policy-doc-reload">Reload</button>
+              <button class="primary-action" type="button" id="policy-doc-save">Save raw JSON</button>
+            </div>
+            <p class="policy-doc-hint">
+              The full live policy JSON. Editing here overrides the form above;
+              saved to the same file and auto-loaded on the next hook.
+            </p>
+            <textarea id="policy-doc-editor" class="policy-doc-editor" spellcheck="false" aria-label="Policy JSON"></textarea>
+            <p class="policy-doc-status" id="policy-doc-status" role="status" aria-live="polite"></p>
+          </details>
+        </section>
+
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    <script src="./app.js?v=20260623-seeded-range"></script>
+  </body>
+</html>

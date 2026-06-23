@@ -1,0 +1,10 @@
+{
+  "session_id": "codex-smoke",
+  "hook_event_name": "PreToolUse",
+  "cwd": "__CWD__",
+  "tool_name": "Bash",
+  "tool_use_id": "pretool-deny",
+  "tool_input": {
+    "command": "cat ~/.ssh/config"
+  }
+}

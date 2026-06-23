@@ -1,0 +1,13 @@
+[package]
+name = "gensee-crate-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gensee-crate-core = { path = "../gensee-crate-core" }
+
+[[bin]]
+name = "endpoint-spike"
+path = "src/bin/endpoint-spike.rs"

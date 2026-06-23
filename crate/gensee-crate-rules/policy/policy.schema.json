@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/GenseeAI/gensee-crate/policy.schema.json",
+  "title": "Gensee Crate policy document",
+  "description": "Schema for the gensee policy document (default-policy.json or $GENSEE_HOME/policy.json). Point your editor's JSON schema mapping at this file for validation + autocomplete. Authoritative validation is `gensee policy validate <file>`.",
+  "type": "object",
+  "required": ["schema_version", "operations", "secret_paths", "persistence_writes", "categories"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Must match the binary's supported version (1) or the document is rejected (fails closed)."
+    },
+    "version": { "type": "string", "description": "Human-readable revision tag, e.g. a date." },
+    "description": { "type": "string" },
+    "source_file_extensions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Extensions never treated as secrets (e.g. .rs, .ts)."
+    },
+    "wildcard_chars": { "type": "array", "items": { "type": "string" } },
+    "operations": {
+      "type": "object",
+      "description": "Operation-class membership: which file operations count as read / destructive / metadata / mutating.",
+      "additionalProperties": true,
+      "properties": {
+        "read": { "type": "array", "items": { "type": "string" } },
+        "destructive": { "type": "array", "items": { "type": "string" } },
+        "metadata": { "type": "array", "items": { "type": "string" } },
+        "mutating_extra": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "secret_paths": { "type": "object", "description": "Protected secret + credential-hint path matchers.", "additionalProperties": true },
+    "persistence_writes": { "type": "object", "description": "Persistence/startup file matcher (ask).", "additionalProperties": true },
+    "artifact_registries": { "type": "object", "additionalProperties": true },
+    "content_rules": {
+      "type": "array",
+      "description": "Substring/shape matchers over the content of an executed script.",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "categories": { "type": "object", "description": "Action/severity/message per finding category.", "additionalProperties": true },
+    "url_rules": {
+      "type": "array",
+      "description": "Host-matched URL rules (e.g. cloud metadata endpoints).",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "command_rules": {
+      "type": "array",
+      "description": "Token-boundary command matchers (fork bomb, firewall flush, sudo, ...).",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+
+    "resource_governance": {
+      "type": "object",
+      "description": "Resource caps (env override: GENSEE_MAX_*). Omitted fields use built-in defaults.",
+      "additionalProperties": false,
+      "properties": {
+        "max_read_bytes": { "type": "integer", "minimum": 1, "default": 10485760 },
+        "max_file_subjects_per_tool": { "type": "integer", "minimum": 1, "default": 50 },
+        "max_shell_segments_per_tool": { "type": "integer", "minimum": 1, "default": 25 },
+        "max_tool_calls_per_session": { "type": "integer", "minimum": 1, "default": 500 },
+        "max_network_egress_per_session": { "type": "integer", "minimum": 1, "default": 100 },
+        "max_file_accessed_rate_per_min": { "type": "number", "minimum": 0, "default": 120.0 },
+        "max_network_rate_per_min": { "type": "number", "minimum": 0, "default": 30.0 }
+      }
+    },
+    "egress": {
+      "type": "object",
+      "description": "Network egress controls (env override: GENSEE_EGRESS_ALLOW_HOSTS / GENSEE_EGRESS_PROXY_URL / GENSEE_REQUIRE_EGRESS_PROXY).",
+      "additionalProperties": false,
+      "properties": {
+        "allow_hosts": { "type": "array", "items": { "type": "string" }, "description": "Allowed egress hosts; empty = no host restriction." },
+        "proxy_url": { "type": ["string", "null"] },
+        "require_proxy": { "type": "boolean", "default": false }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "description": "Run-supervisor limits (env override: GENSEE_MAX_RUNTIME_SECONDS).",
+      "additionalProperties": false,
+      "properties": {
+        "max_runtime_seconds": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "enforcement": {
+      "type": "object",
+      "description": "Enforcement posture (env override: GENSEE_NONINTERACTIVE).",
+      "additionalProperties": false,
+      "properties": {
+        "noninteractive": { "type": "boolean", "default": false, "description": "When true, escalate medium+ `ask` findings to `deny` (fail closed with no operator)." }
+      }
+    },
+    "watch": {
+      "type": "object",
+      "description": "Sidecar watch defaults.",
+      "additionalProperties": false,
+      "properties": {
+        "system_events": {
+          "type": "string",
+          "enum": ["none", "eslogger"],
+          "default": "eslogger",
+          "description": "System-event backend started by `gensee watch` unless overridden with --system-events."
+        }
+      }
+    },
+    "allow_path_prefixes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Trusted path prefixes exempt from secret/persistence findings (env override: GENSEE_POLICY_ALLOW_PATH_PREFIXES)."
+    }
+  }
+}

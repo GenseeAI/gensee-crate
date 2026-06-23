@@ -1,0 +1,12 @@
+/target/
+/.gensee-dev/
+/.gensee-pdf-test/
+**/*.rs.bk
+/bench.db
+/db/output/
+/db/gensee-crate.db
+/db/gensee-crate.db-*
+__pycache__/
+
+# latency bench generated artifacts
+bench/results/

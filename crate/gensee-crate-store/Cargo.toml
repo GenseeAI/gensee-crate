@@ -1,0 +1,15 @@
+[package]
+name = "gensee-crate-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chacha20poly1305 = "0.10"
+gensee-crate-core = { path = "../gensee-crate-core" }
+gensee-crate-db = { path = "../../db" }
+gensee-crate-rules = { path = "../gensee-crate-rules" }
+rusqlite = "0.40"
+serde = { workspace = true }
+serde_json = { workspace = true }

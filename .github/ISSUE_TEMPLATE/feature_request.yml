@@ -1,0 +1,41 @@
+name: Feature request
+description: Suggest an improvement or new capability for Gensee Crate.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user need, threat model, or workflow should this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Gensee Crate to do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - Policy engine
+        - Claude Code integration
+        - Dashboard
+        - Storage / SQLite
+        - macOS runtime
+        - Linux runtime
+        - Documentation
+        - Other
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
