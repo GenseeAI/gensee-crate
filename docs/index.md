@@ -1,0 +1,47 @@
+---
+layout: home
+
+hero:
+  name: Gensee Crate
+  text: Full-stack, long-horizon runtime safety<br>for AI coding agents.
+  tagline: Gensee Crate watches system events,<br>requests, tool calls, skills, and memory<br>behind Claude Code and Codex.
+  image:
+    src: /gensee-crate-defense-in-depth.png
+    alt: Gensee Crate defense-in-depth architecture
+  actions:
+    - theme: brand
+      text: Get Started
+      link: /architecture
+    - theme: alt
+      text: Safety Policy
+      link: /policy
+    - theme: alt
+      text: GitHub
+      link: https://github.com/GenseeAI/gensee-crate
+
+features:
+  - title: Observe What Agents Do
+    details: Capture prompts, tool intent, commands, files, network targets, alerts, and timeline context in a local store.
+    link: /watch
+    linkText: Run the sidecar
+  - title: Enforce Before Risky Tools Run
+    details: Apply configurable allow, ask, and deny decisions for secrets, destructive operations, control-plane writes, and suspicious artifacts.
+    link: /policy
+    linkText: Read the policy model
+  - title: Launch With Extra Containment
+    details: Use managed macOS sandboxing and staged workspace review when you want Gensee to launch the agent.
+    link: /run-and-sandbox
+    linkText: Use gensee run
+  - title: Connect Agent Hooks
+    details: Wire Claude Code or Codex into the same timeline so tool requests and runtime effects are evaluated together.
+    link: /claude-code-hooks
+    linkText: Configure hooks
+  - title: Trace Long-Horizon Behavior
+    details: Link prompts, tool calls, file effects, artifacts, alerts, and review verdicts for post-run inspection.
+    link: /lineage-graph
+    linkText: Explore lineage
+  - title: Inspect The Local Dashboard
+    details: Review live activity, lineage, policy decisions, alerts, and policy edits against the same endpoint store.
+    link: /dashboard
+    linkText: Open dashboard docs
+---

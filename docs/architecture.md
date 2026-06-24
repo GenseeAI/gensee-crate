@@ -13,8 +13,7 @@ current v0.1 release is a macOS-first runtime focused on four workflows:
   dashboard-style setup, and edit supported configuration keys with `get`/`set`.
   See [policy.md](policy.md).
 - `dashboards/web` — local timeline, lineage, policy, and review UI backed by
-  the same `GENSEE_HOME` store as the CLI. See
-  [../dashboards/web/README.md](../dashboards/web/README.md).
+  the same `GENSEE_HOME` store as the CLI. See [dashboard.md](dashboard.md).
 
 Container mode is future work. `eslogger` is the default `gensee watch`
 system-event backend on macOS when available and can be disabled by policy,

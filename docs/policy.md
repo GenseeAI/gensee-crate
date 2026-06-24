@@ -74,7 +74,7 @@ validate <file>` checks it; it is auto-loaded on the next hook. The document is
 tool call rather than silently reverting.
 
 **Editor autocomplete + external validation.** A JSON Schema ships at
-[`crate/gensee-crate-rules/policy/policy.schema.json`](../crate/gensee-crate-rules/policy/policy.schema.json).
+[`crate/gensee-crate-rules/policy/policy.schema.json`](https://github.com/GenseeAI/gensee-crate/blob/main/crate/gensee-crate-rules/policy/policy.schema.json).
 Map your editor's JSON schema setting to it (e.g. VS Code `json.schemas`), or
 validate out-of-band with any draft-07 validator. `gensee policy validate`
 remains the authoritative check (it parses with the same types the engine uses).

@@ -1,4 +1,7 @@
 /target/
+/node_modules/
+/docs/.vitepress/cache/
+/docs/.vitepress/dist/
 /.gensee-dev/
 /.gensee-pdf-test/
 **/*.rs.bk
