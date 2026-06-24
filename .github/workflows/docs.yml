@@ -39,6 +39,8 @@ jobs:
         run: npm run docs:build
       - uses: actions/configure-pages@v5
         if: github.event_name != 'pull_request'
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         if: github.event_name != 'pull_request'
         with:
