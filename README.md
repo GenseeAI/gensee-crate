@@ -23,6 +23,8 @@
 <p align="center">
   <a href="https://www.gensee.ai">gensee.ai</a>
   ·
+  <a href="https://crate-docs.gensee.ai">Docs</a>
+  ·
   <a href="https://www.gensee.ai/discord">Join Discord</a>
 </p>
 
