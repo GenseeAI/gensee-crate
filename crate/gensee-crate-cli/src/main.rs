@@ -55,6 +55,8 @@ mod timeline;
 pub(crate) use timeline::*;
 mod daemon;
 pub(crate) use daemon::*;
+mod telemetry;
+pub(crate) use telemetry::*;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -71,8 +73,15 @@ fn main() {
 
 pub(crate) fn run_cli() -> io::Result<()> {
     let mut args = env::args_os().skip(1).collect::<Vec<_>>();
+    let command = args
+        .first()
+        .and_then(|arg| arg.to_str())
+        .map(ToString::to_string);
+    if let Some(command_name) = command.as_deref() {
+        telemetry_bootstrap_for_command(command_name);
+    }
 
-    match args.first().and_then(|arg| arg.to_str()) {
+    match command.as_deref() {
         Some("run") => {
             args.remove(0);
             if args.first().and_then(|arg| arg.to_str()) == Some("list") {
@@ -130,6 +139,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
         Some("dashboard-state") => {
             args.remove(0);
             dashboard_state()
+        }
+        Some("telemetry") => {
+            args.remove(0);
+            handle_telemetry(args)
         }
         Some("ingest") => {
             args.remove(0);
@@ -659,6 +672,12 @@ pub(crate) fn handle_policy(args: Vec<OsString>) -> io::Result<()> {
             }
             fs::write(&path, format!("{serialized}\n"))?;
             println!("gensee policy: set {key} in {}", path.display());
+            telemetry_record_policy_change(
+                "policy_set_changed",
+                json!({
+                    "key": key,
+                }),
+            );
             Ok(())
         }
         _ => Err(io::Error::new(
@@ -731,6 +750,12 @@ fn policy_setup(args: Vec<OsString>) -> io::Result<()> {
     println!(
         "gensee policy: validate it with `gensee policy validate {}`",
         path.display()
+    );
+    telemetry_record_policy_change(
+        "policy_setup_completed",
+        json!({
+            "path": path,
+        }),
     );
     Ok(())
 }
@@ -1720,6 +1745,7 @@ pub(crate) fn process_hook_event(
             evaluate_pretool_policy_with_store(event, &file_intents, Some(store)),
             &event.provider,
         );
+        telemetry_record_policy_event(event, &decision, &file_intents);
         for finding in &decision.findings {
             store.append_policy_alert(&finding.to_policy_alert(event))?;
         }
@@ -1853,6 +1879,6 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 
 pub(crate) fn print_usage() {
     println!(
-        "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n\nCOMPATIBILITY:\n  gensee session list"
+        "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n\nCOMPATIBILITY:\n  gensee session list"
     );
 }

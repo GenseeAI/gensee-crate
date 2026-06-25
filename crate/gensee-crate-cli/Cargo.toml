@@ -22,5 +22,8 @@ gensee-crate-attribution = { path = "../gensee-crate-attribution" }
 gensee-crate-core = { path = "../gensee-crate-core" }
 gensee-crate-rules = { path = "../gensee-crate-rules" }
 gensee-crate-store = { path = "../gensee-crate-store" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+ureq = { version = "2.10", default-features = true, features = ["json"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
