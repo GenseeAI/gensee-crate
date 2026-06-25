@@ -88,7 +88,8 @@ impl TelemetryClient {
         let path = telemetry_config_path(&root);
         let mut config = if path.exists() {
             let text = fs::read_to_string(&path)?;
-            serde_json::from_str::<TelemetryConfig>(&text).unwrap_or_else(|_| TelemetryConfig::new())
+            serde_json::from_str::<TelemetryConfig>(&text)
+                .unwrap_or_else(|_| TelemetryConfig::new())
         } else {
             TelemetryConfig::new()
         };
@@ -209,12 +210,18 @@ impl TelemetryClient {
             return Ok(());
         }
 
-        let tty = fs::OpenOptions::new().read(true).write(true).open("/dev/tty");
+        let tty = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty");
         match tty {
             Ok(mut tty) => {
                 writeln!(tty, "Gensee telemetry is enabled by default.")?;
                 writeln!(tty, "{TELEMETRY_PRIVACY_NOTICE}")?;
-                writeln!(tty, "Collected categories: lifecycle, policy outcomes, and tool/access stats.")?;
+                writeln!(
+                    tty,
+                    "Collected categories: lifecycle, policy outcomes, and tool/access stats."
+                )?;
                 writeln!(tty, "{TELEMETRY_SUPPORT_NOTICE}")?;
                 write!(
                     tty,
@@ -499,7 +506,10 @@ pub(crate) fn handle_telemetry(args: Vec<OsString>) -> io::Result<()> {
 fn telemetry_tool_category(tool_name: &str) -> &'static str {
     if tool_name == "Bash" {
         "shell"
-    } else if matches!(tool_name, "Read" | "Write" | "Edit" | "MultiEdit" | "apply_patch") {
+    } else if matches!(
+        tool_name,
+        "Read" | "Write" | "Edit" | "MultiEdit" | "apply_patch"
+    ) {
         "filesystem"
     } else if tool_name == "WebFetch" {
         "network"
