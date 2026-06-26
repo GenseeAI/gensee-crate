@@ -547,6 +547,15 @@ fn redacts_secret_values_from_eslogger_events() {
 }
 
 #[test]
+fn malformed_eslogger_line_still_emits_json_valid_raw_payload() {
+    let event = system_event_from_eslogger_line("{not-valid-json", 126);
+
+    assert_eq!(event.event_type, "unknown");
+    assert_eq!(event.event_kind, "unknown");
+    assert!(serde_json::from_str::<serde_json::Value>(&event.raw_json).is_ok());
+}
+
+#[test]
 fn strips_env_prefix_and_detects_sensitive_read() {
     let intents = parse_bash_file_intents(
         "AWS_PROFILE=prod AWS_SECRET_ACCESS_KEY=xxx cat ~/.aws/credentials",

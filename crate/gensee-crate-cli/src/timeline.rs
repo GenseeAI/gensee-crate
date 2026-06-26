@@ -1159,6 +1159,7 @@ pub(crate) fn system_event_from_eslogger_line(line: &str, observed_at_ms: u64) -
     let Ok(mut value) = serde_json::from_str::<Value>(line) else {
         // Not valid JSON: keep only a redacted raw copy. Structured fields are
         // unavailable, but nothing secret-bearing is persisted.
+        let redacted = redact_text(line);
         return SystemEvent {
             source: "macos-eslogger".to_string(),
             event_type: "unknown".to_string(),
@@ -1170,7 +1171,8 @@ pub(crate) fn system_event_from_eslogger_line(line: &str, observed_at_ms: u64) -
             executable_path: None,
             file_path: None,
             command_line: None,
-            raw_json: redact_text(line),
+            // Keep DB CHECK(json_valid(args)) compatible even for malformed lines.
+            raw_json: serde_json::to_string(&redacted).unwrap_or_else(|_| "\"\"".to_string()),
         };
     };
 
@@ -1194,7 +1196,7 @@ pub(crate) fn system_event_from_eslogger_line(line: &str, observed_at_ms: u64) -
         executable_path,
         file_path,
         command_line,
-        raw_json: serde_json::to_string(&value).unwrap_or_default(),
+        raw_json: serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
     }
 }
 
