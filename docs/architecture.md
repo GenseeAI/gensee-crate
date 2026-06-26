@@ -34,6 +34,7 @@ while a signed EndpointSecurity client remains a future enrichment. See
 | `crate/gensee-crate-ml` | Future v0.2 behavioral model experiments |
 | `integrations/claude-code` | Claude Code hook bridge |
 | `integrations/codex` | Codex hook bridge |
+| `integrations/omnigent` | Thin Omnigent sidecar/managed-launch integration |
 | `integrations/vscode` | VS Code/Cursor extension workspace |
 | `integrations/mcp` | Optional MCP bridge |
 | `integrations/generic-launcher` | `gensee run -- <agent>` launcher integration |

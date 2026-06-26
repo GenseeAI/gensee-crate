@@ -122,8 +122,11 @@
       "filename_prefixes": [],
       "filename_suffixes": [],
       "filename_contains": [],
-      "path_suffixes": ["/.gensee/gensee.db"],
-      "path_contains": ["/gensee-crate-rules/policy/default-policy.json"]
+      "path_suffixes": ["/.gensee/gensee.db", "/.omnigent"],
+      "path_contains": [
+        "/.omnigent/",
+        "/gensee-crate-rules/policy/default-policy.json"
+      ]
     }
   },
 

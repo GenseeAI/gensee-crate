@@ -214,6 +214,14 @@ If you use `--system-events eslogger` on macOS, open Apple menu > System Setting
 gensee run -- claude # or: gensee run -- codex
 ```
 
+For orchestration frameworks such as Omnigent, use the same primitives as a
+thin outer safety layer:
+
+```bash
+gensee watch --workspace . --watch-root ~/.omnigent
+gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml
+```
+
 Inspect what happened at any time:
 
 ```bash
@@ -334,6 +342,7 @@ Full docs live in [`docs/`](docs/README.md):
 - [`gensee policy`](docs/gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.
 - [Claude Code hooks](docs/claude-code-hooks.md) — wiring Claude Code prompts and tool intent into Gensee.
 - [Codex hooks](docs/codex-support.md) — wiring Codex prompts and tool intent into Gensee.
+- [Omnigent integration](integrations/omnigent/README.md) — thin sidecar/managed-run support and the deeper policy-bridge plan.
 - [Safety policy](docs/policy.md) — the data-driven allow/ask/deny engine and `gensee policy` workflow.
 - [SQLite lineage graph](docs/lineage-graph.md) — the provenance schema and example queries.
 - [Endpoint Security spike](docs/endpoint-security.md) — `eslogger` system events and the future signed EndpointSecurity path.

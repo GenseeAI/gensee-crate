@@ -2454,6 +2454,29 @@ fn pretool_policy_blocks_dynamic_store_control_plane_writes() {
 }
 
 #[test]
+fn pretool_policy_blocks_omnigent_control_plane_writes() {
+    for command in [
+        "echo nope > /Users/example/.omnigent/codex-native/bridge/state.json",
+        "rm -rf /Users/example/.omnigent",
+    ] {
+        let payload = pretool_bash_payload("s1", "/repo", command);
+        let event = build_agent_hook_event(&payload).unwrap();
+        let intents = file_intents_from_hook(&event, original_bash_command(&payload).as_deref());
+
+        let decision = evaluate_pretool_policy(&event, &intents);
+
+        assert_eq!(decision.action, PolicyAction::Block, "{command}");
+        assert!(
+            decision
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "policy_control_plane_write"),
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn pretool_policy_blocks_cloud_metadata_url() {
     // Assemble the link-local metadata host from octets so the literal does
     // not appear verbatim in source.
