@@ -13,6 +13,7 @@ for a Gensee-launched process root is now `GENSEE_RUN_ID`. Agent hook
 
 ```bash
 cargo run -p gensee-crate-cli -- run -- claude
+cargo run -p gensee-crate-cli -- run -- omnigent run path/to/agent.yaml
 cargo run -p gensee-crate-cli -- run list
 cargo run -p gensee-crate-cli -- timeline
 ```
@@ -71,3 +72,28 @@ gensee run discard run_<pid>_<timestamp_ms>
 ```
 
 Merge-back and automatic rollback flows are future work.
+
+## Omnigent
+
+`gensee run` can launch Omnigent as a managed child process:
+
+```bash
+gensee run --workspace "$PWD" -- omnigent run path/to/agent.yaml
+```
+
+For a first safety demo, prefer a staged workspace:
+
+```bash
+export GENSEE_HOME="$HOME/.gensee-omnigent"
+
+gensee run \
+  --workspace "$PWD" \
+  --workspace-mode staged \
+  -- omnigent
+```
+
+This is thin support: Gensee records the Omnigent root process and workspace
+effects, and staged mode keeps generated edits out of the original working tree
+until review. It does not yet consume Omnigent's internal policy events. See
+[the Omnigent integration guide](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/omnigent) for the
+current workflow and deeper bridge plan.

@@ -140,7 +140,8 @@ gensee policy validate "$GENSEE_HOME/policy.json"
   credential reads, reverse shells — see
   [pre-execution artifact inspection](#pre-execution-artifact-inspection);
 - writes to Gensee's own **control plane** (its store and policy file), so the
-  agent cannot disable the shield;
+  agent cannot disable the shield; the default registry also treats local
+  `.omnigent` state as control-plane material for thin Omnigent runs;
 - **dangerous shell one-liners** that never reach an executable artifact —
   fork bombs (`:|:` self-pipe), firewall flush/disable (`iptables -F`/`--flush`),
   and SIGKILL-all (`kill -9 -1`) — see

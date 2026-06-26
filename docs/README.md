@@ -13,6 +13,7 @@ quick start, then dive into the topic guides below.
 - [Claude Code hooks](claude-code-hooks.md) — wire Claude Code prompts and tool intent into Gensee, and read the combined timeline.
 - [Codex hooks](codex-support.md) — wire Codex prompts and tool intent into Gensee, and read the combined timeline.
 - [Codex integration](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/codex) — setup commands, hook samples, and smoke-test payloads.
+- [Omnigent integration](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/omnigent) — thin `watch`/`run` support and the deeper policy-bridge plan.
 - [Safety policy](policy.md) — the data-driven allow/ask/deny policy engine and how to customize it.
 - [Dashboard](dashboard.md) — inspect live activity, lineage, policy decisions, alerts, and policy edits.
 - [SQLite lineage graph](lineage-graph.md) — the provenance schema, example queries, and what Gensee can flag today.
