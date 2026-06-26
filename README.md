@@ -211,7 +211,7 @@ If you use `--system-events eslogger` on macOS, open Apple menu > System Setting
 - **`gensee run`:** adds managed macOS sandbox confinement and staged, reviewable workspace writes around the launched agent.
 
 ```bash
-gensee run -- claude # or: gensee run -- codex/omnigent
+gensee run -- claude # or: gensee run -- codex
 ```
 
 For orchestration frameworks such as Omnigent, use the same primitives as a
