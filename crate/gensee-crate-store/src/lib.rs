@@ -170,6 +170,7 @@ impl EventStore {
     }
 
     pub fn append_session(&self, session: &AgentSession) -> io::Result<()> {
+        append_jsonl(&self.sessions_path(), session, self.encryption_key.as_ref())?;
         let db = self.sqlite_store()?;
         db.insert_session(&NewSession {
             session_id: session.session_id.clone(),
@@ -179,48 +180,48 @@ impl EventStore {
             flagged: false,
         })
         .map_err(sqlite_error)?;
-        append_jsonl(&self.sessions_path(), session, self.encryption_key.as_ref())
+        Ok(())
     }
 
     pub fn append_hook_event(&self, event: &AgentHookEvent) -> io::Result<()> {
-        self.append_hook_event_database(event)?;
-        append_jsonl(&self.hooks_path(), event, self.encryption_key.as_ref())
+        append_jsonl(&self.hooks_path(), event, self.encryption_key.as_ref())?;
+        self.append_hook_event_database(event)
     }
 
     pub fn append_process_observation(&self, observation: &ProcessObservation) -> io::Result<()> {
-        self.append_process_observation_database(observation)?;
         append_jsonl(
             &self.process_observations_path(),
             observation,
             self.encryption_key.as_ref(),
-        )
+        )?;
+        self.append_process_observation_database(observation)
     }
 
     pub fn append_file_intent(&self, intent: &FileIntent) -> io::Result<()> {
-        self.append_file_intent_database(intent)?;
         append_jsonl(
             &self.file_intents_path(),
             intent,
             self.encryption_key.as_ref(),
-        )
+        )?;
+        self.append_file_intent_database(intent)
     }
 
     pub fn append_system_event(&self, event: &SystemEvent) -> io::Result<()> {
-        self.append_system_event_database(event)?;
         append_jsonl(
             &self.system_events_path(),
             event,
             self.encryption_key.as_ref(),
-        )
+        )?;
+        self.append_system_event_database(event)
     }
 
     pub fn append_workspace_effect(&self, effect: &WorkspaceEffect) -> io::Result<()> {
-        self.append_workspace_effect_database(effect)?;
         append_jsonl(
             &self.workspace_effects_path(),
             effect,
             self.encryption_key.as_ref(),
-        )
+        )?;
+        self.append_workspace_effect_database(effect)
     }
 
     pub fn list_sessions(&self) -> io::Result<Vec<AgentSession>> {
@@ -2188,8 +2189,16 @@ fn append_jsonl<T: Serialize>(
     }
     line.push('\n');
 
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(line.as_bytes())
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.lock()?;
+    let result = file_write_all(&file, line.as_bytes());
+    let _ = file.unlock();
+    result
+}
+
+fn file_write_all(file: &fs::File, buf: &[u8]) -> io::Result<()> {
+    use io::Write;
+    (&*file).write_all(buf)
 }
 
 /// Read newline-delimited JSON records. Lines that fail to parse are skipped
@@ -2376,6 +2385,9 @@ fn hex_value(byte: u8) -> io::Result<u8> {
         )),
     }
 }
+
+#[cfg(test)]
+mod concurrency_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2778,13 +2790,18 @@ mod tests {
         });
         assert!(result.is_err());
 
+        // DB should have nothing — the invalid raw_json causes the DB
+        // write to fail and roll back.
         let db = store.sqlite_store().unwrap();
         assert!(db.get_session(SYSTEM_SESSION_ID).unwrap().is_none());
         assert!(db
             .latest_request_for_session(SYSTEM_SESSION_ID)
             .unwrap()
             .is_none());
-        assert!(store.list_system_events().unwrap().is_empty());
+        // JSONL writes before the DB, so the record lands in the
+        // append-only log even when the DB fails. This is intentional:
+        // JSONL is the durable audit trail and never loses records.
+        assert_eq!(store.list_system_events().unwrap().len(), 1);
 
         fs::remove_dir_all(&dir).ok();
     }
