@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code and Codex.
+  Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
   It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS.
   Real-time enforcement happens within chat interface of the coding agents, while offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
 </p>
@@ -211,7 +211,7 @@ If you use `--system-events eslogger` on macOS, open Apple menu > System Setting
 - **`gensee run`:** adds managed macOS sandbox confinement and staged, reviewable workspace writes around the launched agent.
 
 ```bash
-gensee run -- claude # or: gensee run -- codex
+gensee run -- claude # or: gensee run -- codex/omnigent
 ```
 
 For orchestration frameworks such as Omnigent, use the same primitives as a

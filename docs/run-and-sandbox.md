@@ -95,5 +95,5 @@ gensee run \
 This is thin support: Gensee records the Omnigent root process and workspace
 effects, and staged mode keeps generated edits out of the original working tree
 until review. It does not yet consume Omnigent's internal policy events. See
-[the Omnigent integration guide](../integrations/omnigent/README.md) for the
+[the Omnigent integration guide](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/omnigent) for the
 current workflow and deeper bridge plan.
