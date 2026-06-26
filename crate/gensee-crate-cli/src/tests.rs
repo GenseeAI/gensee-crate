@@ -1,4 +1,135 @@
 use super::*;
+use std::sync::{Mutex, OnceLock};
+
+fn telemetry_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
+fn telemetry_test_root(suffix: &str) -> PathBuf {
+    env::temp_dir().join(format!(
+        "gensee-telemetry-test-{}-{}",
+        std::process::id(),
+        suffix
+    ))
+}
+
+#[test]
+fn telemetry_bootstrap_skips_telemetry_command() {
+    let _guard = telemetry_test_lock();
+    let root = telemetry_test_root("skip-bootstrap");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    env::set_var("GENSEE_HOME", &root);
+    env::set_var("GENSEE_TELEMETRY_REMOTE", "0");
+    telemetry_bootstrap_for_command("telemetry");
+
+    assert!(!root.join("telemetry-events.jsonl").exists());
+
+    env::remove_var("GENSEE_TELEMETRY_REMOTE");
+    env::remove_var("GENSEE_HOME");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn telemetry_bootstrap_records_startup_events_without_upload_rotation() {
+    let _guard = telemetry_test_lock();
+    let root = telemetry_test_root("startup-events");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    env::set_var("GENSEE_HOME", &root);
+    env::set_var("GENSEE_TELEMETRY_REMOTE", "0");
+    telemetry_bootstrap_for_command("run");
+
+    let queue_path = root.join("telemetry-events.jsonl");
+    assert!(queue_path.exists());
+    assert!(!root.join("telemetry-events-upload.jsonl").exists());
+
+    let lines = fs::read_to_string(queue_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+
+    let first: Value = serde_json::from_str(&lines[0]).unwrap();
+    let second: Value = serde_json::from_str(&lines[1]).unwrap();
+    assert_eq!(first["event_name"], json!("app_started"));
+    assert_eq!(second["event_name"], json!("command_invoked"));
+
+    env::remove_var("GENSEE_TELEMETRY_REMOTE");
+    env::remove_var("GENSEE_HOME");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn telemetry_policy_event_does_not_create_upload_artifacts_on_hook_path() {
+    let _guard = telemetry_test_lock();
+    let root = telemetry_test_root("hook-path");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    env::set_var("GENSEE_HOME", &root);
+    env::set_var("GENSEE_TELEMETRY_REMOTE", "1");
+
+    let event = AgentHookEvent {
+        provider: PROVIDER_CLAUDE_CODE.to_string(),
+        session_id: Some("session-1".to_string()),
+        hook_event_name: Some("PreToolUse".to_string()),
+        cwd: Some("/repo".to_string()),
+        transcript_path: None,
+        tool_name: Some("Bash".to_string()),
+        tool_use_id: Some("tool-1".to_string()),
+        tool_input_command: Some("ls".to_string()),
+        tool_input_description: None,
+        tool_response_stdout: None,
+        tool_response_stderr: None,
+        tool_response_interrupted: None,
+        duration_ms: None,
+        permission_mode: Some("default".to_string()),
+        effort_level: None,
+        observed_at_ms: 1,
+        raw_json: "{}".to_string(),
+    };
+    let decision = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+
+    telemetry_record_policy_event(&event, &decision, &[]);
+
+    assert!(root.join("telemetry-events.jsonl").exists());
+    assert!(!root.join("telemetry-events-upload.jsonl").exists());
+    assert!(!root.join("telemetry-flush.lock").exists());
+
+    env::remove_var("GENSEE_TELEMETRY_REMOTE");
+    env::remove_var("GENSEE_HOME");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn telemetry_defaults_remote_upload_off_during_tests() {
+    let _guard = telemetry_test_lock();
+    let root = telemetry_test_root("test-defaults");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    env::set_var("GENSEE_HOME", &root);
+    env::remove_var("GENSEE_TELEMETRY_REMOTE");
+
+    telemetry_bootstrap_for_command("run");
+
+    let config_path = root.join("telemetry.json");
+    let config_text = fs::read_to_string(config_path).unwrap();
+    let config: Value = serde_json::from_str(&config_text).unwrap();
+    assert_eq!(config["remote_enabled"], json!(false));
+    assert_eq!(config["consent_state"], json!("disabled"));
+
+    env::remove_var("GENSEE_HOME");
+    let _ = fs::remove_dir_all(&root);
+}
 
 fn build_agent_hook_event(payload: &str) -> io::Result<AgentHookEvent> {
     super::build_hook_event(payload, PROVIDER_CLAUDE_CODE)

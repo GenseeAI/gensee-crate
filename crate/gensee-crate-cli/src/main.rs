@@ -55,6 +55,8 @@ mod timeline;
 pub(crate) use timeline::*;
 mod daemon;
 pub(crate) use daemon::*;
+mod telemetry;
+pub(crate) use telemetry::*;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -71,8 +73,15 @@ fn main() {
 
 pub(crate) fn run_cli() -> io::Result<()> {
     let mut args = env::args_os().skip(1).collect::<Vec<_>>();
+    let command = args
+        .first()
+        .and_then(|arg| arg.to_str())
+        .map(ToString::to_string);
+    if let Some(command_name) = command.as_deref() {
+        telemetry_bootstrap_for_command(command_name);
+    }
 
-    match args.first().and_then(|arg| arg.to_str()) {
+    match command.as_deref() {
         Some("run") => {
             args.remove(0);
             if args.first().and_then(|arg| arg.to_str()) == Some("list") {
@@ -130,6 +139,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
         Some("dashboard-state") => {
             args.remove(0);
             dashboard_state()
+        }
+        Some("telemetry") => {
+            args.remove(0);
+            handle_telemetry(args)
         }
         Some("ingest") => {
             args.remove(0);
@@ -659,6 +672,12 @@ pub(crate) fn handle_policy(args: Vec<OsString>) -> io::Result<()> {
             }
             fs::write(&path, format!("{serialized}\n"))?;
             println!("gensee policy: set {key} in {}", path.display());
+            telemetry_record_policy_change(
+                "policy_set_changed",
+                json!({
+                    "key": key,
+                }),
+            );
             Ok(())
         }
         _ => Err(io::Error::new(
@@ -731,6 +750,12 @@ fn policy_setup(args: Vec<OsString>) -> io::Result<()> {
     println!(
         "gensee policy: validate it with `gensee policy validate {}`",
         path.display()
+    );
+    telemetry_record_policy_change(
+        "policy_setup_completed",
+        json!({
+            "path": path,
+        }),
     );
     Ok(())
 }
@@ -1380,6 +1405,41 @@ const SETTABLE_POLICY_KEYS: &[&str] = &[
     "allow_path_prefixes",
 ];
 
+pub(crate) fn telemetry_policy_key_bucket(key: &str) -> &'static str {
+    if !SETTABLE_POLICY_KEYS.contains(&key) {
+        return "custom";
+    }
+    match key {
+        "resource_governance.max_read_bytes" => "resource_governance.max_read_bytes",
+        "resource_governance.max_file_subjects_per_tool" => {
+            "resource_governance.max_file_subjects_per_tool"
+        }
+        "resource_governance.max_shell_segments_per_tool" => {
+            "resource_governance.max_shell_segments_per_tool"
+        }
+        "resource_governance.max_tool_calls_per_session" => {
+            "resource_governance.max_tool_calls_per_session"
+        }
+        "resource_governance.max_network_egress_per_session" => {
+            "resource_governance.max_network_egress_per_session"
+        }
+        "resource_governance.max_file_accessed_rate_per_min" => {
+            "resource_governance.max_file_accessed_rate_per_min"
+        }
+        "resource_governance.max_network_rate_per_min" => {
+            "resource_governance.max_network_rate_per_min"
+        }
+        "egress.allow_hosts" => "egress.allow_hosts",
+        "egress.proxy_url" => "egress.proxy_url",
+        "egress.require_proxy" => "egress.require_proxy",
+        "runtime.max_runtime_seconds" => "runtime.max_runtime_seconds",
+        "enforcement.noninteractive" => "enforcement.noninteractive",
+        "watch.system_events" => "watch.system_events",
+        "allow_path_prefixes" => "allow_path_prefixes",
+        _ => "custom",
+    }
+}
+
 /// Look up a dotted key (e.g. `egress.require_proxy`) in a policy JSON value.
 fn policy_value_get<'a>(root: &'a Value, key: &str) -> Option<&'a Value> {
     let mut current = root;
@@ -1547,6 +1607,10 @@ fn feedback_record(args: Vec<OsString>) -> io::Result<()> {
         .get("label")
         .cloned()
         .unwrap_or_else(|| derive_feedback_label(gensee_action.as_deref(), &verdict));
+    let is_manual_overturn = !matches!(label.as_str(), "confirmed");
+    let gensee_action_for_telemetry = gensee_action.clone();
+    let verdict_for_telemetry = verdict.clone();
+    let label_for_telemetry = label.clone();
 
     let store = EventStore::default_local()?;
     let id = store.record_human_feedback(
@@ -1561,6 +1625,16 @@ fn feedback_record(args: Vec<OsString>) -> io::Result<()> {
         opts.get("note").cloned(),
         unix_millis()?,
     )?;
+    if is_manual_overturn {
+        telemetry_record_dashboard_event(
+            "dashboard_manual_overturn",
+            json!({
+                "gensee_action": gensee_action_for_telemetry.as_deref().unwrap_or("unknown"),
+                "human_verdict": verdict_for_telemetry,
+                "label": label_for_telemetry,
+            }),
+        );
+    }
     println!("gensee feedback: recorded verdict #{id}");
     Ok(())
 }
@@ -1720,6 +1794,7 @@ pub(crate) fn process_hook_event(
             evaluate_pretool_policy_with_store(event, &file_intents, Some(store)),
             &event.provider,
         );
+        telemetry_record_policy_event(event, &decision, &file_intents);
         for finding in &decision.findings {
             store.append_policy_alert(&finding.to_policy_alert(event))?;
         }
@@ -1853,6 +1928,6 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 
 pub(crate) fn print_usage() {
     println!(
-        "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee session list"
+    "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee session list"
     );
 }
