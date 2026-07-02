@@ -34,10 +34,67 @@ The setup command backs up the previous settings file, preserves unrelated
 settings, and installs hooks for `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 and `Stop`.
 
+To route Claude Code traffic through an inspecting company gateway at the same
+time, pass the gateway URL and one credential source:
+
+```bash
+gensee setup claude-code \
+  --gensee-home "$GENSEE_HOME" \
+  --anthropic-base-url https://llm-gateway.example.com \
+  --anthropic-auth-token "$GATEWAY_TOKEN"
+```
+
+Use `--anthropic-api-key` instead when the gateway expects `x-api-key`, or
+`--api-key-helper ~/bin/get-gateway-key` when credentials come from SSO or a
+vault. The setup command writes these values into the `env` block of
+`~/.claude/settings.json` and removes stale static Claude credentials that would
+conflict with the selected gateway credential.
+
+This makes requests observable by the gateway; the gateway must still log,
+reject, or canonicalize suspicious request bodies itself. For strict enforcement,
+pair this with network policy that blocks direct Claude provider egress from
+developer machines.
+
+## Local Anthropic gateway screening
+
+For local testing or a small team rollout, Gensee ships a minimal
+Anthropic-compatible gateway:
+
+```bash
+cargo build -p gensee-crate-cli
+
+GENSEE_HOME="$GENSEE_HOME" \
+GENSEE_BIN="$PWD/target/debug/gensee" \
+GENSEE_GATEWAY_TOKEN="local-gateway-token" \
+ANTHROPIC_UPSTREAM_API_KEY="$ANTHROPIC_API_KEY" \
+node scripts/anthropic_gateway.mjs
+```
+
+Then configure Claude Code to use the local gateway:
+
+```bash
+./target/debug/gensee setup claude-code \
+  --gensee-home "$GENSEE_HOME" \
+  --anthropic-base-url http://127.0.0.1:8787 \
+  --anthropic-auth-token local-gateway-token
+```
+
+The gateway screens JSON request bodies before forwarding to Anthropic. By
+default it blocks invisible/bidirectional/variation/tag Unicode markers anywhere
+in the request, and blocks variant punctuation in trusted prompt scaffolding such
+as `system` and tool descriptions. Blocks are recorded with
+`policy_prompt_steganography_detected` through `gensee gateway-alert`, so they
+appear in `timeline` and the dashboard. Set `GENSEE_GATEWAY_STEGO_ACTION=warn`
+to record but forward suspicious requests.
+
 The relevant settings shape is:
 
 ```json
 {
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://llm-gateway.example.com",
+    "ANTHROPIC_AUTH_TOKEN": "sk-gateway-token"
+  },
   "hooks": {
     "UserPromptSubmit": [
       { "matcher": "*", "hooks": [ { "type": "command", "command": "GENSEE_HOME=/tmp/gensee-watch-store /path/to/gensee-crate/target/debug/gensee hook claude-code" } ] }
