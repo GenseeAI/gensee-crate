@@ -152,6 +152,32 @@ Code:
 gensee setup claude-code --gensee-home "$GENSEE_HOME"
 ```
 
+If your team requires Claude Code traffic to pass through an inspecting LLM
+gateway, configure that during the same setup step:
+
+```bash
+gensee setup claude-code \
+  --gensee-home "$GENSEE_HOME" \
+  --anthropic-base-url https://llm-gateway.example.com \
+  --anthropic-auth-token "$GATEWAY_TOKEN"
+```
+
+For local screening/blocking, start the bundled gateway and point Claude Code at
+it:
+
+```bash
+GENSEE_HOME="$GENSEE_HOME" \
+GENSEE_BIN="$PWD/target/debug/gensee" \
+GENSEE_GATEWAY_TOKEN="local-gateway-token" \
+ANTHROPIC_UPSTREAM_API_KEY="$ANTHROPIC_API_KEY" \
+node scripts/anthropic_gateway.mjs
+
+./target/debug/gensee setup claude-code \
+  --gensee-home "$GENSEE_HOME" \
+  --anthropic-base-url http://127.0.0.1:8787 \
+  --anthropic-auth-token local-gateway-token
+```
+
 Or for Codex:
 
 ```bash

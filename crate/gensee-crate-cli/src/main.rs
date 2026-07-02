@@ -136,6 +136,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             args.remove(0);
             handle_feedback(args)
         }
+        Some("gateway-alert") => {
+            args.remove(0);
+            handle_gateway_alert(args)
+        }
         Some("dashboard-state") => {
             args.remove(0);
             dashboard_state()
@@ -199,6 +203,7 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
+    let mut gateway = ClaudeCodeGatewaySettings::default();
 
     let mut index = 0;
     while index < args.len() {
@@ -236,9 +241,29 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
                 bin_path = PathBuf::from(value);
                 index += 2;
             }
+            "--anthropic-base-url" | "--gateway-url" => {
+                gateway.base_url = Some(required_next_arg(&args, index, arg)?);
+                index += 2;
+            }
+            "--anthropic-auth-token" | "--gateway-auth-token" => {
+                gateway.auth_token = Some(required_next_arg(&args, index, arg)?);
+                index += 2;
+            }
+            "--anthropic-api-key" | "--gateway-api-key" => {
+                gateway.api_key = Some(required_next_arg(&args, index, arg)?);
+                index += 2;
+            }
+            "--anthropic-custom-headers" => {
+                gateway.custom_headers = Some(required_next_arg(&args, index, arg)?);
+                index += 2;
+            }
+            "--api-key-helper" => {
+                gateway.api_key_helper = Some(required_next_arg(&args, index, arg)?);
+                index += 2;
+            }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup claude-code [--gensee-home <path>] [--settings <path>] [--bin <path>]"
+                    "usage: gensee setup claude-code [--gensee-home <path>] [--settings <path>] [--bin <path>] [--anthropic-base-url <url>] [--anthropic-auth-token <token>|--anthropic-api-key <key>|--api-key-helper <command>]"
                 );
                 return Ok(());
             }
@@ -250,16 +275,20 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
             }
         }
     }
+    gateway.validate()?;
 
     gensee_home = absolutize_for_hook(&gensee_home)?;
     bin_path = absolutize_for_hook(&bin_path)?;
     let command = claude_code_hook_command(&gensee_home, &bin_path);
-    write_claude_code_settings(&settings_path, &command)?;
+    write_claude_code_settings(&settings_path, &command, &gateway)?;
 
     println!(
         "gensee setup: configured Claude Code hooks in {}",
         settings_path.display()
     );
+    if !gateway.is_empty() {
+        println!("gensee setup: configured Claude Code gateway routing.");
+    }
     println!("gensee setup: hook command: {command}");
     println!("gensee setup: fully restart Claude Code before testing enforcement.");
     Ok(())
@@ -341,7 +370,66 @@ fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
-fn write_claude_code_settings(settings_path: &Path, command: &str) -> io::Result<()> {
+#[derive(Debug, Default)]
+struct ClaudeCodeGatewaySettings {
+    base_url: Option<String>,
+    auth_token: Option<String>,
+    api_key: Option<String>,
+    custom_headers: Option<String>,
+    api_key_helper: Option<String>,
+}
+
+impl ClaudeCodeGatewaySettings {
+    fn is_empty(&self) -> bool {
+        self.base_url.is_none()
+            && self.auth_token.is_none()
+            && self.api_key.is_none()
+            && self.custom_headers.is_none()
+            && self.api_key_helper.is_none()
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        let credential_count = usize::from(self.auth_token.is_some())
+            + usize::from(self.api_key.is_some())
+            + usize::from(self.api_key_helper.is_some());
+        if credential_count > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "setup: choose only one gateway credential source: --anthropic-auth-token, --anthropic-api-key, or --api-key-helper",
+            ));
+        }
+        if self.base_url.is_none()
+            && (self.auth_token.is_some()
+                || self.api_key.is_some()
+                || self.custom_headers.is_some()
+                || self.api_key_helper.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "setup: gateway credential/header options require --anthropic-base-url",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn required_next_arg(args: &[OsString], index: usize, name: &str) -> io::Result<String> {
+    args.get(index + 1)
+        .and_then(|value| value.to_str())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("setup: {name} requires a value"),
+            )
+        })
+}
+
+fn write_claude_code_settings(
+    settings_path: &Path,
+    command: &str,
+    gateway: &ClaudeCodeGatewaySettings,
+) -> io::Result<()> {
     let mut root = if settings_path.exists() {
         let contents = fs::read_to_string(settings_path)?;
         if contents.trim().is_empty() {
@@ -358,6 +446,7 @@ fn write_claude_code_settings(settings_path: &Path, command: &str) -> io::Result
         json!({})
     };
     apply_claude_code_hook_settings(&mut root, command)?;
+    apply_claude_code_gateway_settings(&mut root, gateway)?;
 
     if let Some(parent) = settings_path.parent() {
         fs::create_dir_all(parent)?;
@@ -372,6 +461,60 @@ fn write_claude_code_settings(settings_path: &Path, command: &str) -> io::Result
     }
     let serialized = serde_json::to_string_pretty(&root)?;
     fs::write(settings_path, format!("{serialized}\n"))?;
+    Ok(())
+}
+
+fn apply_claude_code_gateway_settings(
+    root: &mut Value,
+    gateway: &ClaudeCodeGatewaySettings,
+) -> io::Result<()> {
+    if gateway.is_empty() {
+        return Ok(());
+    }
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Claude Code settings must be a JSON object",
+        )
+    })?;
+    {
+        let env_value = root_object
+            .entry("env".to_string())
+            .or_insert_with(|| json!({}));
+        if !env_value.is_object() {
+            *env_value = json!({});
+        }
+        let env_object = env_value.as_object_mut().expect("env is an object");
+
+        if let Some(base_url) = gateway.base_url.as_deref() {
+            env_object.insert("ANTHROPIC_BASE_URL".to_string(), json!(base_url));
+        }
+        if let Some(custom_headers) = gateway.custom_headers.as_deref() {
+            env_object.insert(
+                "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+                json!(custom_headers),
+            );
+        }
+        if let Some(auth_token) = gateway.auth_token.as_deref() {
+            env_object.insert("ANTHROPIC_AUTH_TOKEN".to_string(), json!(auth_token));
+            env_object.remove("ANTHROPIC_API_KEY");
+        }
+        if let Some(api_key) = gateway.api_key.as_deref() {
+            env_object.insert("ANTHROPIC_API_KEY".to_string(), json!(api_key));
+            env_object.remove("ANTHROPIC_AUTH_TOKEN");
+        }
+        if gateway.api_key_helper.is_some() {
+            env_object.remove("ANTHROPIC_AUTH_TOKEN");
+            env_object.remove("ANTHROPIC_API_KEY");
+        }
+    }
+
+    if gateway.auth_token.is_some() || gateway.api_key.is_some() {
+        root_object.remove("apiKeyHelper");
+    }
+    if let Some(helper) = gateway.api_key_helper.as_deref() {
+        root_object.insert("apiKeyHelper".to_string(), json!(helper));
+    }
     Ok(())
 }
 
@@ -1544,20 +1687,72 @@ pub(crate) fn handle_feedback(args: Vec<OsString>) -> io::Result<()> {
     }
 }
 
+pub(crate) fn handle_gateway_alert(args: Vec<OsString>) -> io::Result<()> {
+    let store = EventStore::default_local()?;
+    append_gateway_alert(&store, &args)?;
+    Ok(())
+}
+
+fn append_gateway_alert(store: &EventStore, args: &[OsString]) -> io::Result<()> {
+    let flags = parse_named_flags(args, "gateway-alert")?;
+    let session_id = flags
+        .get("session-id")
+        .cloned()
+        .unwrap_or_else(|| "llm-gateway".to_string());
+    let evidence = flags
+        .get("evidence-json")
+        .map(|value| serde_json::from_str::<Value>(value))
+        .transpose()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?
+        .or_else(|| Some(json!({ "source": "llm_gateway" })));
+    store.append_policy_alert(&PolicyAlert {
+        session_id: Some(session_id),
+        tool_use_id: flags.get("tool-use-id").cloned(),
+        severity: flags
+            .get("severity")
+            .cloned()
+            .unwrap_or_else(|| "high".to_string()),
+        action: flags
+            .get("action")
+            .cloned()
+            .unwrap_or_else(|| "block".to_string()),
+        rule_id: flags
+            .get("rule-id")
+            .cloned()
+            .unwrap_or_else(|| "policy_prompt_steganography_detected".to_string()),
+        message: flags.get("message").cloned().unwrap_or_else(|| {
+            "LLM gateway detected suspicious prompt steganography markers".to_string()
+        }),
+        path: flags.get("path").cloned(),
+        evidence,
+        observed_at_ms: unix_millis()?,
+    })
+}
+
 /// Parse `--key value` pairs into a map. Every flag requires a value.
 fn parse_feedback_flags(
     args: &[OsString],
+) -> io::Result<std::collections::HashMap<String, String>> {
+    parse_named_flags(args, "feedback")
+}
+
+fn parse_named_flags(
+    args: &[OsString],
+    label: &str,
 ) -> io::Result<std::collections::HashMap<String, String>> {
     let mut map = std::collections::HashMap::new();
     let mut index = 0;
     while index < args.len() {
         let key = args[index].to_str().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "feedback: non-UTF8 argument")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label}: non-UTF8 argument"),
+            )
         })?;
         let name = key.strip_prefix("--").ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("feedback: unexpected argument '{key}'"),
+                format!("{label}: unexpected argument '{key}'"),
             )
         })?;
         let value = args
@@ -1566,7 +1761,7 @@ fn parse_feedback_flags(
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("feedback: missing value for --{name}"),
+                    format!("{label}: missing value for --{name}"),
                 )
             })?;
         map.insert(name.to_string(), value.to_string());
@@ -1928,6 +2123,6 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 
 pub(crate) fn print_usage() {
     println!(
-    "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee session list"
+        "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee session list"
     );
 }

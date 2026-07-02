@@ -172,6 +172,127 @@ fn claude_code_setup_preserves_settings_and_sets_hooks() {
 }
 
 #[test]
+fn claude_code_gateway_settings_merge_into_env() {
+    let mut settings = json!({
+        "theme": "dark",
+        "env": {
+            "EXISTING": "keep",
+            "ANTHROPIC_API_KEY": "stale-key"
+        },
+        "apiKeyHelper": "/old/helper"
+    });
+    let gateway = ClaudeCodeGatewaySettings {
+        base_url: Some("https://llm-gateway.example.com".to_string()),
+        auth_token: Some("sk-gateway-token".to_string()),
+        api_key: None,
+        custom_headers: Some("X-Org-Route: prod".to_string()),
+        api_key_helper: None,
+    };
+
+    apply_claude_code_gateway_settings(&mut settings, &gateway).unwrap();
+
+    assert_eq!(settings["theme"], json!("dark"));
+    assert_eq!(settings["env"]["EXISTING"], json!("keep"));
+    assert_eq!(
+        settings["env"]["ANTHROPIC_BASE_URL"],
+        json!("https://llm-gateway.example.com")
+    );
+    assert_eq!(
+        settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+        json!("sk-gateway-token")
+    );
+    assert_eq!(
+        settings["env"]["ANTHROPIC_CUSTOM_HEADERS"],
+        json!("X-Org-Route: prod")
+    );
+    assert!(settings["env"]["ANTHROPIC_API_KEY"].is_null());
+    assert!(settings["apiKeyHelper"].is_null());
+}
+
+#[test]
+fn claude_code_gateway_helper_replaces_static_credentials() {
+    let mut settings = json!({
+        "env": {
+            "ANTHROPIC_AUTH_TOKEN": "stale-token",
+            "ANTHROPIC_API_KEY": "stale-key"
+        }
+    });
+    let gateway = ClaudeCodeGatewaySettings {
+        base_url: Some("https://llm-gateway.example.com".to_string()),
+        auth_token: None,
+        api_key: None,
+        custom_headers: None,
+        api_key_helper: Some("~/bin/gateway-key".to_string()),
+    };
+
+    apply_claude_code_gateway_settings(&mut settings, &gateway).unwrap();
+
+    assert_eq!(
+        settings["env"]["ANTHROPIC_BASE_URL"],
+        json!("https://llm-gateway.example.com")
+    );
+    assert_eq!(settings["apiKeyHelper"], json!("~/bin/gateway-key"));
+    assert!(settings["env"]["ANTHROPIC_AUTH_TOKEN"].is_null());
+    assert!(settings["env"]["ANTHROPIC_API_KEY"].is_null());
+}
+
+#[test]
+fn claude_code_gateway_settings_reject_ambiguous_credentials() {
+    let gateway = ClaudeCodeGatewaySettings {
+        base_url: Some("https://llm-gateway.example.com".to_string()),
+        auth_token: Some("token".to_string()),
+        api_key: Some("key".to_string()),
+        custom_headers: None,
+        api_key_helper: None,
+    };
+    assert!(gateway.validate().is_err());
+}
+
+#[test]
+fn claude_code_gateway_settings_require_base_url_for_credential() {
+    let gateway = ClaudeCodeGatewaySettings {
+        base_url: None,
+        auth_token: Some("token".to_string()),
+        api_key: None,
+        custom_headers: None,
+        api_key_helper: None,
+    };
+    assert!(gateway.validate().is_err());
+}
+
+#[test]
+fn gateway_alert_records_policy_alert() {
+    let (store, _workspace) = temp_store_and_workspace("gateway-alert");
+    append_gateway_alert(
+        &store,
+        &[
+            OsString::from("--session-id"),
+            OsString::from("gw-session"),
+            OsString::from("--action"),
+            OsString::from("block"),
+            OsString::from("--severity"),
+            OsString::from("high"),
+            OsString::from("--message"),
+            OsString::from("blocked stego prompt"),
+            OsString::from("--evidence-json"),
+            OsString::from(r#"{"source":"test","count":1}"#),
+        ],
+    )
+    .unwrap();
+
+    let alerts = store.list_alerts().unwrap();
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].session_id.as_deref(), Some("gw-session"));
+    assert_eq!(alerts[0].action, "block");
+    assert_eq!(alerts[0].rule_id, "policy_prompt_steganography_detected");
+    assert!(alerts[0]
+        .evidence
+        .as_deref()
+        .unwrap()
+        .contains(r#""source":"test""#));
+}
+
+#[test]
 fn claude_code_hook_command_quotes_paths_with_spaces() {
     let command = claude_code_hook_command(
         Path::new("/Users/example/Gensee Store"),
