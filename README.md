@@ -4,10 +4,6 @@
 </h1>
 
 <p align="center">
-  <strong>Full-stack, long-horizon runtime safety for AI coding agents.</strong>
-</p>
-
-<p align="center">
   Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
   It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS.
   Real-time enforcement happens within chat interface of the coding agents, while offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
@@ -40,27 +36,54 @@
 
 ---
 
-## Why Gensee Crate?
+## What Gensee Crate does today
 
 Gensee Crate helps you:
 
 - **Watch what your agent actually does.** Capture files read and written,
-  commands run, network targets reached, hook intent, alerts, and timeline
-  context in one local store.
+  commands run, network intent from tool calls, hook intent, alerts, and
+  timeline context in one local store.
 - **Enforce policy before risky tools run.** Enforces a deterministic, configurable [policy](docs/policy.md) that can allow, ask, or
   deny secret reads, destructive ops, out-of-workspace writes, cloud-metadata
-  access, control-plane writes, dangerous executable content, and more.
+  access, control-plane writes, dangerous executable content, and more. The
+  content rules and executable resolver are deterministic and best-effort.
+  Obfuscated payloads can still slip past them, so treat this as a floor, not a
+  guarantee.
 - **Trace provenance across sessions.** Lineage graphs link prompts,
-  tool calls, filesystem effects, artifacts, alerts, and review verdicts so long-horizon safety issues such as memory poisoning and data exfiltration can be prevented in time and examined afterward.
+  tool calls, filesystem effects, artifacts, alerts, and review verdicts so long-horizon safety issues such as memory poisoning and data exfiltration can be surfaced during a session and reviewed afterward.
 - **Seamless integration with your current workflow.** Run `gensee watch` beside an
   agent or launch an agent in a sandbox with `gensee run` with additional safety.
   Manage policy with `gensee policy` and inspect activity in the local dashboard.
 
+## Roadmap
+
+Gensee Crate is alpha. The deterministic policy engine is the layer shipping
+today. The items below show where each piece stands now and where it is going.
+[`docs/architecture.md`](docs/architecture.md) tracks the full list:
+
+- **Process-level attribution.** Today, "modified outside the agent" is inferred
+  from path/time correlation (FSEvents), so those findings drive `ask`, not
+  `deny`. Next: a signed EndpointSecurity client for exec/actor attribution, so
+  those findings can escalate from `ask` to `deny`.
+- **System-level network capture.** Today, network egress is observed from
+  hook/tool intent. Next: a privileged network sensor for full IP egress/ingress
+  capture, with process attribution back to agent sessions.
+- **Semantic enforcement.** Today, hook enforcement is deterministic and
+  path/tool based. Next: semantic prompt analysis on top of the deterministic
+  floor.
+- **Stronger confinement and recovery.** CPU/memory hard limits, automatic
+  rollback, merge-back review, deny-default policies, and container confinement
+  are on the way.
+
 ## Preliminary Benchmark Results
 
-Preliminary AgentCanary benchmark results show Gensee Crate improving defense
-rate across memory poisoning, long-horizon, and prompt-injection threat types
-with low runtime overhead.
+Preliminary internal AgentCanary runs show Gensee Crate improving defense rate
+across memory poisoning, long-horizon, and prompt-injection threat types with
+low runtime overhead. These are early internal results with methodology
+pending: the corpus, scoring harness, raw data, and per-threat sample counts
+are not yet published, so the figure below is not reproducible from this
+repository. [`bench/`](bench/README.md) currently covers PreToolUse hook
+latency only; a public reproduction kit is planned.
 
 ![Preliminary AgentCanary benchmark results](docs/images/preliminary-agentcanary-benchmark.png)
 
