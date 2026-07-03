@@ -358,11 +358,33 @@ decision and alert show up in the timeline:
 GENSEE_HOME="$PWD/.gensee-dev" gensee timeline
 ```
 
+## Roadmap
+
+Gensee Crate is macOS-first today, with Claude Code and Codex hook support,
+local policy enforcement, staged workspace runs, local telemetry, and a browser
+dashboard. Next directions include:
+
+- **Linux system enforcement:** eBPF, fanotify, seccomp, Landlock, AppArmor,
+  cgroup, and nftables-based visibility and enforcement for agents running
+  directly on Linux hosts.
+- **Endpoint Security-based macOS defense:** deeper host-level file, process,
+  and network visibility once the Apple Endpoint Security path is available.
+- **Sandbox support:** stronger `gensee run` confinement, staged writes, and
+  speculative or transactional execution for risky agent actions.
+- **ML-based policy and rules:** learning from controlled traces, blocked
+  actions, and bypass attempts to improve risk scoring and policy suggestions.
+- **Integrations:** support for more agents and security tooling, including
+  ChatGPT, Gemini, Cursor, GitHub Copilot, Omnigent, CrowdStrike, LLM gateways,
+  MCP servers, and audit/security workflow exports.
+
+See [`docs/roadmap.md`](docs/roadmap.md) for more detail.
+
 ## Documentation
 
 Full docs live in [`docs/`](docs/README.md):
 
 - [Architecture](docs/architecture.md) — the v0.1 wedge, workspace crates, and roadmap.
+- [Roadmap](docs/roadmap.md) — planned Linux enforcement, macOS Endpoint Security, sandbox, ML policy, and integration work.
 - [`gensee watch`](docs/watch.md) — sidecar filesystem and system-event audit, backends, and watch roots.
 - [`gensee run` and the macOS sandbox](docs/run-and-sandbox.md) — managed launch and staged workspaces.
 - [`gensee policy`](docs/gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.
