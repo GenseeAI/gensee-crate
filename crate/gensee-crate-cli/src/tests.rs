@@ -1334,8 +1334,8 @@ fn daemon_round_trip_returns_pretool_decision() {
     let sock = dir.join("rt.sock");
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).unwrap();
-    let store = std::sync::Arc::new(store);
-    let srv = std::sync::Arc::clone(&store);
+    let store = Arc::new(store);
+    let srv = Arc::clone(&store);
     let server = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
         serve_connection(stream, &srv).unwrap();
@@ -1405,8 +1405,8 @@ fn daemon_serves_userpromptsubmit_counter_context() {
     let sock = dir.join("ups.sock");
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).unwrap();
-    let store = std::sync::Arc::new(store);
-    let srv = std::sync::Arc::clone(&store);
+    let store = Arc::new(store);
+    let srv = Arc::clone(&store);
     let server = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
         serve_connection(stream, &srv).unwrap();

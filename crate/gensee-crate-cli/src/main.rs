@@ -20,7 +20,7 @@ pub(crate) use std::fs;
 pub(crate) use std::io::{self, BufRead, Read, Write};
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::process::{Command, Stdio};
-pub(crate) use std::sync::mpsc;
+pub(crate) use std::sync::{mpsc, Arc};
 pub(crate) use std::thread;
 pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

@@ -410,17 +410,26 @@ pub(crate) fn read_small_artifact_content_with_timeout(
     path: &str,
     timeout: Duration,
 ) -> io::Result<Option<ContentSnapshot>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let (sender, receiver) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_clone = Arc::clone(&cancelled);
     let path = path.to_string();
     thread::spawn(move || {
+        if cancelled_clone.load(Ordering::Relaxed) {
+            return;
+        }
         let _ = sender.send(read_small_artifact_content_blocking(&path));
     });
     match receiver.recv_timeout(timeout) {
         Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timed out reading artifact content",
-        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            cancelled.store(true, Ordering::Relaxed);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out reading artifact content",
+            ))
+        }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             Err(io::Error::other("artifact reader thread disconnected"))
         }
