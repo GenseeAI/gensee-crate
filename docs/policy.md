@@ -323,12 +323,13 @@ path/time correlation — FSEvents cannot attribute the actor — so these are
 
 Two classes of **agent-instruction artifact** are registries Gensee defends on
 both sides: **memory** artifacts (`CLAUDE.md`, `MEMORY.md`, `SOUL.md`,
-persona/config) and **skill/plugin** files. The skill registry is
+persona/config) and **skill/plugin/rule** files. The skill registry is
 **directory-scoped** — files under `.claude/skills/`, `.codex/skills/`,
-`.claude/plugins/`, `.codex/plugins/` (e.g. a poisoned `SKILL.md`) — *not* any
-file merely named `SKILL.md`, so a project doc that happens to be called
-`SKILL.md` is unaffected. Both classes carry instructions the agent will follow,
-so a poisoned one is a control-flow hijack.
+`.claude/plugins/`, `.codex/plugins/`, and Antigravity `.agents/`
+customization directories (e.g. a poisoned `SKILL.md` or `.agents/rules/*.md`)
+— *not* any file merely named `SKILL.md`, so a project doc that happens to be
+called `SKILL.md` is unaffected. Both classes carry instructions the agent will
+follow, so a poisoned one is a control-flow hijack.
 
 **Write-side (deterministic).** When the agent writes/edits — or reads — one of
 these artifacts, Gensee evaluates its content against the

@@ -118,6 +118,33 @@ configure_codex_hooks() {
   esac
 }
 
+configure_antigravity_hooks() {
+  local gensee_home="${GENSEE_HOME:-$HOME/.gensee}"
+  local should_configure="${GENSEE_CONFIGURE_ANTIGRAVITY:-}"
+
+  if [ "$should_configure" = "0" ]; then
+    return 0
+  fi
+
+  if [ "$should_configure" != "1" ]; then
+    if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+      return 0
+    fi
+    printf 'Configure Antigravity global hooks now? This is needed to enforce safety rules and will not affect normal Antigravity usage. It updates ~/.gemini/config/hooks.json and writes a backup. [Y/n] ' >/dev/tty
+    IFS= read -r should_configure </dev/tty || should_configure=""
+  fi
+
+  case "$should_configure" in
+    "" | 1 | y | Y | yes | YES)
+      info "Configuring Antigravity global hooks"
+      GENSEE_HOME="$gensee_home" gensee setup antigravity --yes --gensee-home "$gensee_home"
+      ANTIGRAVITY_HOOKS_CONFIGURED=1
+      ;;
+    *)
+      ;;
+  esac
+}
+
 configure_policy() {
   local gensee_home="${GENSEE_HOME:-$HOME/.gensee}"
   local policy_choice="${GENSEE_POLICY_SETUP:-}"
@@ -212,8 +239,10 @@ choose_gensee_home
 
 CLAUDE_HOOKS_CONFIGURED=0
 CODEX_HOOKS_CONFIGURED=0
+ANTIGRAVITY_HOOKS_CONFIGURED=0
 configure_claude_code_hooks
 configure_codex_hooks
+configure_antigravity_hooks
 POLICY_SETUP="default"
 configure_policy
 INSTALL_GENSEE_HOME="$GENSEE_HOME"
@@ -258,8 +287,8 @@ EOF
 else
   cat <<'EOF'
 Configure Claude Code hooks any time:
-  gensee setup claude-code
 EOF
+  printf '  GENSEE_HOME="%s" gensee setup claude-code --gensee-home "%s"\n' "$INSTALL_GENSEE_HOME" "$INSTALL_GENSEE_HOME"
 fi
 
 if [ "$CODEX_HOOKS_CONFIGURED" = "1" ]; then
@@ -269,11 +298,22 @@ EOF
 else
   cat <<'EOF'
 Configure Codex hooks any time:
-  gensee setup codex
 EOF
+  printf '  GENSEE_HOME="%s" gensee setup codex --gensee-home "%s"\n' "$INSTALL_GENSEE_HOME" "$INSTALL_GENSEE_HOME"
+fi
+
+if [ "$ANTIGRAVITY_HOOKS_CONFIGURED" = "1" ]; then
+  cat <<'EOF'
+Antigravity hooks are configured globally. Fully restart Antigravity before testing enforcement.
+EOF
+else
+  cat <<'EOF'
+Configure Antigravity global hooks any time:
+EOF
+  printf '  GENSEE_HOME="%s" gensee setup antigravity --gensee-home "%s"\n' "$INSTALL_GENSEE_HOME" "$INSTALL_GENSEE_HOME"
 fi
 
 cat <<'EOF'
 For non-interactive installs:
-  curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 bash
+  curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 bash
 EOF
