@@ -62,7 +62,12 @@
     "filename_prefixes": [],
     "filename_suffixes": [],
     "filename_contains": [],
-    "path_suffixes": ["/.vscode/tasks.json"],
+    "path_suffixes": [
+      "/.vscode/tasks.json",
+      "/.agents/hooks.json",
+      "/.gemini/config/hooks.json",
+      "/.gemini/config/mcp_config.json"
+    ],
     "path_contains": [
       "/.git/hooks/",
       "/library/launchagents/",
@@ -71,7 +76,11 @@
       "/.claude/plugins/",
       "/.claude/skills/",
       "/.codex/plugins/",
-      "/.codex/skills/"
+      "/.codex/skills/",
+      "/.agents/plugins/",
+      "/.agents/skills/",
+      "/.agents/rules/",
+      "/.gemini/config/sidecars/"
     ]
   },
 
@@ -90,7 +99,11 @@
         "/.claude/plugins/",
         "/.claude/skills/",
         "/.codex/plugins/",
-        "/.codex/skills/"
+        "/.codex/skills/",
+        "/.agents/plugins/",
+        "/.agents/skills/",
+        "/.agents/rules/",
+        "/.gemini/config/sidecars/"
       ]
     },
     "memory": {
@@ -113,7 +126,11 @@
         "/.claude/skills/",
         "/.codex/skills/",
         "/.claude/plugins/",
-        "/.codex/plugins/"
+        "/.codex/plugins/",
+        "/.agents/skills/",
+        "/.agents/plugins/",
+        "/.agents/rules/",
+        "/.gemini/antigravity/builtin/skills/"
       ]
     },
     "control_plane": {
@@ -122,9 +139,18 @@
       "filename_prefixes": [],
       "filename_suffixes": [],
       "filename_contains": [],
-      "path_suffixes": ["/.gensee/gensee.db", "/.omnigent"],
+      "path_suffixes": [
+        "/.gensee/gensee.db",
+        "/.omnigent",
+        "/.agents/hooks.json",
+        "/.gemini/config/hooks.json",
+        "/.gemini/config/mcp_config.json",
+        "/.gemini/antigravity/antigravity_state.pbtxt"
+      ],
       "path_contains": [
         "/.omnigent/",
+        "/.gemini/config/sidecars/",
+        "/.gemini/antigravity/knowledge/",
         "/gensee-crate-rules/policy/default-policy.json"
       ]
     }

@@ -308,6 +308,10 @@ pub(crate) fn build_hook_event(payload: &str, provider: &str) -> io::Result<Agen
         });
     };
 
+    if provider == PROVIDER_ANTIGRAVITY {
+        return build_antigravity_hook_event(value, observed_at_ms);
+    }
+
     let hook_event_name = v_str(&value, "hook_event_name");
     let top_level_permission_command = hook_event_name
         .as_deref()
@@ -348,11 +352,106 @@ pub(crate) fn build_hook_event(payload: &str, provider: &str) -> io::Result<Agen
     })
 }
 
+fn build_antigravity_hook_event(value: Value, observed_at_ms: u64) -> io::Result<AgentHookEvent> {
+    let hook_event_name = antigravity_event_name(&value);
+    let tool_call = value.get("toolCall");
+    let tool_name = tool_call
+        .and_then(|tool_call| tool_call.get("name"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let tool_input = tool_call.and_then(|tool_call| tool_call.get("args"));
+    let tool_input_command = tool_input
+        .and_then(|input| {
+            input
+                .get("CommandLine")
+                .or_else(|| input.get("command"))
+                .or_else(|| input.get("commandLine"))
+        })
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let cwd = tool_input
+        .and_then(|input| input.get("Cwd").or_else(|| input.get("cwd")))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("workspacePaths")
+                .and_then(Value::as_array)
+                .and_then(|paths| paths.first())
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(current_dir_string);
+
+    Ok(AgentHookEvent {
+        provider: PROVIDER_ANTIGRAVITY.to_string(),
+        session_id: v_str(&value, "conversationId")
+            .or_else(|| v_str(&value, "session_id"))
+            .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok()),
+        hook_event_name,
+        cwd,
+        transcript_path: v_str(&value, "transcriptPath"),
+        tool_name,
+        tool_use_id: value
+            .get("stepIdx")
+            .and_then(Value::as_u64)
+            .map(|idx| idx.to_string()),
+        tool_input_command,
+        tool_input_description: tool_input
+            .and_then(|input| {
+                input
+                    .get("Description")
+                    .or_else(|| input.get("description"))
+                    .or_else(|| input.get("Instruction"))
+            })
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        tool_response_stdout: None,
+        tool_response_stderr: value
+            .get("error")
+            .and_then(Value::as_str)
+            .filter(|error| !error.is_empty())
+            .map(ToString::to_string),
+        tool_response_interrupted: None,
+        duration_ms: None,
+        permission_mode: None,
+        effort_level: None,
+        observed_at_ms,
+        raw_json: serde_json::to_string(&value).map_err(io::Error::other)?,
+    })
+}
+
+fn antigravity_event_name(value: &Value) -> Option<String> {
+    if let Some(name) = v_str(value, "hookEventName").or_else(|| v_str(value, "hook_event_name")) {
+        return Some(name);
+    }
+
+    // Antigravity's documented payloads do not include an explicit event name,
+    // so classify by fields that are unique in the published schema. Order
+    // matters: Stop may include `error`, and PreToolUse also includes `stepIdx`.
+    if value.get("executionNum").is_some()
+        || value.get("terminationReason").is_some()
+        || value.get("fullyIdle").is_some()
+    {
+        return Some("Stop".to_string());
+    }
+    if value.get("invocationNum").is_some() || value.get("initialNumSteps").is_some() {
+        return Some("PreInvocation".to_string());
+    }
+    if value.get("toolCall").is_some() {
+        return Some("PreToolUse".to_string());
+    }
+    if value.get("stepIdx").is_some() || value.get("error").is_some() {
+        return Some("PostToolUse".to_string());
+    }
+    None
+}
+
 pub(crate) fn file_intents_from_hook(
     event: &AgentHookEvent,
     original_command: Option<&str>,
 ) -> Vec<FileIntent> {
-    if event.tool_name.as_deref() != Some("Bash") {
+    if !matches!(event.tool_name.as_deref(), Some("Bash" | "run_command")) {
         return Vec::new();
     }
 
@@ -389,6 +488,18 @@ pub(crate) fn file_intents_from_hook(
 /// to drive intent parsing (never persisted).
 pub(crate) fn original_bash_command(payload: &str) -> Option<String> {
     let value: Value = serde_json::from_str(payload).ok()?;
+    if let Some(command) = value
+        .get("toolCall")
+        .and_then(|tool_call| tool_call.get("args"))
+        .and_then(|args| {
+            args.get("CommandLine")
+                .or_else(|| args.get("command"))
+                .or_else(|| args.get("commandLine"))
+        })
+        .and_then(Value::as_str)
+    {
+        return Some(command.to_string());
+    }
     if v_str(&value, "tool_name").as_deref() == Some("Bash") {
         return v_nested_str(&value, "tool_input", "command");
     }

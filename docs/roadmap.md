@@ -1,9 +1,9 @@
 # Roadmap
 
-Gensee Crate is macOS-first today, with Claude Code and Codex hook support,
-local policy enforcement, staged workspace runs, local telemetry, and a browser
-dashboard. This roadmap is directional and may change as agent interfaces and
-operating-system controls evolve.
+Gensee Crate is macOS-first today, with Claude Code, Codex, and Antigravity hook
+support, local policy enforcement, staged workspace runs, local telemetry, and a
+browser dashboard. This roadmap is directional and may change as agent
+interfaces and operating-system controls evolve.
 
 ## Linux System Enforcement
 

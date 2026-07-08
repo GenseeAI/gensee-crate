@@ -1761,6 +1761,8 @@ mod tests {
         assert!(stray.iter().all(|f| f.rule_id != "policy_skill_integrity"));
         assert!(!policy.is_skill_artifact_path("/tmp/project/docs/SKILL.md"));
         assert!(policy.is_skill_artifact_path("/repo/.claude/skills/helper/SKILL.md"));
+        assert!(policy.is_skill_artifact_path("/repo/.agents/skills/helper/SKILL.md"));
+        assert!(policy.is_skill_artifact_path("/repo/.agents/rules/security.md"));
 
         // Memory poison still maps to the memory rule, not the skill rule.
         let mem = policy.evaluate_content(

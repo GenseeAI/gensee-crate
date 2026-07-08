@@ -57,7 +57,8 @@ export default defineConfig({
         text: 'Agent Integrations',
         items: [
           { text: 'Claude Code Hooks', link: '/claude-code-hooks' },
-          { text: 'Codex Hooks', link: '/codex-support' }
+          { text: 'Codex Hooks', link: '/codex-support' },
+          { text: 'Antigravity Support', link: '/antigravity-support' }
         ]
       },
       {

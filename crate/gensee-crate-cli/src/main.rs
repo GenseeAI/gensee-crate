@@ -34,9 +34,13 @@ pub(crate) const ARTIFACT_FACT_RECENT_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 pub(crate) const TIMELINE_PROCESS_DISPLAY_LIMIT: usize = 20;
 pub(crate) const PROVIDER_CLAUDE_CODE: &str = "claude-code";
 pub(crate) const PROVIDER_CODEX: &str = "codex";
+pub(crate) const PROVIDER_ANTIGRAVITY: &str = "antigravity";
 
 pub(crate) fn is_supported_provider(provider: &str) -> bool {
-    matches!(provider, PROVIDER_CLAUDE_CODE | PROVIDER_CODEX)
+    matches!(
+        provider,
+        PROVIDER_CLAUDE_CODE | PROVIDER_CODEX | PROVIDER_ANTIGRAVITY
+    )
 }
 
 mod policy_eval;
@@ -176,9 +180,10 @@ pub(crate) fn handle_hook(args: Vec<OsString>) -> io::Result<()> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("claude-code") => handle_agent_hook(PROVIDER_CLAUDE_CODE),
         Some("codex") => handle_agent_hook(PROVIDER_CODEX),
+        Some("antigravity") => handle_agent_hook(PROVIDER_ANTIGRAVITY),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee hook <claude-code|codex>",
+            "usage: gensee hook <claude-code|codex|antigravity>",
         )),
     }
 }
@@ -187,9 +192,10 @@ pub(crate) fn handle_setup(args: Vec<OsString>) -> io::Result<()> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("claude-code") => setup_claude_code(args[1..].to_vec()),
         Some("codex") => setup_codex(args[1..].to_vec()),
+        Some("antigravity") => setup_antigravity(args[1..].to_vec()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee setup <claude-code|codex> [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
+            "usage: gensee setup <claude-code|codex|antigravity> [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
         )),
     }
 }
@@ -368,6 +374,85 @@ fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
     println!("gensee setup: open /hooks in Codex to review and trust this hook command.");
     println!("gensee setup: re-trust the hook whenever the command or binary path changes.");
     Ok(())
+}
+
+fn setup_antigravity(args: Vec<OsString>) -> io::Result<()> {
+    let mut hooks_path = default_antigravity_hooks_path()?;
+    let mut gensee_home = env::var_os("GENSEE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(default_root()?);
+    let mut bin_path = env::current_exe()?;
+
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
+        })?;
+        match arg {
+            "--yes" => {
+                index += 1;
+            }
+            "--gensee-home" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "setup: --gensee-home requires a path",
+                    )
+                })?;
+                gensee_home = PathBuf::from(value);
+                index += 2;
+            }
+            "--hooks" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "setup: --hooks requires a path",
+                    )
+                })?;
+                hooks_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--bin" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "setup: --bin requires a path")
+                })?;
+                bin_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: gensee setup antigravity [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                );
+                return Ok(());
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("setup: unknown argument `{arg}`"),
+                ));
+            }
+        }
+    }
+
+    gensee_home = absolutize_for_hook(&gensee_home)?;
+    bin_path = absolutize_for_hook(&bin_path)?;
+    let command = antigravity_hook_command(&gensee_home, &bin_path);
+    write_antigravity_hook_settings(&hooks_path, &command)?;
+
+    println!(
+        "gensee setup: configured Antigravity hooks in {}",
+        hooks_path.display()
+    );
+    println!("gensee setup: hook command: {command}");
+    println!("gensee setup: restart Antigravity before testing enforcement.");
+    Ok(())
+}
+
+fn default_antigravity_hooks_path() -> io::Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    Ok(home.join(".gemini").join("config").join("hooks.json"))
 }
 
 #[derive(Debug, Default)]
@@ -552,6 +637,40 @@ fn write_codex_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()>
     Ok(())
 }
 
+fn write_antigravity_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()> {
+    let mut root = if hooks_path.exists() {
+        let contents = fs::read_to_string(hooks_path)?;
+        if contents.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&contents).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not valid JSON: {err}", hooks_path.display()),
+                )
+            })?
+        }
+    } else {
+        json!({})
+    };
+    apply_antigravity_hook_settings(&mut root, command)?;
+
+    if let Some(parent) = hooks_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if hooks_path.exists() {
+        let backup = backup_path(hooks_path)?;
+        fs::copy(hooks_path, &backup)?;
+        println!(
+            "gensee setup: backed up previous hooks to {}",
+            backup.display()
+        );
+    }
+    let serialized = serde_json::to_string_pretty(&root)?;
+    fs::write(hooks_path, format!("{serialized}\n"))?;
+    Ok(())
+}
+
 fn apply_claude_code_hook_settings(root: &mut Value, command: &str) -> io::Result<()> {
     let root_object = root.as_object_mut().ok_or_else(|| {
         io::Error::new(
@@ -622,6 +741,52 @@ fn apply_codex_hook_settings(root: &mut Value, command: &str) -> io::Result<()> 
     Ok(())
 }
 
+fn apply_antigravity_hook_settings(root: &mut Value, command: &str) -> io::Result<()> {
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Antigravity hooks must be a JSON object",
+        )
+    })?;
+    root_object.insert(
+        "gensee-policy".to_string(),
+        json!({
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": command,
+                            "timeout": 30
+                        }
+                    ]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": command,
+                            "timeout": 30
+                        }
+                    ]
+                }
+            ],
+            "PreInvocation": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "timeout": 30
+                }
+            ]
+        }),
+    );
+    Ok(())
+}
+
 fn claude_code_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
     format!(
         "GENSEE_HOME={} {} hook claude-code",
@@ -633,6 +798,14 @@ fn claude_code_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
 fn codex_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
     format!(
         "GENSEE_HOME={} {} hook codex",
+        shell_quote(&gensee_home.display().to_string()),
+        shell_quote(&bin_path.display().to_string())
+    )
+}
+
+fn antigravity_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
+    format!(
+        "GENSEE_HOME={} {} hook antigravity",
         shell_quote(&gensee_home.display().to_string()),
         shell_quote(&bin_path.display().to_string())
     )
@@ -2009,7 +2182,29 @@ pub(crate) fn process_hook_event(
             original_command.as_deref(),
             store,
         )?;
-        Ok(None)
+        if event.provider == PROVIDER_ANTIGRAVITY {
+            Ok(Some(json!({}).to_string()))
+        } else {
+            Ok(None)
+        }
+    } else if event.provider == PROVIDER_ANTIGRAVITY
+        && event.hook_event_name.as_deref() == Some("PreInvocation")
+    {
+        let findings = memory_integrity_findings(event);
+        let already_notified = event
+            .session_id
+            .as_deref()
+            .map(|session_id| store.session_has_alert(session_id, "policy_memory_poison_detected"))
+            .transpose()?
+            .unwrap_or(false);
+        if findings.is_empty() || already_notified {
+            Ok(Some(json!({}).to_string()))
+        } else {
+            for finding in &findings {
+                store.append_policy_alert(&finding.to_policy_alert(event))?;
+            }
+            Ok(Some(antigravity_preinvocation_poison_json()))
+        }
     } else if event.hook_event_name.as_deref() == Some("UserPromptSubmit") {
         // Session-integrity scan for context-injected poison. The framework
         // auto-loads CLAUDE.md/MEMORY.md/SOUL.md and skills into the prompt
@@ -2036,6 +2231,10 @@ pub(crate) fn process_hook_event(
             }
             Ok(Some(userprompt_poison_context_json()))
         }
+    } else if event.provider == PROVIDER_ANTIGRAVITY
+        && event.hook_event_name.as_deref() == Some("Stop")
+    {
+        Ok(Some(json!({ "decision": "allow" }).to_string()))
     } else {
         Ok(None)
     }
@@ -2123,6 +2322,6 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 
 pub(crate) fn print_usage() {
     println!(
-        "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee session list"
+        "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee session list"
     );
 }

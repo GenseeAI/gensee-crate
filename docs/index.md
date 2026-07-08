@@ -4,7 +4,7 @@ layout: home
 hero:
   name: Gensee Crate
   text: Full-stack, long-horizon runtime safety<br>for AI coding agents.
-  tagline: Gensee Crate watches system events,<br>requests, tool calls, skills, and memory<br>behind Claude Code and Codex.
+  tagline: Gensee Crate watches system events,<br>requests, tool calls, skills, and memory<br>behind Claude Code, Codex, and Antigravity.
   image:
     src: /gensee-crate-defense-in-depth.png
     alt: Gensee Crate defense-in-depth architecture
@@ -32,10 +32,10 @@ features:
     details: Use managed macOS sandboxing and staged workspace review when you want Gensee to launch the agent.
     link: /run-and-sandbox
     linkText: Use gensee run
-  - title: Connect Agent Hooks
-    details: Wire Claude Code or Codex into the same timeline so tool requests and runtime effects are evaluated together.
+  - title: Connect Agent Surfaces
+    details: Wire Claude Code, Codex, and Antigravity hooks into the same timeline, with sidecar coverage for unmanaged runs.
     link: /claude-code-hooks
-    linkText: Configure hooks
+    linkText: Configure integrations
   - title: Trace Long-Horizon Behavior
     details: Link prompts, tool calls, file effects, artifacts, alerts, and review verdicts for post-run inspection.
     link: /lineage-graph

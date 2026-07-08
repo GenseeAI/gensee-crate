@@ -141,7 +141,8 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
 
     if !alerts.is_empty() {
         println!("Policy alerts");
-        for alert in alerts.iter().rev().take(40).rev() {
+        let display_alerts = dedupe_policy_alerts(&alerts);
+        for alert in display_alerts.iter().rev().take(40).rev() {
             println!(
                 "  {} | severity={} | action={} | rule={} | request={}{} | {}",
                 alert.created_at,
@@ -281,7 +282,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
             }
             if !call.policy_alerts.is_empty() {
                 println!("    policy:");
-                for alert in &call.policy_alerts {
+                for alert in dedupe_policy_alerts(&call.policy_alerts) {
                     println!(
                         "      action={} severity={} rule={}{} | {}",
                         alert.action,
@@ -993,6 +994,7 @@ pub(crate) fn compact_tool_calls(
     for call in &mut calls {
         call.policy_alerts
             .sort_by_key(|alert| (alert.created_at, alert.alert_id));
+        call.policy_alerts = dedupe_policy_alerts(&call.policy_alerts);
     }
 
     for event in system_events {
@@ -1034,6 +1036,27 @@ pub(crate) fn compact_tool_calls(
     }
 
     calls
+}
+
+fn dedupe_policy_alerts(alerts: &[AlertRecord]) -> Vec<AlertRecord> {
+    let mut deduped = Vec::new();
+    for alert in alerts {
+        let tool_use_id = alert_tool_use_id(alert);
+        if deduped.iter().any(|existing: &AlertRecord| {
+            existing.session_id == alert.session_id
+                && alert_tool_use_id(existing) == tool_use_id
+                && existing.request_id == alert.request_id
+                && existing.action == alert.action
+                && existing.severity == alert.severity
+                && existing.rule_id == alert.rule_id
+                && existing.path == alert.path
+                && existing.message == alert.message
+        }) {
+            continue;
+        }
+        deduped.push(alert.clone());
+    }
+    deduped
 }
 
 pub(crate) fn is_tool_use_hook(hook: &AgentHookEvent) -> bool {

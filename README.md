@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
+  Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
   It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS.
   Real-time enforcement happens within chat interface of the coding agents, while offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
 </p>
@@ -77,10 +77,11 @@ lets you keep the bundled default policy or create an editable local policy:
 curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | bash
 ```
 
-For non-interactive installs that should configure Claude Code and Codex hooks:
+For non-interactive installs that should configure Claude Code, Codex, and
+Antigravity hooks:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 bash
+curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 bash
 ```
 
 <details>
@@ -102,12 +103,29 @@ cargo install --path crate/gensee-crate-cli   # puts `gensee` on PATH
 ```
 
 Gensee stores its local state under `~/.gensee` by default. Set `GENSEE_HOME` to
-override it, and use the **same** `GENSEE_HOME` for `watch`, hooks, and
-`timeline` so the signals appear together:
+override it, and use the **same** `GENSEE_HOME` for `watch`, hooks, `run`,
+`timeline`, and the dashboard so the signals appear together. `GENSEE_HOME` is
+the Gensee data store, not the agent project/workspace folder:
 
 ```bash
 export GENSEE_HOME="$HOME/.gensee"
 ```
+
+For hook-based agents, there are two paths to keep straight:
+
+- `GENSEE_HOME`: where Gensee records hooks, alerts, timelines, policies, and
+  dashboard data. Use the same value across Claude Code, Codex, Antigravity,
+  Omnigent sidecars, `gensee watch`, `gensee timeline`, and the dashboard when
+  you want one combined view.
+- agent workspace/config path: where the agent looks for its hook settings.
+  Claude Code uses `~/.claude/settings.json`, Codex uses `~/.codex/hooks.json`,
+  and Antigravity defaults to global `~/.gemini/config/hooks.json`. Antigravity
+  also supports workspace-local `.agents/hooks.json` when you pass `--hooks`.
+
+Avoid pointing `GENSEE_HOME` at the project workspace root. A repo-local store
+such as `$PWD/.gensee-dev` is convenient for development, while
+`$HOME/.gensee-<agent>` is better for long-running sidecars such as Omnigent so
+Gensee does not watch its own store writes.
 
 The local store can include redacted prompts, commands, paths, policy alerts,
 and lineage data. Fresh telemetry stores are encrypted at rest by default with a
@@ -124,7 +142,8 @@ stores.
 <summary>Toolchain and prerequisites (if the installer reports a missing tool)</summary>
 
 - macOS. v0.1 supports macOS only; Linux and Windows support are planned.
-- Claude Code or Codex for hook-based enforcement. Other agents are planned.
+- Claude Code, Codex, or Antigravity for hook-based enforcement. Other agents
+  are planned.
 - Rust toolchain (`cargo`) and `jq`.
 
 Install the required command-line tools on macOS:
@@ -145,8 +164,8 @@ brew install jq
 
 To capture prompt/tool intent and enforce the [safety policy](docs/policy.md),
 configure your agent's hooks to call the matching `gensee hook` endpoint. The
-installer offers to do this for you. To run the setup step later for Claude
-Code:
+installer offers Claude Code, Codex, and Antigravity setup. To run the setup
+step later for Claude Code:
 
 ```bash
 gensee setup claude-code --gensee-home "$GENSEE_HOME"
@@ -184,20 +203,39 @@ Or for Codex:
 gensee setup codex --gensee-home "$GENSEE_HOME"
 ```
 
+Or for global Antigravity hooks:
+
+```bash
+gensee setup antigravity --gensee-home "$GENSEE_HOME"
+```
+
+For workspace-local Antigravity hooks instead, pass an explicit workspace hook
+path:
+
+```bash
+gensee setup antigravity \
+  --gensee-home "$GENSEE_HOME" \
+  --hooks /path/to/workspace/.agents/hooks.json
+```
+
 If you are running from a source checkout instead of an installed binary:
 
 ```bash
 ./target/debug/gensee setup claude-code --gensee-home "$GENSEE_HOME"
 ./target/debug/gensee setup codex --gensee-home "$GENSEE_HOME"
+./target/debug/gensee setup antigravity --gensee-home "$GENSEE_HOME"
 ```
 
 The setup commands back up the previous hook settings, update
-`~/.claude/settings.json` or `~/.codex/hooks.json`, and use the absolute path to
-the `gensee` binary you invoked. Fully restart Claude Code after configuring
-Claude Code hooks. Open `/hooks` in Codex to review and trust the hook command
-before testing enforcement. Full manual config and what gets recorded (plus
-redaction details) are in [`docs/claude-code-hooks.md`](docs/claude-code-hooks.md)
-and [`docs/codex-support.md`](docs/codex-support.md).
+`~/.claude/settings.json`, `~/.codex/hooks.json`, or
+`~/.gemini/config/hooks.json` by default, and use the absolute path to the
+`gensee` binary you invoked. Fully restart Claude Code or Antigravity after
+changing hook config. Open `/hooks` in Codex to review and trust the hook
+command before testing enforcement. Full manual config and what gets recorded
+(plus redaction details) are in
+[`docs/claude-code-hooks.md`](docs/claude-code-hooks.md),
+[`docs/codex-support.md`](docs/codex-support.md), and
+[`docs/antigravity-support.md`](docs/antigravity-support.md).
 
 </details>
 
@@ -360,9 +398,9 @@ GENSEE_HOME="$PWD/.gensee-dev" gensee timeline
 
 ## Roadmap
 
-Gensee Crate is macOS-first today, with Claude Code and Codex hook support,
-local policy enforcement, staged workspace runs, local telemetry, and a browser
-dashboard. Next directions include:
+Gensee Crate is macOS-first today, with Claude Code, Codex, and Antigravity hook
+support, local policy enforcement, staged workspace runs, local telemetry, and a
+browser dashboard. Next directions include:
 
 - **Linux system enforcement:** eBPF, fanotify, seccomp, Landlock, AppArmor,
   cgroup, and nftables-based visibility and enforcement for agents running
@@ -390,6 +428,7 @@ Full docs live in [`docs/`](docs/README.md):
 - [`gensee policy`](docs/gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.
 - [Claude Code hooks](docs/claude-code-hooks.md) — wiring Claude Code prompts and tool intent into Gensee.
 - [Codex hooks](docs/codex-support.md) — wiring Codex prompts and tool intent into Gensee.
+- [Antigravity support](docs/antigravity-support.md) — wiring Antigravity hooks and `.agents` customizations into Gensee.
 - [Omnigent integration](integrations/omnigent/README.md) — thin sidecar/managed-run support and the deeper policy-bridge plan.
 - [Safety policy](docs/policy.md) — the data-driven allow/ask/deny engine and `gensee policy` workflow.
 - [SQLite lineage graph](docs/lineage-graph.md) — the provenance schema and example queries.
