@@ -7,3 +7,6 @@ repository.workspace = true
 
 [dependencies]
 gensee-crate-core = { path = "../gensee-crate-core" }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

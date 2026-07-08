@@ -49,6 +49,7 @@ export default defineConfig({
         items: [
           { text: 'gensee watch', link: '/watch' },
           { text: 'gensee run', link: '/run-and-sandbox' },
+          { text: 'Linux Host Support', link: '/linux' },
           { text: 'Policy CLI', link: '/gensee-policy' },
           { text: 'Safety Policy', link: '/policy' }
         ]

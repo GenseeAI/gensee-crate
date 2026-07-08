@@ -8,6 +8,7 @@ quick start, then dive into the topic guides below.
 
 - [Architecture](architecture.md) — the v0.1 wedge, workspace crates, and roadmap.
 - [Roadmap](roadmap.md) — planned Linux enforcement, macOS Endpoint Security, sandbox, ML policy, and integration work.
+- [Linux host support](linux.md) — experimental `/proc` process attribution, fanotify sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress controls, and Linux capability planning.
 - [`gensee watch` (sidecar)](watch.md) — observe filesystem effects and macOS system events without launching the agent.
 - [`gensee run` and the macOS sandbox](run-and-sandbox.md) — managed launch with `sandbox-exec` confinement and staged workspaces.
 - [`gensee policy`](gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.

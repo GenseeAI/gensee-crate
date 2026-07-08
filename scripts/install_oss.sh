@@ -188,20 +188,35 @@ configure_policy() {
 
 print_banner
 
-if [ "$(uname -s)" != "Darwin" ]; then
-  printf 'Gensee Crate v0.1 currently supports macOS only.\n' >&2
-  exit 1
-fi
+OS_NAME="$(uname -s)"
 
 if ! command -v curl >/dev/null 2>&1; then
   printf 'curl is required to install Gensee Crate.\n' >&2
   exit 1
 fi
 
-if ! xcode-select -p >/dev/null 2>&1; then
-  info "Installing Xcode Command Line Tools"
-  xcode-select --install || true
-  printf 'After the Xcode Command Line Tools installer finishes, rerun this command.\n'
+if [ "$OS_NAME" = "Darwin" ]; then
+  if ! xcode-select -p >/dev/null 2>&1; then
+    info "Installing Xcode Command Line Tools"
+    xcode-select --install || true
+    printf 'After the Xcode Command Line Tools installer finishes, rerun this command.\n'
+    exit 1
+  fi
+elif [ "$OS_NAME" = "Linux" ]; then
+  warn "Linux support is experimental. The installer will install the CLI, but privileged fanotify/nftables controls may need additional host setup."
+  if command -v apt-get >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1; then
+      info "Installing Linux build and runtime prerequisites"
+      sudo apt-get update
+      sudo apt-get install -y build-essential pkg-config libssl-dev jq nftables git
+    else
+      warn "sudo is not available. Install prerequisites manually: apt-get install build-essential pkg-config libssl-dev jq nftables git"
+    fi
+  else
+    warn "Automatic Linux prerequisite install currently supports apt-get only. Install Rust build tools, pkg-config, OpenSSL headers, jq, nftables, and git with your distro package manager."
+  fi
+else
+  printf 'Gensee Crate currently supports macOS and experimental Linux hosts.\n' >&2
   exit 1
 fi
 
@@ -221,11 +236,11 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
-  if command -v brew >/dev/null 2>&1; then
+  if [ "$OS_NAME" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
     info "Installing jq"
     brew install jq
   else
-    warn "jq is not installed. Install Homebrew and run 'brew install jq' before configuring agent hooks."
+    warn "jq is not installed. Install jq before configuring agent hooks."
   fi
 fi
 

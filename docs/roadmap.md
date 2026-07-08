@@ -2,21 +2,38 @@
 
 Gensee Crate is macOS-first today, with Claude Code, Codex, and Antigravity hook
 support, local policy enforcement, staged workspace runs, local telemetry, and a
-browser dashboard. This roadmap is directional and may change as agent
-interfaces and operating-system controls evolve.
+browser dashboard. Linux host support is now experimental, with `/proc` process
+attribution, capability planning, an initial fanotify sensitive-path permission
+backend, a seccomp launcher profile, and cgroup-scoped nftables egress controls.
+This roadmap is directional and may change as agent interfaces and
+operating-system controls evolve.
 
 ## Linux System Enforcement
 
 Gensee Crate's Linux support will focus on agents running directly on developer
 machines, not only inside containers.
 
-Planned work includes:
+Available experimentally:
 
 - Process-tree attribution for Claude Code, Codex, Omnigent, and other local
-  agents.
-- Linux-native file, process, and network monitoring.
-- Sensitive-path protection for credentials, SSH keys, cloud configs, `.env`
-  files, and policy-controlled project files.
+  agents through `/proc`.
+- Host capability and enforcement planning through `gensee linux status` and
+  `gensee linux plan`.
+- Fanotify permission enforcement for supported sensitive-path exact paths and
+  prefix roots such as `~/.ssh/**`.
+- Seccomp launcher profiles through `gensee linux exec-seccomp -- <agent>` to
+  hard-deny dangerous syscall families such as `ptrace`, `bpf`, kernel module
+  loading, mount changes, and namespace switching.
+- Cgroup/nftables egress controls through `gensee linux network-plan` and
+  `gensee linux network-apply`, scoped to a cgroup v2 agent process tree and
+  IP/CIDR allowlists or deny-all mode.
+
+Planned work includes:
+
+- Linux-native eBPF file, process, and network monitoring.
+- Broader sensitive-path protection for credentials, SSH keys, cloud configs,
+  `.env` files, and policy-controlled project files, including recursive
+  suffix-pattern coverage.
 - Layered enforcement using Linux primitives such as eBPF, fanotify, seccomp,
   Landlock, AppArmor, cgroups, and nftables where available.
 - Local audit trails that connect agent intent, process activity, file access,

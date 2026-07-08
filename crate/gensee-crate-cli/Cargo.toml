@@ -20,6 +20,7 @@ bench-breakdown = ["bench"]
 [dependencies]
 gensee-crate-attribution = { path = "../gensee-crate-attribution" }
 gensee-crate-core = { path = "../gensee-crate-core" }
+gensee-crate-linux = { path = "../gensee-crate-linux" }
 gensee-crate-rules = { path = "../gensee-crate-rules" }
 gensee-crate-store = { path = "../gensee-crate-store" }
 serde = { workspace = true }

@@ -9,15 +9,15 @@
 
 <p align="center">
   Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
-  It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS.
-  Real-time enforcement happens within chat interface of the coding agents, while offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
+  It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS and, experimentally, Linux.
+  Real-time enforcement happens within chat interface of the coding agents, with early Linux system-level file, syscall, and network enforcement available through fanotify, seccomp, cgroups, and nftables, while offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" /></a>
   <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange.svg" />
   <img alt="Rust: stable" src="https://img.shields.io/badge/rust-stable-blue.svg" />
-  <img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS--first-lightgrey.svg" />
+  <img alt="Platform: macOS first, Linux experimental" src="https://img.shields.io/badge/platform-macOS--first%20%7C%20Linux--experimental-lightgrey.svg" />
 </p>
 
 <p align="center">
@@ -87,6 +87,29 @@ curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/
 <details>
 <summary>Prefer to install manually?</summary>
 
+Install platform prerequisites first.
+
+On macOS:
+
+```bash
+xcode-select --install
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+brew install jq
+```
+
+On Ubuntu/Debian Linux:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libssl-dev jq nftables git
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
 Build the CLI from source:
 
 ```bash
@@ -141,10 +164,13 @@ stores.
 <details>
 <summary>Toolchain and prerequisites (if the installer reports a missing tool)</summary>
 
-- macOS. v0.1 supports macOS only; Linux and Windows support are planned.
+- macOS for the stable v0.1 path. Linux host support is experimental and
+  currently focused on `/proc` process attribution, fanotify sensitive-path
+  enforcement, seccomp launcher profiles, and cgroup/nftables network controls.
 - Claude Code, Codex, or Antigravity for hook-based enforcement. Other agents
   are planned.
 - Rust toolchain (`cargo`) and `jq`.
+- On Linux: build tools, `pkg-config`, OpenSSL headers, `nftables`, and `git`.
 
 Install the required command-line tools on macOS:
 
@@ -155,6 +181,16 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 
 brew install jq
+```
+
+Install the required command-line tools on Ubuntu/Debian Linux:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libssl-dev jq nftables git
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
 ```
 
 </details>
@@ -278,6 +314,21 @@ If you use `--system-events eslogger` on macOS, open Apple menu > System Setting
 gensee run -- claude # or: gensee run -- codex
 ```
 
+- **Experimental Linux host controls:** inspect Linux host capabilities, monitor
+  a direct agent process tree through `/proc`, run the fanotify sensitive-path
+  permission backend, launch an agent under a seccomp hard-deny syscall profile,
+  and plan/apply cgroup-scoped nftables egress controls on Linux.
+
+```bash
+gensee linux status --json
+gensee linux plan --json
+gensee linux monitor --pid <agent-root-pid> --json
+gensee linux seccomp-profile --json
+gensee linux exec-seccomp -- claude
+gensee linux network-plan --session-id claude-1 --allow 10.0.0.0/8 --json
+sudo gensee linux fanotify-once --json
+```
+
 For orchestration frameworks such as Omnigent, use the same primitives as a
 thin outer safety layer:
 
@@ -293,8 +344,9 @@ gensee run list   # list guarded run sessions and staged workspaces
 gensee timeline   # show prompts, tool intent, file effects, and policy decisions
 ```
 
-See [`docs/watch.md`](docs/watch.md) and
-[`docs/run-and-sandbox.md`](docs/run-and-sandbox.md) for the full options.
+See [`docs/watch.md`](docs/watch.md),
+[`docs/run-and-sandbox.md`](docs/run-and-sandbox.md), and
+[`docs/linux.md`](docs/linux.md) for the full options.
 
 ### 3. Open the dashboard
 
@@ -402,9 +454,10 @@ Gensee Crate is macOS-first today, with Claude Code, Codex, and Antigravity hook
 support, local policy enforcement, staged workspace runs, local telemetry, and a
 browser dashboard. Next directions include:
 
-- **Linux system enforcement:** eBPF, fanotify, seccomp, Landlock, AppArmor,
-  cgroup, and nftables-based visibility and enforcement for agents running
-  directly on Linux hosts.
+- **Linux system enforcement:** early `/proc` process attribution, fanotify
+  sensitive-path enforcement, seccomp launcher profiles, and cgroup/nftables
+  egress controls are available experimentally; eBPF, Landlock, and AppArmor
+  work remains in progress.
 - **Endpoint Security-based macOS defense:** deeper host-level file, process,
   and network visibility once the Apple Endpoint Security path is available.
 - **Sandbox support:** stronger `gensee run` confinement, staged writes, and
@@ -423,6 +476,9 @@ Full docs live in [`docs/`](docs/README.md):
 
 - [Architecture](docs/architecture.md) — the v0.1 wedge, workspace crates, and roadmap.
 - [Roadmap](docs/roadmap.md) — planned Linux enforcement, macOS Endpoint Security, sandbox, ML policy, and integration work.
+- [Linux host support](docs/linux.md) — experimental `/proc` monitoring,
+  fanotify sensitive-path enforcement, seccomp launcher profiles,
+  cgroup/nftables egress controls, and the Linux enforcement plan.
 - [`gensee watch`](docs/watch.md) — sidecar filesystem and system-event audit, backends, and watch roots.
 - [`gensee run` and the macOS sandbox](docs/run-and-sandbox.md) — managed launch and staged workspaces.
 - [`gensee policy`](docs/gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.

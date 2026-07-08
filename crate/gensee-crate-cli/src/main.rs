@@ -81,7 +81,7 @@ pub(crate) fn run_cli() -> io::Result<()> {
         .first()
         .and_then(|arg| arg.to_str())
         .map(ToString::to_string);
-    if let Some(command_name) = command.as_deref() {
+    if let Some(command_name) = command.as_deref().filter(|name| *name != "linux") {
         telemetry_bootstrap_for_command(command_name);
     }
 
@@ -136,6 +136,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             args.remove(0);
             handle_policy(args)
         }
+        Some("linux") => {
+            args.remove(0);
+            handle_linux(args)
+        }
         Some("feedback") => {
             args.remove(0);
             handle_feedback(args)
@@ -174,6 +178,380 @@ pub(crate) fn run_cli() -> io::Result<()> {
             format!("unknown command: {other}"),
         )),
     }
+}
+
+pub(crate) fn handle_linux(args: Vec<OsString>) -> io::Result<()> {
+    let json_output = has_arg(&args, "--json");
+    let subcommand = args
+        .iter()
+        .filter_map(|arg| arg.to_str())
+        .find(|arg| !arg.starts_with('-'))
+        .unwrap_or("status");
+
+    match subcommand {
+        "status" => {
+            let report = gensee_crate_linux::LinuxCapabilityReport::detect();
+            if json_output {
+                print_json(&report)
+            } else {
+                println!("Linux capability status");
+                print_bool("AppArmor enabled", report.apparmor_enabled);
+                print_bool("SELinux enabled", report.selinux_enabled);
+                print_bool("Landlock available", report.landlock_available);
+                print_bool("bpffs mounted", report.bpf_fs_mounted);
+                print_bool("BPF LSM enabled", report.bpf_lsm_enabled);
+                print_bool("cgroup v2 mounted", report.cgroup_v2_mounted);
+                print_bool("fanotify available", report.fanotify_available);
+                print_bool("seccomp filter available", report.seccomp_filter_available);
+                print_bool("nft available", report.nft_available);
+                print_bool("running as root", report.running_as_root);
+                println!("speculation backends:");
+                if report.speculation_backends.is_empty() {
+                    println!("  - none");
+                } else {
+                    for backend in report.speculation_backends {
+                        println!("  - {backend:?}");
+                    }
+                }
+                Ok(())
+            }
+        }
+        "plan" => {
+            let capabilities = gensee_crate_linux::LinuxCapabilityReport::detect();
+            let policy = gensee_crate_linux::LinuxPolicy::default();
+            let plan = policy.plan(&capabilities);
+            if json_output {
+                print_json(&plan)
+            } else {
+                println!("Linux enforcement plan");
+                println!("mode: {:?}", plan.mode);
+                println!("components:");
+                for component in plan.components {
+                    println!("  - {component:?}");
+                }
+                if !plan.warnings.is_empty() {
+                    println!("warnings:");
+                    for warning in plan.warnings {
+                        println!("  - {warning}");
+                    }
+                }
+                println!("speculation:");
+                println!("  requested: {}", plan.speculation.requested);
+                println!("  available: {}", plan.speculation.available);
+                match plan.speculation.selected_backend {
+                    Some(backend) => println!("  selected backend: {backend:?}"),
+                    None => println!("  selected backend: none"),
+                }
+                println!("  available backends:");
+                if plan.speculation.available_backends.is_empty() {
+                    println!("    - none");
+                } else {
+                    for backend in plan.speculation.available_backends {
+                        println!("    - {backend:?}");
+                    }
+                }
+                Ok(())
+            }
+        }
+        "monitor" => {
+            let pid = linux_arg_value(&args, "--pid")
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "usage: gensee linux monitor --pid <pid> [--session-id <id>] [--json]",
+                    )
+                })?
+                .parse::<u32>()
+                .map_err(|err| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("invalid --pid: {err}"))
+                })?;
+            let session_id =
+                linux_arg_value(&args, "--session-id").unwrap_or_else(|| format!("linux-{pid}"));
+            let session = gensee_crate_linux::LinuxSessionTarget::from_pid(session_id, pid)?;
+            let mut monitor = gensee_crate_linux::LinuxAuditMonitor::with_config(
+                gensee_crate_linux::LinuxMonitorConfig {
+                    session: Some(session),
+                    enable_exec_events: true,
+                    enable_file_events: false,
+                    enable_network_events: false,
+                },
+            );
+            let events = monitor.poll_events()?;
+            if json_output {
+                print_json(&events)
+            } else {
+                println!("Linux process monitor events");
+                for event in events {
+                    println!(
+                        "pid={} ppid={} process={} command={}",
+                        option_u32_display(event.pid),
+                        option_u32_display(event.ppid),
+                        event.process_name.as_deref().unwrap_or("unknown"),
+                        event.command_line.as_deref().unwrap_or("")
+                    );
+                }
+                Ok(())
+            }
+        }
+        "fanotify-plan" => {
+            let plan = gensee_crate_linux::plan_fanotify_marks(
+                &gensee_crate_linux::LinuxPolicy::default(),
+            );
+            if json_output {
+                print_json(&plan)
+            } else {
+                println!("Linux fanotify mark plan");
+                println!("marks:");
+                for mark in plan.marks {
+                    println!(
+                        "  - {}{}",
+                        mark.path,
+                        if mark.include_children { "/**" } else { "" }
+                    );
+                }
+                if !plan.warnings.is_empty() {
+                    println!("warnings:");
+                    for warning in plan.warnings {
+                        println!("  - {warning}");
+                    }
+                }
+                Ok(())
+            }
+        }
+        "fanotify-once" => {
+            let mut enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(
+                gensee_crate_linux::LinuxFanotifyConfig::new(
+                    gensee_crate_linux::LinuxPolicy::default(),
+                ),
+            )?;
+            let status = enforcer.status();
+            let events = enforcer.handle_events_once()?;
+            if json_output {
+                print_json(&json!({
+                    "status": status,
+                    "events": events,
+                }))
+            } else {
+                println!("Linux fanotify enforcement");
+                println!("enforcing: {}", status.enforcing);
+                println!("marked paths:");
+                for path in status.marked_paths {
+                    println!("  - {path}");
+                }
+                if !status.warnings.is_empty() {
+                    println!("warnings:");
+                    for warning in status.warnings {
+                        println!("  - {warning}");
+                    }
+                }
+                println!("events handled: {}", events.len());
+                Ok(())
+            }
+        }
+        "seccomp-profile" => {
+            let profile = gensee_crate_linux::LinuxSeccompProfile::default();
+            if json_output {
+                print_json(&profile)
+            } else {
+                println!("Linux seccomp launcher profile");
+                println!("default action: {:?}", profile.default_action);
+                println!("denied syscalls:");
+                for syscall in profile.denied_syscalls {
+                    println!(
+                        "  - {} [{:?}] - {}",
+                        syscall.name, syscall.group, syscall.reason
+                    );
+                }
+                Ok(())
+            }
+        }
+        "exec-seccomp" => linux_exec_seccomp(args),
+        "network-plan" => {
+            let config = linux_network_config(&args)?;
+            let plan = gensee_crate_linux::plan_nftables_policy(&config);
+            if json_output {
+                print_json(&plan)
+            } else {
+                print_linux_network_plan(&plan);
+                Ok(())
+            }
+        }
+        "network-apply" => {
+            let config = linux_network_config(&args)?;
+            let plan = gensee_crate_linux::plan_nftables_policy(&config);
+            if let Some(pid) = config.root_pid {
+                let attached = gensee_crate_linux::attach_process_tree_to_cgroup(
+                    pid,
+                    Path::new(&config.cgroup_path),
+                )?;
+                println!(
+                    "gensee linux: attached {} process(es) to {}",
+                    attached.len(),
+                    config.cgroup_path
+                );
+            }
+            gensee_crate_linux::apply_nftables_script(&plan.nftables.script)?;
+            if json_output {
+                print_json(&plan)
+            } else {
+                print_linux_network_plan(&plan);
+                Ok(())
+            }
+        }
+        "--help" | "-h" => {
+            println!("usage: gensee linux [status|plan|monitor|fanotify-plan|fanotify-once|seccomp-profile|exec-seccomp|network-plan|network-apply] [--json]\n       gensee linux monitor --pid <pid> [--session-id <id>] [--json]\n       gensee linux exec-seccomp -- <agent> [args...]\n       gensee linux network-plan --session-id <id> [--pid <pid>] [--allow <ip-or-cidr>]... [--deny-all|--monitor] [--json]\n       sudo gensee linux network-apply --session-id <id> --pid <pid> [--allow <ip-or-cidr>]...");
+            Ok(())
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("usage: gensee linux [status|plan|monitor|fanotify-plan|fanotify-once|seccomp-profile|exec-seccomp|network-plan|network-apply] [--json] (unknown: {other})"),
+        )),
+    }
+}
+
+fn linux_network_config(
+    args: &[OsString],
+) -> io::Result<gensee_crate_linux::LinuxNetworkEnforcementConfig> {
+    let session_id = linux_arg_value(args, "--session-id").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee linux network-plan --session-id <id> [--pid <pid>] [--allow <ip-or-cidr>]... [--deny-all]",
+        )
+    })?;
+    let allowed_hosts = linux_arg_values(args, "--allow");
+    let mode = if !allowed_hosts.is_empty() {
+        gensee_crate_linux::LinuxNetworkMode::AllowListed
+    } else if has_arg(args, "--monitor") {
+        gensee_crate_linux::LinuxNetworkMode::Monitor
+    } else {
+        gensee_crate_linux::LinuxNetworkMode::DenyAll
+    };
+    let root_pid = linux_arg_value(args, "--pid")
+        .map(|value| {
+            value.parse::<u32>().map_err(|err| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("invalid --pid: {err}"))
+            })
+        })
+        .transpose()?;
+    let mut config = gensee_crate_linux::LinuxNetworkEnforcementConfig::new(
+        session_id,
+        gensee_crate_linux::LinuxNetworkPolicy {
+            mode,
+            allowed_hosts,
+        },
+    );
+    config.root_pid = root_pid;
+    if let Some(cgroup_path) = linux_arg_value(args, "--cgroup-path") {
+        config.cgroup_path = cgroup_path;
+    }
+    Ok(config)
+}
+
+fn print_linux_network_plan(plan: &gensee_crate_linux::LinuxNetworkEnforcementPlan) {
+    println!("Linux cgroup/nftables network plan");
+    println!("cgroup: {}", plan.cgroup.cgroup_path);
+    if let Some(pid) = plan.cgroup.root_pid {
+        println!("root pid: {pid}");
+        println!("processes: {}", plan.cgroup.process_ids.len());
+    }
+    println!("table: {}", plan.nftables.table_name);
+    println!("chain: {}", plan.nftables.chain_name);
+    println!("mode: {:?}", plan.nftables.mode);
+    println!("allowed destinations:");
+    if plan.nftables.destinations.is_empty() {
+        println!("  - none");
+    } else {
+        for destination in &plan.nftables.destinations {
+            println!("  - {} [{:?}]", destination.value, destination.family);
+        }
+    }
+    if !plan.warnings.is_empty() {
+        println!("warnings:");
+        for warning in &plan.warnings {
+            println!("  - {warning}");
+        }
+    }
+    println!("nftables script:\n{}", plan.nftables.script);
+}
+
+fn linux_exec_seccomp(args: Vec<OsString>) -> io::Result<()> {
+    let command_args = linux_args_after_double_dash(&args).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee linux exec-seccomp -- <agent> [args...]",
+        )
+    })?;
+    let (program, program_args) = command_args.split_first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee linux exec-seccomp -- <agent> [args...]",
+        )
+    })?;
+    linux_spawn_seccomp(program, program_args)
+}
+
+fn linux_args_after_double_dash(args: &[OsString]) -> Option<Vec<OsString>> {
+    args.iter()
+        .position(|arg| arg.to_str() == Some("--"))
+        .map(|index| args[index + 1..].to_vec())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_spawn_seccomp(program: &OsString, program_args: &[OsString]) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let profile = gensee_crate_linux::LinuxSeccompProfile::default();
+    let mut command = Command::new(program);
+    command.args(program_args);
+    unsafe {
+        command.pre_exec(move || gensee_crate_linux::install_seccomp_filter(&profile));
+    }
+    let status = command.status()?;
+    match status.code() {
+        Some(code) => std::process::exit(code),
+        None => std::process::exit(1),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_spawn_seccomp(_program: &OsString, _program_args: &[OsString]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "seccomp launcher profiles are only available on Linux",
+    ))
+}
+
+fn linux_arg_value(args: &[OsString], name: &str) -> Option<String> {
+    args.windows(2).find_map(|window| {
+        if window[0].to_str() == Some(name) {
+            window[1].to_str().map(ToString::to_string)
+        } else {
+            None
+        }
+    })
+}
+
+fn linux_arg_values(args: &[OsString], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter_map(|window| {
+            if window[0].to_str() == Some(name) {
+                window[1].to_str().map(ToString::to_string)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
+    let serialized = serde_json::to_string_pretty(value)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    println!("{serialized}");
+    Ok(())
+}
+
+fn print_bool(label: &str, value: bool) {
+    println!("{label}: {}", if value { "yes" } else { "no" });
 }
 
 pub(crate) fn handle_hook(args: Vec<OsString>) -> io::Result<()> {
@@ -2322,6 +2700,6 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 
 pub(crate) fn print_usage() {
     println!(
-        "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee session list"
+        "gensee\n\nUSAGE:\n  gensee run [--sandbox none|mac] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] -- <agent> [args...]\n  gensee run discard <session_id>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee linux [status|plan|monitor|fanotify-plan|fanotify-once|seccomp-profile|exec-seccomp|network-plan|network-apply] [--json]\n  gensee linux monitor --pid <pid> [--session-id <id>] [--json]\n  gensee linux exec-seccomp -- <agent> [args...]\n  gensee linux network-plan --session-id <id> [--pid <pid>] [--allow <ip-or-cidr>]... [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee linux status --json\n  gensee linux fanotify-plan --json\n  gensee linux seccomp-profile --json\n  gensee linux network-plan --session-id claude-1 --allow 10.0.0.0/8 --json\n  gensee linux exec-seccomp -- claude\n  gensee linux monitor --pid $$ --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee session list"
     );
 }
