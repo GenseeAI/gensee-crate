@@ -422,19 +422,29 @@ fn build_antigravity_hook_event(value: Value, observed_at_ms: u64) -> io::Result
 }
 
 fn antigravity_event_name(value: &Value) -> Option<String> {
+    if let Some(name) = v_str(value, "hookEventName").or_else(|| v_str(value, "hook_event_name")) {
+        return Some(name);
+    }
+
+    // Antigravity's documented payloads do not include an explicit event name,
+    // so classify by fields that are unique in the published schema. Order
+    // matters: Stop may include `error`, and PreToolUse also includes `stepIdx`.
+    if value.get("executionNum").is_some()
+        || value.get("terminationReason").is_some()
+        || value.get("fullyIdle").is_some()
+    {
+        return Some("Stop".to_string());
+    }
+    if value.get("invocationNum").is_some() || value.get("initialNumSteps").is_some() {
+        return Some("PreInvocation".to_string());
+    }
     if value.get("toolCall").is_some() {
         return Some("PreToolUse".to_string());
     }
     if value.get("stepIdx").is_some() || value.get("error").is_some() {
         return Some("PostToolUse".to_string());
     }
-    if value.get("invocationNum").is_some() {
-        return Some("PreInvocation".to_string());
-    }
-    if value.get("executionNum").is_some() || value.get("terminationReason").is_some() {
-        return Some("Stop".to_string());
-    }
-    v_str(value, "hook_event_name")
+    None
 }
 
 pub(crate) fn file_intents_from_hook(

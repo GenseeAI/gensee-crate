@@ -10,10 +10,13 @@
 //!   * **PreToolUse / PermissionRequest** (synchronous, gates the tool or
 //!     native agent approval): the client waits for the decision; the daemon
 //!     evaluates against the already-open store/policy.
-//!   * **PostToolUse / UserPromptSubmit / Stop** (observational, never block):
-//!     the client writes and returns immediately — the store write happens on
-//!     the daemon, off the agent's critical path. Full lineage is still
-//!     recorded; it just no longer costs the agent latency.
+//!   * **UserPromptSubmit / Antigravity PreInvocation** (synchronous, advisory):
+//!     the client waits for optional counter-instructions.
+//!   * **PostToolUse / Stop** for providers with no stdout contract
+//!     (observational, never block): the client writes and returns immediately —
+//!     the store write happens on the daemon, off the agent's critical path.
+//!     Full lineage is still recorded; it just no longer costs the agent
+//!     latency.
 //!
 //! If the daemon is not running the client returns `false` and the caller falls
 //! back to the in-process path, so enforcement is never silently skipped.
@@ -24,6 +27,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 
 const NO_HOOK_OUTPUT: &str = "__gensee_no_hook_output__";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DaemonResponseMode {
+    Required,
+    Optional,
+    FireAndForget,
+}
 
 /// Run the warm daemon: bind the socket, hold the store open, and service hook
 /// connections (one thread per connection; the store's internal mutex
@@ -63,7 +73,7 @@ pub(crate) fn run_daemon() -> io::Result<()> {
 
 /// Read one hook event from `stream`, process it against the warm store, and
 /// write back any hook output `process_hook_event` produces (a PreToolUse
-/// decision or a UserPromptSubmit counter-instruction). The client half-closes
+/// decision or an advisory counter-instruction). The client half-closes
 /// its write side after sending, so `read_to_string` returns at end of request.
 pub(crate) fn serve_connection(mut stream: UnixStream, store: &EventStore) -> io::Result<()> {
     let mut request = String::new();
@@ -80,10 +90,7 @@ pub(crate) fn serve_connection(mut stream: UnixStream, store: &EventStore) -> io
         // Best-effort: the client may have already gone away on a non-blocking
         // event; that is not an error worth failing the connection over.
         let _ = stream.write_all(decision_json.as_bytes());
-    } else if matches!(
-        event.hook_event_name.as_deref(),
-        Some("PreToolUse" | "PermissionRequest")
-    ) {
+    } else if daemon_response_mode(&event) == DaemonResponseMode::Required {
         let _ = stream.write_all(NO_HOOK_OUTPUT.as_bytes());
     }
     Ok(())
@@ -154,8 +161,8 @@ pub(crate) fn dispatch_via_daemon(payload: &str, event: &AgentHookEvent) -> bool
         return false;
     }
 
-    match event.hook_event_name.as_deref() {
-        Some("PreToolUse" | "PermissionRequest") => {
+    match daemon_response_mode(event) {
+        DaemonResponseMode::Required => {
             // Synchronous: the decision gates the tool. Any failure or empty
             // response means the daemon could not decide — fall back to
             // in-process rather than fail open.
@@ -169,12 +176,12 @@ pub(crate) fn dispatch_via_daemon(payload: &str, event: &AgentHookEvent) -> bool
             print!("{response}");
             true
         }
-        Some("UserPromptSubmit") => {
-            // Synchronous but advisory: the daemon runs the memory/skill
-            // integrity scan and returns an `additionalContext` counter-
-            // instruction ONLY when poison is found. An empty response is the
-            // normal clean case (not a failure), so print it if present and
-            // never fall back on empty; only a read error falls back.
+        DaemonResponseMode::Optional => {
+            // Synchronous but advisory: some hook contracts return optional
+            // stdout (`UserPromptSubmit` additionalContext, Antigravity
+            // PreInvocation injectSteps, Antigravity PostToolUse/Stop bodies).
+            // Empty output is a valid clean result, so print only when present
+            // and fall back only on read errors.
             let mut response = String::new();
             if stream.read_to_string(&mut response).is_err() {
                 return false;
@@ -184,10 +191,23 @@ pub(crate) fn dispatch_via_daemon(payload: &str, event: &AgentHookEvent) -> bool
             }
             true
         }
-        _ => {
+        DaemonResponseMode::FireAndForget => {
             // Observational (PostToolUse/Stop): fire-and-forget off the critical
             // path — the daemon records it; we don't wait for the store write.
             true
         }
+    }
+}
+
+pub(crate) fn daemon_response_mode(event: &AgentHookEvent) -> DaemonResponseMode {
+    match event.hook_event_name.as_deref() {
+        Some("PreToolUse" | "PermissionRequest") => DaemonResponseMode::Required,
+        Some("UserPromptSubmit") => DaemonResponseMode::Optional,
+        Some("PreInvocation" | "PostToolUse" | "Stop")
+            if event.provider == PROVIDER_ANTIGRAVITY =>
+        {
+            DaemonResponseMode::Optional
+        }
+        _ => DaemonResponseMode::FireAndForget,
     }
 }
