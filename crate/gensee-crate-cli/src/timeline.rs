@@ -434,6 +434,7 @@ impl TimelineFilter {
             Self::All => {}
             Self::Latest => {
                 let Some(session_id) = latest_agent_session_id(
+                    collections.sessions,
                     collections.user_prompts,
                     collections.assistant_responses,
                     collections.tool_calls,
@@ -443,7 +444,9 @@ impl TimelineFilter {
                 keep_prompt_session(collections.user_prompts, &session_id);
                 keep_response_session(collections.assistant_responses, &session_id);
                 keep_session(collections.tool_calls, &session_id);
-                collections.sessions.clear();
+                collections
+                    .sessions
+                    .retain(|session| session.session_id == session_id);
                 keep_system_event_session(collections.system_events, &session_id);
                 collections
                     .workspace_effects
@@ -496,10 +499,17 @@ impl TimelineFilter {
 }
 
 pub(crate) fn latest_agent_session_id(
+    sessions: &[AgentSession],
     user_prompts: &[AgentUserPrompt],
     assistant_responses: &[AgentAssistantResponse],
     tool_calls: &[AgentToolCall],
 ) -> Option<String> {
+    let latest_session = sessions.iter().map(|session| {
+        (
+            session.ended_at_ms.unwrap_or(session.started_at_ms),
+            session.session_id.clone(),
+        )
+    });
     let latest_prompt = user_prompts
         .iter()
         .filter_map(|prompt| Some((prompt.observed_at_ms, prompt.session_id.clone()?)));
@@ -510,7 +520,8 @@ pub(crate) fn latest_agent_session_id(
         .iter()
         .filter_map(|call| Some((call.last_observed_at_ms()?, call.session_id.clone()?)));
 
-    latest_prompt
+    latest_session
+        .chain(latest_prompt)
         .chain(latest_response)
         .chain(latest_tool)
         .max_by_key(|(observed_at_ms, _)| *observed_at_ms)

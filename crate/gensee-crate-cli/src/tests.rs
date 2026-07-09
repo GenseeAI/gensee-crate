@@ -3406,6 +3406,40 @@ fn timeline_keeps_session_scoped_network_system_events() {
 }
 
 #[test]
+fn timeline_latest_considers_managed_run_sessions() {
+    let sessions = vec![AgentSession {
+        session_id: "run_latest".to_string(),
+        agent_binary: "codex".to_string(),
+        root_pid: 123,
+        cwd: "/repo".to_string(),
+        repo_path: Some("/repo".to_string()),
+        mode: Some("managed-run:linux".to_string()),
+        workspace_mode: Some("in-place".to_string()),
+        original_workspace: Some("/repo".to_string()),
+        staged_workspace: None,
+        sandbox_profile: None,
+        sandbox_profile_path: None,
+        started_at_ms: 20,
+        ended_at_ms: Some(30),
+        exit_code: Some(0),
+    }];
+    let prompts = vec![AgentUserPrompt {
+        session_id: Some("old_codex_hook".to_string()),
+        cwd: Some("/repo".to_string()),
+        transcript_path: None,
+        prompt: Some("old prompt".to_string()),
+        permission_mode: None,
+        effort_level: None,
+        observed_at_ms: 10,
+    }];
+
+    assert_eq!(
+        latest_agent_session_id(&sessions, &prompts, &[], &[]).as_deref(),
+        Some("run_latest")
+    );
+}
+
+#[test]
 fn redacts_secrets_in_agent_hook_payload() {
     let payload = r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"AWS_SECRET_ACCESS_KEY=abcd1234 aws s3 cp x s3://b"},"tool_response":{"stdout":"export GITHUB_TOKEN=ghp_abcdefghijkl","stderr":""}}"#;
 
