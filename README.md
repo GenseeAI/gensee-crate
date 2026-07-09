@@ -321,8 +321,8 @@ gensee run -- claude # or: gensee run -- codex
 ```
 
 - **Experimental Linux host controls:** inspect Linux host capabilities, monitor
-  a direct agent process tree through `/proc`, inspect fanotify sensitive-path
-  permission plans/debug probes, launch an agent under a seccomp hard-deny
+  a direct agent process tree through `/proc`, enforce supported fanotify
+  sensitive-path permission decisions from `run` or `watch --pid`, launch an agent under a seccomp hard-deny
   syscall profile, and plan/apply cgroup-scoped nftables egress controls on Linux. The public CLI
   is capability-oriented; `gensee linux ...` remains only as a compatibility
   alias while this branch is experimental.
@@ -330,6 +330,7 @@ gensee run -- claude # or: gensee run -- codex
 ```bash
 gensee status --json
 gensee watch --pid <agent-root-pid>
+sudo gensee watch --pid <agent-root-pid> --linux-fanotify
 gensee policy setup
 sudo gensee run --sandbox linux -- codex
 ```
@@ -372,6 +373,9 @@ destinations such as `169.254.169.254`. Exact per-attempt child PID attribution
 is future eBPF/nft log work.
 `--linux-fanotify` starts a run-owned fanotify permission listener for supported
 sensitive-path file access and appends `FileAccess...` Layer 1 events.
+`sudo gensee watch --pid <agent-root-pid> --linux-fanotify` uses the same
+fanotify enforcement path as a sidecar attached to an already-running agent
+process tree.
 
 For orchestration frameworks such as Omnigent, use the same primitives as a
 thin outer safety layer:

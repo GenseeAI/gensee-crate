@@ -724,7 +724,7 @@ impl PreparedLinuxFanotifyRunGuard {
     }
 }
 
-fn drain_linux_fanotify_events(
+pub(crate) fn drain_linux_fanotify_events(
     store: &EventStore,
     enforcer: &mut gensee_crate_linux::LinuxFanotifyEnforcer,
     session_id: &str,
@@ -755,7 +755,7 @@ fn drain_linux_fanotify_events(
     }
 }
 
-fn linux_fanotify_system_event(
+pub(crate) fn linux_fanotify_system_event(
     event: &gensee_crate_linux::LinuxFanotifyEvent,
     session_id: &str,
     agent_binary: &str,
@@ -791,7 +791,7 @@ fn linux_fanotify_system_event(
     }
 }
 
-fn linux_fanotify_privilege_error(error: io::Error) -> io::Error {
+pub(crate) fn linux_fanotify_privilege_error(error: io::Error) -> io::Error {
     if error.kind() == io::ErrorKind::PermissionDenied {
         io::Error::new(
             error.kind(),

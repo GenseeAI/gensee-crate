@@ -34,8 +34,9 @@ Available experimentally:
 Planned work includes:
 
 - Linux-native eBPF file, process, and network monitoring.
-- Continuous fanotify ownership in a daemon or watch integration, so
-  sensitive-path permission events are armed during real agent runs.
+- Continuous fanotify ownership in a daemon, so sensitive-path permission events
+  can survive policy reloads and multi-agent session lifecycle beyond the
+  current `run` and `watch --pid` listeners.
 - Broader sensitive-path protection for credentials, SSH keys, cloud configs,
   `.env` files, and policy-controlled project files, including recursive
   suffix-pattern coverage.

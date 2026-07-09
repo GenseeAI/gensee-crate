@@ -90,7 +90,9 @@ The macOS and Linux run paths intentionally use different OS primitives:
   policy. Seccomp can hard-deny dangerous syscalls without root. Network
   enforcement uses cgroup v2 plus nftables and currently needs root.
   `--linux-fanotify` starts a run-owned fanotify permission listener for
-  supported sensitive-path file access and currently needs root.
+  supported sensitive-path file access and currently needs root. `sudo gensee
+  watch --pid PID --linux-fanotify` attaches the same fanotify enforcement path
+  to an already-running agent process tree.
 
 ## Managed Linux Sandbox Mode
 

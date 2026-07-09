@@ -90,13 +90,13 @@ the old `GENSEE_HOME` to start a fresh encrypted store. Set
 - Prompt injection, malicious tool output, exfiltration, and cross-session
   attack chains can be surfaced as graph patterns, but the defense rules are
   still early and mostly deterministic.
-- Linux fanotify can plan and debug supported sensitive-path marks today but is
-  not yet armed continuously by `run` or `watch`; seccomp can hard-deny
-  dangerous syscalls for processes launched with
-  `gensee run --sandbox linux`, and cgroup/nftables can scope egress controls
-  to an attached agent process tree or to policy-managed Linux runs. The
-  long-running daemon, recursive suffix-pattern coverage, eBPF telemetry,
-  Landlock/AppArmor generation, and prompt/speculation brokers are still future
-  work.
+- Linux fanotify can arm supported sensitive-path marks from
+  `gensee run --sandbox linux --linux-fanotify` or
+  `gensee watch --pid <pid> --linux-fanotify`; seccomp can hard-deny dangerous
+  syscalls for processes launched with `gensee run --sandbox linux`, and
+  cgroup/nftables can scope egress controls to an attached agent process tree or
+  to policy-managed Linux runs. The long-running daemon, recursive
+  suffix-pattern coverage, eBPF telemetry, Landlock/AppArmor generation, and
+  prompt/speculation brokers are still future work.
 - Automatic rollback, merge-back review, deny-default policies, and container
   confinement are future work.

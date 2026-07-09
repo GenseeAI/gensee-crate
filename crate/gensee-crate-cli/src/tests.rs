@@ -4019,6 +4019,22 @@ fn parses_watch_system_events_backend() {
 }
 
 #[test]
+fn watch_config_parses_linux_fanotify_pid_mode() {
+    let config = WatchConfig::parse(vec![
+        OsString::from("--pid"),
+        OsString::from("123"),
+        OsString::from("--linux-fanotify"),
+        OsString::from("--duration-seconds"),
+        OsString::from("5"),
+    ])
+    .unwrap();
+
+    assert_eq!(config.pid, Some(123));
+    assert!(config.linux_fanotify);
+    assert_eq!(config.duration_ms, Some(5000));
+}
+
+#[test]
 fn discard_session_ids_are_constrained_to_run_ids() {
     assert!(is_valid_discard_session_id("run_123_456"));
     assert!(is_valid_discard_session_id("run_abc-123"));

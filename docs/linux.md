@@ -13,7 +13,8 @@ the agent to run inside a container.
   speculation backends.
 - `gensee watch --pid <pid>` performs `/proc` process-tree attribution for a
   root agent process and records normalized exec events for the root and
-  descendants.
+  descendants. `--linux-fanotify` adds sidecar fanotify sensitive-path
+  enforcement for that process tree.
 - `gensee run --sandbox linux -- <agent> [args...]` applies Linux host controls
   from policy. `--linux-seccomp`, `--no-linux-seccomp`, `--linux-fanotify`,
   `--linux-network`, and `--allow-net`/`--deny-net` remain per-run overrides for
@@ -32,10 +33,11 @@ shape.
 
 The fanotify backend is the first contextual Linux system-level file-enforcement
 path in Gensee Crate. `gensee run --sandbox linux --linux-fanotify -- <agent>`
-starts a parent-owned listener thread for the run, marks supported sensitive
-paths, answers permission events, and appends file-access decisions to the
-timeline. Fanotify requires Linux, root, and a kernel with fanotify permission
-events enabled.
+starts a parent-owned listener thread for the run. `sudo gensee watch --pid
+PID --linux-fanotify` starts the same listener as an attached sidecar for an
+already-running process tree. Both paths mark supported sensitive paths, answer
+permission events, and append file-access decisions to the timeline. Fanotify
+requires Linux, root, and a kernel with fanotify permission events enabled.
 
 The seccomp launcher is a coarse hard-deny layer. It is less contextual than
 fanotify, but it applies directly at the syscall boundary for processes launched
@@ -90,6 +92,8 @@ Watch a running agent process tree:
 
 ```bash
 gensee watch --pid <agent-root-pid> --duration-seconds 60
+sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$HOME/.gensee" \
+  gensee watch --pid <agent-root-pid> --linux-fanotify --duration-seconds 60
 ```
 
 Configure policy, then launch an agent with the configured Linux controls:
@@ -237,10 +241,10 @@ Linux policy keeps posture and action separate:
   a backend is available.
 
 At the fanotify boundary, `Deny`, `Ask`, and `Speculate` currently fail closed
-with `FAN_DENY` in the run listener and debug enforcer. `Ask` needs a prompt
-broker before it can safely block and wait for a user decision. `Speculate`
-needs a transactional backend before the operation can be allowed into a
-rollback-capable runtime.
+with `FAN_DENY` in the run listener, watch listener, and debug enforcer. `Ask`
+needs a prompt broker before it can safely block and wait for a user decision.
+`Speculate` needs a transactional backend before the operation can be allowed
+into a rollback-capable runtime.
 
 At the seccomp boundary, the default profile allows ordinary syscalls and denies
 configured dangerous syscall families with `EPERM`. The default profile blocks:
@@ -262,7 +266,7 @@ safe hostname support needs DNS resolution plus policy reload logic.
 ## What is still future work
 
 - A long-running Linux daemon that owns fanotify, process monitoring, event
-  storage, and policy reloads.
+  storage, policy reloads, and multi-agent session lifecycle.
 - Recursive sensitive-path fanotify marks for patterns such as `**/.env`.
 - eBPF telemetry for richer exec, file, and network attribution.
 - More contextual seccomp policies that inspect syscall arguments where useful.
