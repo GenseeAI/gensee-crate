@@ -359,18 +359,21 @@ them permanent. Because these commands preserve `HOME` while running privileged
 controls, a root-launched agent may create root-owned files in your home
 directory.
 
-**Watch.** Attach to an already-running agent process tree:
+**Status.** Inspect Linux host capabilities and enabled controls:
 
 ```bash
 gensee status --json
+```
+
+**Watch.** Attach to an already-running agent process tree:
+
+```bash
 gensee watch --pid <agent-root-pid>
-gensee-sudo watch --pid <agent-root-pid> --linux-fanotify
 ```
 
 **Run.** Launch the agent as a child of Gensee with Linux host controls:
 
 ```bash
-gensee policy setup
 gensee-sudo run --sandbox linux -- codex
 ```
 
