@@ -5,6 +5,7 @@ pub struct LinuxPolicy {
     pub mode: LinuxEnforcementMode,
     pub sensitive_paths: Vec<SensitivePathRule>,
     pub network: LinuxNetworkPolicy,
+    pub seccomp_enabled: bool,
     pub dangerous_syscalls: DangerousSyscallPolicy,
 }
 
@@ -43,10 +44,12 @@ pub enum LinuxPolicyAction {
 pub struct LinuxNetworkPolicy {
     pub mode: LinuxNetworkMode,
     pub allowed_hosts: Vec<String>,
+    pub denied_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LinuxNetworkMode {
+    Off,
     Monitor,
     DenyAll,
     AllowListed,
@@ -95,9 +98,11 @@ impl Default for LinuxPolicy {
             mode: LinuxEnforcementMode::Monitor,
             sensitive_paths: default_sensitive_paths(),
             network: LinuxNetworkPolicy {
-                mode: LinuxNetworkMode::Monitor,
+                mode: LinuxNetworkMode::Off,
                 allowed_hosts: Vec::new(),
+                denied_hosts: Vec::new(),
             },
+            seccomp_enabled: false,
             dangerous_syscalls: DangerousSyscallPolicy {
                 deny_mount_namespace_changes: true,
                 deny_ptrace: true,
@@ -134,13 +139,17 @@ impl LinuxPolicy {
             components.push(LinuxEnforcementComponent::AppArmorProfile);
         }
 
-        if capabilities.seccomp_filter_available {
+        if self.seccomp_enabled && capabilities.seccomp_filter_available {
             components.push(LinuxEnforcementComponent::SeccompProfile);
-        } else {
+        } else if self.seccomp_enabled {
             warnings.push("seccomp profiles are not available on this kernel".to_string());
         }
 
-        if self.network.mode != LinuxNetworkMode::Monitor {
+        if matches!(
+            self.network.mode,
+            LinuxNetworkMode::DenyAll | LinuxNetworkMode::AllowListed
+        ) || !self.network.denied_hosts.is_empty()
+        {
             if capabilities.supports_cgroup_network_controls() {
                 components.push(LinuxEnforcementComponent::NftablesNetworkPolicy);
             } else {

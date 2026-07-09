@@ -8,27 +8,26 @@ the agent to run inside a container.
 
 ## What works now
 
-- `gensee linux status` reports host capabilities such as fanotify, seccomp,
+- `gensee status` reports host capabilities such as fanotify, seccomp,
   cgroup v2, nftables, Landlock, BPF mounts, AppArmor, SELinux, and available
   speculation backends.
-- `gensee linux plan` reports the Linux enforcement plan derived from the
-  default Linux policy and the detected host capabilities.
-- `gensee linux monitor --pid <pid>` performs `/proc` process-tree attribution
-  for a root agent process and emits normalized exec events for the root and
+- `gensee watch --pid <pid>` performs `/proc` process-tree attribution for a
+  root agent process and records normalized exec events for the root and
   descendants.
-- `gensee linux fanotify-plan` shows which sensitive-path policy rules can be
-  installed as fanotify permission marks.
-- `gensee linux fanotify-once` starts the Linux fanotify permission backend,
-  installs marks for supported sensitive paths, polls once, evaluates observed
-  permission events through `LinuxPolicy::evaluate_access`, and writes
-  `FAN_ALLOW` or `FAN_DENY` back to the kernel.
-- `gensee linux seccomp-profile` prints the default seccomp launcher profile.
-- `gensee linux exec-seccomp -- <agent> [args...]` starts an agent under a
-  seccomp filter that hard-denies dangerous syscall families such as `ptrace`,
-  `bpf`, kernel module loading, mount changes, and namespace switching.
-- `gensee linux network-plan` generates a cgroup v2 plus nftables egress plan.
-- `gensee linux network-apply` creates/attaches the cgroup process tree and
-  applies the generated nftables script.
+- `gensee run --sandbox linux -- <agent> [args...]` applies Linux host controls
+  from policy. `--linux-seccomp`, `--no-linux-seccomp`, `--linux-network`, and
+  `--allow-net`/`--deny-net` remain per-run overrides for demos and debugging.
+- `gensee run --sandbox linux` is the preferred workflow for network
+  enforcement when policy enables it: it installs nftables for the run cgroup,
+  starts the agent through a small internal exec wrapper, joins that cgroup, and
+  then execs the real agent.
+- `gensee debug ...` contains backend probes such as `plan`, `fanotify-plan`,
+  `fanotify-once`, `seccomp-profile`, `network-plan`, and `network-apply`.
+  These are for development/admin debugging, not the normal enforcement path.
+
+The older `gensee linux ...` form is kept as a compatibility alias while Linux
+support is experimental. New docs and scripts should use the top-level command
+shape.
 
 The fanotify backend is the first contextual Linux system-level enforcement path
 in Gensee Crate. It can deny file opens/accesses before the target process
@@ -49,75 +48,81 @@ egress. It requires Linux, root, cgroup v2, and nftables.
 Inspect capabilities:
 
 ```bash
-gensee linux status --json
+gensee status --json
 ```
 
-Inspect the policy/capability plan:
+Watch a running agent process tree:
 
 ```bash
-gensee linux plan --json
+gensee watch --pid <agent-root-pid> --duration-seconds 60
 ```
 
-Inspect the fanotify mark plan:
+Configure policy, then launch an agent with the configured Linux controls:
 
 ```bash
-gensee linux fanotify-plan --json
+gensee policy setup
+sudo gensee run --sandbox linux -- codex
 ```
 
-Monitor a running agent process tree:
+Relevant policy keys:
 
-```bash
-gensee linux monitor --pid <agent-root-pid> --json
+```json
+{
+  "linux": {
+    "seccomp": {
+      "enabled": true,
+      "deny_ptrace": true,
+      "deny_bpf": true,
+      "deny_kernel_modules": true,
+      "deny_mount_namespace_changes": true
+    },
+    "network": {
+      "mode": "allowlist",
+      "allow": ["1.1.1.1"],
+      "deny": ["169.254.169.254"]
+    }
+  }
+}
 ```
 
-Poll the fanotify backend once:
+The seccomp launcher sets `no_new_privs` and installs the filter in the child
+process immediately before `exec`.
+
+Inspect a cgroup/nftables egress plan for debugging:
 
 ```bash
-sudo gensee linux fanotify-once --json
-```
-
-`fanotify-once` is intentionally a low-level smoke path. A long-running Linux
-daemon loop is still future work.
-
-Inspect the seccomp launcher profile:
-
-```bash
-gensee linux seccomp-profile --json
-```
-
-Launch an agent under the default seccomp profile:
-
-```bash
-gensee linux exec-seccomp -- claude
-gensee linux exec-seccomp -- codex
-```
-
-The launcher sets `no_new_privs` and installs the filter in the child process
-immediately before `exec`.
-
-Inspect a cgroup/nftables egress plan:
-
-```bash
-gensee linux network-plan \
+gensee debug network-plan \
   --session-id claude-1 \
   --pid <agent-root-pid> \
   --allow 10.0.0.0/8 \
+  --deny 169.254.169.254 \
   --allow 2001:db8::/32 \
   --json
 ```
 
-Apply the cgroup/nftables plan:
+Apply the cgroup/nftables plan to an existing process tree for debugging:
 
 ```bash
-sudo gensee linux network-apply \
+sudo gensee debug network-apply \
   --session-id claude-1 \
   --pid <agent-root-pid> \
-  --allow 10.0.0.0/8
+  --allow 10.0.0.0/8 \
+  --deny 169.254.169.254
 ```
 
-If no `--allow` values are supplied, the network policy defaults to deny-all
-for the attached cgroup. Use `--monitor` to generate a non-blocking nftables
-table.
+If no `--allow`, `--deny`, `--deny-all`, or `--monitor` override is supplied,
+the debug network commands use `linux.network` from policy. Use `--monitor` to
+generate a non-default-blocking nftables table, optionally with explicit deny
+destinations.
+
+For real agent launches, prefer `gensee run` so the network policy follows the
+agent you start:
+
+```bash
+sudo gensee run \
+  --sandbox linux \
+  -- codex
+```
 
 ## Sensitive-path coverage
 
@@ -128,9 +133,9 @@ The current fanotify mark planner supports:
 - home-relative prefix roots such as `~/.ssh/**`
 
 It does not yet directly mark suffix glob patterns such as `**/.env` or
-`**/.env.*`. Those rules are reported as warnings in `gensee linux
-fanotify-plan` until recursive directory discovery or broader filesystem/mount
-marking is added.
+`**/.env.*`. Those rules are reported as warnings in
+`gensee debug fanotify-plan` until recursive directory discovery or broader
+filesystem/mount marking is added.
 
 ## Enforcement behavior
 

@@ -201,7 +201,9 @@ mod tests {
             network: LinuxNetworkPolicy {
                 mode: LinuxNetworkMode::Monitor,
                 allowed_hosts: Vec::new(),
+                denied_hosts: Vec::new(),
             },
+            seccomp_enabled: false,
             dangerous_syscalls: DangerousSyscallPolicy {
                 deny_mount_namespace_changes: true,
                 deny_ptrace: true,

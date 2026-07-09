@@ -4318,6 +4318,68 @@ fn run_config_parses_max_runtime_seconds() {
     );
 }
 
+#[test]
+fn run_config_parses_linux_launch_controls() {
+    let config = RunConfig::parse(vec![
+        OsString::from("--sandbox"),
+        OsString::from("linux"),
+        OsString::from("--linux-seccomp"),
+        OsString::from("--linux-network"),
+        OsString::from("allowlist"),
+        OsString::from("--allow-net"),
+        OsString::from("1.1.1.1"),
+        OsString::from("--allow-net"),
+        OsString::from("10.0.0.0/8"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap();
+
+    assert_eq!(config.sandbox, SandboxMode::Linux);
+    assert_eq!(config.linux_seccomp_override, Some(true));
+    assert_eq!(
+        config.linux_network_override,
+        Some(gensee_crate_linux::LinuxNetworkMode::AllowListed)
+    );
+    assert_eq!(
+        config.linux_allow_net_override,
+        vec!["1.1.1.1".to_string(), "10.0.0.0/8".to_string()]
+    );
+    assert_eq!(config.agent_cmd, vec![OsString::from("codex")]);
+}
+
+#[test]
+fn run_config_rejects_linux_controls_without_linux_sandbox() {
+    let error = RunConfig::parse(vec![
+        OsString::from("--linux-seccomp"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("--sandbox linux"));
+}
+
+#[test]
+fn run_config_allows_policy_resolved_linux_allowlist() {
+    let config = RunConfig::parse(vec![
+        OsString::from("--sandbox"),
+        OsString::from("linux"),
+        OsString::from("--linux-network"),
+        OsString::from("allowlist"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap();
+
+    assert_eq!(
+        config.linux_network_override,
+        Some(gensee_crate_linux::LinuxNetworkMode::AllowListed)
+    );
+    assert!(config.linux_allow_net_override.is_empty());
+}
+
 fn temp_store_and_workspace(label: &str) -> (EventStore, PathBuf) {
     let root = env::temp_dir().join(format!(
         "gensee-cli-test-{label}-{}-{}",
@@ -4374,6 +4436,10 @@ fn coerce_policy_value_infers_types() {
         json!(["a.com", "b.com"])
     );
     assert_eq!(
+        coerce_policy_value("linux.network.allow", "1.1.1.1, 10.0.0.0/8"),
+        json!(["1.1.1.1", "10.0.0.0/8"])
+    );
+    assert_eq!(
         coerce_policy_value("egress.proxy_url", "http://p:8080"),
         json!("http://p:8080")
     );
@@ -4401,6 +4467,14 @@ fn policy_setup_flow_updates_dashboard_settings() {
         "http://127.0.0.1:8080",           // egress.proxy_url
         "y",                               // egress.require_proxy
         "600",                             // runtime.max_runtime_seconds
+        "yes",                             // linux.seccomp.enabled
+        "",                                // linux.seccomp.deny_ptrace
+        "no",                              // linux.seccomp.deny_bpf
+        "",                                // linux.seccomp.deny_kernel_modules
+        "",                                // linux.seccomp.deny_mount_namespace_changes
+        "allowlist",                       // linux.network.mode
+        "1.1.1.1, 10.0.0.0/8",             // linux.network.allow
+        "169.254.169.254",                 // linux.network.deny
         "yes",                             // enforcement.noninteractive
         "none",                            // watch.system_events
         "/Users/me/templates,/opt/shared", // allow_path_prefixes
@@ -4433,6 +4507,26 @@ fn policy_setup_flow_updates_dashboard_settings() {
         Some(&json!(600))
     );
     assert_eq!(
+        policy_value_get(&root, "linux.seccomp.enabled"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        policy_value_get(&root, "linux.seccomp.deny_bpf"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        policy_value_get(&root, "linux.network.mode"),
+        Some(&json!("allowlist"))
+    );
+    assert_eq!(
+        policy_value_get(&root, "linux.network.allow"),
+        Some(&json!(["1.1.1.1", "10.0.0.0/8"]))
+    );
+    assert_eq!(
+        policy_value_get(&root, "linux.network.deny"),
+        Some(&json!(["169.254.169.254"]))
+    );
+    assert_eq!(
         policy_value_get(&root, "enforcement.noninteractive"),
         Some(&json!(true))
     );
@@ -4448,6 +4542,7 @@ fn policy_setup_flow_updates_dashboard_settings() {
     let rendered = String::from_utf8(output).unwrap();
     assert!(rendered.contains("Resource governance"));
     assert!(rendered.contains("Network egress"));
+    assert!(rendered.contains("Linux host controls"));
     assert!(rendered.contains("Allowed path prefixes"));
     assert!(rendered.contains("Artifact definitions"));
     assert!(rendered.contains("Decision rules"));

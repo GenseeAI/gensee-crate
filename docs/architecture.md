@@ -92,9 +92,10 @@ the old `GENSEE_HOME` to start a fresh encrypted store. Set
   still early and mostly deterministic.
 - Linux fanotify can enforce supported sensitive-path marks today, seccomp can
   hard-deny dangerous syscalls for processes launched with
-  `gensee linux exec-seccomp`, and cgroup/nftables can scope egress controls to
-  an attached agent process tree. The long-running daemon, recursive
-  suffix-pattern coverage, eBPF telemetry, Landlock/AppArmor generation, and
-  prompt/speculation brokers are still future work.
+  `gensee run --sandbox linux`, and cgroup/nftables can scope egress controls
+  to an attached agent process tree or to policy-managed Linux runs. The
+  long-running daemon, recursive suffix-pattern coverage, eBPF telemetry,
+  Landlock/AppArmor generation, and prompt/speculation brokers are still future
+  work.
 - Automatic rollback, merge-back review, deny-default policies, and container
   confinement are future work.

@@ -484,6 +484,20 @@
   "runtime": {
     "max_runtime_seconds": null
   },
+  "linux": {
+    "seccomp": {
+      "enabled": false,
+      "deny_ptrace": true,
+      "deny_bpf": true,
+      "deny_kernel_modules": true,
+      "deny_mount_namespace_changes": true
+    },
+    "network": {
+      "mode": "off",
+      "allow": [],
+      "deny": []
+    }
+  },
   "enforcement": {
     "noninteractive": false
   },

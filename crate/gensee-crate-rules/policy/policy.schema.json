@@ -83,6 +83,35 @@
         "max_runtime_seconds": { "type": ["integer", "null"], "minimum": 1 }
       }
     },
+    "linux": {
+      "type": "object",
+      "description": "Linux host-enforcement defaults for managed agent launches.",
+      "additionalProperties": false,
+      "properties": {
+        "seccomp": {
+          "type": "object",
+          "description": "Seccomp syscall-deny defaults applied by `gensee run --sandbox linux`.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "deny_ptrace": { "type": "boolean", "default": true },
+            "deny_bpf": { "type": "boolean", "default": true },
+            "deny_kernel_modules": { "type": "boolean", "default": true },
+            "deny_mount_namespace_changes": { "type": "boolean", "default": true }
+          }
+        },
+        "network": {
+          "type": "object",
+          "description": "Cgroup/nftables egress defaults applied by `gensee run --sandbox linux`.",
+          "additionalProperties": false,
+          "properties": {
+            "mode": { "type": "string", "enum": ["off", "monitor", "deny-all", "allowlist"], "default": "off" },
+            "allow": { "type": "array", "items": { "type": "string" }, "description": "Allowed IP/CIDR destinations for allowlist mode." },
+            "deny": { "type": "array", "items": { "type": "string" }, "description": "Denied IP/CIDR destinations applied before allow rules." }
+          }
+        }
+      }
+    },
     "enforcement": {
       "type": "object",
       "description": "Enforcement posture (env override: GENSEE_NONINTERACTIVE).",

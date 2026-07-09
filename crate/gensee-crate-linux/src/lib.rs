@@ -21,10 +21,10 @@ pub use fanotify::{
     LinuxFanotifyMark, LinuxFanotifyMarkPlan, LinuxFanotifyStatus,
 };
 pub use network::{
-    apply_nftables_script, attach_process_tree_to_cgroup, collect_process_tree,
-    default_agent_cgroup_path, plan_nftables_policy, LinuxCgroupAttachPlan,
-    LinuxNetworkEnforcementConfig, LinuxNetworkEnforcementPlan, LinuxNftablesDestination,
-    LinuxNftablesPlan,
+    apply_nftables_script, attach_current_process_to_cgroup, attach_process_tree_to_cgroup,
+    collect_process_tree, create_agent_cgroup, default_agent_cgroup_path, plan_nftables_policy,
+    LinuxCgroupAttachPlan, LinuxNetworkEnforcementConfig, LinuxNetworkEnforcementPlan,
+    LinuxNftablesDestination, LinuxNftablesPlan,
 };
 pub use policy::{
     DangerousSyscallPolicy, LinuxEnforcementComponent, LinuxEnforcementMode, LinuxEnforcementPlan,

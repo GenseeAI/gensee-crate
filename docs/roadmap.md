@@ -17,16 +17,19 @@ Available experimentally:
 
 - Process-tree attribution for Claude Code, Codex, Omnigent, and other local
   agents through `/proc`.
-- Host capability and enforcement planning through `gensee linux status` and
-  `gensee linux plan`.
+- Host capability reporting through `gensee status`.
+- Sidecar attachment for existing Linux agent process trees through
+  `gensee watch --pid <pid>`.
 - Fanotify permission enforcement for supported sensitive-path exact paths and
   prefix roots such as `~/.ssh/**`.
-- Seccomp launcher profiles through `gensee linux exec-seccomp -- <agent>` to
-  hard-deny dangerous syscall families such as `ptrace`, `bpf`, kernel module
-  loading, mount changes, and namespace switching.
-- Cgroup/nftables egress controls through `gensee linux network-plan` and
-  `gensee linux network-apply`, scoped to a cgroup v2 agent process tree and
-  IP/CIDR allowlists or deny-all mode.
+- Seccomp launcher profiles configured through policy and applied by
+  `gensee run --sandbox linux -- <agent>` to hard-deny dangerous syscall
+  families such as `ptrace`, `bpf`, kernel module loading, mount changes, and
+  namespace switching.
+- Cgroup/nftables egress controls through the preferred
+  `gensee run --sandbox linux -- <agent>` launch workflow, scoped to a cgroup
+  v2 agent process tree and policy-managed IP/CIDR allowlists, denylists, or
+  deny-all mode. Low-level planning/apply commands live under `gensee debug`.
 
 Planned work includes:
 

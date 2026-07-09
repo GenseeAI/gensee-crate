@@ -317,16 +317,15 @@ gensee run -- claude # or: gensee run -- codex
 - **Experimental Linux host controls:** inspect Linux host capabilities, monitor
   a direct agent process tree through `/proc`, run the fanotify sensitive-path
   permission backend, launch an agent under a seccomp hard-deny syscall profile,
-  and plan/apply cgroup-scoped nftables egress controls on Linux.
+  and plan/apply cgroup-scoped nftables egress controls on Linux. The public CLI
+  is capability-oriented; `gensee linux ...` remains only as a compatibility
+  alias while this branch is experimental.
 
 ```bash
-gensee linux status --json
-gensee linux plan --json
-gensee linux monitor --pid <agent-root-pid> --json
-gensee linux seccomp-profile --json
-gensee linux exec-seccomp -- claude
-gensee linux network-plan --session-id claude-1 --allow 10.0.0.0/8 --json
-sudo gensee linux fanotify-once --json
+gensee status --json
+gensee watch --pid <agent-root-pid>
+gensee policy setup
+sudo gensee run --sandbox linux -- codex
 ```
 
 For orchestration frameworks such as Omnigent, use the same primitives as a

@@ -90,6 +90,8 @@ pub struct PolicyDocument {
     #[serde(default)]
     pub runtime: RuntimeConfig,
     #[serde(default)]
+    pub linux: LinuxHostConfig,
+    #[serde(default)]
     pub enforcement: EnforcementConfig,
     #[serde(default)]
     pub watch: WatchPolicyConfig,
@@ -147,6 +149,64 @@ pub struct EgressConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub max_runtime_seconds: Option<u64>,
+}
+
+/// Linux host-enforcement defaults for managed agent launches.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LinuxHostConfig {
+    pub seccomp: LinuxSeccompConfig,
+    pub network: LinuxNetworkConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LinuxSeccompConfig {
+    pub enabled: bool,
+    pub deny_ptrace: bool,
+    pub deny_bpf: bool,
+    pub deny_kernel_modules: bool,
+    pub deny_mount_namespace_changes: bool,
+}
+
+impl Default for LinuxSeccompConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            deny_ptrace: true,
+            deny_bpf: true,
+            deny_kernel_modules: true,
+            deny_mount_namespace_changes: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LinuxNetworkConfig {
+    pub mode: LinuxNetworkMode,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl Default for LinuxNetworkConfig {
+    fn default() -> Self {
+        Self {
+            mode: LinuxNetworkMode::Off,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinuxNetworkMode {
+    #[default]
+    Off,
+    Monitor,
+    DenyAll,
+    Allowlist,
 }
 
 /// Enforcement posture (the `GENSEE_NONINTERACTIVE` knob): when true, medium+
@@ -1340,6 +1400,7 @@ mod tests {
             "resource_governance",
             "egress",
             "runtime",
+            "linux",
             "enforcement",
             "watch",
             "allow_path_prefixes",
@@ -1351,6 +1412,8 @@ mod tests {
         assert_eq!(d.resource_governance.max_tool_calls_per_session, 500);
         assert_eq!(d.resource_governance.max_read_bytes, 10 * 1024 * 1024);
         assert!(d.egress.allow_hosts.is_empty());
+        assert!(!d.linux.seccomp.enabled);
+        assert_eq!(d.linux.network.mode, LinuxNetworkMode::Off);
         assert!(!d.enforcement.noninteractive);
         assert!(d.runtime.max_runtime_seconds.is_none());
         assert_eq!(d.watch.system_events, SystemEventMode::Eslogger);
@@ -1378,11 +1441,21 @@ mod tests {
         doc["egress"]["allow_hosts"] = serde_json::json!(["github.com"]);
         doc["enforcement"]["noninteractive"] = serde_json::json!(true);
         doc["runtime"]["max_runtime_seconds"] = serde_json::json!(600);
+        doc["linux"]["seccomp"]["enabled"] = serde_json::json!(true);
+        doc["linux"]["seccomp"]["deny_bpf"] = serde_json::json!(false);
+        doc["linux"]["network"]["mode"] = serde_json::json!("allowlist");
+        doc["linux"]["network"]["allow"] = serde_json::json!(["1.1.1.1"]);
+        doc["linux"]["network"]["deny"] = serde_json::json!(["169.254.169.254"]);
         let policy = Policy::from_json(&doc.to_string()).expect("parses");
         let d = policy.document();
         assert_eq!(d.egress.allow_hosts, vec!["github.com".to_string()]);
         assert!(d.enforcement.noninteractive);
         assert_eq!(d.runtime.max_runtime_seconds, Some(600));
+        assert!(d.linux.seccomp.enabled);
+        assert!(!d.linux.seccomp.deny_bpf);
+        assert_eq!(d.linux.network.mode, LinuxNetworkMode::Allowlist);
+        assert_eq!(d.linux.network.allow, vec!["1.1.1.1".to_string()]);
+        assert_eq!(d.linux.network.deny, vec!["169.254.169.254".to_string()]);
     }
 
     #[test]

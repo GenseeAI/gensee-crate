@@ -1,4 +1,4 @@
-# `gensee run` — managed launch and the macOS sandbox
+# `gensee run` — managed launch and host controls
 
 `gensee run` launches an agent as a managed child, records a local run record in
 `$GENSEE_HOME/sessions.jsonl`, captures the spawned agent root PID, and sets:
@@ -61,6 +61,34 @@ targeted-deny SBPL profile:
 
 `--deny-network`, CPU/memory quotas, deny-default profiles, and container mode
 are intentionally not part of this first cut.
+
+## Managed Linux sandbox mode
+
+On Linux, `gensee run --sandbox linux` can launch the agent through initial
+host-enforcement layers configured in policy:
+
+```bash
+gensee policy setup
+
+sudo gensee run \
+  --sandbox linux \
+  -- codex
+```
+
+When `linux.seccomp.enabled` is true, Gensee installs the configured hard-deny
+syscall profile before the agent binary executes. When `linux.network.mode` is
+`allowlist`, `deny-all`, or has deny destinations, Gensee creates a per-run
+cgroup, installs a cgroup-scoped nftables egress policy, starts the agent
+through an internal exec wrapper, joins that cgroup, and then execs the real
+agent.
+
+`--linux-seccomp`, `--no-linux-seccomp`, `--linux-network`, `--allow-net`, and
+`--deny-net` are per-run overrides for demos, tests, and emergency debugging.
+
+Use `gensee status` to inspect host capabilities. Backend-specific probes such
+as `gensee debug seccomp-profile` and `gensee debug network-plan` are available
+for development/admin debugging. See [Linux host support](linux.md) for details
+and current limitations.
 
 ## Staged workspace review and discard
 

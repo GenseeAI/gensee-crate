@@ -10,6 +10,7 @@ pub(crate) fn current_dir_string() -> Option<String> {
 pub(crate) enum SandboxMode {
     None,
     Mac,
+    Linux,
 }
 
 impl SandboxMode {
@@ -17,6 +18,7 @@ impl SandboxMode {
         match value {
             "none" => Ok(Self::None),
             "mac" => Ok(Self::Mac),
+            "linux" => Ok(Self::Linux),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("unknown sandbox mode: {other}"),
@@ -28,6 +30,7 @@ impl SandboxMode {
         match self {
             Self::None => "none",
             Self::Mac => "mac",
+            Self::Linux => "linux",
         }
     }
 }
@@ -65,6 +68,10 @@ pub(crate) struct RunConfig {
     pub(crate) workspace_mode: WorkspaceMode,
     pub(crate) workspace: PathBuf,
     pub(crate) max_runtime_seconds: Option<u64>,
+    pub(crate) linux_seccomp_override: Option<bool>,
+    pub(crate) linux_network_override: Option<gensee_crate_linux::LinuxNetworkMode>,
+    pub(crate) linux_allow_net_override: Vec<String>,
+    pub(crate) linux_deny_net_override: Vec<String>,
     pub(crate) agent_cmd: Vec<OsString>,
 }
 
@@ -74,6 +81,10 @@ impl RunConfig {
         let mut profile = "observe".to_string();
         let mut workspace_mode = WorkspaceMode::Direct;
         let mut workspace: Option<PathBuf> = None;
+        let mut linux_seccomp_override = None;
+        let mut linux_network_override = None;
+        let mut linux_allow_net_override = Vec::new();
+        let mut linux_deny_net_override = Vec::new();
         // Precedence: --max-runtime-seconds flag (below) > GENSEE_MAX_RUNTIME_SECONDS
         // env > policy doc `runtime.max_runtime_seconds`.
         let mut max_runtime_seconds = env::var("GENSEE_MAX_RUNTIME_SECONDS")
@@ -129,6 +140,66 @@ impl RunConfig {
                         io::Error::new(io::ErrorKind::InvalidInput, "missing --workspace value")
                     })?));
                 }
+                Some("--linux-seccomp") => {
+                    linux_seccomp_override = Some(true);
+                }
+                Some("--no-linux-seccomp") => {
+                    linux_seccomp_override = Some(false);
+                }
+                Some("--linux-network") => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .and_then(|arg| arg.to_str())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "missing --linux-network value",
+                            )
+                        })?;
+                    linux_network_override = Some(match value {
+                        "off" => gensee_crate_linux::LinuxNetworkMode::Off,
+                        "allowlist" => gensee_crate_linux::LinuxNetworkMode::AllowListed,
+                        "deny-all" => gensee_crate_linux::LinuxNetworkMode::DenyAll,
+                        "monitor" => gensee_crate_linux::LinuxNetworkMode::Monitor,
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "unknown --linux-network mode: {other} (expected allowlist|deny-all|monitor|off)"
+                                ),
+                            ));
+                        }
+                    });
+                }
+                Some("--allow-net") => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .and_then(|arg| arg.to_str())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "missing --allow-net value")
+                        })?;
+                    linux_allow_net_override.push(value.to_string());
+                    if linux_network_override.is_none() {
+                        linux_network_override =
+                            Some(gensee_crate_linux::LinuxNetworkMode::AllowListed);
+                    }
+                }
+                Some("--deny-net") => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .and_then(|arg| arg.to_str())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "missing --deny-net value")
+                        })?;
+                    linux_deny_net_override.push(value.to_string());
+                    if linux_network_override.is_none() {
+                        linux_network_override =
+                            Some(gensee_crate_linux::LinuxNetworkMode::Monitor);
+                    }
+                }
                 Some("--max-runtime-seconds") => {
                     index += 1;
                     let value = args
@@ -172,12 +243,23 @@ impl RunConfig {
         if agent_cmd.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: gensee run [--sandbox mac] [--profile cautious] [--workspace-mode staged] [--max-runtime-seconds N] -- <agent> [args...]",
+                "usage: gensee run [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--linux-seccomp|--no-linux-seccomp] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... [--max-runtime-seconds N] -- <agent> [args...]",
             ));
         }
 
         if sandbox == SandboxMode::Mac && profile == "observe" {
             profile = "cautious".to_string();
+        }
+        if (linux_seccomp_override.is_some()
+            || linux_network_override.is_some()
+            || !linux_allow_net_override.is_empty()
+            || !linux_deny_net_override.is_empty())
+            && sandbox != SandboxMode::Linux
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Linux run controls require --sandbox linux",
+            ));
         }
 
         let workspace = workspace.unwrap_or(env::current_dir()?);
@@ -187,18 +269,47 @@ impl RunConfig {
             workspace_mode,
             workspace,
             max_runtime_seconds,
+            linux_seccomp_override,
+            linux_network_override,
+            linux_allow_net_override,
+            linux_deny_net_override,
             agent_cmd,
         })
     }
 }
 
 pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
+    if config.sandbox == SandboxMode::Linux && std::env::consts::OS != "linux" {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "--sandbox linux is supported on Linux, not {}",
+                std::env::consts::OS
+            ),
+        ));
+    }
+
     let started_at_ms = unix_millis()?;
     let run_id = format!("run_{}_{}", std::process::id(), started_at_ms);
     let original_workspace = canonicalize_or_original(&config.workspace);
     let repo_path = find_repo_root(&original_workspace);
     let run_workspace = prepare_run_workspace(&config, &run_id, &original_workspace)?;
     let agent_binary = config.agent_cmd[0].to_string_lossy().to_string();
+    let policy_doc = Policy::global().document();
+    let linux_seccomp_profile = linux_run_seccomp_profile(&config, policy_doc);
+    let linux_network = linux_run_network_config(&config, policy_doc, &run_id)?;
+    if let Some(network_config) = linux_network.as_ref() {
+        gensee_crate_linux::create_agent_cgroup(Path::new(&network_config.cgroup_path))?;
+        let plan = gensee_crate_linux::plan_nftables_policy(network_config);
+        for warning in &plan.warnings {
+            eprintln!("gensee: linux network warning: {warning}");
+        }
+        gensee_crate_linux::apply_nftables_script(&plan.nftables.script)?;
+        eprintln!(
+            "gensee: applied linux network policy session={} cgroup={} mode={:?}",
+            network_config.session_id, network_config.cgroup_path, network_config.network.mode
+        );
+    }
     let sandbox_profile = if config.sandbox == SandboxMode::Mac {
         Some(write_macos_sandbox_profile(
             &run_id,
@@ -216,6 +327,23 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
             .arg("-f")
             .arg(profile_path)
             .arg(&config.agent_cmd[0]);
+        command
+    } else if config.sandbox == SandboxMode::Linux
+        && (linux_seccomp_profile.is_some() || linux_network.is_some())
+    {
+        let mut command = Command::new(env::current_exe()?);
+        command.arg("__linux-exec");
+        if let Some(network_config) = linux_network.as_ref() {
+            command
+                .arg("--cgroup-path")
+                .arg(&network_config.cgroup_path);
+        }
+        if let Some(profile) = linux_seccomp_profile.as_ref() {
+            command
+                .arg("--seccomp-profile-json")
+                .arg(serde_json::to_string(profile)?);
+        }
+        command.arg("--").arg(&config.agent_cmd[0]);
         command
     } else {
         Command::new(&config.agent_cmd[0])
@@ -334,6 +462,97 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
             "agent exited with status {status}"
         )))
     }
+}
+
+fn linux_run_seccomp_profile(
+    config: &RunConfig,
+    policy_doc: &policy::PolicyDocument,
+) -> Option<gensee_crate_linux::LinuxSeccompProfile> {
+    let enabled = config
+        .linux_seccomp_override
+        .unwrap_or(policy_doc.linux.seccomp.enabled);
+    enabled.then(|| {
+        gensee_crate_linux::LinuxSeccompProfile::from_policy(&linux_dangerous_syscall_policy(
+            &policy_doc.linux.seccomp,
+        ))
+    })
+}
+
+fn linux_run_network_config(
+    config: &RunConfig,
+    policy_doc: &policy::PolicyDocument,
+    run_id: &str,
+) -> io::Result<Option<gensee_crate_linux::LinuxNetworkEnforcementConfig>> {
+    let mode = config
+        .linux_network_override
+        .unwrap_or_else(|| linux_network_mode_from_policy(policy_doc.linux.network.mode));
+    if mode == gensee_crate_linux::LinuxNetworkMode::Off {
+        return Ok(None);
+    }
+
+    let allowed_hosts = if config.linux_allow_net_override.is_empty() {
+        policy_doc.linux.network.allow.clone()
+    } else {
+        config.linux_allow_net_override.clone()
+    };
+    if mode == gensee_crate_linux::LinuxNetworkMode::AllowListed && allowed_hosts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Linux network allowlist mode requires policy linux.network.allow or --allow-net",
+        ));
+    }
+    let denied_hosts = if config.linux_deny_net_override.is_empty() {
+        policy_doc.linux.network.deny.clone()
+    } else {
+        config.linux_deny_net_override.clone()
+    };
+
+    Ok(Some(
+        gensee_crate_linux::LinuxNetworkEnforcementConfig::new(
+            run_id,
+            gensee_crate_linux::LinuxNetworkPolicy {
+                mode,
+                allowed_hosts,
+                denied_hosts,
+            },
+        ),
+    ))
+}
+
+pub(crate) fn linux_network_mode_from_policy(
+    mode: policy::LinuxNetworkMode,
+) -> gensee_crate_linux::LinuxNetworkMode {
+    match mode {
+        policy::LinuxNetworkMode::Off => gensee_crate_linux::LinuxNetworkMode::Off,
+        policy::LinuxNetworkMode::Monitor => gensee_crate_linux::LinuxNetworkMode::Monitor,
+        policy::LinuxNetworkMode::DenyAll => gensee_crate_linux::LinuxNetworkMode::DenyAll,
+        policy::LinuxNetworkMode::Allowlist => gensee_crate_linux::LinuxNetworkMode::AllowListed,
+    }
+}
+
+pub(crate) fn linux_dangerous_syscall_policy(
+    config: &policy::LinuxSeccompConfig,
+) -> gensee_crate_linux::DangerousSyscallPolicy {
+    gensee_crate_linux::DangerousSyscallPolicy {
+        deny_mount_namespace_changes: config.deny_mount_namespace_changes,
+        deny_ptrace: config.deny_ptrace,
+        deny_bpf: config.deny_bpf,
+        deny_kernel_module_loading: config.deny_kernel_modules,
+    }
+}
+
+pub(crate) fn linux_policy_from_policy_document(
+    policy_doc: &policy::PolicyDocument,
+) -> gensee_crate_linux::LinuxPolicy {
+    let mut linux_policy = gensee_crate_linux::LinuxPolicy::default();
+    linux_policy.network = gensee_crate_linux::LinuxNetworkPolicy {
+        mode: linux_network_mode_from_policy(policy_doc.linux.network.mode),
+        allowed_hosts: policy_doc.linux.network.allow.clone(),
+        denied_hosts: policy_doc.linux.network.deny.clone(),
+    };
+    linux_policy.seccomp_enabled = policy_doc.linux.seccomp.enabled;
+    linux_policy.dangerous_syscalls = linux_dangerous_syscall_policy(&policy_doc.linux.seccomp);
+    linux_policy
 }
 
 pub(crate) fn wait_for_child_with_timeout(

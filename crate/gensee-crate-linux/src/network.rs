@@ -34,6 +34,7 @@ pub struct LinuxNftablesPlan {
     pub cgroup_path: String,
     pub mode: LinuxNetworkMode,
     pub destinations: Vec<LinuxNftablesDestination>,
+    pub denied_destinations: Vec<LinuxNftablesDestination>,
     pub script: String,
     pub warnings: Vec<String>,
 }
@@ -101,7 +102,17 @@ pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftab
     let table_name = format!("gensee_{}", sanitize_nft_identifier(&config.session_id));
     let chain_name = "egress".to_string();
     let mut destinations = Vec::new();
+    let mut denied_destinations = Vec::new();
     let mut warnings = Vec::new();
+
+    for denied in &config.network.denied_hosts {
+        match parse_destination(denied) {
+            Some(destination) => denied_destinations.push(destination),
+            None => warnings.push(format!(
+                "nftables network enforcement currently requires IP/CIDR denied destinations; skipped `{denied}`"
+            )),
+        }
+    }
 
     for allowed in &config.network.allowed_hosts {
         match parse_destination(allowed) {
@@ -118,6 +129,7 @@ pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftab
         &relative_cgroup_path(&config.cgroup_path),
         config.network.mode,
         &destinations,
+        &denied_destinations,
     );
 
     LinuxNftablesPlan {
@@ -126,6 +138,7 @@ pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftab
         cgroup_path: config.cgroup_path.clone(),
         mode: config.network.mode,
         destinations,
+        denied_destinations,
         script,
         warnings,
     }
@@ -147,7 +160,7 @@ pub fn collect_process_tree(root_pid: u32) -> io::Result<Vec<u32>> {
 
 #[cfg(target_os = "linux")]
 pub fn attach_process_tree_to_cgroup(root_pid: u32, cgroup_path: &Path) -> io::Result<Vec<u32>> {
-    std::fs::create_dir_all(cgroup_path)?;
+    create_agent_cgroup(cgroup_path)?;
     let pids = collect_process_tree(root_pid)?;
     for pid in &pids {
         std::fs::write(cgroup_path.join("cgroup.procs"), format!("{pid}\n"))?;
@@ -164,9 +177,43 @@ pub fn attach_process_tree_to_cgroup(_root_pid: u32, _cgroup_path: &Path) -> io:
 }
 
 #[cfg(target_os = "linux")]
+pub fn create_agent_cgroup(cgroup_path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(cgroup_path)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn create_agent_cgroup(_cgroup_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cgroup network enforcement is only available on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn attach_current_process_to_cgroup(cgroup_path: &Path) -> io::Result<()> {
+    create_agent_cgroup(cgroup_path)?;
+    std::fs::write(
+        cgroup_path.join("cgroup.procs"),
+        format!("{}\n", std::process::id()),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn attach_current_process_to_cgroup(_cgroup_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cgroup network enforcement is only available on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 pub fn apply_nftables_script(script: &str) -> io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
+
+    if script.trim().is_empty() {
+        return Ok(());
+    }
 
     let mut child = Command::new("nft")
         .arg("-f")
@@ -200,16 +247,34 @@ fn nftables_script(
     cgroup_path: &str,
     mode: LinuxNetworkMode,
     destinations: &[LinuxNftablesDestination],
+    denied_destinations: &[LinuxNftablesDestination],
 ) -> String {
     let cgroup_match = format!(
         "socket cgroupv2 level 2 \"{}\"",
         escape_nft_string(cgroup_path)
     );
+    if mode == LinuxNetworkMode::Off {
+        return String::new();
+    }
+
     let mut lines = vec![
         format!("table inet {table_name} {{"),
         format!("  chain {chain_name} {{"),
         "    type filter hook output priority filter; policy accept;".to_string(),
     ];
+
+    for destination in denied_destinations {
+        match destination.family {
+            LinuxNftablesAddressFamily::Ipv4 => lines.push(format!(
+                "    {cgroup_match} ip daddr {} reject with icmpx admin-prohibited",
+                destination.value
+            )),
+            LinuxNftablesAddressFamily::Ipv6 => lines.push(format!(
+                "    {cgroup_match} ip6 daddr {} reject with icmpx admin-prohibited",
+                destination.value
+            )),
+        }
+    }
 
     if mode == LinuxNetworkMode::Monitor {
         lines.push("  }".to_string());
@@ -356,14 +421,19 @@ mod tests {
                     "2001:db8::/32".to_string(),
                     "example.com".to_string(),
                 ],
+                denied_hosts: vec!["169.254.169.254".to_string()],
             },
         );
 
         let plan = build_nftables_plan(&config);
 
         assert_eq!(plan.destinations.len(), 2);
+        assert_eq!(plan.denied_destinations.len(), 1);
         assert_eq!(plan.warnings.len(), 1);
         assert!(plan.script.contains("socket cgroupv2 level 2"));
+        assert!(plan
+            .script
+            .contains("ip daddr 169.254.169.254 reject with icmpx admin-prohibited"));
         assert!(plan.script.contains("ip daddr 1.2.3.4 accept"));
         assert!(plan.script.contains("ip6 daddr 2001:db8::/32 accept"));
         assert!(plan.script.contains("reject with icmpx admin-prohibited"));
@@ -376,11 +446,28 @@ mod tests {
             LinuxNetworkPolicy {
                 mode: LinuxNetworkMode::Monitor,
                 allowed_hosts: Vec::new(),
+                denied_hosts: Vec::new(),
             },
         );
 
         let plan = build_nftables_plan(&config);
 
         assert!(!plan.script.contains("reject with"));
+    }
+
+    #[test]
+    fn off_mode_generates_no_script() {
+        let config = LinuxNetworkEnforcementConfig::new(
+            "agent-1",
+            LinuxNetworkPolicy {
+                mode: LinuxNetworkMode::Off,
+                allowed_hosts: Vec::new(),
+                denied_hosts: Vec::new(),
+            },
+        );
+
+        let plan = build_nftables_plan(&config);
+
+        assert!(plan.script.is_empty());
     }
 }
