@@ -4380,6 +4380,25 @@ fn run_config_allows_policy_resolved_linux_allowlist() {
     assert!(config.linux_allow_net_override.is_empty());
 }
 
+#[test]
+fn linux_network_denylist_implies_monitor_mode() {
+    assert_eq!(
+        crate::run::linux_effective_network_mode(gensee_crate_linux::LinuxNetworkMode::Off, true),
+        gensee_crate_linux::LinuxNetworkMode::Monitor
+    );
+    assert_eq!(
+        crate::run::linux_effective_network_mode(gensee_crate_linux::LinuxNetworkMode::Off, false),
+        gensee_crate_linux::LinuxNetworkMode::Off
+    );
+    assert_eq!(
+        crate::run::linux_effective_network_mode(
+            gensee_crate_linux::LinuxNetworkMode::AllowListed,
+            true
+        ),
+        gensee_crate_linux::LinuxNetworkMode::AllowListed
+    );
+}
+
 fn temp_store_and_workspace(label: &str) -> (EventStore, PathBuf) {
     let root = env::temp_dir().join(format!(
         "gensee-cli-test-{label}-{}-{}",

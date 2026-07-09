@@ -120,6 +120,10 @@ in the user's home directory, so use it only when needed. Seccomp-only launches
 can usually run without `sudo`; cgroup/nftables network enforcement currently
 requires root.
 
+Setting `linux.network.deny` without changing `linux.network.mode` is treated
+as deny-only monitor mode for `gensee run`: Gensee installs rejects for the
+listed destinations while leaving other egress allowed.
+
 Relevant policy keys:
 
 ```json

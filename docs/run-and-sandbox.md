@@ -131,6 +131,9 @@ cgroup, installs a cgroup-scoped nftables egress policy, starts the agent
 through an internal exec wrapper, joins that cgroup, and then execs the real
 agent.
 
+A non-empty `linux.network.deny` with `linux.network.mode` left as `off` is
+treated as deny-only monitor mode: only the listed destinations are rejected.
+
 `--linux-seccomp`, `--no-linux-seccomp`, `--linux-network`, `--allow-net`, and
 `--deny-net` are per-run overrides for demos, tests, and emergency debugging.
 

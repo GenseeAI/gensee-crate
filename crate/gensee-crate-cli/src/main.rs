@@ -518,6 +518,7 @@ fn linux_network_config(
         } else {
             linux_network_mode_from_policy(policy_doc.linux.network.mode)
         };
+    let mode = crate::run::linux_effective_network_mode(mode, !denied_hosts.is_empty());
     let root_pid = linux_arg_value(args, "--pid")
         .map(|value| {
             value.parse::<u32>().map_err(|err| {

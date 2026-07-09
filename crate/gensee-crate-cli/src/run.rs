@@ -486,9 +486,6 @@ fn linux_run_network_config(
     let mode = config
         .linux_network_override
         .unwrap_or_else(|| linux_network_mode_from_policy(policy_doc.linux.network.mode));
-    if mode == gensee_crate_linux::LinuxNetworkMode::Off {
-        return Ok(None);
-    }
 
     let allowed_hosts = if config.linux_allow_net_override.is_empty() {
         policy_doc.linux.network.allow.clone()
@@ -506,6 +503,10 @@ fn linux_run_network_config(
     } else {
         config.linux_deny_net_override.clone()
     };
+    let mode = linux_effective_network_mode(mode, !denied_hosts.is_empty());
+    if mode == gensee_crate_linux::LinuxNetworkMode::Off {
+        return Ok(None);
+    }
 
     Ok(Some(
         gensee_crate_linux::LinuxNetworkEnforcementConfig::new(
@@ -517,6 +518,17 @@ fn linux_run_network_config(
             },
         ),
     ))
+}
+
+pub(crate) fn linux_effective_network_mode(
+    mode: gensee_crate_linux::LinuxNetworkMode,
+    has_denied_hosts: bool,
+) -> gensee_crate_linux::LinuxNetworkMode {
+    if mode == gensee_crate_linux::LinuxNetworkMode::Off && has_denied_hosts {
+        gensee_crate_linux::LinuxNetworkMode::Monitor
+    } else {
+        mode
+    }
 }
 
 pub(crate) fn linux_network_mode_from_policy(
