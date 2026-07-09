@@ -328,6 +328,24 @@ gensee policy setup
 sudo gensee run --sandbox linux -- codex
 ```
 
+When launching Node/npm-installed agents such as Codex or Claude Code with
+`sudo`, preserve the user `PATH` so the agent shim can still find `node`:
+
+```bash
+sudo env "PATH=$PATH" gensee run --sandbox linux -- codex
+```
+
+If testing from a source build, use the same pattern with the debug binary:
+
+```bash
+sudo env "PATH=$PATH" ./target/debug/gensee run --sandbox linux -- codex
+```
+
+If the agent cannot find its auth or config files, also preserve `HOME`, but be
+aware that a root-launched agent may create root-owned files in that directory.
+Seccomp-only launches can usually run without `sudo`; cgroup/nftables network
+enforcement currently requires it.
+
 For orchestration frameworks such as Omnigent, use the same primitives as a
 thin outer safety layer:
 

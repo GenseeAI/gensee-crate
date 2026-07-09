@@ -75,6 +75,28 @@ sudo gensee run \
   -- codex
 ```
 
+When launching npm/Node-based agents such as Codex or Claude Code with `sudo`,
+preserve the user `PATH`; otherwise the agent shim may fail to find `node`:
+
+```bash
+sudo env "PATH=$PATH" gensee run \
+  --sandbox linux \
+  -- codex
+```
+
+For source-tree testing, the same rule applies to the debug binary:
+
+```bash
+sudo env "PATH=$PATH" ./target/debug/gensee run \
+  --sandbox linux \
+  -- codex
+```
+
+If the agent needs user auth or config files, you can also pass `"HOME=$HOME"`,
+but root-launched agents may create root-owned files there. Use `sudo` for
+cgroup/nftables network enforcement; seccomp-only launches can usually run as
+the current user.
+
 When `linux.seccomp.enabled` is true, Gensee installs the configured hard-deny
 syscall profile before the agent binary executes. When `linux.network.mode` is
 `allowlist`, `deny-all`, or has deny destinations, Gensee creates a per-run

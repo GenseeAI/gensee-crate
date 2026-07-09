@@ -64,6 +64,32 @@ gensee policy setup
 sudo gensee run --sandbox linux -- codex
 ```
 
+For Node/npm-installed agent CLIs such as Codex or Claude Code, `sudo` may
+replace the user `PATH` with a restricted `secure_path`. If the launch fails
+with an error like `env: 'node': No such file or directory`, preserve `PATH`
+when invoking Gensee:
+
+```bash
+sudo env "PATH=$PATH" gensee run --sandbox linux -- codex
+```
+
+From a source checkout, use the debug binary the same way:
+
+```bash
+sudo env "PATH=$PATH" ./target/debug/gensee run --sandbox linux -- codex
+```
+
+If the agent cannot find user auth or config files, add `"HOME=$HOME"` as well:
+
+```bash
+sudo env "PATH=$PATH" "HOME=$HOME" gensee run --sandbox linux -- codex
+```
+
+Preserving `HOME` can cause a root-launched process to create root-owned files
+in the user's home directory, so use it only when needed. Seccomp-only launches
+can usually run without `sudo`; cgroup/nftables network enforcement currently
+requires root.
+
 Relevant policy keys:
 
 ```json
@@ -120,6 +146,14 @@ agent you start:
 
 ```bash
 sudo gensee run \
+  --sandbox linux \
+  -- codex
+```
+
+If `codex` or `claude` is installed through npm, prefer:
+
+```bash
+sudo env "PATH=$PATH" gensee run \
   --sandbox linux \
   -- codex
 ```
