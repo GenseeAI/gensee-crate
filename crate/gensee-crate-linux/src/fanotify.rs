@@ -168,7 +168,7 @@ mod platform {
     use crate::enforcement::LinuxAccessOperation;
     use crate::fanotify::{
         fanotify_response_for_verdict, plan_fanotify_marks, request_from_event,
-        LinuxFanotifyConfig, LinuxFanotifyEvent, LinuxFanotifyStatus,
+        LinuxFanotifyConfig, LinuxFanotifyEvent, LinuxFanotifyStatus, FAN_ALLOW,
     };
     use crate::procfs::{is_descendant_or_self, read_parent_by_pid};
 
