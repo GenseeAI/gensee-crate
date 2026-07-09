@@ -35,6 +35,7 @@ pub struct LinuxNftablesPlan {
     pub mode: LinuxNetworkMode,
     pub destinations: Vec<LinuxNftablesDestination>,
     pub denied_destinations: Vec<LinuxNftablesDestination>,
+    pub block_counters: Vec<LinuxNftablesBlockCounter>,
     pub script: String,
     pub warnings: Vec<String>,
 }
@@ -49,6 +50,29 @@ pub struct LinuxNftablesDestination {
 pub enum LinuxNftablesAddressFamily {
     Ipv4,
     Ipv6,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinuxNftablesBlockCounter {
+    pub name: String,
+    pub destination: Option<String>,
+    pub reason: LinuxNetworkBlockReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LinuxNetworkBlockReason {
+    DeniedDestination,
+    DefaultReject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinuxNetworkBlockEvent {
+    pub table_name: String,
+    pub counter_name: String,
+    pub destination: Option<String>,
+    pub reason: LinuxNetworkBlockReason,
+    pub packets: u64,
+    pub bytes: u64,
 }
 
 impl LinuxNetworkEnforcementConfig {
@@ -123,6 +147,7 @@ pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftab
         }
     }
 
+    let block_counters = block_counters(config.network.mode, &denied_destinations);
     let script = nftables_script(
         &table_name,
         &chain_name,
@@ -130,6 +155,7 @@ pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftab
         config.network.mode,
         &destinations,
         &denied_destinations,
+        &block_counters,
     );
 
     LinuxNftablesPlan {
@@ -139,6 +165,7 @@ pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftab
         mode: config.network.mode,
         destinations,
         denied_destinations,
+        block_counters,
         script,
         warnings,
     }
@@ -298,6 +325,44 @@ pub fn validate_nftables_plan_for_apply(plan: &LinuxNftablesPlan) -> io::Result<
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub fn read_nftables_block_events(
+    plan: &LinuxNftablesPlan,
+) -> io::Result<Vec<LinuxNetworkBlockEvent>> {
+    use std::process::Command;
+
+    if plan.block_counters.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let output = Command::new("nft")
+        .arg("-j")
+        .arg("list")
+        .arg("counters")
+        .arg("table")
+        .arg("inet")
+        .arg(&plan.table_name)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "nft exited with status {}",
+            output.status
+        )));
+    }
+
+    parse_nftables_counter_json(plan, &output.stdout)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_nftables_block_events(
+    _plan: &LinuxNftablesPlan,
+) -> io::Result<Vec<LinuxNetworkBlockEvent>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "nftables network enforcement is only available on Linux",
+    ))
+}
+
 fn nftables_script(
     table_name: &str,
     chain_name: &str,
@@ -305,6 +370,7 @@ fn nftables_script(
     mode: LinuxNetworkMode,
     destinations: &[LinuxNftablesDestination],
     denied_destinations: &[LinuxNftablesDestination],
+    block_counters: &[LinuxNftablesBlockCounter],
 ) -> String {
     let cgroup_match = format!(
         "socket cgroupv2 level 2 \"{}\"",
@@ -314,21 +380,30 @@ fn nftables_script(
         return String::new();
     }
 
-    let mut lines = vec![
-        format!("table inet {table_name} {{"),
-        format!("  chain {chain_name} {{"),
-        "    type filter hook output priority filter; policy accept;".to_string(),
-    ];
+    let mut lines = vec![format!("table inet {table_name} {{")];
+    for counter in block_counters {
+        lines.push(format!("  counter {} {{}}", counter.name));
+    }
+    lines.push(format!("  chain {chain_name} {{"));
+    lines.push("    type filter hook output priority filter; policy accept;".to_string());
 
-    for destination in denied_destinations {
+    for (index, destination) in denied_destinations.iter().enumerate() {
+        let counter_name = block_counters
+            .iter()
+            .find(|counter| {
+                counter.reason == LinuxNetworkBlockReason::DeniedDestination
+                    && counter.destination.as_deref() == Some(destination.value.as_str())
+            })
+            .map(|counter| counter.name.clone())
+            .unwrap_or_else(|| denied_counter_name(index));
         match destination.family {
             LinuxNftablesAddressFamily::Ipv4 => lines.push(format!(
-                "    {cgroup_match} ip daddr {} reject with icmpx admin-prohibited",
-                destination.value
+                "    {cgroup_match} ip daddr {} counter name {} reject with icmpx admin-prohibited",
+                destination.value, counter_name
             )),
             LinuxNftablesAddressFamily::Ipv6 => lines.push(format!(
-                "    {cgroup_match} ip6 daddr {} reject with icmpx admin-prohibited",
-                destination.value
+                "    {cgroup_match} ip6 daddr {} counter name {} reject with icmpx admin-prohibited",
+                destination.value, counter_name
             )),
         }
     }
@@ -351,12 +426,100 @@ fn nftables_script(
             )),
         }
     }
+    let default_counter_name = block_counters
+        .iter()
+        .find(|counter| counter.reason == LinuxNetworkBlockReason::DefaultReject)
+        .map(|counter| counter.name.as_str())
+        .unwrap_or(DEFAULT_REJECT_COUNTER);
     lines.push(format!(
-        "    {cgroup_match} reject with icmpx admin-prohibited"
+        "    {cgroup_match} counter name {default_counter_name} reject with icmpx admin-prohibited"
     ));
     lines.push("  }".to_string());
     lines.push("}".to_string());
     format!("{}\n", lines.join("\n"))
+}
+
+fn block_counters(
+    mode: LinuxNetworkMode,
+    denied_destinations: &[LinuxNftablesDestination],
+) -> Vec<LinuxNftablesBlockCounter> {
+    let mut counters = denied_destinations
+        .iter()
+        .enumerate()
+        .map(|(index, destination)| LinuxNftablesBlockCounter {
+            name: denied_counter_name(index),
+            destination: Some(destination.value.clone()),
+            reason: LinuxNetworkBlockReason::DeniedDestination,
+        })
+        .collect::<Vec<_>>();
+    if matches!(
+        mode,
+        LinuxNetworkMode::AllowListed | LinuxNetworkMode::DenyAll
+    ) {
+        counters.push(LinuxNftablesBlockCounter {
+            name: DEFAULT_REJECT_COUNTER.to_string(),
+            destination: None,
+            reason: LinuxNetworkBlockReason::DefaultReject,
+        });
+    }
+    counters
+}
+
+fn denied_counter_name(index: usize) -> String {
+    format!("deny_{index}")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_nftables_counter_json(
+    plan: &LinuxNftablesPlan,
+    data: &[u8],
+) -> io::Result<Vec<LinuxNetworkBlockEvent>> {
+    let value: serde_json::Value = serde_json::from_slice(data).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid nftables counter JSON: {error}"),
+        )
+    })?;
+    let entries = value
+        .get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing nftables array"))?;
+    let mut events = Vec::new();
+    for entry in entries {
+        let Some(counter) = entry.get("counter") else {
+            continue;
+        };
+        let Some(name) = counter.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(planned) = plan
+            .block_counters
+            .iter()
+            .find(|planned| planned.name == name)
+        else {
+            continue;
+        };
+        let packets = counter
+            .get("packets")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let bytes = counter
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if packets == 0 && bytes == 0 {
+            continue;
+        }
+        events.push(LinuxNetworkBlockEvent {
+            table_name: plan.table_name.clone(),
+            counter_name: name.to_string(),
+            destination: planned.destination.clone(),
+            reason: planned.reason,
+            packets,
+            bytes,
+        });
+    }
+    Ok(events)
 }
 
 fn parse_destination(value: &str) -> Option<LinuxNftablesDestination> {
@@ -371,6 +534,8 @@ fn parse_destination(value: &str) -> Option<LinuxNftablesDestination> {
         family,
     })
 }
+
+const DEFAULT_REJECT_COUNTER: &str = "default_block";
 
 fn relative_cgroup_path(path: &str) -> String {
     path.strip_prefix("/sys/fs/cgroup/")
@@ -434,15 +599,20 @@ mod tests {
 
         assert_eq!(plan.destinations.len(), 2);
         assert_eq!(plan.denied_destinations.len(), 1);
+        assert_eq!(plan.block_counters.len(), 2);
         assert_eq!(plan.warnings.len(), 1);
         assert!(validate_nftables_plan_for_apply(&plan).is_err());
+        assert!(plan.script.contains("counter deny_0 {}"));
+        assert!(plan.script.contains("counter default_block {}"));
         assert!(plan.script.contains("socket cgroupv2 level 2"));
-        assert!(plan
-            .script
-            .contains("ip daddr 169.254.169.254 reject with icmpx admin-prohibited"));
+        assert!(plan.script.contains(
+            "ip daddr 169.254.169.254 counter name deny_0 reject with icmpx admin-prohibited"
+        ));
         assert!(plan.script.contains("ip daddr 1.2.3.4 accept"));
         assert!(plan.script.contains("ip6 daddr 2001:db8::/32 accept"));
-        assert!(plan.script.contains("reject with icmpx admin-prohibited"));
+        assert!(plan
+            .script
+            .contains("counter name default_block reject with icmpx admin-prohibited"));
     }
 
     #[test]
@@ -477,9 +647,37 @@ mod tests {
         let plan = build_nftables_plan(&config);
 
         validate_nftables_plan_for_apply(&plan).unwrap();
-        assert!(plan
-            .script
-            .contains("ip daddr 169.254.169.254 reject with icmpx admin-prohibited"));
+        assert!(plan.script.contains(
+            "ip daddr 169.254.169.254 counter name deny_0 reject with icmpx admin-prohibited"
+        ));
+    }
+
+    #[test]
+    fn parses_nonzero_nftables_block_counters() {
+        let config = LinuxNetworkEnforcementConfig::new(
+            "agent-1",
+            LinuxNetworkPolicy {
+                mode: LinuxNetworkMode::Monitor,
+                allowed_hosts: Vec::new(),
+                denied_hosts: vec!["169.254.169.254".to_string()],
+            },
+        );
+        let plan = build_nftables_plan(&config);
+        let data = br#"{
+            "nftables": [
+                {"metainfo": {"json_schema_version": 1}},
+                {"counter": {"family": "inet", "table": "gensee_agent_1", "name": "deny_0", "packets": 2, "bytes": 128}},
+                {"counter": {"family": "inet", "table": "gensee_agent_1", "name": "unknown", "packets": 3, "bytes": 192}}
+            ]
+        }"#;
+
+        let events = parse_nftables_counter_json(&plan, data).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].counter_name, "deny_0");
+        assert_eq!(events[0].destination.as_deref(), Some("169.254.169.254"));
+        assert_eq!(events[0].packets, 2);
+        assert_eq!(events[0].bytes, 128);
     }
 
     #[test]

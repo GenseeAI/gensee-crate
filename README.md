@@ -366,6 +366,10 @@ path. Linux can use lower-level primitives earlier: seccomp for syscall denies,
 fanotify for sensitive file permission experiments, and cgroup/nftables for
 process-scoped network policy. Network destinations must currently be IP/CIDR
 values; hostname entries are rejected on apply rather than silently skipped.
+Managed Linux runs record nftables counter summaries as `NetworkBlocked` Layer 1
+system events after the agent exits, so `gensee timeline` shows blocked
+destinations such as `169.254.169.254`. Exact per-attempt child PID attribution
+is future eBPF/nft log work.
 
 For orchestration frameworks such as Omnigent, use the same primitives as a
 thin outer safety layer:

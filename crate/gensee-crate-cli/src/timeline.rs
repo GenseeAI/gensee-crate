@@ -343,7 +343,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
                 println!("    system events:");
                 for event in &call.system_events {
                     println!(
-                        "      source={} kind={} type={} pid={} ppid={} process={} path={} command={}",
+                        "      source={} kind={} type={} pid={} ppid={} process={} path={} network={} command={}",
                         event.source,
                         event.event_kind,
                         event.event_type,
@@ -351,6 +351,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
                         option_u32_display(event.ppid),
                         event.process_name.as_deref().unwrap_or("unknown"),
                         event.file_path.as_deref().unwrap_or("-"),
+                        system_event_network_dest(event).unwrap_or_else(|| "-".to_string()),
                         one_line(event.command_line.as_deref().unwrap_or("-")),
                     );
                 }
@@ -371,7 +372,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
         println!("Layer 1 system events");
         for event in system_events.iter().rev().take(20).rev() {
             println!(
-                "  {} | source={} | kind={} | type={} | pid={} | process={} | path={} | command={}",
+                "  {} | source={} | kind={} | type={} | pid={} | process={} | path={} | network={} | command={}",
                 event.observed_at_ms,
                 event.source,
                 event.event_kind,
@@ -379,6 +380,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
                 option_u32_display(event.pid),
                 event.process_name.as_deref().unwrap_or("unknown"),
                 event.file_path.as_deref().unwrap_or("-"),
+                system_event_network_dest(event).unwrap_or_else(|| "-".to_string()),
                 one_line(event.command_line.as_deref().unwrap_or("-")),
             );
         }
@@ -442,7 +444,7 @@ impl TimelineFilter {
                 keep_response_session(collections.assistant_responses, &session_id);
                 keep_session(collections.tool_calls, &session_id);
                 collections.sessions.clear();
-                collections.system_events.clear();
+                keep_system_event_session(collections.system_events, &session_id);
                 collections
                     .workspace_effects
                     .retain(|effect| effect.session_id.as_deref() == Some(session_id.as_str()));
@@ -455,7 +457,7 @@ impl TimelineFilter {
                 collections
                     .sessions
                     .retain(|session| session.session_id == *session_id);
-                collections.system_events.clear();
+                keep_system_event_session(collections.system_events, session_id);
                 collections
                     .workspace_effects
                     .retain(|effect| effect.session_id.as_deref() == Some(session_id.as_str()));
@@ -531,6 +533,10 @@ pub(crate) fn keep_alert_sessions(alerts: &mut Vec<AlertRecord>, session_id: &st
     alerts.retain(|alert| alert.session_id.as_deref() == Some(session_id));
 }
 
+pub(crate) fn keep_system_event_session(system_events: &mut Vec<SystemEvent>, session_id: &str) {
+    system_events.retain(|event| system_event_session_id(event).as_deref() == Some(session_id));
+}
+
 pub(crate) fn user_prompt_matches_path(prompt: &AgentUserPrompt, path: &str) -> bool {
     prompt
         .cwd
@@ -604,6 +610,22 @@ pub(crate) fn system_event_matches_path(event: &SystemEvent, path: &str) -> bool
             .as_deref()
             .is_some_and(|value| value.contains(path))
         || event.raw_json.contains(path)
+}
+
+pub(crate) fn system_event_session_id(event: &SystemEvent) -> Option<String> {
+    serde_json::from_str::<Value>(&event.raw_json)
+        .ok()?
+        .get("session_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+pub(crate) fn system_event_network_dest(event: &SystemEvent) -> Option<String> {
+    serde_json::from_str::<Value>(&event.raw_json)
+        .ok()?
+        .get("network_dest")?
+        .as_str()
+        .map(str::to_string)
 }
 
 pub(crate) fn alert_matches_path(alert: &AlertRecord, path: &str) -> bool {

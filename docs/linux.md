@@ -133,6 +133,13 @@ still useful in higher-level hook policy, but cgroup/nftables enforcement
 rejects hostname entries on apply because safe hostname support needs DNS
 resolution plus live policy reloads.
 
+For managed Linux runs, Gensee installs nftables counters on reject rules and
+reads them before run cleanup. Nonzero counters are appended as
+`NetworkBlocked` Layer 1 system events with packet and byte counts, so
+`gensee timeline` can show blocked destinations. This is currently a run-end
+summary; exact child PID and per-attempt timestamps require future nft log or
+eBPF attribution.
+
 Relevant policy keys:
 
 ```json

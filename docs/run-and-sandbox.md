@@ -139,6 +139,12 @@ treated as deny-only monitor mode: only the listed destinations are rejected.
 Destinations must currently be IP/CIDR values; hostname entries cause apply to
 fail instead of being silently skipped.
 
+Before cleanup, managed Linux runs read nftables reject counters and append
+nonzero counters as `NetworkBlocked` system events. These appear in
+`gensee timeline` with the blocked destination when known. The current event is
+a run-level summary; exact child process attribution is planned with future nft
+logging or eBPF telemetry.
+
 `--linux-seccomp`, `--no-linux-seccomp`, `--linux-network`, `--allow-net`, and
 `--deny-net` are per-run overrides for demos, tests, and emergency debugging.
 

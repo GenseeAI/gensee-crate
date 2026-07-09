@@ -308,6 +308,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         ));
     }
     let mut linux_cleanup = None;
+    let mut linux_network_plan = None;
     if let Some(network_config) = linux_network.as_ref() {
         gensee_crate_linux::create_agent_cgroup(Path::new(&network_config.cgroup_path))?;
         let plan = gensee_crate_linux::plan_nftables_policy(network_config);
@@ -327,6 +328,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
             "gensee: applied linux network policy session={} cgroup={} mode={:?}",
             network_config.session_id, network_config.cgroup_path, network_config.network.mode
         );
+        linux_network_plan = Some(plan);
     }
     let sandbox_profile = if config.sandbox == SandboxMode::Mac {
         Some(write_macos_sandbox_profile(
@@ -400,7 +402,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
     let store = EventStore::default_local()?;
     store.append_session(&AgentSession {
         session_id: run_id.clone(),
-        agent_binary,
+        agent_binary: agent_binary.clone(),
         root_pid,
         cwd: run_workspace.to_string_lossy().to_string(),
         repo_path: repo_path
@@ -428,6 +430,16 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
     );
 
     let (status, timed_out) = wait_for_child_with_timeout(&mut child, config.max_runtime_seconds)?;
+    if let Some(plan) = linux_network_plan.as_ref() {
+        append_linux_network_block_events(
+            &store,
+            &plan.nftables,
+            &run_id,
+            root_pid,
+            &agent_binary,
+            unix_millis()?,
+        )?;
+    }
     drop(linux_cleanup.take());
     let ended_at_ms = unix_millis()?;
     let exit_code = status.code();
@@ -480,6 +492,78 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         Err(io::Error::other(format!(
             "agent exited with status {status}"
         )))
+    }
+}
+
+fn append_linux_network_block_events(
+    store: &EventStore,
+    plan: &gensee_crate_linux::LinuxNftablesPlan,
+    session_id: &str,
+    root_pid: u32,
+    process_name: &str,
+    observed_at_ms: u64,
+) -> io::Result<()> {
+    let events = match gensee_crate_linux::read_nftables_block_events(plan) {
+        Ok(events) => events,
+        Err(error) => {
+            eprintln!("gensee: linux network warning: could not read nftables counters: {error}");
+            return Ok(());
+        }
+    };
+    for event in events {
+        eprintln!(
+            "gensee: observed linux network block session={} destination={} packets={} bytes={}",
+            session_id,
+            event.destination.as_deref().unwrap_or("*"),
+            event.packets,
+            event.bytes
+        );
+        store.append_system_event(&linux_network_block_system_event(
+            &event,
+            session_id,
+            root_pid,
+            process_name,
+            observed_at_ms,
+        ))?;
+    }
+    Ok(())
+}
+
+fn linux_network_block_system_event(
+    event: &gensee_crate_linux::LinuxNetworkBlockEvent,
+    session_id: &str,
+    root_pid: u32,
+    process_name: &str,
+    observed_at_ms: u64,
+) -> SystemEvent {
+    let raw_json = serde_json::json!({
+        "session_id": session_id,
+        "action": "block",
+        "network_dest": event.destination,
+        "reason": event.reason,
+        "packets": event.packets,
+        "bytes": event.bytes,
+        "counter_name": event.counter_name,
+        "table_name": event.table_name,
+    })
+    .to_string();
+    SystemEvent {
+        source: "linux".to_string(),
+        event_type: "network_block".to_string(),
+        event_kind: "NetworkBlocked".to_string(),
+        observed_at_ms,
+        pid: Some(root_pid),
+        ppid: None,
+        process_name: Some(process_name.to_string()),
+        executable_path: None,
+        file_path: None,
+        command_line: Some(format!(
+            "nftables blocked network egress to {} ({} packet(s), {} byte(s))",
+            event.destination.as_deref().unwrap_or("default-reject"),
+            event.packets,
+            event.bytes
+        )),
+        raw_json,
     }
 }
 

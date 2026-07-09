@@ -3351,6 +3351,60 @@ fn timeline_marks_blocked_tools_and_hides_process_noise() {
 }
 
 #[test]
+fn timeline_keeps_session_scoped_network_system_events() {
+    let mut events = vec![
+        SystemEvent {
+            source: "linux".to_string(),
+            event_type: "network_block".to_string(),
+            event_kind: "NetworkBlocked".to_string(),
+            observed_at_ms: 10,
+            pid: Some(123),
+            ppid: None,
+            process_name: Some("codex".to_string()),
+            executable_path: None,
+            file_path: None,
+            command_line: Some("nftables blocked network egress".to_string()),
+            raw_json: json!({
+                "session_id": "run_1",
+                "network_dest": "169.254.169.254",
+                "packets": 1,
+                "bytes": 64
+            })
+            .to_string(),
+        },
+        SystemEvent {
+            source: "linux".to_string(),
+            event_type: "network_block".to_string(),
+            event_kind: "NetworkBlocked".to_string(),
+            observed_at_ms: 11,
+            pid: Some(456),
+            ppid: None,
+            process_name: Some("codex".to_string()),
+            executable_path: None,
+            file_path: None,
+            command_line: None,
+            raw_json: json!({
+                "session_id": "run_2",
+                "network_dest": "1.1.1.1"
+            })
+            .to_string(),
+        },
+    ];
+
+    keep_system_event_session(&mut events, "run_1");
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        system_event_session_id(&events[0]).as_deref(),
+        Some("run_1")
+    );
+    assert_eq!(
+        system_event_network_dest(&events[0]).as_deref(),
+        Some("169.254.169.254")
+    );
+}
+
+#[test]
 fn redacts_secrets_in_agent_hook_payload() {
     let payload = r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"AWS_SECRET_ACCESS_KEY=abcd1234 aws s3 cp x s3://b"},"tool_response":{"stdout":"export GITHUB_TOKEN=ghp_abcdefghijkl","stderr":""}}"#;
 
