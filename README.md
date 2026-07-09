@@ -393,18 +393,20 @@ gensee-sudo run --sandbox linux -- omnigent run path/to/agent.yaml
 
 </details>
 
-Inspect what happened at any time:
+See [`docs/watch.md`](docs/watch.md),
+[`docs/run-and-sandbox.md`](docs/run-and-sandbox.md), and
+[`docs/linux.md`](docs/linux.md) for the full options.
+
+### 3. Examine results
+
+**CLI.** Inspect what happened at any time:
 
 ```bash
 gensee run list   # list guarded run sessions and staged workspaces
 gensee timeline   # show prompts, tool intent, file effects, and policy decisions
 ```
 
-See [`docs/watch.md`](docs/watch.md),
-[`docs/run-and-sandbox.md`](docs/run-and-sandbox.md), and
-[`docs/linux.md`](docs/linux.md) for the full options.
-
-### 3. Open the dashboard
+**Dashboard.** Open the local dashboard for a browser view of the same store:
 
 The local dashboard reads the same `GENSEE_HOME` store as `watch`, hooks, and
 `timeline`. It shows live agent activity, policy decisions, alerts, file and
