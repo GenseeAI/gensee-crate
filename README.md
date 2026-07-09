@@ -471,41 +471,6 @@ auto-loaded by the hook, CLI, and dashboard when `GENSEE_POLICY_FILE` is unset.
 You can also point `GENSEE_POLICY_FILE` at a custom policy path; see
 [`docs/policy.md`](docs/policy.md) for the full policy workflow.
 
-### 5. Test
-
-Run the unit/integration test suite:
-
-```bash
-cargo test --workspace
-```
-
-Prepare a populated dashboard store for UI testing:
-
-```bash
-cargo build --release -p gensee-crate-cli
-dashboards/web/scripts/demo.sh
-# open http://localhost:5173
-```
-
-Smoke-test the policy without launching an agent by feeding a sample
-`PreToolUse` payload to a hook — a secret-path read should come back `deny`:
-
-```bash
-echo '{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"'"$PWD"'","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"cat ~/.ssh/config"}}' \
-  | GENSEE_HOME="$PWD/.gensee-dev" ./target/debug/gensee hook claude-code
-# => {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",...}}
-```
-
-For Codex, use `./target/debug/gensee hook codex` with the same sample payload.
-
-End-to-end: with hooks configured and the agent restarted or trusted, ask it to
-read a sensitive file (e.g. `~/.ssh/config`); Gensee denies it, then the
-decision and alert show up in the timeline:
-
-```bash
-GENSEE_HOME="$PWD/.gensee-dev" gensee timeline
-```
-
 ## Roadmap
 
 Gensee Crate supports macOS and Linux today, with Claude Code, Codex, and
