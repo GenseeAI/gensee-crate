@@ -460,14 +460,16 @@ pub(crate) fn handle_linux(args: Vec<OsString>) -> io::Result<()> {
                 let attached = gensee_crate_linux::attach_process_tree_to_cgroup(
                     pid,
                     Path::new(&config.cgroup_path),
-                )?;
+                )
+                .map_err(linux_network_debug_privilege_error("attach process tree to cgroup"))?;
                 println!(
                     "gensee: attached {} process(es) to {}",
                     attached.len(),
                     config.cgroup_path
                 );
             }
-            gensee_crate_linux::apply_nftables_script(&plan.nftables.script)?;
+            gensee_crate_linux::apply_nftables_script(&plan.nftables.script)
+                .map_err(linux_network_debug_privilege_error("apply nftables policy"))?;
             if json_output {
                 print_json(&plan)
             } else {
@@ -483,6 +485,23 @@ pub(crate) fn handle_linux(args: Vec<OsString>) -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             format!("usage: gensee status|plan|monitor|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply [--json] (unknown: {other})"),
         )),
+    }
+}
+
+fn linux_network_debug_privilege_error(
+    operation: &'static str,
+) -> impl FnOnce(io::Error) -> io::Error {
+    move |error| {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "Linux network debug apply could not {operation}: {error}. cgroup/nftables enforcement requires root; retry with sudo",
+                ),
+            )
+        } else {
+            error
+        }
     }
 }
 

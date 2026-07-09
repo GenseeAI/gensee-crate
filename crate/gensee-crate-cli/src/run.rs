@@ -310,7 +310,8 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
     let mut linux_cleanup = None;
     let mut linux_network_plan = None;
     if let Some(network_config) = linux_network.as_ref() {
-        gensee_crate_linux::create_agent_cgroup(Path::new(&network_config.cgroup_path))?;
+        gensee_crate_linux::create_agent_cgroup(Path::new(&network_config.cgroup_path))
+            .map_err(linux_network_privilege_error("create cgroup"))?;
         let plan = gensee_crate_linux::plan_nftables_policy(network_config);
         for warning in &plan.warnings {
             eprintln!("gensee: linux network warning: {warning}");
@@ -320,7 +321,8 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
             network_config.cgroup_path.clone(),
         ));
         gensee_crate_linux::validate_nftables_plan_for_apply(&plan.nftables)?;
-        gensee_crate_linux::apply_nftables_script(&plan.nftables.script)?;
+        gensee_crate_linux::apply_nftables_script(&plan.nftables.script)
+            .map_err(linux_network_privilege_error("apply nftables policy"))?;
         if let Some(cleanup) = linux_cleanup.as_mut() {
             cleanup.mark_table_applied();
         }
@@ -492,6 +494,21 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         Err(io::Error::other(format!(
             "agent exited with status {status}"
         )))
+    }
+}
+
+fn linux_network_privilege_error(operation: &'static str) -> impl FnOnce(io::Error) -> io::Error {
+    move |error| {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "Linux network enforcement could not {operation}: {error}. cgroup/nftables enforcement requires root; retry with sudo and preserve policy with GENSEE_HOME=$HOME/.gensee if policy was configured as your user",
+                ),
+            )
+        } else {
+            error
+        }
     }
 }
 
