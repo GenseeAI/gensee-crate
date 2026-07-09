@@ -368,9 +368,8 @@ pub(crate) fn handle_linux(args: Vec<OsString>) -> io::Result<()> {
             }
         }
         "fanotify-plan" => {
-            let plan = gensee_crate_linux::plan_fanotify_marks(
-                &gensee_crate_linux::LinuxPolicy::default(),
-            );
+            let policy = linux_fanotify_policy_from_policy_document(Policy::global().document());
+            let plan = gensee_crate_linux::plan_fanotify_marks(&policy);
             if json_output {
                 print_json(&plan)
             } else {
@@ -393,10 +392,9 @@ pub(crate) fn handle_linux(args: Vec<OsString>) -> io::Result<()> {
             }
         }
         "fanotify-once" => {
+            let policy = linux_fanotify_policy_from_policy_document(Policy::global().document());
             let mut enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(
-                gensee_crate_linux::LinuxFanotifyConfig::new(
-                    gensee_crate_linux::LinuxPolicy::default(),
-                ),
+                gensee_crate_linux::LinuxFanotifyConfig::new(policy),
             )?;
             let status = enforcer.status();
             let events = enforcer.handle_events_once()?;
@@ -2208,6 +2206,13 @@ const LINUX_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[
         allow_null: false,
     },
     PolicySetupItem {
+        key: "linux.fanotify.paths",
+        value_type: PolicySetupValueType::List,
+        label: "Linux fanotify paths",
+        help: "Comma-separated extra sensitive paths for Linux fanotify marks",
+        allow_null: false,
+    },
+    PolicySetupItem {
         key: "linux.network.mode",
         value_type: PolicySetupValueType::String,
         label: "Linux network mode",
@@ -2366,6 +2371,7 @@ const SETTABLE_POLICY_KEYS: &[&str] = &[
     "linux.seccomp.deny_bpf",
     "linux.seccomp.deny_kernel_modules",
     "linux.seccomp.deny_mount_namespace_changes",
+    "linux.fanotify.paths",
     "linux.network.mode",
     "linux.network.allow",
     "linux.network.deny",
@@ -2409,6 +2415,7 @@ pub(crate) fn telemetry_policy_key_bucket(key: &str) -> &'static str {
         "linux.seccomp.deny_mount_namespace_changes" => {
             "linux.seccomp.deny_mount_namespace_changes"
         }
+        "linux.fanotify.paths" => "linux.fanotify.paths",
         "linux.network.mode" => "linux.network.mode",
         "linux.network.allow" => "linux.network.allow",
         "linux.network.deny" => "linux.network.deny",
@@ -2453,6 +2460,7 @@ fn policy_value_set(root: &mut Value, key: &str, value: Value) -> Result<(), Str
 fn coerce_policy_value(key: &str, raw: &str) -> Value {
     const LIST_KEYS: &[&str] = &[
         "egress.allow_hosts",
+        "linux.fanotify.paths",
         "linux.network.allow",
         "linux.network.deny",
         "allow_path_prefixes",

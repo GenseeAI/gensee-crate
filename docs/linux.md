@@ -157,6 +157,9 @@ Relevant policy keys:
       "deny_kernel_modules": true,
       "deny_mount_namespace_changes": true
     },
+    "fanotify": {
+      "paths": ["/tmp/gensee-demo-secret/**"]
+    },
     "network": {
       "mode": "allowlist",
       "allow": ["1.1.1.1"],
@@ -208,6 +211,9 @@ sudo gensee run \
 If `codex` or `claude` is installed through npm, prefer:
 
 ```bash
+gensee policy set linux.fanotify.paths '/tmp/gensee-demo-secret/**'
+gensee debug fanotify-plan
+
 sudo env "PATH=$PATH" gensee run \
   --sandbox linux \
   --linux-fanotify \
@@ -221,6 +227,18 @@ The current fanotify mark planner supports:
 - exact paths such as `/path/to/file`
 - prefix roots such as `/path/to/secret/**`
 - home-relative prefix roots such as `~/.ssh/**`
+
+The built-in fanotify rules protect common credential locations such as
+`~/.ssh/**`, `~/.aws/**`, and `~/.config/gcloud/**`. `linux.fanotify.paths`
+adds extra rules on top of those defaults. This is useful for demos with paths
+that Codex or Claude Code will actually execute, for example:
+
+```bash
+mkdir -p /tmp/gensee-demo-secret
+printf 'demo\n' >/tmp/gensee-demo-secret/token.txt
+gensee policy set linux.fanotify.paths '/tmp/gensee-demo-secret/**'
+gensee debug fanotify-plan
+```
 
 It does not yet directly mark suffix glob patterns such as `**/.env` or
 `**/.env.*`. Those rules are reported as warnings in

@@ -381,12 +381,14 @@ fn watch_pid(config: WatchConfig) -> io::Result<()> {
         .session_id
         .unwrap_or_else(|| format!("watch_linux_{pid}_{}", std::process::id()));
     let target = gensee_crate_linux::LinuxSessionTarget::from_pid(session_id.clone(), pid)?;
+    let policy_doc = Policy::global().document();
     let store = EventStore::default_local()?;
     let fanotify_guard = if config.linux_fanotify {
         Some(start_watch_linux_fanotify_guard(
             &store,
             &session_id,
             &target,
+            policy_doc,
         )?)
     } else {
         None
@@ -515,11 +517,9 @@ fn start_watch_linux_fanotify_guard(
     store: &EventStore,
     session_id: &str,
     target: &gensee_crate_linux::LinuxSessionTarget,
+    policy_doc: &policy::PolicyDocument,
 ) -> io::Result<WatchLinuxFanotifyGuard> {
-    let policy = gensee_crate_linux::LinuxPolicy {
-        mode: gensee_crate_linux::LinuxEnforcementMode::Enforce,
-        ..Default::default()
-    };
+    let policy = linux_fanotify_policy_from_policy_document(policy_doc);
     let mut enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(
         gensee_crate_linux::LinuxFanotifyConfig::with_session(policy, target.clone()),
     )

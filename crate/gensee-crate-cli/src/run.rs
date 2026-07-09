@@ -408,7 +408,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
 
     let store = EventStore::default_local()?;
     let prepared_fanotify_guard = if config.linux_fanotify {
-        Some(prepare_linux_fanotify_run_guard()?)
+        Some(prepare_linux_fanotify_run_guard(policy_doc)?)
     } else {
         None
     };
@@ -670,11 +670,10 @@ impl Drop for LinuxFanotifyRunGuard {
     }
 }
 
-fn prepare_linux_fanotify_run_guard() -> io::Result<PreparedLinuxFanotifyRunGuard> {
-    let policy = gensee_crate_linux::LinuxPolicy {
-        mode: gensee_crate_linux::LinuxEnforcementMode::Enforce,
-        ..Default::default()
-    };
+fn prepare_linux_fanotify_run_guard(
+    policy_doc: &policy::PolicyDocument,
+) -> io::Result<PreparedLinuxFanotifyRunGuard> {
+    let policy = linux_fanotify_policy_from_policy_document(policy_doc);
     let enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(
         gensee_crate_linux::LinuxFanotifyConfig::new(policy),
     )
@@ -896,7 +895,7 @@ pub(crate) fn linux_dangerous_syscall_policy(
 pub(crate) fn linux_policy_from_policy_document(
     policy_doc: &policy::PolicyDocument,
 ) -> gensee_crate_linux::LinuxPolicy {
-    gensee_crate_linux::LinuxPolicy {
+    let mut policy = gensee_crate_linux::LinuxPolicy {
         network: gensee_crate_linux::LinuxNetworkPolicy {
             mode: linux_network_mode_from_policy(policy_doc.linux.network.mode),
             allowed_hosts: policy_doc.linux.network.allow.clone(),
@@ -905,7 +904,25 @@ pub(crate) fn linux_policy_from_policy_document(
         seccomp_enabled: policy_doc.linux.seccomp.enabled,
         dangerous_syscalls: linux_dangerous_syscall_policy(&policy_doc.linux.seccomp),
         ..Default::default()
-    }
+    };
+    policy
+        .sensitive_paths
+        .extend(policy_doc.linux.fanotify.paths.iter().map(|path| {
+            gensee_crate_linux::SensitivePathRule {
+                pattern: path.clone(),
+                access: gensee_crate_linux::SensitivePathAccess::ReadWrite,
+                action: gensee_crate_linux::LinuxPolicyAction::Ask,
+            }
+        }));
+    policy
+}
+
+pub(crate) fn linux_fanotify_policy_from_policy_document(
+    policy_doc: &policy::PolicyDocument,
+) -> gensee_crate_linux::LinuxPolicy {
+    let mut policy = linux_policy_from_policy_document(policy_doc);
+    policy.mode = gensee_crate_linux::LinuxEnforcementMode::Enforce;
+    policy
 }
 
 pub(crate) fn wait_for_child_with_timeout(

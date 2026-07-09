@@ -50,6 +50,11 @@ to parse, or whose `schema_version` differs from the binary's, **fails closed**.
   `max_network_rate_per_min`
 - `egress` — `allow_hosts` (list), `proxy_url`, `require_proxy`
 - `runtime` — `max_runtime_seconds`
+- `linux.seccomp` — `enabled`, `deny_ptrace`, `deny_bpf`,
+  `deny_kernel_modules`, `deny_mount_namespace_changes`
+- `linux.fanotify` — `paths` (extra Linux fanotify sensitive paths, added on
+  top of built-in credential-path defaults)
+- `linux.network` — `mode`, `allow`, `deny`
 - `enforcement` — `noninteractive` (escalate medium+ `ask` → `deny`)
 - `watch` — `system_events` (`eslogger` by default; set `none` to disable)
 - `allow_path_prefixes` — list (JSON form of `GENSEE_POLICY_ALLOW_PATH_PREFIXES`)
@@ -92,7 +97,7 @@ remains the authoritative check (it parses with the same types the engine uses).
 | `content_rules` | no | Substring/shape matchers over an executed script's content (`all_of` / `patterns`). |
 | `url_rules` | no | Host-matched URL rules (`host_substrings`); hosts are canonicalized (IP encodings, `/dev/tcp`). |
 | `command_rules` | no | Token-boundary command matchers (`commands` / `bare_commands` / `arg_any` / `arg_all`). |
-| `resource_governance`, `egress`, `runtime`, `enforcement`, `allow_path_prefixes` | no | Configuration (see above); env vars override. |
+| `resource_governance`, `egress`, `runtime`, `linux`, `enforcement`, `allow_path_prefixes` | no | Configuration (see above); env vars override where supported. |
 
 Matchers are **structured, not regex** — predicates are exact segment /
 filename / path-suffix tests, so authoring is declarative and there is no ReDoS
@@ -106,6 +111,7 @@ quickest edits via the CLI (no manual JSON):
 ```bash
 gensee policy set allow_path_prefixes /Users/me/trusted-templates
 gensee policy set egress.allow_hosts github.com,internal.example.com
+gensee policy set linux.fanotify.paths '/tmp/gensee-demo-secret/**'
 gensee policy validate "$GENSEE_HOME/policy.json"
 ```
 

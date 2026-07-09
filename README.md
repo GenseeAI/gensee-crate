@@ -375,7 +375,13 @@ is future eBPF/nft log work.
 sensitive-path file access and appends `FileAccess...` Layer 1 events.
 `sudo gensee watch --pid <agent-root-pid> --linux-fanotify` uses the same
 fanotify enforcement path as a sidecar attached to an already-running agent
-process tree.
+process tree. Add harmless demo paths without replacing the built-in credential
+rules:
+
+```bash
+gensee policy set linux.fanotify.paths '/tmp/gensee-demo-secret/**'
+gensee debug fanotify-plan
+```
 
 For orchestration frameworks such as Omnigent, use the same primitives as a
 thin outer safety layer:

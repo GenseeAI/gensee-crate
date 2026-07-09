@@ -4456,6 +4456,28 @@ fn run_config_parses_linux_launch_controls() {
 }
 
 #[test]
+fn linux_policy_includes_configured_fanotify_paths() {
+    let mut root: Value = serde_json::from_str(policy::default_policy_json()).unwrap();
+    root["linux"]["fanotify"]["paths"] = json!(["/tmp/gensee-demo/**", "~/project/.secret"]);
+    let policy = Policy::from_json(&root.to_string()).unwrap();
+
+    let linux_policy = linux_fanotify_policy_from_policy_document(policy.document());
+
+    assert_eq!(
+        linux_policy.mode,
+        gensee_crate_linux::LinuxEnforcementMode::Enforce
+    );
+    assert!(linux_policy
+        .sensitive_paths
+        .iter()
+        .any(|rule| rule.pattern == "/tmp/gensee-demo/**"));
+    assert!(linux_policy
+        .sensitive_paths
+        .iter()
+        .any(|rule| rule.pattern == "~/project/.secret"));
+}
+
+#[test]
 fn run_config_rejects_linux_controls_without_linux_sandbox() {
     let error = RunConfig::parse(vec![
         OsString::from("--linux-seccomp"),
@@ -4566,6 +4588,10 @@ fn coerce_policy_value_infers_types() {
         json!(["1.1.1.1", "10.0.0.0/8"])
     );
     assert_eq!(
+        coerce_policy_value("linux.fanotify.paths", "/tmp/demo/**, ~/project/.secret"),
+        json!(["/tmp/demo/**", "~/project/.secret"])
+    );
+    assert_eq!(
         coerce_policy_value("egress.proxy_url", "http://p:8080"),
         json!("http://p:8080")
     );
@@ -4598,6 +4624,7 @@ fn policy_setup_flow_updates_dashboard_settings() {
         "no",                              // linux.seccomp.deny_bpf
         "",                                // linux.seccomp.deny_kernel_modules
         "",                                // linux.seccomp.deny_mount_namespace_changes
+        "/tmp/gensee-demo/**",             // linux.fanotify.paths
         "allowlist",                       // linux.network.mode
         "1.1.1.1, 10.0.0.0/8",             // linux.network.allow
         "169.254.169.254",                 // linux.network.deny
@@ -4639,6 +4666,10 @@ fn policy_setup_flow_updates_dashboard_settings() {
     assert_eq!(
         policy_value_get(&root, "linux.seccomp.deny_bpf"),
         Some(&json!(false))
+    );
+    assert_eq!(
+        policy_value_get(&root, "linux.fanotify.paths"),
+        Some(&json!(["/tmp/gensee-demo/**"]))
     );
     assert_eq!(
         policy_value_get(&root, "linux.network.mode"),

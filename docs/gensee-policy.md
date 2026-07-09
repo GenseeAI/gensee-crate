@@ -71,6 +71,15 @@ Use a text editor for rule-content changes.
 - `egress.proxy_url`
 - `egress.require_proxy`
 - `runtime.max_runtime_seconds`
+- `linux.seccomp.enabled`
+- `linux.seccomp.deny_ptrace`
+- `linux.seccomp.deny_bpf`
+- `linux.seccomp.deny_kernel_modules`
+- `linux.seccomp.deny_mount_namespace_changes`
+- `linux.fanotify.paths`
+- `linux.network.mode`
+- `linux.network.allow`
+- `linux.network.deny`
 - `enforcement.noninteractive`
 - `watch.system_events`
 - `allow_path_prefixes`

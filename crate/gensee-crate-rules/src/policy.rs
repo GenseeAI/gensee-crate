@@ -156,6 +156,7 @@ pub struct RuntimeConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct LinuxHostConfig {
     pub seccomp: LinuxSeccompConfig,
+    pub fanotify: LinuxFanotifyConfig,
     pub network: LinuxNetworkConfig,
 }
 
@@ -179,6 +180,12 @@ impl Default for LinuxSeccompConfig {
             deny_mount_namespace_changes: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LinuxFanotifyConfig {
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1413,6 +1420,7 @@ mod tests {
         assert_eq!(d.resource_governance.max_read_bytes, 10 * 1024 * 1024);
         assert!(d.egress.allow_hosts.is_empty());
         assert!(!d.linux.seccomp.enabled);
+        assert!(d.linux.fanotify.paths.is_empty());
         assert_eq!(d.linux.network.mode, LinuxNetworkMode::Off);
         assert!(!d.enforcement.noninteractive);
         assert!(d.runtime.max_runtime_seconds.is_none());
@@ -1443,6 +1451,7 @@ mod tests {
         doc["runtime"]["max_runtime_seconds"] = serde_json::json!(600);
         doc["linux"]["seccomp"]["enabled"] = serde_json::json!(true);
         doc["linux"]["seccomp"]["deny_bpf"] = serde_json::json!(false);
+        doc["linux"]["fanotify"]["paths"] = serde_json::json!(["/tmp/gensee-demo/**"]);
         doc["linux"]["network"]["mode"] = serde_json::json!("allowlist");
         doc["linux"]["network"]["allow"] = serde_json::json!(["1.1.1.1"]);
         doc["linux"]["network"]["deny"] = serde_json::json!(["169.254.169.254"]);
@@ -1453,6 +1462,10 @@ mod tests {
         assert_eq!(d.runtime.max_runtime_seconds, Some(600));
         assert!(d.linux.seccomp.enabled);
         assert!(!d.linux.seccomp.deny_bpf);
+        assert_eq!(
+            d.linux.fanotify.paths,
+            vec!["/tmp/gensee-demo/**".to_string()]
+        );
         assert_eq!(d.linux.network.mode, LinuxNetworkMode::Allowlist);
         assert_eq!(d.linux.network.allow, vec!["1.1.1.1".to_string()]);
         assert_eq!(d.linux.network.deny, vec!["169.254.169.254".to_string()]);
