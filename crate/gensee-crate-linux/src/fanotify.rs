@@ -230,6 +230,10 @@ mod platform {
             }
         }
 
+        pub fn set_session(&mut self, session: crate::session::LinuxSessionTarget) {
+            self.config.session = Some(session);
+        }
+
         pub fn handle_events_once(&mut self) -> io::Result<Vec<LinuxFanotifyEvent>> {
             let mut buffer = [0u8; 64 * 1024];
             let read_len = read_fanotify(self.fd, &mut buffer)?;
@@ -451,6 +455,8 @@ mod platform {
                 ],
             }
         }
+
+        pub fn set_session(&mut self, _session: crate::session::LinuxSessionTarget) {}
 
         pub fn handle_events_once(&mut self) -> io::Result<Vec<LinuxFanotifyEvent>> {
             Err(io::Error::new(

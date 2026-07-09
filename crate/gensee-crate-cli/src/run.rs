@@ -406,10 +406,16 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
+    let store = EventStore::default_local()?;
+    let prepared_fanotify_guard = if config.linux_fanotify {
+        Some(prepare_linux_fanotify_run_guard()?)
+    } else {
+        None
+    };
+
     let mut child = command.spawn()?;
     let root_pid = child.id();
 
-    let store = EventStore::default_local()?;
     store.append_session(&AgentSession {
         session_id: run_id.clone(),
         agent_binary: agent_binary.clone(),
@@ -432,8 +438,8 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         exit_code: None,
     })?;
 
-    let fanotify_guard = if config.linux_fanotify {
-        match start_linux_fanotify_run_guard(&store, &run_id, root_pid, &agent_binary) {
+    let fanotify_guard = if let Some(prepared_guard) = prepared_fanotify_guard {
+        match prepared_guard.start(&store, &run_id, root_pid, &agent_binary) {
             Ok(guard) => Some(guard),
             Err(error) => {
                 let _ = child.kill();
@@ -650,6 +656,11 @@ struct LinuxFanotifyRunGuard {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+struct PreparedLinuxFanotifyRunGuard {
+    enforcer: gensee_crate_linux::LinuxFanotifyEnforcer,
+    status: gensee_crate_linux::LinuxFanotifyStatus,
+}
+
 impl Drop for LinuxFanotifyRunGuard {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -659,49 +670,58 @@ impl Drop for LinuxFanotifyRunGuard {
     }
 }
 
-fn start_linux_fanotify_run_guard(
-    store: &EventStore,
-    session_id: &str,
-    root_pid: u32,
-    agent_binary: &str,
-) -> io::Result<LinuxFanotifyRunGuard> {
+fn prepare_linux_fanotify_run_guard() -> io::Result<PreparedLinuxFanotifyRunGuard> {
     let policy = gensee_crate_linux::LinuxPolicy {
         mode: gensee_crate_linux::LinuxEnforcementMode::Enforce,
         ..Default::default()
     };
-    let session = gensee_crate_linux::LinuxSessionTarget::from_pid(session_id, root_pid)?;
-    let mut enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(
-        gensee_crate_linux::LinuxFanotifyConfig::with_session(policy, session),
+    let enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(
+        gensee_crate_linux::LinuxFanotifyConfig::new(policy),
     )
     .map_err(linux_fanotify_privilege_error)?;
     let status = enforcer.status();
-    eprintln!(
-        "gensee: applied linux fanotify policy session={} root_pid={} marked_paths={}",
-        session_id,
-        root_pid,
-        status.marked_paths.len()
-    );
-    for warning in &status.warnings {
-        eprintln!("gensee: linux fanotify warning: {warning}");
-    }
+    Ok(PreparedLinuxFanotifyRunGuard { enforcer, status })
+}
 
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let thread_stop = stop.clone();
-    let store = store.clone();
-    let session_id = session_id.to_string();
-    let agent_binary = agent_binary.to_string();
-    let handle = thread::spawn(move || {
-        while !thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
-            drain_linux_fanotify_events(&store, &mut enforcer, &session_id, &agent_binary);
-            thread::sleep(Duration::from_millis(25));
+impl PreparedLinuxFanotifyRunGuard {
+    fn start(
+        mut self,
+        store: &EventStore,
+        session_id: &str,
+        root_pid: u32,
+        agent_binary: &str,
+    ) -> io::Result<LinuxFanotifyRunGuard> {
+        let session = gensee_crate_linux::LinuxSessionTarget::from_pid(session_id, root_pid)?;
+        self.enforcer.set_session(session);
+        eprintln!(
+            "gensee: applied linux fanotify policy session={} root_pid={} marked_paths={}",
+            session_id,
+            root_pid,
+            self.status.marked_paths.len()
+        );
+        for warning in &self.status.warnings {
+            eprintln!("gensee: linux fanotify warning: {warning}");
         }
-        drain_linux_fanotify_events(&store, &mut enforcer, &session_id, &agent_binary);
-    });
 
-    Ok(LinuxFanotifyRunGuard {
-        stop,
-        handle: Some(handle),
-    })
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let store = store.clone();
+        let session_id = session_id.to_string();
+        let agent_binary = agent_binary.to_string();
+        let mut enforcer = self.enforcer;
+        let handle = thread::spawn(move || {
+            while !thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                drain_linux_fanotify_events(&store, &mut enforcer, &session_id, &agent_binary);
+                thread::sleep(Duration::from_millis(25));
+            }
+            drain_linux_fanotify_events(&store, &mut enforcer, &session_id, &agent_binary);
+        });
+
+        Ok(LinuxFanotifyRunGuard {
+            stop,
+            handle: Some(handle),
+        })
+    }
 }
 
 fn drain_linux_fanotify_events(
