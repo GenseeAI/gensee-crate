@@ -544,15 +544,16 @@ pub(crate) fn linux_dangerous_syscall_policy(
 pub(crate) fn linux_policy_from_policy_document(
     policy_doc: &policy::PolicyDocument,
 ) -> gensee_crate_linux::LinuxPolicy {
-    let mut linux_policy = gensee_crate_linux::LinuxPolicy::default();
-    linux_policy.network = gensee_crate_linux::LinuxNetworkPolicy {
-        mode: linux_network_mode_from_policy(policy_doc.linux.network.mode),
-        allowed_hosts: policy_doc.linux.network.allow.clone(),
-        denied_hosts: policy_doc.linux.network.deny.clone(),
-    };
-    linux_policy.seccomp_enabled = policy_doc.linux.seccomp.enabled;
-    linux_policy.dangerous_syscalls = linux_dangerous_syscall_policy(&policy_doc.linux.seccomp);
-    linux_policy
+    gensee_crate_linux::LinuxPolicy {
+        network: gensee_crate_linux::LinuxNetworkPolicy {
+            mode: linux_network_mode_from_policy(policy_doc.linux.network.mode),
+            allowed_hosts: policy_doc.linux.network.allow.clone(),
+            denied_hosts: policy_doc.linux.network.deny.clone(),
+        },
+        seccomp_enabled: policy_doc.linux.seccomp.enabled,
+        dangerous_syscalls: linux_dangerous_syscall_policy(&policy_doc.linux.seccomp),
+        ..Default::default()
+    }
 }
 
 pub(crate) fn wait_for_child_with_timeout(
