@@ -239,6 +239,7 @@ mod platform {
             let read_len = read_fanotify(self.fd, &mut buffer)?;
             let mut offset = 0usize;
             let mut handled = Vec::new();
+            let mut response_error = None;
 
             while offset + mem::size_of::<FanotifyEventMetadata>() <= read_len {
                 let metadata =
@@ -254,7 +255,9 @@ mod platform {
                     let operation = operation_from_event(metadata.mask, metadata.fd);
                     let request = request_from_event(metadata.fd, metadata.pid as u32, operation);
                     if !self.event_belongs_to_session(metadata.pid as u32) {
-                        write_response(self.fd, metadata.fd, FAN_ALLOW)?;
+                        if let Err(error) = write_response(self.fd, metadata.fd, FAN_ALLOW) {
+                            response_error.get_or_insert(error);
+                        }
                         close_fd(metadata.fd);
                         offset += event_len;
                         continue;
@@ -263,17 +266,27 @@ mod platform {
                         .config
                         .policy
                         .evaluate_access(&request, &self.capabilities);
-                    write_response(
+                    let response_result = write_response(
                         self.fd,
                         metadata.fd,
                         fanotify_response_for_verdict(decision.verdict),
-                    )?;
+                    );
                     close_fd(metadata.fd);
+                    if let Err(error) = response_result {
+                        response_error.get_or_insert(error);
+                        offset += event_len;
+                        continue;
+                    }
                     handled.push(LinuxFanotifyEvent { request, decision });
                 }
                 offset += event_len;
             }
 
+            if handled.is_empty() {
+                if let Some(error) = response_error {
+                    return Err(error);
+                }
+            }
             Ok(handled)
         }
 
@@ -316,11 +329,21 @@ mod platform {
             io::Error::new(io::ErrorKind::InvalidInput, "fanotify path contains NUL")
         })?;
         let mut flags = FAN_MARK_ADD;
-        let mut mask = FAN_OPEN_PERM | FAN_ACCESS_PERM;
+        let mut mask = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN_OPEN_EXEC_PERM;
         if include_children {
             flags |= FAN_MARK_ONLYDIR;
             mask |= FAN_EVENT_ON_CHILD;
         }
+        match fanotify_mark(fd, flags, mask, &path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                fanotify_mark(fd, flags, mask & !FAN_OPEN_EXEC_PERM, &path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn fanotify_mark(fd: RawFd, flags: u32, mask: u64, path: &CString) -> io::Result<()> {
         let result = unsafe {
             libc::syscall(
                 libc::SYS_fanotify_mark,
@@ -373,6 +396,9 @@ mod platform {
     }
 
     fn operation_from_event(mask: u64, fd: RawFd) -> LinuxAccessOperation {
+        if mask & FAN_OPEN_EXEC_PERM != 0 {
+            return LinuxAccessOperation::FileRead;
+        }
         if mask & FAN_ACCESS_PERM != 0 {
             return LinuxAccessOperation::FileRead;
         }
@@ -417,6 +443,7 @@ mod platform {
 
     const FAN_ACCESS_PERM: u64 = 0x0002_0000;
     const FAN_OPEN_PERM: u64 = 0x0001_0000;
+    const FAN_OPEN_EXEC_PERM: u64 = 0x0004_0000;
     const FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
     const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
     const FAN_CLOEXEC: u32 = 0x0000_0001;

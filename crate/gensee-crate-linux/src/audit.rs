@@ -284,4 +284,24 @@ mod tests {
         assert!(is_descendant_or_self(12, 10, &parent_by_pid));
         assert!(!is_descendant_or_self(20, 10, &parent_by_pid));
     }
+
+    #[test]
+    fn priming_suppresses_existing_process_exec_events() {
+        if !std::path::Path::new("/proc/self").exists() {
+            return;
+        }
+
+        let target = LinuxSessionTarget::current("test-session").unwrap();
+        let mut monitor = LinuxAuditMonitor::with_config(LinuxMonitorConfig {
+            session: Some(target),
+            enable_exec_events: true,
+            enable_file_events: false,
+            enable_network_events: false,
+        });
+
+        monitor.prime_process_snapshot().unwrap();
+        let events = monitor.poll_events().unwrap();
+
+        assert!(events.is_empty());
+    }
 }

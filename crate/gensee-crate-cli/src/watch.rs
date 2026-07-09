@@ -401,6 +401,7 @@ fn watch_pid(config: WatchConfig) -> io::Result<()> {
             enable_network_events: false,
         },
     );
+    monitor.prime_process_snapshot()?;
     let started_at_ms = unix_millis()?;
 
     store.append_session(&AgentSession {
