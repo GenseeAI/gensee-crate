@@ -384,18 +384,6 @@ sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=${GENSEE_HOME:-$HOME/.gensee}" \
   ./target/debug/gensee run --sandbox linux -- codex
 ```
 
-Linux network destinations must currently be IP/CIDR values. Managed Linux runs
-record nftables counter summaries as `NetworkBlocked` Layer 1 system events
-after the agent exits. `--linux-fanotify` appends `FileAccess...` Layer 1
-events for supported sensitive-path file access.
-
-Add harmless demo paths without replacing the built-in credential rules:
-
-```bash
-gensee policy set linux.fanotify.paths '/tmp/gensee-demo-secret/**'
-gensee debug fanotify-plan
-```
-
 For orchestration frameworks such as Omnigent, use the same outer safety layer:
 
 ```bash
