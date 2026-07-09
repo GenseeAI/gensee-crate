@@ -450,8 +450,8 @@ and policy decisions over time.
 
 ### 4. Manage policy
 
-`gensee policy` lets you inspect, initialize, validate, and edit the active
-policy document without copying files by hand:
+Use `gensee policy` or the dashboard UI to inspect, initialize, validate, and
+edit the active policy document without copying files by hand:
 
 ```bash
 gensee policy path
