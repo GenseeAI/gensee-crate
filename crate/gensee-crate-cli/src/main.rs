@@ -455,6 +455,7 @@ pub(crate) fn handle_linux(args: Vec<OsString>) -> io::Result<()> {
         "network-apply" => {
             let config = linux_network_config(&args)?;
             let plan = gensee_crate_linux::plan_nftables_policy(&config);
+            gensee_crate_linux::validate_nftables_plan_for_apply(&plan.nftables)?;
             if let Some(pid) = config.root_pid {
                 let attached = gensee_crate_linux::attach_process_tree_to_cgroup(
                     pid,
@@ -519,6 +520,12 @@ fn linux_network_config(
             linux_network_mode_from_policy(policy_doc.linux.network.mode)
         };
     let mode = crate::run::linux_effective_network_mode(mode, !denied_hosts.is_empty());
+    if mode == gensee_crate_linux::LinuxNetworkMode::AllowListed && allowed_hosts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Linux network allowlist mode requires policy linux.network.allow or --allow-net",
+        ));
+    }
     let root_pid = linux_arg_value(args, "--pid")
         .map(|value| {
             value.parse::<u32>().map_err(|err| {

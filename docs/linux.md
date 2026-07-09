@@ -29,10 +29,12 @@ The older `gensee linux ...` form is kept as a compatibility alias while Linux
 support is experimental. New docs and scripts should use the top-level command
 shape.
 
-The fanotify backend is the first contextual Linux system-level enforcement path
-in Gensee Crate. It can deny file opens/accesses before the target process
-continues. It requires Linux, root, and a kernel with fanotify permission events
-enabled.
+The fanotify backend is the first contextual Linux system-level file-enforcement
+experiment in Gensee Crate. Today it is exposed through planning and one-shot
+debug commands; it is not armed by continuous `gensee run` or `gensee watch`
+flows yet. Continuous sensitive-path enforcement needs a long-running daemon or
+watch integration that owns the permission-event loop. Fanotify requires Linux,
+root, and a kernel with fanotify permission events enabled.
 
 The seccomp launcher is a coarse hard-deny layer. It is less contextual than
 fanotify, but it applies directly at the syscall boundary for processes launched
@@ -50,18 +52,20 @@ That gives Gensee a run id, a root pid, lifecycle accounting, policy loading,
 workspace-mode handling, and a place to install launch-time controls before the
 real agent executes.
 
-Without `sudo`, `gensee run --sandbox linux -- <agent>` is still useful. It can
-launch and attribute the agent, record the run, use direct or staged workspace
-mode, and apply unprivileged controls such as seccomp when policy enables them
-and the kernel supports seccomp filters.
+Without `sudo`, `gensee run -- <agent>` is still useful as a supervised launch:
+it can launch and attribute the agent, record the run, and use direct or staged
+workspace mode. `gensee run --sandbox linux -- <agent>` means Linux host
+controls are requested, so it fails closed unless seccomp or network enforcement
+is active. Seccomp can run without root when policy enables it and the kernel
+supports seccomp filters.
 
 `sudo` is needed only for Linux features that modify kernel-owned global or
 privileged state:
 
 - cgroup/nftables network enforcement, because Gensee creates a cgroup subtree
   and installs nftables rules.
-- fanotify permission enforcement, because permission-event marks require root
-  or equivalent capability.
+- fanotify permission-event probes and future continuous file enforcement,
+  because permission-event marks require root or equivalent capability.
 - future eBPF-based telemetry or enforcement, because loading BPF programs and
   reading privileged kernel data requires elevated privilege on normal hosts.
 
@@ -123,6 +127,11 @@ requires root.
 Setting `linux.network.deny` without changing `linux.network.mode` is treated
 as deny-only monitor mode for `gensee run`: Gensee installs rejects for the
 listed destinations while leaving other egress allowed.
+
+Network policy destinations must currently be IP or CIDR strings. Hostnames are
+still useful in higher-level hook policy, but cgroup/nftables enforcement
+rejects hostname entries on apply because safe hostname support needs DNS
+resolution plus live policy reloads.
 
 Relevant policy keys:
 
@@ -219,9 +228,9 @@ Linux policy keeps posture and action separate:
   a backend is available.
 
 At the fanotify boundary, `Deny`, `Ask`, and `Speculate` currently fail closed
-with `FAN_DENY`. `Ask` needs a prompt broker before it can safely block and wait
-for a user decision. `Speculate` needs a transactional backend before the
-operation can be allowed into a rollback-capable runtime.
+with `FAN_DENY` in the debug enforcer. `Ask` needs a prompt broker before it can
+safely block and wait for a user decision. `Speculate` needs a transactional
+backend before the operation can be allowed into a rollback-capable runtime.
 
 At the seccomp boundary, the default profile allows ordinary syscalls and denies
 configured dangerous syscall families with `EPERM`. The default profile blocks:

@@ -2,6 +2,8 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use crate::procfs::{read_proc_cmdline, read_proc_stat};
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LinuxSessionTarget {
     pub session_id: String,
@@ -15,13 +17,6 @@ pub struct LinuxSessionTarget {
     pub cgroup_path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcStat {
-    parent_pid: u32,
-    process_group_id: u32,
-    session_id: u32,
-}
-
 impl LinuxSessionTarget {
     pub fn from_pid(session_id: impl Into<String>, root_pid: u32) -> io::Result<Self> {
         let proc_root = PathBuf::from("/proc").join(root_pid.to_string());
@@ -29,7 +24,7 @@ impl LinuxSessionTarget {
         Ok(Self {
             session_id: session_id.into(),
             root_pid,
-            parent_pid: stat.as_ref().map(|stat| stat.parent_pid),
+            parent_pid: stat.as_ref().map(|stat| stat.ppid),
             process_group_id: stat.as_ref().map(|stat| stat.process_group_id),
             login_session_id: stat.as_ref().map(|stat| stat.session_id),
             executable_path: fs::read_link(proc_root.join("exe"))
@@ -48,17 +43,6 @@ impl LinuxSessionTarget {
     }
 }
 
-fn read_proc_cmdline(pid: u32) -> io::Result<String> {
-    let data = fs::read(PathBuf::from("/proc").join(pid.to_string()).join("cmdline"))?;
-    let command = data
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    Ok(command)
-}
-
 fn read_proc_cgroup(pid: u32) -> io::Result<Option<String>> {
     let data = fs::read_to_string(PathBuf::from("/proc").join(pid.to_string()).join("cgroup"))?;
     Ok(data.lines().find_map(|line| {
@@ -74,34 +58,9 @@ fn read_proc_cgroup(pid: u32) -> io::Result<Option<String>> {
     }))
 }
 
-fn read_proc_stat(pid: u32) -> io::Result<ProcStat> {
-    parse_proc_stat(&fs::read_to_string(
-        PathBuf::from("/proc").join(pid.to_string()).join("stat"),
-    )?)
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid /proc stat format"))
-}
-
-fn parse_proc_stat(input: &str) -> Option<ProcStat> {
-    let close = input.rfind(") ")?;
-    let fields = input[close + 2..].split_whitespace().collect::<Vec<_>>();
-    Some(ProcStat {
-        parent_pid: fields.get(1)?.parse().ok()?,
-        process_group_id: fields.get(2)?.parse().ok()?,
-        session_id: fields.get(3)?.parse().ok()?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_proc_stat_with_spaces_in_comm() {
-        let stat = parse_proc_stat("123 (agent worker) S 1 2 3 4 5").unwrap();
-        assert_eq!(stat.parent_pid, 1);
-        assert_eq!(stat.process_group_id, 2);
-        assert_eq!(stat.session_id, 3);
-    }
 
     #[test]
     fn current_session_target_is_readable_on_procfs_hosts() {

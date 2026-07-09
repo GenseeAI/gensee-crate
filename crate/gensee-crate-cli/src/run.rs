@@ -298,13 +298,31 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
     let policy_doc = Policy::global().document();
     let linux_seccomp_profile = linux_run_seccomp_profile(&config, policy_doc);
     let linux_network = linux_run_network_config(&config, policy_doc, &run_id)?;
+    if config.sandbox == SandboxMode::Linux
+        && linux_seccomp_profile.is_none()
+        && linux_network.is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--sandbox linux requested, but no Linux controls are enabled; enable linux.seccomp.enabled, configure linux.network, or pass --linux-seccomp/--linux-network/--deny-net",
+        ));
+    }
+    let mut linux_cleanup = None;
     if let Some(network_config) = linux_network.as_ref() {
         gensee_crate_linux::create_agent_cgroup(Path::new(&network_config.cgroup_path))?;
         let plan = gensee_crate_linux::plan_nftables_policy(network_config);
         for warning in &plan.warnings {
             eprintln!("gensee: linux network warning: {warning}");
         }
+        linux_cleanup = Some(LinuxNetworkCleanup::new(
+            plan.nftables.table_name.clone(),
+            network_config.cgroup_path.clone(),
+        ));
+        gensee_crate_linux::validate_nftables_plan_for_apply(&plan.nftables)?;
         gensee_crate_linux::apply_nftables_script(&plan.nftables.script)?;
+        if let Some(cleanup) = linux_cleanup.as_mut() {
+            cleanup.mark_table_applied();
+        }
         eprintln!(
             "gensee: applied linux network policy session={} cgroup={} mode={:?}",
             network_config.session_id, network_config.cgroup_path, network_config.network.mode
@@ -410,6 +428,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
     );
 
     let (status, timed_out) = wait_for_child_with_timeout(&mut child, config.max_runtime_seconds)?;
+    drop(linux_cleanup.take());
     let ended_at_ms = unix_millis()?;
     let exit_code = status.code();
 
@@ -461,6 +480,45 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         Err(io::Error::other(format!(
             "agent exited with status {status}"
         )))
+    }
+}
+
+struct LinuxNetworkCleanup {
+    table_name: String,
+    cgroup_path: String,
+    table_applied: bool,
+}
+
+impl LinuxNetworkCleanup {
+    fn new(table_name: String, cgroup_path: String) -> Self {
+        Self {
+            table_name,
+            cgroup_path,
+            table_applied: false,
+        }
+    }
+
+    fn mark_table_applied(&mut self) {
+        self.table_applied = true;
+    }
+}
+
+impl Drop for LinuxNetworkCleanup {
+    fn drop(&mut self) {
+        if self.table_applied {
+            if let Err(error) = gensee_crate_linux::delete_nftables_table(&self.table_name) {
+                eprintln!(
+                    "gensee: linux network cleanup warning: could not delete nftables table {}: {error}",
+                    self.table_name
+                );
+            }
+        }
+        if let Err(error) = gensee_crate_linux::remove_agent_cgroup(Path::new(&self.cgroup_path)) {
+            eprintln!(
+                "gensee: linux network cleanup warning: could not remove cgroup {}: {error}",
+                self.cgroup_path
+            );
+        }
     }
 }
 

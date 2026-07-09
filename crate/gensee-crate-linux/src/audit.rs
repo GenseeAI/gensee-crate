@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use gensee_crate_core::SystemEvent;
 
 use crate::capabilities::LinuxCapabilityReport;
+use crate::procfs::{is_descendant_or_self, read_proc_cmdline, read_proc_stat};
 use crate::session::LinuxSessionTarget;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -209,12 +210,6 @@ struct LinuxProcessInfo {
     command_line: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcStatInfo {
-    process_name: String,
-    ppid: u32,
-}
-
 impl LinuxProcessInfo {
     fn into_exec_event(self, observed_at_ms: u64, session_id: Option<String>) -> LinuxKernelEvent {
         LinuxKernelEvent {
@@ -257,11 +252,11 @@ fn read_proc_processes() -> io::Result<Vec<LinuxProcessInfo>> {
 
 fn read_proc_process(pid: u32) -> Option<LinuxProcessInfo> {
     let proc_root = PathBuf::from("/proc").join(pid.to_string());
-    let stat = parse_proc_stat_info(&fs::read_to_string(proc_root.join("stat")).ok()?)?;
+    let stat = read_proc_stat(pid).ok()?;
     Some(LinuxProcessInfo {
         pid,
         ppid: stat.ppid,
-        process_name: stat.process_name,
+        process_name: stat.comm,
         executable_path: fs::read_link(proc_root.join("exe"))
             .ok()
             .map(|path| path.to_string_lossy().to_string()),
@@ -269,44 +264,6 @@ fn read_proc_process(pid: u32) -> Option<LinuxProcessInfo> {
             .ok()
             .filter(|value| !value.is_empty()),
     })
-}
-
-fn read_proc_cmdline(pid: u32) -> io::Result<String> {
-    let data = fs::read(PathBuf::from("/proc").join(pid.to_string()).join("cmdline"))?;
-    Ok(data
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).to_string())
-        .collect::<Vec<_>>()
-        .join(" "))
-}
-
-fn parse_proc_stat_info(input: &str) -> Option<ProcStatInfo> {
-    let open = input.find('(')?;
-    let close = input.rfind(") ")?;
-    let process_name = input[open + 1..close].to_string();
-    let fields = input[close + 2..].split_whitespace().collect::<Vec<_>>();
-    Some(ProcStatInfo {
-        process_name,
-        ppid: fields.get(1)?.parse().ok()?,
-    })
-}
-
-fn is_descendant_or_self(pid: u32, root_pid: u32, parent_by_pid: &HashMap<u32, u32>) -> bool {
-    let mut current = pid;
-    for _ in 0..256 {
-        if current == root_pid {
-            return true;
-        }
-        let Some(parent) = parent_by_pid.get(&current).copied() else {
-            return false;
-        };
-        if parent == 0 || parent == current {
-            return false;
-        }
-        current = parent;
-    }
-    false
 }
 
 fn now_ms() -> u64 {
@@ -319,13 +276,6 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_proc_stat_process_name_with_spaces() {
-        let stat = parse_proc_stat_info("123 (agent worker) S 1 2 3 4 5").unwrap();
-        assert_eq!(stat.process_name, "agent worker");
-        assert_eq!(stat.ppid, 1);
-    }
 
     #[test]
     fn detects_descendant_processes() {

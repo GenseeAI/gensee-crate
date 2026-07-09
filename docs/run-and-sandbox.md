@@ -71,10 +71,12 @@ available for the selected platform.
 
 Running without `sudo` is still meaningful. On both macOS and Linux, Gensee can
 supervise the agent and apply controls that do not require elevated privilege.
-On Linux, that includes seccomp profiles when the kernel supports seccomp
-filters. Root is only needed when the requested policy uses root-only host
-features, such as cgroup/nftables network policy or fanotify permission
-enforcement.
+On Linux, plain `gensee run -- <agent>` is a supervised launch, while
+`gensee run --sandbox linux -- <agent>` requests Linux host controls and fails
+closed unless seccomp or network enforcement is active. Seccomp can run without
+root when the kernel supports seccomp filters. Root is needed when the requested
+policy uses root-only host features, such as cgroup/nftables network policy or
+fanotify permission-event probes.
 
 ## macOS vs. Linux
 
@@ -87,7 +89,8 @@ The macOS and Linux run paths intentionally use different OS primitives:
 - Linux: `gensee run --sandbox linux` uses Linux host controls configured in
   policy. Seccomp can hard-deny dangerous syscalls without root. Network
   enforcement uses cgroup v2 plus nftables and currently needs root. Fanotify
-  sensitive-path permission enforcement also needs root.
+  sensitive-path enforcement is currently exposed as debug/planning support and
+  needs a daemon/watch integration before it becomes a continuous run control.
 
 ## Managed Linux Sandbox Mode
 
@@ -133,6 +136,8 @@ agent.
 
 A non-empty `linux.network.deny` with `linux.network.mode` left as `off` is
 treated as deny-only monitor mode: only the listed destinations are rejected.
+Destinations must currently be IP/CIDR values; hostname entries cause apply to
+fail instead of being silently skipped.
 
 `--linux-seccomp`, `--no-linux-seccomp`, `--linux-network`, `--allow-net`, and
 `--deny-net` are per-run overrides for demos, tests, and emergency debugging.

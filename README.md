@@ -10,7 +10,7 @@
 <p align="center">
   Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
   It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS and, experimentally, Linux.
-  Real-time enforcement happens within chat interface of the coding agents, with early Linux system-level file, syscall, and network enforcement available through fanotify, seccomp, cgroups, and nftables, while offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
+  Real-time enforcement happens within chat interface of the coding agents, with early Linux system-level syscall and network enforcement available through seccomp, cgroups, and nftables, plus fanotify planning/debug probes while continuous file enforcement is daemonized. Offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
 </p>
 
 <p align="center">
@@ -166,7 +166,8 @@ stores.
 
 - macOS for the stable v0.1 path. Linux host support is experimental and
   currently focused on `/proc` process attribution, fanotify sensitive-path
-  enforcement, seccomp launcher profiles, and cgroup/nftables network controls.
+  planning/debug probes, seccomp launcher profiles, and cgroup/nftables network
+  controls.
 - Claude Code, Codex, or Antigravity for hook-based enforcement. Other agents
   are planned.
 - Rust toolchain (`cargo`) and `jq`.
@@ -320,9 +321,9 @@ gensee run -- claude # or: gensee run -- codex
 ```
 
 - **Experimental Linux host controls:** inspect Linux host capabilities, monitor
-  a direct agent process tree through `/proc`, run the fanotify sensitive-path
-  permission backend, launch an agent under a seccomp hard-deny syscall profile,
-  and plan/apply cgroup-scoped nftables egress controls on Linux. The public CLI
+  a direct agent process tree through `/proc`, inspect fanotify sensitive-path
+  permission plans/debug probes, launch an agent under a seccomp hard-deny
+  syscall profile, and plan/apply cgroup-scoped nftables egress controls on Linux. The public CLI
   is capability-oriented; `gensee linux ...` remains only as a compatibility
   alias while this branch is experimental.
 
@@ -334,7 +335,7 @@ sudo gensee run --sandbox linux -- codex
 ```
 
 `sudo` is needed for Linux controls that modify kernel-owned state, such as
-cgroup/nftables egress enforcement and fanotify permission enforcement. It is
+cgroup/nftables egress enforcement and fanotify permission-event probes. It is
 not required for basic `gensee run` supervision, staged workspace behavior, or
 seccomp-only Linux launches.
 
@@ -354,14 +355,17 @@ sudo env "PATH=$PATH" ./target/debug/gensee run --sandbox linux -- codex
 If the agent cannot find its auth or config files, also preserve `HOME`, but be
 aware that a root-launched agent may create root-owned files in that directory.
 Seccomp-only launches can usually run without `sudo`; cgroup/nftables network
-enforcement currently requires it.
+enforcement currently requires it. `--sandbox linux` now fails closed if neither
+seccomp nor network enforcement is active; use plain `gensee run -- <agent>` for
+supervised-only launches.
 
 The macOS and Linux paths are intentionally different. macOS uses agent hooks,
 workspace watching, `sandbox-exec`, staged workspaces, and optional
 `eslogger`-based telemetry; deeper blocking waits on Apple's EndpointSecurity
 path. Linux can use lower-level primitives earlier: seccomp for syscall denies,
-fanotify for sensitive file permission decisions, and cgroup/nftables for
-process-scoped network policy.
+fanotify for sensitive file permission experiments, and cgroup/nftables for
+process-scoped network policy. Network destinations must currently be IP/CIDR
+values; hostname entries are rejected on apply rather than silently skipped.
 
 For orchestration frameworks such as Omnigent, use the same primitives as a
 thin outer safety layer:

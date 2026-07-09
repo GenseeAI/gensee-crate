@@ -192,8 +192,8 @@ mod platform {
     use crate::seccomp::LinuxSeccompProfile;
 
     pub fn install_seccomp_filter(profile: &LinuxSeccompProfile) -> io::Result<()> {
-        let blocked_syscalls = resolve_syscalls(profile);
-        let mut filter = build_filter(&blocked_syscalls);
+        let blocked_syscalls = resolve_syscalls(profile)?;
+        let mut filter = build_filter(current_audit_arch()?, &blocked_syscalls);
         let mut program = libc::sock_fprog {
             len: filter.len() as u16,
             filter: filter.as_mut_ptr(),
@@ -203,16 +203,36 @@ mod platform {
         prctl_set_seccomp_filter(&mut program)
     }
 
-    fn resolve_syscalls(profile: &LinuxSeccompProfile) -> Vec<i64> {
-        profile
-            .denied_syscalls
-            .iter()
-            .filter_map(|syscall| syscall_number(&syscall.name))
-            .collect()
+    fn resolve_syscalls(profile: &LinuxSeccompProfile) -> io::Result<Vec<i64>> {
+        let mut resolved = Vec::with_capacity(profile.denied_syscalls.len());
+        let mut unresolved = Vec::new();
+        for syscall in &profile.denied_syscalls {
+            match syscall_number(&syscall.name) {
+                Some(number) => resolved.push(number),
+                None => unresolved.push(syscall.name.clone()),
+            }
+        }
+        if unresolved.is_empty() {
+            Ok(resolved)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "seccomp profile contains syscall names unsupported on this build target: {}",
+                    unresolved.join(", ")
+                ),
+            ))
+        }
     }
 
-    fn build_filter(syscalls: &[i64]) -> Vec<libc::sock_filter> {
-        let mut filter = Vec::with_capacity((syscalls.len() * 2) + 2);
+    fn build_filter(audit_arch: u32, syscalls: &[i64]) -> Vec<libc::sock_filter> {
+        let mut filter = Vec::with_capacity((syscalls.len() * 2) + 5);
+        filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
+        filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, audit_arch, 1, 0));
+        filter.push(stmt(
+            BPF_RET | BPF_K,
+            SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        ));
         filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
         for syscall in syscalls {
             filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, *syscall as u32, 0, 1));
@@ -232,6 +252,48 @@ mod platform {
             jf: 0,
             k,
         }
+    }
+
+    fn current_audit_arch() -> io::Result<u32> {
+        audit_arch_for_target().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "seccomp arch gate is not defined for {}",
+                    std::env::consts::ARCH
+                ),
+            )
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn audit_arch_for_target() -> Option<u32> {
+        Some(0xc000_003e)
+    }
+
+    #[cfg(target_arch = "x86")]
+    fn audit_arch_for_target() -> Option<u32> {
+        Some(0x4000_0003)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn audit_arch_for_target() -> Option<u32> {
+        Some(0xc000_00b7)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn audit_arch_for_target() -> Option<u32> {
+        Some(0xc000_00f3)
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
+    fn audit_arch_for_target() -> Option<u32> {
+        None
     }
 
     fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
@@ -297,6 +359,7 @@ mod platform {
     }
 
     const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+    const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
     const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
     const BPF_LD: u16 = 0x00;
@@ -314,10 +377,31 @@ mod platform {
 
         #[test]
         fn builds_allow_default_filter_with_errno_denies() {
-            let filter = build_filter(&resolve_syscalls(&LinuxSeccompProfile::default()));
+            let filter = build_filter(
+                current_audit_arch().unwrap(),
+                &resolve_syscalls(&LinuxSeccompProfile::default()).unwrap(),
+            );
             assert!(filter.len() > 3);
             assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
+            assert_eq!(filter[0].k, SECCOMP_DATA_ARCH_OFFSET);
+            assert_eq!(filter[3].k, SECCOMP_DATA_NR_OFFSET);
             assert_eq!(filter.last().unwrap().k, SECCOMP_RET_ALLOW);
+        }
+
+        #[test]
+        fn unresolved_syscalls_fail_closed() {
+            let mut profile = LinuxSeccompProfile::default();
+            profile
+                .denied_syscalls
+                .push(crate::seccomp::LinuxSeccompDeniedSyscall {
+                    name: "definitely_not_a_syscall".to_string(),
+                    group: crate::seccomp::LinuxSeccompSyscallGroup::Mount,
+                    reason: "test".to_string(),
+                });
+
+            let error = resolve_syscalls(&profile).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("definitely_not_a_syscall"));
         }
     }
 }

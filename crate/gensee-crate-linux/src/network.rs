@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use crate::policy::{LinuxNetworkMode, LinuxNetworkPolicy};
+use crate::procfs::{is_descendant_or_self, read_parent_by_pid};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LinuxNetworkEnforcementConfig {
@@ -233,12 +233,69 @@ pub fn apply_nftables_script(script: &str) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub fn delete_nftables_table(table_name: &str) -> io::Result<()> {
+    use std::process::Command;
+
+    let status = Command::new("nft")
+        .arg("delete")
+        .arg("table")
+        .arg("inet")
+        .arg(table_name)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("nft exited with status {status}")))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn delete_nftables_table(_table_name: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "nftables network enforcement is only available on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn remove_agent_cgroup(cgroup_path: &Path) -> io::Result<()> {
+    std::fs::remove_dir(cgroup_path)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn remove_agent_cgroup(_cgroup_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cgroup network enforcement is only available on Linux",
+    ))
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn apply_nftables_script(_script: &str) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "nftables network enforcement is only available on Linux",
     ))
+}
+
+pub fn validate_nftables_plan_for_apply(plan: &LinuxNftablesPlan) -> io::Result<()> {
+    if !plan.warnings.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot apply nftables policy with unsupported destinations: {}",
+                plan.warnings.join("; ")
+            ),
+        ));
+    }
+    if plan.mode == LinuxNetworkMode::AllowListed && plan.destinations.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Linux network allowlist mode requires at least one IP/CIDR destination",
+        ));
+    }
+    Ok(())
 }
 
 fn nftables_script(
@@ -346,58 +403,6 @@ fn escape_nft_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn read_parent_by_pid() -> io::Result<HashMap<u32, u32>> {
-    let mut parent_by_pid = HashMap::new();
-    let entries = match std::fs::read_dir("/proc") {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(parent_by_pid),
-        Err(error) => return Err(error),
-    };
-
-    for entry in entries {
-        let entry = entry?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|value| value.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if let Some(ppid) = read_parent_pid(pid) {
-            parent_by_pid.insert(pid, ppid);
-        }
-    }
-    Ok(parent_by_pid)
-}
-
-fn read_parent_pid(pid: u32) -> Option<u32> {
-    let stat =
-        std::fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
-    let close = stat.rfind(") ")?;
-    stat[close + 2..].split_whitespace().nth(1)?.parse().ok()
-}
-
-fn is_descendant_or_self(pid: u32, root_pid: u32, parent_by_pid: &HashMap<u32, u32>) -> bool {
-    let mut seen = HashSet::new();
-    let mut current = pid;
-    for _ in 0..256 {
-        if current == root_pid {
-            return true;
-        }
-        if !seen.insert(current) {
-            return false;
-        }
-        let Some(parent) = parent_by_pid.get(&current).copied() else {
-            return false;
-        };
-        if parent == 0 || parent == current {
-            return false;
-        }
-        current = parent;
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +435,7 @@ mod tests {
         assert_eq!(plan.destinations.len(), 2);
         assert_eq!(plan.denied_destinations.len(), 1);
         assert_eq!(plan.warnings.len(), 1);
+        assert!(validate_nftables_plan_for_apply(&plan).is_err());
         assert!(plan.script.contains("socket cgroupv2 level 2"));
         assert!(plan
             .script
@@ -437,6 +443,43 @@ mod tests {
         assert!(plan.script.contains("ip daddr 1.2.3.4 accept"));
         assert!(plan.script.contains("ip6 daddr 2001:db8::/32 accept"));
         assert!(plan.script.contains("reject with icmpx admin-prohibited"));
+    }
+
+    #[test]
+    fn rejects_apply_for_empty_allowlist() {
+        let config = LinuxNetworkEnforcementConfig::new(
+            "agent-1",
+            LinuxNetworkPolicy {
+                mode: LinuxNetworkMode::AllowListed,
+                allowed_hosts: Vec::new(),
+                denied_hosts: Vec::new(),
+            },
+        );
+
+        let plan = build_nftables_plan(&config);
+        let error = validate_nftables_plan_for_apply(&plan).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("allowlist"));
+    }
+
+    #[test]
+    fn allows_apply_for_ip_only_denylist_monitor_mode() {
+        let config = LinuxNetworkEnforcementConfig::new(
+            "agent-1",
+            LinuxNetworkPolicy {
+                mode: LinuxNetworkMode::Monitor,
+                allowed_hosts: Vec::new(),
+                denied_hosts: vec!["169.254.169.254".to_string()],
+            },
+        );
+
+        let plan = build_nftables_plan(&config);
+
+        validate_nftables_plan_for_apply(&plan).unwrap();
+        assert!(plan
+            .script
+            .contains("ip daddr 169.254.169.254 reject with icmpx admin-prohibited"));
     }
 
     #[test]

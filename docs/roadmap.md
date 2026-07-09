@@ -3,8 +3,8 @@
 Gensee Crate is macOS-first today, with Claude Code, Codex, and Antigravity hook
 support, local policy enforcement, staged workspace runs, local telemetry, and a
 browser dashboard. Linux host support is now experimental, with `/proc` process
-attribution, capability planning, an initial fanotify sensitive-path permission
-backend, a seccomp launcher profile, and cgroup-scoped nftables egress controls.
+attribution, capability planning, initial fanotify sensitive-path planning/debug
+probes, a seccomp launcher profile, and cgroup-scoped nftables egress controls.
 This roadmap is directional and may change as agent interfaces and
 operating-system controls evolve.
 
@@ -20,8 +20,8 @@ Available experimentally:
 - Host capability reporting through `gensee status`.
 - Sidecar attachment for existing Linux agent process trees through
   `gensee watch --pid <pid>`.
-- Fanotify permission enforcement for supported sensitive-path exact paths and
-  prefix roots such as `~/.ssh/**`.
+- Fanotify permission planning and one-shot debug enforcement for supported
+  sensitive-path exact paths and prefix roots such as `~/.ssh/**`.
 - Seccomp launcher profiles configured through policy and applied by
   `gensee run --sandbox linux -- <agent>` to hard-deny dangerous syscall
   families such as `ptrace`, `bpf`, kernel module loading, mount changes, and
@@ -34,6 +34,8 @@ Available experimentally:
 Planned work includes:
 
 - Linux-native eBPF file, process, and network monitoring.
+- Continuous fanotify ownership in a daemon or watch integration, so
+  sensitive-path permission events are armed during real agent runs.
 - Broader sensitive-path protection for credentials, SSH keys, cloud configs,
   `.env` files, and policy-controlled project files, including recursive
   suffix-pattern coverage.
