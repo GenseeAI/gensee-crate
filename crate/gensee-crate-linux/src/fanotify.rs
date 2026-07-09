@@ -303,7 +303,7 @@ mod platform {
                 libc::SYS_fanotify_mark,
                 fd,
                 flags as libc::c_uint,
-                mask as u64,
+                mask,
                 libc::AT_FDCWD,
                 path.as_ptr(),
             ) as libc::c_int
