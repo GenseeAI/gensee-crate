@@ -308,56 +308,54 @@ gensee watch # optional flags: --workspace --watch-root --duration-seconds --sys
 
 If you use `--system-events eslogger` on macOS, open Apple menu > System Settings > Privacy & Security > Full Disk Access, click `+`, add the app hosting `gensee` (for example Terminal, iTerm, or Visual Studio Code), then quit and reopen that app. Run the command with `sudo` as well.
 
-- **`gensee run`:** starts the agent as a child of Gensee so the run can be
-  attributed, recorded, and wrapped with launch-time controls. On macOS, this
-  adds managed sandbox confinement and staged, reviewable workspace writes. On
-  Linux, non-root runs can still supervise the agent and apply unprivileged
-  controls such as seccomp when enabled; root is only needed for kernel features
-  that require elevated privilege.
+`gensee run` starts the agent as a child of Gensee so the run can be attributed,
+recorded, and wrapped with launch-time controls.
+
+#### macOS
 
 ```bash
 gensee run -- claude # or: gensee run -- codex
+gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude
 ```
 
-- **Experimental Linux host controls:** inspect Linux host capabilities, monitor
-  a direct agent process tree through `/proc`, enforce supported fanotify
-  sensitive-path permission decisions from `run` or `watch --pid`, launch an agent under a seccomp hard-deny
-  syscall profile, and plan/apply cgroup-scoped nftables egress controls on Linux. The public CLI
-  is capability-oriented; `gensee linux ...` remains only as a compatibility
-  alias while this branch is experimental.
+On macOS, `gensee run --sandbox mac` uses `sandbox-exec` and can stage
+workspace writes for review.
+
+#### Linux
+
+Linux host controls include `/proc` process attribution, fanotify sensitive-path
+permission enforcement, seccomp launcher profiles, and cgroup/nftables network
+controls. Kernel-owned controls need `sudo`; supervised launches and
+seccomp-only launches can usually run without it.
+
+For Node/npm-installed agents such as Codex or Claude Code, preserve `PATH` so
+the agent shim can still find `node`, and preserve `HOME`/`GENSEE_HOME` so
+Gensee and the agent use the expected user config:
+
+```bash
+export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
+alias gensee-sudo='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOME" gensee'
+```
+
+Add those two lines to `~/.bashrc`, `~/.zshrc`, or your shell profile to make
+them permanent. Because these commands preserve `HOME` while running privileged
+controls, a root-launched agent may create root-owned files in your home
+directory.
 
 ```bash
 gensee status --json
 gensee watch --pid <agent-root-pid>
-sudo gensee watch --pid <agent-root-pid> --linux-fanotify
+gensee-sudo watch --pid <agent-root-pid> --linux-fanotify
 gensee policy setup
-sudo gensee run --sandbox linux -- codex
-```
-
-`sudo` is needed for Linux controls that modify kernel-owned state, such as
-cgroup/nftables egress enforcement and fanotify permission-event probes. It is
-not required for basic `gensee run` supervision, staged workspace behavior, or
-seccomp-only Linux launches.
-
-When launching Node/npm-installed agents such as Codex or Claude Code with
-`sudo`, preserve the user `PATH` so the agent shim can still find `node`:
-
-```bash
-sudo env "PATH=$PATH" gensee run --sandbox linux -- codex
+gensee-sudo run --sandbox linux -- codex
 ```
 
 If testing from a source build, use the same pattern with the debug binary:
 
 ```bash
-sudo env "PATH=$PATH" ./target/debug/gensee run --sandbox linux -- codex
+sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=${GENSEE_HOME:-$HOME/.gensee}" \
+  ./target/debug/gensee run --sandbox linux -- codex
 ```
-
-If the agent cannot find its auth or config files, also preserve `HOME`, but be
-aware that a root-launched agent may create root-owned files in that directory.
-Seccomp-only launches can usually run without `sudo`; cgroup/nftables network
-enforcement currently requires it. `--sandbox linux` now fails closed if neither
-seccomp nor network enforcement is active; use plain `gensee run -- <agent>` for
-supervised-only launches.
 
 The macOS and Linux paths are intentionally different. macOS uses agent hooks,
 workspace watching, `sandbox-exec`, staged workspaces, and optional
@@ -372,7 +370,7 @@ destinations such as `169.254.169.254`. Exact per-attempt child PID attribution
 is future eBPF/nft log work.
 `--linux-fanotify` starts a run-owned fanotify permission listener for supported
 sensitive-path file access and appends `FileAccess...` Layer 1 events.
-`sudo gensee watch --pid <agent-root-pid> --linux-fanotify` uses the same
+`gensee-sudo watch --pid <agent-root-pid> --linux-fanotify` uses the same
 fanotify enforcement path as a sidecar attached to an already-running agent
 process tree. Add harmless demo paths without replacing the built-in credential
 rules:
@@ -503,14 +501,13 @@ GENSEE_HOME="$PWD/.gensee-dev" gensee timeline
 
 ## Roadmap
 
-Gensee Crate is macOS-first today, with Claude Code, Codex, and Antigravity hook
-support, local policy enforcement, staged workspace runs, local telemetry, and a
-browser dashboard. Next directions include:
+Gensee Crate supports macOS and Linux today, with Claude Code, Codex, and
+Antigravity hook support, local policy enforcement, staged workspace runs, local
+telemetry, and a browser dashboard. Next directions include:
 
-- **Linux system enforcement:** early `/proc` process attribution, fanotify
-  sensitive-path enforcement, seccomp launcher profiles, and cgroup/nftables
-  egress controls are available experimentally; eBPF, Landlock, and AppArmor
-  work remains in progress.
+- **Linux system enforcement:** eBPF telemetry, Landlock/AppArmor profile
+  generation, daemon-owned fanotify lifecycle, and richer per-attempt
+  attribution.
 - **Endpoint Security-based macOS defense:** deeper host-level file, process,
   and network visibility once the Apple Endpoint Security path is available.
 - **Sandbox support:** stronger `gensee run` confinement, staged writes, and

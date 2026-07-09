@@ -1,27 +1,28 @@
 # Roadmap
 
-Gensee Crate is macOS-first today, with Claude Code, Codex, and Antigravity hook
-support, local policy enforcement, staged workspace runs, local telemetry, and a
-browser dashboard. Linux host support is now experimental, with `/proc` process
-attribution, capability planning, initial fanotify sensitive-path planning/debug
-probes, a seccomp launcher profile, and cgroup-scoped nftables egress controls.
-This roadmap is directional and may change as agent interfaces and
-operating-system controls evolve.
+Gensee Crate supports macOS and Linux today, with Claude Code, Codex, and
+Antigravity hook support, local policy enforcement, staged workspace runs, local
+telemetry, and a browser dashboard. Linux host support includes `/proc` process
+attribution, capability planning, fanotify sensitive-path enforcement, seccomp
+launcher profiles, and cgroup-scoped nftables egress controls. This roadmap is
+directional and may change as agent interfaces and operating-system controls
+evolve.
 
 ## Linux System Enforcement
 
 Gensee Crate's Linux support will focus on agents running directly on developer
 machines, not only inside containers.
 
-Available experimentally:
+Available now:
 
 - Process-tree attribution for Claude Code, Codex, Omnigent, and other local
   agents through `/proc`.
 - Host capability reporting through `gensee status`.
 - Sidecar attachment for existing Linux agent process trees through
   `gensee watch --pid <pid>`.
-- Fanotify permission planning and one-shot debug enforcement for supported
-  sensitive-path exact paths and prefix roots such as `~/.ssh/**`.
+- Fanotify permission enforcement for `gensee run` and `gensee watch --pid`,
+  with built-in credential-path rules and configurable `linux.fanotify.paths`
+  for exact paths and prefix roots such as `~/.ssh/**`.
 - Seccomp launcher profiles configured through policy and applied by
   `gensee run --sandbox linux -- <agent>` to hard-deny dangerous syscall
   families such as `ptrace`, `bpf`, kernel module loading, mount changes, and
@@ -37,13 +38,11 @@ Planned work includes:
 - Continuous fanotify ownership in a daemon, so sensitive-path permission events
   can survive policy reloads and multi-agent session lifecycle beyond the
   current `run` and `watch --pid` listeners.
-- Broader sensitive-path protection for credentials, SSH keys, cloud configs,
-  `.env` files, and policy-controlled project files, including recursive
-  suffix-pattern coverage.
-- Layered enforcement using Linux primitives such as eBPF, fanotify, seccomp,
-  Landlock, AppArmor, cgroups, and nftables where available.
-- Local audit trails that connect agent intent, process activity, file access,
-  network attempts, and policy decisions.
+- Recursive suffix-pattern coverage for rules such as `**/.env` and
+  `**/.env.*`.
+- Landlock and AppArmor profile generation where those systems are available.
+- Richer audit trails that connect agent intent, child PID attribution,
+  per-attempt network timestamps, file access, and policy decisions.
 
 ## Endpoint Security-Based Defense
 
