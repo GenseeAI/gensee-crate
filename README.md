@@ -164,10 +164,9 @@ stores.
 <details>
 <summary>Toolchain and prerequisites (if the installer reports a missing tool)</summary>
 
-- macOS for the stable v0.1 path. Linux host support is experimental and
-  currently focused on `/proc` process attribution, fanotify sensitive-path
-  planning/debug probes, seccomp launcher profiles, and cgroup/nftables network
-  controls.
+- macOS and Linux for the stable v0.1 path. Linux host controls include `/proc`
+  process attribution, fanotify sensitive-path enforcement, seccomp launcher
+  profiles, and cgroup/nftables network controls.
 - Claude Code, Codex, or Antigravity for hook-based enforcement. Other agents
   are planned.
 - Rust toolchain (`cargo`) and `jq`.
@@ -530,9 +529,9 @@ Full docs live in [`docs/`](docs/README.md):
 
 - [Architecture](docs/architecture.md) — the v0.1 wedge, workspace crates, and roadmap.
 - [Roadmap](docs/roadmap.md) — planned Linux enforcement, macOS Endpoint Security, sandbox, ML policy, and integration work.
-- [Linux host support](docs/linux.md) — experimental `/proc` monitoring,
-  fanotify sensitive-path enforcement, seccomp launcher profiles,
-  cgroup/nftables egress controls, and the Linux enforcement plan.
+- [Linux host support](docs/linux.md) — `/proc` monitoring, fanotify
+  sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress
+  controls, and the Linux enforcement plan.
 - [`gensee watch`](docs/watch.md) — sidecar filesystem and system-event audit, backends, and watch roots.
 - [`gensee run` and the macOS sandbox](docs/run-and-sandbox.md) — managed launch and staged workspaces.
 - [`gensee policy`](docs/gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.

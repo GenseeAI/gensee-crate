@@ -25,7 +25,7 @@ features:
     link: /watch
     linkText: Run the sidecar
   - title: Enforce Before Risky Tools Run
-    details: Apply configurable allow, ask, and deny decisions for secrets, destructive operations, control-plane writes, suspicious artifacts, and experimental Linux fanotify file events.
+    details: Apply configurable allow, ask, and deny decisions for secrets, destructive operations, control-plane writes, suspicious artifacts, and Linux fanotify file events.
     link: /policy
     linkText: Read the policy model
   - title: Launch With Extra Containment

@@ -1,10 +1,10 @@
 # Linux host support
 
-Linux support is experimental and targets agents running directly on Linux
-developer hosts or managed Linux workspaces. It is separate from container or
-tclone runtime work: the first goal is to observe and enforce policy for a local
-Claude Code, Codex, Omnigent, or similar agent process tree without requiring
-the agent to run inside a container.
+Linux support targets agents running directly on Linux developer hosts or
+managed Linux workspaces. It is separate from container or tclone runtime work:
+the first goal is to observe and enforce policy for a local Claude Code, Codex,
+Omnigent, or similar agent process tree without requiring the agent to run
+inside a container.
 
 ## What works now
 
