@@ -1,4 +1,4 @@
-# `gensee run` — managed launch and the macOS sandbox
+# `gensee run` — managed launch and host controls
 
 `gensee run` launches an agent as a managed child, records a local run record in
 `$GENSEE_HOME/sessions.jsonl`, captures the spawned agent root PID, and sets:
@@ -61,6 +61,100 @@ targeted-deny SBPL profile:
 
 `--deny-network`, CPU/memory quotas, deny-default profiles, and container mode
 are intentionally not part of this first cut.
+
+## What `gensee run` Means
+
+`gensee run -- <agent>` starts the agent as a child process of Gensee. That
+lets Gensee assign a run id, track the root pid, load policy, choose workspace
+mode, record lifecycle metadata, and install any launch-time controls that are
+available for the selected platform.
+
+Running without `sudo` is still meaningful. On both macOS and Linux, Gensee can
+supervise the agent and apply controls that do not require elevated privilege.
+On Linux, plain `gensee run -- <agent>` is a supervised launch, while
+`gensee run --sandbox linux -- <agent>` requests Linux host controls and fails
+closed unless seccomp or network enforcement is active. Seccomp can run without
+root when the kernel supports seccomp filters. Root is needed when the requested
+policy uses root-only host features, such as cgroup/nftables network policy or
+fanotify permission-event probes.
+
+## macOS vs. Linux
+
+The macOS and Linux run paths intentionally use different OS primitives:
+
+- macOS: `gensee run --sandbox mac` uses `sandbox-exec` and staged workspace
+  review. `gensee watch` can use FSEvents and optional `eslogger` telemetry.
+  Deeper file/process/network blocking is planned through a signed Apple
+  EndpointSecurity client.
+- Linux: `gensee run --sandbox linux` uses Linux host controls configured in
+  policy. Seccomp can hard-deny dangerous syscalls without root. Network
+  enforcement uses cgroup v2 plus nftables and currently needs root.
+  `--linux-fanotify` starts a run-owned fanotify permission listener for
+  supported sensitive-path file access and currently needs root. `sudo gensee
+  watch --pid PID --linux-fanotify` attaches the same fanotify enforcement path
+  to an already-running agent process tree.
+
+## Managed Linux Sandbox Mode
+
+On Linux, `gensee run --sandbox linux` can launch the agent through initial
+host-enforcement layers configured in policy:
+
+```bash
+gensee policy setup
+
+sudo gensee run \
+  --sandbox linux \
+  --linux-fanotify \
+  -- codex
+```
+
+When launching npm/Node-based agents such as Codex or Claude Code with `sudo`,
+preserve the user `PATH`; otherwise the agent shim may fail to find `node`:
+
+```bash
+sudo env "PATH=$PATH" gensee run \
+  --sandbox linux \
+  -- codex
+```
+
+For source-tree testing, the same rule applies to the debug binary:
+
+```bash
+sudo env "PATH=$PATH" ./target/debug/gensee run \
+  --sandbox linux \
+  -- codex
+```
+
+If the agent needs user auth or config files, you can also pass `"HOME=$HOME"`,
+but root-launched agents may create root-owned files there. Use `sudo` for
+cgroup/nftables network enforcement; seccomp-only launches can usually run as
+the current user.
+
+When `linux.seccomp.enabled` is true, Gensee installs the configured hard-deny
+syscall profile before the agent binary executes. When `linux.network.mode` is
+`allowlist`, `deny-all`, or has deny destinations, Gensee creates a per-run
+cgroup, installs a cgroup-scoped nftables egress policy, starts the agent
+through an internal exec wrapper, joins that cgroup, and then execs the real
+agent.
+
+A non-empty `linux.network.deny` with `linux.network.mode` left as `off` is
+treated as deny-only monitor mode: only the listed destinations are rejected.
+Destinations must currently be IP/CIDR values; hostname entries cause apply to
+fail instead of being silently skipped.
+
+Before cleanup, managed Linux runs read nftables reject counters and append
+nonzero counters as `NetworkBlocked` system events. These appear in
+`gensee timeline` with the blocked destination when known. The current event is
+a run-level summary; exact child process attribution is planned with future nft
+logging or eBPF telemetry.
+
+`--linux-seccomp`, `--no-linux-seccomp`, `--linux-network`, `--allow-net`, and
+`--deny-net` are per-run overrides for demos, tests, and emergency debugging.
+
+Use `gensee status` to inspect host capabilities. Backend-specific probes such
+as `gensee debug seccomp-profile` and `gensee debug network-plan` are available
+for development/admin debugging. See [Linux host support](linux.md) for details
+and current limitations.
 
 ## Staged workspace review and discard
 

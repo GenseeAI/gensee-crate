@@ -25,7 +25,7 @@ features:
     link: /watch
     linkText: Run the sidecar
   - title: Enforce Before Risky Tools Run
-    details: Apply configurable allow, ask, and deny decisions for secrets, destructive operations, control-plane writes, and suspicious artifacts.
+    details: Apply configurable allow, ask, and deny decisions for secrets, destructive operations, control-plane writes, suspicious artifacts, and experimental Linux fanotify file events.
     link: /policy
     linkText: Read the policy model
   - title: Launch With Extra Containment
@@ -36,6 +36,10 @@ features:
     details: Wire Claude Code, Codex, and Antigravity hooks into the same timeline, with sidecar coverage for unmanaged runs.
     link: /claude-code-hooks
     linkText: Configure integrations
+  - title: Protect Linux Hosts
+    details: Inspect Linux capabilities, monitor direct agent process trees through /proc, enforce sensitive-path access with fanotify, launch agents under seccomp, and plan cgroup-scoped nftables egress controls.
+    link: /linux
+    linkText: Explore Linux support
   - title: Trace Long-Horizon Behavior
     details: Link prompts, tool calls, file effects, artifacts, alerts, and review verdicts for post-run inspection.
     link: /lineage-graph

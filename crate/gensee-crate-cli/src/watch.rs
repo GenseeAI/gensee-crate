@@ -110,13 +110,16 @@ extern "C" {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WatchConfig {
-    workspace: PathBuf,
-    watch_roots: Vec<PathBuf>,
-    include_sensitive_roots: bool,
-    backend: WatchBackend,
-    system_events: SystemEventBackend,
-    duration_ms: Option<u64>,
-    interval_ms: u64,
+    pub(crate) workspace: PathBuf,
+    pub(crate) watch_roots: Vec<PathBuf>,
+    pub(crate) pid: Option<u32>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) include_sensitive_roots: bool,
+    pub(crate) backend: WatchBackend,
+    pub(crate) system_events: SystemEventBackend,
+    pub(crate) linux_fanotify: bool,
+    pub(crate) duration_ms: Option<u64>,
+    pub(crate) interval_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +193,14 @@ impl WatchConfig {
             .into_iter()
             .map(PathBuf::from)
             .collect();
+        let pid = arg_value(&args, "--pid")
+            .map(|value| {
+                value.parse::<u32>().map_err(|err| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("invalid --pid: {err}"))
+                })
+            })
+            .transpose()?;
+        let session_id = arg_value(&args, "--session-id");
         let include_sensitive_roots = !has_arg(&args, "--no-sensitive-roots");
         let backend = WatchBackend::parse(arg_value(&args, "--backend"))?;
         let policy_system_events =
@@ -199,6 +210,7 @@ impl WatchConfig {
         } else {
             SystemEventBackend::parse(arg_value(&args, "--system-events"), policy_system_events)?
         };
+        let linux_fanotify = has_arg(&args, "--linux-fanotify");
         let duration_ms =
             optional_arg_u64(&args, "--duration-seconds").map(|seconds| seconds * 1000);
         let interval_ms = optional_arg_u64(&args, "--interval-ms").unwrap_or(1000);
@@ -212,9 +224,12 @@ impl WatchConfig {
         Ok(Self {
             workspace,
             watch_roots,
+            pid,
+            session_id,
             include_sensitive_roots,
             backend,
             system_events,
+            linux_fanotify,
             duration_ms,
             interval_ms,
         })
@@ -222,6 +237,16 @@ impl WatchConfig {
 }
 
 pub(crate) fn watch_workspace(config: WatchConfig) -> io::Result<()> {
+    if config.pid.is_some() {
+        return watch_pid(config);
+    }
+    if config.linux_fanotify {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "gensee watch --linux-fanotify currently requires --pid <agent-root-pid>",
+        ));
+    }
+
     let workspace = canonicalize_or_original(&config.workspace);
     let watch_roots = resolve_watch_roots(
         &workspace,
@@ -332,6 +357,205 @@ pub(crate) fn watch_workspace(config: WatchConfig) -> io::Result<()> {
     })?;
 
     watch_result
+}
+
+fn watch_pid(config: WatchConfig) -> io::Result<()> {
+    if std::env::consts::OS != "linux" {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "gensee watch --pid is currently supported on Linux, not {}",
+                std::env::consts::OS
+            ),
+        ));
+    }
+
+    let pid = config.pid.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee watch --pid <pid> [--session-id <id>]",
+        )
+    })?;
+    let workspace = canonicalize_or_original(&config.workspace);
+    let session_id = config
+        .session_id
+        .unwrap_or_else(|| format!("watch_linux_{pid}_{}", std::process::id()));
+    let target = gensee_crate_linux::LinuxSessionTarget::from_pid(session_id.clone(), pid)?;
+    let policy_doc = Policy::global().document();
+    let store = EventStore::default_local()?;
+    let fanotify_guard = if config.linux_fanotify {
+        Some(start_watch_linux_fanotify_guard(
+            &store,
+            &session_id,
+            &target,
+            policy_doc,
+        )?)
+    } else {
+        None
+    };
+    let mut monitor = gensee_crate_linux::LinuxAuditMonitor::with_config(
+        gensee_crate_linux::LinuxMonitorConfig {
+            session: Some(target),
+            enable_exec_events: true,
+            enable_file_events: false,
+            enable_network_events: false,
+        },
+    );
+    monitor.prime_process_snapshot()?;
+    let started_at_ms = unix_millis()?;
+
+    store.append_session(&AgentSession {
+        session_id: session_id.clone(),
+        agent_binary: "sidecar-watch-linux".to_string(),
+        root_pid: pid,
+        cwd: workspace.to_string_lossy().to_string(),
+        repo_path: find_repo_root(&workspace).map(|path| path.to_string_lossy().to_string()),
+        mode: Some("sidecar-watch:linux-pid".to_string()),
+        workspace_mode: Some("direct".to_string()),
+        original_workspace: Some(workspace.to_string_lossy().to_string()),
+        staged_workspace: None,
+        sandbox_profile: None,
+        sandbox_profile_path: None,
+        started_at_ms,
+        ended_at_ms: None,
+        exit_code: None,
+    })?;
+
+    eprintln!("gensee: watching linux pid tree root_pid={pid} session={session_id}");
+    eprintln!("gensee: poll interval {}ms", config.interval_ms);
+    if let Some(duration_ms) = config.duration_ms {
+        eprintln!("gensee: duration {}s", duration_ms / 1000);
+    }
+    if config.linux_fanotify {
+        eprintln!("gensee: linux fanotify enabled");
+    }
+
+    let started = Instant::now();
+    let mut exit_code = Some(0);
+    loop {
+        match monitor.poll_events() {
+            Ok(events) => {
+                for event in events {
+                    let system_event = event.to_system_event();
+                    store.append_system_event(&system_event)?;
+                    eprintln!(
+                        "gensee: linux event kind={:?} pid={} process={} command={}",
+                        event.kind,
+                        option_u32_display(event.pid),
+                        event.process_name.as_deref().unwrap_or("unknown"),
+                        event.command_line.as_deref().unwrap_or("")
+                    );
+                }
+            }
+            Err(error) => {
+                exit_code = Some(1);
+                store.append_session(&AgentSession {
+                    session_id,
+                    agent_binary: "sidecar-watch-linux".to_string(),
+                    root_pid: pid,
+                    cwd: workspace.to_string_lossy().to_string(),
+                    repo_path: find_repo_root(&workspace)
+                        .map(|path| path.to_string_lossy().to_string()),
+                    mode: Some("sidecar-watch:linux-pid".to_string()),
+                    workspace_mode: Some("direct".to_string()),
+                    original_workspace: Some(workspace.to_string_lossy().to_string()),
+                    staged_workspace: None,
+                    sandbox_profile: None,
+                    sandbox_profile_path: None,
+                    started_at_ms,
+                    ended_at_ms: Some(unix_millis()?),
+                    exit_code,
+                })?;
+                return Err(error);
+            }
+        }
+
+        if config
+            .duration_ms
+            .is_some_and(|duration_ms| started.elapsed() >= Duration::from_millis(duration_ms))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(config.interval_ms));
+    }
+
+    drop(fanotify_guard);
+    store.append_session(&AgentSession {
+        session_id,
+        agent_binary: "sidecar-watch-linux".to_string(),
+        root_pid: pid,
+        cwd: workspace.to_string_lossy().to_string(),
+        repo_path: find_repo_root(&workspace).map(|path| path.to_string_lossy().to_string()),
+        mode: Some("sidecar-watch:linux-pid".to_string()),
+        workspace_mode: Some("direct".to_string()),
+        original_workspace: Some(workspace.to_string_lossy().to_string()),
+        staged_workspace: None,
+        sandbox_profile: None,
+        sandbox_profile_path: None,
+        started_at_ms,
+        ended_at_ms: Some(unix_millis()?),
+        exit_code,
+    })?;
+
+    Ok(())
+}
+
+struct WatchLinuxFanotifyGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for WatchLinuxFanotifyGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_watch_linux_fanotify_guard(
+    store: &EventStore,
+    session_id: &str,
+    target: &gensee_crate_linux::LinuxSessionTarget,
+    policy_doc: &policy::PolicyDocument,
+) -> io::Result<WatchLinuxFanotifyGuard> {
+    let policy = linux_fanotify_policy_from_policy_document(policy_doc);
+    let mut enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(
+        gensee_crate_linux::LinuxFanotifyConfig::with_session(policy, target.clone()),
+    )
+    .map_err(linux_fanotify_privilege_error)?;
+    let status = enforcer.status();
+    eprintln!(
+        "gensee: applied linux fanotify policy session={} root_pid={} marked_paths={}",
+        session_id,
+        target.root_pid,
+        status.marked_paths.len()
+    );
+    for warning in &status.warnings {
+        eprintln!("gensee: linux fanotify warning: {warning}");
+    }
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let store = store.clone();
+    let session_id = session_id.to_string();
+    let agent_binary = target
+        .executable_path
+        .clone()
+        .unwrap_or_else(|| "sidecar-watch-linux".to_string());
+    let handle = thread::spawn(move || {
+        while !thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            drain_linux_fanotify_events(&store, &mut enforcer, &session_id, &agent_binary);
+            thread::sleep(Duration::from_millis(25));
+        }
+        drain_linux_fanotify_events(&store, &mut enforcer, &session_id, &agent_binary);
+    });
+
+    Ok(WatchLinuxFanotifyGuard {
+        stop,
+        handle: Some(handle),
+    })
 }
 
 pub(crate) struct SystemEventWatcher {

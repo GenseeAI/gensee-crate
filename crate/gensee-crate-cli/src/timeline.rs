@@ -343,7 +343,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
                 println!("    system events:");
                 for event in &call.system_events {
                     println!(
-                        "      source={} kind={} type={} pid={} ppid={} process={} path={} command={}",
+                        "      source={} kind={} type={} pid={} ppid={} process={} path={} network={} command={}",
                         event.source,
                         event.event_kind,
                         event.event_type,
@@ -351,6 +351,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
                         option_u32_display(event.ppid),
                         event.process_name.as_deref().unwrap_or("unknown"),
                         event.file_path.as_deref().unwrap_or("-"),
+                        system_event_network_dest(event).unwrap_or_else(|| "-".to_string()),
                         one_line(event.command_line.as_deref().unwrap_or("-")),
                     );
                 }
@@ -371,7 +372,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
         println!("Layer 1 system events");
         for event in system_events.iter().rev().take(20).rev() {
             println!(
-                "  {} | source={} | kind={} | type={} | pid={} | process={} | path={} | command={}",
+                "  {} | source={} | kind={} | type={} | pid={} | process={} | path={} | network={} | command={}",
                 event.observed_at_ms,
                 event.source,
                 event.event_kind,
@@ -379,6 +380,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
                 option_u32_display(event.pid),
                 event.process_name.as_deref().unwrap_or("unknown"),
                 event.file_path.as_deref().unwrap_or("-"),
+                system_event_network_dest(event).unwrap_or_else(|| "-".to_string()),
                 one_line(event.command_line.as_deref().unwrap_or("-")),
             );
         }
@@ -432,6 +434,7 @@ impl TimelineFilter {
             Self::All => {}
             Self::Latest => {
                 let Some(session_id) = latest_agent_session_id(
+                    collections.sessions,
                     collections.user_prompts,
                     collections.assistant_responses,
                     collections.tool_calls,
@@ -441,8 +444,10 @@ impl TimelineFilter {
                 keep_prompt_session(collections.user_prompts, &session_id);
                 keep_response_session(collections.assistant_responses, &session_id);
                 keep_session(collections.tool_calls, &session_id);
-                collections.sessions.clear();
-                collections.system_events.clear();
+                collections
+                    .sessions
+                    .retain(|session| session.session_id == session_id);
+                keep_system_event_session(collections.system_events, &session_id);
                 collections
                     .workspace_effects
                     .retain(|effect| effect.session_id.as_deref() == Some(session_id.as_str()));
@@ -455,7 +460,7 @@ impl TimelineFilter {
                 collections
                     .sessions
                     .retain(|session| session.session_id == *session_id);
-                collections.system_events.clear();
+                keep_system_event_session(collections.system_events, session_id);
                 collections
                     .workspace_effects
                     .retain(|effect| effect.session_id.as_deref() == Some(session_id.as_str()));
@@ -485,16 +490,26 @@ impl TimelineFilter {
         }
     }
 
-    fn shows_standalone_system_events(&self) -> bool {
-        matches!(self, Self::All | Self::Path(_))
+    pub(crate) fn shows_standalone_system_events(&self) -> bool {
+        matches!(
+            self,
+            Self::All | Self::Latest | Self::Session(_) | Self::Path(_)
+        )
     }
 }
 
 pub(crate) fn latest_agent_session_id(
+    sessions: &[AgentSession],
     user_prompts: &[AgentUserPrompt],
     assistant_responses: &[AgentAssistantResponse],
     tool_calls: &[AgentToolCall],
 ) -> Option<String> {
+    let latest_session = sessions.iter().map(|session| {
+        (
+            session.ended_at_ms.unwrap_or(session.started_at_ms),
+            session.session_id.clone(),
+        )
+    });
     let latest_prompt = user_prompts
         .iter()
         .filter_map(|prompt| Some((prompt.observed_at_ms, prompt.session_id.clone()?)));
@@ -505,7 +520,8 @@ pub(crate) fn latest_agent_session_id(
         .iter()
         .filter_map(|call| Some((call.last_observed_at_ms()?, call.session_id.clone()?)));
 
-    latest_prompt
+    latest_session
+        .chain(latest_prompt)
         .chain(latest_response)
         .chain(latest_tool)
         .max_by_key(|(observed_at_ms, _)| *observed_at_ms)
@@ -529,6 +545,10 @@ pub(crate) fn keep_session(tool_calls: &mut Vec<AgentToolCall>, session_id: &str
 
 pub(crate) fn keep_alert_sessions(alerts: &mut Vec<AlertRecord>, session_id: &str) {
     alerts.retain(|alert| alert.session_id.as_deref() == Some(session_id));
+}
+
+pub(crate) fn keep_system_event_session(system_events: &mut Vec<SystemEvent>, session_id: &str) {
+    system_events.retain(|event| system_event_session_id(event).as_deref() == Some(session_id));
 }
 
 pub(crate) fn user_prompt_matches_path(prompt: &AgentUserPrompt, path: &str) -> bool {
@@ -604,6 +624,22 @@ pub(crate) fn system_event_matches_path(event: &SystemEvent, path: &str) -> bool
             .as_deref()
             .is_some_and(|value| value.contains(path))
         || event.raw_json.contains(path)
+}
+
+pub(crate) fn system_event_session_id(event: &SystemEvent) -> Option<String> {
+    serde_json::from_str::<Value>(&event.raw_json)
+        .ok()?
+        .get("session_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+pub(crate) fn system_event_network_dest(event: &SystemEvent) -> Option<String> {
+    serde_json::from_str::<Value>(&event.raw_json)
+        .ok()?
+        .get("network_dest")?
+        .as_str()
+        .map(str::to_string)
 }
 
 pub(crate) fn alert_matches_path(alert: &AlertRecord, path: &str) -> bool {

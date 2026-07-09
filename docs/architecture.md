@@ -17,8 +17,11 @@ current v0.1 release is a macOS-first runtime focused on four workflows:
 
 Container mode is future work. `eslogger` is the default `gensee watch`
 system-event backend on macOS when available and can be disabled by policy,
-while a signed EndpointSecurity client remains a future enrichment. See
-[endpoint-security.md](endpoint-security.md).
+while a signed EndpointSecurity client remains a future enrichment. Experimental
+Linux host support now includes `/proc` process attribution, capability
+planning, fanotify sensitive-path planning/debug probes, a seccomp launcher
+profile for dangerous syscalls, and cgroup/nftables network controls. See
+[endpoint-security.md](endpoint-security.md) and [linux.md](linux.md).
 
 ## Workspace layout
 
@@ -29,7 +32,7 @@ while a signed EndpointSecurity client remains a future enrichment. See
 | `crate/gensee-crate-rules` | Deterministic detection rules and the data-driven [policy engine](policy.md) |
 | `crate/gensee-crate-store` | Local storage and migrations |
 | `crate/gensee-crate-macos` | macOS EndpointSecurity integration |
-| `crate/gensee-crate-linux` | Future Linux audit/eBPF integration |
+| `crate/gensee-crate-linux` | Experimental Linux capability detection, `/proc` monitoring, policy decisions, fanotify planning/debug probes, seccomp launcher profiles, and cgroup/nftables egress controls |
 | `crate/gensee-crate-cli` | `gensee` CLI entry point, including run/watch/timeline/policy commands |
 | `crate/gensee-crate-ml` | Future v0.2 behavioral model experiments |
 | `integrations/claude-code` | Claude Code hook bridge |
@@ -87,5 +90,13 @@ the old `GENSEE_HOME` to start a fresh encrypted store. Set
 - Prompt injection, malicious tool output, exfiltration, and cross-session
   attack chains can be surfaced as graph patterns, but the defense rules are
   still early and mostly deterministic.
+- Linux fanotify can arm supported sensitive-path marks from
+  `gensee run --sandbox linux --linux-fanotify` or
+  `gensee watch --pid <pid> --linux-fanotify`; seccomp can hard-deny dangerous
+  syscalls for processes launched with `gensee run --sandbox linux`, and
+  cgroup/nftables can scope egress controls to an attached agent process tree or
+  to policy-managed Linux runs. The long-running daemon, recursive
+  suffix-pattern coverage, eBPF telemetry, Landlock/AppArmor generation, and
+  prompt/speculation brokers are still future work.
 - Automatic rollback, merge-back review, deny-default policies, and container
   confinement are future work.

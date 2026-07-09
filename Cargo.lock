@@ -237,6 +237,7 @@ version = "0.1.0"
 dependencies = [
  "gensee-crate-attribution",
  "gensee-crate-core",
+ "gensee-crate-linux",
  "gensee-crate-rules",
  "gensee-crate-store",
  "serde",
@@ -269,6 +270,9 @@ name = "gensee-crate-linux"
 version = "0.1.0"
 dependencies = [
  "gensee-crate-core",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

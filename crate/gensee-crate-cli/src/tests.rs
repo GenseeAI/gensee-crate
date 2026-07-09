@@ -3351,6 +3351,95 @@ fn timeline_marks_blocked_tools_and_hides_process_noise() {
 }
 
 #[test]
+fn timeline_keeps_session_scoped_network_system_events() {
+    let mut events = vec![
+        SystemEvent {
+            source: "linux".to_string(),
+            event_type: "network_block".to_string(),
+            event_kind: "NetworkBlocked".to_string(),
+            observed_at_ms: 10,
+            pid: Some(123),
+            ppid: None,
+            process_name: Some("codex".to_string()),
+            executable_path: None,
+            file_path: None,
+            command_line: Some("nftables blocked network egress".to_string()),
+            raw_json: json!({
+                "session_id": "run_1",
+                "network_dest": "169.254.169.254",
+                "packets": 1,
+                "bytes": 64
+            })
+            .to_string(),
+        },
+        SystemEvent {
+            source: "linux".to_string(),
+            event_type: "network_block".to_string(),
+            event_kind: "NetworkBlocked".to_string(),
+            observed_at_ms: 11,
+            pid: Some(456),
+            ppid: None,
+            process_name: Some("codex".to_string()),
+            executable_path: None,
+            file_path: None,
+            command_line: None,
+            raw_json: json!({
+                "session_id": "run_2",
+                "network_dest": "1.1.1.1"
+            })
+            .to_string(),
+        },
+    ];
+
+    keep_system_event_session(&mut events, "run_1");
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        system_event_session_id(&events[0]).as_deref(),
+        Some("run_1")
+    );
+    assert_eq!(
+        system_event_network_dest(&events[0]).as_deref(),
+        Some("169.254.169.254")
+    );
+    assert!(TimelineFilter::Session("run_1".to_string()).shows_standalone_system_events());
+}
+
+#[test]
+fn timeline_latest_considers_managed_run_sessions() {
+    let sessions = vec![AgentSession {
+        session_id: "run_latest".to_string(),
+        agent_binary: "codex".to_string(),
+        root_pid: 123,
+        cwd: "/repo".to_string(),
+        repo_path: Some("/repo".to_string()),
+        mode: Some("managed-run:linux".to_string()),
+        workspace_mode: Some("in-place".to_string()),
+        original_workspace: Some("/repo".to_string()),
+        staged_workspace: None,
+        sandbox_profile: None,
+        sandbox_profile_path: None,
+        started_at_ms: 20,
+        ended_at_ms: Some(30),
+        exit_code: Some(0),
+    }];
+    let prompts = vec![AgentUserPrompt {
+        session_id: Some("old_codex_hook".to_string()),
+        cwd: Some("/repo".to_string()),
+        transcript_path: None,
+        prompt: Some("old prompt".to_string()),
+        permission_mode: None,
+        effort_level: None,
+        observed_at_ms: 10,
+    }];
+
+    assert_eq!(
+        latest_agent_session_id(&sessions, &prompts, &[], &[]).as_deref(),
+        Some("run_latest")
+    );
+}
+
+#[test]
 fn redacts_secrets_in_agent_hook_payload() {
     let payload = r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"AWS_SECRET_ACCESS_KEY=abcd1234 aws s3 cp x s3://b"},"tool_response":{"stdout":"export GITHUB_TOKEN=ghp_abcdefghijkl","stderr":""}}"#;
 
@@ -3930,6 +4019,22 @@ fn parses_watch_system_events_backend() {
 }
 
 #[test]
+fn watch_config_parses_linux_fanotify_pid_mode() {
+    let config = WatchConfig::parse(vec![
+        OsString::from("--pid"),
+        OsString::from("123"),
+        OsString::from("--linux-fanotify"),
+        OsString::from("--duration-seconds"),
+        OsString::from("5"),
+    ])
+    .unwrap();
+
+    assert_eq!(config.pid, Some(123));
+    assert!(config.linux_fanotify);
+    assert_eq!(config.duration_ms, Some(5000));
+}
+
+#[test]
 fn discard_session_ids_are_constrained_to_run_ids() {
     assert!(is_valid_discard_session_id("run_123_456"));
     assert!(is_valid_discard_session_id("run_abc-123"));
@@ -4318,6 +4423,111 @@ fn run_config_parses_max_runtime_seconds() {
     );
 }
 
+#[test]
+fn run_config_parses_linux_launch_controls() {
+    let config = RunConfig::parse(vec![
+        OsString::from("--sandbox"),
+        OsString::from("linux"),
+        OsString::from("--linux-seccomp"),
+        OsString::from("--linux-fanotify"),
+        OsString::from("--linux-network"),
+        OsString::from("allowlist"),
+        OsString::from("--allow-net"),
+        OsString::from("1.1.1.1"),
+        OsString::from("--allow-net"),
+        OsString::from("10.0.0.0/8"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap();
+
+    assert_eq!(config.sandbox, SandboxMode::Linux);
+    assert_eq!(config.linux_seccomp_override, Some(true));
+    assert!(config.linux_fanotify);
+    assert_eq!(
+        config.linux_network_override,
+        Some(gensee_crate_linux::LinuxNetworkMode::AllowListed)
+    );
+    assert_eq!(
+        config.linux_allow_net_override,
+        vec!["1.1.1.1".to_string(), "10.0.0.0/8".to_string()]
+    );
+    assert_eq!(config.agent_cmd, vec![OsString::from("codex")]);
+}
+
+#[test]
+fn linux_policy_includes_configured_fanotify_paths() {
+    let mut root: Value = serde_json::from_str(policy::default_policy_json()).unwrap();
+    root["linux"]["fanotify"]["paths"] = json!(["/tmp/gensee-demo/**", "~/project/.secret"]);
+    let policy = Policy::from_json(&root.to_string()).unwrap();
+
+    let linux_policy = linux_fanotify_policy_from_policy_document(policy.document());
+
+    assert_eq!(
+        linux_policy.mode,
+        gensee_crate_linux::LinuxEnforcementMode::Enforce
+    );
+    assert!(linux_policy
+        .sensitive_paths
+        .iter()
+        .any(|rule| rule.pattern == "/tmp/gensee-demo/**"));
+    assert!(linux_policy
+        .sensitive_paths
+        .iter()
+        .any(|rule| rule.pattern == "~/project/.secret"));
+}
+
+#[test]
+fn run_config_rejects_linux_controls_without_linux_sandbox() {
+    let error = RunConfig::parse(vec![
+        OsString::from("--linux-seccomp"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("--sandbox linux"));
+}
+
+#[test]
+fn run_config_allows_policy_resolved_linux_allowlist() {
+    let config = RunConfig::parse(vec![
+        OsString::from("--sandbox"),
+        OsString::from("linux"),
+        OsString::from("--linux-network"),
+        OsString::from("allowlist"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap();
+
+    assert_eq!(
+        config.linux_network_override,
+        Some(gensee_crate_linux::LinuxNetworkMode::AllowListed)
+    );
+    assert!(config.linux_allow_net_override.is_empty());
+}
+
+#[test]
+fn linux_network_denylist_implies_monitor_mode() {
+    assert_eq!(
+        crate::run::linux_effective_network_mode(gensee_crate_linux::LinuxNetworkMode::Off, true),
+        gensee_crate_linux::LinuxNetworkMode::Monitor
+    );
+    assert_eq!(
+        crate::run::linux_effective_network_mode(gensee_crate_linux::LinuxNetworkMode::Off, false),
+        gensee_crate_linux::LinuxNetworkMode::Off
+    );
+    assert_eq!(
+        crate::run::linux_effective_network_mode(
+            gensee_crate_linux::LinuxNetworkMode::AllowListed,
+            true
+        ),
+        gensee_crate_linux::LinuxNetworkMode::AllowListed
+    );
+}
+
 fn temp_store_and_workspace(label: &str) -> (EventStore, PathBuf) {
     let root = env::temp_dir().join(format!(
         "gensee-cli-test-{label}-{}-{}",
@@ -4374,6 +4584,14 @@ fn coerce_policy_value_infers_types() {
         json!(["a.com", "b.com"])
     );
     assert_eq!(
+        coerce_policy_value("linux.network.allow", "1.1.1.1, 10.0.0.0/8"),
+        json!(["1.1.1.1", "10.0.0.0/8"])
+    );
+    assert_eq!(
+        coerce_policy_value("linux.fanotify.paths", "/tmp/demo/**, ~/project/.secret"),
+        json!(["/tmp/demo/**", "~/project/.secret"])
+    );
+    assert_eq!(
         coerce_policy_value("egress.proxy_url", "http://p:8080"),
         json!("http://p:8080")
     );
@@ -4401,6 +4619,15 @@ fn policy_setup_flow_updates_dashboard_settings() {
         "http://127.0.0.1:8080",           // egress.proxy_url
         "y",                               // egress.require_proxy
         "600",                             // runtime.max_runtime_seconds
+        "yes",                             // linux.seccomp.enabled
+        "",                                // linux.seccomp.deny_ptrace
+        "no",                              // linux.seccomp.deny_bpf
+        "",                                // linux.seccomp.deny_kernel_modules
+        "",                                // linux.seccomp.deny_mount_namespace_changes
+        "/tmp/gensee-demo/**",             // linux.fanotify.paths
+        "allowlist",                       // linux.network.mode
+        "1.1.1.1, 10.0.0.0/8",             // linux.network.allow
+        "169.254.169.254",                 // linux.network.deny
         "yes",                             // enforcement.noninteractive
         "none",                            // watch.system_events
         "/Users/me/templates,/opt/shared", // allow_path_prefixes
@@ -4433,6 +4660,30 @@ fn policy_setup_flow_updates_dashboard_settings() {
         Some(&json!(600))
     );
     assert_eq!(
+        policy_value_get(&root, "linux.seccomp.enabled"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        policy_value_get(&root, "linux.seccomp.deny_bpf"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        policy_value_get(&root, "linux.fanotify.paths"),
+        Some(&json!(["/tmp/gensee-demo/**"]))
+    );
+    assert_eq!(
+        policy_value_get(&root, "linux.network.mode"),
+        Some(&json!("allowlist"))
+    );
+    assert_eq!(
+        policy_value_get(&root, "linux.network.allow"),
+        Some(&json!(["1.1.1.1", "10.0.0.0/8"]))
+    );
+    assert_eq!(
+        policy_value_get(&root, "linux.network.deny"),
+        Some(&json!(["169.254.169.254"]))
+    );
+    assert_eq!(
         policy_value_get(&root, "enforcement.noninteractive"),
         Some(&json!(true))
     );
@@ -4448,6 +4699,7 @@ fn policy_setup_flow_updates_dashboard_settings() {
     let rendered = String::from_utf8(output).unwrap();
     assert!(rendered.contains("Resource governance"));
     assert!(rendered.contains("Network egress"));
+    assert!(rendered.contains("Linux host controls"));
     assert!(rendered.contains("Allowed path prefixes"));
     assert!(rendered.contains("Artifact definitions"));
     assert!(rendered.contains("Decision rules"));
