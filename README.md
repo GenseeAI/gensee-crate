@@ -295,33 +295,50 @@ cargo install --path crate/gensee-crate-cli --force
 
 ### 2. Run
 
-Gensee has three protection levels you can combine:
+Choose the section for your operating system. Each path can combine hooks,
+sidecar watching, and managed `gensee run` launches.
 
-- **Hooks only:** Agent requests and tool calling are checked and protected by the safety
-  policy rules. Require agent hook installation (part of Step 1 above). No running commands needed.
+<details>
+<summary>macOS</summary>
 
-- **`gensee watch`:** performs system-level event watching such as file system operations, macOS EndpointSecurityLogger events, etc. On macOS, `--system-events eslogger` needs Full Disk Access for the host app and `sudo` so it can create an EndpointSecurity client.
+**Hooks only.** Agent requests and tool calls are checked by Gensee policy after
+Step 1 setup. No extra command needs to keep running.
+
+**Watch.** Observe workspace file effects, and optionally ingest macOS
+EndpointSecurityLogger events:
 
 ```bash
-gensee watch # optional flags: --workspace --watch-root --duration-seconds --system-events
+gensee watch # optional flags: --workspace --watch-root --duration-seconds
+sudo gensee watch --system-events eslogger
 ```
 
-If you use `--system-events eslogger` on macOS, open Apple menu > System Settings > Privacy & Security > Full Disk Access, click `+`, add the app hosting `gensee` (for example Terminal, iTerm, or Visual Studio Code), then quit and reopen that app. Run the command with `sudo` as well.
+If you use `--system-events eslogger`, open Apple menu > System Settings >
+Privacy & Security > Full Disk Access, click `+`, add the app hosting `gensee`
+(for example Terminal, iTerm, or Visual Studio Code), then quit and reopen that
+app.
 
-`gensee run` starts the agent as a child of Gensee so the run can be attributed,
-recorded, and wrapped with launch-time controls.
-
-#### macOS
+**Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
+`sandbox-exec` and can stage workspace writes for review.
 
 ```bash
 gensee run -- claude # or: gensee run -- codex
 gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude
 ```
 
-On macOS, `gensee run --sandbox mac` uses `sandbox-exec` and can stage
-workspace writes for review.
+For orchestration frameworks such as Omnigent, use the same outer safety layer:
 
-#### Linux
+```bash
+gensee watch --workspace . --watch-root ~/.omnigent
+gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml
+```
+
+</details>
+
+<details>
+<summary>Linux</summary>
+
+**Hooks only.** Agent requests and tool calls are checked by Gensee policy after
+Step 1 setup. No extra command needs to keep running.
 
 Linux host controls include `/proc` process attribution, fanotify sensitive-path
 permission enforcement, seccomp launcher profiles, and cgroup/nftables network
@@ -342,10 +359,17 @@ them permanent. Because these commands preserve `HOME` while running privileged
 controls, a root-launched agent may create root-owned files in your home
 directory.
 
+**Watch.** Attach to an already-running agent process tree:
+
 ```bash
 gensee status --json
 gensee watch --pid <agent-root-pid>
 gensee-sudo watch --pid <agent-root-pid> --linux-fanotify
+```
+
+**Run.** Launch the agent as a child of Gensee with Linux host controls:
+
+```bash
 gensee policy setup
 gensee-sudo run --sandbox linux -- codex
 ```
@@ -357,36 +381,26 @@ sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=${GENSEE_HOME:-$HOME/.gensee}" \
   ./target/debug/gensee run --sandbox linux -- codex
 ```
 
-The macOS and Linux paths are intentionally different. macOS uses agent hooks,
-workspace watching, `sandbox-exec`, staged workspaces, and optional
-`eslogger`-based telemetry; deeper blocking waits on Apple's EndpointSecurity
-path. Linux can use lower-level primitives earlier: seccomp for syscall denies,
-fanotify for sensitive file permission experiments, and cgroup/nftables for
-process-scoped network policy. Network destinations must currently be IP/CIDR
-values; hostname entries are rejected on apply rather than silently skipped.
-Managed Linux runs record nftables counter summaries as `NetworkBlocked` Layer 1
-system events after the agent exits, so `gensee timeline` shows blocked
-destinations such as `169.254.169.254`. Exact per-attempt child PID attribution
-is future eBPF/nft log work.
-`--linux-fanotify` starts a run-owned fanotify permission listener for supported
-sensitive-path file access and appends `FileAccess...` Layer 1 events.
-`gensee-sudo watch --pid <agent-root-pid> --linux-fanotify` uses the same
-fanotify enforcement path as a sidecar attached to an already-running agent
-process tree. Add harmless demo paths without replacing the built-in credential
-rules:
+Linux network destinations must currently be IP/CIDR values. Managed Linux runs
+record nftables counter summaries as `NetworkBlocked` Layer 1 system events
+after the agent exits. `--linux-fanotify` appends `FileAccess...` Layer 1
+events for supported sensitive-path file access.
+
+Add harmless demo paths without replacing the built-in credential rules:
 
 ```bash
 gensee policy set linux.fanotify.paths '/tmp/gensee-demo-secret/**'
 gensee debug fanotify-plan
 ```
 
-For orchestration frameworks such as Omnigent, use the same primitives as a
-thin outer safety layer:
+For orchestration frameworks such as Omnigent, use the same outer safety layer:
 
 ```bash
 gensee watch --workspace . --watch-root ~/.omnigent
-gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml
+gensee-sudo run --sandbox linux -- omnigent run path/to/agent.yaml
 ```
+
+</details>
 
 Inspect what happened at any time:
 
