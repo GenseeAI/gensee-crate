@@ -88,9 +88,9 @@ The macOS and Linux run paths intentionally use different OS primitives:
   EndpointSecurity client.
 - Linux: `gensee run --sandbox linux` uses Linux host controls configured in
   policy. Seccomp can hard-deny dangerous syscalls without root. Network
-  enforcement uses cgroup v2 plus nftables and currently needs root. Fanotify
-  sensitive-path enforcement is currently exposed as debug/planning support and
-  needs a daemon/watch integration before it becomes a continuous run control.
+  enforcement uses cgroup v2 plus nftables and currently needs root.
+  `--linux-fanotify` starts a run-owned fanotify permission listener for
+  supported sensitive-path file access and currently needs root.
 
 ## Managed Linux Sandbox Mode
 
@@ -102,6 +102,7 @@ gensee policy setup
 
 sudo gensee run \
   --sandbox linux \
+  --linux-fanotify \
   -- codex
 ```
 

@@ -69,6 +69,7 @@ pub(crate) struct RunConfig {
     pub(crate) workspace: PathBuf,
     pub(crate) max_runtime_seconds: Option<u64>,
     pub(crate) linux_seccomp_override: Option<bool>,
+    pub(crate) linux_fanotify: bool,
     pub(crate) linux_network_override: Option<gensee_crate_linux::LinuxNetworkMode>,
     pub(crate) linux_allow_net_override: Vec<String>,
     pub(crate) linux_deny_net_override: Vec<String>,
@@ -82,6 +83,7 @@ impl RunConfig {
         let mut workspace_mode = WorkspaceMode::Direct;
         let mut workspace: Option<PathBuf> = None;
         let mut linux_seccomp_override = None;
+        let mut linux_fanotify = false;
         let mut linux_network_override = None;
         let mut linux_allow_net_override = Vec::new();
         let mut linux_deny_net_override = Vec::new();
@@ -145,6 +147,9 @@ impl RunConfig {
                 }
                 Some("--no-linux-seccomp") => {
                     linux_seccomp_override = Some(false);
+                }
+                Some("--linux-fanotify") => {
+                    linux_fanotify = true;
                 }
                 Some("--linux-network") => {
                     index += 1;
@@ -243,7 +248,7 @@ impl RunConfig {
         if agent_cmd.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: gensee run [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--linux-seccomp|--no-linux-seccomp] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... [--max-runtime-seconds N] -- <agent> [args...]",
+                "usage: gensee run [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... [--max-runtime-seconds N] -- <agent> [args...]",
             ));
         }
 
@@ -251,6 +256,7 @@ impl RunConfig {
             profile = "cautious".to_string();
         }
         if (linux_seccomp_override.is_some()
+            || linux_fanotify
             || linux_network_override.is_some()
             || !linux_allow_net_override.is_empty()
             || !linux_deny_net_override.is_empty())
@@ -270,6 +276,7 @@ impl RunConfig {
             workspace,
             max_runtime_seconds,
             linux_seccomp_override,
+            linux_fanotify,
             linux_network_override,
             linux_allow_net_override,
             linux_deny_net_override,
@@ -300,11 +307,12 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
     let linux_network = linux_run_network_config(&config, policy_doc, &run_id)?;
     if config.sandbox == SandboxMode::Linux
         && linux_seccomp_profile.is_none()
+        && !config.linux_fanotify
         && linux_network.is_none()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--sandbox linux requested, but no Linux controls are enabled; enable linux.seccomp.enabled, configure linux.network, or pass --linux-seccomp/--linux-network/--deny-net",
+            "--sandbox linux requested, but no Linux controls are enabled; enable linux.seccomp.enabled, configure linux.network, or pass --linux-seccomp/--linux-fanotify/--linux-network/--deny-net",
         ));
     }
     let mut linux_cleanup = None;
@@ -424,6 +432,19 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         exit_code: None,
     })?;
 
+    let fanotify_guard = if config.linux_fanotify {
+        match start_linux_fanotify_run_guard(&store, &run_id, root_pid, &agent_binary) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
     eprintln!(
         "gensee: started run {run_id} root_pid={root_pid} workspace={} sandbox={} profile={}",
         run_workspace.display(),
@@ -442,6 +463,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
             unix_millis()?,
         )?;
     }
+    drop(fanotify_guard);
     drop(linux_cleanup.take());
     let ended_at_ms = unix_millis()?;
     let exit_code = status.code();
@@ -620,6 +642,145 @@ impl Drop for LinuxNetworkCleanup {
                 self.cgroup_path
             );
         }
+    }
+}
+
+struct LinuxFanotifyRunGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for LinuxFanotifyRunGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_linux_fanotify_run_guard(
+    store: &EventStore,
+    session_id: &str,
+    root_pid: u32,
+    agent_binary: &str,
+) -> io::Result<LinuxFanotifyRunGuard> {
+    let policy = gensee_crate_linux::LinuxPolicy {
+        mode: gensee_crate_linux::LinuxEnforcementMode::Enforce,
+        ..Default::default()
+    };
+    let session = gensee_crate_linux::LinuxSessionTarget::from_pid(session_id, root_pid)?;
+    let mut enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(
+        gensee_crate_linux::LinuxFanotifyConfig::with_session(policy, session),
+    )
+    .map_err(linux_fanotify_privilege_error)?;
+    let status = enforcer.status();
+    eprintln!(
+        "gensee: applied linux fanotify policy session={} root_pid={} marked_paths={}",
+        session_id,
+        root_pid,
+        status.marked_paths.len()
+    );
+    for warning in &status.warnings {
+        eprintln!("gensee: linux fanotify warning: {warning}");
+    }
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let store = store.clone();
+    let session_id = session_id.to_string();
+    let agent_binary = agent_binary.to_string();
+    let handle = thread::spawn(move || {
+        while !thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            drain_linux_fanotify_events(&store, &mut enforcer, &session_id, &agent_binary);
+            thread::sleep(Duration::from_millis(25));
+        }
+        drain_linux_fanotify_events(&store, &mut enforcer, &session_id, &agent_binary);
+    });
+
+    Ok(LinuxFanotifyRunGuard {
+        stop,
+        handle: Some(handle),
+    })
+}
+
+fn drain_linux_fanotify_events(
+    store: &EventStore,
+    enforcer: &mut gensee_crate_linux::LinuxFanotifyEnforcer,
+    session_id: &str,
+    agent_binary: &str,
+) {
+    let events = match enforcer.handle_events_once() {
+        Ok(events) => events,
+        Err(error) => {
+            eprintln!("gensee: linux fanotify warning: could not handle events: {error}");
+            return;
+        }
+    };
+    for event in events {
+        eprintln!(
+            "gensee: observed linux fanotify decision session={} verdict={:?} path={}",
+            session_id,
+            event.decision.verdict,
+            event.request.path.as_deref().unwrap_or("-")
+        );
+        if let Err(error) = store.append_system_event(&linux_fanotify_system_event(
+            &event,
+            session_id,
+            agent_binary,
+            unix_millis().unwrap_or(0),
+        )) {
+            eprintln!("gensee: linux fanotify warning: could not append timeline event: {error}");
+        }
+    }
+}
+
+fn linux_fanotify_system_event(
+    event: &gensee_crate_linux::LinuxFanotifyEvent,
+    session_id: &str,
+    agent_binary: &str,
+    observed_at_ms: u64,
+) -> SystemEvent {
+    let raw_json = serde_json::json!({
+        "session_id": session_id,
+        "action": format!("{:?}", event.decision.verdict),
+        "requested_action": event.decision.requested_action,
+        "matched_rule": event.decision.matched_rule,
+        "reason": event.decision.reason,
+        "pid": event.request.pid,
+        "path": event.request.path,
+        "operation": event.request.operation,
+    })
+    .to_string();
+    SystemEvent {
+        source: "linux".to_string(),
+        event_type: "file_access".to_string(),
+        event_kind: format!("FileAccess{:?}", event.decision.verdict),
+        observed_at_ms,
+        pid: event.request.pid,
+        ppid: None,
+        process_name: event
+            .request
+            .process_name
+            .clone()
+            .or_else(|| Some(agent_binary.to_string())),
+        executable_path: None,
+        file_path: event.request.path.clone(),
+        command_line: event.request.command_line.clone(),
+        raw_json,
+    }
+}
+
+fn linux_fanotify_privilege_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Linux fanotify enforcement could not start: {error}. fanotify permission enforcement requires root and a kernel with fanotify permission events; retry with sudo and preserve HOME/GENSEE_HOME as needed",
+            ),
+        )
+    } else {
+        error
     }
 }
 

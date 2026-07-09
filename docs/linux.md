@@ -15,8 +15,9 @@ the agent to run inside a container.
   root agent process and records normalized exec events for the root and
   descendants.
 - `gensee run --sandbox linux -- <agent> [args...]` applies Linux host controls
-  from policy. `--linux-seccomp`, `--no-linux-seccomp`, `--linux-network`, and
-  `--allow-net`/`--deny-net` remain per-run overrides for demos and debugging.
+  from policy. `--linux-seccomp`, `--no-linux-seccomp`, `--linux-fanotify`,
+  `--linux-network`, and `--allow-net`/`--deny-net` remain per-run overrides for
+  demos and debugging.
 - `gensee run --sandbox linux` is the preferred workflow for network
   enforcement when policy enables it: it installs nftables for the run cgroup,
   starts the agent through a small internal exec wrapper, joins that cgroup, and
@@ -30,11 +31,11 @@ support is experimental. New docs and scripts should use the top-level command
 shape.
 
 The fanotify backend is the first contextual Linux system-level file-enforcement
-experiment in Gensee Crate. Today it is exposed through planning and one-shot
-debug commands; it is not armed by continuous `gensee run` or `gensee watch`
-flows yet. Continuous sensitive-path enforcement needs a long-running daemon or
-watch integration that owns the permission-event loop. Fanotify requires Linux,
-root, and a kernel with fanotify permission events enabled.
+path in Gensee Crate. `gensee run --sandbox linux --linux-fanotify -- <agent>`
+starts a parent-owned listener thread for the run, marks supported sensitive
+paths, answers permission events, and appends file-access decisions to the
+timeline. Fanotify requires Linux, root, and a kernel with fanotify permission
+events enabled.
 
 The seccomp launcher is a coarse hard-deny layer. It is less contextual than
 fanotify, but it applies directly at the syscall boundary for processes launched
@@ -64,8 +65,8 @@ privileged state:
 
 - cgroup/nftables network enforcement, because Gensee creates a cgroup subtree
   and installs nftables rules.
-- fanotify permission-event probes and future continuous file enforcement,
-  because permission-event marks require root or equivalent capability.
+- fanotify permission-event enforcement, because permission-event marks require
+  root or equivalent capability.
 - future eBPF-based telemetry or enforcement, because loading BPF programs and
   reading privileged kernel data requires elevated privilege on normal hosts.
 
@@ -205,6 +206,7 @@ If `codex` or `claude` is installed through npm, prefer:
 ```bash
 sudo env "PATH=$PATH" gensee run \
   --sandbox linux \
+  --linux-fanotify \
   -- codex
 ```
 
@@ -235,9 +237,10 @@ Linux policy keeps posture and action separate:
   a backend is available.
 
 At the fanotify boundary, `Deny`, `Ask`, and `Speculate` currently fail closed
-with `FAN_DENY` in the debug enforcer. `Ask` needs a prompt broker before it can
-safely block and wait for a user decision. `Speculate` needs a transactional
-backend before the operation can be allowed into a rollback-capable runtime.
+with `FAN_DENY` in the run listener and debug enforcer. `Ask` needs a prompt
+broker before it can safely block and wait for a user decision. `Speculate`
+needs a transactional backend before the operation can be allowed into a
+rollback-capable runtime.
 
 At the seccomp boundary, the default profile allows ordinary syscalls and denies
 configured dangerous syscall families with `EPERM`. The default profile blocks:

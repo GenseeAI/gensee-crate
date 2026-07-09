@@ -170,6 +170,7 @@ mod platform {
         fanotify_response_for_verdict, plan_fanotify_marks, request_from_event,
         LinuxFanotifyConfig, LinuxFanotifyEvent, LinuxFanotifyStatus,
     };
+    use crate::procfs::{is_descendant_or_self, read_parent_by_pid};
 
     pub struct LinuxFanotifyEnforcer {
         fd: RawFd,
@@ -248,6 +249,12 @@ mod platform {
                 if metadata.fd >= 0 {
                     let operation = operation_from_event(metadata.mask, metadata.fd);
                     let request = request_from_event(metadata.fd, metadata.pid as u32, operation);
+                    if !self.event_belongs_to_session(metadata.pid as u32) {
+                        write_response(self.fd, metadata.fd, FAN_ALLOW)?;
+                        close_fd(metadata.fd);
+                        offset += event_len;
+                        continue;
+                    }
                     let decision = self
                         .config
                         .policy
@@ -264,6 +271,18 @@ mod platform {
             }
 
             Ok(handled)
+        }
+
+        fn event_belongs_to_session(&self, pid: u32) -> bool {
+            let Some(session) = self.config.session.as_ref() else {
+                return true;
+            };
+            if pid == session.root_pid {
+                return true;
+            }
+            read_parent_by_pid()
+                .map(|parents| is_descendant_or_self(pid, session.root_pid, &parents))
+                .unwrap_or(false)
         }
     }
 

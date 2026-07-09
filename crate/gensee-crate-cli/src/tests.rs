@@ -4379,6 +4379,7 @@ fn run_config_parses_linux_launch_controls() {
         OsString::from("--sandbox"),
         OsString::from("linux"),
         OsString::from("--linux-seccomp"),
+        OsString::from("--linux-fanotify"),
         OsString::from("--linux-network"),
         OsString::from("allowlist"),
         OsString::from("--allow-net"),
@@ -4392,6 +4393,7 @@ fn run_config_parses_linux_launch_controls() {
 
     assert_eq!(config.sandbox, SandboxMode::Linux);
     assert_eq!(config.linux_seccomp_override, Some(true));
+    assert!(config.linux_fanotify);
     assert_eq!(
         config.linux_network_override,
         Some(gensee_crate_linux::LinuxNetworkMode::AllowListed)

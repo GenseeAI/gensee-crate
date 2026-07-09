@@ -370,6 +370,8 @@ Managed Linux runs record nftables counter summaries as `NetworkBlocked` Layer 1
 system events after the agent exits, so `gensee timeline` shows blocked
 destinations such as `169.254.169.254`. Exact per-attempt child PID attribution
 is future eBPF/nft log work.
+`--linux-fanotify` starts a run-owned fanotify permission listener for supported
+sensitive-path file access and appends `FileAccess...` Layer 1 events.
 
 For orchestration frameworks such as Omnigent, use the same primitives as a
 thin outer safety layer:
