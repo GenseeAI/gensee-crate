@@ -62,7 +62,34 @@ targeted-deny SBPL profile:
 `--deny-network`, CPU/memory quotas, deny-default profiles, and container mode
 are intentionally not part of this first cut.
 
-## Managed Linux sandbox mode
+## What `gensee run` Means
+
+`gensee run -- <agent>` starts the agent as a child process of Gensee. That
+lets Gensee assign a run id, track the root pid, load policy, choose workspace
+mode, record lifecycle metadata, and install any launch-time controls that are
+available for the selected platform.
+
+Running without `sudo` is still meaningful. On both macOS and Linux, Gensee can
+supervise the agent and apply controls that do not require elevated privilege.
+On Linux, that includes seccomp profiles when the kernel supports seccomp
+filters. Root is only needed when the requested policy uses root-only host
+features, such as cgroup/nftables network policy or fanotify permission
+enforcement.
+
+## macOS vs. Linux
+
+The macOS and Linux run paths intentionally use different OS primitives:
+
+- macOS: `gensee run --sandbox mac` uses `sandbox-exec` and staged workspace
+  review. `gensee watch` can use FSEvents and optional `eslogger` telemetry.
+  Deeper file/process/network blocking is planned through a signed Apple
+  EndpointSecurity client.
+- Linux: `gensee run --sandbox linux` uses Linux host controls configured in
+  policy. Seccomp can hard-deny dangerous syscalls without root. Network
+  enforcement uses cgroup v2 plus nftables and currently needs root. Fanotify
+  sensitive-path permission enforcement also needs root.
+
+## Managed Linux Sandbox Mode
 
 On Linux, `gensee run --sandbox linux` can launch the agent through initial
 host-enforcement layers configured in policy:

@@ -43,6 +43,36 @@ places the agent process tree into a cgroup v2 subtree and uses nftables
 `socket cgroupv2` matching to allow listed IP/CIDR destinations or reject other
 egress. It requires Linux, root, cgroup v2, and nftables.
 
+## Privilege model
+
+`gensee run` always means Gensee is the parent launcher for the agent process.
+That gives Gensee a run id, a root pid, lifecycle accounting, policy loading,
+workspace-mode handling, and a place to install launch-time controls before the
+real agent executes.
+
+Without `sudo`, `gensee run --sandbox linux -- <agent>` is still useful. It can
+launch and attribute the agent, record the run, use direct or staged workspace
+mode, and apply unprivileged controls such as seccomp when policy enables them
+and the kernel supports seccomp filters.
+
+`sudo` is needed only for Linux features that modify kernel-owned global or
+privileged state:
+
+- cgroup/nftables network enforcement, because Gensee creates a cgroup subtree
+  and installs nftables rules.
+- fanotify permission enforcement, because permission-event marks require root
+  or equivalent capability.
+- future eBPF-based telemetry or enforcement, because loading BPF programs and
+  reading privileged kernel data requires elevated privilege on normal hosts.
+
+The macOS path has a different shape. macOS support is currently stable around
+agent hooks, filesystem watching, staged workspaces, and `sandbox-exec`
+profiles. `eslogger` can add EndpointSecurity-derived telemetry with Full Disk
+Access and `sudo`, but it is not the same as owning a signed EndpointSecurity
+client that can make production-grade blocking decisions. Linux gives Gensee
+earlier access to host-level controls through seccomp, fanotify, cgroups,
+nftables, and future eBPF work.
+
 ## Commands
 
 Inspect capabilities:

@@ -308,7 +308,12 @@ gensee watch # optional flags: --workspace --watch-root --duration-seconds --sys
 
 If you use `--system-events eslogger` on macOS, open Apple menu > System Settings > Privacy & Security > Full Disk Access, click `+`, add the app hosting `gensee` (for example Terminal, iTerm, or Visual Studio Code), then quit and reopen that app. Run the command with `sudo` as well.
 
-- **`gensee run`:** adds managed macOS sandbox confinement and staged, reviewable workspace writes around the launched agent.
+- **`gensee run`:** starts the agent as a child of Gensee so the run can be
+  attributed, recorded, and wrapped with launch-time controls. On macOS, this
+  adds managed sandbox confinement and staged, reviewable workspace writes. On
+  Linux, non-root runs can still supervise the agent and apply unprivileged
+  controls such as seccomp when enabled; root is only needed for kernel features
+  that require elevated privilege.
 
 ```bash
 gensee run -- claude # or: gensee run -- codex
@@ -328,6 +333,11 @@ gensee policy setup
 sudo gensee run --sandbox linux -- codex
 ```
 
+`sudo` is needed for Linux controls that modify kernel-owned state, such as
+cgroup/nftables egress enforcement and fanotify permission enforcement. It is
+not required for basic `gensee run` supervision, staged workspace behavior, or
+seccomp-only Linux launches.
+
 When launching Node/npm-installed agents such as Codex or Claude Code with
 `sudo`, preserve the user `PATH` so the agent shim can still find `node`:
 
@@ -345,6 +355,13 @@ If the agent cannot find its auth or config files, also preserve `HOME`, but be
 aware that a root-launched agent may create root-owned files in that directory.
 Seccomp-only launches can usually run without `sudo`; cgroup/nftables network
 enforcement currently requires it.
+
+The macOS and Linux paths are intentionally different. macOS uses agent hooks,
+workspace watching, `sandbox-exec`, staged workspaces, and optional
+`eslogger`-based telemetry; deeper blocking waits on Apple's EndpointSecurity
+path. Linux can use lower-level primitives earlier: seccomp for syscall denies,
+fanotify for sensitive file permission decisions, and cgroup/nftables for
+process-scoped network policy.
 
 For orchestration frameworks such as Omnigent, use the same primitives as a
 thin outer safety layer:
