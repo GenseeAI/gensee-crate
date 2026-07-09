@@ -9,15 +9,15 @@
 
 <p align="center">
   Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
-  It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS and, experimentally, Linux.
-  Real-time enforcement happens within chat interface of the coding agents, with early Linux system-level syscall and network enforcement available through seccomp, cgroups, and nftables, plus fanotify planning/debug probes while continuous file enforcement is daemonized. Offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
+  It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS and Linux.
+  Real-time enforcement combines agent-interface decisions with Linux syscall, network, and sensitive-file controls. Offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" /></a>
   <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-orange.svg" />
   <img alt="Rust: stable" src="https://img.shields.io/badge/rust-stable-blue.svg" />
-  <img alt="Platform: macOS first, Linux experimental" src="https://img.shields.io/badge/platform-macOS--first%20%7C%20Linux--experimental-lightgrey.svg" />
+  <img alt="Platform: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg" />
 </p>
 
 <p align="center">
