@@ -3402,6 +3402,7 @@ fn timeline_keeps_session_scoped_network_system_events() {
         system_event_network_dest(&events[0]).as_deref(),
         Some("169.254.169.254")
     );
+    assert!(TimelineFilter::Session("run_1".to_string()).shows_standalone_system_events());
 }
 
 #[test]

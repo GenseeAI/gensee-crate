@@ -487,8 +487,11 @@ impl TimelineFilter {
         }
     }
 
-    fn shows_standalone_system_events(&self) -> bool {
-        matches!(self, Self::All | Self::Path(_))
+    pub(crate) fn shows_standalone_system_events(&self) -> bool {
+        matches!(
+            self,
+            Self::All | Self::Latest | Self::Session(_) | Self::Path(_)
+        )
     }
 }
 
