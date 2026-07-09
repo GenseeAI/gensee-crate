@@ -340,10 +340,10 @@ gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml
 **Hooks only.** Agent requests and tool calls are checked by Gensee policy after
 Step 1 setup. No extra command needs to keep running.
 
-Linux host controls include `/proc` process attribution, fanotify sensitive-path
-permission enforcement, seccomp launcher profiles, and cgroup/nftables network
-controls. Kernel-owned controls need `sudo`; supervised launches and
-seccomp-only launches can usually run without it.
+**Environment config.** Linux host controls include `/proc` process attribution,
+fanotify sensitive-path permission enforcement, seccomp launcher profiles, and
+cgroup/nftables network controls. Kernel-owned controls need `sudo`; supervised
+launches and seccomp-only launches can usually run without it.
 
 For Node/npm-installed agents such as Codex or Claude Code, preserve `PATH` so
 the agent shim can still find `node`, and preserve `HOME`/`GENSEE_HOME` so
@@ -359,7 +359,7 @@ them permanent. Because these commands preserve `HOME` while running privileged
 controls, a root-launched agent may create root-owned files in your home
 directory.
 
-**Status.** Inspect Linux host capabilities and enabled controls:
+Inspect Linux host capabilities and enabled controls:
 
 ```bash
 gensee status --json
