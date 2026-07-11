@@ -4456,6 +4456,41 @@ fn run_config_parses_linux_launch_controls() {
 }
 
 #[test]
+fn run_config_parses_tclone_runtime() {
+    let config = RunConfig::parse(vec![
+        OsString::from("--runtime"),
+        OsString::from("tclone"),
+        OsString::from("--workspace"),
+        OsString::from("/repo"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap();
+
+    assert_eq!(config.runtime, RuntimeMode::Tclone);
+    assert_eq!(config.sandbox, SandboxMode::None);
+    assert_eq!(config.workspace, PathBuf::from("/repo"));
+    assert_eq!(config.agent_cmd, vec![OsString::from("codex")]);
+}
+
+#[test]
+fn run_config_rejects_tclone_with_linux_controls() {
+    let error = RunConfig::parse(vec![
+        OsString::from("--runtime"),
+        OsString::from("tclone"),
+        OsString::from("--sandbox"),
+        OsString::from("linux"),
+        OsString::from("--linux-seccomp"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("--runtime tclone"));
+}
+
+#[test]
 fn linux_policy_includes_configured_fanotify_paths() {
     let mut root: Value = serde_json::from_str(policy::default_policy_json()).unwrap();
     root["linux"]["fanotify"]["paths"] = json!(["/tmp/gensee-demo/**", "~/project/.secret"]);

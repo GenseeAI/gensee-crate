@@ -61,8 +61,28 @@ impl WorkspaceMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeMode {
+    Local,
+    Tclone,
+}
+
+impl RuntimeMode {
+    fn from_str(value: &str) -> io::Result<Self> {
+        match value {
+            "local" => Ok(Self::Local),
+            "tclone" => Ok(Self::Tclone),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown runtime mode: {other}"),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RunConfig {
+    pub(crate) runtime: RuntimeMode,
     pub(crate) sandbox: SandboxMode,
     pub(crate) profile: String,
     pub(crate) workspace_mode: WorkspaceMode,
@@ -78,6 +98,7 @@ pub(crate) struct RunConfig {
 
 impl RunConfig {
     pub(crate) fn parse(args: Vec<OsString>) -> io::Result<Self> {
+        let mut runtime = RuntimeMode::Local;
         let mut sandbox = SandboxMode::None;
         let mut profile = "observe".to_string();
         let mut workspace_mode = WorkspaceMode::Direct;
@@ -112,6 +133,16 @@ impl RunConfig {
                             io::Error::new(io::ErrorKind::InvalidInput, "missing --sandbox value")
                         })?;
                     sandbox = SandboxMode::from_str(value)?;
+                }
+                Some("--runtime") => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .and_then(|arg| arg.to_str())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "missing --runtime value")
+                        })?;
+                    runtime = RuntimeMode::from_str(value)?;
                 }
                 Some("--profile") => {
                     index += 1;
@@ -252,6 +283,20 @@ impl RunConfig {
             ));
         }
 
+        if runtime == RuntimeMode::Tclone
+            && (sandbox != SandboxMode::None
+                || linux_seccomp_override.is_some()
+                || linux_fanotify
+                || linux_network_override.is_some()
+                || !linux_allow_net_override.is_empty()
+                || !linux_deny_net_override.is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--runtime tclone currently owns sandboxing at the container layer; omit --sandbox and Linux host-control flags for this initial integration",
+            ));
+        }
+
         if sandbox == SandboxMode::Mac && profile == "observe" {
             profile = "cautious".to_string();
         }
@@ -270,6 +315,7 @@ impl RunConfig {
 
         let workspace = workspace.unwrap_or(env::current_dir()?);
         Ok(Self {
+            runtime,
             sandbox,
             profile,
             workspace_mode,
@@ -286,6 +332,10 @@ impl RunConfig {
 }
 
 pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
+    if config.runtime == RuntimeMode::Tclone {
+        return run_tclone_agent(config);
+    }
+
     if config.sandbox == SandboxMode::Linux && std::env::consts::OS != "linux" {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1138,6 +1188,10 @@ pub(crate) fn discard_run(args: Vec<OsString>) -> io::Result<()> {
             "usage: gensee run discard <session_id>",
         ));
     };
+
+    if tclone_discard_if_exists(session_id)? {
+        return Ok(());
+    }
 
     if !is_valid_discard_session_id(session_id) {
         return Err(io::Error::new(

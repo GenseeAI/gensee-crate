@@ -391,11 +391,22 @@ gensee watch --workspace . --watch-root ~/.omnigent
 gensee-sudo run --sandbox linux -- omnigent run path/to/agent.yaml
 ```
 
+**Tclone runtime.** On a prepared
+[GenseeAI/os4agent](https://github.com/GenseeAI/os4agent) tclone host, launch
+an agent in cloneable container storage and fork it from another terminal.
+Tclone provides low-latency full-workspace forking for AI agents:
+
+```bash
+gensee run --runtime tclone -- codex
+gensee fork <run_id> --copies 2
+```
+
 </details>
 
 See [`docs/watch.md`](docs/watch.md),
 [`docs/run-and-sandbox.md`](docs/run-and-sandbox.md), and
-[`docs/linux.md`](docs/linux.md) for the full options.
+[`docs/linux.md`](docs/linux.md) for the full options. See
+[`docs/tclone.md`](docs/tclone.md) for cloneable container runtime workflows.
 
 ### 3. Examine results
 
@@ -480,6 +491,9 @@ telemetry, and a browser dashboard. Next directions include:
 - **Linux system enforcement:** eBPF telemetry, Landlock/AppArmor profile
   generation, daemon-owned fanotify lifecycle, and richer per-attempt
   attribution.
+- **Transactional Linux runtimes:** initial tclone launch/fork/shell/diff/keep
+  support is available; next work is post-fork hook rebind, policy-controlled
+  rollback, and multi-fork lifecycle management.
 - **Endpoint Security-based macOS defense:** deeper host-level file, process,
   and network visibility once the Apple Endpoint Security path is available.
 - **Sandbox support:** stronger `gensee run` confinement, staged writes, and
@@ -501,6 +515,9 @@ Full docs live in [`docs/`](docs/README.md):
 - [Linux host support](docs/linux.md) — `/proc` monitoring, fanotify
   sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress
   controls, and the Linux enforcement plan.
+- [Tclone runtime integration](docs/tclone.md) — launch agents in cloneable Linux
+  containers, fork live source containers, inspect diffs, keep workspaces, and
+  discard forks.
 - [`gensee watch`](docs/watch.md) — sidecar filesystem and system-event audit, backends, and watch roots.
 - [`gensee run` and the macOS sandbox](docs/run-and-sandbox.md) — managed launch and staged workspaces.
 - [`gensee policy`](docs/gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.
