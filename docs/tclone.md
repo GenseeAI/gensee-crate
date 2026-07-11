@@ -1,7 +1,9 @@
 # Tclone Runtime Integration
 
-Gensee can launch agents in a tclone-backed Podman container on Linux hosts.
-This mode is for whole-workspace fork, inspect, keep, and discard workflows.
+Gensee can launch agents in a
+[GenseeAI/os4agent](https://github.com/GenseeAI/os4agent) tclone-backed Podman
+container on Linux hosts. This mode is for whole-workspace fork, inspect, keep,
+and discard workflows.
 
 ```bash
 gensee run --runtime tclone -- codex

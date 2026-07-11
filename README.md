@@ -391,8 +391,9 @@ gensee watch --workspace . --watch-root ~/.omnigent
 gensee-sudo run --sandbox linux -- omnigent run path/to/agent.yaml
 ```
 
-**Tclone runtime.** On a prepared tclone host, launch an agent in cloneable
-container storage and fork it from another terminal:
+**Tclone runtime.** On a prepared
+[GenseeAI/os4agent](https://github.com/GenseeAI/os4agent) tclone host, launch
+an agent in cloneable container storage and fork it from another terminal:
 
 ```bash
 gensee run --runtime tclone -- codex
