@@ -3,6 +3,7 @@ use crate::*;
 const DEFAULT_TCLONE_IMAGE: &str = "ghcr.io/wuklab/webtop:ubuntu-kde";
 const DEFAULT_CONTAINER_HOME: &str = "/home/gensee";
 const DEFAULT_CONTAINER_WORKSPACE: &str = "/workspace";
+const TCLONE_STATE_LOCK_STALE_SECS: u64 = 30;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct TcloneRunRecord {
@@ -542,6 +543,10 @@ fn tclone_target_arg(args: &[OsString], usage: &str) -> io::Result<String> {
             continue;
         };
         if value.starts_with('-') {
+            if value.contains('=') {
+                index += 1;
+                continue;
+            }
             index += if tclone_option_takes_value(value) {
                 2
             } else {
@@ -739,8 +744,15 @@ impl TcloneStateLock {
         let lock_path = state_path.with_extension("lock");
         for _ in 0..100 {
             match fs::create_dir(&lock_path) {
-                Ok(()) => return Ok(Self { path: lock_path }),
+                Ok(()) => {
+                    fs::write(lock_path.join("pid"), std::process::id().to_string())?;
+                    return Ok(Self { path: lock_path });
+                }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    if tclone_lock_is_stale(&lock_path)? {
+                        let _ = fs::remove_dir_all(&lock_path);
+                        continue;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(err) => return Err(err),
@@ -756,9 +768,47 @@ impl TcloneStateLock {
     }
 }
 
+fn tclone_lock_is_stale(lock_path: &Path) -> io::Result<bool> {
+    if let Some(pid) = fs::read_to_string(lock_path.join("pid"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    {
+        if !process_exists(pid) {
+            return Ok(true);
+        }
+    }
+    let metadata = fs::metadata(lock_path)?;
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok());
+    Ok(age.is_some_and(|age| age.as_secs() >= TCLONE_STATE_LOCK_STALE_SECS))
+}
+
+#[cfg(target_os = "linux")]
+fn process_exists(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    true
+}
+
 impl Drop for TcloneStateLock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -832,13 +882,22 @@ fn run_command_capture_with_env(
 }
 
 fn arg_value(args: &[OsString], name: &str) -> Option<String> {
-    args.windows(2).find_map(|window| {
-        if window[0].to_str() == Some(name) {
-            window[1].to_str().map(ToString::to_string)
-        } else {
-            None
-        }
-    })
+    args.windows(2)
+        .find_map(|window| {
+            if window[0].to_str() == Some(name) {
+                window[1].to_str().map(ToString::to_string)
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            let prefix = format!("{name}=");
+            args.iter().find_map(|arg| {
+                arg.to_str()
+                    .and_then(|value| value.strip_prefix(&prefix))
+                    .map(ToString::to_string)
+            })
+        })
 }
 
 fn find_command(name: &str) -> Option<PathBuf> {
@@ -925,5 +984,35 @@ mod tests {
         ];
 
         assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+    }
+
+    #[test]
+    fn tclone_target_arg_and_arg_value_handle_equals_form() {
+        let args = vec![
+            OsString::from("--copies=2"),
+            OsString::from("--name=fork-prefix"),
+            OsString::from("run_1"),
+        ];
+
+        assert_eq!(arg_value(&args, "--copies").unwrap(), "2");
+        assert_eq!(arg_value(&args, "--name").unwrap(), "fork-prefix");
+        assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+    }
+
+    #[test]
+    fn tclone_state_lock_breaks_dead_pid_lock() {
+        let path = temp_state_path("stale-lock");
+        let lock_path = path.with_extension("lock");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&lock_path);
+        fs::create_dir_all(&lock_path).unwrap();
+        fs::write(lock_path.join("pid"), "999999").unwrap();
+
+        let lock = TcloneStateLock::acquire(&path).unwrap();
+
+        assert!(lock_path.join("pid").exists());
+        drop(lock);
+        assert!(!lock_path.exists());
+        let _ = fs::remove_file(path);
     }
 }
