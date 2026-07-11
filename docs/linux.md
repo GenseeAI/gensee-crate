@@ -290,5 +290,6 @@ safe hostname support needs DNS resolution plus policy reload logic.
 - More contextual seccomp policies that inspect syscall arguments where useful.
 - DNS-aware network allowlists and live nftables policy reloads.
 - Landlock/AppArmor profile generation where those systems are available.
-- Integration with tclone or another transactional runtime for speculative
-  execution and rollback.
+- Deeper tclone integration beyond the initial host-side runtime: post-fork
+  hook rebind, policy-controlled preserve/rollback, and daemon-owned multi-fork
+  lifecycle.

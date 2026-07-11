@@ -24,6 +24,17 @@ pub(crate) fn list_runs() -> io::Result<()> {
         );
     }
 
+    let tclone_runs = list_tclone_runs()?;
+    if !tclone_runs.is_empty() {
+        println!("Tclone containers");
+        for run in tclone_runs {
+            println!(
+                "{} | {} | container={} | {} | {}",
+                run.run_id, run.role, run.container_name, run.container_workspace, run.status
+            );
+        }
+    }
+
     Ok(())
 }
 
