@@ -78,13 +78,6 @@ impl RuntimeMode {
             )),
         }
     }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Tclone => "tclone",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -481,11 +474,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         repo_path: repo_path
             .clone()
             .map(|path| path.to_string_lossy().to_string()),
-        mode: Some(format!(
-            "managed-run:{}:{}",
-            config.runtime.label(),
-            config.sandbox.label()
-        )),
+        mode: Some(format!("managed-run:{}", config.sandbox.label())),
         workspace_mode: Some(config.workspace_mode.label().to_string()),
         original_workspace: Some(original_workspace.to_string_lossy().to_string()),
         staged_workspace: (config.workspace_mode == WorkspaceMode::Staged)
@@ -541,11 +530,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         root_pid,
         cwd: run_workspace.to_string_lossy().to_string(),
         repo_path: repo_path.map(|path| path.to_string_lossy().to_string()),
-        mode: Some(format!(
-            "managed-run:{}:{}",
-            config.runtime.label(),
-            config.sandbox.label()
-        )),
+        mode: Some(format!("managed-run:{}", config.sandbox.label())),
         workspace_mode: Some(config.workspace_mode.label().to_string()),
         original_workspace: Some(original_workspace.to_string_lossy().to_string()),
         staged_workspace: (config.workspace_mode == WorkspaceMode::Staged)

@@ -34,7 +34,7 @@ gensee run discard <run_id-or-container>
 Environment overrides:
 
 ```bash
-export GENSEE_TCLONE_PODMAN=/home/yiying/os4agent/podman-tfork.sh
+export GENSEE_TCLONE_PODMAN=/path/to/os4agent/podman-tfork.sh
 export GENSEE_TCLONE_IMAGE=ghcr.io/wuklab/webtop:ubuntu-kde
 export GENSEE_TCLONE_NODE_ROOT="$HOME/.nvm"
 export GENSEE_TCLONE_NODE_BIN="$(dirname "$(command -v node)")"
@@ -58,6 +58,9 @@ the source `GENSEE_RUN_ID` to a fork-specific run id after live cloning.
 - `--runtime tclone` is separate from `--sandbox linux` in this first version.
   Linux seccomp, fanotify, and cgroup/nftables controls are not yet applied to
   tclone containers by `gensee run`.
+- Tclone mode is not yet a confinement boundary. Source containers currently run
+  with unconfined seccomp/AppArmor settings required by the live-clone bring-up,
+  and copied agent/Gensee config is duplicated into each fork.
 - Hook telemetry inside an already-running fork may still identify as the
   source run until post-fork rebind is implemented.
 - `gensee run keep` copies a forked workspace out to a destination directory; it

@@ -162,7 +162,7 @@ On prepared Linux tclone hosts, `gensee run --runtime tclone` launches an agent
 inside cloneable Podman container storage:
 
 ```bash
-export GENSEE_TCLONE_PODMAN=/home/yiying/os4agent/podman-tfork.sh
+export GENSEE_TCLONE_PODMAN=/path/to/os4agent/podman-tfork.sh
 gensee run --runtime tclone -- codex
 ```
 
@@ -180,7 +180,8 @@ gensee run discard <run_id-or-container>
 This initial mode is separate from `--sandbox linux`: Gensee owns source/fork
 container orchestration, while Linux seccomp, fanotify, and cgroup/nftables
 controls are still applied by the direct Linux run path. See
-[Tclone runtime integration](tclone.md) for setup and limitations.
+[Tclone runtime integration](tclone.md) for setup and limitations. Tclone mode
+is not yet a confinement boundary.
 
 ## Staged workspace review and discard
 
