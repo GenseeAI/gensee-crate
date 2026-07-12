@@ -128,6 +128,36 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     let output = run_command_capture(&podman, &run_args)?;
     let container_id = output.lines().next().map(str::trim).map(str::to_string);
     let cleanup_guard = TcloneContainerCleanup::new(&podman, &source_container);
+    let root_pid = inspect_container_pid(&podman, &source_container).unwrap_or(0);
+    append_tclone_record(&TcloneRunRecord {
+        run_id: run_id.clone(),
+        parent_run_id: None,
+        role: "source".to_string(),
+        status: "preparing".to_string(),
+        container_name: source_container.clone(),
+        container_id: container_id.clone(),
+        source_container: Some(source_container.clone()),
+        fork_prefix: Some(fork_prefix),
+        image,
+        workspace: original_workspace.to_string_lossy().to_string(),
+        container_workspace: container_workspace.clone(),
+        container_home: container_home.clone(),
+        agent_cmd: config
+            .agent_cmd
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect(),
+        fork_base_git_head: None,
+        fork_base_overlay_lowerdir: None,
+        fork_overlay_upperdir: None,
+        started_at_ms,
+        updated_at_ms: started_at_ms,
+        exit_code: None,
+    })?;
+    eprintln!(
+        "gensee: preparing tclone run {run_id} source_container={source_container} workspace={}",
+        original_workspace.display()
+    );
 
     tclone_exec(
         &podman,
@@ -183,7 +213,6 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         }
     }
 
-    let root_pid = inspect_container_pid(&podman, &source_container).unwrap_or(0);
     let store = EventStore::default_local()?;
     store.append_session(&AgentSession {
         session_id: run_id.clone(),
@@ -203,31 +232,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         ended_at_ms: None,
         exit_code: None,
     })?;
-    append_tclone_record(&TcloneRunRecord {
-        run_id: run_id.clone(),
-        parent_run_id: None,
-        role: "source".to_string(),
-        status: "running".to_string(),
-        container_name: source_container.clone(),
-        container_id,
-        source_container: Some(source_container.clone()),
-        fork_prefix: Some(fork_prefix),
-        image,
-        workspace: original_workspace.to_string_lossy().to_string(),
-        container_workspace: container_workspace.clone(),
-        container_home: container_home.clone(),
-        agent_cmd: config
-            .agent_cmd
-            .iter()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect(),
-        fork_base_git_head: None,
-        fork_base_overlay_lowerdir: None,
-        fork_overlay_upperdir: None,
-        started_at_ms,
-        updated_at_ms: started_at_ms,
-        exit_code: None,
-    })?;
+    append_tclone_status(&run_id, "running", None)?;
     cleanup_guard.disarm();
 
     eprintln!(
@@ -307,6 +312,12 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         ));
     }
     let source = find_tclone_record(&parent)?;
+    if source.status == "preparing" {
+        return Err(io::Error::other(format!(
+            "tclone source {} is still preparing; wait for status=running before forking",
+            source.run_id
+        )));
+    }
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &source)?;
     let forked_at_ms = unix_millis()?;
@@ -532,8 +543,17 @@ pub(crate) fn tclone_delete(args: Vec<OsString>) -> io::Result<()> {
 }
 
 fn tclone_delete_all() -> io::Result<()> {
+    let podman = tclone_podman();
     let records = list_tclone_runs()?;
-    if records.is_empty() {
+    let tracked_container_names = records
+        .iter()
+        .map(|record| record.container_name.clone())
+        .collect::<HashSet<_>>();
+    let orphan_container_names = list_tclone_container_names(&podman)?
+        .into_iter()
+        .filter(|name| !tracked_container_names.contains(name))
+        .collect::<Vec<_>>();
+    if records.is_empty() && orphan_container_names.is_empty() {
         println!("gensee: no tclone runs to delete");
         return Ok(());
     }
@@ -561,10 +581,25 @@ fn tclone_delete_all() -> io::Result<()> {
             }
         }
     }
+    let mut removed_orphans = 0;
+    for container_name in orphan_container_names {
+        match remove_tclone_container_by_name(&podman, &container_name) {
+            Ok(TcloneContainerRemoval::Removed) => {
+                removed_orphans += 1;
+            }
+            Ok(TcloneContainerRemoval::AlreadyGone) => {}
+            Err(error) => {
+                failed += 1;
+                eprintln!(
+                    "gensee: warning: could not remove orphaned tclone container {container_name}: {error}"
+                );
+            }
+        }
+    }
     let removed_records =
         delete_tclone_records(|record| deleted_run_ids.contains(record.run_id.as_str()))?;
     println!(
-        "gensee: deleted {removed_records} tclone run records, removed {removed_containers} containers, and pruned {already_gone} stale records"
+        "gensee: deleted {removed_records} tclone run records, removed {removed_containers} tracked containers, removed {removed_orphans} orphaned containers, and pruned {already_gone} stale records"
     );
     if failed > 0 {
         return Err(io::Error::other(format!(
@@ -591,19 +626,44 @@ impl TcloneContainerRemoval {
 
 fn remove_tclone_container(record: &TcloneRunRecord) -> io::Result<TcloneContainerRemoval> {
     let podman = tclone_podman();
-    if !tclone_container_exists(&podman, &record.container_name)? {
+    remove_tclone_container_by_name(&podman, &record.container_name)
+}
+
+fn remove_tclone_container_by_name(
+    podman: &OsString,
+    container_name: &str,
+) -> io::Result<TcloneContainerRemoval> {
+    if !tclone_container_exists(podman, container_name)? {
         return Ok(TcloneContainerRemoval::AlreadyGone);
     }
 
     run_command_status(
-        &podman,
+        podman,
         &[
             OsString::from("rm"),
             OsString::from("-f"),
-            OsString::from(&record.container_name),
+            OsString::from(container_name),
         ],
     )?;
     Ok(TcloneContainerRemoval::Removed)
+}
+
+fn list_tclone_container_names(podman: &OsString) -> io::Result<Vec<String>> {
+    let output = run_command_capture(
+        podman,
+        &[
+            OsString::from("ps"),
+            OsString::from("-a"),
+            OsString::from("--format"),
+            OsString::from("{{.Names}}"),
+        ],
+    )?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|name| name.starts_with("gensee-tclone-"))
+        .map(ToString::to_string)
+        .collect())
 }
 
 fn tclone_container_exists(podman: &OsString, container_name: &str) -> io::Result<bool> {
