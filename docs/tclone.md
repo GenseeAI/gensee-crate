@@ -28,6 +28,8 @@ gensee run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.c
 gensee run switch <fork-id>
 gensee run keep <run_id-or-container> --to /tmp/kept-workspace
 gensee run discard <run_id-or-container>
+gensee run delete <run_id-or-container>   # remove container and hide from run list
+gensee run delete --all                   # clean all tracked tclone containers
 ```
 
 `gensee run merge` is the reconciliation command. The default `--git` scope
@@ -52,6 +54,12 @@ recreated before filesystem merge.
 `gensee run switch` does not merge files. It marks the selected fork as the
 active source container for future shells, forks, and merge targets, and marks
 the previous source as switched away when Gensee knows the parent source.
+
+`gensee run discard <run_id-or-container>` removes the container and keeps a
+`discarded` record for history. `gensee run delete <run_id-or-container>`
+removes the container and removes that tclone record from `gensee run list`.
+Use `gensee run delete --all` to clean all tracked tclone containers and clear
+the tclone section of the run list.
 
 ## Requirements
 

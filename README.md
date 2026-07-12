@@ -543,8 +543,8 @@ Full docs live in [`docs/`](docs/README.md):
   sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress
   controls, and the Linux enforcement plan.
 - [Tclone runtime integration](docs/tclone.md) — launch agents in cloneable Linux
-  containers, fork live source containers, inspect diffs, keep workspaces, and
-  discard forks.
+  containers, fork live source containers, inspect diffs, merge/switch results,
+  and clean up forks.
 - [`gensee watch`](docs/watch.md) — sidecar filesystem and system-event audit, backends, and watch roots.
 - [`gensee run` and the macOS sandbox](docs/run-and-sandbox.md) — managed launch and staged workspaces.
 - [`gensee policy`](docs/gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.

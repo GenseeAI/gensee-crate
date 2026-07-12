@@ -123,6 +123,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
                 args.remove(0);
                 return tclone_keep(args);
             }
+            if args.first().and_then(|arg| arg.to_str()) == Some("delete") {
+                args.remove(0);
+                return tclone_delete(args);
+            }
             if args.first().and_then(|arg| arg.to_str()) == Some("discard") {
                 args.remove(0);
                 return discard_run(args);

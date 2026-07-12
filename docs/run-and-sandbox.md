@@ -179,6 +179,7 @@ gensee run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.c
 gensee run switch <fork-id>
 gensee run keep <run_id-or-container> --to /tmp/kept-workspace
 gensee run discard <run_id-or-container>
+gensee run delete --all
 ```
 
 This initial mode is separate from `--sandbox linux`: Gensee owns source/fork

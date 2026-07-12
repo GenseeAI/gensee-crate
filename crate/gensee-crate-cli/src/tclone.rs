@@ -503,6 +503,67 @@ pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn tclone_delete(args: Vec<OsString>) -> io::Result<()> {
+    let delete_all = args.iter().any(|arg| arg == "--all");
+    if delete_all {
+        return tclone_delete_all();
+    }
+
+    let target = tclone_target_arg(
+        &args,
+        "usage: gensee run delete <tclone-run-or-container>|--all",
+    )?;
+    let record = find_tclone_record(&target)?;
+    let removed_container = remove_tclone_container_best_effort(&record);
+    let removed_records = delete_tclone_records(|candidate| candidate.run_id == record.run_id)?;
+
+    println!(
+        "gensee: deleted tclone run {} ({}) container_removed={} records_removed={removed_records}",
+        record.run_id, record.container_name, removed_container
+    );
+    Ok(())
+}
+
+fn tclone_delete_all() -> io::Result<()> {
+    let records = list_tclone_runs()?;
+    if records.is_empty() {
+        println!("gensee: no tclone runs to delete");
+        return Ok(());
+    }
+
+    let mut removed_containers = 0;
+    for record in &records {
+        if remove_tclone_container_best_effort(record) {
+            removed_containers += 1;
+        }
+    }
+    let removed_records = delete_tclone_records(|_| true)?;
+    println!(
+        "gensee: deleted {removed_records} tclone run records and removed {removed_containers} containers"
+    );
+    Ok(())
+}
+
+fn remove_tclone_container_best_effort(record: &TcloneRunRecord) -> bool {
+    match run_command_status(
+        &tclone_podman(),
+        &[
+            OsString::from("rm"),
+            OsString::from("-f"),
+            OsString::from(&record.container_name),
+        ],
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "gensee: warning: could not remove tclone container {}: {error}",
+                record.container_name
+            );
+            false
+        }
+    }
+}
+
 fn switched_tclone_source_record(
     mut fork: TcloneRunRecord,
     switched_at_ms: u64,
@@ -1252,6 +1313,20 @@ pub(crate) fn list_tclone_runs() -> io::Result<Vec<TcloneRunRecord>> {
     read_tclone_runs_from_path(&path)
 }
 
+fn delete_tclone_records(
+    mut should_delete: impl FnMut(&TcloneRunRecord) -> bool,
+) -> io::Result<usize> {
+    let path = tclone_state_path()?;
+    let records = read_tclone_runs_from_path(&path)?;
+    let original_count = records.len();
+    let retained = records
+        .into_iter()
+        .filter(|record| !should_delete(record))
+        .collect::<Vec<_>>();
+    write_tclone_runs_to_path(&path, &retained)?;
+    Ok(original_count.saturating_sub(retained.len()))
+}
+
 fn read_tclone_runs_from_path(path: &Path) -> io::Result<Vec<TcloneRunRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -1281,6 +1356,28 @@ fn read_tclone_runs_from_path(path: &Path) -> io::Result<Vec<TcloneRunRecord>> {
         }
     }
     Ok(records)
+}
+
+fn write_tclone_runs_to_path(path: &Path, records: &[TcloneRunRecord]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _lock = TcloneStateLock::acquire(path)?;
+    let temp_path = path.with_extension("jsonl.tmp");
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)?;
+        for record in records {
+            let line = serde_json::to_string(record)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+            writeln!(file, "{line}")?;
+        }
+    }
+    fs::rename(temp_path, path)?;
+    Ok(())
 }
 
 fn append_tclone_record(record: &TcloneRunRecord) -> io::Result<()> {
@@ -1832,6 +1929,44 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].run_id, "run_1");
         assert_eq!(records[0].status, "discarded");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tclone_state_write_replaces_existing_records() {
+        let path = temp_state_path("write-replaces");
+        let _ = fs::remove_file(&path);
+        let first = test_record("run_1", "running");
+        let second = test_record("run_2", "running");
+        write_tclone_runs_to_path(&path, &[first.clone(), second.clone()]).unwrap();
+        write_tclone_runs_to_path(&path, std::slice::from_ref(&second)).unwrap();
+
+        let records = read_tclone_runs_from_path(&path).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "run_2");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tclone_delete_records_filters_matching_runs() {
+        let path = temp_state_path("delete-filter");
+        let _ = fs::remove_file(&path);
+        let first = test_record("run_1", "running");
+        let second = test_record("run_2", "running");
+        write_tclone_runs_to_path(&path, &[first, second]).unwrap();
+
+        let records = read_tclone_runs_from_path(&path).unwrap();
+        let retained = records
+            .into_iter()
+            .filter(|record| record.run_id != "run_1")
+            .collect::<Vec<_>>();
+        write_tclone_runs_to_path(&path, &retained).unwrap();
+
+        let records = read_tclone_runs_from_path(&path).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "run_2");
         let _ = fs::remove_file(path);
     }
 
