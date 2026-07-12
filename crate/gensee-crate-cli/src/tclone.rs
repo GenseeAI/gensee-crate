@@ -514,12 +514,19 @@ pub(crate) fn tclone_delete(args: Vec<OsString>) -> io::Result<()> {
         "usage: gensee run delete <tclone-run-or-container>|--all",
     )?;
     let record = find_tclone_record(&target)?;
-    let removed_container = remove_tclone_container_best_effort(&record);
+    let removed_container = remove_tclone_container(&record).map_err(|error| {
+        io::Error::other(format!(
+            "could not remove tclone container {} (record preserved): {error}",
+            record.container_name
+        ))
+    })?;
     let removed_records = delete_tclone_records(|candidate| candidate.run_id == record.run_id)?;
 
     println!(
-        "gensee: deleted tclone run {} ({}) container_removed={} records_removed={removed_records}",
-        record.run_id, record.container_name, removed_container
+        "gensee: deleted tclone run {} ({}) container={} records_removed={removed_records}",
+        record.run_id,
+        record.container_name,
+        removed_container.as_str()
     );
     Ok(())
 }
@@ -532,36 +539,99 @@ fn tclone_delete_all() -> io::Result<()> {
     }
 
     let mut removed_containers = 0;
+    let mut already_gone = 0;
+    let mut failed = 0;
+    let mut deleted_run_ids = HashSet::new();
     for record in &records {
-        if remove_tclone_container_best_effort(record) {
-            removed_containers += 1;
+        match remove_tclone_container(record) {
+            Ok(TcloneContainerRemoval::Removed) => {
+                removed_containers += 1;
+                deleted_run_ids.insert(record.run_id.clone());
+            }
+            Ok(TcloneContainerRemoval::AlreadyGone) => {
+                already_gone += 1;
+                deleted_run_ids.insert(record.run_id.clone());
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!(
+                    "gensee: warning: could not remove tclone container {} (record preserved): {error}",
+                    record.container_name
+                );
+            }
         }
     }
-    let removed_records = delete_tclone_records(|_| true)?;
+    let removed_records =
+        delete_tclone_records(|record| deleted_run_ids.contains(record.run_id.as_str()))?;
     println!(
-        "gensee: deleted {removed_records} tclone run records and removed {removed_containers} containers"
+        "gensee: deleted {removed_records} tclone run records, removed {removed_containers} containers, and pruned {already_gone} stale records"
     );
+    if failed > 0 {
+        return Err(io::Error::other(format!(
+            "{failed} tclone container(s) could not be removed; their records were preserved"
+        )));
+    }
     Ok(())
 }
 
-fn remove_tclone_container_best_effort(record: &TcloneRunRecord) -> bool {
-    match run_command_status(
-        &tclone_podman(),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcloneContainerRemoval {
+    Removed,
+    AlreadyGone,
+}
+
+impl TcloneContainerRemoval {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::AlreadyGone => "already-gone",
+        }
+    }
+}
+
+fn remove_tclone_container(record: &TcloneRunRecord) -> io::Result<TcloneContainerRemoval> {
+    let podman = tclone_podman();
+    if !tclone_container_exists(&podman, &record.container_name)? {
+        return Ok(TcloneContainerRemoval::AlreadyGone);
+    }
+
+    run_command_status(
+        &podman,
         &[
             OsString::from("rm"),
             OsString::from("-f"),
             OsString::from(&record.container_name),
         ],
-    ) {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!(
-                "gensee: warning: could not remove tclone container {}: {error}",
-                record.container_name
-            );
-            false
-        }
+    )?;
+    Ok(TcloneContainerRemoval::Removed)
+}
+
+fn tclone_container_exists(podman: &OsString, container_name: &str) -> io::Result<bool> {
+    let output = Command::new(podman)
+        .arg("inspect")
+        .arg("--type")
+        .arg("container")
+        .arg(container_name)
+        .output()?;
+    if output.status.success() {
+        return Ok(true);
     }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr.contains("no such")
+        || stderr.contains("not found")
+        || stderr.contains("does not exist")
+        || stderr.contains("no container with name")
+    {
+        return Ok(false);
+    }
+
+    Err(io::Error::other(format!(
+        "{} inspect failed for {}: {}",
+        podman.to_string_lossy(),
+        container_name,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
 }
 
 fn switched_tclone_source_record(
