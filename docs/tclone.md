@@ -2,9 +2,9 @@
 
 Gensee can launch agents in a
 [GenseeAI/os4agent](https://github.com/GenseeAI/os4agent) tclone-backed Podman
-container on Linux hosts. This mode is for whole-workspace fork, inspect, keep,
-and discard workflows. Tclone provides low-latency full-workspace forking for
-AI agents.
+container on Linux hosts. This mode is for whole-workspace fork, inspect,
+merge, copy-out, and discard workflows. Tclone provides low-latency
+full-workspace forking for AI agents.
 
 ```bash
 gensee run --runtime tclone -- codex
@@ -22,9 +22,15 @@ gensee run list
 gensee fork <run_id> --copies 2
 gensee run shell <run_id-or-container>
 gensee run diff <run_id-or-container>
+gensee run merge <fork-id> --into <source-id>
 gensee run keep <run_id-or-container> --to /tmp/kept-workspace
 gensee run discard <run_id-or-container>
 ```
+
+`gensee run merge` applies the fork's git patch back into its source container.
+Use `--dry-run` to check whether the patch applies cleanly without modifying the
+source, or `--force` to merge from a fork that is not recorded as a direct child
+of the target source.
 
 ## Requirements
 
@@ -66,5 +72,8 @@ the source `GENSEE_RUN_ID` to a fork-specific run id after live cloning.
   and copied agent/Gensee config is duplicated into each fork.
 - Hook telemetry inside an already-running fork may still identify as the
   source run until post-fork rebind is implemented.
-- `gensee run keep` copies a forked workspace out to a destination directory; it
-  does not merge changes back into the original workspace.
+- `gensee run merge` is currently git patch based. It merges filesystem changes
+  in the container workspace; it does not merge process state, database state, or
+  external side effects.
+- `gensee run keep` copies a forked workspace out to a destination directory for
+  inspection/debugging.

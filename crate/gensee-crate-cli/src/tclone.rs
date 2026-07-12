@@ -404,6 +404,65 @@ pub(crate) fn tclone_diff(args: Vec<OsString>) -> io::Result<()> {
     )
 }
 
+pub(crate) fn tclone_merge(args: Vec<OsString>) -> io::Result<()> {
+    let fork_target = tclone_target_arg(
+        &args,
+        "usage: gensee run merge <fork-id> --into <source-id> [--dry-run] [--force]",
+    )?;
+    let source_target = arg_value(&args, "--into").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee run merge <fork-id> --into <source-id> [--dry-run] [--force]",
+        )
+    })?;
+    let dry_run = arg_flag(&args, "--dry-run");
+    let force = arg_flag(&args, "--force");
+    let fork = find_tclone_record(&fork_target)?;
+    let source = find_tclone_record(&source_target)?;
+    validate_tclone_merge_pair(&fork, &source, force)?;
+
+    let podman = tclone_podman();
+    let patch = tclone_merge_patch(&podman, &fork)?;
+    if patch.trim().is_empty() {
+        println!(
+            "gensee: no changes to merge from {} into {}",
+            fork.run_id, source.run_id
+        );
+        return Ok(());
+    }
+
+    let patch_id = format!("gensee-merge-{}.patch", unix_millis()?);
+    let host_patch = gensee_tmp_root()?.join(&patch_id);
+    fs::write(&host_patch, patch)?;
+    let container_patch = format!("/tmp/{patch_id}");
+    let result = (|| {
+        podman_cp(
+            &podman,
+            &host_patch,
+            &format!("{}:{container_patch}", source.container_name),
+        )?;
+        tclone_apply_merge_patch(&podman, &source, &container_patch, dry_run)
+    })();
+    let _ = fs::remove_file(&host_patch);
+    let _ = tclone_exec(
+        &podman,
+        &source.container_name,
+        &["rm", "-f", &container_patch],
+    );
+    result?;
+
+    if dry_run {
+        println!(
+            "gensee: merge dry-run succeeded from {} into {}",
+            fork.run_id, source.run_id
+        );
+    } else {
+        append_tclone_status(&fork.run_id, "merged", None)?;
+        println!("gensee: merged {} into {}", fork.run_id, source.run_id);
+    }
+    Ok(())
+}
+
 pub(crate) fn tclone_keep(args: Vec<OsString>) -> io::Result<()> {
     let target = tclone_target_arg(
         &args,
@@ -432,6 +491,83 @@ pub(crate) fn tclone_keep(args: Vec<OsString>) -> io::Result<()> {
         record.run_id, destination
     );
     Ok(())
+}
+
+fn validate_tclone_merge_pair(
+    fork: &TcloneRunRecord,
+    source: &TcloneRunRecord,
+    force: bool,
+) -> io::Result<()> {
+    if fork.run_id == source.run_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot merge a tclone container into itself",
+        ));
+    }
+    if fork.role != "fork" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("merge source must be a fork, got role={}", fork.role),
+        ));
+    }
+    if source.role != "source" && !force {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("merge target must be a source, got role={}", source.role),
+        ));
+    }
+    if fork.parent_run_id.as_deref() != Some(source.run_id.as_str()) && !force {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a fork of {}; pass --force to override",
+                fork.run_id, source.run_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn tclone_merge_patch(podman: &OsString, fork: &TcloneRunRecord) -> io::Result<String> {
+    let script = r#"set -euo pipefail
+cd "$GENSEE_WORKSPACE"
+git rev-parse --show-toplevel >/dev/null
+git diff --binary
+while IFS= read -r -d '' file; do
+  git diff --binary --no-index -- /dev/null "$file" || true
+done < <(git ls-files --others --exclude-standard -z)
+"#;
+    tclone_exec_capture_env(
+        podman,
+        &fork.container_name,
+        &[("GENSEE_WORKSPACE", &fork.container_workspace)],
+        &["bash", "-lc", script],
+    )
+}
+
+fn tclone_apply_merge_patch(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+    container_patch: &str,
+    dry_run: bool,
+) -> io::Result<()> {
+    let script = if dry_run {
+        format!(
+            "set -euo pipefail\ncd \"$GENSEE_WORKSPACE\"\ngit rev-parse --show-toplevel >/dev/null\ngit apply --check '{}'\ngit status --short",
+            container_patch
+        )
+    } else {
+        format!(
+            "set -euo pipefail\ncd \"$GENSEE_WORKSPACE\"\ngit rev-parse --show-toplevel >/dev/null\ngit apply --check '{}'\ngit apply '{}'\ngit status --short",
+            container_patch, container_patch
+        )
+    };
+    tclone_exec_env(
+        podman,
+        &source.container_name,
+        &[("GENSEE_WORKSPACE", &source.container_workspace)],
+        &["bash", "-lc", &script],
+    )
 }
 
 pub(crate) fn tclone_discard_if_exists(target: &str) -> io::Result<bool> {
@@ -560,7 +696,10 @@ fn tclone_target_arg(args: &[OsString], usage: &str) -> io::Result<String> {
 }
 
 fn tclone_option_takes_value(option: &str) -> bool {
-    matches!(option, "--copies" | "--name" | "--shell" | "--to")
+    matches!(
+        option,
+        "--copies" | "--name" | "--shell" | "--to" | "--into"
+    )
 }
 
 fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
@@ -694,6 +833,22 @@ fn tclone_exec_env(
     args.push(OsString::from(container));
     args.extend(command.iter().map(OsString::from));
     run_command_status(podman, &args)
+}
+
+fn tclone_exec_capture_env(
+    podman: &OsString,
+    container: &str,
+    envs: &[(&str, &str)],
+    command: &[&str],
+) -> io::Result<String> {
+    let mut args = vec![OsString::from("exec")];
+    for (key, value) in envs {
+        args.push(OsString::from("-e"));
+        args.push(OsString::from(format!("{key}={value}")));
+    }
+    args.push(OsString::from(container));
+    args.extend(command.iter().map(OsString::from));
+    run_command_capture(podman, &args)
 }
 
 fn inspect_container_pid(podman: &OsString, container: &str) -> io::Result<u32> {
@@ -900,6 +1055,10 @@ fn arg_value(args: &[OsString], name: &str) -> Option<String> {
         })
 }
 
+fn arg_flag(args: &[OsString], name: &str) -> bool {
+    args.iter().any(|arg| arg.to_str() == Some(name))
+}
+
 fn find_command(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     env::split_paths(&path)
@@ -930,6 +1089,13 @@ mod tests {
             updated_at_ms: 1,
             exit_code: None,
         }
+    }
+
+    fn test_fork_record(run_id: &str, parent_run_id: &str) -> TcloneRunRecord {
+        let mut record = test_record(run_id, "running");
+        record.role = "fork".to_string();
+        record.parent_run_id = Some(parent_run_id.to_string());
+        record
     }
 
     fn temp_state_path(name: &str) -> PathBuf {
@@ -991,12 +1157,41 @@ mod tests {
         let args = vec![
             OsString::from("--copies=2"),
             OsString::from("--name=fork-prefix"),
+            OsString::from("--into=source"),
             OsString::from("run_1"),
         ];
 
         assert_eq!(arg_value(&args, "--copies").unwrap(), "2");
         assert_eq!(arg_value(&args, "--name").unwrap(), "fork-prefix");
+        assert_eq!(arg_value(&args, "--into").unwrap(), "source");
         assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+    }
+
+    #[test]
+    fn tclone_arg_flag_detects_boolean_options() {
+        let args = vec![
+            OsString::from("fork_1"),
+            OsString::from("--into"),
+            OsString::from("source_1"),
+            OsString::from("--dry-run"),
+        ];
+
+        assert!(arg_flag(&args, "--dry-run"));
+        assert!(!arg_flag(&args, "--force"));
+    }
+
+    #[test]
+    fn tclone_merge_pair_requires_fork_parent_source() {
+        let source = test_record("source_1", "running");
+        let fork = test_fork_record("fork_1", "source_1");
+        let unrelated = test_fork_record("fork_2", "other_source");
+        let mut source_as_fork = test_record("not_fork", "running");
+        source_as_fork.role = "source".to_string();
+
+        assert!(validate_tclone_merge_pair(&fork, &source, false).is_ok());
+        assert!(validate_tclone_merge_pair(&unrelated, &source, false).is_err());
+        assert!(validate_tclone_merge_pair(&unrelated, &source, true).is_ok());
+        assert!(validate_tclone_merge_pair(&source_as_fork, &source, false).is_err());
     }
 
     #[test]
