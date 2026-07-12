@@ -25,6 +25,7 @@ gensee run diff <run_id-or-container>
 gensee run merge <fork-id> --into <source-id>          # default: --git
 gensee run merge <fork-id> --into <source-id> --filesystem
 gensee run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.codex
+gensee run switch <fork-id>
 gensee run keep <run_id-or-container> --to /tmp/kept-workspace
 gensee run discard <run_id-or-container>
 ```
@@ -44,8 +45,13 @@ use the fork's tclone overlay lowerdir as the merge base and upperdir as the
 fork delta, then stop with a conflict report if the source and fork changed the
 same path differently. These scopes do not merge live memory, running process
 state, or pseudo filesystems such as `/proc`, `/sys`, `/dev`, `/run`, and `/tmp`.
-GenseeAI's tclone fork makes live clones overlay-backed by default; older plain
-btrfs-snapshot forks must be recreated before filesystem merge.
+Gensee passes tclone's `--tfork-overlay-btrfs` flag internally when creating
+forks, so users do not need to set it. Older plain btrfs-snapshot forks must be
+recreated before filesystem merge.
+
+`gensee run switch` does not merge files. It marks the selected fork as the
+active source container for future shells, forks, and merge targets, and marks
+the previous source as switched away when Gensee knows the parent source.
 
 ## Requirements
 

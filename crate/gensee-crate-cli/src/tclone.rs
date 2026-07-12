@@ -324,6 +324,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         OsString::from("--live"),
         OsString::from(format!("--copies={copies}")),
         OsString::from("--persistent=async"),
+        OsString::from("--tfork-overlay-btrfs"),
         OsString::from("--tfork-tcp-close"),
         OsString::from("--tfork-ghost-limit=67108864"),
         OsString::from("--name"),
@@ -467,6 +468,57 @@ pub(crate) fn tclone_merge(args: Vec<OsString>) -> io::Result<()> {
             tclone_merge_filesystem(&podman, &fork, &source, Some(paths), dry_run)
         }
     }
+}
+
+pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
+    let target = tclone_target_arg(&args, "usage: gensee run switch <fork-id>")?;
+    let fork = find_tclone_record(&target)?;
+    if fork.role != "fork" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("switch target must be a fork, got role={}", fork.role),
+        ));
+    }
+
+    let podman = tclone_podman();
+    ensure_tclone_container_exists(&podman, &fork)?;
+    let switched_at_ms = unix_millis()?;
+
+    if let Some(parent_run_id) = fork.parent_run_id.as_deref() {
+        if let Ok(mut previous_source) = find_tclone_record(parent_run_id) {
+            if previous_source.role == "source" {
+                previous_source.status = "switched-away".to_string();
+                previous_source.updated_at_ms = switched_at_ms;
+                append_tclone_record(&previous_source)?;
+            }
+        }
+    }
+
+    let switched = switched_tclone_source_record(fork, switched_at_ms)?;
+    append_tclone_record(&switched)?;
+    println!(
+        "gensee: switched active tclone source to {} ({})",
+        switched.run_id, switched.container_name
+    );
+    Ok(())
+}
+
+fn switched_tclone_source_record(
+    mut fork: TcloneRunRecord,
+    switched_at_ms: u64,
+) -> io::Result<TcloneRunRecord> {
+    if fork.role != "fork" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("switch target must be a fork, got role={}", fork.role),
+        ));
+    }
+    fork.parent_run_id = None;
+    fork.role = "source".to_string();
+    fork.status = "active".to_string();
+    fork.source_container = Some(fork.container_name.clone());
+    fork.updated_at_ms = switched_at_ms;
+    Ok(fork)
 }
 
 fn tclone_merge_git(
@@ -1877,6 +1929,29 @@ mod tests {
         ];
 
         assert!(tclone_merge_scope(&args).is_err());
+    }
+
+    #[test]
+    fn tclone_switch_promotes_fork_to_source_record() {
+        let fork = test_fork_record("fork_1", "source_1");
+
+        let switched = switched_tclone_source_record(fork, 42).unwrap();
+
+        assert_eq!(switched.role, "source");
+        assert_eq!(switched.status, "active");
+        assert_eq!(switched.parent_run_id, None);
+        assert_eq!(
+            switched.source_container.as_deref(),
+            Some("container-fork_1")
+        );
+        assert_eq!(switched.updated_at_ms, 42);
+    }
+
+    #[test]
+    fn tclone_switch_rejects_non_fork_record() {
+        let source = test_record("source_1", "running");
+
+        assert!(switched_tclone_source_record(source, 42).is_err());
     }
 
     #[test]

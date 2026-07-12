@@ -428,6 +428,7 @@ gensee run --runtime tclone -- codex
 gensee fork <run_id> --copies 2
 gensee run diff <fork_id>
 gensee run merge <fork_id> --into <run_id>          # default: --git
+gensee run switch <fork_id>                         # continue from the fork
 ```
 
 </details>

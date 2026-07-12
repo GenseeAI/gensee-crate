@@ -176,6 +176,7 @@ gensee run diff <run_id-or-container>
 gensee run merge <fork-id> --into <source-id>          # default: --git
 gensee run merge <fork-id> --into <source-id> --filesystem
 gensee run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.codex
+gensee run switch <fork-id>
 gensee run keep <run_id-or-container> --to /tmp/kept-workspace
 gensee run discard <run_id-or-container>
 ```
