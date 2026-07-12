@@ -98,6 +98,8 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         OsString::from("-t"),
         OsString::from("--name"),
         OsString::from(&source_container),
+        OsString::from("--entrypoint"),
+        config.agent_cmd[0].clone(),
         OsString::from("--log-driver=k8s-file"),
         OsString::from("--security-opt"),
         OsString::from("seccomp=unconfined"),
@@ -141,7 +143,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         )));
     }
     create_args.push(OsString::from(&image));
-    create_args.extend(config.agent_cmd.iter().cloned());
+    create_args.extend(config.agent_cmd.iter().skip(1).cloned());
 
     let output = run_command_capture(&podman, &create_args)?;
     let container_id = output.lines().next().map(str::trim).map(str::to_string);
