@@ -1231,8 +1231,11 @@ fn ensure_tclone_container_exists(podman: &OsString, record: &TcloneRunRecord) -
         Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "tclone container for {} not found: {}",
-                record.run_id, record.container_name
+                "tclone container for {} not found: {}. Checked with podman command `{}`. If the container was created with sudo or GENSEE_TCLONE_PODMAN, run this command through the same wrapper, for example `gensee-tclone fork {}`.",
+                record.run_id,
+                record.container_name,
+                podman.to_string_lossy(),
+                record.run_id
             ),
         ))
     }

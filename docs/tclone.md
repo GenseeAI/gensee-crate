@@ -42,6 +42,9 @@ gensee-tclone run delete --all                   # clean all tracked tclone cont
 The source id is the row with role `source` under the `Tclone containers`
 section of `gensee run list`. The launcher also prints it directly:
 `gensee: fork from another terminal with: gensee fork run_...`.
+Use the same `gensee-tclone` wrapper for `run list`, `fork`, `shell`, `merge`,
+`switch`, and cleanup; otherwise Gensee may read the source record but look in a
+different Podman store and report that the container is missing.
 
 `gensee run merge` is the reconciliation command. The default `--git` scope
 applies the fork's repo patch back into its source container, including staged
