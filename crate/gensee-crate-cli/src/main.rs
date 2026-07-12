@@ -107,6 +107,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
                 args.remove(0);
                 return tclone_shell(args);
             }
+            if args.first().and_then(|arg| arg.to_str()) == Some("attach") {
+                args.remove(0);
+                return tclone_attach(args);
+            }
             if args.first().and_then(|arg| arg.to_str()) == Some("diff") {
                 args.remove(0);
                 return tclone_diff(args);

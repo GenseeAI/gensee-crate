@@ -68,20 +68,36 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     let podman = tclone_podman();
     let original_workspace = canonicalize_or_original(&config.workspace);
     let repo_path = find_repo_root(&original_workspace);
-    let staged_workspace = gensee_tmp_root()?.join(&run_id).join("tclone-workspace");
-    copy_tclone_workspace(&original_workspace, &staged_workspace)?;
+    let seed_root = gensee_tmp_root()?.join(&run_id).join("tclone-seed");
+    let staged_workspace = seed_root.join(container_relative_path(&container_workspace)?);
 
     let agent_binary = config.agent_cmd[0].to_string_lossy().to_string();
     let agent_home = detect_agent_home(&agent_binary);
     let gensee_home = default_root().ok().filter(|path| path.exists());
+    prepare_tclone_seed(
+        &seed_root,
+        &original_workspace,
+        agent_home.as_ref(),
+        gensee_home.as_ref(),
+        &container_workspace,
+        &container_home,
+    )?;
+    if let Ok(current_exe) = env::current_exe() {
+        if current_exe.exists() {
+            let destination = seed_root.join("usr/local/bin/gensee");
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&current_exe, destination)?;
+        }
+    }
 
-    let mut run_args = vec![
-        OsString::from("run"),
-        OsString::from("-d"),
+    let mut create_args = vec![
+        OsString::from("create"),
+        OsString::from("-i"),
+        OsString::from("-t"),
         OsString::from("--name"),
         OsString::from(&source_container),
-        OsString::from("--entrypoint"),
-        OsString::from("/bin/sleep"),
         OsString::from("--log-driver=k8s-file"),
         OsString::from("--security-opt"),
         OsString::from("seccomp=unconfined"),
@@ -103,32 +119,33 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         OsString::from(format!("AGENT_SHIELD_SESSION_ID={run_id}")),
         OsString::from("-e"),
         OsString::from(format!("GENSEE_WORKSPACE={container_workspace}")),
+        OsString::from("-w"),
+        OsString::from(&container_workspace),
     ];
     if let Some((name, _host, container_path)) = agent_home.as_ref() {
-        run_args.push(OsString::from("-e"));
-        run_args.push(OsString::from(format!("{name}={container_path}")));
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!("{name}={container_path}")));
     }
     if let Some((node_root, node_bin)) = tclone_node_mount() {
-        run_args.push(OsString::from("-v"));
-        run_args.push(OsString::from(format!(
+        create_args.push(OsString::from("-v"));
+        create_args.push(OsString::from(format!(
             "{}:{}:ro",
             node_root.display(),
             node_root.display()
         )));
-        run_args.push(OsString::from("-e"));
-        run_args.push(OsString::from(format!(
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!(
             "PATH={}:{}",
             node_bin.display(),
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         )));
     }
-    run_args.push(OsString::from(&image));
-    run_args.push(OsString::from("infinity"));
+    create_args.push(OsString::from(&image));
+    create_args.extend(config.agent_cmd.iter().cloned());
 
-    let output = run_command_capture(&podman, &run_args)?;
+    let output = run_command_capture(&podman, &create_args)?;
     let container_id = output.lines().next().map(str::trim).map(str::to_string);
     let cleanup_guard = TcloneContainerCleanup::new(&podman, &source_container);
-    let root_pid = inspect_container_pid(&podman, &source_container).unwrap_or(0);
     append_tclone_record(&TcloneRunRecord {
         run_id: run_id.clone(),
         parent_run_id: None,
@@ -159,59 +176,12 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         original_workspace.display()
     );
 
-    tclone_exec(
+    podman_cp_contents(&podman, &seed_root, &format!("{source_container}:/"))?;
+    run_command_status(
         &podman,
-        &source_container,
-        &[
-            "bash",
-            "-lc",
-            &format!("mkdir -p '{}' '{}'", container_home, container_workspace),
-        ],
+        &[OsString::from("start"), OsString::from(&source_container)],
     )?;
-    podman_cp_contents(
-        &podman,
-        &staged_workspace,
-        &format!("{source_container}:{container_workspace}/"),
-    )?;
-    if let Some((_, host_home, container_path)) =
-        agent_home.as_ref().filter(|(_, path, _)| path.exists())
-    {
-        tclone_exec(
-            &podman,
-            &source_container,
-            &["bash", "-lc", &format!("mkdir -p '{}'", container_path)],
-        )?;
-        podman_cp_contents(
-            &podman,
-            host_home,
-            &format!("{source_container}:{container_path}/"),
-        )?;
-    }
-    if let Some(gensee_home) = gensee_home.as_ref() {
-        tclone_exec(
-            &podman,
-            &source_container,
-            &[
-                "bash",
-                "-lc",
-                &format!("mkdir -p '{container_home}/.gensee'"),
-            ],
-        )?;
-        podman_cp_contents(
-            &podman,
-            gensee_home,
-            &format!("{source_container}:{container_home}/.gensee/"),
-        )?;
-    }
-    if let Ok(current_exe) = env::current_exe() {
-        if current_exe.exists() {
-            podman_cp(
-                &podman,
-                &current_exe,
-                &format!("{source_container}:/usr/local/bin/gensee"),
-            )?;
-        }
-    }
+    let root_pid = inspect_container_pid(&podman, &source_container).unwrap_or(0);
 
     let store = EventStore::default_local()?;
     store.append_session(&AgentSession {
@@ -242,21 +212,8 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     eprintln!("gensee: fork from another terminal with: gensee fork {run_id}");
 
     let status = Command::new(&podman)
-        .arg("exec")
-        .arg("-it")
-        .arg("-w")
-        .arg(&container_workspace)
-        .arg("-e")
-        .arg(format!("GENSEE_RUN_ID={run_id}"))
-        .arg("-e")
-        .arg(format!("AGENT_SHIELD_SESSION_ID={run_id}"))
-        .arg("-e")
-        .arg(format!("GENSEE_HOME={container_home}/.gensee"))
-        .arg("-e")
-        .arg(format!("GENSEE_WORKSPACE={container_workspace}"))
+        .arg("attach")
         .arg(&source_container)
-        .arg(&config.agent_cmd[0])
-        .args(&config.agent_cmd[1..])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -432,6 +389,27 @@ pub(crate) fn tclone_shell(args: Vec<OsString>) -> io::Result<()> {
     } else {
         Err(io::Error::other(format!(
             "tclone shell exited with status {status}"
+        )))
+    }
+}
+
+pub(crate) fn tclone_attach(args: Vec<OsString>) -> io::Result<()> {
+    let target = tclone_target_arg(&args, "usage: gensee run attach <run_id-or-container>")?;
+    let record = find_tclone_record(&target)?;
+    let podman = tclone_podman();
+    ensure_tclone_container_exists(&podman, &record)?;
+    let status = Command::new(&podman)
+        .arg("attach")
+        .arg(&record.container_name)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "tclone attach exited with status {status}"
         )))
     }
 }
@@ -1615,6 +1593,50 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
     }
 }
 
+fn prepare_tclone_seed(
+    seed_root: &Path,
+    original_workspace: &Path,
+    agent_home: Option<&(String, PathBuf, String)>,
+    gensee_home: Option<&PathBuf>,
+    container_workspace: &str,
+    container_home: &str,
+) -> io::Result<()> {
+    if seed_root.exists() {
+        fs::remove_dir_all(seed_root)?;
+    }
+    fs::create_dir_all(seed_root)?;
+
+    let workspace_seed = seed_root.join(container_relative_path(container_workspace)?);
+    copy_tclone_workspace(original_workspace, &workspace_seed)?;
+
+    if let Some((_, host_home, container_path)) = agent_home.filter(|(_, path, _)| path.exists()) {
+        copy_path_all(
+            host_home,
+            &seed_root.join(container_relative_path(container_path)?),
+        )?;
+    }
+    if let Some(gensee_home) = gensee_home.filter(|path| path.exists()) {
+        copy_path_all(
+            gensee_home,
+            &seed_root.join(container_relative_path(&format!(
+                "{container_home}/.gensee"
+            ))?),
+        )?;
+    }
+    Ok(())
+}
+
+fn container_relative_path(path: &str) -> io::Result<PathBuf> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.split('/').any(|part| part == "..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid container path for tclone seed: {path}"),
+        ));
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
 fn copy_tclone_workspace(source: &Path, destination: &Path) -> io::Result<()> {
     if destination.exists() {
         fs::remove_dir_all(destination)?;
@@ -1651,6 +1673,38 @@ fn copy_tclone_path(source: &Path, destination: &Path) -> io::Result<()> {
         }
         #[cfg(not(unix))]
         {
+            fs::copy(source, destination)?;
+        }
+    } else if metadata.is_file() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, destination)?;
+    }
+    Ok(())
+}
+
+fn copy_path_all(source: &Path, destination: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_path_all(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            std::os::unix::fs::symlink(fs::read_link(source)?, destination)?;
+        }
+        #[cfg(not(unix))]
+        {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::copy(source, destination)?;
         }
     } else if metadata.is_file() {

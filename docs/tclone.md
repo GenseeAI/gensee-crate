@@ -14,10 +14,10 @@ alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOM
 gensee-tclone run --runtime tclone -- codex
 ```
 
-The host-side Gensee process owns container orchestration. It creates a source
-container, copies the workspace into cloneable container storage, copies
-detected agent config such as `CODEX_HOME` or `CLAUDE_CONFIG_DIR`, copies
-`GENSEE_HOME`, and starts the agent in the foreground with `podman exec -it`.
+The host-side Gensee process owns container orchestration. It prepares a source
+container with the workspace, detected agent config such as `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR`, and `GENSEE_HOME`, then starts the agent as the container's
+main process and attaches the foreground terminal to it.
 Add the exports and alias to `~/.bashrc`, `~/.zshrc`, or your shell profile if
 you use this host regularly. If testing from a source checkout, replace the
 alias target `gensee` with `./target/debug/gensee`.
@@ -28,6 +28,7 @@ Use a second terminal to fork the running source container:
 gensee-tclone run list
 gensee-tclone fork <source-run-id> --copies 2
 gensee-tclone run shell <run_id-or-container>
+gensee-tclone run attach <run_id-or-container>
 gensee-tclone run diff <run_id-or-container>
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
 gensee-tclone run merge <fork-id> --into <source-id> --filesystem
