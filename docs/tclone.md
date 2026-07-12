@@ -22,15 +22,30 @@ gensee run list
 gensee fork <run_id> --copies 2
 gensee run shell <run_id-or-container>
 gensee run diff <run_id-or-container>
-gensee run merge <fork-id> --into <source-id>
+gensee run merge <fork-id> --into <source-id>          # default: --git
+gensee run merge <fork-id> --into <source-id> --filesystem
+gensee run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.codex
 gensee run keep <run_id-or-container> --to /tmp/kept-workspace
 gensee run discard <run_id-or-container>
 ```
 
-`gensee run merge` applies the fork's git patch back into its source container.
-Use `--dry-run` to check whether the patch applies cleanly without modifying the
-source, or `--force` to merge from a fork that is not recorded as a direct child
-of the target source.
+`gensee run merge` is the reconciliation command. The default `--git` scope
+applies the fork's repo patch back into its source container, including staged
+changes and commits made after the recorded fork point. Use `--dry-run` to check
+whether the patch applies cleanly without modifying the source, or `--force` to
+merge from a fork that is not recorded as a direct child of the target source.
+If a fork was created before fork-point metadata existed, `--git` falls back to
+`git diff HEAD`, which includes staged and unstaged working-tree changes but not
+already committed fork work.
+
+`--filesystem` merges persistent container filesystem changes from the fork into
+the source container. `--paths` does the same for selected container paths. Both
+use the fork's tclone overlay lowerdir as the merge base and upperdir as the
+fork delta, then stop with a conflict report if the source and fork changed the
+same path differently. These scopes do not merge live memory, running process
+state, or pseudo filesystems such as `/proc`, `/sys`, `/dev`, `/run`, and `/tmp`.
+GenseeAI's tclone fork makes live clones overlay-backed by default; older plain
+btrfs-snapshot forks must be recreated before filesystem merge.
 
 ## Requirements
 
@@ -72,8 +87,12 @@ the source `GENSEE_RUN_ID` to a fork-specific run id after live cloning.
   and copied agent/Gensee config is duplicated into each fork.
 - Hook telemetry inside an already-running fork may still identify as the
   source run until post-fork rebind is implemented.
-- `gensee run merge` is currently git patch based. It merges filesystem changes
-  in the container workspace; it does not merge process state, database state, or
-  external side effects.
+- `gensee run merge` defaults to `--git`, which merges repo changes from the
+  fork into the source container. `--filesystem` and `--paths` merge persistent
+  container filesystem changes with conflict detection. None of the merge scopes
+  merge process memory or external side effects.
+- Merge into an active source container can race with writes from the running
+  source agent. Prefer merging when the source agent is idle, stopped, or at a
+  known checkpoint.
 - `gensee run keep` copies a forked workspace out to a destination directory for
   inspection/debugging.
