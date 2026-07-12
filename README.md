@@ -424,12 +424,20 @@ an agent in cloneable container storage and fork it from another terminal.
 Tclone provides low-latency full-workspace forking for AI agents:
 
 ```bash
-gensee run --runtime tclone -- codex
-gensee fork <run_id> --copies 2
-gensee run diff <fork_id>
-gensee run merge <fork_id> --into <run_id>          # default: --git
-gensee run switch <fork_id>                         # continue from the fork
+export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
+export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" gensee'
+
+gensee-tclone run --runtime tclone -- codex
+gensee-tclone run list              # source id is under "Tclone containers"
+gensee-tclone fork <source-run-id> --copies 2
+gensee-tclone run diff <fork-id>
+gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
+gensee-tclone run switch <fork-id>                         # continue from the fork
 ```
+
+The tclone launcher also prints the source id directly:
+`gensee: fork from another terminal with: gensee fork run_...`.
 
 </details>
 

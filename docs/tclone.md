@@ -7,30 +7,41 @@ merge, copy-out, and discard workflows. Tclone provides low-latency
 full-workspace forking for AI agents.
 
 ```bash
-gensee run --runtime tclone -- codex
+export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
+export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" gensee'
+
+gensee-tclone run --runtime tclone -- codex
 ```
 
 The host-side Gensee process owns container orchestration. It creates a source
 container, copies the workspace into cloneable container storage, copies
 detected agent config such as `CODEX_HOME` or `CLAUDE_CONFIG_DIR`, copies
 `GENSEE_HOME`, and starts the agent in the foreground with `podman exec -it`.
+Add the exports and alias to `~/.bashrc`, `~/.zshrc`, or your shell profile if
+you use this host regularly. If testing from a source checkout, replace the
+alias target `gensee` with `./target/debug/gensee`.
 
 Use a second terminal to fork the running source container:
 
 ```bash
-gensee run list
-gensee fork <run_id> --copies 2
-gensee run shell <run_id-or-container>
-gensee run diff <run_id-or-container>
-gensee run merge <fork-id> --into <source-id>          # default: --git
-gensee run merge <fork-id> --into <source-id> --filesystem
-gensee run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.codex
-gensee run switch <fork-id>
-gensee run keep <run_id-or-container> --to /tmp/kept-workspace
-gensee run discard <run_id-or-container>
-gensee run delete <run_id-or-container>   # remove container and hide from run list
-gensee run delete --all                   # clean all tracked tclone containers
+gensee-tclone run list
+gensee-tclone fork <source-run-id> --copies 2
+gensee-tclone run shell <run_id-or-container>
+gensee-tclone run diff <run_id-or-container>
+gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
+gensee-tclone run merge <fork-id> --into <source-id> --filesystem
+gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.codex
+gensee-tclone run switch <fork-id>
+gensee-tclone run keep <run_id-or-container> --to /tmp/kept-workspace
+gensee-tclone run discard <run_id-or-container>
+gensee-tclone run delete <run_id-or-container>   # remove container and hide from run list
+gensee-tclone run delete --all                   # clean all tracked tclone containers
 ```
+
+The source id is the row with role `source` under the `Tclone containers`
+section of `gensee run list`. The launcher also prints it directly:
+`gensee: fork from another terminal with: gensee fork run_...`.
 
 `gensee run merge` is the reconciliation command. The default `--git` scope
 applies the fork's repo patch back into its source container, including staged
