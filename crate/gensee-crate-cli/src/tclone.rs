@@ -215,6 +215,11 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     );
     eprintln!("gensee: fork from another terminal with: gensee fork {run_id}");
 
+    if env_flag("GENSEE_TCLONE_NO_ATTACH") {
+        eprintln!("gensee: tclone source left running without attach because GENSEE_TCLONE_NO_ATTACH is set");
+        return Ok(());
+    }
+
     let status = tclone_attach_container(&podman, &source_container)?;
     let ended_at_ms = unix_millis()?;
     let exit_code = status.code();
@@ -275,6 +280,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     }
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &source)?;
+    detach_tclone_tmux_clients(&podman, &source.container_name);
     let forked_at_ms = unix_millis()?;
     let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
     let prefix = arg_value(&args, "--name").unwrap_or_else(|| {
@@ -432,6 +438,21 @@ fn tclone_attach_container(
             .stderr(Stdio::inherit())
             .status(),
     }
+}
+
+fn detach_tclone_tmux_clients(podman: &OsString, container_name: &str) {
+    let _ = Command::new(podman)
+        .arg("exec")
+        .arg(container_name)
+        .arg("tmux")
+        .arg("detach-client")
+        .arg("-a")
+        .arg("-s")
+        .arg(TCLONE_AGENT_TMUX_SESSION)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    thread::sleep(Duration::from_millis(250));
 }
 
 pub(crate) fn tclone_diff(args: Vec<OsString>) -> io::Result<()> {
@@ -1783,6 +1804,12 @@ fn tclone_podman() -> OsString {
     env::var_os("GENSEE_TCLONE_PODMAN")
         .or_else(|| env::var_os("PODMAN_TFORK"))
         .unwrap_or_else(|| OsString::from("podman"))
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 fn podman_cp(podman: &OsString, source: &Path, destination: &str) -> io::Result<()> {

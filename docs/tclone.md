@@ -49,6 +49,9 @@ section of `gensee run list`. The launcher also prints it directly:
 Use the same `gensee-tclone` wrapper for `run list`, `fork`, `shell`, `merge`,
 `switch`, and cleanup; otherwise Gensee may read the source record but look in a
 different Podman store and report that the container is missing.
+Before cloning a tmux-backed source, `gensee fork` detaches active
+`gensee-agent` clients so tclone can checkpoint a stable process tree; reattach
+to the source or fork with `gensee-tclone run attach <id>`.
 
 `gensee run merge` is the reconciliation command. The default `--git` scope
 applies the fork's repo patch back into its source container, including staged
