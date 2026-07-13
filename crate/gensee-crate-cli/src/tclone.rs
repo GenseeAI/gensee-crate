@@ -1639,11 +1639,15 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
 fn tclone_agent_start_script(agent_cmd: &[OsString]) -> String {
     let command = shell_join(agent_cmd);
     format!(
-        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} {} >> \"$log\" 2>&1\n  sleep 1\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session exited during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exec sleep infinity\nfi\nprintf 'tmux not found; exec agent directly: %s\\n' {} > \"$log\"\nexec {}\n",
+        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exec sleep infinity\nfi\nprintf 'tmux not found; exec agent directly: %s\\n' {} > \"$log\"\nexec {}\n",
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&format!("exec {command}")),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         command
