@@ -316,6 +316,10 @@ pub(crate) fn build_hook_event(payload: &str, provider: &str) -> io::Result<Agen
         return build_vscode_hook_event(value, observed_at_ms);
     }
 
+    if provider == PROVIDER_CURSOR {
+        return build_cursor_hook_event(value, observed_at_ms);
+    }
+
     let hook_event_name = v_str(&value, "hook_event_name");
     let top_level_permission_command = hook_event_name
         .as_deref()
@@ -460,6 +464,91 @@ fn build_vscode_hook_event(value: Value, observed_at_ms: u64) -> io::Result<Agen
     })
 }
 
+/// Build an `AgentHookEvent` from a Cursor hook payload. Cursor sends camelCase
+/// event names (`preToolUse`, `beforeShellExecution`, …) and uses
+/// `conversation_id` where other providers use `session_id`. Normalize both so
+/// the shared `process_hook_event` path works without change.
+fn build_cursor_hook_event(value: Value, observed_at_ms: u64) -> io::Result<AgentHookEvent> {
+    let raw_event_name = v_str(&value, "hook_event_name");
+    // Map Cursor camelCase event names to the PascalCase names expected by the
+    // shared processing path.
+    let hook_event_name = raw_event_name.as_deref().map(|name| {
+        match name {
+            "preToolUse" => "PreToolUse",
+            "postToolUse" => "PostToolUse",
+            // beforeShellExecution carries a top-level `command` field like
+            // Codex PermissionRequest; reuse that evaluation path.
+            "beforeShellExecution" => "PermissionRequest",
+            "beforeSubmitPrompt" => "UserPromptSubmit",
+            "stop" => "Stop",
+            other => other,
+        }
+        .to_string()
+    });
+
+    // beforeShellExecution has the shell command at the top level.
+    let top_level_shell_command = raw_event_name
+        .as_deref()
+        .filter(|name| *name == "beforeShellExecution")
+        .and_then(|_| v_str(&value, "command"));
+    let tool_input_command =
+        v_nested_str(&value, "tool_input", "command").or(top_level_shell_command);
+
+    let tool_name = v_str(&value, "tool_name").or_else(|| {
+        // Synthesize a tool name for the PermissionRequest equivalent so that
+        // bash command parsing (file_intents_from_hook) is triggered.
+        if hook_event_name.as_deref() == Some("PermissionRequest") && tool_input_command.is_some() {
+            Some("Shell".to_string())
+        } else {
+            None
+        }
+    });
+
+    // Prefer the per-tool `cwd` field, then tool_input.working_directory (the
+    // shell's actual working directory for this invocation — Cursor includes it
+    // on Shell preToolUse payloads but omits the top-level `cwd`), then
+    // workspace_roots[0], then process cwd. Using working_directory before the
+    // workspace root avoids evaluating relative path intents (e.g. `cat ./secret`)
+    // against the wrong base and producing false allow/block decisions.
+    let cwd = v_str(&value, "cwd")
+        .or_else(|| v_nested_str(&value, "tool_input", "working_directory"))
+        .or_else(|| {
+            value
+                .get("workspace_roots")
+                .and_then(Value::as_array)
+                .and_then(|roots| roots.first())
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(current_dir_string);
+
+    Ok(AgentHookEvent {
+        provider: PROVIDER_CURSOR.to_string(),
+        // Cursor uses conversation_id; fall back to session_id for compatibility.
+        session_id: v_str(&value, "conversation_id")
+            .or_else(|| v_str(&value, "session_id"))
+            .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok()),
+        hook_event_name,
+        cwd,
+        transcript_path: v_str(&value, "transcript_path"),
+        tool_name,
+        tool_use_id: v_str(&value, "tool_use_id"),
+        tool_input_command,
+        tool_input_description: v_nested_str(&value, "tool_input", "description"),
+        tool_response_stdout: v_nested_str(&value, "tool_response", "stdout"),
+        tool_response_stderr: v_nested_str(&value, "tool_response", "stderr"),
+        tool_response_interrupted: value
+            .get("tool_response")
+            .and_then(|response| response.get("interrupted"))
+            .and_then(Value::as_bool),
+        duration_ms: find_first(&value, &["duration", "duration_ms"]).and_then(Value::as_u64),
+        permission_mode: v_str(&value, "permission_mode"),
+        effort_level: find_first_str(&value, &["effort"]),
+        observed_at_ms,
+        raw_json: serde_json::to_string(&value).map_err(io::Error::other)?,
+    })
+}
+
 fn antigravity_event_name(value: &Value) -> Option<String> {
     if let Some(name) = v_str(value, "hookEventName").or_else(|| v_str(value, "hook_event_name")) {
         return Some(name);
@@ -492,7 +581,7 @@ pub(crate) fn file_intents_from_hook(
 ) -> Vec<FileIntent> {
     if !matches!(
         event.tool_name.as_deref(),
-        Some("Bash" | "run_command" | "runInTerminal" | "runTerminalCommand")
+        Some("Bash" | "run_command" | "runInTerminal" | "runTerminalCommand" | "Shell")
     ) {
         return Vec::new();
     }
@@ -544,11 +633,14 @@ pub(crate) fn original_bash_command(payload: &str) -> Option<String> {
     }
     if matches!(
         v_str(&value, "tool_name").as_deref(),
-        Some("Bash") | Some("runInTerminal") | Some("runTerminalCommand")
+        Some("Bash") | Some("runInTerminal") | Some("runTerminalCommand") | Some("Shell")
     ) {
         return v_nested_str(&value, "tool_input", "command");
     }
-    if v_str(&value, "hook_event_name").as_deref() == Some("PermissionRequest") {
+    if matches!(
+        v_str(&value, "hook_event_name").as_deref(),
+        Some("PermissionRequest") | Some("beforeShellExecution")
+    ) {
         return v_str(&value, "command");
     }
     None
