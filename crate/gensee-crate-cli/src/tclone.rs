@@ -1679,6 +1679,7 @@ fn prepare_tclone_seed(
             host_home,
             &seed_root.join(container_relative_path(container_path)?),
         )?;
+        install_tclone_host_path_compatibility(seed_root, host_home, container_path)?;
     }
     if let Some(gensee_home) = gensee_home.filter(|path| path.exists()) {
         copy_path_all(
@@ -1687,8 +1688,73 @@ fn prepare_tclone_seed(
                 "{container_home}/.gensee"
             ))?),
         )?;
+        install_tclone_gensee_home_compatibility(seed_root, gensee_home, container_home)?;
     }
     Ok(())
+}
+
+fn install_tclone_host_path_compatibility(
+    seed_root: &Path,
+    host_home: &Path,
+    container_path: &str,
+) -> io::Result<()> {
+    let Some(host_home_parent) = host_home.parent() else {
+        return Ok(());
+    };
+    let host_home_link = seed_root.join(container_relative_path(&host_home.to_string_lossy())?);
+    if !host_home_link.exists() {
+        if let Some(parent) = host_home_link.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        symlink_or_copy_marker(container_path, &host_home_link)?;
+    }
+
+    let host_cargo_bin = host_home_parent.join(".cargo/bin");
+    let host_gensee = host_cargo_bin.join("gensee");
+    let seed_gensee = seed_root.join(container_relative_path(&host_gensee.to_string_lossy())?);
+    if !seed_gensee.exists() {
+        fs::create_dir_all(seed_gensee.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid tclone compatibility path: {}",
+                    seed_gensee.display()
+                ),
+            )
+        })?)?;
+        symlink_or_copy_marker("/usr/local/bin/gensee", &seed_gensee)?;
+    }
+    Ok(())
+}
+
+fn install_tclone_gensee_home_compatibility(
+    seed_root: &Path,
+    host_gensee_home: &Path,
+    container_home: &str,
+) -> io::Result<()> {
+    let host_link = seed_root.join(container_relative_path(
+        &host_gensee_home.to_string_lossy(),
+    )?);
+    if host_link.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = host_link.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    symlink_or_copy_marker(&format!("{container_home}/.gensee"), &host_link)
+}
+
+#[cfg(unix)]
+fn symlink_or_copy_marker(target: &str, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(not(unix))]
+fn symlink_or_copy_marker(_target: &str, link: &Path) -> io::Result<()> {
+    fs::write(
+        link,
+        "This tclone compatibility path requires Unix symlink support.\n",
+    )
 }
 
 fn container_relative_path(path: &str) -> io::Result<PathBuf> {
@@ -2277,6 +2343,61 @@ mod tests {
         assert!(script.contains("tmux new-session -d -s 'gensee-agent'"));
         assert!(script.contains("'codex' '--prompt' 'don'\\''t panic'"));
         assert!(script.contains("exec 'codex' '--prompt' 'don'\\''t panic'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_seed_installs_host_path_compatibility_links() {
+        let root = temp_tree("compat-links");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let host_home = root.join("host-home/yiying/.codex");
+        let gensee_home = root.join("host-home/yiying/.gensee");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(&host_home).unwrap();
+        fs::write(host_home.join("hooks.json"), "{}").unwrap();
+        fs::create_dir_all(&gensee_home).unwrap();
+        fs::write(gensee_home.join("policy.json"), "{}").unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "CODEX_HOME".to_string(),
+                host_home.clone(),
+                "/home/gensee/.codex".to_string(),
+            )),
+            Some(&gensee_home),
+            "/workspace",
+            "/home/gensee",
+        )
+        .unwrap();
+
+        assert!(seed.join("home/gensee/.codex/hooks.json").exists());
+        assert_eq!(
+            fs::read_link(seed.join(host_home.strip_prefix("/").unwrap())).unwrap(),
+            PathBuf::from("/home/gensee/.codex")
+        );
+        assert_eq!(
+            fs::read_link(
+                seed.join(
+                    host_home
+                        .parent()
+                        .unwrap()
+                        .join(".cargo/bin/gensee")
+                        .strip_prefix("/")
+                        .unwrap()
+                )
+            )
+            .unwrap(),
+            PathBuf::from("/usr/local/bin/gensee")
+        );
+        assert_eq!(
+            fs::read_link(seed.join(gensee_home.strip_prefix("/").unwrap())).unwrap(),
+            PathBuf::from("/home/gensee/.gensee")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
