@@ -122,6 +122,8 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         OsString::from(format!("AGENT_SHIELD_SESSION_ID={run_id}")),
         OsString::from("-e"),
         OsString::from(format!("GENSEE_WORKSPACE={container_workspace}")),
+        OsString::from("-e"),
+        OsString::from("TERM=xterm-256color"),
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
@@ -1637,7 +1639,11 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
 fn tclone_agent_start_script(agent_cmd: &[OsString]) -> String {
     let command = shell_join(agent_cmd);
     format!(
-        "set -e\nif command -v tmux >/dev/null 2>&1; then\n  tmux new-session -d -s {} {}\n  exec sleep infinity\nfi\nexec {}\n",
+        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} {} >> \"$log\" 2>&1\n  sleep 1\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session exited during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exec sleep infinity\nfi\nprintf 'tmux not found; exec agent directly: %s\\n' {} > \"$log\"\nexec {}\n",
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(&command),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(&command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         command
