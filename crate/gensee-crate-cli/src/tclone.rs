@@ -9,6 +9,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 const DEFAULT_TCLONE_IMAGE: &str = "ghcr.io/wuklab/webtop:ubuntu-kde";
 const DEFAULT_CONTAINER_HOME: &str = "/home/gensee";
 const DEFAULT_CONTAINER_WORKSPACE: &str = "/workspace";
+const TCLONE_AGENT_TMUX_SESSION: &str = "gensee-agent";
 const TCLONE_STATE_LOCK_STALE_SECS: u64 = 30;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -99,7 +100,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         OsString::from("--name"),
         OsString::from(&source_container),
         OsString::from("--entrypoint"),
-        config.agent_cmd[0].clone(),
+        OsString::from("/bin/sh"),
         OsString::from("--log-driver=k8s-file"),
         OsString::from("--security-opt"),
         OsString::from("seccomp=unconfined"),
@@ -143,7 +144,8 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         )));
     }
     create_args.push(OsString::from(&image));
-    create_args.extend(config.agent_cmd.iter().skip(1).cloned());
+    create_args.push(OsString::from("-lc"));
+    create_args.push(OsString::from(tclone_agent_start_script(&config.agent_cmd)));
 
     let output = run_command_capture(&podman, &create_args)?;
     let container_id = output.lines().next().map(str::trim).map(str::to_string);
@@ -213,13 +215,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     );
     eprintln!("gensee: fork from another terminal with: gensee fork {run_id}");
 
-    let status = Command::new(&podman)
-        .arg("attach")
-        .arg(&source_container)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
+    let status = tclone_attach_container(&podman, &source_container)?;
     let ended_at_ms = unix_millis()?;
     let exit_code = status.code();
     store.append_session(&AgentSession {
@@ -400,19 +396,41 @@ pub(crate) fn tclone_attach(args: Vec<OsString>) -> io::Result<()> {
     let record = find_tclone_record(&target)?;
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &record)?;
-    let status = Command::new(&podman)
-        .arg("attach")
-        .arg(&record.container_name)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
+    let status = tclone_attach_container(&podman, &record.container_name)?;
     if status.success() {
         Ok(())
     } else {
         Err(io::Error::other(format!(
             "tclone attach exited with status {status}"
         )))
+    }
+}
+
+fn tclone_attach_container(
+    podman: &OsString,
+    container_name: &str,
+) -> io::Result<std::process::ExitStatus> {
+    let tmux_status = Command::new(podman)
+        .arg("exec")
+        .arg("-it")
+        .arg(container_name)
+        .arg("tmux")
+        .arg("attach-session")
+        .arg("-t")
+        .arg(TCLONE_AGENT_TMUX_SESSION)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+    match tmux_status {
+        Ok(status) if status.success() => Ok(status),
+        Ok(_) | Err(_) => Command::new(podman)
+            .arg("attach")
+            .arg(container_name)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status(),
     }
 }
 
@@ -1595,6 +1613,30 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
     }
 }
 
+fn tclone_agent_start_script(agent_cmd: &[OsString]) -> String {
+    let command = shell_join(agent_cmd);
+    format!(
+        "set -e\nif command -v tmux >/dev/null 2>&1; then\n  tmux new-session -d -s {} {}\n  exec sleep infinity\nfi\nexec {}\n",
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(&command),
+        command
+    )
+}
+
+fn shell_join(args: &[OsString]) -> String {
+    args.iter()
+        .map(|arg| shell_quote(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn prepare_tclone_seed(
     seed_root: &Path,
     original_workspace: &Path,
@@ -2195,6 +2237,19 @@ mod tests {
         assert_eq!(arg_value(&args, "--name").unwrap(), "fork-prefix");
         assert_eq!(arg_value(&args, "--into").unwrap(), "source");
         assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+    }
+
+    #[test]
+    fn tclone_agent_start_script_wraps_command_in_tmux_when_available() {
+        let script = tclone_agent_start_script(&[
+            OsString::from("codex"),
+            OsString::from("--prompt"),
+            OsString::from("don't panic"),
+        ]);
+
+        assert!(script.contains("tmux new-session -d -s 'gensee-agent'"));
+        assert!(script.contains("'codex' '--prompt' 'don'\\''t panic'"));
+        assert!(script.contains("exec 'codex' '--prompt' 'don'\\''t panic'"));
     }
 
     #[test]
