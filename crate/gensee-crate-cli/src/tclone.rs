@@ -1643,7 +1643,7 @@ fn tclone_agent_start_script(agent_cmd: &[OsString]) -> String {
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
-        shell_quote(&command),
+        shell_quote(&format!("exec {command}")),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         command
