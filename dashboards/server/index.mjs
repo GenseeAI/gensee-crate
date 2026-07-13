@@ -14,15 +14,15 @@ import { createServer }  from 'node:http';
 import { homedir }       from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { handleState }       from './routes/v1/state.mjs';
-import { handleSessions }    from './routes/v1/sessions.mjs';
-import { handleAgentEvents, handleEventStream, handleSessionEvents } from './routes/v1/events.mjs';
-import { handleAlerts }      from './routes/v1/alerts.mjs';
-import { handleMetricsToday } from './routes/v1/metrics.mjs';
-import { handleStats }       from './routes/v1/stats.mjs';
-import { handleArtifacts }   from './routes/v1/artifacts.mjs';
-import { handlePolicy }      from './routes/v1/policy.mjs';
-import { handleFeedback }    from './routes/v1/feedback.mjs';
+import { handleState }       from './state.mjs';
+import { handleSessions }    from './sessions.mjs';
+import { handleAgentEvents, handleEventStream, handleSessionEvents } from './events.mjs';
+import { handleAlerts }      from './alerts.mjs';
+import { handleMetricsToday } from './metrics.mjs';
+import { handleStats }       from './stats.mjs';
+import { handleArtifacts }   from './artifacts.mjs';
+import { handlePolicy }      from './policy.mjs';
+import { handleFeedback }    from './feedback.mjs';
 import { dbPath, genseeHome } from './db.mjs';
 
 const PORT      = parseInt(process.env.PORT      ?? '3001', 10);

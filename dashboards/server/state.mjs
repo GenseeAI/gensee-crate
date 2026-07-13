@@ -1,4 +1,4 @@
-import { query } from '../../db.mjs';
+import { query } from './db.mjs';
 
 /**
  * GET /api/v1/state

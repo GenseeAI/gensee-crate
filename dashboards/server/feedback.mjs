@@ -1,4 +1,4 @@
-import { query, escStr, clampLimit } from '../../db.mjs';
+import { query, escStr, clampLimit } from './db.mjs';
 
 const VALID_VERDICTS = new Set(['agree', 'allow', 'deny']);
 

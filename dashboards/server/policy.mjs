@@ -3,20 +3,19 @@ import { join }   from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { genseeHome } from '../../db.mjs';
+import { genseeHome } from './db.mjs';
 
 const execFileAsync = promisify(execFile);
 
 const policyPath   = join(genseeHome, 'policy.json');
 const defaultPolicyPath = new URL(
-  '../../../../crate/gensee-crate-rules/policy/default-policy.json',
+  '../../crate/gensee-crate-rules/policy/default-policy.json',
   import.meta.url,
 ).pathname;
 
 // Candidate gensee binaries for validation.
 function genseeCandidates() {
-  // policy.mjs lives at ui/server/routes/v1/ — four levels up reaches the repo root.
-  const repoRoot = new URL('../../../../', import.meta.url).pathname;
+  const repoRoot = new URL('../../', import.meta.url).pathname;
   return [
     process.env.GENSEE_BIN,
     join(repoRoot, 'target', 'release', 'gensee'),

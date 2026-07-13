@@ -1,4 +1,4 @@
-import { query, escStr, clampLimit } from '../../db.mjs';
+import { query, escStr, clampLimit } from './db.mjs';
 
 /**
  * GET /api/v1/sessions

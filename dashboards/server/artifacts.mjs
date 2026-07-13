@@ -1,4 +1,4 @@
-import { query, escInt, clampLimit } from '../../db.mjs';
+import { query, escInt, clampLimit } from './db.mjs';
 
 /**
  * GET /api/v1/artifacts

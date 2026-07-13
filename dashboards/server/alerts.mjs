@@ -1,4 +1,4 @@
-import { query, escStr, clampLimit } from '../../db.mjs';
+import { query, escStr, clampLimit } from './db.mjs';
 
 const VALID_SEVERITIES = new Set(['info', 'low', 'medium', 'high', 'critical']);
 const VALID_ACTIONS    = new Set(['allow', 'warn', 'ask', 'block']);

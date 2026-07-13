@@ -1,4 +1,4 @@
-import { query, queryOne } from '../../db.mjs';
+import { query, queryOne } from './db.mjs';
 
 const TODAY_AE      = "date(ae.ts/1000,'unixepoch','localtime') = date('now','localtime')";
 const TODAY_SESS    = "date(first_event_at/1000,'unixepoch','localtime') = date('now','localtime')";
