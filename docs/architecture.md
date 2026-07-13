@@ -12,8 +12,8 @@ current v0.1 release is a macOS-first runtime focused on four workflows:
   `$GENSEE_HOME/policy.json`, validate policy files, walk through
   dashboard-style setup, and edit supported configuration keys with `get`/`set`.
   See [policy.md](policy.md).
-- `dashboards/web` — local timeline, lineage, policy, and review UI backed by
-  the same `GENSEE_HOME` store as the CLI. See [dashboard.md](dashboard.md).
+- `dashboards/` — local timeline, lineage, policy, and review UI (React + Node API)
+  backed by the same `GENSEE_HOME` store as the CLI. See [dashboard.md](dashboard.md).
 
 Container mode is future work. `eslogger` is the default `gensee watch`
 system-event backend on macOS when available and can be disabled by policy,
@@ -42,7 +42,7 @@ profile for dangerous syscalls, and cgroup/nftables network controls. See
 | `integrations/mcp` | Optional MCP bridge |
 | `integrations/generic-launcher` | `gensee run -- <agent>` launcher integration |
 | `models` | Future model artifacts and notes |
-| `dashboards/web` | Local dashboard for timeline, lineage, policy, and review workflows |
+| `dashboards` | Local dashboard for timeline, lineage, policy, and review workflows (React + Vite + Node API) |
 | `scripts` | Local development and benchmark helpers |
 | `docs` | This documentation |
 

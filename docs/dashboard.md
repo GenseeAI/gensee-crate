@@ -10,95 +10,94 @@ place.
 
 ## Launch
 
-Build the CLI first so the dashboard can read encrypted telemetry, validate
-policy edits, and use the local dashboard-state command:
+Build the CLI first so the dashboard can validate policy edits:
 
 ```bash
 cargo build --release -p gensee-crate-cli
 ```
 
+Install the dashboard dependencies once (requires Node 18+):
+
+```bash
+npm install --prefix dashboards
+```
+
 Then start the dashboard against the store you want to inspect:
 
 ```bash
-GENSEE_HOME="$PWD/.gensee-dev" npm --prefix dashboards/web run dev
-# open http://localhost:5173
+cd dashboards
+GENSEE_HOME="$HOME/.gensee" npm run dev:full
+# open http://localhost:5174
 ```
 
-Use the same `GENSEE_HOME` for hooks, `watch`, `run`, `timeline`, and the
-dashboard when you want all signals to appear together.
+This starts both the Vite frontend (port 5174) and the Node API server (port 3001)
+with a single command. Use the same `GENSEE_HOME` for hooks, `watch`, `run`,
+`timeline`, and the dashboard when you want all signals to appear together.
 
 ## Requirements
 
 - Node 18 or newer.
-- A built `gensee` binary for encrypted telemetry, live policy view/edit, and
-  policy validation.
-- Optional: `sqlite3` on `PATH` for unencrypted demo-store fallback reads.
+- A built `gensee` binary for policy validation.
+- Optional: `sqlite3` on `PATH` for demo-store fallback reads.
 
-The dashboard dev server exposes local API endpoints such as `GET /api/state`
-and `GET`/`POST /api/policy`. It prefers `gensee dashboard-state`, which can
-read encrypted local telemetry, and falls back to raw `sqlite3`/JSONL reads for
-unencrypted demo or development stores.
+The API server at port 3001 exposes versioned endpoints under `/api/v1/` such
+as `GET /api/v1/sessions`, `GET /api/v1/alerts`, and `GET`/`POST /api/v1/policy`.
+It binds to loopback only (`127.0.0.1`) and is proxied by Vite during development.
 
 ## Demo Data
 
-A fresh store is empty. Seed a demo store to populate the Live, Timeline,
-Lineage, and Policy views:
+A fresh store is empty. Seed a demo store to populate the Timeline, Lineage,
+and Policy views by running agent sessions with `gensee-sudo run -- <agent>`,
+or point `GENSEE_HOME` at an existing store that already has data.
 
 ```bash
-# seed only:
-dashboards/web/scripts/seed-demo.sh
+# Example: run a quick Claude session to generate events
+GENSEE_HOME=~/.gensee gensee-sudo run -- claude
 
-# seed + serve:
-dashboards/web/scripts/demo.sh
-# then open http://localhost:5173
-```
-
-Both commands default to `GENSEE_HOME=~/.gensee-demo`. Override `GENSEE_HOME` or
-`GENSEE_BIN` to point at a different store or binary.
-
-`seed-demo.sh` wipes the target `GENSEE_HOME` before seeding. To avoid deleting
-a real store by accident, it refuses to delete a directory it did not create.
-It marks demo stores with `.gensee-demo-seed`; pass `--force` only when you
-intend to overwrite the target:
-
-```bash
-dashboards/web/scripts/demo.sh --force
+# Then open the dashboard
+cd dashboards && GENSEE_HOME=~/.gensee npm run dev:full
 ```
 
 ## Live Policy Editing
 
-The Policy document panel reads and writes `$GENSEE_HOME/policy.json` through
-the local `/api/policy` endpoint. Saves require the dashboard's CSRF header and
-are validated by the policy engine before the file is written.
-
-Legacy quick controls, such as rule toggles and allowlist prefixes, remain
-cosmetic browser state until they are wired to the policy document. Use the
-Policy document panel or [`gensee policy`](gensee-policy.md) for changes that
-must affect enforcement.
+The Policy page reads and writes `$GENSEE_HOME/policy.json` through the local
+`/api/v1/policy` endpoint. Saves are validated by the policy engine before the
+file is written. The Settings, Decision Rules, and Artifact Definitions tabs
+provide structured editing; the Advanced (JSON) tab gives full raw access.
 
 ## Development
 
-Run the dashboard package directly when working on the UI:
+Run frontend and API server together:
 
 ```bash
-npm --prefix dashboards/web run dev
+cd dashboards && GENSEE_HOME=~/.gensee npm run dev:full
+```
+
+Or start them separately:
+
+```bash
+# Terminal 1 — API server
+cd dashboards && GENSEE_HOME=~/.gensee npm run dev:server
+
+# Terminal 2 — Vite frontend
+cd dashboards && npm run dev
 ```
 
 Use a separate store while developing:
 
 ```bash
-GENSEE_HOME=/tmp/gensee-dashboard-fixture PORT=4173 npm --prefix dashboards/web run dev
+cd dashboards && GENSEE_HOME=/tmp/gensee-fixture npm run dev:full
 ```
 
-Validate the dashboard JavaScript and local dev server:
+Type-check the frontend:
 
 ```bash
-npm --prefix dashboards/web run check
+npm --prefix dashboards run build   # full TypeScript + Vite build check
 ```
 
 ## Rendering Safety
 
 Prompts, commands, file paths, tool names, policy reasons, and artifact URIs are
 attacker-influenced input. Keep dynamic rendering on safe text APIs such as
-`textContent` or framework escaping. Do not pass live Gensee values through
+React's JSX text nodes or `textContent`. Do not pass live Gensee values through
 `innerHTML`, even inside the security console itself.

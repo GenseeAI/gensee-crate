@@ -2098,7 +2098,27 @@ fn tool_input_json(event: &AgentHookEvent) -> Option<String> {
 
     let tools = native_file_tools(event);
     match tools.as_slice() {
-        [] => None,
+        [] => {
+            // Fall back to the raw tool_input from the hook JSON so that queries/URLs
+            // for tools like WebSearch, ToolSearch, WebFetch, etc. are preserved.
+            let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+            let input = value.get("tool_input")?;
+            if input.is_null() {
+                return None;
+            }
+            if let Some(map) = input.as_object() {
+                if map.is_empty() {
+                    return None;
+                }
+                let mut out = serde_json::Map::new();
+                if let Some(id) = event.tool_use_id.as_deref() {
+                    out.insert("tool_use_id".to_string(), json!(id));
+                }
+                out.extend(map.clone());
+                return Some(Value::Object(out).to_string());
+            }
+            None
+        }
         [tool] => Some(
             json!({
                 "tool_use_id": event.tool_use_id.as_deref(),

@@ -12,7 +12,7 @@ risks. If this change is not security-sensitive, say so explicitly.
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`
-- [ ] `cd dashboards/web && npm run check`
+- [ ] `cd dashboards && npm run build`
 
 ## Documentation
 

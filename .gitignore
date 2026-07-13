@@ -1,5 +1,6 @@
 /target/
-/node_modules/
+**/node_modules/
+**/dist/
 /docs/.vitepress/cache/
 /docs/.vitepress/dist/
 /.gensee-dev/
@@ -13,3 +14,5 @@ __pycache__/
 
 # latency bench generated artifacts
 bench/results/
+
+.local

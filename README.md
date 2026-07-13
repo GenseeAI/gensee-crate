@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="dashboards/web/src/eye-only.png" alt="" width="48" />
+  <img src="dashboards/public/eye-only.png" alt="" width="48" />
   Gensee Crate
 </h1>
 
@@ -413,24 +413,21 @@ The local dashboard reads the same `GENSEE_HOME` store as `watch`, hooks, and
 request lineage, and the active policy document; users can record review
 verdicts and edit validated policy settings from the browser.
 
-Launch it from the repository checkout against your active store:
+Install dependencies once, then launch from the repository checkout:
 
 ```bash
-cd /path/to/agent-shield
-GENSEE_HOME="$PWD/.gensee-dev" npm --prefix "$PWD/dashboards/web" run dev
-# open http://localhost:5173
+npm install --prefix dashboards
+cd dashboards
+GENSEE_HOME="$HOME/.gensee" npm run dev:full
+# open http://localhost:5174
 ```
 
-If you launch it from another directory, use absolute paths and the same
-`GENSEE_HOME` that your hooks or `gensee watch` use:
+The `dev:full` script starts both the Vite frontend (port 5174) and the Node
+API server (port 3001) together. Use the same `GENSEE_HOME` that your hooks or
+`gensee watch` use.
 
-```bash
-REPO=/path/to/agent-shield
-GENSEE_HOME="$REPO/.gensee-dev" npm --prefix "$REPO/dashboards/web" run dev
-```
-
-See [`dashboards/web/README.md`](dashboards/web/README.md) for requirements,
-demo data, and policy editing notes.
+See [`dashboards/README.md`](dashboards/README.md) for requirements, demo data, and policy
+editing notes.
 
 The activity view brings policy decisions, timeline filtering, event details,
 and command/tool context into one local browser surface.
