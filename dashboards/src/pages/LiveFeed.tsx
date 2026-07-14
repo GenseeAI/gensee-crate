@@ -16,7 +16,6 @@ import { ClearOutlined, PauseCircleOutlined, PlayCircleOutlined } from '@ant-des
 import { PageHeader }  from '@/components/PageHeader';
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder';
 import { useRealtime } from '@/hooks/useRealtime';
-import { api }         from '@/api/client';
 import type { AgentEvent } from '@/api/types';
 
 const { Text } = Typography;
@@ -61,7 +60,7 @@ export default function LiveFeed() {
   const [enabled, setEnabled]   = useState(true);
   const [typeFilter, setFilter] = useState<string | undefined>(undefined);
 
-  const { events, connected, error, clear } = useRealtime(api.realtimeUrl(), enabled);
+  const { events, connected, error, clear } = useRealtime('', enabled);
 
   const filtered = typeFilter
     ? events.filter(e => e.type === typeFilter)

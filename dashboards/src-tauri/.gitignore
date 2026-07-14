@@ -1,0 +1,11 @@
+# Tauri Rust build output — kept separate from the root /target/ rule
+# because this workspace is isolated from the monorepo Cargo workspace.
+/target/
+
+# Cargo.lock is intentionally excluded for library crates.
+# For the Tauri binary it is conventional to commit it, but since the
+# dashboard is still under active development we omit it here.
+Cargo.lock
+
+# Tauri-generated schema files (produced by tauri build / tauri dev)
+/gen/

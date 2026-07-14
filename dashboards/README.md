@@ -1,12 +1,15 @@
 # Gensee Crate UI
 
-React + TypeScript dashboard for the Gensee Crate security monitor.
+Native Tauri dashboard for the Gensee Crate security monitor. The React
+frontend communicates with the Rust backend through process-local Tauri IPC;
+the dashboard does not start an HTTP API server.
 
 ## Requirements
 
 - Node 18 or newer
+- Rust stable and the Tauri CLI (`cargo install tauri-cli --version '^2'`)
 - A built `gensee` CLI binary (for policy validation)
-- Optional: `sqlite3` on `PATH`
+- Linux: WebKitGTK development packages (see the Tauri prerequisites below)
 
 ## Quick start
 
@@ -14,21 +17,18 @@ React + TypeScript dashboard for the Gensee Crate security monitor.
 # Install dependencies (once)
 npm install
 
-# Start frontend (port 5174) + API server (port 3001) together
-GENSEE_HOME="$HOME/.gensee" npm run dev:full
-
-# Open http://localhost:5174
+# Launch the native desktop application
+GENSEE_HOME="$HOME/.gensee" cargo tauri dev
 ```
 
 ## Scripts
 
 | Command | Description |
 |---|---|
-| `npm run dev` | Vite dev server only (port 5174) |
-| `npm run dev:server` | Node API server only (port 3001) |
-| `npm run dev:full` | Both together via `concurrently` |
+| `cargo tauri dev` | Native desktop app with Vite hot-module reload |
+| `cargo tauri build` | Build native installable application bundles |
+| `npm run dev` | Development asset server for the Tauri WebView only |
 | `npm run build` | Production build into `dist/` |
-| `npm run preview` | Preview the production build |
 
 ## Environment variables
 
@@ -37,29 +37,33 @@ GENSEE_HOME="$HOME/.gensee" npm run dev:full
 | `GENSEE_HOME` | `~/.gensee` | Path to the Gensee data directory containing `gensee.db` |
 | `GENSEE_DB_PATH` | `$GENSEE_HOME/gensee.db` | Override the SQLite database path directly |
 | `GENSEE_BIN` | auto-detected | Path to the `gensee` binary for policy validation |
-| `PORT` | `3001` | API server port |
 
 ## Architecture
 
 ```
-Vite (port 5174)         Node API server (port 3001)
-   React + TypeScript  ──proxy /api/v1/──▶  server/index.mjs
-   src/                                      server/routes/v1/
-   src/pages/                                  sessions.mjs
-   src/components/                             events.mjs
-   src/layouts/                                alerts.mjs
-   src/api/client.ts                           artifacts.mjs
-   src/hooks/                                  policy.mjs
-                                               feedback.mjs
-                                               stats.mjs
+Tauri WebView                    Rust backend (same native process)
+   React + TypeScript  ──IPC invoke()──▶  src-tauri/src/lib.rs
+   src/                                  SQLite + policy filesystem access
+   src/api/client.ts                     Tauri events for live activity
 ```
 
-The API server binds to `127.0.0.1` only (loopback). The Vite proxy forwards
-`/api` requests to port 3001 during development.
+Vite uses `http://localhost:5174` only during `cargo tauri dev` to serve
+hot-reload assets to the native WebView. It is not a dashboard API and normal
+browsers cannot render the dashboard or invoke its IPC commands. Production
+builds embed the static frontend; they do not open a localhost port.
+
+## Linux Tauri prerequisites
+
+On Ubuntu/Debian:
+
+```bash
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev \
+   libayatana-appindicator3-dev librsvg2-dev build-essential pkg-config
+```
 
 ## Policy editing
 
 The Policy page loads `$GENSEE_HOME/policy.json` (or the bundled default if not
 yet customised). Saving validates the document via the `gensee` binary then
-writes `$GENSEE_HOME/policy.json`. The next hook or `gensee run` invocation
-picks up the change automatically.
+writes `$GENSEE_HOME/policy.json` with owner-only permissions (`0600` on Unix).
+The next hook or `gensee run` invocation picks up the change automatically.

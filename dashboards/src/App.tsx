@@ -1,4 +1,5 @@
 import { App as AntApp, ConfigProvider } from 'antd';
+import { isTauri } from '@tauri-apps/api/core';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { ThemeProvider, useTheme } from '@/hooks/useTheme';
 import { darkTheme, lightTheme } from '@/theme';
@@ -49,6 +50,20 @@ function ThemedApp() {
 }
 
 export default function App() {
+  // Vite's localhost server exists only during `cargo tauri dev` to provide
+  // hot-module reload to the native WebView. It is not a dashboard API: the
+  // app deliberately refuses to render outside a Tauri IPC context, where
+  // `invoke()` commands are unavailable.
+  if (!isTauri()) {
+    return (
+      <main style={{ maxWidth: 560, margin: '15vh auto', padding: 24, fontFamily: 'system-ui, sans-serif' }}>
+        <h1>Gensee Dashboard</h1>
+        <p>This interface must be launched through the Gensee desktop application.</p>
+        <p>For development, run <code>cargo tauri dev</code> from the dashboards directory.</p>
+      </main>
+    );
+  }
+
   return (
     <ThemeProvider>
       <ThemedApp />

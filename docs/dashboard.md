@@ -1,6 +1,6 @@
 # Dashboard
 
-The Gensee Crate dashboard is a local browser console for inspecting the same
+The Gensee Crate dashboard is a local native desktop application for inspecting the same
 `GENSEE_HOME` store used by `gensee watch`, agent hooks, `gensee run`, and
 `gensee timeline`.
 
@@ -19,30 +19,33 @@ cargo build --release -p gensee-crate-cli
 Install the dashboard dependencies once (requires Node 18+):
 
 ```bash
-npm install --prefix dashboards
+npm install --prefix dashboards --legacy-peer-deps
 ```
 
-Then start the dashboard against the store you want to inspect:
+Then launch the Tauri desktop app:
 
 ```bash
 cd dashboards
-GENSEE_HOME="$HOME/.gensee" npm run dev:full
-# open http://localhost:5174
+GENSEE_HOME="$HOME/.gensee" npm run tauri:dev
 ```
 
-This starts both the Vite frontend (port 5174) and the Node API server (port 3001)
-with a single command. Use the same `GENSEE_HOME` for hooks, `watch`, `run`,
-`timeline`, and the dashboard when you want all signals to appear together.
+This opens a native window backed by the Rust core — no TCP server is
+started. All data access goes through Tauri IPC.
 
 ## Requirements
 
 - Node 18 or newer.
 - A built `gensee` binary for policy validation.
-- Optional: `sqlite3` on `PATH` for demo-store fallback reads.
+- Linux development requires WebKitGTK and GTK development packages; see
+	[`dashboards/README.md`](../dashboards/README.md#linux-tauri-prerequisites).
 
-The API server at port 3001 exposes versioned endpoints under `/api/v1/` such
-as `GET /api/v1/sessions`, `GET /api/v1/alerts`, and `GET`/`POST /api/v1/policy`.
-It binds to loopback only (`127.0.0.1`) and is proxied by Vite during development.
+The Tauri app binds no TCP port. All data access goes through Rust `#[tauri::command]`
+handlers over the Tauri IPC bridge. Policy writes apply `0600` permissions and
+require a `gensee` binary for validation before writing the file.
+
+**Threat model**: single-user workstation. Processes running as the same OS user
+are implicitly trusted (they can already read `$GENSEE_HOME` directly). There is
+no network-accessible endpoint to attack.
 
 ## Demo Data
 
@@ -55,44 +58,32 @@ or point `GENSEE_HOME` at an existing store that already has data.
 GENSEE_HOME=~/.gensee gensee-sudo run -- claude
 
 # Then open the dashboard
-cd dashboards && GENSEE_HOME=~/.gensee npm run dev:full
+cd dashboards && GENSEE_HOME=~/.gensee cargo tauri dev
 ```
 
 ## Live Policy Editing
 
-The Policy page reads and writes `$GENSEE_HOME/policy.json` through the local
-`/api/v1/policy` endpoint. Saves are validated by the policy engine before the
-file is written. The Settings, Decision Rules, and Artifact Definitions tabs
-provide structured editing; the Advanced (JSON) tab gives full raw access.
+The Policy page reads and writes `$GENSEE_HOME/policy.json` through a native
+Tauri IPC command. Saves are validated by the policy engine before the file is
+written with owner-only permissions (`0600` on Unix). The Settings, Decision
+Rules, and Artifact Definitions tabs provide structured editing; the Advanced
+(JSON) tab gives full raw access.
 
 ## Development
 
-Run frontend and API server together:
+Run the native app with frontend hot reload:
 
 ```bash
-cd dashboards && GENSEE_HOME=~/.gensee npm run dev:full
+cd dashboards && npm run tauri:dev
 ```
 
-Or start them separately:
+The Tauri dev runner starts Vite automatically (configured in
+`src-tauri/tauri.conf.json → build.beforeDevCommand`).
+
+Type-check and build the frontend bundle:
 
 ```bash
-# Terminal 1 — API server
-cd dashboards && GENSEE_HOME=~/.gensee npm run dev:server
-
-# Terminal 2 — Vite frontend
-cd dashboards && npm run dev
-```
-
-Use a separate store while developing:
-
-```bash
-cd dashboards && GENSEE_HOME=/tmp/gensee-fixture npm run dev:full
-```
-
-Type-check the frontend:
-
-```bash
-npm --prefix dashboards run build   # full TypeScript + Vite build check
+npm --prefix dashboards run build
 ```
 
 ## Rendering Safety

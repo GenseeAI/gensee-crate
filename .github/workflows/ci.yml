@@ -38,5 +38,14 @@ jobs:
           cache-dependency-path: dashboards/package-lock.json
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
-      - name: Type-check and build
+      - name: Type-check and build frontend
         run: npm run build
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check Tauri backend
+        run: cargo check --manifest-path src-tauri/Cargo.toml

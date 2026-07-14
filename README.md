@@ -406,31 +406,29 @@ gensee run list   # list guarded run sessions and staged workspaces
 gensee timeline   # show prompts, tool intent, file effects, and policy decisions
 ```
 
-**Dashboard.** Open the local dashboard for a browser view of the same store:
+**Dashboard.** Open the local native dashboard for a view of the same store:
 
 The local dashboard reads the same `GENSEE_HOME` store as `watch`, hooks, and
 `timeline`. It shows live agent activity, policy decisions, alerts, file and
 request lineage, and the active policy document; users can record review
-verdicts and edit validated policy settings from the browser.
+verdicts and edit validated policy settings in the desktop application.
 
 Install dependencies once, then launch from the repository checkout:
 
 ```bash
-npm install --prefix dashboards
+npm install --prefix dashboards --legacy-peer-deps
 cd dashboards
-GENSEE_HOME="$HOME/.gensee" npm run dev:full
-# open http://localhost:5174
+GENSEE_HOME="$HOME/.gensee" npm run tauri:dev
 ```
 
-The `dev:full` script starts both the Vite frontend (port 5174) and the Node
-API server (port 3001) together. Use the same `GENSEE_HOME` that your hooks or
-`gensee watch` use.
+This opens a native desktop window backed by the Rust core. No TCP server
+is started; all data access goes through Tauri IPC.
 
 See [`dashboards/README.md`](dashboards/README.md) for requirements, demo data, and policy
 editing notes.
 
 The activity view brings policy decisions, timeline filtering, event details,
-and command/tool context into one local browser surface.
+and command/tool context into one local desktop surface.
 
 ![Gensee Crate dashboard activity timeline](docs/images/dashboard-activity.png)
 

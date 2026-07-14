@@ -1,9 +1,15 @@
+/**
+ * Tauri IPC client — replaces the HTTP fetch() layer.
+ *
+ * Every function calls a #[tauri::command] in the Rust backend via invoke().
+ * No TCP port is used; communication goes through the Tauri WebView IPC bridge.
+ */
+import { invoke } from '@tauri-apps/api/core';
 import type {
   Session,
   Request,
   AgentEvent,
   Alert,
-  Artifact,
   ArtifactGraphData,
   HumanFeedback,
   DashboardState,
@@ -14,105 +20,62 @@ import type {
   TodayMetrics,
 } from './types';
 
-/**
- * Base URL for the versioned API.
- * Override with VITE_API_BASE_URL in .env for non-standard setups.
- */
-const BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '/api/v1';
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-async function get<T>(
-  path: string,
-  params?: Record<string, string | number | boolean>,
-): Promise<T> {
-  const url = new URL(`${BASE}${path}`, window.location.origin);
-  if (params) {
-    Object.entries(params).forEach(([k, v]) => {
-      if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-    });
-  }
-  const res = await fetch(url.toString(), {
-    headers: { 'X-Gensee-Dashboard': '1' },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`[${res.status}] ${text || res.statusText}`);
-  }
-  return res.json() as Promise<T>;
-}
-
-async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Gensee-Dashboard': '1',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`[${res.status}] ${text || res.statusText}`);
-  }
-  return res.json() as Promise<T>;
-}
-
-// ---------------------------------------------------------------------------
-// Public API surface
-// ---------------------------------------------------------------------------
-
 export const api = {
-  // Dashboard summary counts.
-  state: () => get<DashboardState>('/state'),
+  // Dashboard state
+  state: () => invoke<DashboardState>('get_state'),
 
-  // Sessions.
+  // Sessions
   sessions: (limit = 50, offset = 0, hideEmpty = false) =>
-    get<Session[]>('/sessions', { limit, offset, ...(hideEmpty && { hide_empty: 'true' }) }),
-  session: (id: string) => get<Session>(`/sessions/${encodeURIComponent(id)}`),
+    invoke<Session[]>('get_sessions', { limit, offset, hideEmpty }),
+  session: (id: string) => invoke<Session>('get_session', { id }),
   sessionRequests: (id: string, limit = 50) =>
-    get<Request[]>(`/sessions/${encodeURIComponent(id)}/requests`, { limit }),
+    invoke<Request[]>('get_session_requests', { id, limit }),
   sessionEvents: (id: string) =>
-    get<SystemEvent[]>(`/sessions/${encodeURIComponent(id)}/events`),
+    invoke<SystemEvent[]>('get_session_events', { id }),
 
-  // Agent events.
+  // Agent events
   agentEvents: (params?: Partial<{ request_id: number; limit: number; offset: number }>) =>
-    get<AgentEvent[]>('/events/agent', params as Record<string, number>),
+    invoke<AgentEvent[]>('get_agent_events', {
+      requestId: params?.request_id,
+      limit:     params?.limit,
+      offset:    params?.offset,
+    }),
 
-  // Alerts.
+  // Alerts
   alerts: (params?: Partial<{ severity: string; action: string; request_id: number; limit: number; offset: number }>) =>
-    get<Alert[]>('/alerts', params as Record<string, string | number>),
+    invoke<Alert[]>('get_alerts', {
+      severity:  params?.severity,
+      action:    params?.action,
+      requestId: params?.request_id,
+      limit:     params?.limit,
+      offset:    params?.offset,
+    }),
 
-  // Dashboard stats charts.
+  // Stats charts
   activityStats: (range: '24h' | '7d' = '24h') =>
-    get<ActivityStats>('/stats/activity', { range }),
+    invoke<ActivityStats>('get_activity_stats', { range }),
   severityStats: () =>
-    get<SeverityCount[]>('/stats/severity'),
+    invoke<SeverityCount[]>('get_severity_stats'),
 
-  // Artifacts & lineage.
+  // Artifacts
   artifacts: (limit = 50, offset = 0) =>
-    get<Artifact[]>('/artifacts', { limit, offset }),
+    invoke<unknown[]>('get_artifacts', { limit, offset }),
   artifactLineage: (id: number) =>
-    get<LineageGraphData>(`/artifacts/${id}/lineage`),
+    invoke<LineageGraphData>('get_artifact_lineage', { id }),
   artifactGraph: () =>
-    get<ArtifactGraphData>('/artifacts/graph'),
+    invoke<ArtifactGraphData>('get_artifact_graph'),
 
-  // Policy document.
-  policy: () => get<unknown>('/policy'),
-  savePolicy: (body: unknown) => post<{ ok: boolean }>('/policy', body),
+  // Policy
+  policy: () => invoke<unknown>('get_policy'),
+  savePolicy: (body: unknown) => invoke<void>('save_policy', { body }),
 
-  // Human feedback.
+  // Feedback
   feedback: (limit = 50, offset = 0) =>
-    get<HumanFeedback[]>('/feedback', { limit, offset }),
+    invoke<HumanFeedback[]>('get_feedback', { limit, offset }),
   recordFeedback: (data: Partial<HumanFeedback>) =>
-    post<{ feedback_id: number }>('/feedback', data),
+    invoke<{ feedback_id: number }>('record_feedback', { data }),
 
-  /** SSE endpoint URL for the Live Feed page. */
-  realtimeUrl: () => `${BASE}/events/stream`,
-
-  // Today's (or any day's) activity metrics.
+  // Today metrics
   todayMetrics: (date?: string) =>
-    get<TodayMetrics>('/metrics/today', date ? { date } : undefined),
+    invoke<TodayMetrics>('get_today_metrics', { date }),
 };

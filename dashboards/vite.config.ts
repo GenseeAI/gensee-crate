@@ -16,13 +16,7 @@ export default defineConfig({
   server: {
     port: 5174,
     strictPort: true,
-    // Proxy API calls to the Node API server during development.
-    proxy: {
-      '/api': {
-        target: 'http://127.0.0.1:3001',
-        changeOrigin: true,
-      },
-    },
+    // No proxy needed — data access goes through Tauri IPC, not HTTP.
   },
   build: {
     outDir: 'dist',

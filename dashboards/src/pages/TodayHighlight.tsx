@@ -62,7 +62,7 @@ export default function TodayHighlight() {
 
   const m = data;
   const totalAlerts = m
-    ? Object.values(m.alerts_by_action).reduce((s, n) => s + n, 0)
+    ? Object.values(m.alerts_by_action ?? {}).reduce((s, n) => s + n, 0)
     : 0;
   return (
     <div>
