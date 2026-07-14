@@ -52,6 +52,17 @@ hot-reload assets to the native WebView. It is not a dashboard API and normal
 browsers cannot render the dashboard or invoke its IPC commands. Production
 builds embed the static frontend; they do not open a localhost port.
 
+## Local telemetry privacy
+
+`$GENSEE_HOME/gensee.db` is sensitive local security telemetry. It can contain
+agent prompts, file paths, tool names, policy findings, and bounded metadata for
+WebSearch, WebFetch, and ToolSearch calls. Treat the Gensee home directory as
+private user data and do not share the database without review.
+
+The store does not generically copy arbitrary non-file tool-input objects. Each
+persisted tool-input JSON record is capped at 16 KiB; oversized inputs are
+replaced by truncation metadata rather than partial content.
+
 ## Linux Tauri prerequisites
 
 On Ubuntu/Debian:
