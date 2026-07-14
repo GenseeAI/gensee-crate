@@ -37,7 +37,7 @@ started. All data access goes through Tauri IPC.
 - Node 18 or newer.
 - A built `gensee` binary for policy validation.
 - Linux development requires WebKitGTK and GTK development packages; see
-	[`dashboards/README.md`](../dashboards/README.md#linux-tauri-prerequisites).
+	[`dashboards/README.md`](https://github.com/GenseeAI/gensee-crate/blob/main/dashboards/README.md#linux-tauri-prerequisites).
 
 The Tauri app binds no TCP port. All data access goes through Rust `#[tauri::command]`
 handlers over the Tauri IPC bridge. Policy writes apply `0600` permissions and

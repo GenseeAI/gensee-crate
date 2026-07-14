@@ -2090,10 +2090,10 @@ fn resolve_tool_path(path: &str, cwd: Option<&str>) -> String {
 fn tool_input_json(event: &AgentHookEvent) -> Option<String> {
     if event.tool_input_command.is_some() || event.tool_input_description.is_some() {
         return store_tool_input(json!({
-                "tool_use_id": event.tool_use_id.as_deref(),
-                "command": event.tool_input_command.as_deref(),
-                "description": event.tool_input_description.as_deref(),
-            }));
+            "tool_use_id": event.tool_use_id.as_deref(),
+            "command": event.tool_input_command.as_deref(),
+            "description": event.tool_input_description.as_deref(),
+        }));
     }
 
     let tools = native_file_tools(event);
@@ -2125,20 +2125,20 @@ fn tool_input_json(event: &AgentHookEvent) -> Option<String> {
             None
         }
         [tool] => store_tool_input(json!({
-                "tool_use_id": event.tool_use_id.as_deref(),
-                "operation": tool.operation,
-                "path": tool.path,
-            })),
+            "tool_use_id": event.tool_use_id.as_deref(),
+            "operation": tool.operation,
+            "path": tool.path,
+        })),
         _ => store_tool_input(json!({
-                "tool_use_id": event.tool_use_id.as_deref(),
-                "changes": tools
-                    .iter()
-                    .map(|tool| json!({
-                        "operation": tool.operation,
-                        "path": tool.path,
-                    }))
-                    .collect::<Vec<_>>(),
-            })),
+            "tool_use_id": event.tool_use_id.as_deref(),
+            "changes": tools
+                .iter()
+                .map(|tool| json!({
+                    "operation": tool.operation,
+                    "path": tool.path,
+                }))
+                .collect::<Vec<_>>(),
+        })),
     }
 }
 
@@ -2151,12 +2151,14 @@ fn store_tool_input(value: Value) -> Option<String> {
         return Some(encoded);
     }
 
-    Some(json!({
-        "truncated": true,
-        "original_bytes": encoded.len(),
-        "max_bytes": MAX_STORED_TOOL_INPUT_BYTES,
-    })
-    .to_string())
+    Some(
+        json!({
+            "truncated": true,
+            "original_bytes": encoded.len(),
+            "max_bytes": MAX_STORED_TOOL_INPUT_BYTES,
+        })
+        .to_string(),
+    )
 }
 
 fn tool_response_json(event: &AgentHookEvent) -> Option<String> {
