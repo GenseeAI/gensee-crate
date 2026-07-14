@@ -704,11 +704,15 @@ pub fn run() {
             get_today_metrics,
         ])
         .setup(move |app| {
-            // Development-only: expose WebView console errors instead of leaving
-            // a blank page with no diagnostics when Vite/frontend code fails.
-            #[cfg(debug_assertions)]
-            if let Some(window) = app.get_webview_window("main") {
-                window.open_devtools();
+            // Expose WebView devtools in debug builds, or when explicitly
+            // requested in release via GENSEE_OPEN_DEVTOOLS=1.
+            let open_devtools = cfg!(debug_assertions)
+                || std::env::var("GENSEE_OPEN_DEVTOOLS").ok().as_deref() == Some("1");
+
+            if open_devtools {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.open_devtools();
+                }
             }
 
             let handle = app.handle().clone();

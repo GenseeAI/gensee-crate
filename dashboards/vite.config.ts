@@ -8,6 +8,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
+  // Tauri loads production files from local app resources, not from a web root.
+  // Relative asset URLs prevent '/assets/*' lookups that break in bundled apps.
+  base: './',
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),

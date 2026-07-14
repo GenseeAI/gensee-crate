@@ -57,7 +57,7 @@ export default function App() {
   if (!isTauri()) {
     return (
       <main style={{ maxWidth: 560, margin: '15vh auto', padding: 24, fontFamily: 'system-ui, sans-serif' }}>
-        <h1>Gensee Dashboard</h1>
+        <h1>Gensee Dashboards</h1>
         <p>This interface must be launched through the Gensee desktop application.</p>
         <p>For development, run <code>cargo tauri dev</code> from the dashboards directory.</p>
       </main>
