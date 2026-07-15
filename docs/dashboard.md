@@ -22,11 +22,17 @@ Install the dashboard dependencies once (requires Node 18+):
 npm install --prefix dashboards --legacy-peer-deps
 ```
 
+Install the pinned native Tauri CLI once:
+
+```bash
+cargo install tauri-cli --version "^2" --locked
+```
+
 Then launch the Tauri desktop app:
 
 ```bash
 cd dashboards
-GENSEE_HOME="$HOME/.gensee" npm run tauri:dev
+GENSEE_HOME="$HOME/.gensee" cargo tauri dev
 ```
 
 This opens a native window backed by the Rust core — no TCP server is
@@ -49,13 +55,13 @@ no network-accessible endpoint to attack.
 
 ## Demo Data
 
-A fresh store is empty. Seed a demo store to populate the Timeline, Lineage,
-and Policy views by running agent sessions with `gensee-sudo run -- <agent>`,
-or point `GENSEE_HOME` at an existing store that already has data.
+A fresh store is empty. Populate the Timeline, Lineage, and Policy views by
+running an agent session with `gensee run -- <agent>`, or point `GENSEE_HOME`
+at an existing store that already has data.
 
 ```bash
 # Example: run a quick Claude session to generate events
-GENSEE_HOME=~/.gensee gensee-sudo run -- claude
+GENSEE_HOME=~/.gensee gensee run -- claude
 
 # Then open the dashboard
 cd dashboards && GENSEE_HOME=~/.gensee cargo tauri dev
@@ -74,7 +80,7 @@ Rules, and Artifact Definitions tabs provide structured editing; the Advanced
 Run the native app with frontend hot reload:
 
 ```bash
-cd dashboards && npm run tauri:dev
+cd dashboards && cargo tauri dev
 ```
 
 The Tauri dev runner starts Vite automatically (configured in

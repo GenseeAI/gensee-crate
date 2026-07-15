@@ -7,7 +7,7 @@ the dashboard does not start an HTTP API server.
 ## Requirements
 
 - Node 18 or newer
-- Rust stable and the Tauri CLI (`cargo install tauri-cli --version '^2'`)
+- Rust stable and the Tauri CLI (`cargo install tauri-cli --version "^2" --locked`)
 - A built `gensee` CLI binary (for policy validation)
 - Linux: WebKitGTK development packages (see the Tauri prerequisites below)
 

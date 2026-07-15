@@ -10,7 +10,7 @@
 <p align="center">
   Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
   It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS and Linux.
-  Real-time enforcement combines agent-interface decisions with Linux syscall, network, and sensitive-file controls. Offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
+  Real-time enforcement combines agent-interface decisions with Linux syscall, network, and sensitive-file controls. Offline event tracking, lineage, and provenance can be viewed in a native desktop dashboard and command line.
 </p>
 
 <p align="center">
@@ -417,8 +417,9 @@ Install dependencies once, then launch from the repository checkout:
 
 ```bash
 npm install --prefix dashboards --legacy-peer-deps
+cargo install tauri-cli --version "^2" --locked
 cd dashboards
-GENSEE_HOME="$HOME/.gensee" npm run tauri:dev
+GENSEE_HOME="$HOME/.gensee" cargo tauri dev
 ```
 
 This opens a native desktop window backed by the Rust core. No TCP server
@@ -470,7 +471,7 @@ You can also point `GENSEE_POLICY_FILE` at a custom policy path; see
 
 Gensee Crate supports macOS and Linux today, with Claude Code, Codex, and
 Antigravity hook support, local policy enforcement, staged workspace runs, local
-telemetry, and a browser dashboard. Next directions include:
+telemetry, and a native desktop dashboard. Next directions include:
 
 - **Linux system enforcement:** eBPF telemetry, Landlock/AppArmor profile
   generation, daemon-owned fanotify lifecycle, and richer per-attempt
