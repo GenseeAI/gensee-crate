@@ -218,13 +218,16 @@ fn get_session_events(state: tauri::State<AppState>, id: String) -> Result<Vec<V
     qjson(&conn, "
         SELECT se.*,
             COALESCE(
-                CASE WHEN se.cwd != '' THEN se.cwd END,
+                -- Workspace-effect/fsevents records store the changed file at
+                -- the top level. cwd is the workspace root, not the event path.
+                json_extract(se.args, '$.path'),
                 json_extract(se.args, '$.event.write.target.path'),
                 json_extract(se.args, '$.event.create.destination.path'),
                 json_extract(se.args, '$.event.rename.destination.path'),
                 json_extract(se.args, '$.event.unlink.target.path'),
                 json_extract(se.args, '$.event.exec.target.path'),
-                json_extract(se.args, '$.event.open.file.path')
+                json_extract(se.args, '$.event.open.file.path'),
+                CASE WHEN se.cwd != '' THEN se.cwd END
             ) AS path,
             json_extract(se.args, '$.process.executable.path') AS process
           FROM system_events se
