@@ -11,6 +11,21 @@ the dashboard does not start an HTTP API server.
 - A built `gensee` CLI binary (for policy validation)
 - Linux: WebKitGTK development packages (see the Tauri prerequisites below)
 
+## Installer setup
+
+The one-line Gensee installer can provision this dashboard source checkout and
+its Tauri/frontend dependencies. In an interactive install, accept the native
+dashboard prompt; for unattended installs use:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh \
+   | GENSEE_CONFIGURE_DASHBOARD=1 bash
+```
+
+Set `GENSEE_DASHBOARD_SOURCE_DIR` to choose the local source checkout location.
+The installer requires Node.js 18+ and prints the resulting `cargo tauri dev`
+launch command after setup.
+
 ## Quick start
 
 ```bash

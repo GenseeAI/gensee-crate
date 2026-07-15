@@ -186,6 +186,82 @@ configure_policy() {
   esac
 }
 
+configure_dashboard() {
+  local should_configure="${GENSEE_CONFIGURE_DASHBOARD:-}"
+  local dashboard_dir="${GENSEE_DASHBOARD_SOURCE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/gensee/dashboard}"
+
+  if [ "$should_configure" = "0" ]; then
+    return 0
+  fi
+
+  if [ "$should_configure" != "1" ]; then
+    if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+      return 0
+    fi
+    printf 'Set up the native Gensee dashboard now? This installs Tauri and Node dependencies. [y/N] ' >/dev/tty
+    IFS= read -r should_configure </dev/tty || should_configure=""
+  fi
+
+  case "$should_configure" in
+    1 | y | Y | yes | YES)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    warn "Node.js 18+ and npm are required for the native dashboard. Install them, then rerun with GENSEE_CONFIGURE_DASHBOARD=1."
+    return 0
+  fi
+
+  local node_major
+  node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  if [ "$node_major" -lt 18 ]; then
+    warn "The native dashboard requires Node.js 18+ (found $(node --version))."
+    return 0
+  fi
+
+  if [ "$OS_NAME" = "Linux" ] && command -v apt-get >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1; then
+      info "Installing Linux Tauri WebView prerequisites"
+      sudo apt-get update
+      sudo apt-get install -y \
+        libwebkit2gtk-4.1-dev libgtk-3-dev \
+        libayatana-appindicator3-dev librsvg2-dev
+    else
+      warn "sudo is unavailable. Install Tauri prerequisites manually: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev"
+      return 0
+    fi
+  elif [ "$OS_NAME" = "Linux" ]; then
+    warn "Automatic Tauri prerequisite installation supports apt-get only. Install WebKitGTK, GTK3, AppIndicator, and librsvg development packages for your distribution."
+    return 0
+  fi
+
+  if ! command -v cargo-tauri >/dev/null 2>&1; then
+    info "Installing Tauri CLI"
+    cargo install tauri-cli --version "^2" --locked
+  fi
+
+  info "Preparing dashboard source at $dashboard_dir"
+  if [ -d "$dashboard_dir/.git" ]; then
+    git -C "$dashboard_dir" fetch --depth 1 origin "$INSTALL_REF"
+    git -C "$dashboard_dir" checkout --force FETCH_HEAD
+  else
+    mkdir -p "$(dirname "$dashboard_dir")"
+    git clone --depth 1 "$REPO_URL" "$dashboard_dir"
+    git -C "$dashboard_dir" checkout --force "$INSTALL_REF"
+  fi
+
+  info "Installing dashboard frontend dependencies"
+  npm --prefix "$dashboard_dir/dashboards" install --legacy-peer-deps
+  info "Validating dashboard frontend build"
+  npm --prefix "$dashboard_dir/dashboards" run build
+
+  DASHBOARD_CONFIGURED=1
+  DASHBOARD_DIR="$dashboard_dir/dashboards"
+}
+
 print_banner
 
 OS_NAME="$(uname -s)"
@@ -255,11 +331,14 @@ choose_gensee_home
 CLAUDE_HOOKS_CONFIGURED=0
 CODEX_HOOKS_CONFIGURED=0
 ANTIGRAVITY_HOOKS_CONFIGURED=0
+DASHBOARD_CONFIGURED=0
+DASHBOARD_DIR=""
 configure_claude_code_hooks
 configure_codex_hooks
 configure_antigravity_hooks
 POLICY_SETUP="default"
 configure_policy
+configure_dashboard
 INSTALL_GENSEE_HOME="$GENSEE_HOME"
 
 cat <<'EOF'
@@ -328,7 +407,22 @@ EOF
   printf '  GENSEE_HOME="%s" gensee setup antigravity --gensee-home "%s"\n' "$INSTALL_GENSEE_HOME" "$INSTALL_GENSEE_HOME"
 fi
 
+if [ "$DASHBOARD_CONFIGURED" = "1" ]; then
+  cat <<EOF
+
+Native dashboard dependencies are installed. Launch it with:
+  cd "$DASHBOARD_DIR"
+  GENSEE_HOME="$INSTALL_GENSEE_HOME" cargo tauri dev
+EOF
+else
+  cat <<'EOF'
+
+Set up the native dashboard later with:
+  GENSEE_CONFIGURE_DASHBOARD=1 scripts/install_oss.sh
+EOF
+fi
+
 cat <<'EOF'
 For non-interactive installs:
-  curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 bash
+  curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 GENSEE_CONFIGURE_DASHBOARD=1 bash
 EOF

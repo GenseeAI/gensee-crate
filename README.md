@@ -77,11 +77,16 @@ lets you keep the bundled default policy or create an editable local policy:
 curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | bash
 ```
 
+During an interactive install, choose the native dashboard prompt to provision
+its Tauri and frontend dependencies. For a non-interactive install, add
+`GENSEE_CONFIGURE_DASHBOARD=1`. This requires Node.js 18+; on Linux it also
+installs the WebKitGTK development packages required by Tauri.
+
 For non-interactive installs that should configure Claude Code, Codex, and
 Antigravity hooks:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 bash
+curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 GENSEE_CONFIGURE_DASHBOARD=1 bash
 ```
 
 <details>
