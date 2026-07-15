@@ -9,6 +9,7 @@ use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager};
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::Mutex,
     time::Duration,
@@ -23,6 +24,52 @@ pub struct AppState {
     ro: Mutex<Connection>,
     /// Directory that contains gensee.db, policy.json, etc.
     home: PathBuf,
+}
+
+/// Open a Gensee database exactly like the store does: encrypted stores use
+/// SQLCipher and the hex key in `$GENSEE_HOME/gensee.key`; legacy/plaintext
+/// SQLite stores intentionally remain keyless.
+fn open_dashboard_connection(
+    home: &Path,
+    db_path: &Path,
+    flags: OpenFlags,
+) -> Result<Connection, String> {
+    let conn = Connection::open_with_flags(db_path, flags).map_err(|e| {
+        format!("Unable to open Gensee database {}: {e}", db_path.display())
+    })?;
+
+    if !database_is_plaintext(db_path)? {
+        let key_path = home.join("gensee.key");
+        let key = fs::read_to_string(&key_path).map_err(|e| {
+            format!(
+                "The encrypted Gensee database requires {}: {e}",
+                key_path.display()
+            )
+        })?;
+        let key = key.trim();
+        if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("Invalid SQLCipher key in {}", key_path.display()));
+        }
+        conn.pragma_update(None, "key", key).map_err(|e| {
+            format!("Unable to apply SQLCipher key for {}: {e}", db_path.display())
+        })?;
+    }
+
+    // Force page access now. Without this, SQLCipher reports SQLITE_NOTADB only
+    // later on the first dashboard query, which obscures the real cause.
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("Unable to read Gensee database {}: {e}", db_path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    Ok(conn)
+}
+
+fn database_is_plaintext(path: &Path) -> Result<bool, String> {
+    let mut header = [0_u8; 16];
+    let mut file = fs::File::open(path)
+        .map_err(|e| format!("Unable to read Gensee database {}: {e}", path.display()))?;
+    use std::io::Read;
+    let bytes = file.read(&mut header).map_err(|e| e.to_string())?;
+    Ok(bytes == header.len() && &header == b"SQLite format 3\0")
 }
 
 // ---------------------------------------------------------------------------
@@ -472,9 +519,13 @@ fn get_feedback(state: tauri::State<AppState>, limit: Option<u32>, offset: Optio
 
 #[tauri::command]
 fn record_feedback(state: tauri::State<AppState>, data: Value) -> Result<Value, String> {
-    // Open a read-write connection for this write operation.
+    // Open a SQLCipher-aware read-write connection for this write operation.
     let db_path = state.home.join("gensee.db");
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let conn = open_dashboard_connection(
+        &state.home,
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
 
     let now = chrono_now_ms();
     let event_key    = data.get("event_key").and_then(Value::as_str).unwrap_or("");
@@ -615,9 +666,9 @@ fn get_today_metrics(state: tauri::State<AppState>, date: Option<String>) -> Res
 // Real-time event stream (background thread → Tauri events)
 // ---------------------------------------------------------------------------
 
-fn start_event_stream(app: tauri::AppHandle, db_path: PathBuf) {
+fn start_event_stream(app: tauri::AppHandle, home: PathBuf, db_path: PathBuf) {
     std::thread::spawn(move || {
-        let conn = match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        let conn = match open_dashboard_connection(&home, &db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
             Ok(c) => c,
             Err(e) => { eprintln!("Event stream: cannot open DB: {e}"); return; }
         };
@@ -675,10 +726,10 @@ pub fn run() {
     let home    = resolve_home();
     let db_path = resolve_db_path(&home);
 
-    // Open read-only connection (dashboard never writes agent data).
-    let ro = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .or_else(|_| Connection::open_with_flags(":memory:", OpenFlags::SQLITE_OPEN_READ_ONLY))
-        .expect("Failed to open SQLite connection");
+    // Open the real store at startup. Do not fall back to an empty in-memory
+    // database: that hides encryption/key failures behind blank dashboard data.
+    let ro = open_dashboard_connection(&home, &db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap_or_else(|error| panic!("Failed to open Gensee store: {error}"));
 
     let state = AppState { ro: Mutex::new(ro), home: home.clone() };
 
@@ -716,7 +767,7 @@ pub fn run() {
             }
 
             let handle = app.handle().clone();
-            start_event_stream(handle, db_path.clone());
+            start_event_stream(handle, home.clone(), db_path.clone());
             Ok(())
         })
         .run(tauri::generate_context!())

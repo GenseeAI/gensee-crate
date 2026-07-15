@@ -63,6 +63,25 @@ The store does not generically copy arbitrary non-file tool-input objects. Each
 persisted tool-input JSON record is capped at 16 KiB; oversized inputs are
 replaced by truncation metadata rather than partial content.
 
+## Encrypted-store smoke test
+
+Encryption at rest is enabled by default. The Tauri backend uses bundled
+SQLCipher and reads `$GENSEE_HOME/gensee.key` before opening an encrypted
+`gensee.db`; it does not silently fall back to an empty database when the key is
+missing or invalid.
+
+After generating at least one event with the default store, verify the native
+dashboard against that same encrypted store:
+
+```bash
+# This should open real sessions, alerts, and Timeline data from the default
+# encrypted store. Do not copy or print $GENSEE_HOME/gensee.key.
+GENSEE_HOME="$HOME/.gensee" cargo tauri dev
+```
+
+If the key is unavailable or mismatched, startup fails with an explicit store
+error rather than rendering empty panels.
+
 ## Linux Tauri prerequisites
 
 On Ubuntu/Debian:

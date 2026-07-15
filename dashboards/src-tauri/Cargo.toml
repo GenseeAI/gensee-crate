@@ -18,8 +18,10 @@ tauri-build = { version = "2", features = [] }
 tauri      = { version = "2", features = ["devtools"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Bundled SQLite so the binary has no system-sqlite version dependency.
-rusqlite   = { version = "0.32", features = ["bundled"] }
+# Match gensee-crate-db: default stores use SQLCipher and require gensee.key.
+# Bundling SQLCipher avoids a system library dependency and supports plaintext
+# stores too when no key is required.
+rusqlite   = { version = "0.32", features = ["bundled-sqlcipher"] }
 hex        = "0.4"    # blob columns → hex strings
 dirs       = "5"      # platform home dir for GENSEE_HOME fallback
 getrandom  = "0.2"   # CSPRNG for temp-file name generation
