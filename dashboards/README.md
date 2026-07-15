@@ -133,4 +133,6 @@ sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev \
 The Policy page loads `$GENSEE_HOME/policy.json` (or the bundled default if not
 yet customised). Saving validates the document via the `gensee` binary then
 writes `$GENSEE_HOME/policy.json` with owner-only permissions (`0600` on Unix).
+The validated content is synced to a same-directory temporary file and atomically
+renamed into place, so an interrupted save leaves the previous policy intact.
 The next hook or `gensee run` invocation picks up the change automatically.

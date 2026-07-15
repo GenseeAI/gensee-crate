@@ -505,22 +505,40 @@ fn which_gensee() -> Option<PathBuf> {
         } else { None })
 }
 
+/// Write sensitive configuration without ever truncating the active policy.
+/// The temporary file lives beside the destination, so a successful rename is
+/// atomic on Unix. If replacement is unsupported on a platform, the operation
+/// fails with the existing policy intact rather than risking corruption.
 fn write_secret(path: PathBuf, data: &[u8]) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .and_then(|mut f| f.write_all(data))
-            .map_err(|e| e.to_string())
+    use std::io::Write;
+
+    let filename = path.file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("Invalid policy path: {}", path.display()))?;
+    let temporary = path.with_file_name(format!(".{filename}.{}.tmp", uuid_hex()));
+
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        // Keep the prior policy untouched and clean up an incomplete staged file.
+        fs::remove_file(&temporary).ok();
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, data).map_err(|e| e.to_string())
-    }
+    result.map_err(|e| format!("Unable to atomically write policy: {e}"))
 }
 
 /// Tiny UUID-like hex string from OS CSPRNG bytes.
