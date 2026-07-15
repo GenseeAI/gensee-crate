@@ -1427,8 +1427,9 @@ fn antigravity_native_policy_subjects(event: &AgentHookEvent, value: &Value) -> 
 
 /// VS Code native file-operation tools mapped to policy subjects. VS Code uses
 /// camelCase `filePath` for single-file tools and a `files` array for
-/// `editFiles`. `runInTerminal` is handled downstream by `file_intents_from_hook`
-/// (bash command parsing) and deliberately returns empty here.
+/// `editFiles`. Terminal tools are handled downstream by
+/// `file_intents_from_hook` (bash command parsing) and deliberately return empty
+/// here.
 fn vscode_native_policy_subjects(event: &AgentHookEvent, value: &Value) -> Vec<PolicySubject> {
     let Some(tool_name) = event.tool_name.as_deref() else {
         return Vec::new();
@@ -1439,7 +1440,7 @@ fn vscode_native_policy_subjects(event: &AgentHookEvent, value: &Value) -> Vec<P
     };
 
     // Shell commands: intent is extracted via bash command parsing elsewhere.
-    if tool_name == "runInTerminal" {
+    if matches!(tool_name, "runInTerminal" | "runTerminalCommand") {
         return Vec::new();
     }
 
@@ -1463,7 +1464,12 @@ fn vscode_native_policy_subjects(event: &AgentHookEvent, value: &Value) -> Vec<P
     }
 
     let (operation, path_key): (&str, &str) = match tool_name {
-        "create_file" | "replace_string_in_file" | "insert_edit_into_file" => ("write", "filePath"),
+        "create_file"
+        | "createFile"
+        | "replace_string_in_file"
+        | "replaceStringInFile"
+        | "insert_edit_into_file"
+        | "insertEditIntoFile" => ("write", "filePath"),
         "readFile" => ("read", "filePath"),
         "deleteFile" => ("delete", "filePath"),
         _ => return Vec::new(),

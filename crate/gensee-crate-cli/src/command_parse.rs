@@ -428,9 +428,9 @@ fn build_antigravity_hook_event(value: Value, observed_at_ms: u64) -> io::Result
 /// Build an `AgentHookEvent` from a VS Code / GitHub Copilot hook payload.
 /// VS Code uses PascalCase event names (same as Claude Code) and the same
 /// `session_id` / `cwd` / `hook_event_name` field names, so the only notable
-/// difference from Claude Code parsing is that VS Code's shell tool is named
-/// `runInTerminal` (not `Bash`) and `tool_response` is a flat string (not a
-/// nested object with stdout/stderr).
+/// difference from Claude Code parsing is that VS Code's shell tools are named
+/// `runTerminalCommand` or `runInTerminal` (not `Bash`) and `tool_response` is
+/// a flat string (not a nested object with stdout/stderr).
 fn build_vscode_hook_event(value: Value, observed_at_ms: u64) -> io::Result<AgentHookEvent> {
     let hook_event_name = v_str(&value, "hook_event_name");
     let tool_input_command = v_nested_str(&value, "tool_input", "command");
@@ -490,7 +490,10 @@ pub(crate) fn file_intents_from_hook(
     event: &AgentHookEvent,
     original_command: Option<&str>,
 ) -> Vec<FileIntent> {
-    if !matches!(event.tool_name.as_deref(), Some("Bash" | "run_command" | "runInTerminal")) {
+    if !matches!(
+        event.tool_name.as_deref(),
+        Some("Bash" | "run_command" | "runInTerminal" | "runTerminalCommand")
+    ) {
         return Vec::new();
     }
 
@@ -541,7 +544,7 @@ pub(crate) fn original_bash_command(payload: &str) -> Option<String> {
     }
     if matches!(
         v_str(&value, "tool_name").as_deref(),
-        Some("Bash") | Some("runInTerminal")
+        Some("Bash") | Some("runInTerminal") | Some("runTerminalCommand")
     ) {
         return v_nested_str(&value, "tool_input", "command");
     }

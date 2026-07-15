@@ -1188,15 +1188,28 @@ pub(crate) fn apply_vscode_hook_settings(root: &mut Value, command: &str) -> io:
     // { "type": "command", "command": "..." } without the nested matcher/hooks
     // arrays used by Claude Code.  VS Code also reads Claude Code's nested
     // format, but the flat form is the idiomatic VS Code style.
-    let hook_entry = json!([
-        {
-            "type": "command",
-            "command": command,
-            "timeout": 30
-        }
-    ]);
+    let hook_entry = json!({
+        "type": "command",
+        "command": command,
+        "timeout": 30
+    });
     for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
-        hooks_object.insert(event_name.to_string(), hook_entry.clone());
+        let entries = hooks_object
+            .entry(event_name.to_string())
+            .or_insert_with(|| json!([]));
+        if !entries.is_array() {
+            *entries = json!([]);
+        }
+        let entries = entries.as_array_mut().expect("hook entries are an array");
+        // Replace a previous Gensee entry so rerunning setup is idempotent and
+        // updates changed paths, while preserving unrelated commands.
+        entries.retain(|entry| {
+            !entry
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|existing| existing.ends_with(" hook vscode"))
+        });
+        entries.push(hook_entry.clone());
     }
     Ok(())
 }

@@ -613,30 +613,60 @@ fn vscode_setup_adds_hooks_in_flat_format_preserving_existing() {
     )
     .unwrap();
 
-    // Unrelated hook entry must survive.
+    // Unrelated hook entry in the same event must survive.
     assert_eq!(
         settings["hooks"]["PostToolUse"][0]["command"],
-        json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook vscode"),
-        "PostToolUse should be overwritten by gensee entry"
+        json!("./format.sh")
     );
     for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
+        let gensee_entry = settings["hooks"][event_name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| {
+                entry["command"]
+                    == json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook vscode")
+            })
+            .unwrap();
         // Flat format: each entry is { "type": "command", "command": "...", "timeout": 30 }
         // NOT nested like Claude Code ({ "matcher": "*", "hooks": [{ ... }] }).
         assert_eq!(
-            settings["hooks"][event_name][0]["type"],
+            gensee_entry["type"],
             json!("command"),
             "flat type field for {event_name}"
         );
         assert_eq!(
-            settings["hooks"][event_name][0]["command"],
+            gensee_entry["command"],
             json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook vscode")
         );
-        assert_eq!(settings["hooks"][event_name][0]["timeout"], json!(30));
+        assert_eq!(gensee_entry["timeout"], json!(30));
         // No nested hooks array (Claude Code style).
         assert!(
-            settings["hooks"][event_name][0].get("hooks").is_none(),
+            gensee_entry.get("hooks").is_none(),
             "flat format must not have nested hooks array for {event_name}"
         );
+    }
+
+    // Rerunning setup replaces the Gensee command instead of duplicating it.
+    apply_vscode_hook_settings(
+        &mut settings,
+        "GENSEE_HOME=/new/store /opt/gensee hook vscode",
+    )
+    .unwrap();
+    for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
+        let entries = settings["hooks"][event_name].as_array().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["command"]
+                    .as_str()
+                    .is_some_and(|command| command.ends_with(" hook vscode")))
+                .count(),
+            1
+        );
+        assert!(entries.iter().any(
+            |entry| entry["command"] == json!("GENSEE_HOME=/new/store /opt/gensee hook vscode")
+        ));
     }
 }
 
@@ -684,9 +714,32 @@ fn vscode_hook_event_parses_pretool_run_in_terminal() {
     assert_eq!(event.tool_name.as_deref(), Some("runInTerminal"));
     assert_eq!(event.tool_input_command.as_deref(), Some("npm test"));
     assert_eq!(event.cwd.as_deref(), Some("/project"));
+    assert_eq!(original_bash_command(&payload).as_deref(), Some("npm test"));
+}
+
+#[test]
+fn vscode_hook_event_parses_documented_run_terminal_command() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vsc-sess-current",
+        "tool_name": "runTerminalCommand",
+        "tool_input": { "command": "cargo test" },
+        "tool_use_id": "use-current",
+        "cwd": "/project"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    assert_eq!(event.tool_name.as_deref(), Some("runTerminalCommand"));
+    assert_eq!(event.tool_input_command.as_deref(), Some("cargo test"));
     assert_eq!(
         original_bash_command(&payload).as_deref(),
-        Some("npm test")
+        Some("cargo test")
+    );
+    assert_eq!(
+        file_intents_from_hook(&event, Some("touch /tmp/vscode-current"))[0].path,
+        "/tmp/vscode-current"
     );
 }
 
@@ -759,7 +812,9 @@ fn vscode_userpromptsubmit_poison_json_uses_system_message() {
     // systemMessage is shown to the user in chat — more visible than
     // Claude Code's model-only additionalContext.
     assert!(
-        parsed["systemMessage"].as_str().is_some_and(|m| !m.is_empty()),
+        parsed["systemMessage"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
         "systemMessage must be non-empty: {parsed}"
     );
     // Must NOT use the Claude Code envelope (would be ignored by VS Code).
@@ -790,7 +845,9 @@ fn vscode_native_subjects_parse_edit_files_array() {
 fn vscode_native_subjects_parse_single_file_tools() {
     for (tool_name, expected_op) in [
         ("create_file", "write"),
+        ("createFile", "write"),
         ("replace_string_in_file", "write"),
+        ("replaceStringInFile", "write"),
         ("readFile", "read"),
         ("deleteFile", "delete"),
     ] {

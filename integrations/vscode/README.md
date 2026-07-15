@@ -47,8 +47,8 @@ command written by `gensee setup vscode`:
 Note: VS Code also reads `.claude/settings.json` natively, so an existing
 `gensee setup claude-code` installation already fires hooks inside VS Code.
 The `vscode` provider adds correct parsing of VS Code-specific tool names
-(e.g. `runInTerminal` for shell commands) that the `claude-code` provider does
-not handle.
+(e.g. `runTerminalCommand` and `runInTerminal` for shell commands) that the
+`claude-code` provider does not handle.
 
 ## Installed Hooks
 
@@ -130,10 +130,10 @@ VS Code uses different tool names from Claude Code. Gensee maps them correctly:
 
 | VS Code tool | Operation | Notes |
 |---|---|---|
-| `runInTerminal` | Bash shell command | Full bash intent parsing applied |
+| `runTerminalCommand`, `runInTerminal` | Bash shell command | Full bash intent parsing applied |
 | `editFiles` | File edit (multi-file) | `tool_input.files` array |
-| `create_file` | File write | `tool_input.filePath` |
-| `replace_string_in_file` | File write | `tool_input.filePath` |
+| `createFile`, `create_file` | File write | `tool_input.filePath` |
+| `replaceStringInFile`, `replace_string_in_file` | File write | `tool_input.filePath` |
 | `readFile` | File read | `tool_input.filePath` |
 | `deleteFile` | File delete | `tool_input.filePath` |
 
@@ -142,4 +142,3 @@ VS Code uses different tool names from Claude Code. Gensee maps them correctly:
 ```bash
 GENSEE_HOME=$PWD/.gensee-dev ./target/debug/gensee timeline --latest
 ```
-
