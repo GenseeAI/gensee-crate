@@ -20,8 +20,9 @@
       }
     ],
     "security": {
-      "csp": null,
-      "devCsp": "default-src 'self' http://localhost:5174; connect-src 'self' ipc: http://ipc.localhost http://localhost:5174 ws://localhost:5174; script-src 'self' 'unsafe-eval' http://localhost:5174; style-src 'self' 'unsafe-inline' http://localhost:5174; img-src 'self' data: http://localhost:5174; font-src 'self' data: http://localhost:5174"
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:",
+      "devCsp": "default-src 'self' http://localhost:5174; connect-src 'self' ipc: http://ipc.localhost http://localhost:5174 ws://localhost:5174; script-src 'self' 'unsafe-eval' http://localhost:5174; style-src 'self' 'unsafe-inline' http://localhost:5174; img-src 'self' data: http://localhost:5174; font-src 'self' data: http://localhost:5174",
+      "dangerousDisableAssetCspModification": ["style-src"]
     }
   },
   "bundle": {

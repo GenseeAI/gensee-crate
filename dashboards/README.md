@@ -74,6 +74,16 @@ hot-reload assets to the native WebView. It is not a dashboard API and normal
 browsers cannot render the dashboard or invoke its IPC commands. Production
 builds embed the static frontend; they do not open a localhost port.
 
+Production builds enforce a restrictive Content Security Policy: bundled assets
+and the Tauri IPC bridge are permitted, while arbitrary network connections,
+external scripts, and JavaScript `eval` are not. The separate development CSP
+permits Vite localhost/HMR assets only during `cargo tauri dev`.
+
+Tauri's automatic CSP nonce injection is disabled only for `style-src` because
+Ant Design and the chart library generate styles at runtime. The production CSP
+therefore explicitly allows inline styles, while retaining strict script and
+network restrictions.
+
 ## Local telemetry privacy
 
 `$GENSEE_HOME/gensee.db` is sensitive local security telemetry. It can contain
