@@ -73,6 +73,28 @@ fn database_is_plaintext(path: &Path) -> Result<bool, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Commands — local store security status
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn get_store_security(state: tauri::State<AppState>) -> Result<Value, String> {
+    let db_path = resolve_db_path(&state.home);
+    if !db_path.exists() {
+        return Ok(json!({
+            "database_exists": false,
+            "encrypted_at_rest": false,
+            "db_path": db_path,
+        }));
+    }
+
+    Ok(json!({
+        "database_exists": true,
+        "encrypted_at_rest": !database_is_plaintext(&db_path)?,
+        "db_path": db_path,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // SQL helpers
 // ---------------------------------------------------------------------------
 
@@ -737,6 +759,7 @@ pub fn run() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_state,
+            get_store_security,
             get_sessions,
             get_session,
             get_session_requests,

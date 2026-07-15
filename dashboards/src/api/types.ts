@@ -147,6 +147,12 @@ export interface DashboardState {
   artifacts_count: number;
 }
 
+export interface StoreSecurityStatus {
+  database_exists: boolean;
+  encrypted_at_rest: boolean;
+  db_path: string;
+}
+
 export interface BucketCount {
   bucket: number;   // Unix epoch ms
   count:  number;

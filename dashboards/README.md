@@ -82,6 +82,11 @@ GENSEE_HOME="$HOME/.gensee" cargo tauri dev
 If the key is unavailable or mismatched, startup fails with an explicit store
 error rather than rendering empty panels.
 
+The Settings page displays whether the active store is encrypted. Plaintext
+stores show an action-required warning. Gensee intentionally does not attempt
+an in-place SQLCipher conversion from the dashboard; use a tested migration to
+a newly initialized encrypted `GENSEE_HOME` before replacing an active store.
+
 ## Linux Tauri prerequisites
 
 On Ubuntu/Debian:

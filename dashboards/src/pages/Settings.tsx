@@ -1,41 +1,67 @@
-import { Card, Col, Divider, Form, Input, Row, Switch, Typography } from 'antd';
+import { Alert, Card, Col, Divider, Form, Input, Row, Switch, Tag, Typography } from 'antd';
 import { PageHeader } from '@/components/PageHeader';
 import { useTheme }   from '@/hooks/useTheme';
+import { useApi }     from '@/hooks/useApi';
+import { api }        from '@/api/client';
 
 const { Text } = Typography;
 
 export default function Settings() {
   const { isDark, toggle } = useTheme();
+  const { data: storeSecurity, loading: storeSecurityLoading } = useApi(api.storeSecurity);
+  const plaintextStore = storeSecurity?.database_exists && !storeSecurity.encrypted_at_rest;
 
   return (
     <div>
       <PageHeader
         title="Settings"
-        description="Connection, appearance, and advanced configuration."
+        description="Local-store security, appearance, and advanced configuration."
       />
 
+      {plaintextStore && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="Plaintext local database detected"
+          description={
+            <span>
+              This dashboard can read the store, but telemetry is not encrypted at rest. To enable
+              encryption safely, create or migrate to a new Gensee home with encryption enabled, then
+              set <code>GENSEE_HOME</code> to that directory before launching Gensee. Automatic in-place
+              encryption is intentionally not offered because it could corrupt the active security store.
+            </span>
+          }
+        />
+      )}
+
       <Row gutter={[16, 16]}>
-        {/* Connection settings */}
+        {/* Local store settings */}
         <Col xs={24} lg={12}>
-          <Card size="small" title="Connection">
+          <Card size="small" title="Local Store">
             <Form layout="vertical">
               <Form.Item
-                label="GENSEE_HOME"
-                help="Directory containing gensee.db and policy.json."
+                label="Local database"
+                help="GENSEE_HOME contains gensee.db, gensee.key, and policy.json."
               >
                 <Input
-                  placeholder="~/.gensee"
-                  // TODO: read from /api/v1/state or a dedicated /api/v1/config endpoint.
+                  value={storeSecurity?.db_path ?? '~/.gensee/gensee.db'}
+                  readOnly
                 />
               </Form.Item>
-              <Form.Item
-                label="API server URL"
-                help="Base URL for the versioned API (overrides VITE_API_BASE_URL)."
-              >
-                <Input placeholder="http://127.0.0.1:3001/api/v1" />
+              <Form.Item label="Encryption at rest" help="SQLCipher encryption for gensee.db.">
+                {storeSecurityLoading ? (
+                  <Tag>Checking…</Tag>
+                ) : storeSecurity?.database_exists ? (
+                  storeSecurity.encrypted_at_rest
+                    ? <Tag color="green">ENCRYPTED</Tag>
+                    : <Tag color="orange">PLAINTEXT — ACTION REQUIRED</Tag>
+                ) : (
+                  <Tag color="default">NO DATABASE</Tag>
+                )}
               </Form.Item>
-              <Form.Item label="GENSEE_BIN path" help="Path to the gensee binary for policy validation.">
-                <Input placeholder="Auto-detect" />
+              <Form.Item label="Backend transport" help="No local HTTP API server is started.">
+                <Tag color="blue">TAURI IPC</Tag>
               </Form.Item>
             </Form>
           </Card>

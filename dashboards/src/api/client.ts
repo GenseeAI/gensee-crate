@@ -13,6 +13,7 @@ import type {
   ArtifactGraphData,
   HumanFeedback,
   DashboardState,
+  StoreSecurityStatus,
   LineageGraphData,
   ActivityStats,
   SeverityCount,
@@ -23,6 +24,7 @@ import type {
 export const api = {
   // Dashboard state
   state: () => invoke<DashboardState>('get_state'),
+  storeSecurity: () => invoke<StoreSecurityStatus>('get_store_security'),
 
   // Sessions
   sessions: (limit = 50, offset = 0, hideEmpty = false) =>
