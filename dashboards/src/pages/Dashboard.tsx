@@ -10,6 +10,7 @@ import { Area, Pie } from '@ant-design/plots';
 import { PageHeader }              from '@/components/PageHeader';
 import { StatCard }                from '@/components/StatCard';
 import { SeverityBadge, ActionBadge } from '@/components/SeverityBadge';
+import { AlertDetails }             from '@/components/AlertDetails';
 import { useApi }                  from '@/hooks/useApi';
 import { api }                     from '@/api/client';
 import { useTheme }                from '@/hooks/useTheme';
@@ -28,8 +29,14 @@ const ALERT_COLUMNS = [
     title: 'Action', dataIndex: 'action', key: 'action', width: 80,
     render: (v: string) => <ActionBadge action={v} />,
   },
-  { title: 'Rule',    dataIndex: 'rule_id', key: 'rule_id', width: 220, ellipsis: true },
-  { title: 'Message', dataIndex: 'message', key: 'message', ellipsis: true },
+  {
+    title: 'Rule', dataIndex: 'rule_id', key: 'rule_id', width: 220, ellipsis: true,
+    render: (v: string) => <Typography.Text ellipsis={{ tooltip: v }} style={{ fontSize: 11 }}>{v}</Typography.Text>,
+  },
+  {
+    title: 'Message', dataIndex: 'message', key: 'message', ellipsis: true,
+    render: (v: string) => <Typography.Text ellipsis={{ tooltip: v }}>{v}</Typography.Text>,
+  },
   {
     title: 'Time', dataIndex: 'created_at', key: 'created_at', width: 160,
     render: (v: number) => new Date(v).toLocaleString(),
@@ -253,6 +260,10 @@ export default function Dashboard() {
               rowKey="alert_id"
               size="small"
               pagination={false}
+              expandable={{
+                expandedRowRender: alert => <AlertDetails alert={alert} />,
+                rowExpandable: () => true,
+              }}
               locale={{ emptyText: 'No recent alerts — all clear.' }}
             />
           </Card>

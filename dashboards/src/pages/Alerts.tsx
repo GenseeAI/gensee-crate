@@ -4,6 +4,7 @@ import type { ColumnsType } from 'antd/es/table';
 import { ReloadOutlined }    from '@ant-design/icons';
 import { PageHeader }        from '@/components/PageHeader';
 import { SeverityBadge, ActionBadge } from '@/components/SeverityBadge';
+import { AlertDetails }      from '@/components/AlertDetails';
 import { EmptyPlaceholder }  from '@/components/EmptyPlaceholder';
 import { useApi }            from '@/hooks/useApi';
 import { api }               from '@/api/client';
@@ -41,10 +42,16 @@ const COLUMNS: ColumnsType<Alert> = [
     width:     80,
     render:    v => <ActionBadge action={v} />,
   },
-  { title: 'Rule',    dataIndex: 'rule_id',  key: 'rule_id',  width: 220, ellipsis: true },
-  { title: 'Message', dataIndex: 'message',  key: 'message',  ellipsis: true },
+  {
+    title: 'Rule', dataIndex: 'rule_id', key: 'rule_id', width: 220, ellipsis: true,
+    render: (v: string) => <Text ellipsis={{ tooltip: v }} style={{ fontSize: 11 }}>{v}</Text>,
+  },
+  {
+    title: 'Message', dataIndex: 'message', key: 'message', ellipsis: true,
+    render: (v: string) => <Text ellipsis={{ tooltip: v }}>{v}</Text>,
+  },
   { title: 'Path',    dataIndex: 'path',     key: 'path',     width: 200, ellipsis: true,
-    render: v => v ? <Text code style={{ fontSize: 11 }}>{v}</Text> : '—' },
+    render: v => v ? <Text code ellipsis={{ tooltip: v }} style={{ fontSize: 11 }}>{v}</Text> : '—' },
   {
     title:     'Time',
     dataIndex: 'created_at',
@@ -106,6 +113,10 @@ export default function Alerts() {
               loading={loading}
               size="small"
               pagination={{ pageSize: 25, showSizeChanger: true }}
+              expandable={{
+                expandedRowRender: alert => <AlertDetails alert={alert} />,
+                rowExpandable: () => true,
+              }}
               locale={{ emptyText: <EmptyPlaceholder description="No alerts found." /> }}
             />
           </Card>

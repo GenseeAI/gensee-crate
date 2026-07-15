@@ -160,7 +160,10 @@ function RequestsPanel({ sessionId }: { sessionId: string }) {
       items={requests.map((r: Request) => ({
         key:   r.request_id,
         label: (
-          <Typography.Text style={{ fontSize: 12 }} ellipsis>
+          <Typography.Text
+            style={{ fontSize: 12 }}
+            ellipsis={{ tooltip: r.original_user_prompt ?? undefined }}
+          >
             {r.original_user_prompt ?? (
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>(no prompt)</Typography.Text>
             )}
@@ -213,7 +216,11 @@ function SystemEventsPanel({ sessionId }: { sessionId: string }) {
             </Typography.Text>
             <Tag style={{ flexShrink: 0 }}>{e.type}</Tag>
             {processName && (
-              <Typography.Text type="secondary" style={{ fontSize: 11, width: 130, flexShrink: 0 }} ellipsis>
+              <Typography.Text
+                type="secondary"
+                style={{ fontSize: 11, width: 130, flexShrink: 0 }}
+                ellipsis={{ tooltip: e.process }}
+              >
                 {processName}
               </Typography.Text>
             )}
