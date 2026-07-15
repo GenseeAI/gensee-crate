@@ -21,6 +21,13 @@ npm install
 GENSEE_HOME="$HOME/.gensee" cargo tauri dev
 ```
 
+To open the WebView developer tools while debugging the frontend, opt in
+explicitly:
+
+```bash
+GENSEE_OPEN_DEVTOOLS=1 GENSEE_HOME="$HOME/.gensee" cargo tauri dev
+```
+
 ## Scripts
 
 | Command | Description |

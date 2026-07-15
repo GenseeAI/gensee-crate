@@ -781,10 +781,9 @@ pub fn run() {
             get_today_metrics,
         ])
         .setup(move |app| {
-            // Expose WebView devtools in debug builds, or when explicitly
-            // requested in release via GENSEE_OPEN_DEVTOOLS=1.
-            let open_devtools = cfg!(debug_assertions)
-                || std::env::var("GENSEE_OPEN_DEVTOOLS").ok().as_deref() == Some("1");
+            // Devtools are opt-in even for debug builds so normal development
+            // launches start with the complete dashboard window available.
+            let open_devtools = std::env::var("GENSEE_OPEN_DEVTOOLS").ok().as_deref() == Some("1");
 
             if open_devtools {
                 if let Some(window) = app.get_webview_window("main") {
