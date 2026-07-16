@@ -192,6 +192,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         &podman,
         &source_container,
         &agent_cmd_strings,
+        env_flag("GENSEE_TCLONE_NO_ATTACH"),
         Duration::from_secs(20),
     )?;
     let root_pid = inspect_container_pid(&podman, &source_container).unwrap_or(0);
@@ -454,6 +455,7 @@ fn wait_tclone_agent_ready(
     podman: &OsString,
     container_name: &str,
     agent_cmd: &[String],
+    require_agent_process: bool,
     timeout: Duration,
 ) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
@@ -468,7 +470,7 @@ fn wait_tclone_agent_ready(
                 ),
             ));
         }
-        match tclone_agent_readiness(podman, container_name, agent_cmd) {
+        match tclone_agent_readiness(podman, container_name, agent_cmd, require_agent_process) {
             Ok(TcloneAgentReadiness::Ready) | Ok(TcloneAgentReadiness::NoTmux) => return Ok(()),
             Ok(TcloneAgentReadiness::Starting(message)) => last_error = Some(message),
             Ok(TcloneAgentReadiness::Exited(message)) => return Err(io::Error::other(message)),
@@ -482,7 +484,7 @@ fn ensure_tclone_agent_ready_for_fork(
     podman: &OsString,
     source: &TcloneRunRecord,
 ) -> io::Result<()> {
-    match tclone_agent_readiness(podman, &source.container_name, &source.agent_cmd)? {
+    match tclone_agent_readiness(podman, &source.container_name, &source.agent_cmd, true)? {
         TcloneAgentReadiness::Ready | TcloneAgentReadiness::NoTmux => Ok(()),
         TcloneAgentReadiness::Starting(message) | TcloneAgentReadiness::Exited(message) => {
             Err(io::Error::other(format!(
@@ -505,8 +507,13 @@ fn tclone_agent_readiness(
     podman: &OsString,
     container_name: &str,
     agent_cmd: &[String],
+    require_agent_process: bool,
 ) -> io::Result<TcloneAgentReadiness> {
-    let process_check = tclone_agent_process_check(agent_cmd).unwrap_or("true");
+    let process_check = if require_agent_process {
+        tclone_agent_process_check(agent_cmd).unwrap_or("true")
+    } else {
+        "true"
+    };
     let script = format!(
         r#"if ! command -v tmux >/dev/null 2>&1; then
   echo no-tmux
