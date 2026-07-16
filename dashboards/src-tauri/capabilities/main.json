@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/capabilities.schema.json",
+  "identifier": "main-capability",
+  "description": "Minimal capabilities for the Gensee dashboard main window. All data access goes through custom #[tauri::command] handlers — no filesystem, shell, or process plugins are granted.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

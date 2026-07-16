@@ -2,6 +2,8 @@
 set -euo pipefail
 
 REPO_URL="${GENSEE_REPO_URL:-https://github.com/GenseeAI/gensee-crate}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 if [ -n "${GENSEE_INSTALL_REF:-}" ]; then
   INSTALL_REF="$GENSEE_INSTALL_REF"
 elif [[ "$REPO_URL" == file://* ]] && command -v git >/dev/null 2>&1; then
@@ -64,9 +66,22 @@ choose_gensee_home() {
   info "Using GENSEE_HOME=$GENSEE_HOME"
 }
 
+warn_unwritable_gensee_files() {
+  local gensee_home="${GENSEE_HOME:-$HOME/.gensee}"
+  [ -d "$gensee_home" ] || return 0
+
+  local unwritable
+  unwritable="$(find "$gensee_home" -maxdepth 1 -type f ! -w -printf '%f ' 2>/dev/null || true)"
+  if [ -n "$unwritable" ]; then
+    warn "Some GENSEE_HOME files are not writable by $(id -un): $unwritable"
+    warn "This commonly happens after running gensee with sudo and can prevent telemetry recording. Fix ownership before continuing, for example: sudo chown -R $(id -un):$(id -gn) $gensee_home"
+  fi
+}
+
 configure_claude_code_hooks() {
   local gensee_home="${GENSEE_HOME:-$HOME/.gensee}"
   local should_configure="${GENSEE_CONFIGURE_CLAUDE:-}"
+  local settings_path="$HOME/.claude/settings.json"
 
   if [ "$should_configure" = "0" ]; then
     return 0
@@ -82,6 +97,17 @@ configure_claude_code_hooks() {
 
   case "$should_configure" in
     "" | 1 | y | Y | yes | YES)
+      # A prior `sudo claude` or manual edit can leave this file root-owned.
+      # Detect it before `gensee setup` creates a backup then fails to write.
+      if [ -e "$settings_path" ] && [ ! -w "$settings_path" ]; then
+        warn "Cannot configure Claude Code hooks: $settings_path is not writable by $(id -un)."
+        warn "Fix ownership (for example: sudo chown $(id -un):$(id -gn) $settings_path) and rerun GENSEE_CONFIGURE_CLAUDE=1."
+        return 0
+      fi
+      if [ ! -d "$HOME/.claude" ] || [ ! -w "$HOME/.claude" ]; then
+        warn "Cannot configure Claude Code hooks: $HOME/.claude is missing or not writable by $(id -un)."
+        return 0
+      fi
       info "Configuring Claude Code hooks"
       GENSEE_HOME="$gensee_home" gensee setup claude-code --yes --gensee-home "$gensee_home"
       CLAUDE_HOOKS_CONFIGURED=1
@@ -186,6 +212,97 @@ configure_policy() {
   esac
 }
 
+configure_dashboard() {
+  local should_configure="${GENSEE_CONFIGURE_DASHBOARD:-}"
+  local dashboard_dir="${GENSEE_DASHBOARD_SOURCE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/gensee/dashboard}"
+  local dashboard_source
+
+  if [ "$should_configure" = "0" ]; then
+    return 0
+  fi
+
+  if [ "$should_configure" != "1" ]; then
+    if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+      return 0
+    fi
+    printf 'Set up the native Gensee dashboard now? This installs Tauri and Node dependencies. [y/N] ' >/dev/tty
+    IFS= read -r should_configure </dev/tty || should_configure=""
+  fi
+
+  case "$should_configure" in
+    1 | y | Y | yes | YES)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    warn "Node.js 18+ and npm are required for the native dashboard. Install them, then rerun with GENSEE_CONFIGURE_DASHBOARD=1."
+    return 0
+  fi
+
+  local node_major
+  node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  if [ "$node_major" -lt 18 ]; then
+    warn "The native dashboard requires Node.js 18+ (found $(node --version))."
+    return 0
+  fi
+
+  if [ "$OS_NAME" = "Linux" ] && command -v apt-get >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1; then
+      info "Installing Linux Tauri WebView prerequisites"
+      sudo apt-get update
+      sudo apt-get install -y \
+        libwebkit2gtk-4.1-dev libgtk-3-dev \
+        libayatana-appindicator3-dev librsvg2-dev
+    else
+      warn "sudo is unavailable. Install Tauri prerequisites manually: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev"
+      return 0
+    fi
+  elif [ "$OS_NAME" = "Linux" ]; then
+    warn "Automatic Tauri prerequisite installation supports apt-get only. Install WebKitGTK, GTK3, AppIndicator, and librsvg development packages for your distribution."
+    return 0
+  fi
+
+  if ! command -v cargo-tauri >/dev/null 2>&1; then
+    info "Installing Tauri CLI"
+    cargo install tauri-cli --version "^2" --locked
+  fi
+
+  # When invoked from a repository checkout, use that exact checkout. This
+  # makes branch/local development setup reliable and avoids cloning `main`
+  # when the dashboard implementation exists only on the checked-out branch.
+  if [ -f "$LOCAL_REPO_ROOT/dashboards/package.json" ]; then
+    dashboard_source="$LOCAL_REPO_ROOT"
+    info "Using dashboard source from local checkout at $dashboard_source"
+  else
+    dashboard_source="$dashboard_dir"
+    info "Preparing dashboard source at $dashboard_source"
+    if [ -d "$dashboard_source/.git" ]; then
+      git -C "$dashboard_source" fetch --depth 1 origin "$INSTALL_REF"
+      git -C "$dashboard_source" checkout --force FETCH_HEAD
+    else
+      mkdir -p "$(dirname "$dashboard_source")"
+      git clone --depth 1 "$REPO_URL" "$dashboard_source"
+      git -C "$dashboard_source" checkout --force "$INSTALL_REF"
+    fi
+  fi
+
+  if [ ! -f "$dashboard_source/dashboards/package.json" ]; then
+    warn "The selected source ref ($INSTALL_REF) does not contain the native dashboards/ application. Use a release/ref that includes it, or set GENSEE_REPO_URL and GENSEE_INSTALL_REF explicitly."
+    return 0
+  fi
+
+  info "Installing dashboard frontend dependencies"
+  npm --prefix "$dashboard_source/dashboards" install --legacy-peer-deps
+  info "Validating dashboard frontend build"
+  npm --prefix "$dashboard_source/dashboards" run build
+
+  DASHBOARD_CONFIGURED=1
+  DASHBOARD_DIR="$dashboard_source/dashboards"
+}
+
 print_banner
 
 OS_NAME="$(uname -s)"
@@ -251,15 +368,19 @@ info "Installed $(command -v gensee)"
 gensee --help >/dev/null
 
 choose_gensee_home
+warn_unwritable_gensee_files
 
 CLAUDE_HOOKS_CONFIGURED=0
 CODEX_HOOKS_CONFIGURED=0
 ANTIGRAVITY_HOOKS_CONFIGURED=0
+DASHBOARD_CONFIGURED=0
+DASHBOARD_DIR=""
 configure_claude_code_hooks
 configure_codex_hooks
 configure_antigravity_hooks
 POLICY_SETUP="default"
 configure_policy
+configure_dashboard
 INSTALL_GENSEE_HOME="$GENSEE_HOME"
 
 cat <<'EOF'
@@ -328,7 +449,22 @@ EOF
   printf '  GENSEE_HOME="%s" gensee setup antigravity --gensee-home "%s"\n' "$INSTALL_GENSEE_HOME" "$INSTALL_GENSEE_HOME"
 fi
 
+if [ "$DASHBOARD_CONFIGURED" = "1" ]; then
+  cat <<EOF
+
+Native dashboard dependencies are installed. Launch it with:
+  cd "$DASHBOARD_DIR"
+  GENSEE_HOME="$INSTALL_GENSEE_HOME" cargo tauri dev
+EOF
+else
+  cat <<'EOF'
+
+Set up the native dashboard later with:
+  GENSEE_CONFIGURE_DASHBOARD=1 scripts/install_oss.sh
+EOF
+fi
+
 cat <<'EOF'
 For non-interactive installs:
-  curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 bash
+  curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 GENSEE_CONFIGURE_DASHBOARD=1 bash
 EOF

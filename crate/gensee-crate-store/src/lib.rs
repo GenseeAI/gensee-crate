@@ -38,6 +38,9 @@ const SYSTEM_SESSION_ID: &str = "system";
 const SYSTEM_AGENT_ID: &str = "system-monitor";
 const SYSTEM_EVENT_CORRELATION_WINDOW_MS: i64 = 60_000;
 const ARTIFACT_FACT_RECENT_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+// Tool inputs are operator-visible telemetry. Bound their at-rest size so a
+// single tool invocation cannot bloat the local store with arbitrary payloads.
+const MAX_STORED_TOOL_INPUT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
@@ -2086,41 +2089,76 @@ fn resolve_tool_path(path: &str, cwd: Option<&str>) -> String {
 
 fn tool_input_json(event: &AgentHookEvent) -> Option<String> {
     if event.tool_input_command.is_some() || event.tool_input_description.is_some() {
-        return Some(
-            json!({
-                "tool_use_id": event.tool_use_id.as_deref(),
-                "command": event.tool_input_command.as_deref(),
-                "description": event.tool_input_description.as_deref(),
-            })
-            .to_string(),
-        );
+        return store_tool_input(json!({
+            "tool_use_id": event.tool_use_id.as_deref(),
+            "command": event.tool_input_command.as_deref(),
+            "description": event.tool_input_description.as_deref(),
+        }));
     }
 
     let tools = native_file_tools(event);
     match tools.as_slice() {
-        [] => None,
-        [tool] => Some(
-            json!({
-                "tool_use_id": event.tool_use_id.as_deref(),
-                "operation": tool.operation,
-                "path": tool.path,
-            })
-            .to_string(),
-        ),
-        _ => Some(
-            json!({
-                "tool_use_id": event.tool_use_id.as_deref(),
-                "changes": tools
-                    .iter()
-                    .map(|tool| json!({
-                        "operation": tool.operation,
-                        "path": tool.path,
-                    }))
-                    .collect::<Vec<_>>(),
-            })
-            .to_string(),
-        ),
+        [] => {
+            // Preserve query/URL metadata for the discovery tools displayed by
+            // Timeline. Do not generically persist arbitrary tool payloads:
+            // they can include prompts, command arguments, or secret material.
+            let tool_name = event.tool_name.as_deref()?;
+            if !matches!(tool_name, "WebSearch" | "WebFetch" | "ToolSearch") {
+                return None;
+            }
+            let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+            let input = value.get("tool_input")?;
+            if input.is_null() {
+                return None;
+            }
+            if let Some(map) = input.as_object() {
+                if map.is_empty() {
+                    return None;
+                }
+                let mut out = serde_json::Map::new();
+                if let Some(id) = event.tool_use_id.as_deref() {
+                    out.insert("tool_use_id".to_string(), json!(id));
+                }
+                out.extend(map.clone());
+                return store_tool_input(Value::Object(out));
+            }
+            None
+        }
+        [tool] => store_tool_input(json!({
+            "tool_use_id": event.tool_use_id.as_deref(),
+            "operation": tool.operation,
+            "path": tool.path,
+        })),
+        _ => store_tool_input(json!({
+            "tool_use_id": event.tool_use_id.as_deref(),
+            "changes": tools
+                .iter()
+                .map(|tool| json!({
+                    "operation": tool.operation,
+                    "path": tool.path,
+                }))
+                .collect::<Vec<_>>(),
+        })),
     }
+}
+
+/// Serialize telemetry input only when it stays within the storage budget.
+/// Returning a valid metadata record rather than a partial JSON string keeps the
+/// SQLite JSON constraint intact and makes truncation visible to consumers.
+fn store_tool_input(value: Value) -> Option<String> {
+    let encoded = value.to_string();
+    if encoded.len() <= MAX_STORED_TOOL_INPUT_BYTES {
+        return Some(encoded);
+    }
+
+    Some(
+        json!({
+            "truncated": true,
+            "original_bytes": encoded.len(),
+            "max_bytes": MAX_STORED_TOOL_INPUT_BYTES,
+        })
+        .to_string(),
+    )
 }
 
 fn tool_response_json(event: &AgentHookEvent) -> Option<String> {

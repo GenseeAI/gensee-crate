@@ -1,6 +1,6 @@
 # Dashboard
 
-The Gensee Crate dashboard is a local browser console for inspecting the same
+The Gensee Crate dashboard is a local native desktop application for inspecting the same
 `GENSEE_HOME` store used by `gensee watch`, agent hooks, `gensee run`, and
 `gensee timeline`.
 
@@ -10,95 +10,91 @@ place.
 
 ## Launch
 
-Build the CLI first so the dashboard can read encrypted telemetry, validate
-policy edits, and use the local dashboard-state command:
+Build the CLI first so the dashboard can validate policy edits:
 
 ```bash
 cargo build --release -p gensee-crate-cli
 ```
 
-Then start the dashboard against the store you want to inspect:
+Install the dashboard dependencies once (requires Node 18+):
 
 ```bash
-GENSEE_HOME="$PWD/.gensee-dev" npm --prefix dashboards/web run dev
-# open http://localhost:5173
+npm install --prefix dashboards --legacy-peer-deps
 ```
 
-Use the same `GENSEE_HOME` for hooks, `watch`, `run`, `timeline`, and the
-dashboard when you want all signals to appear together.
+Install the pinned native Tauri CLI once:
+
+```bash
+cargo install tauri-cli --version "^2" --locked
+```
+
+Then launch the Tauri desktop app:
+
+```bash
+cd dashboards
+GENSEE_HOME="$HOME/.gensee" cargo tauri dev
+```
+
+This opens a native window backed by the Rust core — no TCP server is
+started. All data access goes through Tauri IPC.
 
 ## Requirements
 
 - Node 18 or newer.
-- A built `gensee` binary for encrypted telemetry, live policy view/edit, and
-  policy validation.
-- Optional: `sqlite3` on `PATH` for unencrypted demo-store fallback reads.
+- A built `gensee` binary for policy validation.
+- Linux development requires WebKitGTK and GTK development packages; see
+	[`dashboards/README.md`](https://github.com/GenseeAI/gensee-crate/blob/main/dashboards/README.md#linux-tauri-prerequisites).
 
-The dashboard dev server exposes local API endpoints such as `GET /api/state`
-and `GET`/`POST /api/policy`. It prefers `gensee dashboard-state`, which can
-read encrypted local telemetry, and falls back to raw `sqlite3`/JSONL reads for
-unencrypted demo or development stores.
+The Tauri app binds no TCP port. All data access goes through Rust `#[tauri::command]`
+handlers over the Tauri IPC bridge. Policy writes apply `0600` permissions and
+require a `gensee` binary for validation before writing the file.
+
+**Threat model**: single-user workstation. Processes running as the same OS user
+are implicitly trusted (they can already read `$GENSEE_HOME` directly). There is
+no network-accessible endpoint to attack.
 
 ## Demo Data
 
-A fresh store is empty. Seed a demo store to populate the Live, Timeline,
-Lineage, and Policy views:
+A fresh store is empty. Populate the Timeline, Lineage, and Policy views by
+running an agent session with `gensee run -- <agent>`, or point `GENSEE_HOME`
+at an existing store that already has data.
 
 ```bash
-# seed only:
-dashboards/web/scripts/seed-demo.sh
+# Example: run a quick Claude session to generate events
+GENSEE_HOME=~/.gensee gensee run -- claude
 
-# seed + serve:
-dashboards/web/scripts/demo.sh
-# then open http://localhost:5173
-```
-
-Both commands default to `GENSEE_HOME=~/.gensee-demo`. Override `GENSEE_HOME` or
-`GENSEE_BIN` to point at a different store or binary.
-
-`seed-demo.sh` wipes the target `GENSEE_HOME` before seeding. To avoid deleting
-a real store by accident, it refuses to delete a directory it did not create.
-It marks demo stores with `.gensee-demo-seed`; pass `--force` only when you
-intend to overwrite the target:
-
-```bash
-dashboards/web/scripts/demo.sh --force
+# Then open the dashboard
+cd dashboards && GENSEE_HOME=~/.gensee cargo tauri dev
 ```
 
 ## Live Policy Editing
 
-The Policy document panel reads and writes `$GENSEE_HOME/policy.json` through
-the local `/api/policy` endpoint. Saves require the dashboard's CSRF header and
-are validated by the policy engine before the file is written.
-
-Legacy quick controls, such as rule toggles and allowlist prefixes, remain
-cosmetic browser state until they are wired to the policy document. Use the
-Policy document panel or [`gensee policy`](gensee-policy.md) for changes that
-must affect enforcement.
+The Policy page reads and writes `$GENSEE_HOME/policy.json` through a native
+Tauri IPC command. Saves are validated by the policy engine before the file is
+written with owner-only permissions (`0600` on Unix). The Settings, Decision
+Rules, and Artifact Definitions tabs provide structured editing; the Advanced
+(JSON) tab gives full raw access.
 
 ## Development
 
-Run the dashboard package directly when working on the UI:
+Run the native app with frontend hot reload:
 
 ```bash
-npm --prefix dashboards/web run dev
+cd dashboards && cargo tauri dev
 ```
 
-Use a separate store while developing:
+The Tauri dev runner starts Vite automatically (configured in
+`src-tauri/tauri.conf.json → build.beforeDevCommand`).
+
+Type-check and build the frontend bundle:
 
 ```bash
-GENSEE_HOME=/tmp/gensee-dashboard-fixture PORT=4173 npm --prefix dashboards/web run dev
-```
-
-Validate the dashboard JavaScript and local dev server:
-
-```bash
-npm --prefix dashboards/web run check
+npm --prefix dashboards run build
 ```
 
 ## Rendering Safety
 
 Prompts, commands, file paths, tool names, policy reasons, and artifact URIs are
 attacker-influenced input. Keep dynamic rendering on safe text APIs such as
-`textContent` or framework escaping. Do not pass live Gensee values through
+React's JSX text nodes or `textContent`. Do not pass live Gensee values through
 `innerHTML`, even inside the security console itself.

@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="dashboards/web/src/eye-only.png" alt="" width="48" />
+  <img src="dashboards/public/eye-only.png" alt="" width="48" />
   Gensee Crate
 </h1>
 
@@ -10,7 +10,7 @@
 <p align="center">
   Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
   It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS and Linux.
-  Real-time enforcement combines agent-interface decisions with Linux syscall, network, and sensitive-file controls. Offline event tracking, lineage, and provenance can be viewed in a web dashboard and command line.
+  Real-time enforcement combines agent-interface decisions with Linux syscall, network, and sensitive-file controls. Offline event tracking, lineage, and provenance can be viewed in a native desktop dashboard and command line.
 </p>
 
 <p align="center">
@@ -77,11 +77,16 @@ lets you keep the bundled default policy or create an editable local policy:
 curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | bash
 ```
 
+During an interactive install, choose the native dashboard prompt to provision
+its Tauri and frontend dependencies. For a non-interactive install, add
+`GENSEE_CONFIGURE_DASHBOARD=1`. This requires Node.js 18+; on Linux it also
+installs the WebKitGTK development packages required by Tauri.
+
 For non-interactive installs that should configure Claude Code, Codex, and
 Antigravity hooks:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 bash
+curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 GENSEE_CONFIGURE_DASHBOARD=1 bash
 ```
 
 <details>
@@ -417,34 +422,30 @@ gensee run list   # list guarded run sessions and staged workspaces
 gensee timeline   # show prompts, tool intent, file effects, and policy decisions
 ```
 
-**Dashboard.** Open the local dashboard for a browser view of the same store:
+**Dashboard.** Open the local native dashboard for a view of the same store:
 
 The local dashboard reads the same `GENSEE_HOME` store as `watch`, hooks, and
 `timeline`. It shows live agent activity, policy decisions, alerts, file and
 request lineage, and the active policy document; users can record review
-verdicts and edit validated policy settings from the browser.
+verdicts and edit validated policy settings in the desktop application.
 
-Launch it from the repository checkout against your active store:
-
-```bash
-cd /path/to/agent-shield
-GENSEE_HOME="$PWD/.gensee-dev" npm --prefix "$PWD/dashboards/web" run dev
-# open http://localhost:5173
-```
-
-If you launch it from another directory, use absolute paths and the same
-`GENSEE_HOME` that your hooks or `gensee watch` use:
+Install dependencies once, then launch from the repository checkout:
 
 ```bash
-REPO=/path/to/agent-shield
-GENSEE_HOME="$REPO/.gensee-dev" npm --prefix "$REPO/dashboards/web" run dev
+npm install --prefix dashboards --legacy-peer-deps
+cargo install tauri-cli --version "^2" --locked
+cd dashboards
+GENSEE_HOME="$HOME/.gensee" cargo tauri dev
 ```
 
-See [`dashboards/web/README.md`](dashboards/web/README.md) for requirements,
-demo data, and policy editing notes.
+This opens a native desktop window backed by the Rust core. No TCP server
+is started; all data access goes through Tauri IPC.
+
+See [`dashboards/README.md`](dashboards/README.md) for requirements, demo data, and policy
+editing notes.
 
 The activity view brings policy decisions, timeline filtering, event details,
-and command/tool context into one local browser surface.
+and command/tool context into one local desktop surface.
 
 ![Gensee Crate dashboard activity timeline](docs/images/dashboard-activity.png)
 
@@ -486,7 +487,7 @@ You can also point `GENSEE_POLICY_FILE` at a custom policy path; see
 
 Gensee Crate supports macOS and Linux today, with Claude Code, Codex, and
 Antigravity hook support, local policy enforcement, staged workspace runs, local
-telemetry, and a browser dashboard. Next directions include:
+telemetry, and a native desktop dashboard. Next directions include:
 
 - **Linux system enforcement:** eBPF telemetry, Landlock/AppArmor profile
   generation, daemon-owned fanotify lifecycle, and richer per-attempt

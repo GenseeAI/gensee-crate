@@ -16,8 +16,8 @@ cargo test --workspace
 Dashboard checks:
 
 ```bash
-cd dashboards/web
-npm run check
+cd dashboards
+npm run build
 ```
 
 ## Development Checks
@@ -28,7 +28,7 @@ Before opening a pull request, run:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd dashboards/web && npm run check
+cd dashboards && npm run build
 ```
 
 Some daemon/socket tests may need normal local process permissions. If they fail
