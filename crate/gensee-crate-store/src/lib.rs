@@ -2112,6 +2112,18 @@ fn tool_input_json(event: &AgentHookEvent) -> Option<String> {
             // Timeline. Do not generically persist arbitrary tool payloads:
             // they can include prompts, command arguments, or secret material.
             let tool_name = event.tool_name.as_deref()?;
+            if event.provider == "vscode" && matches!(tool_name, "file_search" | "grep_search") {
+                let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+                let query = value
+                    .get("tool_input")?
+                    .get("query")?
+                    .as_str()
+                    .filter(|query| !query.is_empty())?;
+                return store_tool_input(json!({
+                    "tool_use_id": event.tool_use_id.as_deref(),
+                    "query": query,
+                }));
+            }
             if !matches!(tool_name, "WebSearch" | "WebFetch" | "ToolSearch") {
                 return None;
             }
@@ -3352,6 +3364,48 @@ mod tests {
                 && relation.dst_id == request.request_id
                 && relation.relation_type == "consumed_by"
         }));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vscode_search_tools_store_only_safe_query_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-vscode-search-input-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"find code"}"#,
+                100,
+            ))
+            .unwrap();
+        for (index, tool_name) in ["file_search", "grep_search"].iter().enumerate() {
+            let mut event = native_tool_event(
+                tool_name,
+                &format!("vscode_search_{index}"),
+                r#"{"query":"macos support","includePattern":"**/*.rs","maxResults":200}"#,
+                110 + index as u64,
+            );
+            event.provider = "vscode".to_string();
+            store.append_hook_event(&event).unwrap();
+        }
+
+        let db = store.sqlite_store().unwrap();
+        let request = db.latest_request_for_session("s1").unwrap().unwrap();
+        let agent_events = db.agent_events_for_request(request.request_id).unwrap();
+        assert_eq!(agent_events.len(), 2);
+        for event in agent_events {
+            let input =
+                serde_json::from_str::<Value>(event.tool_input.as_deref().unwrap()).unwrap();
+            assert_eq!(input["query"], "macos support");
+            assert_eq!(input.as_object().unwrap().len(), 2);
+            assert!(input.get("includePattern").is_none());
+            assert!(input.get("maxResults").is_none());
+        }
 
         fs::remove_dir_all(&dir).ok();
     }
