@@ -4,7 +4,7 @@ layout: home
 hero:
   name: Gensee Crate
   text: Full-stack, long-horizon runtime safety<br>for AI coding agents.
-  tagline: Gensee Crate watches system events,<br>requests, tool calls, skills, and memory<br>behind Claude Code, Codex, and Antigravity.
+  tagline: Gensee Crate watches system events,<br>requests, tool calls, skills, and memory<br>behind Claude Code, Codex, Antigravity, and VS Code.
   image:
     src: /gensee-crate-defense-in-depth.png
     alt: Gensee Crate defense-in-depth architecture
@@ -33,8 +33,8 @@ features:
     link: /run-and-sandbox
     linkText: Use gensee run
   - title: Connect Agent Surfaces
-    details: Wire Claude Code, Codex, and Antigravity hooks into the same timeline, with sidecar coverage for unmanaged runs.
-    link: /claude-code-hooks
+    details: Wire Claude Code, Codex, Antigravity, and VS Code hooks into the same timeline, with sidecar coverage for unmanaged runs.
+    link: /vscode-support
     linkText: Configure integrations
   - title: Protect Linux Hosts
     details: Inspect Linux capabilities, monitor direct agent process trees through /proc, enforce sensitive-path access with fanotify, launch agents under seccomp, and plan cgroup-scoped nftables egress controls.

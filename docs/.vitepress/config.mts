@@ -59,7 +59,8 @@ export default defineConfig({
         items: [
           { text: 'Claude Code Hooks', link: '/claude-code-hooks' },
           { text: 'Codex Hooks', link: '/codex-support' },
-          { text: 'Antigravity Support', link: '/antigravity-support' }
+          { text: 'Antigravity Support', link: '/antigravity-support' },
+          { text: 'VS Code / GitHub Copilot', link: '/vscode-support' }
         ]
       },
       {

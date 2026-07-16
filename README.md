@@ -89,6 +89,14 @@ Antigravity hooks:
 curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 GENSEE_CONFIGURE_DASHBOARD=1 bash
 ```
 
+To configure VS Code / GitHub Copilot hooks instead, use the VS Code toggle.
+Avoid enabling both Claude Code and VS Code hooks for the same VS Code sessions,
+because VS Code also loads Claude-compatible hook settings:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_VSCODE=1 bash
+```
+
 <details>
 <summary>Prefer to install manually?</summary>
 
@@ -143,12 +151,13 @@ For hook-based agents, there are two paths to keep straight:
 
 - `GENSEE_HOME`: where Gensee records hooks, alerts, timelines, policies, and
   dashboard data. Use the same value across Claude Code, Codex, Antigravity,
-  Omnigent sidecars, `gensee watch`, `gensee timeline`, and the dashboard when
-  you want one combined view.
+  VS Code, Omnigent sidecars, `gensee watch`, `gensee timeline`, and the
+  dashboard when you want one combined view.
 - agent workspace/config path: where the agent looks for its hook settings.
   Claude Code uses `~/.claude/settings.json`, Codex uses `~/.codex/hooks.json`,
-  and Antigravity defaults to global `~/.gemini/config/hooks.json`. Antigravity
-  also supports workspace-local `.agents/hooks.json` when you pass `--hooks`.
+  Antigravity defaults to global `~/.gemini/config/hooks.json`, and VS Code uses
+  `~/.copilot/hooks/gensee.json`. Antigravity also supports workspace-local
+  `.agents/hooks.json` when you pass `--hooks`.
 
 Avoid pointing `GENSEE_HOME` at the project workspace root. A repo-local store
 such as `$PWD/.gensee-dev` is convenient for development, while
@@ -172,8 +181,8 @@ stores.
 - macOS and Linux for the stable v0.1 path. Linux host controls include `/proc`
   process attribution, fanotify sensitive-path enforcement, seccomp launcher
   profiles, and cgroup/nftables network controls.
-- Claude Code, Codex, or Antigravity for hook-based enforcement. Other agents
-  are planned.
+- Claude Code, Codex, Antigravity, or VS Code / GitHub Copilot for hook-based
+  enforcement. Other agents are planned.
 - Rust toolchain (`cargo`) and `jq`.
 - On Linux: build tools, `pkg-config`, OpenSSL headers, `nftables`, and `git`.
 
@@ -205,8 +214,8 @@ source "$HOME/.cargo/env"
 
 To capture prompt/tool intent and enforce the [safety policy](docs/policy.md),
 configure your agent's hooks to call the matching `gensee hook` endpoint. The
-installer offers Claude Code, Codex, and Antigravity setup. To run the setup
-step later for Claude Code:
+installer offers Claude Code, Codex, Antigravity, and opt-in VS Code setup. To
+run the setup step later for Claude Code:
 
 ```bash
 gensee setup claude-code --gensee-home "$GENSEE_HOME"
@@ -250,6 +259,16 @@ Or for global Antigravity hooks:
 gensee setup antigravity --gensee-home "$GENSEE_HOME"
 ```
 
+Or for VS Code / GitHub Copilot:
+
+```bash
+gensee setup vscode --gensee-home "$GENSEE_HOME"
+```
+
+VS Code also loads `~/.claude/settings.json`. Configure the dedicated VS Code
+provider when you need its native tool-name parsing, and avoid installing both
+providers for the same VS Code sessions so the hook does not run twice.
+
 For workspace-local Antigravity hooks instead, pass an explicit workspace hook
 path:
 
@@ -265,18 +284,21 @@ If you are running from a source checkout instead of an installed binary:
 ./target/debug/gensee setup claude-code --gensee-home "$GENSEE_HOME"
 ./target/debug/gensee setup codex --gensee-home "$GENSEE_HOME"
 ./target/debug/gensee setup antigravity --gensee-home "$GENSEE_HOME"
+./target/debug/gensee setup vscode --gensee-home "$GENSEE_HOME"
 ```
 
 The setup commands back up the previous hook settings, update
 `~/.claude/settings.json`, `~/.codex/hooks.json`, or
-`~/.gemini/config/hooks.json` by default, and use the absolute path to the
-`gensee` binary you invoked. Fully restart Claude Code or Antigravity after
-changing hook config. Open `/hooks` in Codex to review and trust the hook
+`~/.gemini/config/hooks.json`, or write `~/.copilot/hooks/gensee.json` by
+default, and use the absolute path to the `gensee` binary you invoked. Fully
+restart Claude Code or Antigravity after changing hook config. VS Code reloads
+hook files automatically. Open `/hooks` in Codex to review and trust the hook
 command before testing enforcement. Full manual config and what gets recorded
 (plus redaction details) are in
 [`docs/claude-code-hooks.md`](docs/claude-code-hooks.md),
-[`docs/codex-support.md`](docs/codex-support.md), and
-[`docs/antigravity-support.md`](docs/antigravity-support.md).
+[`docs/codex-support.md`](docs/codex-support.md),
+[`docs/antigravity-support.md`](docs/antigravity-support.md), and
+[`docs/vscode-support.md`](docs/vscode-support.md).
 
 </details>
 
@@ -485,9 +507,10 @@ You can also point `GENSEE_POLICY_FILE` at a custom policy path; see
 
 ## Roadmap
 
-Gensee Crate supports macOS and Linux today, with Claude Code, Codex, and
-Antigravity hook support, local policy enforcement, staged workspace runs, local
-telemetry, and a native desktop dashboard. Next directions include:
+Gensee Crate supports macOS and Linux today, with Claude Code, Codex,
+Antigravity, and VS Code / GitHub Copilot hook support, local policy
+enforcement, staged workspace runs, local telemetry, and a native desktop
+dashboard. Next directions include:
 
 - **Linux system enforcement:** eBPF telemetry, Landlock/AppArmor profile
   generation, daemon-owned fanotify lifecycle, and richer per-attempt
@@ -502,8 +525,8 @@ telemetry, and a native desktop dashboard. Next directions include:
 - **ML-based policy and rules:** learning from controlled traces, blocked
   actions, and bypass attempts to improve risk scoring and policy suggestions.
 - **Integrations:** support for more agents and security tooling, including
-  ChatGPT, Gemini, Cursor, GitHub Copilot, Omnigent, CrowdStrike, LLM gateways,
-  MCP servers, and audit/security workflow exports.
+  ChatGPT, Gemini, Cursor, Omnigent, CrowdStrike, LLM gateways, MCP servers, and
+  audit/security workflow exports.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for more detail.
 
@@ -525,6 +548,7 @@ Full docs live in [`docs/`](docs/README.md):
 - [Claude Code hooks](docs/claude-code-hooks.md) — wiring Claude Code prompts and tool intent into Gensee.
 - [Codex hooks](docs/codex-support.md) — wiring Codex prompts and tool intent into Gensee.
 - [Antigravity support](docs/antigravity-support.md) — wiring Antigravity hooks and `.agents` customizations into Gensee.
+- [VS Code / GitHub Copilot hooks](docs/vscode-support.md) — wiring VS Code agent hooks and native tool intent into Gensee.
 - [Omnigent integration](integrations/omnigent/README.md) — thin sidecar/managed-run support and the deeper policy-bridge plan.
 - [Safety policy](docs/policy.md) — the data-driven allow/ask/deny engine and `gensee policy` workflow.
 - [SQLite lineage graph](docs/lineage-graph.md) — the provenance schema and example queries.

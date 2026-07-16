@@ -1,12 +1,12 @@
 # Roadmap
 
-Gensee Crate supports macOS and Linux today, with Claude Code, Codex, and
-Antigravity hook support, local policy enforcement, staged workspace runs, local
-telemetry, and a browser dashboard. Linux host support includes `/proc` process
-attribution, capability planning, fanotify sensitive-path enforcement, seccomp
-launcher profiles, and cgroup-scoped nftables egress controls. This roadmap is
-directional and may change as agent interfaces and operating-system controls
-evolve.
+Gensee Crate supports macOS and Linux today, with Claude Code, Codex,
+Antigravity, and VS Code / GitHub Copilot hook support, local policy
+enforcement, staged workspace runs, local telemetry, and a browser dashboard.
+Linux host support includes `/proc` process attribution, capability planning,
+fanotify sensitive-path enforcement, seccomp launcher profiles, and
+cgroup-scoped nftables egress controls. This roadmap is directional and may
+change as agent interfaces and operating-system controls evolve.
 
 ## Linux System Enforcement
 
@@ -95,8 +95,7 @@ use.
 
 Planned integration areas include:
 
-- Additional coding agents and assistants such as ChatGPT, Gemini, Cursor, and
-  GitHub Copilot.
+- Additional coding agents and assistants such as ChatGPT, Gemini, and Cursor.
 - Agent orchestration frameworks such as Omnigent.
 - Security tooling such as CrowdStrike and other endpoint or detection systems.
 - LLM gateways, MCP servers, and policy/control-plane tools.
