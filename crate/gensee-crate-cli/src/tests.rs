@@ -892,7 +892,9 @@ fn vscode_native_subjects_parse_single_file_tools() {
         ("createFile", "write"),
         ("replace_string_in_file", "write"),
         ("replaceStringInFile", "write"),
+        ("read_file", "read"),
         ("readFile", "read"),
+        ("delete_file", "delete"),
         ("deleteFile", "delete"),
     ] {
         let payload = json!({
@@ -913,6 +915,36 @@ fn vscode_native_subjects_parse_single_file_tools() {
         );
         assert_eq!(subjects[0].path, "/workspace/src/target.ts");
     }
+}
+
+#[test]
+fn vscode_runtime_read_file_uses_path_policy() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "read_file",
+        "tool_input": {
+            "filePath": "/etc/passwd",
+            "startLine": 1,
+            "endLine": 20
+        },
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert_eq!(decision.action, PolicyAction::Block);
+    assert!(decision
+        .findings
+        .iter()
+        .any(|finding| finding.path.as_deref() == Some("/etc/passwd")));
+    assert!(!decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool"));
 }
 
 #[test]

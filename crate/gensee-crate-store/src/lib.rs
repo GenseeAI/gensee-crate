@@ -4,8 +4,8 @@ use chacha20poly1305::{
 };
 use gensee_crate_core::{
     extract_apply_patch_input, normalize_agent_path, parse_apply_patch_changes,
-    parse_mcp_file_intents, AgentHookEvent, AgentSession, FileIntent, ProcessObservation,
-    SystemEvent, WorkspaceEffect,
+    parse_mcp_file_intents, parse_vscode_file_intents, AgentHookEvent, AgentSession, FileIntent,
+    ProcessObservation, SystemEvent, WorkspaceEffect,
 };
 use gensee_crate_db::sqlite::{
     open_store, AgentEventRecord, NewAgentEvent, NewAlert, NewArtifact, NewArtifactFact,
@@ -2064,6 +2064,15 @@ fn native_file_tools(event: &AgentHookEvent) -> Vec<NativeFileTool> {
             })
             .collect();
     }
+    if event.provider == "vscode" {
+        return parse_vscode_file_intents(tool_name, input)
+            .into_iter()
+            .map(|intent| NativeFileTool {
+                operation: intent.operation,
+                path: resolve_tool_path(&intent.path, event.cwd.as_deref()),
+            })
+            .collect();
+    }
 
     let (operation, path_key) = match tool_name {
         "Read" => ("read", "file_path"),
@@ -3300,6 +3309,49 @@ mod tests {
                 && relation.dst_kind == "artifact"
                 && relation.dst_id == summary_artifact_id
                 && relation.relation_type == "derived_from"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vscode_runtime_read_file_stores_path_and_lineage() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-vscode-read-lineage-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"read input"}"#,
+                100,
+            ))
+            .unwrap();
+        let mut read_event = native_tool_event(
+            "read_file",
+            "vscode_read",
+            r#"{"filePath":"src/lib.rs","startLine":1,"endLine":20}"#,
+            110,
+        );
+        read_event.provider = "vscode".to_string();
+        store.append_hook_event(&read_event).unwrap();
+
+        let db = store.sqlite_store().unwrap();
+        let request = db.latest_request_for_session("s1").unwrap().unwrap();
+        let agent_events = db.agent_events_for_request(request.request_id).unwrap();
+        let tool_input =
+            serde_json::from_str::<Value>(agent_events[0].tool_input.as_deref().unwrap()).unwrap();
+        assert_eq!(tool_input["operation"], "read");
+        assert_eq!(tool_input["path"], "/repo/src/lib.rs");
+
+        let relations = db.relations_for_request(request.request_id).unwrap();
+        assert!(relations.iter().any(|relation| {
+            relation.src_kind == "artifact"
+                && relation.dst_kind == "request"
+                && relation.dst_id == request.request_id
+                && relation.relation_type == "consumed_by"
+        }));
 
         fs::remove_dir_all(&dir).ok();
     }

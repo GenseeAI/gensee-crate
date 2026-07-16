@@ -1447,68 +1447,14 @@ fn vscode_native_policy_subjects(event: &AgentHookEvent, value: &Value) -> Vec<P
         return Vec::new();
     }
 
-    // editFiles: tool_input.files is an array of file path strings.
-    if tool_name == "editFiles" {
-        return input
-            .get("files")
-            .and_then(Value::as_array)
-            .map(|files| {
-                files
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|path| PolicySubject {
-                        source: "native_tool",
-                        operation: "edit".to_string(),
-                        path: normalize_intent_path(path, cwd),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-    }
-
-    let (operation, path_key): (&str, &str) = match tool_name {
-        "create_file"
-        | "createFile"
-        | "replace_string_in_file"
-        | "replaceStringInFile"
-        | "insert_edit_into_file"
-        | "insertEditIntoFile" => ("write", "filePath"),
-        "readFile" => ("read", "filePath"),
-        "deleteFile" => ("delete", "filePath"),
-        _ => return Vec::new(),
-    };
-
-    // Accept camelCase filePath (VS Code standard) with snake_case and bare
-    // "path" as fallbacks for forward-compatibility.
-    let Some(path) = input
-        .get(path_key)
-        .or_else(|| input.get("file_path"))
-        .or_else(|| input.get("path"))
-        .and_then(Value::as_str)
-    else {
-        return Vec::new();
-    };
-
-    vec![PolicySubject {
-        source: "native_tool",
-        operation: operation.to_string(),
-        path: normalize_intent_path(path, cwd),
-    }]
-}
-
-fn is_vscode_file_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "editFiles"
-            | "create_file"
-            | "createFile"
-            | "replace_string_in_file"
-            | "replaceStringInFile"
-            | "insert_edit_into_file"
-            | "insertEditIntoFile"
-            | "readFile"
-            | "deleteFile"
-    )
+    parse_vscode_file_intents(tool_name, input)
+        .into_iter()
+        .map(|intent| PolicySubject {
+            source: "native_tool",
+            operation: intent.operation,
+            path: normalize_intent_path(&intent.path, cwd),
+        })
+        .collect()
 }
 
 fn unparsed_vscode_file_tool_finding(event: &AgentHookEvent) -> Option<PolicyFinding> {
@@ -1530,7 +1476,7 @@ fn unparsed_vscode_file_tool_finding(event: &AgentHookEvent) -> Option<PolicyFin
             .iter()
             .any(|field| input.contains_key(*field))
     });
-    if !is_vscode_file_tool(tool_name) && !has_file_shaped_field {
+    if !is_vscode_file_tool_name(tool_name) && !has_file_shaped_field {
         return None;
     }
 

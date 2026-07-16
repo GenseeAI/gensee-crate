@@ -1,8 +1,9 @@
 pub(crate) use gensee_crate_attribution::process_tree::ProcessTree;
+pub(crate) use gensee_crate_core::is_vscode_file_tool_name;
 pub(crate) use gensee_crate_core::{
     extract_apply_patch_input, normalize_agent_path, parse_apply_patch_changes,
-    parse_mcp_file_intents, redact_text, redact_value, AgentHookEvent, AgentSession, FileIntent,
-    ProcessObservation, SystemEvent, WorkspaceEffect,
+    parse_mcp_file_intents, parse_vscode_file_intents, redact_text, redact_value, AgentHookEvent,
+    AgentSession, FileIntent, ProcessObservation, SystemEvent, WorkspaceEffect,
 };
 pub(crate) use gensee_crate_rules::policy::{self, Policy};
 pub(crate) use gensee_crate_store::{
