@@ -110,6 +110,50 @@ fn telemetry_policy_event_does_not_create_upload_artifacts_on_hook_path() {
 }
 
 #[test]
+fn telemetry_records_vscode_file_tool_schema_drift() {
+    let _guard = telemetry_test_lock();
+    let root = telemetry_test_root("vscode-schema-drift");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    env::set_var("GENSEE_HOME", &root);
+    env::set_var("GENSEE_TELEMETRY_REMOTE", "0");
+
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-session",
+        "tool_name": "moveFileV2",
+        "tool_input": { "filePath": "/workspace/src/target.ts" },
+        "tool_use_id": "tool-1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    telemetry_record_policy_event(&event, &decision, &[]);
+
+    let events = fs::read_to_string(root.join("telemetry-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let drift = events
+        .iter()
+        .find(|event| event["event_name"] == json!("hook_schema_drift"))
+        .expect("schema drift should emit a dedicated telemetry event");
+    assert_eq!(drift["props"]["provider"], json!(PROVIDER_VSCODE));
+    assert_eq!(
+        drift["props"]["rule_id"],
+        json!("policy_unparsed_vscode_file_tool")
+    );
+
+    env::remove_var("GENSEE_TELEMETRY_REMOTE");
+    env::remove_var("GENSEE_HOME");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn telemetry_defaults_remote_upload_off_during_tests() {
     let _guard = telemetry_test_lock();
     let root = telemetry_test_root("test-defaults");
