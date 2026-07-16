@@ -171,6 +171,42 @@ configure_antigravity_hooks() {
   esac
 }
 
+configure_vscode_hooks() {
+  local gensee_home="${GENSEE_HOME:-$HOME/.gensee}"
+  local should_configure="${GENSEE_CONFIGURE_VSCODE:-}"
+  local hooks_path="$HOME/.copilot/hooks/gensee.json"
+
+  if [ "$should_configure" = "0" ]; then
+    return 0
+  fi
+
+  if [ "$should_configure" != "1" ]; then
+    if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+      return 0
+    fi
+    printf 'Configure VS Code / GitHub Copilot hooks now? VS Code also loads Claude-compatible hooks, so select this only if Claude Code hooks are not sufficient. It updates ~/.copilot/hooks/gensee.json and writes a backup. [y/N] ' >/dev/tty
+    IFS= read -r should_configure </dev/tty || should_configure=""
+  fi
+
+  case "$should_configure" in
+    1 | y | Y | yes | YES)
+      if [ "${CLAUDE_HOOKS_CONFIGURED:-0}" = "1" ]; then
+        warn "Claude Code and VS Code hooks were both selected. VS Code loads Claude-compatible hooks, so Gensee may run twice in VS Code sessions."
+      fi
+      if [ -e "$hooks_path" ] && [ ! -w "$hooks_path" ]; then
+        warn "Cannot configure VS Code hooks: $hooks_path is not writable by $(id -un)."
+        warn "Fix ownership and rerun GENSEE_CONFIGURE_VSCODE=1."
+        return 0
+      fi
+      info "Configuring VS Code / GitHub Copilot hooks"
+      GENSEE_HOME="$gensee_home" gensee setup vscode --yes --gensee-home "$gensee_home"
+      VSCODE_HOOKS_CONFIGURED=1
+      ;;
+    *)
+      ;;
+  esac
+}
+
 configure_policy() {
   local gensee_home="${GENSEE_HOME:-$HOME/.gensee}"
   local policy_choice="${GENSEE_POLICY_SETUP:-}"
@@ -373,11 +409,13 @@ warn_unwritable_gensee_files
 CLAUDE_HOOKS_CONFIGURED=0
 CODEX_HOOKS_CONFIGURED=0
 ANTIGRAVITY_HOOKS_CONFIGURED=0
+VSCODE_HOOKS_CONFIGURED=0
 DASHBOARD_CONFIGURED=0
 DASHBOARD_DIR=""
 configure_claude_code_hooks
 configure_codex_hooks
 configure_antigravity_hooks
+configure_vscode_hooks
 POLICY_SETUP="default"
 configure_policy
 configure_dashboard
@@ -449,6 +487,17 @@ EOF
   printf '  GENSEE_HOME="%s" gensee setup antigravity --gensee-home "%s"\n' "$INSTALL_GENSEE_HOME" "$INSTALL_GENSEE_HOME"
 fi
 
+if [ "$VSCODE_HOOKS_CONFIGURED" = "1" ]; then
+  cat <<'EOF'
+VS Code / GitHub Copilot hooks are configured. VS Code reloads hook files automatically on save.
+EOF
+else
+  cat <<'EOF'
+Configure VS Code / GitHub Copilot hooks any time (avoid enabling both VS Code and Claude hooks for the same VS Code sessions):
+EOF
+  printf '  GENSEE_HOME="%s" gensee setup vscode --gensee-home "%s"\n' "$INSTALL_GENSEE_HOME" "$INSTALL_GENSEE_HOME"
+fi
+
 if [ "$DASHBOARD_CONFIGURED" = "1" ]; then
   cat <<EOF
 
@@ -465,6 +514,7 @@ EOF
 fi
 
 cat <<'EOF'
-For non-interactive installs:
+For non-interactive installs, enable only the hook providers you use:
   curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 GENSEE_CONFIGURE_DASHBOARD=1 bash
+  curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_VSCODE=1 bash
 EOF
