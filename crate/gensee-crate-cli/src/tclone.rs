@@ -148,6 +148,11 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     create_args.push(OsString::from(&image));
     create_args.push(OsString::from("-lc"));
     create_args.push(OsString::from(tclone_agent_start_script(&config.agent_cmd)));
+    let agent_cmd_strings = config
+        .agent_cmd
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
 
     let output = run_command_capture(&podman, &create_args)?;
     let container_id = output.lines().next().map(str::trim).map(str::to_string);
@@ -165,11 +170,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         workspace: original_workspace.to_string_lossy().to_string(),
         container_workspace: container_workspace.clone(),
         container_home: container_home.clone(),
-        agent_cmd: config
-            .agent_cmd
-            .iter()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect(),
+        agent_cmd: agent_cmd_strings.clone(),
         fork_base_git_head: None,
         fork_base_overlay_lowerdir: None,
         fork_overlay_upperdir: None,
@@ -187,7 +188,12 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         &podman,
         &[OsString::from("start"), OsString::from(&source_container)],
     )?;
-    wait_tclone_agent_ready(&podman, &source_container, Duration::from_secs(20))?;
+    wait_tclone_agent_ready(
+        &podman,
+        &source_container,
+        &agent_cmd_strings,
+        Duration::from_secs(20),
+    )?;
     let root_pid = inspect_container_pid(&podman, &source_container).unwrap_or(0);
 
     let store = EventStore::default_local()?;
@@ -447,6 +453,7 @@ fn tclone_attach_container(
 fn wait_tclone_agent_ready(
     podman: &OsString,
     container_name: &str,
+    agent_cmd: &[String],
     timeout: Duration,
 ) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
@@ -461,7 +468,7 @@ fn wait_tclone_agent_ready(
                 ),
             ));
         }
-        match tclone_agent_readiness(podman, container_name) {
+        match tclone_agent_readiness(podman, container_name, agent_cmd) {
             Ok(TcloneAgentReadiness::Ready) | Ok(TcloneAgentReadiness::NoTmux) => return Ok(()),
             Ok(TcloneAgentReadiness::Starting(message)) => last_error = Some(message),
             Ok(TcloneAgentReadiness::Exited(message)) => return Err(io::Error::other(message)),
@@ -475,7 +482,7 @@ fn ensure_tclone_agent_ready_for_fork(
     podman: &OsString,
     source: &TcloneRunRecord,
 ) -> io::Result<()> {
-    match tclone_agent_readiness(podman, &source.container_name)? {
+    match tclone_agent_readiness(podman, &source.container_name, &source.agent_cmd)? {
         TcloneAgentReadiness::Ready | TcloneAgentReadiness::NoTmux => Ok(()),
         TcloneAgentReadiness::Starting(message) | TcloneAgentReadiness::Exited(message) => {
             Err(io::Error::other(format!(
@@ -497,7 +504,9 @@ enum TcloneAgentReadiness {
 fn tclone_agent_readiness(
     podman: &OsString,
     container_name: &str,
+    agent_cmd: &[String],
 ) -> io::Result<TcloneAgentReadiness> {
+    let process_check = tclone_agent_process_check(agent_cmd).unwrap_or("true");
     let script = format!(
         r#"if ! command -v tmux >/dev/null 2>&1; then
   echo no-tmux
@@ -513,9 +522,15 @@ if tmux list-panes -t {session} -F '#{{pane_dead}}' 2>/dev/null | grep -q '^1$';
   tmux capture-pane -pt {session} 2>/dev/null | tail -n 40 || true
   exit 0
 fi
+if ! ({process_check}); then
+  echo starting
+  echo agent process is not running yet
+  exit 0
+fi
 echo ready
 "#,
-        session = shell_quote(TCLONE_AGENT_TMUX_SESSION)
+        session = shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        process_check = process_check
     );
     let output = Command::new(podman)
         .arg("exec")
@@ -542,6 +557,17 @@ echo ready
         "starting" => Ok(TcloneAgentReadiness::Starting(detail)),
         "exited" => Ok(TcloneAgentReadiness::Exited(detail)),
         _ => Ok(TcloneAgentReadiness::Starting(stdout.trim().to_string())),
+    }
+}
+
+fn tclone_agent_process_check(agent_cmd: &[String]) -> Option<&'static str> {
+    let binary = agent_cmd.first()?.to_ascii_lowercase();
+    if binary.contains("codex") {
+        Some("ps ax -o args= | grep -E '(^|/)(codex)( |$)|@openai/codex' | grep -v grep >/dev/null")
+    } else if binary.contains("claude") {
+        Some("ps ax -o args= | grep -E '(^|/)(claude)( |$)|claude-code' | grep -v grep >/dev/null")
+    } else {
+        None
     }
 }
 
