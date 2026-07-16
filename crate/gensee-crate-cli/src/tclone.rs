@@ -187,6 +187,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         &podman,
         &[OsString::from("start"), OsString::from(&source_container)],
     )?;
+    wait_tclone_agent_ready(&podman, &source_container, Duration::from_secs(20))?;
     let root_pid = inspect_container_pid(&podman, &source_container).unwrap_or(0);
 
     let store = EventStore::default_local()?;
@@ -282,6 +283,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     }
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &source)?;
+    ensure_tclone_agent_ready_for_fork(&podman, &source)?;
     detach_tclone_tmux_clients(&podman, &source.container_name);
     let forked_at_ms = unix_millis()?;
     let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
@@ -439,6 +441,107 @@ fn tclone_attach_container(
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status(),
+    }
+}
+
+fn wait_tclone_agent_ready(
+    podman: &OsString,
+    container_name: &str,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error: Option<String> = None;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for tclone agent session in {container_name}: {}",
+                    last_error.unwrap_or_else(|| "agent not ready".to_string())
+                ),
+            ));
+        }
+        match tclone_agent_readiness(podman, container_name) {
+            Ok(TcloneAgentReadiness::Ready) | Ok(TcloneAgentReadiness::NoTmux) => return Ok(()),
+            Ok(TcloneAgentReadiness::Starting(message)) => last_error = Some(message),
+            Ok(TcloneAgentReadiness::Exited(message)) => return Err(io::Error::other(message)),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn ensure_tclone_agent_ready_for_fork(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+) -> io::Result<()> {
+    match tclone_agent_readiness(podman, &source.container_name)? {
+        TcloneAgentReadiness::Ready | TcloneAgentReadiness::NoTmux => Ok(()),
+        TcloneAgentReadiness::Starting(message) | TcloneAgentReadiness::Exited(message) => {
+            Err(io::Error::other(format!(
+                "tclone source {} is not ready to fork: {message}",
+                source.run_id
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TcloneAgentReadiness {
+    Ready,
+    NoTmux,
+    Starting(String),
+    Exited(String),
+}
+
+fn tclone_agent_readiness(
+    podman: &OsString,
+    container_name: &str,
+) -> io::Result<TcloneAgentReadiness> {
+    let script = format!(
+        r#"if ! command -v tmux >/dev/null 2>&1; then
+  echo no-tmux
+  exit 0
+fi
+if ! tmux has-session -t {session} 2>/dev/null; then
+  echo starting
+  test -f /tmp/gensee-agent-start.log && tail -n 20 /tmp/gensee-agent-start.log
+  exit 0
+fi
+if tmux list-panes -t {session} -F '#{{pane_dead}}' 2>/dev/null | grep -q '^1$'; then
+  echo exited
+  tmux capture-pane -pt {session} 2>/dev/null | tail -n 40 || true
+  exit 0
+fi
+echo ready
+"#,
+        session = shell_quote(TCLONE_AGENT_TMUX_SESSION)
+    );
+    let output = Command::new(podman)
+        .arg("exec")
+        .arg(container_name)
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{} exec readiness check failed for {}: {}",
+            podman.to_string_lossy(),
+            container_name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let state = lines.next().unwrap_or("").trim();
+    let detail = lines.collect::<Vec<_>>().join("\n");
+    match state {
+        "ready" => Ok(TcloneAgentReadiness::Ready),
+        "no-tmux" => Ok(TcloneAgentReadiness::NoTmux),
+        "starting" => Ok(TcloneAgentReadiness::Starting(detail)),
+        "exited" => Ok(TcloneAgentReadiness::Exited(detail)),
+        _ => Ok(TcloneAgentReadiness::Starting(stdout.trim().to_string())),
     }
 }
 
