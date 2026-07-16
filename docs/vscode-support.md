@@ -65,12 +65,12 @@ delete policy subjects:
 | VS Code tool | Policy operation |
 | --- | --- |
 | `runTerminalCommand`, `runInTerminal` | Shell command and parsed file intents |
-| `editFiles` | Edit each path in `tool_input.files` |
+| `editFiles`, `edit_files` | Edit each path in `tool_input.files` |
 | `createFile`, `create_file` | Write |
 | `replaceStringInFile`, `replace_string_in_file` | Write |
 | `insertEditIntoFile`, `insert_edit_into_file` | Write |
-| `readFile` | Read |
-| `deleteFile` | Delete |
+| `readFile`, `read_file` | Read |
+| `deleteFile`, `delete_file` | Delete |
 
 If a known file tool cannot be parsed, or an unknown tool carries file-shaped
 inputs, Gensee asks for approval instead of silently bypassing path policy. It

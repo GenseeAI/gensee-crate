@@ -131,11 +131,11 @@ VS Code uses different tool names from Claude Code. Gensee maps them correctly:
 | VS Code tool | Operation | Notes |
 |---|---|---|
 | `runTerminalCommand`, `runInTerminal` | Bash shell command | Full bash intent parsing applied |
-| `editFiles` | File edit (multi-file) | `tool_input.files` array |
+| `editFiles`, `edit_files` | File edit (multi-file) | `tool_input.files` array |
 | `createFile`, `create_file` | File write | `tool_input.filePath` |
 | `replaceStringInFile`, `replace_string_in_file` | File write | `tool_input.filePath` |
-| `readFile` | File read | `tool_input.filePath` |
-| `deleteFile` | File delete | `tool_input.filePath` |
+| `readFile`, `read_file` | File read | `tool_input.filePath` |
+| `deleteFile`, `delete_file` | File delete | `tool_input.filePath` |
 
 ## Viewing Results
 
