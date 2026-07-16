@@ -103,6 +103,9 @@ pub(crate) fn evaluate_pretool_policy_with_store(
     if let Some(finding) = unparsed_apply_patch_finding(event) {
         findings.push(finding);
     }
+    if let Some(finding) = unparsed_vscode_file_tool_finding(event) {
+        findings.push(finding);
+    }
     let resource_config = ResourceGovernanceConfig::resolve(policy.document());
     findings.extend(resource_governance_findings_with_config(
         event,
@@ -1491,6 +1494,66 @@ fn vscode_native_policy_subjects(event: &AgentHookEvent, value: &Value) -> Vec<P
         operation: operation.to_string(),
         path: normalize_intent_path(path, cwd),
     }]
+}
+
+fn is_vscode_file_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "editFiles"
+            | "create_file"
+            | "createFile"
+            | "replace_string_in_file"
+            | "replaceStringInFile"
+            | "insert_edit_into_file"
+            | "insertEditIntoFile"
+            | "readFile"
+            | "deleteFile"
+    )
+}
+
+fn unparsed_vscode_file_tool_finding(event: &AgentHookEvent) -> Option<PolicyFinding> {
+    if event.provider != PROVIDER_VSCODE
+        || event.hook_event_name.as_deref() != Some("PreToolUse")
+        || !native_policy_subjects(event).is_empty()
+    {
+        return None;
+    }
+
+    let tool_name = event.tool_name.as_deref()?;
+    let value = serde_json::from_str::<Value>(&event.raw_json).ok();
+    let input = value
+        .as_ref()
+        .and_then(|value| value.get("tool_input"))
+        .and_then(Value::as_object);
+    let has_file_shaped_field = input.is_some_and(|input| {
+        ["filePath", "file_path", "path", "files"]
+            .iter()
+            .any(|field| input.contains_key(*field))
+    });
+    if !is_vscode_file_tool(tool_name) && !has_file_shaped_field {
+        return None;
+    }
+
+    let field_names = input
+        .map(|input| input.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    Some(PolicyFinding {
+        action: PolicyAction::Ask,
+        severity: "high".to_string(),
+        rule_id: "policy_unparsed_vscode_file_tool".to_string(),
+        message: format!(
+            "Review VS Code tool `{tool_name}` before running; file paths could not be safely classified"
+        ),
+        path: event.cwd.clone(),
+        evidence: json!({
+            "source": "vscode_tool",
+            "reason": "no_parseable_file_subjects",
+            "provider": event.provider,
+            "tool_name": tool_name,
+            "tool_input_fields": field_names,
+            "tool_use_id": event.tool_use_id.as_deref(),
+        }),
+    })
 }
 
 fn unparsed_apply_patch_finding(event: &AgentHookEvent) -> Option<PolicyFinding> {

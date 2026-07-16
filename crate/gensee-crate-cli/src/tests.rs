@@ -872,6 +872,96 @@ fn vscode_native_subjects_parse_single_file_tools() {
 }
 
 #[test]
+fn vscode_unknown_file_tool_fails_closed() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "moveFileV2",
+        "tool_input": { "filePath": "/workspace/src/target.ts" },
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert_eq!(decision.action, PolicyAction::Ask);
+    let finding = decision
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool")
+        .expect("unknown file-shaped tool should fail closed");
+    assert_eq!(finding.action, PolicyAction::Ask);
+    assert_eq!(finding.severity, "high");
+    assert_eq!(finding.evidence["tool_name"], json!("moveFileV2"));
+}
+
+#[test]
+fn vscode_malformed_known_file_tool_fails_closed() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "createFile",
+        "tool_input": { "filePath": { "unexpected": "shape" } },
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert_eq!(decision.action, PolicyAction::Ask);
+    assert!(decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool"));
+}
+
+#[test]
+fn vscode_known_file_tool_with_missing_input_fails_closed() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "deleteFile",
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert_eq!(decision.action, PolicyAction::Ask);
+    assert!(decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool"));
+}
+
+#[test]
+fn vscode_unknown_non_file_tool_does_not_trigger_file_drift_guard() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "searchWorkspaceSymbols",
+        "tool_input": { "query": "PolicyDecision" },
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert!(!decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool"));
+}
+
+#[test]
 fn codex_hook_event_uses_codex_provider() {
     let payload = pretool_bash_payload("s1", "/repo", "ls");
     let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
