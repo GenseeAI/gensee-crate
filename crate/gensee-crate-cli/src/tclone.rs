@@ -1148,7 +1148,7 @@ fn tclone_merge_filesystem(
         return Ok(());
     }
 
-    apply_tclone_overlay_merge(&source_rootfs, &plan)?;
+    apply_tclone_overlay_merge(podman, source, &plan)?;
     append_tclone_status(&fork.run_id, "merged", None)?;
     println!(
         "gensee: merged overlay filesystem changes from {} into {}",
@@ -1330,64 +1330,57 @@ fn overlay_whiteout_target(path: &str, entry: &fs::DirEntry) -> io::Result<Optio
 }
 
 fn apply_tclone_overlay_merge(
-    source_rootfs: &Path,
+    podman: &OsString,
+    source: &TcloneRunRecord,
     plan: &TcloneOverlayMergePlan,
 ) -> io::Result<()> {
     for change in plan.deletions() {
-        remove_path_if_exists(&source_rootfs.join(&change.path))?;
+        let destination = format!("/{}", change.path);
+        tclone_exec(
+            podman,
+            &source.container_name,
+            &["rm", "-rf", "--", &destination],
+        )?;
     }
     for change in plan.upserts() {
-        let destination = source_rootfs.join(&change.path);
+        let destination = format!("/{}", change.path);
         match change.op {
-            TcloneOverlayMergeOp::CreateDir => fs::create_dir_all(&destination)?,
+            TcloneOverlayMergeOp::CreateDir => {
+                tclone_exec(
+                    podman,
+                    &source.container_name,
+                    &["mkdir", "-p", "--", &destination],
+                )?;
+            }
             TcloneOverlayMergeOp::UpsertFile => {
-                let source = change.source.as_ref().ok_or_else(|| {
+                let overlay_source = change.source.as_ref().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("missing overlay source for {}", change.path),
                     )
                 })?;
-                if let Some(parent) = destination.parent() {
-                    fs::create_dir_all(parent)?;
+                if let Some(parent) = Path::new(&destination).parent().and_then(Path::to_str) {
+                    tclone_exec(
+                        podman,
+                        &source.container_name,
+                        &["mkdir", "-p", "--", parent],
+                    )?;
                 }
-                remove_path_if_exists(&destination)?;
-                copy_path_preserving_metadata(source, &destination)?;
+                tclone_exec(
+                    podman,
+                    &source.container_name,
+                    &["rm", "-rf", "--", &destination],
+                )?;
+                podman_cp(
+                    podman,
+                    overlay_source,
+                    &format!("{}:{destination}", source.container_name),
+                )?;
             }
             TcloneOverlayMergeOp::Delete => {}
         }
     }
     Ok(())
-}
-
-fn remove_path_if_exists(path: &Path) -> io::Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    if metadata.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    }
-}
-
-fn copy_path_preserving_metadata(source: &Path, destination: &Path) -> io::Result<()> {
-    let status = Command::new("cp")
-        .arg("-a")
-        .arg("--reflink=auto")
-        .arg(source)
-        .arg(destination)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "cp -a --reflink=auto {} {} exited with status {status}",
-            source.display(),
-            destination.display()
-        )))
-    }
 }
 
 fn normalize_tclone_merge_path(path: &str) -> String {
