@@ -1,7 +1,7 @@
 use crate::*;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -271,6 +271,8 @@ struct TcloneHostControlServer {
     control_dir: PathBuf,
 }
 
+struct TcloneContainerFileControlServer;
+
 impl TcloneHostControlServer {
     fn start(socket_path: &Path, control_dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(control_dir.join("requests"))?;
@@ -318,6 +320,32 @@ impl TcloneHostControlServer {
                 "tclone host control is only supported on Unix",
             ))
         }
+    }
+}
+
+impl TcloneContainerFileControlServer {
+    fn start(
+        podman: &OsString,
+        container_name: &str,
+        control_dir: &str,
+        poll_interval: Duration,
+    ) -> io::Result<Self> {
+        let exe = env::current_exe()?;
+        let podman = podman.clone();
+        let container_name = container_name.to_string();
+        let control_dir = control_dir.to_string();
+        thread::spawn(move || loop {
+            if let Err(error) = drain_tclone_container_host_control_file_requests(
+                &podman,
+                &container_name,
+                &control_dir,
+                &exe,
+            ) {
+                eprintln!("gensee: tclone container host-control bridge failed: {error}");
+            }
+            thread::sleep(poll_interval);
+        });
+        Ok(Self)
     }
 }
 
@@ -420,6 +448,114 @@ fn drain_tclone_host_control_file_requests(control_dir: &Path, exe: &Path) -> io
     Ok(())
 }
 
+fn drain_tclone_container_host_control_file_requests(
+    podman: &OsString,
+    container_name: &str,
+    control_dir: &str,
+    exe: &Path,
+) -> io::Result<()> {
+    let requests_dir = format!("{control_dir}/requests");
+    let responses_dir = format!("{control_dir}/responses");
+    let list_script = format!(
+        "mkdir -p {} {}; find {} -maxdepth 1 -type f -name '*.json' -printf '%f\\n' 2>/dev/null || true",
+        shell_quote(&requests_dir),
+        shell_quote(&responses_dir),
+        shell_quote(&requests_dir),
+    );
+    let output = Command::new(podman)
+        .arg("exec")
+        .arg(container_name)
+        .arg("sh")
+        .arg("-lc")
+        .arg(&list_script)
+        .output()?;
+    if !output.status.success() {
+        return Ok(());
+    }
+    for file_name in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with(".json") && !line.contains('/'))
+    {
+        let request_path = format!("{requests_dir}/{file_name}");
+        let response_path = format!("{responses_dir}/{file_name}");
+        let request_json = match Command::new(podman)
+            .arg("exec")
+            .arg(container_name)
+            .arg("sh")
+            .arg("-lc")
+            .arg(format!("cat {}", shell_quote(&request_path)))
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).to_string()
+            }
+            _ => continue,
+        };
+        let response = serde_json::from_str::<TcloneHostControlRequest>(&request_json)
+            .map_err(io::Error::other)
+            .and_then(|request| execute_tclone_host_control_request(request, exe))
+            .unwrap_or_else(|error| TcloneHostControlResponse {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(error.to_string()),
+            });
+        write_tclone_container_host_control_response(
+            podman,
+            container_name,
+            &request_path,
+            &response_path,
+            &response,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_tclone_container_host_control_response(
+    podman: &OsString,
+    container_name: &str,
+    request_path: &str,
+    response_path: &str,
+    response: &TcloneHostControlResponse,
+) -> io::Result<()> {
+    let response_tmp = format!("{response_path}.tmp");
+    let script = format!(
+        "cat > {}; mv {} {}; rm -f {}",
+        shell_quote(&response_tmp),
+        shell_quote(&response_tmp),
+        shell_quote(response_path),
+        shell_quote(request_path),
+    );
+    let mut child = Command::new(podman)
+        .arg("exec")
+        .arg("-i")
+        .arg(container_name)
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io::Error::other("could not open podman exec stdin"))?;
+        stdin.write_all(&serde_json::to_vec(response)?)?;
+    }
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "podman exec response write failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+}
+
 pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     if std::env::consts::OS != "linux" {
         return Err(io::Error::new(
@@ -449,8 +585,6 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     let host_control_dir = gensee_tmp_root()?.join(&run_id).join("host-control");
     fs::create_dir_all(&host_control_dir)?;
     let host_control_socket = host_control_dir.join("control.sock");
-    let container_host_control_dir = format!("{container_home}/.gensee/host-control");
-    let container_host_control_socket = format!("{container_host_control_dir}/control.sock");
     let container_workspace_host_control_dir =
         format!("{container_workspace}/{TCLONE_HOST_CONTROL_WORKSPACE_DIR}");
     if let Some((socket, target)) = infer_host_tmux_context() {
@@ -469,6 +603,16 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         gensee_home.as_ref(),
         &container_workspace,
         &container_home,
+    )?;
+    fs::create_dir_all(
+        staged_workspace
+            .join(TCLONE_HOST_CONTROL_WORKSPACE_DIR)
+            .join("requests"),
+    )?;
+    fs::create_dir_all(
+        staged_workspace
+            .join(TCLONE_HOST_CONTROL_WORKSPACE_DIR)
+            .join("responses"),
     )?;
     if let Ok(current_exe) = env::current_exe() {
         if current_exe.exists() {
@@ -511,26 +655,10 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         OsString::from(format!("GENSEE_WORKSPACE={container_workspace}")),
         OsString::from("-e"),
         OsString::from(format!(
-            "{TCLONE_HOST_CONTROL_SOCKET_ENV}={container_host_control_socket}"
-        )),
-        OsString::from("-e"),
-        OsString::from(format!(
             "{TCLONE_HOST_CONTROL_DIR_ENV}={container_workspace_host_control_dir}"
         )),
         OsString::from("-e"),
         OsString::from("TERM=xterm-256color"),
-        OsString::from("-v"),
-        OsString::from(format!(
-            "{}:{}",
-            host_control_dir.display(),
-            container_host_control_dir
-        )),
-        OsString::from("-v"),
-        OsString::from(format!(
-            "{}:{}",
-            host_control_dir.display(),
-            container_workspace_host_control_dir
-        )),
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
@@ -594,6 +722,12 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     run_command_status(
         &podman,
         &[OsString::from("start"), OsString::from(&source_container)],
+    )?;
+    let _container_file_control = TcloneContainerFileControlServer::start(
+        &podman,
+        &source_container,
+        &container_workspace_host_control_dir,
+        Duration::from_millis(200),
     )?;
     let no_attach = env_flag("GENSEE_TCLONE_NO_ATTACH");
     wait_tclone_agent_ready(
