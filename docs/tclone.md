@@ -41,7 +41,7 @@ gensee-tclone run switch <fork-id>
 gensee-tclone run keep <run_id-or-container> --to /tmp/kept-workspace
 gensee-tclone run discard <run_id-or-container>
 gensee-tclone run delete <run_id-or-container>   # remove container and hide from run list
-gensee-tclone run delete --all                   # clean all tracked tclone containers
+gensee-tclone run delete --all                   # clean tracked runs and gensee-tclone-* orphans
 ```
 
 The source id is the row with role `source` under the `Tclone containers`
@@ -81,8 +81,9 @@ the previous source as switched away when Gensee knows the parent source.
 `gensee run discard <run_id-or-container>` removes the container and keeps a
 `discarded` record for history. `gensee run delete <run_id-or-container>`
 removes the container and removes that tclone record from `gensee run list`.
-Use `gensee run delete --all` to clean all tracked tclone containers and clear
-the tclone section of the run list.
+Use `gensee run delete --all` to clean tracked tclone containers, clear the
+tclone section of the run list, and reap untracked `gensee-tclone-*` orphan
+containers in the same Podman store.
 
 ## Requirements
 
@@ -101,6 +102,7 @@ export GENSEE_TCLONE_PODMAN=/path/to/os4agent/podman-tfork.sh
 export GENSEE_TCLONE_IMAGE=ghcr.io/wuklab/webtop:ubuntu-kde
 export GENSEE_TCLONE_NODE_ROOT="$HOME/.nvm"
 export GENSEE_TCLONE_NODE_BIN="$(dirname "$(command -v node)")"
+export GENSEE_TCLONE_READY_TIMEOUT_SECS=120
 ```
 
 ## Control Split

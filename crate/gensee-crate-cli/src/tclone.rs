@@ -190,12 +190,13 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         &podman,
         &[OsString::from("start"), OsString::from(&source_container)],
     )?;
+    let no_attach = env_flag("GENSEE_TCLONE_NO_ATTACH");
     wait_tclone_agent_ready(
         &podman,
         &source_container,
         &agent_cmd_strings,
-        env_flag("GENSEE_TCLONE_NO_ATTACH"),
-        Duration::from_secs(20),
+        no_attach,
+        tclone_agent_ready_timeout(no_attach),
     )?;
     let root_pid = inspect_container_pid(&podman, &source_container).unwrap_or(0);
 
@@ -1102,7 +1103,8 @@ fn tclone_merge_filesystem(
         ));
     }
 
-    let fork_overlay = inspect_tclone_overlay_rootfs(podman, &fork.container_name)?;
+    let fork_overlay = inspect_tclone_overlay_rootfs(podman, &fork.container_name)
+        .or_else(|_| recorded_tclone_overlay_rootfs(fork))?;
     let source_rootfs = inspect_tclone_rootfs(podman, &source.container_name)?;
     let filter = paths.map(|paths| {
         paths
@@ -1625,6 +1627,40 @@ fn inspect_tclone_overlay_rootfs(
     };
     Ok(TcloneOverlayRootfs {
         rootfs,
+        lowerdir,
+        upperdir,
+    })
+}
+
+fn recorded_tclone_overlay_rootfs(record: &TcloneRunRecord) -> io::Result<TcloneOverlayRootfs> {
+    let lowerdir = record
+        .fork_base_overlay_lowerdir
+        .as_ref()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "tclone fork {} does not have recorded overlay lowerdir metadata; recreate the fork with Gensee's tclone overlay mode",
+                    record.run_id
+                ),
+            )
+        })?;
+    let upperdir = record
+        .fork_overlay_upperdir
+        .as_ref()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "tclone fork {} does not have recorded overlay upperdir metadata; recreate the fork with Gensee's tclone overlay mode",
+                    record.run_id
+                ),
+            )
+        })?;
+    Ok(TcloneOverlayRootfs {
+        rootfs: upperdir.clone(),
         lowerdir,
         upperdir,
     })
@@ -2227,6 +2263,20 @@ fn env_flag(name: &str) -> bool {
     env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+fn tclone_agent_ready_timeout(no_attach: bool) -> Duration {
+    env::var("GENSEE_TCLONE_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| {
+            if no_attach {
+                Duration::from_secs(120)
+            } else {
+                Duration::from_secs(20)
+            }
+        })
 }
 
 fn podman_cp(podman: &OsString, source: &Path, destination: &str) -> io::Result<()> {
@@ -2941,6 +2991,60 @@ mod tests {
         assert_eq!(plan.changes[0].path, "home/gensee/.codex/config");
         assert_eq!(plan.changes[0].op, TcloneOverlayMergeOp::UpsertFile);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_overlay_merge_plan_applies_whiteout_delete() {
+        let root = temp_tree("whiteout-delete");
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+        let source = root.join("source");
+        fs::create_dir_all(lower.join("workspace")).unwrap();
+        fs::create_dir_all(upper.join("workspace")).unwrap();
+        fs::create_dir_all(source.join("workspace")).unwrap();
+        fs::write(lower.join("workspace/a.txt"), "old").unwrap();
+        fs::write(upper.join("workspace/.wh.a.txt"), "").unwrap();
+        fs::write(source.join("workspace/a.txt"), "old").unwrap();
+
+        let plan = build_tclone_overlay_merge_plan(&lower, &upper, &source, &None).unwrap();
+
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].path, "workspace/a.txt");
+        assert_eq!(plan.changes[0].op, TcloneOverlayMergeOp::Delete);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_overlay_merge_plan_rejects_opaque_directory_marker() {
+        let root = temp_tree("opaque-dir");
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+        let source = root.join("source");
+        fs::create_dir_all(&lower).unwrap();
+        fs::create_dir_all(upper.join("workspace")).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(upper.join("workspace/.wh..wh..opq"), "").unwrap();
+
+        let error = build_tclone_overlay_merge_plan(&lower, &upper, &source, &None).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error
+            .to_string()
+            .contains("overlay opaque directory marker is not supported"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_recorded_overlay_rootfs_uses_stored_layers() {
+        let mut record = test_fork_record("fork_1", "source_1");
+        record.fork_base_overlay_lowerdir = Some("/tmp/lower".to_string());
+        record.fork_overlay_upperdir = Some("/tmp/upper".to_string());
+
+        let overlay = recorded_tclone_overlay_rootfs(&record).unwrap();
+
+        assert_eq!(overlay.lowerdir, PathBuf::from("/tmp/lower"));
+        assert_eq!(overlay.upperdir, PathBuf::from("/tmp/upper"));
     }
 
     #[test]
