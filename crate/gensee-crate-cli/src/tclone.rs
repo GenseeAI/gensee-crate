@@ -21,6 +21,7 @@ const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
 const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
+const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
@@ -443,12 +444,24 @@ fn spawn_tclone_host_control_request(
         exe.display(),
         request.args
     )?;
+    let delay_secs = tclone_async_fork_delay_secs();
+    writeln!(
+        log,
+        "gensee async job {}: waiting {}s before host fork",
+        job.id, delay_secs
+    )?;
     let stderr = log.try_clone()?;
-    Command::new(&exe)
+    Command::new("sh")
+        .arg("-c")
+        .arg("sleep \"$1\"; shift; exec \"$@\"")
+        .arg("gensee-tclone-async-fork")
+        .arg(delay_secs.to_string())
+        .arg(&exe)
         .args(&request.args)
         .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
         .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
         .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
+        .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
         .spawn()?;
@@ -458,6 +471,13 @@ fn spawn_tclone_host_control_request(
 fn tclone_host_control_should_run_async(args: &[String]) -> bool {
     matches!(args.first().map(String::as_str), Some("run"))
         && matches!(args.get(1).map(String::as_str), Some("fork"))
+}
+
+fn tclone_async_fork_delay_secs() -> u64 {
+    env::var("GENSEE_TCLONE_ASYNC_FORK_DELAY_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(TCLONE_ASYNC_FORK_DELAY_SECS)
 }
 
 fn tclone_async_job(args: &[String]) -> io::Result<TcloneAsyncJob> {
