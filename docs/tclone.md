@@ -15,12 +15,13 @@ gensee-tclone run --runtime tclone -- codex
 ```
 
 The host-side Gensee process owns container orchestration. It prepares a source
-container with the workspace, detected agent config such as `CODEX_HOME` or
-`CLAUDE_CONFIG_DIR`, and `GENSEE_HOME`, then starts the agent as the container's
-main process. If the image has `tmux`, Gensee runs the agent inside a named
-`gensee-agent` tmux session and `gensee run attach` reconnects to that session;
-otherwise it falls back to raw Podman attach, which may not survive tclone
-restore for interactive agents.
+container with the workspace, detected agent config such as `CODEX_HOME`,
+`CLAUDE_CONFIG_DIR`, or Antigravity's `GEMINI_HOME`, and `GENSEE_HOME`, then
+starts the agent as the container's main process. If the image has `tmux`,
+Gensee runs the agent inside a named `gensee-agent` tmux session and
+`gensee run attach` reconnects to that session. Treat `tmux` as required for
+reliable attach to live/forked interactive agents; raw Podman attach is only a
+fallback and may not survive tclone restore.
 Add the exports and alias to `~/.bashrc`, `~/.zshrc`, or your shell profile if
 you use this host regularly. If testing from a source checkout, replace the
 alias target `gensee` with `./target/debug/gensee`.
@@ -90,7 +91,8 @@ the tclone section of the run list.
 - The tclone CRIU/crun stack configured for Podman.
 - A container image with the agent runtime available, or a host Node/NVM mount
   that makes Node-based shims such as Codex available.
-- `tmux` inside the image for reliable attach to forked interactive agents.
+- `tmux` inside the image for `gensee run attach` with live/forked interactive
+  agents. `gensee run shell` only opens a new shell and does not require tmux.
 
 Environment overrides:
 

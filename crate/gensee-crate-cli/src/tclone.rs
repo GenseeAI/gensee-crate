@@ -1952,6 +1952,15 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
             host,
             format!("{DEFAULT_CONTAINER_HOME}/.claude"),
         ))
+    } else if lower.contains("antigravity") || lower.contains("gemini") {
+        let host = env::var_os("GEMINI_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".gemini"));
+        Some((
+            "GEMINI_HOME".to_string(),
+            host,
+            format!("{DEFAULT_CONTAINER_HOME}/.gemini"),
+        ))
     } else {
         None
     }
@@ -2745,6 +2754,40 @@ mod tests {
         assert_eq!(
             fs::read_link(seed.join(gensee_home.strip_prefix("/").unwrap())).unwrap(),
             PathBuf::from("/home/gensee/.gensee")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_seed_copies_antigravity_gemini_home() {
+        let root = temp_tree("antigravity-home");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let gemini_home = root.join("host-home/yiying/.gemini");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(gemini_home.join("config")).unwrap();
+        fs::write(gemini_home.join("config/hooks.json"), "{}").unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "GEMINI_HOME".to_string(),
+                gemini_home.clone(),
+                "/home/gensee/.gemini".to_string(),
+            )),
+            None,
+            "/workspace",
+            "/home/gensee",
+        )
+        .unwrap();
+
+        assert!(seed.join("home/gensee/.gemini/config/hooks.json").exists());
+        assert_eq!(
+            fs::read_link(seed.join(gemini_home.strip_prefix("/").unwrap())).unwrap(),
+            PathBuf::from("/home/gensee/.gemini")
         );
         let _ = fs::remove_dir_all(root);
     }
