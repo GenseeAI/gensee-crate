@@ -399,7 +399,11 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             } else {
                 HostTmuxPlacement::Below
             };
-            open_tclone_attach_in_host_tmux(run_id, placement)?;
+            if let Err(err) = open_tclone_attach_in_host_tmux_after_preflight(run_id, placement) {
+                eprintln!(
+                    "gensee: warning: fork {run_id} was created, but tmux attach failed: {err}"
+                );
+            }
         }
     }
     Ok(())
@@ -474,8 +478,15 @@ fn parse_host_tmux_placement(value: &str) -> io::Result<HostTmuxPlacement> {
 
 fn open_tclone_attach_in_host_tmux(target: &str, placement: HostTmuxPlacement) -> io::Result<()> {
     ensure_host_tmux_available()?;
+    open_tclone_attach_in_host_tmux_after_preflight(target, placement)
+}
+
+fn open_tclone_attach_in_host_tmux_after_preflight(
+    target: &str,
+    placement: HostTmuxPlacement,
+) -> io::Result<()> {
     let exe = env::current_exe()?;
-    let command = host_tmux_attach_command(target, &exe);
+    let command = host_tmux_attach_command(target, &exe, env::var_os("SUDO_USER").is_some());
     open_host_tmux_pane(&command, placement)
 }
 
@@ -515,8 +526,7 @@ fn open_host_tmux_pane(command: &str, placement: HostTmuxPlacement) -> io::Resul
     }
 }
 
-fn host_tmux_attach_command(target: &str, exe: &Path) -> String {
-    let use_sudo = env::var_os("SUDO_USER").is_some();
+fn host_tmux_attach_command(target: &str, exe: &Path, use_sudo: bool) -> String {
     let mut parts = Vec::new();
     if use_sudo {
         parts.push("sudo".to_string());
@@ -2890,11 +2900,21 @@ mod tests {
 
     #[test]
     fn tclone_host_tmux_attach_command_reenters_gensee_attach() {
-        let command = host_tmux_attach_command("run_1_fork_0", Path::new("/tmp/gensee"));
+        let command = host_tmux_attach_command("run_1_fork_0", Path::new("/tmp/gensee"), false);
 
         assert!(command.contains("'/tmp/gensee' run attach 'run_1_fork_0'"));
+        assert!(command.starts_with("env "));
+        assert!(!command.starts_with("sudo "));
         assert!(command.contains("attach exited with status"));
         assert!(command.contains("exec \"${SHELL:-/bin/sh}\""));
+    }
+
+    #[test]
+    fn tclone_host_tmux_attach_command_can_reenter_with_sudo() {
+        let command = host_tmux_attach_command("run_1_fork_0", Path::new("/tmp/gensee"), true);
+
+        assert!(command.starts_with("sudo env "));
+        assert!(command.contains("'/tmp/gensee' run attach 'run_1_fork_0'"));
     }
 
     #[test]
