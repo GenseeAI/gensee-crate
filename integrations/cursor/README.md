@@ -44,6 +44,12 @@ The generated command is equivalent to:
 GENSEE_HOME=/absolute/gensee-home /absolute/path/to/gensee hook cursor
 ```
 
+Cursor may also load Claude-compatible hook settings. Gensee detects imported
+Claude invocations from conservative Cursor runtime markers and suppresses one
+only when a native Gensee Cursor hook covers the same event. Otherwise the
+payload is processed through the Cursor parser, preserving enforcement without
+requiring users to remove either configuration.
+
 A hand-editable `~/.cursor/hooks.json` looks like:
 
 ```json

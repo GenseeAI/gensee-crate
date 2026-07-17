@@ -89,9 +89,10 @@ Antigravity hooks:
 curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 GENSEE_CONFIGURE_DASHBOARD=1 bash
 ```
 
-To configure VS Code / GitHub Copilot hooks instead, use the VS Code toggle.
-Avoid enabling both Claude Code and VS Code hooks for the same VS Code sessions,
-because VS Code also loads Claude-compatible hook settings:
+To configure VS Code / GitHub Copilot hooks, use the VS Code toggle. VS Code
+also loads Claude-compatible hook settings; when both Gensee integrations are
+installed, Gensee detects the VS Code payload and suppresses the imported
+Claude invocation for events covered by the native VS Code hook:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_VSCODE=1 bash

@@ -17,6 +17,13 @@ duplicate Gensee commands are replaced with one current entry. Changed files
 are backed up and written atomically, while unchanged setup runs do not create
 additional backups. Restart Cursor after setup.
 
+Cursor can also import Claude-compatible hook settings. If Gensee's Claude Code
+hooks are present, Gensee recognizes Cursor payloads using `cursor_version` plus
+an independent conversation or transcript marker. A Claude compatibility
+invocation is suppressed only when the native Cursor config contains a Gensee
+hook for that same event. If the native hook is absent, the invocation continues
+through the Cursor parser so enforcement and provider attribution are preserved.
+
 The one-line installer can configure Cursor non-interactively:
 
 ```bash

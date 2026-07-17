@@ -1105,6 +1105,13 @@ fn default_vscode_hooks_path() -> io::Result<PathBuf> {
     Ok(home.join(".copilot").join("hooks").join("gensee.json"))
 }
 
+fn default_cursor_hooks_path() -> io::Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    Ok(home.join(".cursor").join("hooks.json"))
+}
+
 fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
     let mut hooks_path = default_vscode_hooks_path()?;
     let mut gensee_home = env::var_os("GENSEE_HOME")
@@ -1231,10 +1238,7 @@ fn vscode_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
 }
 
 fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    let mut hooks_path = home.join(".cursor").join("hooks.json");
+    let mut hooks_path = default_cursor_hooks_path()?;
     let mut gensee_home = env::var_os("GENSEE_HOME")
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
@@ -1434,6 +1438,126 @@ fn write_json_config_if_changed_with_mode(
 
 fn gensee_hook_command_owned_by(command: &str, provider: &str) -> bool {
     command.contains("GENSEE_HOME=") && command.trim_end().ends_with(&format!(" hook {provider}"))
+}
+
+fn config_has_owned_hook_for_event(root: &Value, provider: &str, event_name: &str) -> bool {
+    fn contains_owned_command(value: &Value, provider: &str) -> bool {
+        match value {
+            Value::Object(object) => {
+                object
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| gensee_hook_command_owned_by(command, provider))
+                    || object
+                        .values()
+                        .any(|value| contains_owned_command(value, provider))
+            }
+            Value::Array(values) => values
+                .iter()
+                .any(|value| contains_owned_command(value, provider)),
+            _ => false,
+        }
+    }
+
+    root.get("hooks")
+        .and_then(|hooks| hooks.get(event_name))
+        .is_some_and(|event| contains_owned_command(event, provider))
+}
+
+fn native_hook_config_paths(provider: &str, payload: &Value) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        match provider {
+            PROVIDER_CURSOR => paths.push(home.join(".cursor").join("hooks.json")),
+            PROVIDER_VSCODE => paths.push(home.join(".copilot").join("hooks").join("gensee.json")),
+            _ => {}
+        }
+    }
+
+    let mut workspace_roots = payload
+        .get("workspace_roots")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|root| !root.trim().is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if let Some(cwd) = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.trim().is_empty())
+    {
+        workspace_roots.push(PathBuf::from(cwd));
+    }
+
+    for root in workspace_roots {
+        let path = match provider {
+            PROVIDER_CURSOR => root.join(".cursor").join("hooks.json"),
+            PROVIDER_VSCODE => root.join(".github").join("hooks").join("gensee.json"),
+            _ => continue,
+        };
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn native_gensee_hook_configured(provider: &str, payload: &str) -> io::Result<bool> {
+    let payload_value: Value = serde_json::from_str(payload).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("compatibility payload is not valid JSON: {error}"),
+        )
+    })?;
+    let Some(event_name) = payload_value
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .filter(|event_name| !event_name.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+
+    let mut first_error = None;
+    for path in native_hook_config_paths(provider, &payload_value) {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("cannot read native hook config {}: {error}", path.display()),
+                    )
+                });
+                continue;
+            }
+        };
+        let root = match serde_json::from_str::<Value>(&contents) {
+            Ok(root) => root,
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "native hook config {} is not valid JSON: {error}",
+                            path.display()
+                        ),
+                    )
+                });
+                continue;
+            }
+        };
+        if config_has_owned_hook_for_event(&root, provider, event_name) {
+            return Ok(true);
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(false),
+    }
 }
 
 fn command_hook_owned_by(entry: &Value, provider: &str, context: &str) -> io::Result<bool> {
@@ -3324,7 +3448,29 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     let mut payload = String::new();
     io::stdin().read_to_string(&mut payload)?;
 
-    let event = build_hook_event(&payload, provider)?;
+    let mut effective_provider = provider;
+    if let Some(native_provider) = compatibility_payload_provider(&payload) {
+        if native_provider != provider {
+            match native_gensee_hook_configured(native_provider, &payload) {
+                Ok(true) => {
+                    telemetry_record_hook_compatibility_suppressed(provider, native_provider);
+                    return Ok(());
+                }
+                Ok(false) => effective_provider = native_provider,
+                Err(error) => {
+                    // A broken or unreadable native config is not evidence that
+                    // the native hook will run. Preserve enforcement by handling
+                    // this compatibility invocation through the native parser.
+                    eprintln!(
+                        "gensee hook: cannot verify {native_provider} native hook config ({error}); processing the compatibility invocation"
+                    );
+                    effective_provider = native_provider;
+                }
+            }
+        }
+    }
+
+    let event = build_hook_event(&payload, effective_provider)?;
 
     // Fast path: if the warm daemon is up, hand off over its socket — PreToolUse
     // waits for the decision (warm eval, no per-call store open), observational

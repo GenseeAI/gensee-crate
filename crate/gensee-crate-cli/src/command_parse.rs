@@ -273,6 +273,69 @@ pub(crate) fn is_env_assignment_token(token: &str) -> bool {
     }
 }
 
+/// Detect when a Claude-compatible hook payload was emitted by another host.
+///
+/// Cursor and VS Code both import Claude hook settings. Keep these checks
+/// deliberately conservative: a false positive could route a real Claude Code
+/// invocation through the wrong response format, or suppress it when a native
+/// hook is configured.
+pub(crate) fn compatibility_payload_provider(payload: &str) -> Option<&'static str> {
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+
+    let nonempty = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    };
+    let transcript = value
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    // Cursor runtime payloads include cursor_version plus conversation_id.
+    // Some events omit one of those identifiers but retain the Cursor agent
+    // transcript path, so accept that as the second independent marker.
+    if nonempty("cursor_version")
+        && (nonempty("conversation_id")
+            || (transcript.contains(".cursor") && transcript.contains("agent-transcripts")))
+    {
+        return Some(PROVIDER_CURSOR);
+    }
+
+    // VS Code adds an ISO timestamp to all hook payloads. Require another
+    // VS Code-specific marker: Copilot's transcript location, its tool-use ID
+    // suffix, or a native tool name. This avoids treating a future Claude Code
+    // timestamp field alone as proof that the payload came from VS Code.
+    let tool_use_id = value
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let tool_name = value
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let vscode_marker = transcript.contains("github.copilot-chat")
+        || tool_use_id.contains("__vscode-")
+        || matches!(
+            tool_name,
+            "runTerminalCommand"
+                | "runInTerminal"
+                | "editFiles"
+                | "createFile"
+                | "replaceStringInFile"
+                | "insertEditIntoFile"
+                | "readFile"
+                | "deleteFile"
+        );
+    if nonempty("timestamp") && vscode_marker {
+        return Some(PROVIDER_VSCODE);
+    }
+
+    None
+}
+
 /// Parse an agent hook payload, redact secrets, and project it into an
 /// `AgentHookEvent`. All structured fields are read from the *redacted* JSON, so
 /// nothing secret-bearing is persisted or fed into downstream intent parsing.

@@ -110,6 +110,43 @@ fn telemetry_policy_event_does_not_create_upload_artifacts_on_hook_path() {
 }
 
 #[test]
+fn telemetry_records_suppressed_compatibility_invocation_without_flushing() {
+    let _guard = telemetry_test_lock();
+    let root = telemetry_test_root("hook-compatibility-suppressed");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    env::set_var("GENSEE_HOME", &root);
+    env::set_var("GENSEE_TELEMETRY_REMOTE", "1");
+    telemetry_record_hook_compatibility_suppressed(PROVIDER_CLAUDE_CODE, PROVIDER_CURSOR);
+
+    let events = fs::read_to_string(root.join("telemetry-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0]["event_name"],
+        json!("hook_compatibility_duplicate_suppressed")
+    );
+    assert_eq!(
+        events[0]["props"]["source_provider"],
+        json!(PROVIDER_CLAUDE_CODE)
+    );
+    assert_eq!(
+        events[0]["props"]["native_provider"],
+        json!(PROVIDER_CURSOR)
+    );
+    assert!(!root.join("telemetry-events-upload.jsonl").exists());
+    assert!(!root.join("telemetry-flush.lock").exists());
+
+    env::remove_var("GENSEE_TELEMETRY_REMOTE");
+    env::remove_var("GENSEE_HOME");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn telemetry_records_vscode_file_tool_schema_drift() {
     let _guard = telemetry_test_lock();
     let root = telemetry_test_root("vscode-schema-drift");
@@ -912,6 +949,202 @@ fn cursor_hook_command_quotes_paths_with_spaces() {
         command,
         "GENSEE_HOME='/Users/example/Gensee Store' '/Applications/Gensee Crate/gensee' hook cursor"
     );
+}
+
+#[test]
+fn compatibility_payload_provider_detects_cursor_with_independent_markers() {
+    let payload = json!({
+        "hook_event_name": "beforeSubmitPrompt",
+        "conversation_id": "conv-123",
+        "cursor_version": "3.11.19",
+        "transcript_path": null
+    })
+    .to_string();
+
+    assert_eq!(
+        compatibility_payload_provider(&payload),
+        Some(PROVIDER_CURSOR)
+    );
+
+    let transcript_payload = json!({
+        "hook_event_name": "stop",
+        "cursor_version": "3.11.19",
+        "transcript_path": "/tmp/.cursor/projects/repo/agent-transcripts/conv.jsonl"
+    })
+    .to_string();
+    assert_eq!(
+        compatibility_payload_provider(&transcript_payload),
+        Some(PROVIDER_CURSOR)
+    );
+}
+
+#[test]
+fn compatibility_payload_provider_does_not_trust_cursor_version_alone() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session",
+        "cursor_version": "unexpected-user-field",
+        "transcript_path": "/tmp/.claude/transcript.jsonl"
+    })
+    .to_string();
+
+    assert_eq!(compatibility_payload_provider(&payload), None);
+}
+
+#[test]
+fn compatibility_payload_provider_detects_vscode_runtime_payload() {
+    let payload = json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "vscode-session",
+        "timestamp": "2026-07-16T06:19:24.635Z",
+        "transcript_path": "/home/user/.vscode-server/data/User/workspaceStorage/hash/GitHub.copilot-chat/transcripts/session.jsonl"
+    })
+    .to_string();
+
+    assert_eq!(
+        compatibility_payload_provider(&payload),
+        Some(PROVIDER_VSCODE)
+    );
+
+    let tool_payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-session",
+        "timestamp": "2026-07-16T06:19:25.000Z",
+        "tool_name": "read_file",
+        "tool_use_id": "call_123__vscode-1784135936211"
+    })
+    .to_string();
+    assert_eq!(
+        compatibility_payload_provider(&tool_payload),
+        Some(PROVIDER_VSCODE)
+    );
+}
+
+#[test]
+fn compatibility_payload_provider_does_not_trust_timestamp_alone_or_guess_codex() {
+    let claude_payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session",
+        "timestamp": "2026-07-16T06:19:25.000Z",
+        "tool_name": "Bash",
+        "transcript_path": "/tmp/.claude/transcript.jsonl"
+    })
+    .to_string();
+    assert_eq!(compatibility_payload_provider(&claude_payload), None);
+
+    let codex_payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "codex-session",
+        "turn_id": "turn-1",
+        "model": "gpt-5",
+        "tool_name": "Bash"
+    })
+    .to_string();
+    assert_eq!(compatibility_payload_provider(&codex_payload), None);
+}
+
+#[test]
+fn native_hook_detection_is_provider_and_event_specific_across_config_shapes() {
+    let vscode = json!({
+        "hooks": {
+            "PreToolUse": [{
+                "type": "command",
+                "command": "GENSEE_HOME=/tmp/gensee /usr/bin/gensee hook vscode"
+            }],
+            "Stop": [{
+                "type": "command",
+                "command": "/usr/bin/other-hook"
+            }]
+        }
+    });
+    assert!(config_has_owned_hook_for_event(
+        &vscode,
+        PROVIDER_VSCODE,
+        "PreToolUse"
+    ));
+    assert!(!config_has_owned_hook_for_event(
+        &vscode,
+        PROVIDER_VSCODE,
+        "Stop"
+    ));
+    assert!(!config_has_owned_hook_for_event(
+        &vscode,
+        PROVIDER_CURSOR,
+        "PreToolUse"
+    ));
+
+    let nested = json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "GENSEE_HOME=/tmp/gensee /usr/bin/gensee hook cursor"
+                }]
+            }]
+        }
+    });
+    assert!(config_has_owned_hook_for_event(
+        &nested,
+        PROVIDER_CURSOR,
+        "PreToolUse"
+    ));
+}
+
+#[test]
+fn native_hook_paths_include_standard_workspace_configs() {
+    let cursor_payload = json!({
+        "workspace_roots": ["/workspace/one", "/workspace/two"],
+        "cwd": "/workspace/one"
+    });
+    let cursor_paths = native_hook_config_paths(PROVIDER_CURSOR, &cursor_payload);
+    assert!(cursor_paths.contains(&PathBuf::from("/workspace/one/.cursor/hooks.json")));
+    assert!(cursor_paths.contains(&PathBuf::from("/workspace/two/.cursor/hooks.json")));
+
+    let vscode_payload = json!({ "cwd": "/workspace/project" });
+    let vscode_paths = native_hook_config_paths(PROVIDER_VSCODE, &vscode_payload);
+    assert!(vscode_paths.contains(&PathBuf::from(
+        "/workspace/project/.github/hooks/gensee.json"
+    )));
+}
+
+#[test]
+fn native_hook_configuration_check_reads_the_matching_workspace_event() {
+    let root = env::temp_dir().join(format!(
+        "gensee-native-hook-config-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    let config_path = root.join(".cursor").join("hooks.json");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(
+        &config_path,
+        json!({
+            "hooks": {
+                "testCompatibilityEvent": [{
+                    "command": "GENSEE_HOME=/tmp/gensee /usr/bin/gensee hook cursor"
+                }]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let payload = json!({
+        "hook_event_name": "testCompatibilityEvent",
+        "workspace_roots": [root.clone()]
+    })
+    .to_string();
+
+    assert!(native_gensee_hook_configured(PROVIDER_CURSOR, &payload).unwrap());
+
+    let other_event = json!({
+        "hook_event_name": "otherCompatibilityEvent",
+        "workspace_roots": [root.clone()]
+    })
+    .to_string();
+    assert!(!native_gensee_hook_configured(PROVIDER_CURSOR, &other_event).unwrap());
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
