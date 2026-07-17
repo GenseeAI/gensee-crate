@@ -35,6 +35,12 @@ struct TcloneHostControlResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct TcloneAsyncJob {
+    id: String,
+    log_path: PathBuf,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct TcloneRunRecord {
     pub(crate) run_id: String,
@@ -392,8 +398,9 @@ fn execute_tclone_host_control_request(
         });
     }
     if tclone_host_control_should_run_async(&request.args) {
-        let response = tclone_host_control_async_response(&request.args);
-        spawn_tclone_host_control_request(request, exe.to_path_buf());
+        let job = tclone_async_job(&request.args)?;
+        let response = tclone_host_control_async_response(&request.args, &job);
+        spawn_tclone_host_control_request(request, exe.to_path_buf(), &job)?;
         return Ok(response);
     }
     execute_tclone_host_control_request_sync(request, exe)
@@ -417,40 +424,35 @@ fn execute_tclone_host_control_request_sync(
     })
 }
 
-fn spawn_tclone_host_control_request(request: TcloneHostControlRequest, exe: PathBuf) {
-    thread::spawn(move || {
-        let output = Command::new(&exe)
-            .args(&request.args)
-            .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
-            .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
-            .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
-            .output();
-        match output {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stdout.trim().is_empty() {
-                    eprintln!("{}", stdout.trim_end());
-                }
-                if !stderr.trim().is_empty() {
-                    eprintln!("{}", stderr.trim_end());
-                }
-            }
-            Ok(output) => {
-                eprintln!(
-                    "gensee: async tclone host command failed with status {}",
-                    output.status
-                );
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.trim().is_empty() {
-                    eprintln!("{}", stderr.trim_end());
-                }
-            }
-            Err(error) => {
-                eprintln!("gensee: async tclone host command failed to start: {error}");
-            }
-        }
-    });
+fn spawn_tclone_host_control_request(
+    request: TcloneHostControlRequest,
+    exe: PathBuf,
+    job: &TcloneAsyncJob,
+) -> io::Result<()> {
+    if let Some(parent) = job.log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&job.log_path)?;
+    writeln!(
+        log,
+        "gensee async job {}: {} {:?}",
+        job.id,
+        exe.display(),
+        request.args
+    )?;
+    let stderr = log.try_clone()?;
+    Command::new(&exe)
+        .args(&request.args)
+        .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
+        .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
+        .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
+        .spawn()?;
+    Ok(())
 }
 
 fn tclone_host_control_should_run_async(args: &[String]) -> bool {
@@ -458,18 +460,48 @@ fn tclone_host_control_should_run_async(args: &[String]) -> bool {
         && matches!(args.get(1).map(String::as_str), Some("fork"))
 }
 
-fn tclone_host_control_async_response(args: &[String]) -> TcloneHostControlResponse {
+fn tclone_async_job(args: &[String]) -> io::Result<TcloneAsyncJob> {
+    let target = args
+        .iter()
+        .skip(2)
+        .find(|arg| !arg.starts_with("--"))
+        .map(|arg| arg.replace(['/', ':'], "_"))
+        .unwrap_or_else(|| "tclone".to_string());
+    let id = format!(
+        "{}_{}_{}",
+        target,
+        std::process::id(),
+        unix_millis().unwrap_or(0)
+    );
+    Ok(TcloneAsyncJob {
+        log_path: gensee_tmp_root()?
+            .join("tclone-async")
+            .join(format!("{id}.log")),
+        id,
+    })
+}
+
+fn tclone_host_control_async_response(
+    args: &[String],
+    job: &TcloneAsyncJob,
+) -> TcloneHostControlResponse {
     let stdout = if args.iter().any(|arg| arg == "--json") {
         format!(
             "{}\n",
             json!({
                 "scheduled": true,
                 "command": "run fork",
+                "job_id": job.id,
+                "log_path": job.log_path,
                 "message": "gensee scheduled the tclone fork on the host",
             })
         )
     } else {
-        "gensee: scheduled tclone fork on host\n".to_string()
+        format!(
+            "gensee: scheduled tclone fork on host job_id={} log_path={}\n",
+            job.id,
+            job.log_path.display()
+        )
     };
     TcloneHostControlResponse {
         exit_code: Some(0),
@@ -570,7 +602,8 @@ fn drain_tclone_container_host_control_file_requests(
         let response =
             match parsed_request {
                 Ok(request) if tclone_host_control_should_run_async(&request.args) => {
-                    let response = tclone_host_control_async_response(&request.args);
+                    let job = tclone_async_job(&request.args)?;
+                    let response = tclone_host_control_async_response(&request.args, &job);
                     write_tclone_container_host_control_response(
                         podman,
                         container_name,
@@ -578,7 +611,11 @@ fn drain_tclone_container_host_control_file_requests(
                         &response_path,
                         &response,
                     )?;
-                    spawn_tclone_host_control_request(request, exe.to_path_buf());
+                    if let Err(error) =
+                        spawn_tclone_host_control_request(request, exe.to_path_buf(), &job)
+                    {
+                        eprintln!("gensee: async tclone host command failed to start: {error}");
+                    }
                     continue;
                 }
                 Ok(request) => execute_tclone_host_control_request_sync(request, exe)
@@ -3976,10 +4013,16 @@ mod tests {
         assert!(tclone_host_control_should_run_async(&fork_args));
         assert!(!tclone_host_control_should_run_async(&exec_args));
 
-        let response = tclone_host_control_async_response(&fork_args);
+        let job = TcloneAsyncJob {
+            id: "job_1".to_string(),
+            log_path: PathBuf::from("/tmp/gensee/job_1.log"),
+        };
+        let response = tclone_host_control_async_response(&fork_args, &job);
         let payload: serde_json::Value = serde_json::from_str(response.stdout.trim()).unwrap();
         assert_eq!(payload["scheduled"], true);
         assert_eq!(payload["command"], "run fork");
+        assert_eq!(payload["job_id"], "job_1");
+        assert_eq!(payload["log_path"], "/tmp/gensee/job_1.log");
     }
 
     #[test]
