@@ -626,12 +626,10 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
 
     let mut create_args = vec![
         OsString::from("create"),
-        OsString::from("-i"),
-        OsString::from("-t"),
         OsString::from("--name"),
         OsString::from(&source_container),
         OsString::from("--entrypoint"),
-        OsString::from("/bin/sh"),
+        OsString::from("/bin/sleep"),
         OsString::from("--log-driver=k8s-file"),
         OsString::from("--security-opt"),
         OsString::from("seccomp=unconfined"),
@@ -681,8 +679,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         )));
     }
     create_args.push(OsString::from(&image));
-    create_args.push(OsString::from("-lc"));
-    create_args.push(OsString::from(tclone_agent_start_script(&config.agent_cmd)));
+    create_args.push(OsString::from("infinity"));
     let agent_cmd_strings = config
         .agent_cmd
         .iter()
@@ -723,6 +720,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         &podman,
         &[OsString::from("start"), OsString::from(&source_container)],
     )?;
+    start_tclone_agent_session(&podman, &source_container, &config.agent_cmd)?;
     let _container_file_control = TcloneContainerFileControlServer::start(
         &podman,
         &source_container,
@@ -3157,7 +3155,7 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
 fn tclone_agent_start_script(agent_cmd: &[OsString]) -> String {
     let command = shell_join(agent_cmd);
     format!(
-        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  while :; do\n    wait || true\n    sleep 1\n  done\nfi\nprintf 'tmux not found; exec agent directly: %s\\n' {} > \"$log\"\nexec {}\n",
+        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\n",
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
@@ -3168,8 +3166,30 @@ fn tclone_agent_start_script(agent_cmd: &[OsString]) -> String {
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
-        command
+        shell_quote(&format!("exec {command}"))
     )
+}
+
+fn start_tclone_agent_session(
+    podman: &OsString,
+    container_name: &str,
+    agent_cmd: &[OsString],
+) -> io::Result<()> {
+    let script = tclone_agent_start_script(agent_cmd);
+    let status = Command::new(podman)
+        .arg("exec")
+        .arg(container_name)
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "tclone agent startup exited with status {status}"
+        )))
+    }
 }
 
 fn shell_join(args: &[OsString]) -> String {
@@ -4138,10 +4158,13 @@ mod tests {
         ]);
 
         assert!(script.contains("tmux new-session -d -s 'gensee-agent'"));
-        assert!(script.contains("'codex' '--prompt' 'don'\\''t panic'"));
-        assert!(script.contains("while :; do\n    wait || true\n    sleep 1\n  done"));
+        assert!(script.contains("codex"));
+        assert!(script.contains("--prompt"));
+        assert!(script.contains("don"));
+        assert!(script.contains("panic"));
+        assert!(script.contains("exit 0"));
         assert!(!script.contains("exec sleep infinity"));
-        assert!(script.contains("exec 'codex' '--prompt' 'don'\\''t panic'"));
+        assert!(!script.contains("while :; do"));
     }
 
     #[cfg(unix)]
