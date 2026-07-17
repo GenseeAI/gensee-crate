@@ -1161,7 +1161,6 @@ fn tclone_merge_filesystem(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TcloneOverlayRootfs {
-    rootfs: PathBuf,
     lowerdir: PathBuf,
     upperdir: PathBuf,
 }
@@ -1625,11 +1624,7 @@ fn inspect_tclone_overlay_rootfs(
             ),
         ));
     };
-    Ok(TcloneOverlayRootfs {
-        rootfs,
-        lowerdir,
-        upperdir,
-    })
+    Ok(TcloneOverlayRootfs { lowerdir, upperdir })
 }
 
 fn recorded_tclone_overlay_rootfs(record: &TcloneRunRecord) -> io::Result<TcloneOverlayRootfs> {
@@ -1646,6 +1641,16 @@ fn recorded_tclone_overlay_rootfs(record: &TcloneRunRecord) -> io::Result<Tclone
                 ),
             )
         })?;
+    if !lowerdir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "recorded tclone overlay lowerdir for {} no longer exists: {}; recreate the fork before filesystem merge",
+                record.run_id,
+                lowerdir.display()
+            ),
+        ));
+    }
     let upperdir = record
         .fork_overlay_upperdir
         .as_ref()
@@ -1659,11 +1664,17 @@ fn recorded_tclone_overlay_rootfs(record: &TcloneRunRecord) -> io::Result<Tclone
                 ),
             )
         })?;
-    Ok(TcloneOverlayRootfs {
-        rootfs: upperdir.clone(),
-        lowerdir,
-        upperdir,
-    })
+    if !upperdir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "recorded tclone overlay upperdir for {} no longer exists: {}; recreate the fork before filesystem merge",
+                record.run_id,
+                upperdir.display()
+            ),
+        ));
+    }
+    Ok(TcloneOverlayRootfs { lowerdir, upperdir })
 }
 
 fn overlay_layers_for_mountpoint(rootfs: &Path) -> io::Result<Option<(PathBuf, PathBuf)>> {
@@ -3037,14 +3048,34 @@ mod tests {
 
     #[test]
     fn tclone_recorded_overlay_rootfs_uses_stored_layers() {
+        let root = temp_tree("recorded-overlay");
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+        fs::create_dir_all(&lower).unwrap();
+        fs::create_dir_all(&upper).unwrap();
         let mut record = test_fork_record("fork_1", "source_1");
-        record.fork_base_overlay_lowerdir = Some("/tmp/lower".to_string());
-        record.fork_overlay_upperdir = Some("/tmp/upper".to_string());
+        record.fork_base_overlay_lowerdir = Some(lower.to_string_lossy().to_string());
+        record.fork_overlay_upperdir = Some(upper.to_string_lossy().to_string());
 
         let overlay = recorded_tclone_overlay_rootfs(&record).unwrap();
 
-        assert_eq!(overlay.lowerdir, PathBuf::from("/tmp/lower"));
-        assert_eq!(overlay.upperdir, PathBuf::from("/tmp/upper"));
+        assert_eq!(overlay.lowerdir, lower);
+        assert_eq!(overlay.upperdir, upper);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_recorded_overlay_rootfs_rejects_stale_layers() {
+        let mut record = test_fork_record("fork_1", "source_1");
+        record.fork_base_overlay_lowerdir = Some("/tmp/gensee-missing-lower".to_string());
+        record.fork_overlay_upperdir = Some("/tmp/gensee-missing-upper".to_string());
+
+        let error = recorded_tclone_overlay_rootfs(&record).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error
+            .to_string()
+            .contains("recorded tclone overlay lowerdir"));
     }
 
     #[test]
