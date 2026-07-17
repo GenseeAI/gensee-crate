@@ -424,9 +424,23 @@ an agent in cloneable container storage and fork it from another terminal.
 Tclone provides low-latency full-workspace forking for AI agents:
 
 ```bash
-gensee run --runtime tclone -- codex
-gensee fork <run_id> --copies 2
+export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
+export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" gensee'
+
+gensee-tclone run --runtime tclone -- codex
+gensee-tclone run list              # source id is under "Tclone containers"
+gensee-tclone run fork <source-run-id> --copies 2
+gensee-tclone run diff <fork-id>
+gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
+gensee-tclone run switch <fork-id>                         # continue from the fork
 ```
+
+The tclone launcher also prints the source id directly:
+`gensee: fork from another terminal with: gensee run fork run_...`.
+Use a tclone image with `tmux` for reliable `gensee run attach`; without tmux,
+`gensee run shell` still opens a new shell but does not reconnect to the live
+agent UI.
 
 </details>
 
@@ -540,8 +554,8 @@ Full docs live in [`docs/`](docs/README.md):
   sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress
   controls, and the Linux enforcement plan.
 - [Tclone runtime integration](docs/tclone.md) — launch agents in cloneable Linux
-  containers, fork live source containers, inspect diffs, keep workspaces, and
-  discard forks.
+  containers, fork live source containers, inspect diffs, merge/switch results,
+  and clean up forks.
 - [`gensee watch`](docs/watch.md) — sidecar filesystem and system-event audit, backends, and watch roots.
 - [`gensee run` and the macOS sandbox](docs/run-and-sandbox.md) — managed launch and staged workspaces.
 - [`gensee policy`](docs/gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.

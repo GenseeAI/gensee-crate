@@ -1,8 +1,17 @@
 use crate::*;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::io::Read;
+
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 const DEFAULT_TCLONE_IMAGE: &str = "ghcr.io/wuklab/webtop:ubuntu-kde";
 const DEFAULT_CONTAINER_HOME: &str = "/home/gensee";
 const DEFAULT_CONTAINER_WORKSPACE: &str = "/workspace";
+const TCLONE_AGENT_TMUX_SESSION: &str = "gensee-agent";
+const TCLONE_FORK_IN_PROGRESS_MARKER: &str = "/tmp/gensee-tclone-fork-in-progress";
+const TCLONE_REATTACH_MARKER: &str = "/tmp/gensee-tclone-reattach-source";
 const TCLONE_STATE_LOCK_STALE_SECS: u64 = 30;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -20,9 +29,22 @@ pub(crate) struct TcloneRunRecord {
     pub(crate) container_workspace: String,
     pub(crate) container_home: String,
     pub(crate) agent_cmd: Vec<String>,
+    #[serde(default)]
+    pub(crate) fork_base_git_head: Option<String>,
+    #[serde(default)]
+    pub(crate) fork_base_overlay_lowerdir: Option<String>,
+    #[serde(default)]
+    pub(crate) fork_overlay_upperdir: Option<String>,
     pub(crate) started_at_ms: u64,
     pub(crate) updated_at_ms: u64,
     pub(crate) exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TcloneMergeScope {
+    Git,
+    Filesystem,
+    Paths(Vec<String>),
 }
 
 pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
@@ -49,20 +71,38 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     let podman = tclone_podman();
     let original_workspace = canonicalize_or_original(&config.workspace);
     let repo_path = find_repo_root(&original_workspace);
-    let staged_workspace = gensee_tmp_root()?.join(&run_id).join("tclone-workspace");
-    copy_tclone_workspace(&original_workspace, &staged_workspace)?;
+    let seed_root = gensee_tmp_root()?.join(&run_id).join("tclone-seed");
+    let staged_workspace = seed_root.join(container_relative_path(&container_workspace)?);
 
     let agent_binary = config.agent_cmd[0].to_string_lossy().to_string();
     let agent_home = detect_agent_home(&agent_binary);
     let gensee_home = default_root().ok().filter(|path| path.exists());
+    prepare_tclone_seed(
+        &seed_root,
+        &original_workspace,
+        agent_home.as_ref(),
+        gensee_home.as_ref(),
+        &container_workspace,
+        &container_home,
+    )?;
+    if let Ok(current_exe) = env::current_exe() {
+        if current_exe.exists() {
+            let destination = seed_root.join("usr/local/bin/gensee");
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&current_exe, destination)?;
+        }
+    }
 
-    let mut run_args = vec![
-        OsString::from("run"),
-        OsString::from("-d"),
+    let mut create_args = vec![
+        OsString::from("create"),
+        OsString::from("-i"),
+        OsString::from("-t"),
         OsString::from("--name"),
         OsString::from(&source_container),
         OsString::from("--entrypoint"),
-        OsString::from("/bin/sleep"),
+        OsString::from("/bin/sh"),
         OsString::from("--log-driver=k8s-file"),
         OsString::from("--security-opt"),
         OsString::from("seccomp=unconfined"),
@@ -84,87 +124,82 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         OsString::from(format!("AGENT_SHIELD_SESSION_ID={run_id}")),
         OsString::from("-e"),
         OsString::from(format!("GENSEE_WORKSPACE={container_workspace}")),
+        OsString::from("-e"),
+        OsString::from("TERM=xterm-256color"),
+        OsString::from("-w"),
+        OsString::from(&container_workspace),
     ];
     if let Some((name, _host, container_path)) = agent_home.as_ref() {
-        run_args.push(OsString::from("-e"));
-        run_args.push(OsString::from(format!("{name}={container_path}")));
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!("{name}={container_path}")));
     }
     if let Some((node_root, node_bin)) = tclone_node_mount() {
-        run_args.push(OsString::from("-v"));
-        run_args.push(OsString::from(format!(
+        create_args.push(OsString::from("-v"));
+        create_args.push(OsString::from(format!(
             "{}:{}:ro",
             node_root.display(),
             node_root.display()
         )));
-        run_args.push(OsString::from("-e"));
-        run_args.push(OsString::from(format!(
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!(
             "PATH={}:{}",
             node_bin.display(),
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         )));
     }
-    run_args.push(OsString::from(&image));
-    run_args.push(OsString::from("infinity"));
+    create_args.push(OsString::from(&image));
+    create_args.push(OsString::from("-lc"));
+    create_args.push(OsString::from(tclone_agent_start_script(&config.agent_cmd)));
+    let agent_cmd_strings = config
+        .agent_cmd
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
 
-    let output = run_command_capture(&podman, &run_args)?;
+    let output = run_command_capture(&podman, &create_args)?;
     let container_id = output.lines().next().map(str::trim).map(str::to_string);
     let cleanup_guard = TcloneContainerCleanup::new(&podman, &source_container);
+    append_tclone_record(&TcloneRunRecord {
+        run_id: run_id.clone(),
+        parent_run_id: None,
+        role: "source".to_string(),
+        status: "preparing".to_string(),
+        container_name: source_container.clone(),
+        container_id: container_id.clone(),
+        source_container: Some(source_container.clone()),
+        fork_prefix: Some(fork_prefix),
+        image,
+        workspace: original_workspace.to_string_lossy().to_string(),
+        container_workspace: container_workspace.clone(),
+        container_home: container_home.clone(),
+        agent_cmd: agent_cmd_strings.clone(),
+        fork_base_git_head: None,
+        fork_base_overlay_lowerdir: None,
+        fork_overlay_upperdir: None,
+        started_at_ms,
+        updated_at_ms: started_at_ms,
+        exit_code: None,
+    })?;
+    eprintln!(
+        "gensee: preparing tclone run {run_id} source_container={source_container} workspace={}",
+        original_workspace.display()
+    );
 
-    tclone_exec(
+    podman_cp_contents(&podman, &seed_root, &format!("{source_container}:/"))?;
+    run_command_status(
+        &podman,
+        &[OsString::from("start"), OsString::from(&source_container)],
+    )?;
+    let no_attach = env_flag("GENSEE_TCLONE_NO_ATTACH");
+    wait_tclone_agent_ready(
         &podman,
         &source_container,
-        &[
-            "bash",
-            "-lc",
-            &format!("mkdir -p '{}' '{}'", container_home, container_workspace),
-        ],
+        &agent_cmd_strings,
+        no_attach,
+        tclone_agent_ready_timeout(no_attach),
     )?;
-    podman_cp_contents(
-        &podman,
-        &staged_workspace,
-        &format!("{source_container}:{container_workspace}/"),
-    )?;
-    if let Some((_, host_home, container_path)) =
-        agent_home.as_ref().filter(|(_, path, _)| path.exists())
-    {
-        tclone_exec(
-            &podman,
-            &source_container,
-            &["bash", "-lc", &format!("mkdir -p '{}'", container_path)],
-        )?;
-        podman_cp_contents(
-            &podman,
-            host_home,
-            &format!("{source_container}:{container_path}/"),
-        )?;
-    }
-    if let Some(gensee_home) = gensee_home.as_ref() {
-        tclone_exec(
-            &podman,
-            &source_container,
-            &[
-                "bash",
-                "-lc",
-                &format!("mkdir -p '{container_home}/.gensee'"),
-            ],
-        )?;
-        podman_cp_contents(
-            &podman,
-            gensee_home,
-            &format!("{source_container}:{container_home}/.gensee/"),
-        )?;
-    }
-    if let Ok(current_exe) = env::current_exe() {
-        if current_exe.exists() {
-            podman_cp(
-                &podman,
-                &current_exe,
-                &format!("{source_container}:/usr/local/bin/gensee"),
-            )?;
-        }
-    }
-
     let root_pid = inspect_container_pid(&podman, &source_container).unwrap_or(0);
+
     let store = EventStore::default_local()?;
     store.append_session(&AgentSession {
         session_id: run_id.clone(),
@@ -184,56 +219,21 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         ended_at_ms: None,
         exit_code: None,
     })?;
-    append_tclone_record(&TcloneRunRecord {
-        run_id: run_id.clone(),
-        parent_run_id: None,
-        role: "source".to_string(),
-        status: "running".to_string(),
-        container_name: source_container.clone(),
-        container_id,
-        source_container: Some(source_container.clone()),
-        fork_prefix: Some(fork_prefix),
-        image,
-        workspace: original_workspace.to_string_lossy().to_string(),
-        container_workspace: container_workspace.clone(),
-        container_home: container_home.clone(),
-        agent_cmd: config
-            .agent_cmd
-            .iter()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect(),
-        started_at_ms,
-        updated_at_ms: started_at_ms,
-        exit_code: None,
-    })?;
+    append_tclone_status(&run_id, "running", None)?;
     cleanup_guard.disarm();
 
     eprintln!(
         "gensee: started tclone run {run_id} source_container={source_container} workspace={}",
         original_workspace.display()
     );
-    eprintln!("gensee: fork from another terminal with: gensee fork {run_id}");
+    eprintln!("gensee: fork from another terminal with: gensee run fork {run_id}");
 
-    let status = Command::new(&podman)
-        .arg("exec")
-        .arg("-it")
-        .arg("-w")
-        .arg(&container_workspace)
-        .arg("-e")
-        .arg(format!("GENSEE_RUN_ID={run_id}"))
-        .arg("-e")
-        .arg(format!("AGENT_SHIELD_SESSION_ID={run_id}"))
-        .arg("-e")
-        .arg(format!("GENSEE_HOME={container_home}/.gensee"))
-        .arg("-e")
-        .arg(format!("GENSEE_WORKSPACE={container_workspace}"))
-        .arg(&source_container)
-        .arg(&config.agent_cmd[0])
-        .args(&config.agent_cmd[1..])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
+    if env_flag("GENSEE_TCLONE_NO_ATTACH") {
+        eprintln!("gensee: tclone source left running without attach because GENSEE_TCLONE_NO_ATTACH is set");
+        return Ok(());
+    }
+
+    let status = tclone_attach_container(&podman, &source_container)?;
     let ended_at_ms = unix_millis()?;
     let exit_code = status.code();
     store.append_session(&AgentSession {
@@ -266,7 +266,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
 pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     let parent = tclone_target_arg(
         &args,
-        "usage: gensee fork <run_id> [--copies N] [--name <prefix>]",
+        "usage: gensee run fork <run_id> [--copies N] [--name <prefix>]",
     )?;
     let copies = arg_value(&args, "--copies")
         .map(|value| value.parse::<usize>())
@@ -285,8 +285,19 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         ));
     }
     let source = find_tclone_record(&parent)?;
+    if source.status == "preparing" {
+        return Err(io::Error::other(format!(
+            "tclone source {} is still preparing; wait for status=running before forking",
+            source.run_id
+        )));
+    }
     let podman = tclone_podman();
+    ensure_tclone_container_exists(&podman, &source)?;
+    ensure_tclone_agent_ready_for_fork(&podman, &source)?;
+    let _detach_guard = TcloneForkDetachGuard::mark(&podman, &source.container_name)?;
+    detach_tclone_tmux_clients(&podman, &source.container_name);
     let forked_at_ms = unix_millis()?;
+    let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
     let prefix = arg_value(&args, "--name").unwrap_or_else(|| {
         format!(
             "gensee-tclone-fork-{}-{}",
@@ -300,6 +311,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         OsString::from("--live"),
         OsString::from(format!("--copies={copies}")),
         OsString::from("--persistent=async"),
+        OsString::from("--tfork-overlay-btrfs"),
         OsString::from("--tfork-tcp-close"),
         OsString::from("--tfork-ghost-limit=67108864"),
         OsString::from("--name"),
@@ -327,6 +339,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 }
             });
         let root_pid = inspect_container_pid(&podman, &container_name).unwrap_or(0);
+        let overlay_layers = inspect_tclone_overlay_rootfs(&podman, &container_name).ok();
         let observed_at = unix_millis()?;
         EventStore::default_local()?.append_session(&AgentSession {
             session_id: run_id.clone(),
@@ -358,6 +371,13 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             container_workspace: source.container_workspace.clone(),
             container_home: source.container_home.clone(),
             agent_cmd: source.agent_cmd.clone(),
+            fork_base_git_head: fork_base_git_head.clone(),
+            fork_base_overlay_lowerdir: overlay_layers
+                .as_ref()
+                .map(|layers| layers.lowerdir.to_string_lossy().to_string()),
+            fork_overlay_upperdir: overlay_layers
+                .as_ref()
+                .map(|layers| layers.upperdir.to_string_lossy().to_string()),
             started_at_ms: observed_at,
             updated_at_ms: observed_at,
             exit_code: None,
@@ -392,6 +412,320 @@ pub(crate) fn tclone_shell(args: Vec<OsString>) -> io::Result<()> {
     }
 }
 
+pub(crate) fn tclone_attach(args: Vec<OsString>) -> io::Result<()> {
+    let target = tclone_target_arg(&args, "usage: gensee run attach <run_id-or-container>")?;
+    let record = find_tclone_record(&target)?;
+    let podman = tclone_podman();
+    ensure_tclone_container_exists(&podman, &record)?;
+    let status = tclone_attach_container(&podman, &record.container_name)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "tclone attach exited with status {status}"
+        )))
+    }
+}
+
+fn tclone_attach_container(
+    podman: &OsString,
+    container_name: &str,
+) -> io::Result<std::process::ExitStatus> {
+    loop {
+        let attach_started_ms = unix_millis().unwrap_or(0);
+        let tmux_status = Command::new(podman)
+            .arg("exec")
+            .arg("-it")
+            .arg(container_name)
+            .arg("tmux")
+            .arg("attach-session")
+            .arg("-t")
+            .arg(TCLONE_AGENT_TMUX_SESSION)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+        match tmux_status {
+            Ok(status) if status.success() => {
+                if consume_tclone_reattach_marker(podman, container_name, attach_started_ms) {
+                    eprintln!("gensee: reattaching to source after tclone fork");
+                    continue;
+                }
+                return Ok(status);
+            }
+            Ok(_) | Err(_) => {
+                return Command::new(podman)
+                    .arg("attach")
+                    .arg(container_name)
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status();
+            }
+        }
+    }
+}
+
+fn wait_tclone_agent_ready(
+    podman: &OsString,
+    container_name: &str,
+    agent_cmd: &[String],
+    require_agent_process: bool,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error: Option<String> = None;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for tclone agent session in {container_name}: {}",
+                    last_error.unwrap_or_else(|| "agent not ready".to_string())
+                ),
+            ));
+        }
+        match tclone_agent_readiness(podman, container_name, agent_cmd, require_agent_process) {
+            Ok(TcloneAgentReadiness::Ready) | Ok(TcloneAgentReadiness::NoTmux) => return Ok(()),
+            Ok(TcloneAgentReadiness::Starting(message)) => last_error = Some(message),
+            Ok(TcloneAgentReadiness::Exited(message)) => return Err(io::Error::other(message)),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn ensure_tclone_agent_ready_for_fork(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+) -> io::Result<()> {
+    match tclone_agent_readiness(podman, &source.container_name, &source.agent_cmd, true)? {
+        TcloneAgentReadiness::Ready | TcloneAgentReadiness::NoTmux => Ok(()),
+        TcloneAgentReadiness::Starting(message) | TcloneAgentReadiness::Exited(message) => {
+            Err(io::Error::other(format!(
+                "tclone source {} is not ready to fork: {message}",
+                source.run_id
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TcloneAgentReadiness {
+    Ready,
+    NoTmux,
+    Starting(String),
+    Exited(String),
+}
+
+fn tclone_agent_readiness(
+    podman: &OsString,
+    container_name: &str,
+    agent_cmd: &[String],
+    require_agent_process: bool,
+) -> io::Result<TcloneAgentReadiness> {
+    let process_check = if require_agent_process {
+        tclone_agent_process_check(agent_cmd).unwrap_or("true")
+    } else {
+        "true"
+    };
+    let script = format!(
+        r#"if ! command -v tmux >/dev/null 2>&1; then
+  echo no-tmux
+  exit 0
+fi
+if ! tmux has-session -t {session} 2>/dev/null; then
+  echo starting
+  test -f /tmp/gensee-agent-start.log && tail -n 20 /tmp/gensee-agent-start.log
+  exit 0
+fi
+if tmux list-panes -t {session} -F '#{{pane_dead}}' 2>/dev/null | grep -q '^1$'; then
+  echo exited
+  tmux capture-pane -pt {session} 2>/dev/null | tail -n 40 || true
+  exit 0
+fi
+if ! ({process_check}); then
+  echo starting
+  echo agent process is not running yet
+  exit 0
+fi
+echo ready
+"#,
+        session = shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        process_check = process_check
+    );
+    let output = Command::new(podman)
+        .arg("exec")
+        .arg(container_name)
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{} exec readiness check failed for {}: {}",
+            podman.to_string_lossy(),
+            container_name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let state = lines.next().unwrap_or("").trim();
+    let detail = lines.collect::<Vec<_>>().join("\n");
+    match state {
+        "ready" => Ok(TcloneAgentReadiness::Ready),
+        "no-tmux" => Ok(TcloneAgentReadiness::NoTmux),
+        "starting" => Ok(TcloneAgentReadiness::Starting(detail)),
+        "exited" => Ok(TcloneAgentReadiness::Exited(detail)),
+        _ => Ok(TcloneAgentReadiness::Starting(stdout.trim().to_string())),
+    }
+}
+
+fn tclone_agent_process_check(agent_cmd: &[String]) -> Option<&'static str> {
+    let binary = agent_cmd.first()?.to_ascii_lowercase();
+    if binary.contains("codex") {
+        Some("ps ax -o args= | grep -E '(^|/)(codex)( |$)|@openai/codex' | grep -v grep >/dev/null")
+    } else if binary.contains("claude") {
+        Some("ps ax -o args= | grep -E '(^|/)(claude)( |$)|claude-code' | grep -v grep >/dev/null")
+    } else {
+        None
+    }
+}
+
+struct TcloneForkDetachGuard {
+    podman: OsString,
+    container_name: String,
+}
+
+impl TcloneForkDetachGuard {
+    fn mark(podman: &OsString, container_name: &str) -> io::Result<Self> {
+        let timestamp = unix_millis()?;
+        write_tclone_marker(
+            podman,
+            container_name,
+            TCLONE_FORK_IN_PROGRESS_MARKER,
+            timestamp,
+        )?;
+        write_tclone_marker(podman, container_name, TCLONE_REATTACH_MARKER, timestamp)?;
+        Ok(Self {
+            podman: podman.clone(),
+            container_name: container_name.to_string(),
+        })
+    }
+}
+
+impl Drop for TcloneForkDetachGuard {
+    fn drop(&mut self) {
+        remove_tclone_marker(
+            &self.podman,
+            &self.container_name,
+            TCLONE_FORK_IN_PROGRESS_MARKER,
+        );
+    }
+}
+
+fn consume_tclone_reattach_marker(
+    podman: &OsString,
+    container_name: &str,
+    attach_started_ms: u64,
+) -> bool {
+    let Some(marker_ms) = tclone_marker_timestamp(podman, container_name, TCLONE_REATTACH_MARKER)
+    else {
+        return false;
+    };
+    let now_ms = unix_millis().unwrap_or(marker_ms);
+    if marker_ms.saturating_add(5 * 60 * 1_000) < now_ms
+        || marker_ms.saturating_add(2_000) < attach_started_ms
+    {
+        remove_tclone_marker(podman, container_name, TCLONE_REATTACH_MARKER);
+        return false;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if tclone_marker_timestamp(podman, container_name, TCLONE_FORK_IN_PROGRESS_MARKER).is_none()
+        {
+            wait_tclone_container_exec_ready(podman, container_name, Duration::from_secs(15));
+            remove_tclone_marker(podman, container_name, TCLONE_REATTACH_MARKER);
+            return true;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    wait_tclone_container_exec_ready(podman, container_name, Duration::from_secs(15));
+    remove_tclone_marker(podman, container_name, TCLONE_FORK_IN_PROGRESS_MARKER);
+    remove_tclone_marker(podman, container_name, TCLONE_REATTACH_MARKER);
+    true
+}
+
+fn wait_tclone_container_exec_ready(podman: &OsString, container_name: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if tclone_exec_ready(podman, container_name) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn tclone_exec_ready(podman: &OsString, container_name: &str) -> bool {
+    Command::new(podman)
+        .arg("exec")
+        .arg(container_name)
+        .arg("true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn write_tclone_marker(
+    podman: &OsString,
+    container_name: &str,
+    marker: &str,
+    timestamp_ms: u64,
+) -> io::Result<()> {
+    let script = format!("printf '%s\\n' {timestamp_ms} > {}", shell_quote(marker));
+    tclone_exec(podman, container_name, &["sh", "-lc", script.as_str()])
+}
+
+fn remove_tclone_marker(podman: &OsString, container_name: &str, marker: &str) {
+    let script = format!("rm -f {}", shell_quote(marker));
+    let _ = tclone_exec(podman, container_name, &["sh", "-lc", script.as_str()]);
+}
+
+fn tclone_marker_timestamp(podman: &OsString, container_name: &str, marker: &str) -> Option<u64> {
+    let script = format!("cat {} 2>/dev/null || true", shell_quote(marker));
+    let output = Command::new(podman)
+        .arg("exec")
+        .arg(container_name)
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+fn detach_tclone_tmux_clients(podman: &OsString, container_name: &str) {
+    let _ = Command::new(podman)
+        .arg("exec")
+        .arg(container_name)
+        .arg("tmux")
+        .arg("detach-client")
+        .arg("-a")
+        .arg("-s")
+        .arg(TCLONE_AGENT_TMUX_SESSION)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    thread::sleep(Duration::from_millis(250));
+}
+
 pub(crate) fn tclone_diff(args: Vec<OsString>) -> io::Result<()> {
     let target = tclone_target_arg(&args, "usage: gensee run diff <run_id-or-container>")?;
     let record = find_tclone_record(&target)?;
@@ -402,6 +736,667 @@ pub(crate) fn tclone_diff(args: Vec<OsString>) -> io::Result<()> {
         &[("GENSEE_WORKSPACE", &record.container_workspace)],
         &["bash", "-lc", script],
     )
+}
+
+pub(crate) fn tclone_merge(args: Vec<OsString>) -> io::Result<()> {
+    let fork_target = tclone_target_arg(
+        &args,
+        "usage: gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]",
+    )?;
+    let source_target = arg_value(&args, "--into").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]",
+        )
+    })?;
+    let dry_run = arg_flag(&args, "--dry-run");
+    let force = arg_flag(&args, "--force");
+    let scope = tclone_merge_scope(&args)?;
+    let fork = find_tclone_record(&fork_target)?;
+    let source = find_tclone_record(&source_target)?;
+    validate_tclone_merge_pair(&fork, &source, force)?;
+
+    let podman = tclone_podman();
+    ensure_tclone_container_exists(&podman, &fork)?;
+    ensure_tclone_container_exists(&podman, &source)?;
+
+    match scope {
+        TcloneMergeScope::Git => tclone_merge_git(&podman, &fork, &source, dry_run),
+        TcloneMergeScope::Filesystem => {
+            tclone_merge_filesystem(&podman, &fork, &source, None, dry_run)
+        }
+        TcloneMergeScope::Paths(paths) => {
+            tclone_merge_filesystem(&podman, &fork, &source, Some(paths), dry_run)
+        }
+    }
+}
+
+pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
+    let target = tclone_target_arg(&args, "usage: gensee run switch <fork-id>")?;
+    let fork = find_tclone_record(&target)?;
+    if fork.role != "fork" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("switch target must be a fork, got role={}", fork.role),
+        ));
+    }
+
+    let podman = tclone_podman();
+    ensure_tclone_container_exists(&podman, &fork)?;
+    let switched_at_ms = unix_millis()?;
+
+    if let Some(parent_run_id) = fork.parent_run_id.as_deref() {
+        if let Ok(mut previous_source) = find_tclone_record(parent_run_id) {
+            if previous_source.role == "source" {
+                previous_source.status = "switched-away".to_string();
+                previous_source.updated_at_ms = switched_at_ms;
+                append_tclone_record(&previous_source)?;
+            }
+        }
+    }
+
+    let switched = switched_tclone_source_record(fork, switched_at_ms)?;
+    append_tclone_record(&switched)?;
+    println!(
+        "gensee: switched active tclone source to {} ({})",
+        switched.run_id, switched.container_name
+    );
+    Ok(())
+}
+
+pub(crate) fn tclone_delete(args: Vec<OsString>) -> io::Result<()> {
+    let delete_all = args.iter().any(|arg| arg == "--all");
+    if delete_all {
+        return tclone_delete_all();
+    }
+
+    let target = tclone_target_arg(
+        &args,
+        "usage: gensee run delete <tclone-run-or-container>|--all",
+    )?;
+    let record = find_tclone_record(&target)?;
+    let removed_container = remove_tclone_container(&record).map_err(|error| {
+        io::Error::other(format!(
+            "could not remove tclone container {} (record preserved): {error}",
+            record.container_name
+        ))
+    })?;
+    let removed_records = delete_tclone_records(|candidate| candidate.run_id == record.run_id)?;
+
+    println!(
+        "gensee: deleted tclone run {} ({}) container={} records_removed={removed_records}",
+        record.run_id,
+        record.container_name,
+        removed_container.as_str()
+    );
+    Ok(())
+}
+
+fn tclone_delete_all() -> io::Result<()> {
+    let podman = tclone_podman();
+    let records = list_tclone_runs()?;
+    let tracked_container_names = records
+        .iter()
+        .map(|record| record.container_name.clone())
+        .collect::<HashSet<_>>();
+    let orphan_container_names = list_tclone_container_names(&podman)?
+        .into_iter()
+        .filter(|name| !tracked_container_names.contains(name))
+        .collect::<Vec<_>>();
+    if records.is_empty() && orphan_container_names.is_empty() {
+        println!("gensee: no tclone runs to delete");
+        return Ok(());
+    }
+
+    let mut removed_containers = 0;
+    let mut already_gone = 0;
+    let mut failed = 0;
+    let mut deleted_run_ids = HashSet::new();
+    for record in &records {
+        match remove_tclone_container(record) {
+            Ok(TcloneContainerRemoval::Removed) => {
+                removed_containers += 1;
+                deleted_run_ids.insert(record.run_id.clone());
+            }
+            Ok(TcloneContainerRemoval::AlreadyGone) => {
+                already_gone += 1;
+                deleted_run_ids.insert(record.run_id.clone());
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!(
+                    "gensee: warning: could not remove tclone container {} (record preserved): {error}",
+                    record.container_name
+                );
+            }
+        }
+    }
+    let mut removed_orphans = 0;
+    for container_name in orphan_container_names {
+        match remove_tclone_container_by_name(&podman, &container_name) {
+            Ok(TcloneContainerRemoval::Removed) => {
+                removed_orphans += 1;
+            }
+            Ok(TcloneContainerRemoval::AlreadyGone) => {}
+            Err(error) => {
+                failed += 1;
+                eprintln!(
+                    "gensee: warning: could not remove orphaned tclone container {container_name}: {error}"
+                );
+            }
+        }
+    }
+    let removed_records =
+        delete_tclone_records(|record| deleted_run_ids.contains(record.run_id.as_str()))?;
+    println!(
+        "gensee: deleted {removed_records} tclone run records, removed {removed_containers} tracked containers, removed {removed_orphans} orphaned containers, and pruned {already_gone} stale records"
+    );
+    if failed > 0 {
+        return Err(io::Error::other(format!(
+            "{failed} tclone container(s) could not be removed; their records were preserved"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcloneContainerRemoval {
+    Removed,
+    AlreadyGone,
+}
+
+impl TcloneContainerRemoval {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::AlreadyGone => "already-gone",
+        }
+    }
+}
+
+fn remove_tclone_container(record: &TcloneRunRecord) -> io::Result<TcloneContainerRemoval> {
+    let podman = tclone_podman();
+    remove_tclone_container_by_name(&podman, &record.container_name)
+}
+
+fn remove_tclone_container_by_name(
+    podman: &OsString,
+    container_name: &str,
+) -> io::Result<TcloneContainerRemoval> {
+    if !tclone_container_exists(podman, container_name)? {
+        return Ok(TcloneContainerRemoval::AlreadyGone);
+    }
+
+    run_command_status(
+        podman,
+        &[
+            OsString::from("rm"),
+            OsString::from("-f"),
+            OsString::from(container_name),
+        ],
+    )?;
+    Ok(TcloneContainerRemoval::Removed)
+}
+
+fn list_tclone_container_names(podman: &OsString) -> io::Result<Vec<String>> {
+    let output = run_command_capture(
+        podman,
+        &[
+            OsString::from("ps"),
+            OsString::from("-a"),
+            OsString::from("--format"),
+            OsString::from("{{.Names}}"),
+        ],
+    )?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|name| name.starts_with("gensee-tclone-"))
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn tclone_container_exists(podman: &OsString, container_name: &str) -> io::Result<bool> {
+    let output = Command::new(podman)
+        .arg("inspect")
+        .arg("--type")
+        .arg("container")
+        .arg(container_name)
+        .output()?;
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr.contains("no such")
+        || stderr.contains("not found")
+        || stderr.contains("does not exist")
+        || stderr.contains("no container with name")
+    {
+        return Ok(false);
+    }
+
+    Err(io::Error::other(format!(
+        "{} inspect failed for {}: {}",
+        podman.to_string_lossy(),
+        container_name,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+fn switched_tclone_source_record(
+    mut fork: TcloneRunRecord,
+    switched_at_ms: u64,
+) -> io::Result<TcloneRunRecord> {
+    if fork.role != "fork" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("switch target must be a fork, got role={}", fork.role),
+        ));
+    }
+    fork.parent_run_id = None;
+    fork.role = "source".to_string();
+    fork.status = "active".to_string();
+    fork.source_container = Some(fork.container_name.clone());
+    fork.updated_at_ms = switched_at_ms;
+    Ok(fork)
+}
+
+fn tclone_merge_git(
+    podman: &OsString,
+    fork: &TcloneRunRecord,
+    source: &TcloneRunRecord,
+    dry_run: bool,
+) -> io::Result<()> {
+    let source_files_id = format!("gensee-source-files-{}.txt", unix_millis()?);
+    let host_source_files = gensee_tmp_root()?.join(&source_files_id);
+    let fork_source_files = format!("/tmp/{source_files_id}");
+    fs::write(
+        &host_source_files,
+        tclone_source_workspace_file_list(podman, source)?,
+    )?;
+    let patch = (|| {
+        podman_cp(
+            podman,
+            &host_source_files,
+            &format!("{}:{fork_source_files}", fork.container_name),
+        )?;
+        tclone_merge_patch(podman, fork, &fork_source_files)
+    })();
+    let _ = fs::remove_file(&host_source_files);
+    let _ = tclone_exec(
+        podman,
+        &fork.container_name,
+        &["rm", "-f", &fork_source_files],
+    );
+    let patch = patch?;
+    if patch.trim().is_empty() {
+        println!(
+            "gensee: no changes to merge from {} into {}",
+            fork.run_id, source.run_id
+        );
+        return Ok(());
+    }
+
+    let patch_id = format!("gensee-merge-{}.patch", unix_millis()?);
+    let host_patch = gensee_tmp_root()?.join(&patch_id);
+    fs::write(&host_patch, patch)?;
+    let container_patch = format!("/tmp/{patch_id}");
+    let result = (|| {
+        podman_cp(
+            podman,
+            &host_patch,
+            &format!("{}:{container_patch}", source.container_name),
+        )?;
+        tclone_apply_merge_patch(podman, source, &container_patch, dry_run)
+    })();
+    let _ = fs::remove_file(&host_patch);
+    let _ = tclone_exec(
+        podman,
+        &source.container_name,
+        &["rm", "-f", &container_patch],
+    );
+    result?;
+
+    if dry_run {
+        println!(
+            "gensee: git merge dry-run succeeded from {} into {}",
+            fork.run_id, source.run_id
+        );
+    } else {
+        append_tclone_status(&fork.run_id, "merged", None)?;
+        println!(
+            "gensee: merged git changes from {} into {}",
+            fork.run_id, source.run_id
+        );
+    }
+    Ok(())
+}
+
+fn tclone_source_workspace_file_list(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+) -> io::Result<String> {
+    let script = r#"set -euo pipefail
+cd "$GENSEE_WORKSPACE"
+find . -path './.git' -prune -o -type f -printf '%P\n' | sort
+"#;
+    tclone_exec_capture_env(
+        podman,
+        &source.container_name,
+        &[("GENSEE_WORKSPACE", &source.container_workspace)],
+        &["bash", "-lc", script],
+    )
+}
+
+fn tclone_merge_filesystem(
+    podman: &OsString,
+    fork: &TcloneRunRecord,
+    source: &TcloneRunRecord,
+    paths: Option<Vec<String>>,
+    dry_run: bool,
+) -> io::Result<()> {
+    if paths.as_ref().is_some_and(Vec::is_empty) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "gensee run merge --paths requires at least one path",
+        ));
+    }
+
+    let fork_overlay = inspect_tclone_overlay_rootfs(podman, &fork.container_name)
+        .or_else(|_| recorded_tclone_overlay_rootfs(fork))?;
+    let source_rootfs = inspect_tclone_rootfs(podman, &source.container_name)?;
+    let filter = paths.map(|paths| {
+        paths
+            .into_iter()
+            .map(|path| normalize_tclone_merge_path(&path))
+            .collect::<Vec<_>>()
+    });
+    let plan = build_tclone_overlay_merge_plan(
+        &fork_overlay.lowerdir,
+        &fork_overlay.upperdir,
+        &source_rootfs,
+        &filter,
+    )?;
+
+    if !plan.conflicts.is_empty() {
+        let shown = plan
+            .conflicts
+            .iter()
+            .take(20)
+            .map(|path| format!("/{path}"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "filesystem merge has {} conflict(s); resolve manually before retrying. First conflicts:\n  {shown}",
+                plan.conflicts.len()
+            ),
+        ));
+    }
+    if plan.changes.is_empty() {
+        println!(
+            "gensee: no filesystem changes to merge from {} into {}",
+            fork.run_id, source.run_id
+        );
+        return Ok(());
+    }
+    if dry_run {
+        println!(
+            "gensee: overlay filesystem merge dry-run found {} change(s) and no conflicts",
+            plan.changes.len()
+        );
+        return Ok(());
+    }
+
+    apply_tclone_overlay_merge(podman, source, &plan)?;
+    append_tclone_status(&fork.run_id, "merged", None)?;
+    println!(
+        "gensee: merged overlay filesystem changes from {} into {}",
+        fork.run_id, source.run_id
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcloneOverlayRootfs {
+    lowerdir: PathBuf,
+    upperdir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TcloneOverlayMergeOp {
+    UpsertFile,
+    CreateDir,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcloneOverlayMergeChange {
+    path: String,
+    op: TcloneOverlayMergeOp,
+    source: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcloneOverlayMergePlan {
+    changes: Vec<TcloneOverlayMergeChange>,
+    conflicts: Vec<String>,
+}
+
+impl TcloneOverlayMergePlan {
+    fn upserts(&self) -> impl Iterator<Item = &TcloneOverlayMergeChange> {
+        self.changes
+            .iter()
+            .filter(|change| change.op != TcloneOverlayMergeOp::Delete)
+    }
+
+    fn deletions(&self) -> impl Iterator<Item = &TcloneOverlayMergeChange> {
+        self.changes
+            .iter()
+            .rev()
+            .filter(|change| change.op == TcloneOverlayMergeOp::Delete)
+    }
+}
+
+fn build_tclone_overlay_merge_plan(
+    lowerdir: &Path,
+    upperdir: &Path,
+    source_rootfs: &Path,
+    filter: &Option<Vec<String>>,
+) -> io::Result<TcloneOverlayMergePlan> {
+    let mut upper_changes = enumerate_tclone_overlay_changes(upperdir, filter)?;
+    let mut changes = Vec::new();
+    let mut conflicts = Vec::new();
+
+    upper_changes.sort_by(|left, right| left.path.cmp(&right.path));
+    upper_changes.dedup_by(|left, right| left.path == right.path && left.op == right.op);
+
+    for change in upper_changes {
+        let base_path = lowerdir.join(&change.path);
+        if change.op == TcloneOverlayMergeOp::CreateDir && base_path.exists() {
+            continue;
+        }
+        let source_path = source_rootfs.join(&change.path);
+        let source_matches_base = path_signatures_equal(&source_path, &base_path)?;
+        let source_matches_fork = change
+            .source
+            .as_ref()
+            .map(|fork_path| path_signatures_equal(&source_path, fork_path))
+            .transpose()?
+            .unwrap_or_else(|| !source_path.exists());
+        if !source_matches_base && !source_matches_fork {
+            conflicts.push(change.path);
+            continue;
+        }
+        changes.push(change);
+    }
+
+    conflicts.sort();
+    conflicts.dedup();
+    Ok(TcloneOverlayMergePlan { changes, conflicts })
+}
+
+fn enumerate_tclone_overlay_changes(
+    upperdir: &Path,
+    filter: &Option<Vec<String>>,
+) -> io::Result<Vec<TcloneOverlayMergeChange>> {
+    let mut changes = Vec::new();
+    enumerate_tclone_overlay_changes_inner(upperdir, upperdir, filter, &mut changes)?;
+    Ok(changes)
+}
+
+fn enumerate_tclone_overlay_changes_inner(
+    root: &Path,
+    current: &Path,
+    filter: &Option<Vec<String>>,
+    changes: &mut Vec<TcloneOverlayMergeChange>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if file_name == ".wh..wh..opq" {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "overlay opaque directory marker is not supported yet near {}",
+                    path.display()
+                ),
+            ));
+        }
+        if let Some(deleted) = overlay_whiteout_target(&rel, &entry)? {
+            if path_matches_tclone_merge_filter(&deleted, filter) {
+                changes.push(TcloneOverlayMergeChange {
+                    path: deleted,
+                    op: TcloneOverlayMergeOp::Delete,
+                    source: None,
+                });
+            }
+            continue;
+        }
+
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if path_matches_tclone_merge_filter(&rel, filter) {
+                changes.push(TcloneOverlayMergeChange {
+                    path: rel.clone(),
+                    op: TcloneOverlayMergeOp::CreateDir,
+                    source: Some(path.clone()),
+                });
+            }
+            enumerate_tclone_overlay_changes_inner(root, &path, filter, changes)?;
+        } else if (file_type.is_file() || file_type.is_symlink())
+            && path_matches_tclone_merge_filter(&rel, filter)
+        {
+            changes.push(TcloneOverlayMergeChange {
+                path: rel,
+                op: TcloneOverlayMergeOp::UpsertFile,
+                source: Some(path),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn overlay_whiteout_target(path: &str, entry: &fs::DirEntry) -> io::Result<Option<String>> {
+    let file_name = entry.file_name().to_string_lossy().to_string();
+    if let Some(stripped) = file_name.strip_prefix(".wh.") {
+        let parent = Path::new(path)
+            .parent()
+            .and_then(Path::to_str)
+            .unwrap_or("");
+        return Ok(Some(if parent.is_empty() {
+            stripped.to_string()
+        } else {
+            format!("{parent}/{stripped}")
+        }));
+    }
+
+    #[cfg(unix)]
+    {
+        if entry.file_type()?.is_char_device() {
+            return Ok(Some(path.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn apply_tclone_overlay_merge(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+    plan: &TcloneOverlayMergePlan,
+) -> io::Result<()> {
+    for change in plan.deletions() {
+        let destination = format!("/{}", change.path);
+        tclone_exec(
+            podman,
+            &source.container_name,
+            &["rm", "-rf", "--", &destination],
+        )?;
+    }
+    for change in plan.upserts() {
+        let destination = format!("/{}", change.path);
+        match change.op {
+            TcloneOverlayMergeOp::CreateDir => {
+                tclone_exec(
+                    podman,
+                    &source.container_name,
+                    &["mkdir", "-p", "--", &destination],
+                )?;
+            }
+            TcloneOverlayMergeOp::UpsertFile => {
+                let overlay_source = change.source.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("missing overlay source for {}", change.path),
+                    )
+                })?;
+                if let Some(parent) = Path::new(&destination).parent().and_then(Path::to_str) {
+                    tclone_exec(
+                        podman,
+                        &source.container_name,
+                        &["mkdir", "-p", "--", parent],
+                    )?;
+                }
+                tclone_exec(
+                    podman,
+                    &source.container_name,
+                    &["rm", "-rf", "--", &destination],
+                )?;
+                podman_cp(
+                    podman,
+                    overlay_source,
+                    &format!("{}:{destination}", source.container_name),
+                )?;
+            }
+            TcloneOverlayMergeOp::Delete => {}
+        }
+    }
+    Ok(())
+}
+
+fn normalize_tclone_merge_path(path: &str) -> String {
+    path.trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn path_matches_tclone_merge_filter(path: &str, filter: &Option<Vec<String>>) -> bool {
+    match filter {
+        Some(filters) => filters
+            .iter()
+            .any(|filter| path == filter || path.starts_with(&format!("{filter}/"))),
+        None => true,
+    }
 }
 
 pub(crate) fn tclone_keep(args: Vec<OsString>) -> io::Result<()> {
@@ -434,6 +1429,387 @@ pub(crate) fn tclone_keep(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_tclone_merge_pair(
+    fork: &TcloneRunRecord,
+    source: &TcloneRunRecord,
+    force: bool,
+) -> io::Result<()> {
+    if fork.run_id == source.run_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot merge a tclone container into itself",
+        ));
+    }
+    if fork.role != "fork" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("merge source must be a fork, got role={}", fork.role),
+        ));
+    }
+    if source.role != "source" && !force {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("merge target must be a source, got role={}", source.role),
+        ));
+    }
+    if fork.parent_run_id.as_deref() != Some(source.run_id.as_str()) && !force {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a fork of {}; pass --force to override",
+                fork.run_id, source.run_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn tclone_merge_scope(args: &[OsString]) -> io::Result<TcloneMergeScope> {
+    let git = arg_flag(args, "--git");
+    let filesystem = arg_flag(args, "--filesystem");
+    let paths = arg_values_after(args, "--paths");
+    let selected = usize::from(git) + usize::from(filesystem) + usize::from(!paths.is_empty());
+    if selected > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "choose only one merge scope: --git, --filesystem, or --paths",
+        ));
+    }
+    if filesystem {
+        Ok(TcloneMergeScope::Filesystem)
+    } else if !paths.is_empty() {
+        Ok(TcloneMergeScope::Paths(paths))
+    } else {
+        Ok(TcloneMergeScope::Git)
+    }
+}
+
+fn tclone_merge_patch(
+    podman: &OsString,
+    fork: &TcloneRunRecord,
+    source_files_path: &str,
+) -> io::Result<String> {
+    let script = r#"set -euo pipefail
+cd "$GENSEE_WORKSPACE"
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "gensee: merge --git requires a git workspace at $GENSEE_WORKSPACE" >&2
+  exit 64
+fi
+base="${GENSEE_GIT_MERGE_BASE:-HEAD}"
+if git rev-parse --verify "$base^{commit}" >/dev/null 2>&1; then
+  git diff --binary "$base" -- . \
+    ':(exclude)gensee.db' \
+    ':(exclude)gensee.db-wal' \
+    ':(exclude)gensee.db-shm' \
+    ':(exclude)gensee.key' \
+    ':(exclude)telemetry.json'
+else
+  echo "gensee: warning: fork git merge base '$base' is unavailable; falling back to git diff HEAD" >&2
+  git diff --binary HEAD -- . \
+    ':(exclude)gensee.db' \
+    ':(exclude)gensee.db-wal' \
+    ':(exclude)gensee.db-shm' \
+    ':(exclude)gensee.key' \
+    ':(exclude)telemetry.json'
+fi
+while IFS= read -r -d '' file; do
+  case "$file" in
+    gensee.db|gensee.db-wal|gensee.db-shm|gensee.key|telemetry.json) continue ;;
+  esac
+  if grep -Fxq -- "$file" "$GENSEE_SOURCE_FILES"; then
+    continue
+  fi
+  git diff --binary --no-index -- /dev/null "$file" || true
+done < <(git ls-files --others --exclude-standard -z)
+"#;
+    let mut envs = vec![
+        ("GENSEE_WORKSPACE", fork.container_workspace.as_str()),
+        ("GENSEE_SOURCE_FILES", source_files_path),
+    ];
+    if let Some(base) = fork.fork_base_git_head.as_deref() {
+        envs.push(("GENSEE_GIT_MERGE_BASE", base));
+    }
+    tclone_exec_capture_env(
+        podman,
+        &fork.container_name,
+        &envs,
+        &["bash", "-lc", script],
+    )
+}
+
+fn capture_tclone_git_head(podman: &OsString, source: &TcloneRunRecord) -> io::Result<String> {
+    let script = r#"set -euo pipefail
+cd "$GENSEE_WORKSPACE"
+git rev-parse --verify HEAD
+"#;
+    let output = tclone_exec_capture_env(
+        podman,
+        &source.container_name,
+        &[("GENSEE_WORKSPACE", &source.container_workspace)],
+        &["bash", "-lc", script],
+    )?;
+    let head = output.trim().to_string();
+    if head.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty git HEAD from tclone source container",
+        ))
+    } else {
+        Ok(head)
+    }
+}
+
+fn ensure_tclone_container_exists(podman: &OsString, record: &TcloneRunRecord) -> io::Result<()> {
+    let status = Command::new(podman)
+        .arg("inspect")
+        .arg("--type")
+        .arg("container")
+        .arg(&record.container_name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "tclone container for {} not found: {}. Checked with podman command `{}`. If the container was created with sudo or GENSEE_TCLONE_PODMAN, run this command through the same wrapper, for example `gensee-tclone fork {}`.",
+                record.run_id,
+                record.container_name,
+                podman.to_string_lossy(),
+                record.run_id
+            ),
+        ))
+    }
+}
+
+fn inspect_tclone_rootfs(podman: &OsString, container: &str) -> io::Result<PathBuf> {
+    let output = run_command_capture(
+        podman,
+        &[OsString::from("inspect"), OsString::from(container)],
+    )?;
+    let values = serde_json::from_str::<Vec<serde_json::Value>>(&output)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    let Some(value) = values.first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("podman inspect returned no container for {container}"),
+        ));
+    };
+    let data = &value["GraphDriver"]["Data"];
+    let path = data["Source"]
+        .as_str()
+        .or_else(|| data["MergedDir"].as_str())
+        .or_else(|| value["Rootfs"].as_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("podman inspect for {container} did not include a rootfs path"),
+            )
+        })?;
+    Ok(PathBuf::from(path))
+}
+
+fn inspect_tclone_overlay_rootfs(
+    podman: &OsString,
+    container: &str,
+) -> io::Result<TcloneOverlayRootfs> {
+    let rootfs = inspect_tclone_rootfs(podman, container)?;
+    let Some((lowerdir, upperdir)) = overlay_layers_for_mountpoint(&rootfs)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "container {container} is not backed by a visible overlay rootfs; create a new fork with Gensee's tclone overlay mode"
+            ),
+        ));
+    };
+    Ok(TcloneOverlayRootfs { lowerdir, upperdir })
+}
+
+fn recorded_tclone_overlay_rootfs(record: &TcloneRunRecord) -> io::Result<TcloneOverlayRootfs> {
+    let lowerdir = record
+        .fork_base_overlay_lowerdir
+        .as_ref()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "tclone fork {} does not have recorded overlay lowerdir metadata; recreate the fork with Gensee's tclone overlay mode",
+                    record.run_id
+                ),
+            )
+        })?;
+    if !lowerdir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "recorded tclone overlay lowerdir for {} no longer exists: {}; recreate the fork before filesystem merge",
+                record.run_id,
+                lowerdir.display()
+            ),
+        ));
+    }
+    let upperdir = record
+        .fork_overlay_upperdir
+        .as_ref()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "tclone fork {} does not have recorded overlay upperdir metadata; recreate the fork with Gensee's tclone overlay mode",
+                    record.run_id
+                ),
+            )
+        })?;
+    if !upperdir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "recorded tclone overlay upperdir for {} no longer exists: {}; recreate the fork before filesystem merge",
+                record.run_id,
+                upperdir.display()
+            ),
+        ));
+    }
+    Ok(TcloneOverlayRootfs { lowerdir, upperdir })
+}
+
+fn overlay_layers_for_mountpoint(rootfs: &Path) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    let rootfs = rootfs.to_string_lossy().to_string();
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    for line in mountinfo.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let left_fields = left.split_whitespace().collect::<Vec<_>>();
+        let right_fields = right.split_whitespace().collect::<Vec<_>>();
+        if left_fields.len() < 5 || right_fields.len() < 3 {
+            continue;
+        }
+        let mountpoint = unescape_mountinfo_field(left_fields[4]);
+        if mountpoint != rootfs {
+            continue;
+        }
+        if right_fields[0] != "overlay" {
+            return Ok(None);
+        }
+        let opts = right_fields[2];
+        let mut lowerdir = None;
+        let mut upperdir = None;
+        for option in opts.split(',') {
+            if let Some(value) = option.strip_prefix("lowerdir=") {
+                lowerdir = value.split(':').next().map(unescape_mountinfo_field);
+            } else if let Some(value) = option.strip_prefix("upperdir=") {
+                upperdir = Some(unescape_mountinfo_field(value));
+            }
+        }
+        return match (lowerdir, upperdir) {
+            (Some(lowerdir), Some(upperdir)) => {
+                Ok(Some((PathBuf::from(lowerdir), PathBuf::from(upperdir))))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("overlay mount for {rootfs} did not expose lowerdir and upperdir"),
+            )),
+        };
+    }
+    Ok(None)
+}
+
+fn unescape_mountinfo_field(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TclonePathSignature {
+    Missing,
+    File { mode: u32, len: u64, hash: u64 },
+    Dir { mode: u32 },
+    Symlink(String),
+    Other,
+}
+
+fn path_signatures_equal(left: &Path, right: &Path) -> io::Result<bool> {
+    Ok(path_signature(left)? == path_signature(right)?)
+}
+
+fn path_signature(path: &Path) -> io::Result<TclonePathSignature> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(TclonePathSignature::Missing);
+        }
+        Err(err) => return Err(err),
+    };
+    let file_type = metadata.file_type();
+    #[cfg(unix)]
+    let mode = metadata.permissions().mode();
+    #[cfg(not(unix))]
+    let mode = 0;
+    if file_type.is_symlink() {
+        return Ok(TclonePathSignature::Symlink(
+            fs::read_link(path)?.to_string_lossy().to_string(),
+        ));
+    }
+    if file_type.is_dir() {
+        return Ok(TclonePathSignature::Dir { mode });
+    }
+    if file_type.is_file() {
+        return Ok(TclonePathSignature::File {
+            mode,
+            len: metadata.len(),
+            hash: hash_file(path)?,
+        });
+    }
+    Ok(TclonePathSignature::Other)
+}
+
+fn hash_file(path: &Path) -> io::Result<u64> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = DefaultHasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        buffer[..read].hash(&mut hasher);
+    }
+    Ok(hasher.finish())
+}
+
+fn tclone_apply_merge_patch(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+    container_patch: &str,
+    dry_run: bool,
+) -> io::Result<()> {
+    let script = if dry_run {
+        format!(
+            "set -euo pipefail\ncd \"$GENSEE_WORKSPACE\"\nif ! git rev-parse --show-toplevel >/dev/null 2>&1; then echo \"gensee: merge --git requires a git workspace at $GENSEE_WORKSPACE\" >&2; exit 64; fi\ngit apply --check '{}'\ngit status --short",
+            container_patch
+        )
+    } else {
+        format!(
+            "set -euo pipefail\ncd \"$GENSEE_WORKSPACE\"\nif ! git rev-parse --show-toplevel >/dev/null 2>&1; then echo \"gensee: merge --git requires a git workspace at $GENSEE_WORKSPACE\" >&2; exit 64; fi\ngit apply '{}'\ngit status --short",
+            container_patch
+        )
+    };
+    tclone_exec_env(
+        podman,
+        &source.container_name,
+        &[("GENSEE_WORKSPACE", &source.container_workspace)],
+        &["bash", "-lc", &script],
+    )
+}
+
 pub(crate) fn tclone_discard_if_exists(target: &str) -> io::Result<bool> {
     let Ok(record) = find_tclone_record(target) else {
         return Ok(false);
@@ -457,6 +1833,20 @@ pub(crate) fn tclone_discard_if_exists(target: &str) -> io::Result<bool> {
 pub(crate) fn list_tclone_runs() -> io::Result<Vec<TcloneRunRecord>> {
     let path = tclone_state_path()?;
     read_tclone_runs_from_path(&path)
+}
+
+fn delete_tclone_records(
+    mut should_delete: impl FnMut(&TcloneRunRecord) -> bool,
+) -> io::Result<usize> {
+    let path = tclone_state_path()?;
+    let records = read_tclone_runs_from_path(&path)?;
+    let original_count = records.len();
+    let retained = records
+        .into_iter()
+        .filter(|record| !should_delete(record))
+        .collect::<Vec<_>>();
+    write_tclone_runs_to_path(&path, &retained)?;
+    Ok(original_count.saturating_sub(retained.len()))
 }
 
 fn read_tclone_runs_from_path(path: &Path) -> io::Result<Vec<TcloneRunRecord>> {
@@ -488,6 +1878,28 @@ fn read_tclone_runs_from_path(path: &Path) -> io::Result<Vec<TcloneRunRecord>> {
         }
     }
     Ok(records)
+}
+
+fn write_tclone_runs_to_path(path: &Path, records: &[TcloneRunRecord]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _lock = TcloneStateLock::acquire(path)?;
+    let temp_path = path.with_extension("jsonl.tmp");
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)?;
+        for record in records {
+            let line = serde_json::to_string(record)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+            writeln!(file, "{line}")?;
+        }
+    }
+    fs::rename(temp_path, path)?;
+    Ok(())
 }
 
 fn append_tclone_record(record: &TcloneRunRecord) -> io::Result<()> {
@@ -560,7 +1972,10 @@ fn tclone_target_arg(args: &[OsString], usage: &str) -> io::Result<String> {
 }
 
 fn tclone_option_takes_value(option: &str) -> bool {
-    matches!(option, "--copies" | "--name" | "--shell" | "--to")
+    matches!(
+        option,
+        "--copies" | "--name" | "--shell" | "--to" | "--into" | "--paths"
+    )
 }
 
 fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
@@ -584,9 +1999,160 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
             host,
             format!("{DEFAULT_CONTAINER_HOME}/.claude"),
         ))
+    } else if lower.contains("antigravity") || lower.contains("gemini") {
+        let host = env::var_os("GEMINI_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".gemini"));
+        Some((
+            "GEMINI_HOME".to_string(),
+            host,
+            format!("{DEFAULT_CONTAINER_HOME}/.gemini"),
+        ))
     } else {
         None
     }
+}
+
+fn tclone_agent_start_script(agent_cmd: &[OsString]) -> String {
+    let command = shell_join(agent_cmd);
+    format!(
+        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  while :; do\n    wait || true\n    sleep 1\n  done\nfi\nprintf 'tmux not found; exec agent directly: %s\\n' {} > \"$log\"\nexec {}\n",
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(&command),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(&format!("exec {command}")),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        shell_quote(&command),
+        command
+    )
+}
+
+fn shell_join(args: &[OsString]) -> String {
+    args.iter()
+        .map(|arg| shell_quote(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn prepare_tclone_seed(
+    seed_root: &Path,
+    original_workspace: &Path,
+    agent_home: Option<&(String, PathBuf, String)>,
+    gensee_home: Option<&PathBuf>,
+    container_workspace: &str,
+    container_home: &str,
+) -> io::Result<()> {
+    if seed_root.exists() {
+        fs::remove_dir_all(seed_root)?;
+    }
+    fs::create_dir_all(seed_root)?;
+
+    let workspace_seed = seed_root.join(container_relative_path(container_workspace)?);
+    copy_tclone_workspace(original_workspace, &workspace_seed)?;
+
+    if let Some((_, host_home, container_path)) = agent_home.filter(|(_, path, _)| path.exists()) {
+        copy_path_all(
+            host_home,
+            &seed_root.join(container_relative_path(container_path)?),
+        )?;
+        install_tclone_host_path_compatibility(seed_root, host_home, container_path)?;
+    }
+    if let Some(gensee_home) = gensee_home.filter(|path| path.exists()) {
+        copy_path_all(
+            gensee_home,
+            &seed_root.join(container_relative_path(&format!(
+                "{container_home}/.gensee"
+            ))?),
+        )?;
+        install_tclone_gensee_home_compatibility(seed_root, gensee_home, container_home)?;
+    }
+    Ok(())
+}
+
+fn install_tclone_host_path_compatibility(
+    seed_root: &Path,
+    host_home: &Path,
+    container_path: &str,
+) -> io::Result<()> {
+    let Some(host_home_parent) = host_home.parent() else {
+        return Ok(());
+    };
+    let host_home_link = seed_root.join(container_relative_path(&host_home.to_string_lossy())?);
+    if !host_home_link.exists() {
+        if let Some(parent) = host_home_link.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        symlink_or_copy_marker(container_path, &host_home_link)?;
+    }
+
+    let host_cargo_bin = host_home_parent.join(".cargo/bin");
+    let host_gensee = host_cargo_bin.join("gensee");
+    let seed_gensee = seed_root.join(container_relative_path(&host_gensee.to_string_lossy())?);
+    if !seed_gensee.exists() {
+        fs::create_dir_all(seed_gensee.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid tclone compatibility path: {}",
+                    seed_gensee.display()
+                ),
+            )
+        })?)?;
+        symlink_or_copy_marker("/usr/local/bin/gensee", &seed_gensee)?;
+    }
+    Ok(())
+}
+
+fn install_tclone_gensee_home_compatibility(
+    seed_root: &Path,
+    host_gensee_home: &Path,
+    container_home: &str,
+) -> io::Result<()> {
+    let host_link = seed_root.join(container_relative_path(
+        &host_gensee_home.to_string_lossy(),
+    )?);
+    if host_link.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = host_link.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    symlink_or_copy_marker(&format!("{container_home}/.gensee"), &host_link)
+}
+
+#[cfg(unix)]
+fn symlink_or_copy_marker(target: &str, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(not(unix))]
+fn symlink_or_copy_marker(_target: &str, link: &Path) -> io::Result<()> {
+    fs::write(
+        link,
+        "This tclone compatibility path requires Unix symlink support.\n",
+    )
+}
+
+fn container_relative_path(path: &str) -> io::Result<PathBuf> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.split('/').any(|part| part == "..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid container path for tclone seed: {path}"),
+        ));
+    }
+    Ok(PathBuf::from(trimmed))
 }
 
 fn copy_tclone_workspace(source: &Path, destination: &Path) -> io::Result<()> {
@@ -636,9 +2202,52 @@ fn copy_tclone_path(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn copy_path_all(source: &Path, destination: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_path_all(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            std::os::unix::fs::symlink(fs::read_link(source)?, destination)?;
+        }
+        #[cfg(not(unix))]
+        {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source, destination)?;
+        }
+    } else if metadata.is_file() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, destination)?;
+    }
+    Ok(())
+}
+
 fn should_skip_tclone_workspace_entry(name: &str) -> bool {
     // Applied at every workspace depth to avoid copying bulky build/dependency trees.
-    matches!(name, "target" | "node_modules" | ".gensee" | ".gensee-dev") || name.ends_with(".tmp")
+    matches!(
+        name,
+        "target"
+            | "node_modules"
+            | ".gensee"
+            | ".gensee-dev"
+            | "gensee.db"
+            | "gensee.db-wal"
+            | "gensee.db-shm"
+            | "gensee.key"
+            | "telemetry.json"
+    ) || name.ends_with(".tmp")
 }
 
 fn tclone_node_mount() -> Option<(PathBuf, PathBuf)> {
@@ -659,6 +2268,26 @@ fn tclone_podman() -> OsString {
     env::var_os("GENSEE_TCLONE_PODMAN")
         .or_else(|| env::var_os("PODMAN_TFORK"))
         .unwrap_or_else(|| OsString::from("podman"))
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn tclone_agent_ready_timeout(no_attach: bool) -> Duration {
+    env::var("GENSEE_TCLONE_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| {
+            if no_attach {
+                Duration::from_secs(120)
+            } else {
+                Duration::from_secs(20)
+            }
+        })
 }
 
 fn podman_cp(podman: &OsString, source: &Path, destination: &str) -> io::Result<()> {
@@ -694,6 +2323,22 @@ fn tclone_exec_env(
     args.push(OsString::from(container));
     args.extend(command.iter().map(OsString::from));
     run_command_status(podman, &args)
+}
+
+fn tclone_exec_capture_env(
+    podman: &OsString,
+    container: &str,
+    envs: &[(&str, &str)],
+    command: &[&str],
+) -> io::Result<String> {
+    let mut args = vec![OsString::from("exec")];
+    for (key, value) in envs {
+        args.push(OsString::from("-e"));
+        args.push(OsString::from(format!("{key}={value}")));
+    }
+    args.push(OsString::from(container));
+    args.extend(command.iter().map(OsString::from));
+    run_command_capture(podman, &args)
 }
 
 fn inspect_container_pid(podman: &OsString, container: &str) -> io::Result<u32> {
@@ -900,6 +2545,46 @@ fn arg_value(args: &[OsString], name: &str) -> Option<String> {
         })
 }
 
+fn arg_values_after(args: &[OsString], name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index].to_str() == Some(name) {
+            index += 1;
+            while index < args.len() {
+                let Some(value) = args[index].to_str() else {
+                    index += 1;
+                    continue;
+                };
+                if value.starts_with("--") {
+                    break;
+                }
+                values.push(value.to_string());
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(value) = args[index]
+            .to_str()
+            .and_then(|value| value.strip_prefix(&format!("{name}=")))
+        {
+            values.extend(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+            );
+        }
+        index += 1;
+    }
+    values
+}
+
+fn arg_flag(args: &[OsString], name: &str) -> bool {
+    args.iter().any(|arg| arg.to_str() == Some(name))
+}
+
 fn find_command(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     env::split_paths(&path)
@@ -926,10 +2611,20 @@ mod tests {
             container_workspace: "/workspace".to_string(),
             container_home: "/home/gensee".to_string(),
             agent_cmd: vec!["codex".to_string()],
+            fork_base_git_head: None,
+            fork_base_overlay_lowerdir: None,
+            fork_overlay_upperdir: None,
             started_at_ms: 1,
             updated_at_ms: 1,
             exit_code: None,
         }
+    }
+
+    fn test_fork_record(run_id: &str, parent_run_id: &str) -> TcloneRunRecord {
+        let mut record = test_record(run_id, "running");
+        record.role = "fork".to_string();
+        record.parent_run_id = Some(parent_run_id.to_string());
+        record
     }
 
     fn temp_state_path(name: &str) -> PathBuf {
@@ -937,6 +2632,16 @@ mod tests {
             "gensee-tclone-state-test-{}-{name}.jsonl",
             std::process::id()
         ))
+    }
+
+    fn temp_tree(name: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "gensee-tclone-tree-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 
     #[test]
@@ -964,10 +2669,53 @@ mod tests {
     }
 
     #[test]
+    fn tclone_state_write_replaces_existing_records() {
+        let path = temp_state_path("write-replaces");
+        let _ = fs::remove_file(&path);
+        let first = test_record("run_1", "running");
+        let second = test_record("run_2", "running");
+        write_tclone_runs_to_path(&path, &[first.clone(), second.clone()]).unwrap();
+        write_tclone_runs_to_path(&path, std::slice::from_ref(&second)).unwrap();
+
+        let records = read_tclone_runs_from_path(&path).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "run_2");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tclone_delete_records_filters_matching_runs() {
+        let path = temp_state_path("delete-filter");
+        let _ = fs::remove_file(&path);
+        let first = test_record("run_1", "running");
+        let second = test_record("run_2", "running");
+        write_tclone_runs_to_path(&path, &[first, second]).unwrap();
+
+        let records = read_tclone_runs_from_path(&path).unwrap();
+        let retained = records
+            .into_iter()
+            .filter(|record| record.run_id != "run_1")
+            .collect::<Vec<_>>();
+        write_tclone_runs_to_path(&path, &retained).unwrap();
+
+        let records = read_tclone_runs_from_path(&path).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "run_2");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn tclone_workspace_skip_covers_build_and_temp_entries() {
         assert!(should_skip_tclone_workspace_entry("target"));
         assert!(should_skip_tclone_workspace_entry("node_modules"));
         assert!(should_skip_tclone_workspace_entry(".gensee"));
+        assert!(should_skip_tclone_workspace_entry("gensee.db"));
+        assert!(should_skip_tclone_workspace_entry("gensee.db-wal"));
+        assert!(should_skip_tclone_workspace_entry("gensee.db-shm"));
+        assert!(should_skip_tclone_workspace_entry("gensee.key"));
+        assert!(should_skip_tclone_workspace_entry("telemetry.json"));
         assert!(should_skip_tclone_workspace_entry("scratch.tmp"));
         assert!(!should_skip_tclone_workspace_entry(".git"));
         assert!(!should_skip_tclone_workspace_entry("src"));
@@ -991,12 +2739,357 @@ mod tests {
         let args = vec![
             OsString::from("--copies=2"),
             OsString::from("--name=fork-prefix"),
+            OsString::from("--into=source"),
             OsString::from("run_1"),
         ];
 
         assert_eq!(arg_value(&args, "--copies").unwrap(), "2");
         assert_eq!(arg_value(&args, "--name").unwrap(), "fork-prefix");
+        assert_eq!(arg_value(&args, "--into").unwrap(), "source");
         assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+    }
+
+    #[test]
+    fn tclone_agent_start_script_wraps_command_in_tmux_when_available() {
+        let script = tclone_agent_start_script(&[
+            OsString::from("codex"),
+            OsString::from("--prompt"),
+            OsString::from("don't panic"),
+        ]);
+
+        assert!(script.contains("tmux new-session -d -s 'gensee-agent'"));
+        assert!(script.contains("'codex' '--prompt' 'don'\\''t panic'"));
+        assert!(script.contains("while :; do\n    wait || true\n    sleep 1\n  done"));
+        assert!(!script.contains("exec sleep infinity"));
+        assert!(script.contains("exec 'codex' '--prompt' 'don'\\''t panic'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_seed_installs_host_path_compatibility_links() {
+        let root = temp_tree("compat-links");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let host_home = root.join("host-home/yiying/.codex");
+        let gensee_home = root.join("host-home/yiying/.gensee");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(&host_home).unwrap();
+        fs::write(host_home.join("hooks.json"), "{}").unwrap();
+        fs::create_dir_all(&gensee_home).unwrap();
+        fs::write(gensee_home.join("policy.json"), "{}").unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "CODEX_HOME".to_string(),
+                host_home.clone(),
+                "/home/gensee/.codex".to_string(),
+            )),
+            Some(&gensee_home),
+            "/workspace",
+            "/home/gensee",
+        )
+        .unwrap();
+
+        assert!(seed.join("home/gensee/.codex/hooks.json").exists());
+        assert_eq!(
+            fs::read_link(seed.join(host_home.strip_prefix("/").unwrap())).unwrap(),
+            PathBuf::from("/home/gensee/.codex")
+        );
+        assert_eq!(
+            fs::read_link(
+                seed.join(
+                    host_home
+                        .parent()
+                        .unwrap()
+                        .join(".cargo/bin/gensee")
+                        .strip_prefix("/")
+                        .unwrap()
+                )
+            )
+            .unwrap(),
+            PathBuf::from("/usr/local/bin/gensee")
+        );
+        assert_eq!(
+            fs::read_link(seed.join(gensee_home.strip_prefix("/").unwrap())).unwrap(),
+            PathBuf::from("/home/gensee/.gensee")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_seed_copies_antigravity_gemini_home() {
+        let root = temp_tree("antigravity-home");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let gemini_home = root.join("host-home/yiying/.gemini");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(gemini_home.join("config")).unwrap();
+        fs::write(gemini_home.join("config/hooks.json"), "{}").unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "GEMINI_HOME".to_string(),
+                gemini_home.clone(),
+                "/home/gensee/.gemini".to_string(),
+            )),
+            None,
+            "/workspace",
+            "/home/gensee",
+        )
+        .unwrap();
+
+        assert!(seed.join("home/gensee/.gemini/config/hooks.json").exists());
+        assert_eq!(
+            fs::read_link(seed.join(gemini_home.strip_prefix("/").unwrap())).unwrap(),
+            PathBuf::from("/home/gensee/.gemini")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_arg_flag_detects_boolean_options() {
+        let args = vec![
+            OsString::from("fork_1"),
+            OsString::from("--into"),
+            OsString::from("source_1"),
+            OsString::from("--dry-run"),
+        ];
+
+        assert!(arg_flag(&args, "--dry-run"));
+        assert!(!arg_flag(&args, "--force"));
+    }
+
+    #[test]
+    fn tclone_merge_scope_defaults_to_git() {
+        let args = vec![
+            OsString::from("fork_1"),
+            OsString::from("--into"),
+            OsString::from("source_1"),
+        ];
+
+        assert_eq!(tclone_merge_scope(&args).unwrap(), TcloneMergeScope::Git);
+    }
+
+    #[test]
+    fn tclone_merge_scope_parses_paths() {
+        let args = vec![
+            OsString::from("fork_1"),
+            OsString::from("--into"),
+            OsString::from("source_1"),
+            OsString::from("--paths"),
+            OsString::from("/workspace"),
+            OsString::from("/home/gensee/.codex"),
+            OsString::from("--dry-run"),
+        ];
+
+        assert_eq!(
+            tclone_merge_scope(&args).unwrap(),
+            TcloneMergeScope::Paths(vec![
+                "/workspace".to_string(),
+                "/home/gensee/.codex".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn tclone_merge_scope_rejects_multiple_scopes() {
+        let args = vec![
+            OsString::from("fork_1"),
+            OsString::from("--into"),
+            OsString::from("source_1"),
+            OsString::from("--git"),
+            OsString::from("--filesystem"),
+        ];
+
+        assert!(tclone_merge_scope(&args).is_err());
+    }
+
+    #[test]
+    fn tclone_switch_promotes_fork_to_source_record() {
+        let fork = test_fork_record("fork_1", "source_1");
+
+        let switched = switched_tclone_source_record(fork, 42).unwrap();
+
+        assert_eq!(switched.role, "source");
+        assert_eq!(switched.status, "active");
+        assert_eq!(switched.parent_run_id, None);
+        assert_eq!(
+            switched.source_container.as_deref(),
+            Some("container-fork_1")
+        );
+        assert_eq!(switched.updated_at_ms, 42);
+    }
+
+    #[test]
+    fn tclone_switch_rejects_non_fork_record() {
+        let source = test_record("source_1", "running");
+
+        assert!(switched_tclone_source_record(source, 42).is_err());
+    }
+
+    #[test]
+    fn tclone_overlay_merge_plan_applies_fork_only_change() {
+        let root = temp_tree("fork-only");
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+        let source = root.join("source");
+        fs::create_dir_all(lower.join("workspace")).unwrap();
+        fs::create_dir_all(upper.join("workspace")).unwrap();
+        fs::create_dir_all(source.join("workspace")).unwrap();
+        fs::write(lower.join("workspace/a.txt"), "old").unwrap();
+        fs::write(upper.join("workspace/a.txt"), "new").unwrap();
+        fs::write(source.join("workspace/a.txt"), "old").unwrap();
+
+        let plan = build_tclone_overlay_merge_plan(&lower, &upper, &source, &None).unwrap();
+
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].path, "workspace/a.txt");
+        assert_eq!(plan.changes[0].op, TcloneOverlayMergeOp::UpsertFile);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_overlay_merge_plan_detects_conflict() {
+        let root = temp_tree("conflict");
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+        let source = root.join("source");
+        fs::create_dir_all(lower.join("workspace")).unwrap();
+        fs::create_dir_all(upper.join("workspace")).unwrap();
+        fs::create_dir_all(source.join("workspace")).unwrap();
+        fs::write(lower.join("workspace/a.txt"), "old").unwrap();
+        fs::write(upper.join("workspace/a.txt"), "fork").unwrap();
+        fs::write(source.join("workspace/a.txt"), "source").unwrap();
+
+        let plan = build_tclone_overlay_merge_plan(&lower, &upper, &source, &None).unwrap();
+
+        assert_eq!(plan.conflicts, vec!["workspace/a.txt".to_string()]);
+        assert!(plan.changes.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_overlay_merge_plan_honors_path_filter() {
+        let root = temp_tree("filter");
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+        let source = root.join("source");
+        fs::create_dir_all(lower.join("workspace")).unwrap();
+        fs::create_dir_all(upper.join("workspace")).unwrap();
+        fs::create_dir_all(source.join("workspace")).unwrap();
+        fs::create_dir_all(lower.join("home/gensee/.codex")).unwrap();
+        fs::create_dir_all(upper.join("home/gensee/.codex")).unwrap();
+        fs::create_dir_all(source.join("home/gensee/.codex")).unwrap();
+        fs::write(lower.join("workspace/a.txt"), "old").unwrap();
+        fs::write(upper.join("workspace/a.txt"), "new").unwrap();
+        fs::write(source.join("workspace/a.txt"), "old").unwrap();
+        fs::write(lower.join("home/gensee/.codex/config"), "old").unwrap();
+        fs::write(upper.join("home/gensee/.codex/config"), "new").unwrap();
+        fs::write(source.join("home/gensee/.codex/config"), "old").unwrap();
+        let filter = Some(vec!["home/gensee/.codex".to_string()]);
+
+        let plan = build_tclone_overlay_merge_plan(&lower, &upper, &source, &filter).unwrap();
+
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].path, "home/gensee/.codex/config");
+        assert_eq!(plan.changes[0].op, TcloneOverlayMergeOp::UpsertFile);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_overlay_merge_plan_applies_whiteout_delete() {
+        let root = temp_tree("whiteout-delete");
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+        let source = root.join("source");
+        fs::create_dir_all(lower.join("workspace")).unwrap();
+        fs::create_dir_all(upper.join("workspace")).unwrap();
+        fs::create_dir_all(source.join("workspace")).unwrap();
+        fs::write(lower.join("workspace/a.txt"), "old").unwrap();
+        fs::write(upper.join("workspace/.wh.a.txt"), "").unwrap();
+        fs::write(source.join("workspace/a.txt"), "old").unwrap();
+
+        let plan = build_tclone_overlay_merge_plan(&lower, &upper, &source, &None).unwrap();
+
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].path, "workspace/a.txt");
+        assert_eq!(plan.changes[0].op, TcloneOverlayMergeOp::Delete);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_overlay_merge_plan_rejects_opaque_directory_marker() {
+        let root = temp_tree("opaque-dir");
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+        let source = root.join("source");
+        fs::create_dir_all(&lower).unwrap();
+        fs::create_dir_all(upper.join("workspace")).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(upper.join("workspace/.wh..wh..opq"), "").unwrap();
+
+        let error = build_tclone_overlay_merge_plan(&lower, &upper, &source, &None).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error
+            .to_string()
+            .contains("overlay opaque directory marker is not supported"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_recorded_overlay_rootfs_uses_stored_layers() {
+        let root = temp_tree("recorded-overlay");
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+        fs::create_dir_all(&lower).unwrap();
+        fs::create_dir_all(&upper).unwrap();
+        let mut record = test_fork_record("fork_1", "source_1");
+        record.fork_base_overlay_lowerdir = Some(lower.to_string_lossy().to_string());
+        record.fork_overlay_upperdir = Some(upper.to_string_lossy().to_string());
+
+        let overlay = recorded_tclone_overlay_rootfs(&record).unwrap();
+
+        assert_eq!(overlay.lowerdir, lower);
+        assert_eq!(overlay.upperdir, upper);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_recorded_overlay_rootfs_rejects_stale_layers() {
+        let mut record = test_fork_record("fork_1", "source_1");
+        record.fork_base_overlay_lowerdir = Some("/tmp/gensee-missing-lower".to_string());
+        record.fork_overlay_upperdir = Some("/tmp/gensee-missing-upper".to_string());
+
+        let error = recorded_tclone_overlay_rootfs(&record).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error
+            .to_string()
+            .contains("recorded tclone overlay lowerdir"));
+    }
+
+    #[test]
+    fn tclone_merge_pair_requires_fork_parent_source() {
+        let source = test_record("source_1", "running");
+        let fork = test_fork_record("fork_1", "source_1");
+        let unrelated = test_fork_record("fork_2", "other_source");
+        let mut source_as_fork = test_record("not_fork", "running");
+        source_as_fork.role = "source".to_string();
+
+        assert!(validate_tclone_merge_pair(&fork, &source, false).is_ok());
+        assert!(validate_tclone_merge_pair(&unrelated, &source, false).is_err());
+        assert!(validate_tclone_merge_pair(&unrelated, &source, true).is_ok());
+        assert!(validate_tclone_merge_pair(&source_as_fork, &source, false).is_err());
     }
 
     #[test]

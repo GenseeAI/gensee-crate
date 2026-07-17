@@ -162,20 +162,32 @@ On prepared Linux tclone hosts, `gensee run --runtime tclone` launches an agent
 inside cloneable Podman container storage:
 
 ```bash
-export GENSEE_TCLONE_PODMAN=/path/to/os4agent/podman-tfork.sh
-gensee run --runtime tclone -- codex
+export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
+export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" gensee'
+
+gensee-tclone run --runtime tclone -- codex
 ```
 
 From another terminal, fork and inspect the running source container:
 
 ```bash
-gensee run list
-gensee fork <run_id> --copies 2
-gensee run shell <run_id-or-container>
-gensee run diff <run_id-or-container>
-gensee run keep <run_id-or-container> --to /tmp/kept-workspace
-gensee run discard <run_id-or-container>
+gensee-tclone run list
+gensee-tclone fork <source-run-id> --copies 2
+gensee-tclone run shell <run_id-or-container>
+gensee-tclone run diff <run_id-or-container>
+gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
+gensee-tclone run merge <fork-id> --into <source-id> --filesystem
+gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.codex
+gensee-tclone run switch <fork-id>
+gensee-tclone run keep <run_id-or-container> --to /tmp/kept-workspace
+gensee-tclone run discard <run_id-or-container>
+gensee-tclone run delete --all
 ```
+
+Use the row with role `source` under the `Tclone containers` section as
+`<source-run-id>`. The launcher also prints the source id as soon as the source
+container is created.
 
 This initial mode is separate from `--sandbox linux`: Gensee owns source/fork
 container orchestration, while Linux seccomp, fanotify, and cgroup/nftables

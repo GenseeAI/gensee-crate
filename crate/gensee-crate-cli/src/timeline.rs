@@ -3,13 +3,14 @@ use crate::*;
 pub(crate) fn list_runs() -> io::Result<()> {
     let store = EventStore::default_local()?;
     let sessions = compact_sessions(store.list_sessions()?);
+    let tclone_runs = list_tclone_runs()?;
 
-    if sessions.is_empty() {
+    if sessions.is_empty() && tclone_runs.is_empty() {
         println!("No runs found.");
         return Ok(());
     }
 
-    for session in sessions {
+    for session in &sessions {
         println!(
             "{} | {} | root_pid={} | {} | {}",
             session.session_id,
@@ -24,7 +25,6 @@ pub(crate) fn list_runs() -> io::Result<()> {
         );
     }
 
-    let tclone_runs = list_tclone_runs()?;
     if !tclone_runs.is_empty() {
         println!("Tclone containers");
         for run in tclone_runs {
