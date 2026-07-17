@@ -1159,8 +1159,15 @@ fn infer_host_tmux_context() -> Option<(String, String)> {
             target.to_string_lossy().to_string(),
         ));
     }
-    if env::var_os("TMUX").is_some() {
-        return None;
+    if let Some(tmux) = env::var_os("TMUX") {
+        if let Some(context) = host_tmux_context_from_tmux_env(&tmux) {
+            return Some(context);
+        }
+    }
+    for tmux in parent_process_tmux_envs() {
+        if let Some(context) = host_tmux_context_from_tmux_env(&tmux) {
+            return Some(context);
+        }
     }
     let tty = current_tty_path()?;
     for socket in host_tmux_socket_candidates() {
@@ -1169,6 +1176,64 @@ fn infer_host_tmux_context() -> Option<(String, String)> {
         }
     }
     None
+}
+
+fn host_tmux_context_from_tmux_env(tmux: &OsString) -> Option<(String, String)> {
+    let tmux = tmux.to_string_lossy();
+    let socket = tmux.split(',').next()?.to_string();
+    if socket.is_empty() {
+        return None;
+    }
+    let target = Command::new("tmux")
+        .env("TMUX", tmux.as_ref())
+        .arg("display-message")
+        .arg("-p")
+        .arg("#{pane_id}")
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|target| !target.is_empty())?;
+    Some((socket, target))
+}
+
+fn parent_process_tmux_envs() -> Vec<OsString> {
+    let mut values = Vec::new();
+    let mut pid = parent_pid_of(std::process::id());
+    for _ in 0..4 {
+        let Some(current_pid) = pid else {
+            break;
+        };
+        if let Some(tmux) = process_env_value(current_pid, "TMUX") {
+            values.push(tmux);
+        }
+        pid = parent_pid_of(current_pid);
+    }
+    values
+}
+
+fn parent_pid_of(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(") ")?;
+    stat[end + 2..].split_whitespace().nth(1)?.parse().ok()
+}
+
+fn process_env_value(pid: u32, key: &str) -> Option<OsString> {
+    let bytes = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{key}=");
+    bytes
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find_map(|entry| {
+            entry
+                .strip_prefix(&prefix)
+                .map(|value| OsString::from(value.to_string()))
+        })
 }
 
 fn current_tty_path() -> Option<String> {
