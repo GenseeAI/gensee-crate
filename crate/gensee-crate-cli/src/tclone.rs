@@ -17,6 +17,7 @@ const TCLONE_REATTACH_MARKER: &str = "/tmp/gensee-tclone-reattach-source";
 const TCLONE_STATE_LOCK_STALE_SECS: u64 = 30;
 const TCLONE_HOST_CONTROL_SOCKET_ENV: &str = "GENSEE_TCLONE_HOST_SOCKET";
 const TCLONE_HOST_CONTROL_DIR_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DIR";
+const TCLONE_HOST_CONTROL_DISABLE_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DISABLE";
 const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
 const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
 
@@ -67,6 +68,9 @@ enum TcloneMergeScope {
 }
 
 pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Result<bool> {
+    if env::var_os(TCLONE_HOST_CONTROL_DISABLE_ENV).is_some() {
+        return Ok(false);
+    }
     if !tclone_host_control_should_proxy(args) {
         return Ok(false);
     }
@@ -359,6 +363,7 @@ fn execute_tclone_host_control_request(
         .args(&request.args)
         .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
         .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
+        .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
         .output()?;
     Ok(TcloneHostControlResponse {
         exit_code: output.status.code(),
@@ -3461,6 +3466,24 @@ mod tests {
             None => env::remove_var("GENSEE_HOME"),
         }
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tclone_host_control_disable_env_skips_proxy() {
+        let old_disabled = env::var_os(TCLONE_HOST_CONTROL_DISABLE_ENV);
+        env::set_var(TCLONE_HOST_CONTROL_DISABLE_ENV, "1");
+
+        let args = vec![
+            OsString::from("run"),
+            OsString::from("fork"),
+            OsString::from("run_1"),
+        ];
+        assert!(!proxy_tclone_host_control_if_needed(&args).unwrap());
+
+        match old_disabled {
+            Some(value) => env::set_var(TCLONE_HOST_CONTROL_DISABLE_ENV, value),
+            None => env::remove_var(TCLONE_HOST_CONTROL_DISABLE_ENV),
+        }
     }
 
     #[test]
