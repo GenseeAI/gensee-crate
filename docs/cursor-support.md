@@ -11,8 +11,10 @@ Build or install `gensee`, then configure the global Cursor hook file:
 GENSEE_HOME="$PWD/.gensee-dev" ./target/debug/gensee setup cursor
 ```
 
-By default this updates `~/.cursor/hooks.json`. Existing unrelated settings are
-preserved, changed files are backed up, and unchanged setup runs do not create
+By default this updates `~/.cursor/hooks.json`. Existing non-Gensee commands,
+including commands registered for the same events, are preserved; stale or
+duplicate Gensee commands are replaced with one current entry. Changed files
+are backed up and written atomically, while unchanged setup runs do not create
 additional backups. Restart Cursor after setup.
 
 The one-line installer can configure Cursor non-interactively:

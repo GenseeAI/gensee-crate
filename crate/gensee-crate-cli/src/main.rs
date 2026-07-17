@@ -1169,36 +1169,9 @@ fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
 }
 
 fn write_vscode_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()> {
-    let mut root = if hooks_path.exists() {
-        let contents = fs::read_to_string(hooks_path)?;
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", hooks_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+    let (existing_contents, mut root) = read_json_config(hooks_path)?;
     apply_vscode_hook_settings(&mut root, command)?;
-
-    if let Some(parent) = hooks_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if hooks_path.exists() {
-        let backup = backup_path(hooks_path)?;
-        fs::copy(hooks_path, &backup)?;
-        println!(
-            "gensee setup: backed up previous hooks to {}",
-            backup.display()
-        );
-    }
-    let serialized = serde_json::to_string_pretty(&root)?;
-    fs::write(hooks_path, format!("{serialized}\n"))?;
+    write_json_config_if_changed(hooks_path, existing_contents.as_deref(), &root, "hooks")?;
     Ok(())
 }
 
@@ -1213,7 +1186,10 @@ pub(crate) fn apply_vscode_hook_settings(root: &mut Value, command: &str) -> io:
         .entry("hooks".to_string())
         .or_insert_with(|| json!({}));
     if !hooks.is_object() {
-        *hooks = json!({});
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VS Code hooks field must be a JSON object",
+        ));
     }
     let hooks_object = hooks.as_object_mut().expect("hooks is an object");
     // VS Code hooks use a flat entry format: each hook is directly
@@ -1226,22 +1202,13 @@ pub(crate) fn apply_vscode_hook_settings(root: &mut Value, command: &str) -> io:
         "timeout": 30
     });
     for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
-        let entries = hooks_object
-            .entry(event_name.to_string())
-            .or_insert_with(|| json!([]));
-        if !entries.is_array() {
-            *entries = json!([]);
-        }
-        let entries = entries.as_array_mut().expect("hook entries are an array");
-        // Replace a previous Gensee entry so rerunning setup is idempotent and
-        // updates changed paths, while preserving unrelated commands.
-        entries.retain(|entry| {
-            !entry
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|existing| existing.ends_with(" hook vscode"))
-        });
-        entries.push(hook_entry.clone());
+        merge_flat_hook_event(
+            hooks_object,
+            event_name,
+            PROVIDER_VSCODE,
+            hook_entry.clone(),
+            "VS Code",
+        )?;
     }
     Ok(())
 }
@@ -1330,49 +1297,9 @@ fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
 }
 
 fn write_cursor_hook_settings(hooks_path: &Path, command: &str) -> io::Result<bool> {
-    let existing_contents = if hooks_path.exists() {
-        Some(fs::read_to_string(hooks_path)?)
-    } else {
-        None
-    };
-    let mut root = if let Some(contents) = existing_contents.as_deref() {
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", hooks_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+    let (existing_contents, mut root) = read_json_config(hooks_path)?;
     apply_cursor_hook_settings(&mut root, command)?;
-
-    let serialized = serde_json::to_string_pretty(&root)?;
-    let updated_contents = format!("{serialized}\n");
-    if existing_contents.as_deref() == Some(updated_contents.as_str()) {
-        return Ok(false);
-    }
-
-    if let Some(parent) = hooks_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    if existing_contents.is_some() {
-        let backup = backup_path(hooks_path)?;
-        fs::copy(hooks_path, &backup)?;
-        println!(
-            "gensee setup: backed up previous hooks to {}",
-            backup.display()
-        );
-    }
-    write_file_atomically(hooks_path, updated_contents.as_bytes())?;
-    Ok(true)
+    write_json_config_if_changed(hooks_path, existing_contents.as_deref(), &root, "hooks")
 }
 
 fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -1408,6 +1335,195 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     result
 }
 
+fn read_json_config(path: &Path) -> io::Result<(Option<String>, Value)> {
+    let existing_contents = if path.exists() {
+        Some(fs::read_to_string(path)?)
+    } else {
+        None
+    };
+    let root = match existing_contents.as_deref() {
+        Some(contents) if contents.trim().is_empty() => json!({}),
+        Some(contents) => serde_json::from_str(contents).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not valid JSON: {err}", path.display()),
+            )
+        })?,
+        None => json!({}),
+    };
+    Ok((existing_contents, root))
+}
+
+fn write_json_config_if_changed(
+    path: &Path,
+    existing_contents: Option<&str>,
+    root: &Value,
+    backup_subject: &str,
+) -> io::Result<bool> {
+    let serialized = serde_json::to_string_pretty(root)?;
+    let updated_contents = format!("{serialized}\n");
+    if existing_contents == Some(updated_contents.as_str()) {
+        return Ok(false);
+    }
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    if existing_contents.is_some() {
+        let backup = backup_path(path)?;
+        fs::copy(path, &backup)?;
+        println!(
+            "gensee setup: backed up previous {backup_subject} to {}",
+            backup.display()
+        );
+    }
+    write_file_atomically(path, updated_contents.as_bytes())?;
+    Ok(true)
+}
+
+fn gensee_hook_command_owned_by(command: &str, provider: &str) -> bool {
+    command.contains("GENSEE_HOME=") && command.trim_end().ends_with(&format!(" hook {provider}"))
+}
+
+fn command_hook_owned_by(entry: &Value, provider: &str, context: &str) -> io::Result<bool> {
+    let object = entry.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{context} hook entry must be a JSON object"),
+        )
+    })?;
+    match object.get("command") {
+        Some(Value::String(command)) => Ok(gensee_hook_command_owned_by(command, provider)),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{context} hook command must be a string"),
+        )),
+        None => Ok(false),
+    }
+}
+
+fn merge_flat_hook_event(
+    hooks: &mut serde_json::Map<String, Value>,
+    event_name: &str,
+    provider: &str,
+    hook_entry: Value,
+    integration: &str,
+) -> io::Result<()> {
+    let entries = hooks
+        .entry(event_name.to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{integration} {event_name} hooks must be a JSON array"),
+            )
+        })?;
+    let context = format!("{integration} {event_name}");
+    let mut owned = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        owned.push(command_hook_owned_by(entry, provider, &context)?);
+    }
+    let insert_at = owned
+        .iter()
+        .position(|is_owned| *is_owned)
+        .unwrap_or(entries.len());
+    let mut index = 0;
+    entries.retain(|_| {
+        let keep = !owned[index];
+        index += 1;
+        keep
+    });
+    entries.insert(insert_at.min(entries.len()), hook_entry);
+    Ok(())
+}
+
+fn validate_nested_hook_groups(
+    entries: &[Value],
+    provider: &str,
+    context: &str,
+) -> io::Result<Vec<Vec<bool>>> {
+    let mut owned = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let group = entry.as_object().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{context} matcher entry must be a JSON object"),
+            )
+        })?;
+        let commands = group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{context} matcher hooks must be a JSON array"),
+                )
+            })?;
+        let mut group_owned = Vec::with_capacity(commands.len());
+        for command in commands {
+            group_owned.push(command_hook_owned_by(command, provider, context)?);
+        }
+        owned.push(group_owned);
+    }
+    Ok(owned)
+}
+
+fn merge_nested_hook_event(
+    hooks: &mut serde_json::Map<String, Value>,
+    event_name: &str,
+    provider: &str,
+    hook_entry: Value,
+    integration: &str,
+) -> io::Result<()> {
+    let entries = hooks
+        .entry(event_name.to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{integration} {event_name} hooks must be a JSON array"),
+            )
+        })?;
+    let context = format!("{integration} {event_name}");
+    let owned = validate_nested_hook_groups(entries, provider, &context)?;
+    let first_owned_group = owned
+        .iter()
+        .position(|group| group.iter().any(|is_owned| *is_owned));
+
+    for (entry, group_owned) in entries.iter_mut().zip(owned.iter()) {
+        let commands = entry
+            .get_mut("hooks")
+            .and_then(Value::as_array_mut)
+            .expect("nested hook groups were validated");
+        let mut index = 0;
+        commands.retain(|_| {
+            let keep = !group_owned[index];
+            index += 1;
+            keep
+        });
+    }
+    let mut group_index = 0;
+    entries.retain(|entry| {
+        let removed_owned_command = owned[group_index].iter().any(|is_owned| *is_owned);
+        group_index += 1;
+        !removed_owned_command
+            || entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|commands| !commands.is_empty())
+    });
+    let insert_at = first_owned_group
+        .unwrap_or(entries.len())
+        .min(entries.len());
+    entries.insert(insert_at, hook_entry);
+    Ok(())
+}
+
 pub(crate) fn apply_cursor_hook_settings(root: &mut Value, command: &str) -> io::Result<()> {
     let root_object = root.as_object_mut().ok_or_else(|| {
         io::Error::new(
@@ -1420,15 +1536,16 @@ pub(crate) fn apply_cursor_hook_settings(root: &mut Value, command: &str) -> io:
         .entry("hooks".to_string())
         .or_insert_with(|| json!({}));
     if !hooks.is_object() {
-        *hooks = json!({});
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Cursor hooks field must be a JSON object",
+        ));
     }
     let hooks_object = hooks.as_object_mut().expect("hooks is an object");
-    let hook_entry = json!([
-        {
-            "command": command,
-            "timeout": 30
-        }
-    ]);
+    let hook_entry = json!({
+        "command": command,
+        "timeout": 30
+    });
     for event_name in [
         "preToolUse",
         "postToolUse",
@@ -1436,7 +1553,13 @@ pub(crate) fn apply_cursor_hook_settings(root: &mut Value, command: &str) -> io:
         "beforeSubmitPrompt",
         "stop",
     ] {
-        hooks_object.insert(event_name.to_string(), hook_entry.clone());
+        merge_flat_hook_event(
+            hooks_object,
+            event_name,
+            PROVIDER_CURSOR,
+            hook_entry.clone(),
+            "Cursor",
+        )?;
     }
     Ok(())
 }
@@ -1509,37 +1632,15 @@ fn write_claude_code_settings(
     command: &str,
     gateway: &ClaudeCodeGatewaySettings,
 ) -> io::Result<()> {
-    let mut root = if settings_path.exists() {
-        let contents = fs::read_to_string(settings_path)?;
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", settings_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+    let (existing_contents, mut root) = read_json_config(settings_path)?;
     apply_claude_code_hook_settings(&mut root, command)?;
     apply_claude_code_gateway_settings(&mut root, gateway)?;
-
-    if let Some(parent) = settings_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if settings_path.exists() {
-        let backup = backup_path(settings_path)?;
-        fs::copy(settings_path, &backup)?;
-        println!(
-            "gensee setup: backed up previous settings to {}",
-            backup.display()
-        );
-    }
-    let serialized = serde_json::to_string_pretty(&root)?;
-    fs::write(settings_path, format!("{serialized}\n"))?;
+    write_json_config_if_changed(
+        settings_path,
+        existing_contents.as_deref(),
+        &root,
+        "settings",
+    )?;
     Ok(())
 }
 
@@ -1598,70 +1699,16 @@ fn apply_claude_code_gateway_settings(
 }
 
 fn write_codex_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()> {
-    let mut root = if hooks_path.exists() {
-        let contents = fs::read_to_string(hooks_path)?;
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", hooks_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+    let (existing_contents, mut root) = read_json_config(hooks_path)?;
     apply_codex_hook_settings(&mut root, command)?;
-
-    if let Some(parent) = hooks_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if hooks_path.exists() {
-        let backup = backup_path(hooks_path)?;
-        fs::copy(hooks_path, &backup)?;
-        println!(
-            "gensee setup: backed up previous hooks to {}",
-            backup.display()
-        );
-    }
-    let serialized = serde_json::to_string_pretty(&root)?;
-    fs::write(hooks_path, format!("{serialized}\n"))?;
+    write_json_config_if_changed(hooks_path, existing_contents.as_deref(), &root, "hooks")?;
     Ok(())
 }
 
 fn write_antigravity_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()> {
-    let mut root = if hooks_path.exists() {
-        let contents = fs::read_to_string(hooks_path)?;
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", hooks_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+    let (existing_contents, mut root) = read_json_config(hooks_path)?;
     apply_antigravity_hook_settings(&mut root, command)?;
-
-    if let Some(parent) = hooks_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if hooks_path.exists() {
-        let backup = backup_path(hooks_path)?;
-        fs::copy(hooks_path, &backup)?;
-        println!(
-            "gensee setup: backed up previous hooks to {}",
-            backup.display()
-        );
-    }
-    let serialized = serde_json::to_string_pretty(&root)?;
-    fs::write(hooks_path, format!("{serialized}\n"))?;
+    write_json_config_if_changed(hooks_path, existing_contents.as_deref(), &root, "hooks")?;
     Ok(())
 }
 
@@ -1676,22 +1723,29 @@ fn apply_claude_code_hook_settings(root: &mut Value, command: &str) -> io::Resul
         .entry("hooks".to_string())
         .or_insert_with(|| json!({}));
     if !hooks.is_object() {
-        *hooks = json!({});
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Claude Code hooks field must be a JSON object",
+        ));
     }
     let hooks_object = hooks.as_object_mut().expect("hooks is an object");
-    let hook_entry = json!([
-        {
-            "matcher": "*",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command
-                }
-            ]
-        }
-    ]);
+    let hook_entry = json!({
+        "matcher": "*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": command
+            }
+        ]
+    });
     for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
-        hooks_object.insert(event_name.to_string(), hook_entry.clone());
+        merge_nested_hook_event(
+            hooks_object,
+            event_name,
+            PROVIDER_CLAUDE_CODE,
+            hook_entry.clone(),
+            "Claude Code",
+        )?;
     }
     Ok(())
 }
@@ -1707,22 +1761,23 @@ fn apply_codex_hook_settings(root: &mut Value, command: &str) -> io::Result<()> 
         .entry("hooks".to_string())
         .or_insert_with(|| json!({}));
     if !hooks.is_object() {
-        *hooks = json!({});
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex hooks field must be a JSON object",
+        ));
     }
     let hooks_object = hooks.as_object_mut().expect("hooks is an object");
-    let hook_entry = json!([
-        {
-            "matcher": "*",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command,
-                    "statusMessage": "Checking Gensee policy",
-                    "timeout": 30
-                }
-            ]
-        }
-    ]);
+    let hook_entry = json!({
+        "matcher": "*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "statusMessage": "Checking Gensee policy",
+                "timeout": 30
+            }
+        ]
+    });
     for event_name in [
         "UserPromptSubmit",
         "PreToolUse",
@@ -1730,7 +1785,13 @@ fn apply_codex_hook_settings(root: &mut Value, command: &str) -> io::Result<()> 
         "PostToolUse",
         "Stop",
     ] {
-        hooks_object.insert(event_name.to_string(), hook_entry.clone());
+        merge_nested_hook_event(
+            hooks_object,
+            event_name,
+            PROVIDER_CODEX,
+            hook_entry.clone(),
+            "Codex",
+        )?;
     }
     Ok(())
 }
@@ -1742,42 +1803,45 @@ fn apply_antigravity_hook_settings(root: &mut Value, command: &str) -> io::Resul
             "Antigravity hooks must be a JSON object",
         )
     })?;
-    root_object.insert(
-        "gensee-policy".to_string(),
+    let policy = root_object
+        .entry("gensee-policy".to_string())
+        .or_insert_with(|| json!({}));
+    let policy = policy.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Antigravity gensee-policy field must be a JSON object",
+        )
+    })?;
+    let nested_hook_entry = json!({
+        "matcher": "*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "timeout": 30
+            }
+        ]
+    });
+    for event_name in ["PreToolUse", "PostToolUse"] {
+        merge_nested_hook_event(
+            policy,
+            event_name,
+            PROVIDER_ANTIGRAVITY,
+            nested_hook_entry.clone(),
+            "Antigravity",
+        )?;
+    }
+    merge_flat_hook_event(
+        policy,
+        "PreInvocation",
+        PROVIDER_ANTIGRAVITY,
         json!({
-            "PreToolUse": [
-                {
-                    "matcher": "*",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": command,
-                            "timeout": 30
-                        }
-                    ]
-                }
-            ],
-            "PostToolUse": [
-                {
-                    "matcher": "*",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": command,
-                            "timeout": 30
-                        }
-                    ]
-                }
-            ],
-            "PreInvocation": [
-                {
-                    "type": "command",
-                    "command": command,
-                    "timeout": 30
-                }
-            ]
+            "type": "command",
+            "command": command,
+            "timeout": 30
         }),
-    );
+        "Antigravity",
+    )?;
     Ok(())
 }
 

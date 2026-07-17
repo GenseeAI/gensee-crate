@@ -20,9 +20,10 @@ cargo build -p gensee-crate-cli
 GENSEE_HOME="$PWD/.gensee-dev" ./target/debug/gensee setup vscode
 ```
 
-The setup command writes `~/.copilot/hooks/gensee.json`, preserves unrelated
-hook entries, backs up an existing file, and prints the exact command it
-installed. VS Code reloads hook files automatically when they are saved.
+The setup command writes `~/.copilot/hooks/gensee.json`, preserves non-Gensee
+hook entries in the same events, and replaces stale or duplicate Gensee
+entries. Changed files are backed up and written atomically; unchanged setup
+runs do not rewrite them. VS Code reloads hook files automatically when saved.
 
 The one-line installer also supports an explicit VS Code toggle:
 

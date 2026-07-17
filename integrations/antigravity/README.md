@@ -13,7 +13,10 @@ GENSEE_HOME="$PWD/.gensee-dev" ./target/debug/gensee setup antigravity
 The setup command writes the global Antigravity hook file at
 `~/.gemini/config/hooks.json` by default. Use
 `--hooks /path/to/workspace/.agents/hooks.json` only when a project needs a
-workspace-local hook definition.
+workspace-local hook definition. Existing non-Gensee commands in Gensee's
+managed events are preserved, while stale or duplicate Gensee commands are
+replaced. Changed files are backed up and written atomically; unchanged setup
+runs do not rewrite them.
 
 ## What Gensee Protects
 

@@ -258,7 +258,22 @@ fn claude_code_setup_preserves_settings_and_sets_hooks() {
     let mut settings = json!({
         "theme": "dark",
         "hooks": {
-            "PreToolUse": [{"matcher": "old"}],
+            "PreToolUse": [
+                {
+                    "matcher": "old",
+                    "hooks": [
+                        {"type": "command", "command": "./existing.sh"},
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook claude-code"
+                        },
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/duplicate /duplicate/gensee hook claude-code"
+                        }
+                    ]
+                }
+            ],
             "Unrelated": [{"matcher": "keep"}]
         }
     });
@@ -271,11 +286,30 @@ fn claude_code_setup_preserves_settings_and_sets_hooks() {
 
     assert_eq!(settings["theme"], json!("dark"));
     assert_eq!(settings["hooks"]["Unrelated"][0]["matcher"], json!("keep"));
+    assert!(settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .any(|hook| hook["command"] == json!("./existing.sh")));
     for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
         assert_eq!(settings["hooks"][event_name][0]["matcher"], json!("*"));
         assert_eq!(
             settings["hooks"][event_name][0]["hooks"][0]["command"],
             json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code")
+        );
+        assert_eq!(
+            settings["hooks"][event_name]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|group| group["hooks"].as_array().unwrap())
+                .filter(|hook| hook["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("GENSEE_HOME=")
+                        && command.ends_with(" hook claude-code")))
+                .count(),
+            1
         );
     }
 }
@@ -418,7 +452,18 @@ fn claude_code_hook_command_quotes_paths_with_spaces() {
 fn codex_setup_preserves_hooks_and_sets_gensee_hooks() {
     let mut settings = json!({
         "hooks": {
-            "PreToolUse": [{"matcher": "old"}],
+            "PreToolUse": [
+                {
+                    "matcher": "old",
+                    "hooks": [
+                        {"type": "command", "command": "./existing.sh"},
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook codex"
+                        }
+                    ]
+                }
+            ],
             "Unrelated": [{"matcher": "keep"}]
         }
     });
@@ -430,6 +475,12 @@ fn codex_setup_preserves_hooks_and_sets_gensee_hooks() {
     .unwrap();
 
     assert_eq!(settings["hooks"]["Unrelated"][0]["matcher"], json!("keep"));
+    assert!(settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .any(|hook| hook["command"] == json!("./existing.sh")));
     for event_name in [
         "UserPromptSubmit",
         "PreToolUse",
@@ -449,6 +500,19 @@ fn codex_setup_preserves_hooks_and_sets_gensee_hooks() {
         assert_eq!(
             settings["hooks"][event_name][0]["hooks"][0]["timeout"],
             json!(30)
+        );
+        assert_eq!(
+            settings["hooks"][event_name]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|group| group["hooks"].as_array().unwrap())
+                .filter(|hook| hook["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("GENSEE_HOME=")
+                        && command.ends_with(" hook codex")))
+                .count(),
+            1
         );
     }
 }
@@ -471,7 +535,19 @@ fn cursor_setup_adds_version_and_hooks_preserving_existing() {
     let mut settings = json!({
         "version": 1,
         "hooks": {
-            "afterFileEdit": [{ "command": "./format.sh" }]
+            "afterFileEdit": [{ "command": "./format.sh" }],
+            "preToolUse": [
+                {"command": "./existing-security-check.sh"},
+                {"command": "./wrapper hook cursor"},
+                {
+                    "command": "GENSEE_HOME=/old /old/gensee hook cursor",
+                    "timeout": 10
+                },
+                {
+                    "command": "GENSEE_HOME=/duplicate /duplicate/gensee hook cursor",
+                    "timeout": 10
+                }
+            ]
         }
     });
 
@@ -494,12 +570,55 @@ fn cursor_setup_adds_version_and_hooks_preserving_existing() {
         "beforeSubmitPrompt",
         "stop",
     ] {
+        let entries = settings["hooks"][event_name].as_array().unwrap();
+        let gensee_entries = entries
+            .iter()
+            .filter(|entry| {
+                entry["command"].as_str().is_some_and(|command| {
+                    command.contains("GENSEE_HOME=") && command.ends_with(" hook cursor")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(gensee_entries.len(), 1);
         assert_eq!(
-            settings["hooks"][event_name][0]["command"],
+            gensee_entries[0]["command"],
             json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook cursor")
         );
-        assert_eq!(settings["hooks"][event_name][0]["timeout"], json!(30));
+        assert_eq!(gensee_entries[0]["timeout"], json!(30));
     }
+    assert!(settings["hooks"]["preToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["command"] == json!("./existing-security-check.sh")));
+    assert!(settings["hooks"]["preToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["command"] == json!("./wrapper hook cursor")));
+}
+
+#[test]
+fn hook_setup_rejects_malformed_structures_instead_of_replacing_them() {
+    let mut claude = json!({"hooks": []});
+    assert!(apply_claude_code_hook_settings(&mut claude, "gensee hook claude-code").is_err());
+    assert_eq!(claude["hooks"], json!([]));
+
+    let mut codex = json!({"hooks": {"PreToolUse": {}}});
+    assert!(apply_codex_hook_settings(&mut codex, "gensee hook codex").is_err());
+    assert_eq!(codex["hooks"]["PreToolUse"], json!({}));
+
+    let mut antigravity = json!({"gensee-policy": []});
+    assert!(apply_antigravity_hook_settings(&mut antigravity, "gensee hook antigravity").is_err());
+    assert_eq!(antigravity["gensee-policy"], json!([]));
+
+    let mut vscode = json!({"hooks": {"PostToolUse": {}}});
+    assert!(apply_vscode_hook_settings(&mut vscode, "gensee hook vscode").is_err());
+    assert_eq!(vscode["hooks"]["PostToolUse"], json!({}));
+
+    let mut cursor = json!({"hooks": []});
+    assert!(apply_cursor_hook_settings(&mut cursor, "gensee hook cursor").is_err());
+    assert_eq!(cursor["hooks"], json!([]));
 }
 
 #[test]
@@ -858,6 +977,28 @@ fn antigravity_setup_preserves_hooks_and_sets_gensee_hook() {
                     ]
                 }
             ]
+        },
+        "gensee-policy": {
+            "PreToolUse": [
+                {
+                    "matcher": "existing",
+                    "hooks": [
+                        {"type": "command", "command": "./existing-policy.sh"},
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook antigravity"
+                        }
+                    ]
+                }
+            ],
+            "PreInvocation": [
+                {"type": "command", "command": "./existing-invocation.sh"},
+                {
+                    "type": "command",
+                    "command": "GENSEE_HOME=/old /old/gensee hook antigravity"
+                }
+            ],
+            "CustomEvent": [{"command": "./custom.sh"}]
         }
     });
 
@@ -871,6 +1012,12 @@ fn antigravity_setup_preserves_hooks_and_sets_gensee_hook() {
         settings["existing-hook"]["PreToolUse"][0]["hooks"][0]["command"],
         json!("./existing.sh")
     );
+    assert!(settings["gensee-policy"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .any(|hook| hook["command"] == json!("./existing-policy.sh")));
     assert_eq!(
         settings["gensee-policy"]["PreToolUse"][0]["hooks"][0]["command"],
         json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook antigravity")
@@ -880,8 +1027,16 @@ fn antigravity_setup_preserves_hooks_and_sets_gensee_hook() {
         json!(30)
     );
     assert_eq!(
-        settings["gensee-policy"]["PreInvocation"][0]["command"],
+        settings["gensee-policy"]["PreInvocation"][1]["command"],
         json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook antigravity")
+    );
+    assert_eq!(
+        settings["gensee-policy"]["PreInvocation"][0]["command"],
+        json!("./existing-invocation.sh")
+    );
+    assert_eq!(
+        settings["gensee-policy"]["CustomEvent"][0]["command"],
+        json!("./custom.sh")
     );
 }
 
@@ -1067,7 +1222,17 @@ fn antigravity_native_file_tool_paths_become_policy_subjects() {
 fn vscode_setup_adds_hooks_in_flat_format_preserving_existing() {
     let mut settings = json!({
         "hooks": {
-            "PostToolUse": [{ "type": "command", "command": "./format.sh" }]
+            "PostToolUse": [
+                { "type": "command", "command": "./format.sh" },
+                {
+                    "type": "command",
+                    "command": "GENSEE_HOME=/old /old/gensee hook vscode"
+                },
+                {
+                    "type": "command",
+                    "command": "GENSEE_HOME=/duplicate /duplicate/gensee hook vscode"
+                }
+            ]
         }
     });
 
