@@ -808,6 +808,12 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         )),
         OsString::from("-e"),
         OsString::from("TERM=xterm-256color"),
+        OsString::from("-v"),
+        OsString::from(format!(
+            "{}:{}:rw",
+            host_control_dir.display(),
+            container_workspace_host_control_dir
+        )),
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
