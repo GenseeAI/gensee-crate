@@ -20,6 +20,8 @@ const TCLONE_HOST_CONTROL_DIR_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DIR";
 const TCLONE_HOST_CONTROL_DISABLE_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DISABLE";
 const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
 const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
+const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
+const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
@@ -448,6 +450,10 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     let container_host_control_socket = format!("{container_host_control_dir}/control.sock");
     let container_workspace_host_control_dir =
         format!("{container_workspace}/{TCLONE_HOST_CONTROL_WORKSPACE_DIR}");
+    if let Some((socket, target)) = infer_host_tmux_context() {
+        env::set_var(TCLONE_HOST_TMUX_SOCKET_ENV, socket);
+        env::set_var(TCLONE_HOST_TMUX_TARGET_ENV, target);
+    }
     let _host_control = TcloneHostControlServer::start(&host_control_socket, &host_control_dir)?;
 
     let agent_binary = config.agent_cmd[0].to_string_lossy().to_string();
@@ -1140,6 +1146,93 @@ fn parse_host_tmux_placement(value: &str) -> io::Result<HostTmuxPlacement> {
     }
 }
 
+fn infer_host_tmux_context() -> Option<(String, String)> {
+    if let (Some(socket), Some(target)) = (
+        env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV),
+        env::var_os(TCLONE_HOST_TMUX_TARGET_ENV),
+    ) {
+        return Some((
+            socket.to_string_lossy().to_string(),
+            target.to_string_lossy().to_string(),
+        ));
+    }
+    if env::var_os("TMUX").is_some() {
+        return None;
+    }
+    let tty = current_tty_path()?;
+    for socket in host_tmux_socket_candidates() {
+        if let Some(target) = tmux_pane_for_tty(&socket, &tty) {
+            return Some((socket.to_string_lossy().to_string(), target));
+        }
+    }
+    None
+}
+
+fn current_tty_path() -> Option<String> {
+    let output = Command::new("tty").stdin(Stdio::inherit()).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if tty.is_empty() || tty == "not a tty" {
+        None
+    } else {
+        Some(tty)
+    }
+}
+
+fn host_tmux_socket_candidates() -> Vec<PathBuf> {
+    let Some(uid) = env::var_os("SUDO_UID").or_else(|| current_uid_string().map(OsString::from))
+    else {
+        return Vec::new();
+    };
+    let root = PathBuf::from(format!("/tmp/tmux-{}", uid.to_string_lossy()));
+    let mut candidates = vec![root.join("default")];
+    if let Ok(entries) = fs::read_dir(&root) {
+        candidates.extend(entries.flatten().map(|entry| entry.path()));
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn current_uid_string() -> Option<String> {
+    let output = Command::new("id").arg("-u").output().ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn tmux_pane_for_tty(socket: &Path, tty: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .arg("-S")
+        .arg(socket)
+        .arg("list-panes")
+        .arg("-a")
+        .arg("-F")
+        .arg("#{pane_tty}\t#{pane_id}")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .find_map(|(pane_tty, pane_id)| {
+            if pane_tty == tty {
+                Some(pane_id.to_string())
+            } else {
+                None
+            }
+        })
+}
+
 fn open_tclone_attach_in_host_tmux(target: &str, placement: HostTmuxPlacement) -> io::Result<()> {
     ensure_host_tmux_available()?;
     open_tclone_attach_in_host_tmux_after_preflight(target, placement)
@@ -1155,10 +1248,13 @@ fn open_tclone_attach_in_host_tmux_after_preflight(
 }
 
 fn ensure_host_tmux_available() -> io::Result<()> {
-    if env::var_os("TMUX").is_none() {
+    if env::var_os("TMUX").is_none()
+        && (env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV).is_none()
+            || env::var_os(TCLONE_HOST_TMUX_TARGET_ENV).is_none())
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "tmux attach requested but TMUX is not set; run from inside tmux and preserve TMUX through sudo",
+            "tmux attach requested but no host tmux context was found; run from inside tmux or preserve TMUX through sudo",
         ));
     }
     if find_command("tmux").is_none() {
@@ -1176,7 +1272,13 @@ fn open_host_tmux_pane(command: &str, placement: HostTmuxPlacement) -> io::Resul
         HostTmuxPlacement::Below => "-v",
     };
     let mut tmux = Command::new("tmux");
+    if let Some(socket) = env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV) {
+        tmux.arg("-S").arg(socket);
+    }
     tmux.arg("split-window").arg(split_flag);
+    if let Some(target) = env::var_os(TCLONE_HOST_TMUX_TARGET_ENV) {
+        tmux.arg("-t").arg(target);
+    }
     if let Ok(cwd) = env::current_dir() {
         tmux.arg("-c").arg(cwd);
     }
@@ -1220,6 +1322,8 @@ const TCLONE_HOST_TMUX_ENV_KEYS: &[&str] = &[
     "GENSEE_TCLONE_NODE_ROOT",
     "GENSEE_TCLONE_NODE_BIN",
     "GENSEE_TCLONE_READY_TIMEOUT_SECS",
+    TCLONE_HOST_TMUX_SOCKET_ENV,
+    TCLONE_HOST_TMUX_TARGET_ENV,
     "TERM",
 ];
 
