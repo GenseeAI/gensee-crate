@@ -110,6 +110,50 @@ fn telemetry_policy_event_does_not_create_upload_artifacts_on_hook_path() {
 }
 
 #[test]
+fn telemetry_records_vscode_file_tool_schema_drift() {
+    let _guard = telemetry_test_lock();
+    let root = telemetry_test_root("vscode-schema-drift");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    env::set_var("GENSEE_HOME", &root);
+    env::set_var("GENSEE_TELEMETRY_REMOTE", "0");
+
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-session",
+        "tool_name": "moveFileV2",
+        "tool_input": { "filePath": "/workspace/src/target.ts" },
+        "tool_use_id": "tool-1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    telemetry_record_policy_event(&event, &decision, &[]);
+
+    let events = fs::read_to_string(root.join("telemetry-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let drift = events
+        .iter()
+        .find(|event| event["event_name"] == json!("hook_schema_drift"))
+        .expect("schema drift should emit a dedicated telemetry event");
+    assert_eq!(drift["props"]["provider"], json!(PROVIDER_VSCODE));
+    assert_eq!(
+        drift["props"]["rule_id"],
+        json!("policy_unparsed_vscode_file_tool")
+    );
+
+    env::remove_var("GENSEE_TELEMETRY_REMOTE");
+    env::remove_var("GENSEE_HOME");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn telemetry_defaults_remote_upload_off_during_tests() {
     let _guard = telemetry_test_lock();
     let root = telemetry_test_root("test-defaults");
@@ -597,6 +641,400 @@ fn antigravity_native_file_tool_paths_become_policy_subjects() {
     assert_eq!(subjects[0].source, "antigravity_tool");
     assert_eq!(subjects[0].operation, "write");
     assert_eq!(subjects[0].path, "/tmp/gensee-outside.txt");
+}
+
+#[test]
+fn vscode_setup_adds_hooks_in_flat_format_preserving_existing() {
+    let mut settings = json!({
+        "hooks": {
+            "PostToolUse": [{ "type": "command", "command": "./format.sh" }]
+        }
+    });
+
+    apply_vscode_hook_settings(
+        &mut settings,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook vscode",
+    )
+    .unwrap();
+
+    // Unrelated hook entry in the same event must survive.
+    assert_eq!(
+        settings["hooks"]["PostToolUse"][0]["command"],
+        json!("./format.sh")
+    );
+    for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
+        let gensee_entry = settings["hooks"][event_name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| {
+                entry["command"]
+                    == json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook vscode")
+            })
+            .unwrap();
+        // Flat format: each entry is { "type": "command", "command": "...", "timeout": 30 }
+        // NOT nested like Claude Code ({ "matcher": "*", "hooks": [{ ... }] }).
+        assert_eq!(
+            gensee_entry["type"],
+            json!("command"),
+            "flat type field for {event_name}"
+        );
+        assert_eq!(
+            gensee_entry["command"],
+            json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook vscode")
+        );
+        assert_eq!(gensee_entry["timeout"], json!(30));
+        // No nested hooks array (Claude Code style).
+        assert!(
+            gensee_entry.get("hooks").is_none(),
+            "flat format must not have nested hooks array for {event_name}"
+        );
+    }
+
+    // Rerunning setup replaces the Gensee command instead of duplicating it.
+    apply_vscode_hook_settings(
+        &mut settings,
+        "GENSEE_HOME=/new/store /opt/gensee hook vscode",
+    )
+    .unwrap();
+    for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
+        let entries = settings["hooks"][event_name].as_array().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["command"]
+                    .as_str()
+                    .is_some_and(|command| command.ends_with(" hook vscode")))
+                .count(),
+            1
+        );
+        assert!(entries.iter().any(
+            |entry| entry["command"] == json!("GENSEE_HOME=/new/store /opt/gensee hook vscode")
+        ));
+    }
+}
+
+#[test]
+fn vscode_hook_command_quotes_paths_with_spaces() {
+    let command = vscode_hook_command(
+        Path::new("/Users/example/Gensee Store"),
+        Path::new("/Applications/Gensee Crate/gensee"),
+    );
+
+    assert_eq!(
+        command,
+        "GENSEE_HOME='/Users/example/Gensee Store' '/Applications/Gensee Crate/gensee' hook vscode"
+    );
+}
+
+#[test]
+fn vscode_default_hooks_path_is_copilot_hooks_dir() {
+    let path = default_vscode_hooks_path().unwrap();
+    assert!(
+        path.ends_with(".copilot/hooks/gensee.json"),
+        "unexpected path: {}",
+        path.display()
+    );
+}
+
+#[test]
+fn vscode_hook_event_parses_pretool_run_in_terminal() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vsc-sess-1",
+        "tool_name": "runInTerminal",
+        "tool_input": { "command": "npm test" },
+        "tool_use_id": "use-1",
+        "cwd": "/project",
+        "transcript_path": "/tmp/transcript.jsonl"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    assert_eq!(event.provider, PROVIDER_VSCODE);
+    assert_eq!(event.hook_event_name.as_deref(), Some("PreToolUse"));
+    assert_eq!(event.session_id.as_deref(), Some("vsc-sess-1"));
+    assert_eq!(event.tool_name.as_deref(), Some("runInTerminal"));
+    assert_eq!(event.tool_input_command.as_deref(), Some("npm test"));
+    assert_eq!(event.cwd.as_deref(), Some("/project"));
+    assert_eq!(original_bash_command(&payload).as_deref(), Some("npm test"));
+}
+
+#[test]
+fn vscode_hook_event_parses_documented_run_terminal_command() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vsc-sess-current",
+        "tool_name": "runTerminalCommand",
+        "tool_input": { "command": "cargo test" },
+        "tool_use_id": "use-current",
+        "cwd": "/project"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    assert_eq!(event.tool_name.as_deref(), Some("runTerminalCommand"));
+    assert_eq!(event.tool_input_command.as_deref(), Some("cargo test"));
+    assert_eq!(
+        original_bash_command(&payload).as_deref(),
+        Some("cargo test")
+    );
+    assert_eq!(
+        file_intents_from_hook(&event, Some("touch /tmp/vscode-current"))[0].path,
+        "/tmp/vscode-current"
+    );
+}
+
+#[test]
+fn vscode_hook_event_parses_pretool_edit_files() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vsc-sess-2",
+        "tool_name": "editFiles",
+        "tool_input": { "files": ["src/auth.ts", "src/utils.ts"] },
+        "tool_use_id": "use-2",
+        "cwd": "/project"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    assert_eq!(event.tool_name.as_deref(), Some("editFiles"));
+    // editFiles has no shell command to extract.
+    assert_eq!(event.tool_input_command, None);
+}
+
+#[test]
+fn vscode_pretool_emits_hookspecificoutput_identical_to_claude_code() {
+    // VS Code PreToolUse output format is identical to Claude Code.
+    let allow = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+    let claude = decision_json_for_provider(&allow, PROVIDER_CLAUDE_CODE, "PreToolUse");
+    let vscode = decision_json_for_provider(&allow, PROVIDER_VSCODE, "PreToolUse");
+    assert_eq!(
+        claude, vscode,
+        "VS Code and Claude Code PreToolUse output must be identical"
+    );
+}
+
+#[test]
+fn vscode_pretool_deny_contains_permission_decision() {
+    let block = PolicyDecision {
+        action: PolicyAction::Block,
+        findings: vec![PolicyFinding {
+            action: PolicyAction::Block,
+            severity: "high".to_string(),
+            rule_id: "policy_write_outside_workspace".to_string(),
+            message: "Write outside workspace".to_string(),
+            path: Some("/etc/passwd".to_string()),
+            evidence: json!({}),
+        }],
+    };
+    let output = decision_json_for_provider(&block, PROVIDER_VSCODE, "PreToolUse")
+        .expect("Block should produce output");
+    let parsed: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(
+        parsed["hookSpecificOutput"]["permissionDecision"],
+        json!("deny")
+    );
+    assert_eq!(
+        parsed["hookSpecificOutput"]["hookEventName"],
+        json!("PreToolUse")
+    );
+}
+
+#[test]
+fn vscode_userpromptsubmit_poison_json_uses_system_message() {
+    let output = vscode_userpromptsubmit_poison_json();
+    let parsed: Value = serde_json::from_str(&output).unwrap();
+    // Non-blocking.
+    assert_eq!(parsed["continue"], json!(true));
+    // systemMessage is shown to the user in chat — more visible than
+    // Claude Code's model-only additionalContext.
+    assert!(
+        parsed["systemMessage"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "systemMessage must be non-empty: {parsed}"
+    );
+    // Must NOT use the Claude Code envelope (would be ignored by VS Code).
+    assert!(parsed.get("hookSpecificOutput").is_none());
+}
+
+#[test]
+fn vscode_native_subjects_parse_edit_files_array() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "editFiles",
+        "tool_input": { "files": ["/workspace/src/auth.ts", "/workspace/src/utils.ts"] },
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+    let subjects = native_policy_subjects(&event);
+
+    assert_eq!(subjects.len(), 2);
+    assert!(subjects.iter().all(|s| s.operation == "edit"));
+    assert!(subjects.iter().any(|s| s.path == "/workspace/src/auth.ts"));
+    assert!(subjects.iter().any(|s| s.path == "/workspace/src/utils.ts"));
+}
+
+#[test]
+fn vscode_native_subjects_parse_single_file_tools() {
+    for (tool_name, expected_op) in [
+        ("create_file", "write"),
+        ("createFile", "write"),
+        ("replace_string_in_file", "write"),
+        ("replaceStringInFile", "write"),
+        ("read_file", "read"),
+        ("readFile", "read"),
+        ("delete_file", "delete"),
+        ("deleteFile", "delete"),
+    ] {
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "tool_name": tool_name,
+            "tool_input": { "filePath": "/workspace/src/target.ts" },
+            "tool_use_id": "u1",
+            "cwd": "/workspace"
+        })
+        .to_string();
+        let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+        let subjects = native_policy_subjects(&event);
+        assert_eq!(subjects.len(), 1, "expected 1 subject for {tool_name}");
+        assert_eq!(
+            subjects[0].operation, expected_op,
+            "wrong operation for {tool_name}"
+        );
+        assert_eq!(subjects[0].path, "/workspace/src/target.ts");
+    }
+}
+
+#[test]
+fn vscode_runtime_read_file_uses_path_policy() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "read_file",
+        "tool_input": {
+            "filePath": "/etc/passwd",
+            "startLine": 1,
+            "endLine": 20
+        },
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert_eq!(decision.action, PolicyAction::Block);
+    assert!(decision
+        .findings
+        .iter()
+        .any(|finding| finding.path.as_deref() == Some("/etc/passwd")));
+    assert!(!decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool"));
+}
+
+#[test]
+fn vscode_unknown_file_tool_fails_closed() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "moveFileV2",
+        "tool_input": { "filePath": "/workspace/src/target.ts" },
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert_eq!(decision.action, PolicyAction::Ask);
+    let finding = decision
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool")
+        .expect("unknown file-shaped tool should fail closed");
+    assert_eq!(finding.action, PolicyAction::Ask);
+    assert_eq!(finding.severity, "high");
+    assert_eq!(finding.evidence["tool_name"], json!("moveFileV2"));
+}
+
+#[test]
+fn vscode_malformed_known_file_tool_fails_closed() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "createFile",
+        "tool_input": { "filePath": { "unexpected": "shape" } },
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert_eq!(decision.action, PolicyAction::Ask);
+    assert!(decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool"));
+}
+
+#[test]
+fn vscode_known_file_tool_with_missing_input_fails_closed() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "deleteFile",
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert_eq!(decision.action, PolicyAction::Ask);
+    assert!(decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool"));
+}
+
+#[test]
+fn vscode_unknown_non_file_tool_does_not_trigger_file_drift_guard() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "tool_name": "searchWorkspaceSymbols",
+        "tool_input": { "query": "PolicyDecision" },
+        "tool_use_id": "u1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_VSCODE).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert!(!decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool"));
 }
 
 #[test]

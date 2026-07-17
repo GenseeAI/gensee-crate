@@ -312,6 +312,10 @@ pub(crate) fn build_hook_event(payload: &str, provider: &str) -> io::Result<Agen
         return build_antigravity_hook_event(value, observed_at_ms);
     }
 
+    if provider == PROVIDER_VSCODE {
+        return build_vscode_hook_event(value, observed_at_ms);
+    }
+
     let hook_event_name = v_str(&value, "hook_event_name");
     let top_level_permission_command = hook_event_name
         .as_deref()
@@ -421,6 +425,41 @@ fn build_antigravity_hook_event(value: Value, observed_at_ms: u64) -> io::Result
     })
 }
 
+/// Build an `AgentHookEvent` from a VS Code / GitHub Copilot hook payload.
+/// VS Code uses PascalCase event names (same as Claude Code) and the same
+/// `session_id` / `cwd` / `hook_event_name` field names, so the only notable
+/// difference from Claude Code parsing is that VS Code's shell tools are named
+/// `runTerminalCommand` or `runInTerminal` (not `Bash`) and `tool_response` is
+/// a flat string (not a nested object with stdout/stderr).
+fn build_vscode_hook_event(value: Value, observed_at_ms: u64) -> io::Result<AgentHookEvent> {
+    let hook_event_name = v_str(&value, "hook_event_name");
+    let tool_input_command = v_nested_str(&value, "tool_input", "command");
+    let tool_name = v_str(&value, "tool_name");
+
+    Ok(AgentHookEvent {
+        provider: PROVIDER_VSCODE.to_string(),
+        session_id: v_str(&value, "session_id")
+            .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok()),
+        hook_event_name,
+        cwd: v_str(&value, "cwd").or_else(current_dir_string),
+        transcript_path: v_str(&value, "transcript_path"),
+        tool_name,
+        tool_use_id: v_str(&value, "tool_use_id"),
+        tool_input_command,
+        tool_input_description: v_nested_str(&value, "tool_input", "description"),
+        // VS Code's PostToolUse sends tool_response as a flat string, not a
+        // nested object, so stdout/stderr are unavailable via this hook.
+        tool_response_stdout: None,
+        tool_response_stderr: None,
+        tool_response_interrupted: None,
+        duration_ms: find_first(&value, &["duration_ms"]).and_then(Value::as_u64),
+        permission_mode: v_str(&value, "permission_mode"),
+        effort_level: find_first_str(&value, &["level"]),
+        observed_at_ms,
+        raw_json: serde_json::to_string(&value).map_err(io::Error::other)?,
+    })
+}
+
 fn antigravity_event_name(value: &Value) -> Option<String> {
     if let Some(name) = v_str(value, "hookEventName").or_else(|| v_str(value, "hook_event_name")) {
         return Some(name);
@@ -451,7 +490,10 @@ pub(crate) fn file_intents_from_hook(
     event: &AgentHookEvent,
     original_command: Option<&str>,
 ) -> Vec<FileIntent> {
-    if !matches!(event.tool_name.as_deref(), Some("Bash" | "run_command")) {
+    if !matches!(
+        event.tool_name.as_deref(),
+        Some("Bash" | "run_command" | "runInTerminal" | "runTerminalCommand")
+    ) {
         return Vec::new();
     }
 
@@ -500,7 +542,10 @@ pub(crate) fn original_bash_command(payload: &str) -> Option<String> {
     {
         return Some(command.to_string());
     }
-    if v_str(&value, "tool_name").as_deref() == Some("Bash") {
+    if matches!(
+        v_str(&value, "tool_name").as_deref(),
+        Some("Bash") | Some("runInTerminal") | Some("runTerminalCommand")
+    ) {
         return v_nested_str(&value, "tool_input", "command");
     }
     if v_str(&value, "hook_event_name").as_deref() == Some("PermissionRequest") {

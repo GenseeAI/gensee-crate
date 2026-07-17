@@ -62,6 +62,7 @@ interface ToolCall {
   startTs:     number;
   endTs:       number | null;
   duration:    number | null;
+  durationSource: 'reported' | 'elapsed' | null;
   input:       Record<string, unknown> | null;
   response:    Record<string, unknown> | null;
   detail:      string | null;   // short label (query, filename, url…)
@@ -110,12 +111,23 @@ export function buildToolCalls(events: AgentEvent[]): ToolCall[] {
     const input = parseJson(pre.tool_input);
     const resp  = post ? parseJson(post.tool_response) : null;
     const det   = extractDetail(input);
+    const reportedDuration = typeof resp?.duration_ms === 'number'
+      ? resp.duration_ms
+      : null;
+    const elapsedDuration = post && post.ts >= pre.ts
+      ? post.ts - pre.ts
+      : null;
     calls.push({
       id,
       toolName:   pre.tool_name ?? '(unknown)',
       startTs:    pre.ts,
       endTs:      post?.ts ?? null,
-      duration:   (resp?.duration_ms as number | undefined) ?? null,
+      duration:   reportedDuration ?? elapsedDuration,
+      durationSource: reportedDuration !== null
+        ? 'reported'
+        : elapsedDuration !== null
+          ? 'elapsed'
+          : null,
       input,
       response:   resp,
       detail:     det?.label   ?? null,
@@ -387,8 +399,9 @@ function CallRow({
 }) {
   const [open, setOpen] = useState(false);
   const barLeft  = Math.round(((call.startTs - minTs) / span) * TRACK_W);
-  // Use duration_ms (actual tool execution time) for bar width — NOT
-  // endTs - startTs, which includes LLM thinking time between hook events.
+  // Prefer provider-reported duration_ms. When a provider omits it (VS Code),
+  // use PreToolUse -> PostToolUse elapsed time; that fallback may include time
+  // spent waiting for user approval, so the text label marks it as approximate.
   const barWidth = call.duration !== null
     ? Math.max(BAR_MIN, Math.round((call.duration / span) * TRACK_W))
     : BAR_MIN;
@@ -461,8 +474,13 @@ function CallRow({
         <Typography.Text
           type="secondary"
           style={{ fontSize: 11, textAlign: 'right' }}
+          title={call.durationSource === 'elapsed'
+            ? 'Elapsed from PreToolUse to PostToolUse; may include approval wait'
+            : undefined}
         >
-          {call.duration !== null ? `${call.duration} ms` : ''}
+          {call.duration !== null
+            ? `${call.durationSource === 'elapsed' ? '~' : ''}${call.duration} ms`
+            : ''}
         </Typography.Text>
 
         {/* Col 7 — Timeline track */}
@@ -498,11 +516,16 @@ function CallRow({
 function ExpandedDetail({ call }: { call: ToolCall }) {
   const hasInput    = call.input    && Object.keys(call.input).length > 0;
   const hasResponse = call.response && Object.keys(call.response).length > 0;
-  if (!hasInput && !hasResponse) return null;
+  const hasTiming   = call.duration !== null;
+  if (!hasInput && !hasResponse && !hasTiming) return null;
 
   // Build a concise response summary (avoid dumping huge stdout).
   const respLines: string[] = [];
-  if (call.duration !== null) respLines.push(`${call.duration} ms`);
+  if (call.duration !== null) {
+    respLines.push(call.durationSource === 'elapsed'
+      ? `elapsed: ~${call.duration} ms (may include approval wait)`
+      : `duration: ${call.duration} ms`);
+  }
   if (call.response) {
     const { stdout, stderr, interrupted } = call.response as Record<string, unknown>;
     if (typeof stdout === 'string' && stdout)
