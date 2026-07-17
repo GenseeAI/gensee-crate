@@ -90,14 +90,14 @@ pub(crate) fn run_cli() -> io::Result<()> {
         .first()
         .and_then(|arg| arg.to_str())
         .map(ToString::to_string);
+    if proxy_tclone_host_control_if_needed(&args)? {
+        return Ok(());
+    }
     if let Some(command_name) = command
         .as_deref()
         .filter(|name| should_bootstrap_telemetry_for_command(name))
     {
         telemetry_bootstrap_for_command(command_name);
-    }
-    if proxy_tclone_host_control_if_needed(&args)? {
-        return Ok(());
     }
 
     match command.as_deref() {
