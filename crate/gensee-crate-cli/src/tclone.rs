@@ -21,7 +21,7 @@ const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
 const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
-const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
+const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 10;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
