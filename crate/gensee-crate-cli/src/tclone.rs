@@ -453,6 +453,70 @@ pub(crate) fn tclone_attach(args: Vec<OsString>) -> io::Result<()> {
     }
 }
 
+pub(crate) fn tclone_run_exec(args: Vec<OsString>) -> io::Result<()> {
+    let (target_args, command_args) = tclone_exec_split(&args)?;
+    let target = tclone_target_arg(
+        target_args,
+        "usage: gensee run exec <run_id-or-container> -- <command> [args...]",
+    )?;
+    let record = find_tclone_record(&target)?;
+    let podman = tclone_podman();
+    ensure_tclone_container_exists(&podman, &record)?;
+    let status = Command::new(&podman)
+        .arg("exec")
+        .arg("-w")
+        .arg(&record.container_workspace)
+        .args(tclone_run_exec_env_args(&record))
+        .arg(&record.container_name)
+        .args(command_args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "tclone exec exited with status {status}"
+        )))
+    }
+}
+
+fn tclone_exec_split(args: &[OsString]) -> io::Result<(&[OsString], &[OsString])> {
+    let Some(separator) = args.iter().position(|arg| arg == "--") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee run exec <run_id-or-container> -- <command> [args...]",
+        ));
+    };
+    if separator + 1 >= args.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee run exec <run_id-or-container> -- <command> [args...]",
+        ));
+    }
+    Ok((&args[..separator], &args[separator + 1..]))
+}
+
+fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
+    let gensee_home = format!("{}/.gensee", record.container_home);
+    [
+        ("HOME", record.container_home.as_str()),
+        ("GENSEE_HOME", gensee_home.as_str()),
+        ("GENSEE_RUN_ID", record.run_id.as_str()),
+        ("AGENT_SHIELD_SESSION_ID", record.run_id.as_str()),
+        ("GENSEE_WORKSPACE", record.container_workspace.as_str()),
+    ]
+    .into_iter()
+    .flat_map(|(key, value)| {
+        [
+            OsString::from("-e"),
+            OsString::from(format!("{key}={value}")),
+        ]
+    })
+    .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostTmuxPlacement {
     Right,
@@ -2883,6 +2947,56 @@ mod tests {
         assert_eq!(arg_value(&args, "--attach").unwrap(), "tmux:below");
         assert_eq!(arg_value(&args, "--into").unwrap(), "source");
         assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+    }
+
+    #[test]
+    fn tclone_exec_split_requires_separator_and_command() {
+        let missing_separator = vec![OsString::from("run_1"), OsString::from("echo")];
+        assert!(tclone_exec_split(&missing_separator).is_err());
+
+        let missing_command = vec![OsString::from("run_1"), OsString::from("--")];
+        assert!(tclone_exec_split(&missing_command).is_err());
+    }
+
+    #[test]
+    fn tclone_exec_split_preserves_command_args_after_separator() {
+        let args = vec![
+            OsString::from("run_1_fork_0"),
+            OsString::from("--"),
+            OsString::from("bash"),
+            OsString::from("-lc"),
+            OsString::from("cargo test --locked"),
+        ];
+
+        let (target_args, command_args) = tclone_exec_split(&args).unwrap();
+
+        assert_eq!(
+            tclone_target_arg(target_args, "usage").unwrap(),
+            "run_1_fork_0"
+        );
+        assert_eq!(
+            command_args,
+            &[
+                OsString::from("bash"),
+                OsString::from("-lc"),
+                OsString::from("cargo test --locked"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tclone_run_exec_env_args_include_session_and_workspace_context() {
+        let mut record = test_record("run_1_fork_0", "running");
+        record.container_home = "/home/gensee".to_string();
+        record.container_workspace = "/workspace".to_string();
+
+        let env_args = tclone_run_exec_env_args(&record);
+
+        assert!(env_args.contains(&OsString::from("HOME=/home/gensee")));
+        assert!(env_args.contains(&OsString::from("GENSEE_HOME=/home/gensee/.gensee")));
+        assert!(env_args.contains(&OsString::from("GENSEE_RUN_ID=run_1_fork_0")));
+        assert!(env_args.contains(&OsString::from("AGENT_SHIELD_SESSION_ID=run_1_fork_0")));
+        assert!(env_args.contains(&OsString::from("GENSEE_WORKSPACE=/workspace")));
     }
 
     #[test]

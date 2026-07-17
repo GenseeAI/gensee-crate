@@ -35,6 +35,7 @@ gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right
 gensee-tclone run shell <run_id-or-container>
 gensee-tclone run attach <run_id-or-container>
 gensee-tclone run attach <run_id-or-container> --tmux right
+gensee-tclone run exec <run_id-or-container> -- bash -lc 'cargo test'
 gensee-tclone run diff <run_id-or-container>
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
 gensee-tclone run merge <fork-id> --into <source-id> --filesystem
@@ -54,9 +55,9 @@ upgrades, migrations, broad refactors, lockfile changes, destructive cleanup, or
 database resets, Gensee records a `policy_fork_suggested` alert with suggested
 `gensee run fork` and `gensee run shell` commands.
 Use the same `gensee-tclone` wrapper for `run list`, `run fork`, `run shell`,
-`run merge`, `run switch`, and cleanup; otherwise Gensee may read the source
-record but look in a different Podman store and report that the container is
-missing.
+`run attach`, `run exec`, `run merge`, `run switch`, and cleanup; otherwise
+Gensee may read the source record but look in a different Podman store and
+report that the container is missing.
 Before cloning a tmux-backed source, `gensee run fork` detaches active
 `gensee-agent` clients so tclone can checkpoint a stable process tree; reattach
 to the source or fork with `gensee-tclone run attach <id>`. If the host command
@@ -65,6 +66,20 @@ runs inside tmux and the sudo wrapper preserves `TMUX`, `gensee run fork
 the cloned in-container `gensee-agent` session. With `--copies 2`, additional
 forks are opened below the first fork pane. `gensee run attach <id> --tmux
 right` can open an existing run or fork in a new host pane.
+
+Use `gensee run exec <id> -- <command>` for non-interactive work in a fork,
+such as commands requested by an agent. The command runs inside the container
+workspace without attaching to the live agent UI, and receives the container's
+`GENSEE_RUN_ID`, `AGENT_SHIELD_SESSION_ID`, `GENSEE_HOME`, and
+`GENSEE_WORKSPACE` context. Like `gensee run shell`, this is a host/container
+control command and does not run the command through the agent PreToolUse hook;
+use it only for commands you intend to execute in that fork. It runs alongside
+any live in-container agent, so concurrent writes to the same workspace files can
+race. For shell features or a series of commands, wrap them explicitly:
+
+```bash
+gensee-tclone run exec <fork-id> -- bash -lc 'npm install && npm test'
+```
 
 `gensee run merge` is the reconciliation command. The default `--git` scope
 applies the fork's repo patch back into its source container, including staged
