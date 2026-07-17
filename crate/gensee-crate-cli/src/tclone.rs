@@ -1981,14 +1981,28 @@ fn tclone_exec_ready(podman: &OsString, container_name: &str) -> bool {
 }
 
 fn detach_tclone_tmux_clients(podman: &OsString, container_name: &str) {
+    let script = format!(
+        r#"if command -v tmux >/dev/null 2>&1 && tmux has-session -t {session} 2>/dev/null; then
+  tmux list-clients -t {session} -F '#{{client_tty}}' 2>/dev/null |
+    while IFS= read -r client_tty; do
+      [ -n "$client_tty" ] && tmux detach-client -t "$client_tty" 2>/dev/null || true
+    done
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! tmux list-clients -t {session} 2>/dev/null | grep -q .; then
+      exit 0
+    fi
+    sleep 0.1
+  done
+fi
+"#,
+        session = shell_quote(TCLONE_AGENT_TMUX_SESSION),
+    );
     let _ = Command::new(podman)
         .arg("exec")
         .arg(container_name)
-        .arg("tmux")
-        .arg("detach-client")
-        .arg("-a")
-        .arg("-s")
-        .arg(TCLONE_AGENT_TMUX_SESSION)
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
