@@ -41,7 +41,8 @@ export default defineConfig({
         text: 'Start',
         items: [
           { text: 'Overview', link: '/' },
-          { text: 'Architecture', link: '/architecture' }
+          { text: 'Architecture', link: '/architecture' },
+          { text: 'Roadmap', link: '/roadmap' }
         ]
       },
       {
