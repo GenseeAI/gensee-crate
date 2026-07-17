@@ -16,6 +16,9 @@ const TCLONE_FORK_IN_PROGRESS_MARKER: &str = "/tmp/gensee-tclone-fork-in-progres
 const TCLONE_REATTACH_MARKER: &str = "/tmp/gensee-tclone-reattach-source";
 const TCLONE_STATE_LOCK_STALE_SECS: u64 = 30;
 const TCLONE_HOST_CONTROL_SOCKET_ENV: &str = "GENSEE_TCLONE_HOST_SOCKET";
+const TCLONE_HOST_CONTROL_DIR_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DIR";
+const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
+const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
@@ -67,9 +70,6 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
     if !tclone_host_control_should_proxy(args) {
         return Ok(false);
     }
-    let Some(socket_path) = tclone_host_control_socket_path() else {
-        return Ok(false);
-    };
     let mut request_args = Vec::new();
     for arg in args {
         let Some(value) = arg.to_str() else {
@@ -80,10 +80,22 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
         };
         request_args.push(value.to_string());
     }
-    let response = tclone_host_control_request(
-        &socket_path,
-        &TcloneHostControlRequest { args: request_args },
-    )?;
+    let request = TcloneHostControlRequest { args: request_args };
+    let response = match tclone_host_control_socket_path() {
+        Some(socket_path) => match tclone_host_control_request(&socket_path, &request) {
+            Ok(response) => response,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                tclone_host_control_file_request(&request)?
+            }
+            Err(error) => return Err(error),
+        },
+        None => tclone_host_control_file_request(&request)?,
+    };
     print!("{}", response.stdout);
     eprint!("{}", response.stderr);
     if let Some(error) = response.error {
@@ -113,6 +125,21 @@ fn tclone_host_control_socket_path() -> Option<PathBuf> {
     candidates.push(PathBuf::from(
         "/home/gensee/.gensee/host-control/control.sock",
     ));
+
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn tclone_host_control_dir_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os(TCLONE_HOST_CONTROL_DIR_ENV).map(PathBuf::from) {
+        candidates.push(path);
+    }
+    if let Some(path) = env::var_os("GENSEE_WORKSPACE").map(PathBuf::from) {
+        candidates.push(path.join(TCLONE_HOST_CONTROL_WORKSPACE_DIR));
+    }
+    candidates.push(PathBuf::from(format!(
+        "{DEFAULT_CONTAINER_WORKSPACE}/{TCLONE_HOST_CONTROL_WORKSPACE_DIR}"
+    )));
 
     candidates.into_iter().find(|path| path.exists())
 }
@@ -167,12 +194,89 @@ fn tclone_host_control_request(
     ))
 }
 
+fn tclone_host_control_file_request(
+    request: &TcloneHostControlRequest,
+) -> io::Result<TcloneHostControlResponse> {
+    let Some(control_dir) = tclone_host_control_dir_path() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not find tclone host-control socket or workspace file bridge",
+        ));
+    };
+    let requests_dir = control_dir.join("requests");
+    let responses_dir = control_dir.join("responses");
+    fs::create_dir_all(&requests_dir)?;
+    fs::create_dir_all(&responses_dir)?;
+
+    let request_id = format!("{}_{}", std::process::id(), unix_millis().unwrap_or(0));
+    let request_path = requests_dir.join(format!("{request_id}.json"));
+    let request_tmp = requests_dir.join(format!("{request_id}.tmp"));
+    let response_path = responses_dir.join(format!("{request_id}.json"));
+    let response_tmp = responses_dir.join(format!("{request_id}.tmp"));
+    let _ = fs::remove_file(&request_path);
+    let _ = fs::remove_file(&request_tmp);
+    let _ = fs::remove_file(&response_path);
+    let _ = fs::remove_file(&response_tmp);
+
+    fs::write(&request_tmp, serde_json::to_vec(request)?)?;
+    fs::rename(&request_tmp, &request_path)?;
+
+    let deadline = Instant::now()
+        + Duration::from_secs(
+            env::var("GENSEE_TCLONE_HOST_FILE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS),
+        );
+    loop {
+        match fs::read_to_string(&response_path) {
+            Ok(text) => {
+                let _ = fs::remove_file(&response_path);
+                let _ = fs::remove_file(&request_path);
+                return serde_json::from_str(&text).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid host Gensee file-control response: {error}"),
+                    )
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            let _ = fs::remove_file(&request_path);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for host Gensee file-control response in {}",
+                    control_dir.display()
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 struct TcloneHostControlServer {
     socket_path: PathBuf,
+    control_dir: PathBuf,
 }
 
 impl TcloneHostControlServer {
-    fn start(socket_path: &Path) -> io::Result<Self> {
+    fn start(socket_path: &Path, control_dir: &Path) -> io::Result<Self> {
+        fs::create_dir_all(control_dir.join("requests"))?;
+        fs::create_dir_all(control_dir.join("responses"))?;
+        let file_exe = env::current_exe()?;
+        let file_control_dir = control_dir.to_path_buf();
+        thread::spawn(move || loop {
+            if let Err(error) =
+                drain_tclone_host_control_file_requests(&file_control_dir, &file_exe)
+            {
+                eprintln!("gensee: tclone host-control file bridge failed: {error}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        });
+
         #[cfg(unix)]
         {
             if let Some(parent) = socket_path.parent() {
@@ -194,6 +298,7 @@ impl TcloneHostControlServer {
             });
             Ok(Self {
                 socket_path: socket_path.to_path_buf(),
+                control_dir: control_dir.to_path_buf(),
             })
         }
         #[cfg(not(unix))]
@@ -210,6 +315,8 @@ impl TcloneHostControlServer {
 impl Drop for TcloneHostControlServer {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.socket_path);
+        let _ = fs::remove_dir_all(self.control_dir.join("requests"));
+        let _ = fs::remove_dir_all(self.control_dir.join("responses"));
     }
 }
 
@@ -231,6 +338,13 @@ fn handle_tclone_host_control_request(
     exe: &Path,
 ) -> io::Result<TcloneHostControlResponse> {
     let request: TcloneHostControlRequest = serde_json::from_reader(stream)?;
+    execute_tclone_host_control_request(request, exe)
+}
+
+fn execute_tclone_host_control_request(
+    request: TcloneHostControlRequest,
+    exe: &Path,
+) -> io::Result<TcloneHostControlResponse> {
     if !tclone_host_control_should_proxy(
         &request.args.iter().map(OsString::from).collect::<Vec<_>>(),
     ) {
@@ -244,6 +358,7 @@ fn handle_tclone_host_control_request(
     let output = Command::new(exe)
         .args(&request.args)
         .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
+        .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
         .output()?;
     Ok(TcloneHostControlResponse {
         exit_code: output.status.code(),
@@ -251,6 +366,48 @@ fn handle_tclone_host_control_request(
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         error: None,
     })
+}
+
+fn drain_tclone_host_control_file_requests(control_dir: &Path, exe: &Path) -> io::Result<()> {
+    let requests_dir = control_dir.join("requests");
+    let responses_dir = control_dir.join("responses");
+    let entries = match fs::read_dir(&requests_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let response_path = responses_dir.join(format!("{stem}.json"));
+        if response_path.exists() {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        let response = match fs::File::open(&path)
+            .and_then(|file| serde_json::from_reader(file).map_err(io::Error::other))
+            .and_then(|request| execute_tclone_host_control_request(request, exe))
+        {
+            Ok(response) => response,
+            Err(error) => TcloneHostControlResponse {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(error.to_string()),
+            },
+        };
+        let response_tmp = responses_dir.join(format!("{stem}.tmp"));
+        fs::write(&response_tmp, serde_json::to_vec(&response)?)?;
+        fs::rename(response_tmp, response_path)?;
+        let _ = fs::remove_file(&path);
+    }
+    Ok(())
 }
 
 pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
@@ -284,7 +441,9 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     let host_control_socket = host_control_dir.join("control.sock");
     let container_host_control_dir = format!("{container_home}/.gensee/host-control");
     let container_host_control_socket = format!("{container_host_control_dir}/control.sock");
-    let _host_control = TcloneHostControlServer::start(&host_control_socket)?;
+    let container_workspace_host_control_dir =
+        format!("{container_workspace}/{TCLONE_HOST_CONTROL_WORKSPACE_DIR}");
+    let _host_control = TcloneHostControlServer::start(&host_control_socket, &host_control_dir)?;
 
     let agent_binary = config.agent_cmd[0].to_string_lossy().to_string();
     let agent_home = detect_agent_home(&agent_binary);
@@ -341,12 +500,22 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
             "{TCLONE_HOST_CONTROL_SOCKET_ENV}={container_host_control_socket}"
         )),
         OsString::from("-e"),
+        OsString::from(format!(
+            "{TCLONE_HOST_CONTROL_DIR_ENV}={container_workspace_host_control_dir}"
+        )),
+        OsString::from("-e"),
         OsString::from("TERM=xterm-256color"),
         OsString::from("-v"),
         OsString::from(format!(
             "{}:{}",
             host_control_dir.display(),
             container_host_control_dir
+        )),
+        OsString::from("-v"),
+        OsString::from(format!(
+            "{}:{}",
+            host_control_dir.display(),
+            container_workspace_host_control_dir
         )),
         OsString::from("-w"),
         OsString::from(&container_workspace),
