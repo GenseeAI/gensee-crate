@@ -664,8 +664,9 @@ fn cursor_before_shell_execution_normalized_to_permission_request() {
     let payload = json!({
         "hook_event_name": "beforeShellExecution",
         "conversation_id": "conv-xyz",
-        "command": "rm -rf /tmp/test",
-        "cwd": "/project",
+        "command": "cat ./secret.txt",
+        "cwd": "",
+        "workspace_roots": ["", "/project"],
         "sandbox": false,
         "cursor_version": "1.7.2"
     })
@@ -677,11 +678,16 @@ fn cursor_before_shell_execution_normalized_to_permission_request() {
     assert_eq!(event.tool_name.as_deref(), Some("Shell"));
     assert_eq!(
         event.tool_input_command.as_deref(),
-        Some("rm -rf /tmp/test")
+        Some("cat ./secret.txt")
     );
     assert_eq!(
         original_bash_command(&payload).as_deref(),
-        Some("rm -rf /tmp/test")
+        Some("cat ./secret.txt")
+    );
+    assert_eq!(event.cwd.as_deref(), Some("/project"));
+    assert_eq!(
+        file_intents_from_hook(&event, original_bash_command(&payload).as_deref())[0].path,
+        "/project/secret.txt"
     );
 }
 
@@ -764,7 +770,8 @@ fn cursor_cwd_falls_back_to_workspace_roots() {
         "hook_event_name": "postToolUse",
         "conversation_id": "conv-1",
         "tool_name": "Shell",
-        "workspace_roots": ["/workspace/project"],
+        "cwd": "   ",
+        "workspace_roots": ["", "   ", "/workspace/project"],
         "cursor_version": "1.7.2"
     })
     .to_string();
@@ -786,15 +793,37 @@ fn cursor_cwd_prefers_tool_input_working_directory_over_workspace_roots() {
             "command": "cat secret.txt",
             "working_directory": "/project/subdir"
         },
+        "cwd": "",
         "tool_use_id": "use-1",
         "workspace_roots": ["/project"],
         "cursor_version": "1.7.2"
-        // no top-level "cwd"
     })
     .to_string();
 
     let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
     // Must use working_directory, not workspace_roots[0].
+    assert_eq!(event.cwd.as_deref(), Some("/project/subdir"));
+}
+
+#[test]
+fn cursor_cwd_accepts_tool_input_cwd_alias() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "conv-1",
+        "tool_name": "Shell",
+        "tool_input": {
+            "command": "cat secret.txt",
+            "working_directory": "",
+            "cwd": "/project/subdir"
+        },
+        "cwd": "",
+        "tool_use_id": "use-1",
+        "workspace_roots": ["/project"],
+        "cursor_version": "1.7.2"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
     assert_eq!(event.cwd.as_deref(), Some("/project/subdir"));
 }
 

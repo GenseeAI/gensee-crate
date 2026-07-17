@@ -504,20 +504,29 @@ fn build_cursor_hook_event(value: Value, observed_at_ms: u64) -> io::Result<Agen
         }
     });
 
-    // Prefer the per-tool `cwd` field, then tool_input.working_directory (the
-    // shell's actual working directory for this invocation — Cursor includes it
-    // on Shell preToolUse payloads but omits the top-level `cwd`), then
-    // workspace_roots[0], then process cwd. Using working_directory before the
-    // workspace root avoids evaluating relative path intents (e.g. `cat ./secret`)
-    // against the wrong base and producing false allow/block decisions.
+    // Prefer the per-tool `cwd` field, then tool_input.working_directory or
+    // tool_input.cwd (the shell's actual working directory for this invocation),
+    // then the first non-empty workspace root, then process cwd. Cursor may send
+    // an empty top-level `cwd`, which must not suppress these fallbacks. Using the
+    // tool working directory before the workspace root avoids evaluating relative
+    // path intents (e.g. `cat ./secret`) against the wrong base and producing
+    // false allow/block decisions.
     let cwd = v_str(&value, "cwd")
+        .filter(|cwd| !cwd.trim().is_empty())
         .or_else(|| v_nested_str(&value, "tool_input", "working_directory"))
+        .filter(|cwd| !cwd.trim().is_empty())
+        .or_else(|| v_nested_str(&value, "tool_input", "cwd"))
+        .filter(|cwd| !cwd.trim().is_empty())
         .or_else(|| {
             value
                 .get("workspace_roots")
                 .and_then(Value::as_array)
-                .and_then(|roots| roots.first())
-                .and_then(Value::as_str)
+                .and_then(|roots| {
+                    roots
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .find(|root| !root.trim().is_empty())
+                })
                 .map(ToString::to_string)
         })
         .or_else(current_dir_string);
