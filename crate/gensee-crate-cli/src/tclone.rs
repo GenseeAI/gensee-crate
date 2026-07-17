@@ -391,6 +391,18 @@ fn execute_tclone_host_control_request(
             error: Some("unsupported tclone host-control command".to_string()),
         });
     }
+    if tclone_host_control_should_run_async(&request.args) {
+        let response = tclone_host_control_async_response(&request.args);
+        spawn_tclone_host_control_request(request, exe.to_path_buf());
+        return Ok(response);
+    }
+    execute_tclone_host_control_request_sync(request, exe)
+}
+
+fn execute_tclone_host_control_request_sync(
+    request: TcloneHostControlRequest,
+    exe: &Path,
+) -> io::Result<TcloneHostControlResponse> {
     let output = Command::new(exe)
         .args(&request.args)
         .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
@@ -403,6 +415,68 @@ fn execute_tclone_host_control_request(
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         error: None,
     })
+}
+
+fn spawn_tclone_host_control_request(request: TcloneHostControlRequest, exe: PathBuf) {
+    thread::spawn(move || {
+        let output = Command::new(&exe)
+            .args(&request.args)
+            .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
+            .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
+            .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stdout.trim().is_empty() {
+                    eprintln!("{}", stdout.trim_end());
+                }
+                if !stderr.trim().is_empty() {
+                    eprintln!("{}", stderr.trim_end());
+                }
+            }
+            Ok(output) => {
+                eprintln!(
+                    "gensee: async tclone host command failed with status {}",
+                    output.status
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.trim().is_empty() {
+                    eprintln!("{}", stderr.trim_end());
+                }
+            }
+            Err(error) => {
+                eprintln!("gensee: async tclone host command failed to start: {error}");
+            }
+        }
+    });
+}
+
+fn tclone_host_control_should_run_async(args: &[String]) -> bool {
+    matches!(args.first().map(String::as_str), Some("run"))
+        && matches!(args.get(1).map(String::as_str), Some("fork"))
+}
+
+fn tclone_host_control_async_response(args: &[String]) -> TcloneHostControlResponse {
+    let stdout = if args.iter().any(|arg| arg == "--json") {
+        format!(
+            "{}\n",
+            json!({
+                "scheduled": true,
+                "command": "run fork",
+                "message": "gensee scheduled the tclone fork on the host",
+            })
+        )
+    } else {
+        "gensee: scheduled tclone fork on host\n".to_string()
+    };
+    TcloneHostControlResponse {
+        exit_code: Some(0),
+        stdout,
+        stderr: String::new(),
+        error: None,
+    }
 }
 
 fn drain_tclone_host_control_file_requests(control_dir: &Path, exe: &Path) -> io::Result<()> {
@@ -491,15 +565,36 @@ fn drain_tclone_container_host_control_file_requests(
             }
             _ => continue,
         };
-        let response = serde_json::from_str::<TcloneHostControlRequest>(&request_json)
-            .map_err(io::Error::other)
-            .and_then(|request| execute_tclone_host_control_request(request, exe))
-            .unwrap_or_else(|error| TcloneHostControlResponse {
-                exit_code: Some(1),
-                stdout: String::new(),
-                stderr: String::new(),
-                error: Some(error.to_string()),
-            });
+        let parsed_request = serde_json::from_str::<TcloneHostControlRequest>(&request_json)
+            .map_err(io::Error::other);
+        let response =
+            match parsed_request {
+                Ok(request) if tclone_host_control_should_run_async(&request.args) => {
+                    let response = tclone_host_control_async_response(&request.args);
+                    write_tclone_container_host_control_response(
+                        podman,
+                        container_name,
+                        &request_path,
+                        &response_path,
+                        &response,
+                    )?;
+                    spawn_tclone_host_control_request(request, exe.to_path_buf());
+                    continue;
+                }
+                Ok(request) => execute_tclone_host_control_request_sync(request, exe)
+                    .unwrap_or_else(|error| TcloneHostControlResponse {
+                        exit_code: Some(1),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: Some(error.to_string()),
+                    }),
+                Err(error) => TcloneHostControlResponse {
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(error.to_string()),
+                },
+            };
         write_tclone_container_host_control_response(
             podman,
             container_name,
@@ -3866,6 +3961,25 @@ mod tests {
         assert!(!should_retry_tclone_without_overlay(
             "podman exited with status 125: container not found"
         ));
+    }
+
+    #[test]
+    fn tclone_host_control_runs_fork_async_and_preserves_json_ack() {
+        let fork_args = vec![
+            "run".to_string(),
+            "fork".to_string(),
+            "run_1".to_string(),
+            "--json".to_string(),
+        ];
+        let exec_args = vec!["run".to_string(), "exec".to_string(), "run_1".to_string()];
+
+        assert!(tclone_host_control_should_run_async(&fork_args));
+        assert!(!tclone_host_control_should_run_async(&exec_args));
+
+        let response = tclone_host_control_async_response(&fork_args);
+        let payload: serde_json::Value = serde_json::from_str(response.stdout.trim()).unwrap();
+        assert_eq!(payload["scheduled"], true);
+        assert_eq!(payload["command"], "run fork");
     }
 
     #[test]
