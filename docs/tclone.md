@@ -31,10 +31,11 @@ Use a second terminal to fork the running source container:
 ```bash
 gensee-tclone run list
 gensee-tclone run fork <source-run-id> --copies 2
-gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right
+gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right --json
 gensee-tclone run shell <run_id-or-container>
 gensee-tclone run attach <run_id-or-container>
 gensee-tclone run attach <run_id-or-container> --tmux right
+gensee-tclone run send <run_id-or-container> -- 'Run npm test and fix failures'
 gensee-tclone run exec <run_id-or-container> -- bash -lc 'cargo test'
 gensee-tclone run diff <run_id-or-container>
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
@@ -53,11 +54,11 @@ section of `gensee run list`. The launcher also prints it directly:
 When hooks see commands that are good fork candidates, such as dependency
 upgrades, migrations, broad refactors, lockfile changes, destructive cleanup, or
 database resets, Gensee records a `policy_fork_suggested` alert with suggested
-`gensee run fork` and `gensee run shell` commands.
+`gensee run fork --attach tmux:right --json` and `gensee run send` commands.
 Use the same `gensee-tclone` wrapper for `run list`, `run fork`, `run shell`,
-`run attach`, `run exec`, `run merge`, `run switch`, and cleanup; otherwise
-Gensee may read the source record but look in a different Podman store and
-report that the container is missing.
+`run attach`, `run send`, `run exec`, `run merge`, `run switch`, and cleanup;
+otherwise Gensee may read the source record but look in a different Podman store
+and report that the container is missing.
 Before cloning a tmux-backed source, `gensee run fork` detaches active
 `gensee-agent` clients so tclone can checkpoint a stable process tree; reattach
 to the source or fork with `gensee-tclone run attach <id>`. If the host command
@@ -66,6 +67,17 @@ runs inside tmux and the sudo wrapper preserves `TMUX`, `gensee run fork
 the cloned in-container `gensee-agent` session. With `--copies 2`, additional
 forks are opened below the first fork pane. `gensee run attach <id> --tmux
 right` can open an existing run or fork in a new host pane.
+
+Use `gensee run send <id> -- <prompt>` to paste a prompt into the fork's
+in-container `gensee-agent` tmux session and press Enter. If that fork is
+attached in a host tmux pane, the pane visibly shows the forked agent receiving
+and executing the work:
+
+```bash
+FORK_ID=$(gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right --json \
+  | jq -r '.forks[0].run_id')
+gensee-tclone run send "$FORK_ID" -- 'Try the dependency upgrade, run tests, and summarize the result.'
+```
 
 Use `gensee run exec <id> -- <command>` for non-interactive work in a fork,
 such as commands requested by an agent. The command runs inside the container
