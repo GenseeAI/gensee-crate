@@ -100,7 +100,10 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
             }
             Err(error) => return Err(error),
         },
-        None => tclone_host_control_file_request(&request)?,
+        None if tclone_host_control_dir_path().is_some() => {
+            tclone_host_control_file_request(&request)?
+        }
+        None => return Ok(false),
     };
     print!("{}", response.stdout);
     eprint!("{}", response.stderr);
@@ -3587,6 +3590,32 @@ mod tests {
         match old_disabled {
             Some(value) => env::set_var(TCLONE_HOST_CONTROL_DISABLE_ENV, value),
             None => env::remove_var(TCLONE_HOST_CONTROL_DISABLE_ENV),
+        }
+    }
+
+    #[test]
+    fn tclone_host_control_without_bridge_runs_locally() {
+        let old_socket = env::var_os(TCLONE_HOST_CONTROL_SOCKET_ENV);
+        let old_dir = env::var_os(TCLONE_HOST_CONTROL_DIR_ENV);
+        let old_workspace = env::var_os("GENSEE_WORKSPACE");
+        env::remove_var(TCLONE_HOST_CONTROL_SOCKET_ENV);
+        env::remove_var(TCLONE_HOST_CONTROL_DIR_ENV);
+        env::set_var("GENSEE_WORKSPACE", "/definitely-not-a-gensee-workspace");
+
+        let args = vec![OsString::from("run"), OsString::from("list")];
+        assert!(!proxy_tclone_host_control_if_needed(&args).unwrap());
+
+        match old_socket {
+            Some(value) => env::set_var(TCLONE_HOST_CONTROL_SOCKET_ENV, value),
+            None => env::remove_var(TCLONE_HOST_CONTROL_SOCKET_ENV),
+        }
+        match old_dir {
+            Some(value) => env::set_var(TCLONE_HOST_CONTROL_DIR_ENV, value),
+            None => env::remove_var(TCLONE_HOST_CONTROL_DIR_ENV),
+        }
+        match old_workspace {
+            Some(value) => env::set_var("GENSEE_WORKSPACE", value),
+            None => env::remove_var("GENSEE_WORKSPACE"),
         }
     }
 
