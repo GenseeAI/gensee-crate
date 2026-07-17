@@ -9,7 +9,7 @@ full-workspace forking for AI agents.
 ```bash
 export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
-alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" gensee'
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
 
 gensee-tclone run --runtime tclone -- codex
 ```
@@ -30,9 +30,11 @@ Use a second terminal to fork the running source container:
 
 ```bash
 gensee-tclone run list
-gensee-tclone fork <source-run-id> --copies 2
+gensee-tclone run fork <source-run-id> --copies 2
+gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right
 gensee-tclone run shell <run_id-or-container>
 gensee-tclone run attach <run_id-or-container>
+gensee-tclone run attach <run_id-or-container> --tmux right
 gensee-tclone run diff <run_id-or-container>
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
 gensee-tclone run merge <fork-id> --into <source-id> --filesystem
@@ -57,7 +59,12 @@ record but look in a different Podman store and report that the container is
 missing.
 Before cloning a tmux-backed source, `gensee run fork` detaches active
 `gensee-agent` clients so tclone can checkpoint a stable process tree; reattach
-to the source or fork with `gensee-tclone run attach <id>`.
+to the source or fork with `gensee-tclone run attach <id>`. If the host command
+runs inside tmux and the sudo wrapper preserves `TMUX`, `gensee run fork
+--attach tmux:right` opens the new fork in a right-side pane and reconnects to
+the cloned in-container `gensee-agent` session. With `--copies 2`, additional
+forks are opened below the first fork pane. `gensee run attach <id> --tmux
+right` can open an existing run or fork in a new host pane.
 
 `gensee run merge` is the reconciliation command. The default `--git` scope
 applies the fork's repo patch back into its source container, including staged

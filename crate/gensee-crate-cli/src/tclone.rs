@@ -266,8 +266,14 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
 pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     let parent = tclone_target_arg(
         &args,
-        "usage: gensee run fork <run_id> [--copies N] [--name <prefix>]",
+        "usage: gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below]",
     )?;
+    let host_tmux_attach = arg_value(&args, "--attach")
+        .map(|value| parse_host_tmux_placement(&value))
+        .transpose()?;
+    if host_tmux_attach.is_some() {
+        ensure_host_tmux_available()?;
+    }
     let copies = arg_value(&args, "--copies")
         .map(|value| value.parse::<usize>())
         .transpose()
@@ -326,6 +332,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let mut fork_run_ids = Vec::new();
     for index in 0..copies {
         let run_id = format!("{}_fork_{}_{}", source.run_id, forked_at_ms, index);
         let container_name = ids
@@ -383,6 +390,21 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             exit_code: None,
         })?;
         println!("{run_id} | container={container_name}");
+        fork_run_ids.push(run_id);
+    }
+    if let Some(placement) = host_tmux_attach {
+        for (index, run_id) in fork_run_ids.iter().enumerate() {
+            let placement = if index == 0 {
+                placement
+            } else {
+                HostTmuxPlacement::Below
+            };
+            if let Err(err) = open_tclone_attach_in_host_tmux_after_preflight(run_id, placement) {
+                eprintln!(
+                    "gensee: warning: fork {run_id} was created, but tmux attach failed: {err}"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -414,6 +436,10 @@ pub(crate) fn tclone_shell(args: Vec<OsString>) -> io::Result<()> {
 
 pub(crate) fn tclone_attach(args: Vec<OsString>) -> io::Result<()> {
     let target = tclone_target_arg(&args, "usage: gensee run attach <run_id-or-container>")?;
+    if let Some(placement) = arg_value(&args, "--tmux") {
+        let placement = parse_host_tmux_placement(&placement)?;
+        return open_tclone_attach_in_host_tmux(&target, placement);
+    }
     let record = find_tclone_record(&target)?;
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &record)?;
@@ -426,6 +452,112 @@ pub(crate) fn tclone_attach(args: Vec<OsString>) -> io::Result<()> {
         )))
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostTmuxPlacement {
+    Right,
+    Below,
+}
+
+fn parse_host_tmux_placement(value: &str) -> io::Result<HostTmuxPlacement> {
+    let value = value
+        .strip_prefix("tmux:")
+        .unwrap_or(value)
+        .to_ascii_lowercase();
+    match value.as_str() {
+        "right" | "split-right" | "horizontal" | "h" => Ok(HostTmuxPlacement::Right),
+        "below" | "down" | "bottom" | "split-down" | "vertical" | "v" => {
+            Ok(HostTmuxPlacement::Below)
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown tmux placement: {other}; expected right or below"),
+        )),
+    }
+}
+
+fn open_tclone_attach_in_host_tmux(target: &str, placement: HostTmuxPlacement) -> io::Result<()> {
+    ensure_host_tmux_available()?;
+    open_tclone_attach_in_host_tmux_after_preflight(target, placement)
+}
+
+fn open_tclone_attach_in_host_tmux_after_preflight(
+    target: &str,
+    placement: HostTmuxPlacement,
+) -> io::Result<()> {
+    let exe = env::current_exe()?;
+    let command = host_tmux_attach_command(target, &exe, env::var_os("SUDO_USER").is_some());
+    open_host_tmux_pane(&command, placement)
+}
+
+fn ensure_host_tmux_available() -> io::Result<()> {
+    if env::var_os("TMUX").is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tmux attach requested but TMUX is not set; run from inside tmux and preserve TMUX through sudo",
+        ));
+    }
+    if find_command("tmux").is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "tmux attach requested but `tmux` was not found on PATH",
+        ));
+    }
+    Ok(())
+}
+
+fn open_host_tmux_pane(command: &str, placement: HostTmuxPlacement) -> io::Result<()> {
+    let split_flag = match placement {
+        HostTmuxPlacement::Right => "-h",
+        HostTmuxPlacement::Below => "-v",
+    };
+    let mut tmux = Command::new("tmux");
+    tmux.arg("split-window").arg(split_flag);
+    if let Ok(cwd) = env::current_dir() {
+        tmux.arg("-c").arg(cwd);
+    }
+    let status = tmux.arg(command).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "tmux split-window exited with status {status}"
+        )))
+    }
+}
+
+fn host_tmux_attach_command(target: &str, exe: &Path, use_sudo: bool) -> String {
+    let mut parts = Vec::new();
+    if use_sudo {
+        parts.push("sudo".to_string());
+    }
+    parts.push("env".to_string());
+    for key in TCLONE_HOST_TMUX_ENV_KEYS {
+        if let Some(value) = env::var_os(key) {
+            parts.push(shell_quote(&format!("{key}={}", value.to_string_lossy())));
+        }
+    }
+    parts.push(shell_quote(&exe.to_string_lossy()));
+    parts.push("run".to_string());
+    parts.push("attach".to_string());
+    parts.push(shell_quote(target));
+    format!(
+        "{}; status=$?; printf '\\n[gensee] attach exited with status %s. Press Ctrl-D to close this pane.\\n' \"$status\"; exec \"${{SHELL:-/bin/sh}}\"",
+        parts.join(" ")
+    )
+}
+
+const TCLONE_HOST_TMUX_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "GENSEE_HOME",
+    "GENSEE_TCLONE_PODMAN",
+    "GENSEE_TCLONE_IMAGE",
+    "GENSEE_TCLONE_NODE_ROOT",
+    "GENSEE_TCLONE_NODE_BIN",
+    "GENSEE_TCLONE_READY_TIMEOUT_SECS",
+    "TERM",
+];
 
 fn tclone_attach_container(
     podman: &OsString,
@@ -1974,7 +2106,7 @@ fn tclone_target_arg(args: &[OsString], usage: &str) -> io::Result<String> {
 fn tclone_option_takes_value(option: &str) -> bool {
     matches!(
         option,
-        "--copies" | "--name" | "--shell" | "--to" | "--into" | "--paths"
+        "--copies" | "--name" | "--attach" | "--tmux" | "--shell" | "--to" | "--into" | "--paths"
     )
 }
 
@@ -2728,6 +2860,8 @@ mod tests {
             OsString::from("2"),
             OsString::from("--name"),
             OsString::from("fork-prefix"),
+            OsString::from("--attach"),
+            OsString::from("tmux:right"),
             OsString::from("run_1"),
         ];
 
@@ -2739,14 +2873,48 @@ mod tests {
         let args = vec![
             OsString::from("--copies=2"),
             OsString::from("--name=fork-prefix"),
+            OsString::from("--attach=tmux:below"),
             OsString::from("--into=source"),
             OsString::from("run_1"),
         ];
 
         assert_eq!(arg_value(&args, "--copies").unwrap(), "2");
         assert_eq!(arg_value(&args, "--name").unwrap(), "fork-prefix");
+        assert_eq!(arg_value(&args, "--attach").unwrap(), "tmux:below");
         assert_eq!(arg_value(&args, "--into").unwrap(), "source");
         assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+    }
+
+    #[test]
+    fn tclone_host_tmux_placement_parser_accepts_aliases() {
+        assert_eq!(
+            parse_host_tmux_placement("tmux:right").unwrap(),
+            HostTmuxPlacement::Right
+        );
+        assert_eq!(
+            parse_host_tmux_placement("split-down").unwrap(),
+            HostTmuxPlacement::Below
+        );
+        assert!(parse_host_tmux_placement("tmux:grid").is_err());
+    }
+
+    #[test]
+    fn tclone_host_tmux_attach_command_reenters_gensee_attach() {
+        let command = host_tmux_attach_command("run_1_fork_0", Path::new("/tmp/gensee"), false);
+
+        assert!(command.contains("'/tmp/gensee' run attach 'run_1_fork_0'"));
+        assert!(command.starts_with("env "));
+        assert!(!command.starts_with("sudo "));
+        assert!(command.contains("attach exited with status"));
+        assert!(command.contains("exec \"${SHELL:-/bin/sh}\""));
+    }
+
+    #[test]
+    fn tclone_host_tmux_attach_command_can_reenter_with_sudo() {
+        let command = host_tmux_attach_command("run_1_fork_0", Path::new("/tmp/gensee"), true);
+
+        assert!(command.starts_with("sudo env "));
+        assert!(command.contains("'/tmp/gensee' run attach 'run_1_fork_0'"));
     }
 
     #[test]

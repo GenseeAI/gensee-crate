@@ -426,11 +426,12 @@ Tclone provides low-latency full-workspace forking for AI agents:
 ```bash
 export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
-alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" gensee'
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
 
 gensee-tclone run --runtime tclone -- codex
 gensee-tclone run list              # source id is under "Tclone containers"
-gensee-tclone run fork <source-run-id> --copies 2
+gensee-tclone run fork <source-run-id> --copies 2 --attach tmux:right
+gensee-tclone run attach <fork-id> --tmux right
 gensee-tclone run diff <fork-id>
 gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
 gensee-tclone run switch <fork-id>                         # continue from the fork
@@ -441,9 +442,10 @@ The tclone launcher also prints the source id directly:
 Agent hooks also record fork suggestions for exploratory commands such as
 dependency upgrades, migrations, broad refactors, lockfile changes, destructive
 cleanup, and database resets.
-Use a tclone image with `tmux` for reliable `gensee run attach`; without tmux,
-`gensee run shell` still opens a new shell but does not reconnect to the live
-agent UI.
+Use a tclone image with `tmux` for reliable `gensee run attach`. From inside a
+host tmux session, `--attach tmux:right` opens the forked live agent in a new
+pane. Without tmux, `gensee run shell` still opens a new shell but does not
+reconnect to the live agent UI.
 
 </details>
 
