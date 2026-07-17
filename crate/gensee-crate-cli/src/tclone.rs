@@ -225,7 +225,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         "gensee: started tclone run {run_id} source_container={source_container} workspace={}",
         original_workspace.display()
     );
-    eprintln!("gensee: fork from another terminal with: gensee fork {run_id}");
+    eprintln!("gensee: fork from another terminal with: gensee run fork {run_id}");
 
     if env_flag("GENSEE_TCLONE_NO_ATTACH") {
         eprintln!("gensee: tclone source left running without attach because GENSEE_TCLONE_NO_ATTACH is set");
@@ -265,7 +265,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
 pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     let parent = tclone_target_arg(
         &args,
-        "usage: gensee fork <run_id> [--copies N] [--name <prefix>]",
+        "usage: gensee run fork <run_id> [--copies N] [--name <prefix>]",
     )?;
     let copies = arg_value(&args, "--copies")
         .map(|value| value.parse::<usize>())

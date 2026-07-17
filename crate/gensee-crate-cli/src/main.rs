@@ -103,6 +103,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
                 args.remove(0);
                 return list_runs();
             }
+            if args.first().and_then(|arg| arg.to_str()) == Some("fork") {
+                args.remove(0);
+                return tclone_fork(args);
+            }
             if args.first().and_then(|arg| arg.to_str()) == Some("shell") {
                 args.remove(0);
                 return tclone_shell(args);

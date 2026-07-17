@@ -430,14 +430,14 @@ alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOM
 
 gensee-tclone run --runtime tclone -- codex
 gensee-tclone run list              # source id is under "Tclone containers"
-gensee-tclone fork <source-run-id> --copies 2
+gensee-tclone run fork <source-run-id> --copies 2
 gensee-tclone run diff <fork-id>
 gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
 gensee-tclone run switch <fork-id>                         # continue from the fork
 ```
 
 The tclone launcher also prints the source id directly:
-`gensee: fork from another terminal with: gensee fork run_...`.
+`gensee: fork from another terminal with: gensee run fork run_...`.
 
 </details>
 
