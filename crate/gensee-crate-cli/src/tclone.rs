@@ -12,8 +12,7 @@ const DEFAULT_TCLONE_IMAGE: &str = "ghcr.io/wuklab/webtop:ubuntu-kde";
 const DEFAULT_CONTAINER_HOME: &str = "/home/gensee";
 const DEFAULT_CONTAINER_WORKSPACE: &str = "/workspace";
 const TCLONE_AGENT_TMUX_SESSION: &str = "gensee-agent";
-const TCLONE_FORK_IN_PROGRESS_MARKER: &str = "/tmp/gensee-tclone-fork-in-progress";
-const TCLONE_REATTACH_MARKER: &str = "/tmp/gensee-tclone-reattach-source";
+const TCLONE_HOST_FORK_IN_PROGRESS_FILE: &str = "fork-in-progress";
 const TCLONE_STATE_LOCK_STALE_SECS: u64 = 30;
 const TCLONE_HOST_CONTROL_SOCKET_ENV: &str = "GENSEE_TCLONE_HOST_SOCKET";
 const TCLONE_HOST_CONTROL_DIR_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DIR";
@@ -838,7 +837,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &source)?;
     ensure_tclone_agent_ready_for_fork(&podman, &source)?;
-    let _detach_guard = TcloneForkDetachGuard::mark(&podman, &source.container_name)?;
+    let _detach_guard = TcloneForkDetachGuard::mark(&source.run_id)?;
     detach_tclone_tmux_clients(&podman, &source.container_name);
     let forked_at_ms = unix_millis()?;
     let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
@@ -1586,7 +1585,7 @@ fn tclone_attach_container(
             .status();
         match tmux_status {
             Ok(status) if status.success() => {
-                if consume_tclone_reattach_marker(podman, container_name, attach_started_ms) {
+                if consume_tclone_host_fork_marker(podman, container_name, attach_started_ms) {
                     eprintln!("gensee: reattaching to source after tclone fork");
                     continue;
                 }
@@ -1733,43 +1732,41 @@ fn tclone_agent_process_check(agent_cmd: &[String]) -> Option<&'static str> {
 }
 
 struct TcloneForkDetachGuard {
-    podman: OsString,
-    container_name: String,
+    marker_path: PathBuf,
 }
 
 impl TcloneForkDetachGuard {
-    fn mark(podman: &OsString, container_name: &str) -> io::Result<Self> {
+    fn mark(run_id: &str) -> io::Result<Self> {
         let timestamp = unix_millis()?;
-        write_tclone_marker(
-            podman,
-            container_name,
-            TCLONE_FORK_IN_PROGRESS_MARKER,
-            timestamp,
-        )?;
-        write_tclone_marker(podman, container_name, TCLONE_REATTACH_MARKER, timestamp)?;
-        Ok(Self {
-            podman: podman.clone(),
-            container_name: container_name.to_string(),
-        })
+        let marker_path = tclone_host_fork_marker_path(run_id)?;
+        if let Some(parent) = marker_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&marker_path, format!("{timestamp}\n"))?;
+        Ok(Self { marker_path })
     }
 }
 
 impl Drop for TcloneForkDetachGuard {
     fn drop(&mut self) {
-        remove_tclone_marker(
-            &self.podman,
-            &self.container_name,
-            TCLONE_FORK_IN_PROGRESS_MARKER,
-        );
+        let _ = fs::remove_file(&self.marker_path);
     }
 }
 
-fn consume_tclone_reattach_marker(
+fn consume_tclone_host_fork_marker(
     podman: &OsString,
     container_name: &str,
     attach_started_ms: u64,
 ) -> bool {
-    let Some(marker_ms) = tclone_marker_timestamp(podman, container_name, TCLONE_REATTACH_MARKER)
+    let Ok(record) = find_tclone_record(container_name) else {
+        return false;
+    };
+    let Ok(marker_path) = tclone_host_fork_marker_path(&record.run_id) else {
+        return false;
+    };
+    let Some(marker_ms) = fs::read_to_string(&marker_path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
     else {
         return false;
     };
@@ -1777,25 +1774,29 @@ fn consume_tclone_reattach_marker(
     if marker_ms.saturating_add(5 * 60 * 1_000) < now_ms
         || marker_ms.saturating_add(2_000) < attach_started_ms
     {
-        remove_tclone_marker(podman, container_name, TCLONE_REATTACH_MARKER);
+        let _ = fs::remove_file(&marker_path);
         return false;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(5 * 60);
     while Instant::now() < deadline {
-        if tclone_marker_timestamp(podman, container_name, TCLONE_FORK_IN_PROGRESS_MARKER).is_none()
-        {
+        if !marker_path.exists() {
             wait_tclone_container_exec_ready(podman, container_name, Duration::from_secs(15));
-            remove_tclone_marker(podman, container_name, TCLONE_REATTACH_MARKER);
             return true;
         }
         thread::sleep(Duration::from_millis(250));
     }
 
     wait_tclone_container_exec_ready(podman, container_name, Duration::from_secs(15));
-    remove_tclone_marker(podman, container_name, TCLONE_FORK_IN_PROGRESS_MARKER);
-    remove_tclone_marker(podman, container_name, TCLONE_REATTACH_MARKER);
+    let _ = fs::remove_file(&marker_path);
     true
+}
+
+fn tclone_host_fork_marker_path(run_id: &str) -> io::Result<PathBuf> {
+    Ok(gensee_tmp_root()?
+        .join(run_id)
+        .join("host-control")
+        .join(TCLONE_HOST_FORK_IN_PROGRESS_FILE))
 }
 
 fn wait_tclone_container_exec_ready(podman: &OsString, container_name: &str, timeout: Duration) {
@@ -1817,37 +1818,6 @@ fn tclone_exec_ready(podman: &OsString, container_name: &str) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-
-fn write_tclone_marker(
-    podman: &OsString,
-    container_name: &str,
-    marker: &str,
-    timestamp_ms: u64,
-) -> io::Result<()> {
-    let script = format!("printf '%s\\n' {timestamp_ms} > {}", shell_quote(marker));
-    tclone_exec(podman, container_name, &["sh", "-lc", script.as_str()])
-}
-
-fn remove_tclone_marker(podman: &OsString, container_name: &str, marker: &str) {
-    let script = format!("rm -f {}", shell_quote(marker));
-    let _ = tclone_exec(podman, container_name, &["sh", "-lc", script.as_str()]);
-}
-
-fn tclone_marker_timestamp(podman: &OsString, container_name: &str, marker: &str) -> Option<u64> {
-    let script = format!("cat {} 2>/dev/null || true", shell_quote(marker));
-    let output = Command::new(podman)
-        .arg("exec")
-        .arg(container_name)
-        .arg("sh")
-        .arg("-lc")
-        .arg(script)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 fn detach_tclone_tmux_clients(podman: &OsString, container_name: &str) {
