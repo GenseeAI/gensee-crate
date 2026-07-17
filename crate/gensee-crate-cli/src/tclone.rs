@@ -1007,7 +1007,28 @@ fn tclone_merge_git(
     source: &TcloneRunRecord,
     dry_run: bool,
 ) -> io::Result<()> {
-    let patch = tclone_merge_patch(podman, fork)?;
+    let source_files_id = format!("gensee-source-files-{}.txt", unix_millis()?);
+    let host_source_files = gensee_tmp_root()?.join(&source_files_id);
+    let fork_source_files = format!("/tmp/{source_files_id}");
+    fs::write(
+        &host_source_files,
+        tclone_source_workspace_file_list(podman, source)?,
+    )?;
+    let patch = (|| {
+        podman_cp(
+            podman,
+            &host_source_files,
+            &format!("{}:{fork_source_files}", fork.container_name),
+        )?;
+        tclone_merge_patch(podman, fork, &fork_source_files)
+    })();
+    let _ = fs::remove_file(&host_source_files);
+    let _ = tclone_exec(
+        podman,
+        &fork.container_name,
+        &["rm", "-f", &fork_source_files],
+    );
+    let patch = patch?;
     if patch.trim().is_empty() {
         println!(
             "gensee: no changes to merge from {} into {}",
@@ -1049,6 +1070,22 @@ fn tclone_merge_git(
         );
     }
     Ok(())
+}
+
+fn tclone_source_workspace_file_list(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+) -> io::Result<String> {
+    let script = r#"set -euo pipefail
+cd "$GENSEE_WORKSPACE"
+find . -path './.git' -prune -o -type f -printf '%P\n' | sort
+"#;
+    tclone_exec_capture_env(
+        podman,
+        &source.container_name,
+        &[("GENSEE_WORKSPACE", &source.container_workspace)],
+        &["bash", "-lc", script],
+    )
 }
 
 fn tclone_merge_filesystem(
@@ -1453,7 +1490,11 @@ fn tclone_merge_scope(args: &[OsString]) -> io::Result<TcloneMergeScope> {
     }
 }
 
-fn tclone_merge_patch(podman: &OsString, fork: &TcloneRunRecord) -> io::Result<String> {
+fn tclone_merge_patch(
+    podman: &OsString,
+    fork: &TcloneRunRecord,
+    source_files_path: &str,
+) -> io::Result<String> {
     let script = r#"set -euo pipefail
 cd "$GENSEE_WORKSPACE"
 if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
@@ -1481,10 +1522,16 @@ while IFS= read -r -d '' file; do
   case "$file" in
     gensee.db|gensee.db-wal|gensee.db-shm|gensee.key|telemetry.json) continue ;;
   esac
+  if grep -Fxq -- "$file" "$GENSEE_SOURCE_FILES"; then
+    continue
+  fi
   git diff --binary --no-index -- /dev/null "$file" || true
 done < <(git ls-files --others --exclude-standard -z)
 "#;
-    let mut envs = vec![("GENSEE_WORKSPACE", fork.container_workspace.as_str())];
+    let mut envs = vec![
+        ("GENSEE_WORKSPACE", fork.container_workspace.as_str()),
+        ("GENSEE_SOURCE_FILES", source_files_path),
+    ];
     if let Some(base) = fork.fork_base_git_head.as_deref() {
         envs.push(("GENSEE_GIT_MERGE_BASE", base));
     }
