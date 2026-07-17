@@ -1266,14 +1266,14 @@ fn codex_permission_request_records_and_denies_destructive_command() {
 
     let output = process_hook_event(&payload, &event, &store).unwrap();
 
-    let output = output.expect("destructive permission request should return a deny decision");
+    let output = output.expect("destructive permission request should return a system message");
     assert!(
-        output.contains("\"hookEventName\":\"PermissionRequest\""),
-        "expected PermissionRequest-specific output: {output}"
+        output.contains("\"systemMessage\""),
+        "expected Codex-supported PermissionRequest output: {output}"
     );
     assert!(
-        output.contains("\"permissionDecision\":\"deny\""),
-        "expected destructive permission request to be denied: {output}"
+        !output.contains("\"permissionDecision\""),
+        "Codex PermissionRequest does not accept permissionDecision output: {output}"
     );
     assert!(store
         .list_alerts()
@@ -1298,10 +1298,14 @@ fn codex_permission_request_without_command_fails_closed() {
 
     let output = process_hook_event(&payload, &event, &store).unwrap();
 
-    let output = output.expect("unparseable permission request should return a deny decision");
+    let output = output.expect("unparseable permission request should return a system message");
     assert!(
-        output.contains("\"permissionDecision\":\"deny\""),
-        "expected unparseable permission request to be denied: {output}"
+        output.contains("\"systemMessage\""),
+        "expected Codex-supported PermissionRequest output: {output}"
+    );
+    assert!(
+        !output.contains("\"permissionDecision\""),
+        "Codex PermissionRequest does not accept permissionDecision output: {output}"
     );
     assert!(store
         .list_alerts()

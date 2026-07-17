@@ -1488,6 +1488,12 @@ pub(crate) fn decision_json_for_provider(
             .join("; ")
     };
     let permission_decision = decision.action.hook_permission_decision();
+    if provider == PROVIDER_CODEX && hook_event_name == "PermissionRequest" {
+        if matches!(decision.action, PolicyAction::Allow) && decision.findings.is_empty() {
+            return None;
+        }
+        return Some(json!({ "systemMessage": reason }).to_string());
+    }
     if provider == PROVIDER_ANTIGRAVITY {
         return Some(
             json!({
