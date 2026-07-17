@@ -185,9 +185,285 @@ pub(crate) fn evaluate_pretool_policy_with_store(
             findings.push(finding);
         }
     }
+    if !matches!(action, PolicyAction::Block) {
+        if let Some(finding) =
+            fork_suggestion_finding(event, &subjects, env::var("GENSEE_RUN_ID").ok().as_deref())
+        {
+            findings.push(finding);
+        }
+    }
 
     PolicyDecision { action, findings }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForkSuggestionReason {
+    DependencyUpgrade,
+    SchemaMigration,
+    LargeRefactor,
+    DestructiveFileCleanup,
+    LockfileChange,
+    DestructiveDatabaseCommand,
+    TestStrategyChange,
+}
+
+impl ForkSuggestionReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::DependencyUpgrade => "dependency_upgrade",
+            Self::SchemaMigration => "schema_migration",
+            Self::LargeRefactor => "large_refactor",
+            Self::DestructiveFileCleanup => "destructive_file_cleanup",
+            Self::LockfileChange => "lockfile_change",
+            Self::DestructiveDatabaseCommand => "destructive_database_command",
+            Self::TestStrategyChange => "test_strategy_change",
+        }
+    }
+
+    fn name_hint(self) -> &'static str {
+        match self {
+            Self::DependencyUpgrade => "try-upgrade",
+            Self::SchemaMigration => "try-migration",
+            Self::LargeRefactor => "try-refactor",
+            Self::DestructiveFileCleanup => "try-cleanup",
+            Self::LockfileChange => "try-lockfile-change",
+            Self::DestructiveDatabaseCommand => "try-db-change",
+            Self::TestStrategyChange => "try-test-plan",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DependencyUpgrade => "dependency upgrade",
+            Self::SchemaMigration => "schema migration",
+            Self::LargeRefactor => "large refactor",
+            Self::DestructiveFileCleanup => "destructive file cleanup",
+            Self::LockfileChange => "lockfile change",
+            Self::DestructiveDatabaseCommand => "destructive database command",
+            Self::TestStrategyChange => "test strategy change",
+        }
+    }
+}
+
+pub(crate) fn fork_suggestion_finding(
+    event: &AgentHookEvent,
+    subjects: &[PolicySubject],
+    current_run_id: Option<&str>,
+) -> Option<PolicyFinding> {
+    if event.hook_event_name.as_deref() != Some("PreToolUse") {
+        return None;
+    }
+    let command = event.tool_input_command.as_deref()?;
+    let reason = fork_suggestion_reason(command, subjects)?;
+    let name_hint = reason.name_hint();
+    let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
+        format!(
+            "This looks suitable for a forked run ({reason}); suggested: gensee run fork {run_id} --name {name_hint}; gensee run shell {name_hint}",
+            reason = reason.label()
+        )
+    } else {
+        format!(
+            "This looks suitable for a forked run ({reason}); start the agent with `gensee run --runtime tclone -- <agent>` to enable workspace forks",
+            reason = reason.label()
+        )
+    };
+    Some(PolicyFinding {
+        action: PolicyAction::Allow,
+        severity: "info".to_string(),
+        rule_id: "policy_fork_suggested".to_string(),
+        message,
+        path: event.cwd.clone(),
+        evidence: json!({
+            "source": "fork_suggestion",
+            "reason": reason.code(),
+            "suggested_name": name_hint,
+            "current_run_id": current_run_id,
+            "provider": event.provider,
+            "tool_name": event.tool_name.as_deref(),
+            "tool_use_id": event.tool_use_id.as_deref(),
+        }),
+    })
+}
+
+pub(crate) fn fork_suggestion_reason(
+    command: &str,
+    subjects: &[PolicySubject],
+) -> Option<ForkSuggestionReason> {
+    let normalized = normalize_command_for_matching(command);
+    if command_suggests_destructive_db(&normalized) {
+        return Some(ForkSuggestionReason::DestructiveDatabaseCommand);
+    }
+    if command_suggests_schema_migration(&normalized) {
+        return Some(ForkSuggestionReason::SchemaMigration);
+    }
+    if command_suggests_destructive_cleanup(&normalized) {
+        return Some(ForkSuggestionReason::DestructiveFileCleanup);
+    }
+    if command_suggests_dependency_upgrade(&normalized) {
+        return Some(ForkSuggestionReason::DependencyUpgrade);
+    }
+    if subjects.iter().any(|subject| {
+        policy_subject_is_mutating(&subject.operation) && path_is_lockfile(&subject.path)
+    }) || command_mentions_lockfile(&normalized)
+    {
+        return Some(ForkSuggestionReason::LockfileChange);
+    }
+    if command_suggests_large_refactor(&normalized) {
+        return Some(ForkSuggestionReason::LargeRefactor);
+    }
+    if command_suggests_test_strategy_change(&normalized) {
+        return Some(ForkSuggestionReason::TestStrategyChange);
+    }
+    None
+}
+
+fn normalize_command_for_matching(command: &str) -> String {
+    command
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn command_suggests_dependency_upgrade(command: &str) -> bool {
+    command_contains_any(
+        command,
+        &[
+            "npm update",
+            "npm upgrade",
+            "npm install",
+            "npm i ",
+            "pnpm update",
+            "pnpm upgrade",
+            "pnpm add",
+            "yarn upgrade",
+            "yarn up",
+            "yarn add",
+            "cargo update",
+            "pip install -u",
+            "pip3 install -u",
+            "poetry update",
+            "uv lock --upgrade",
+            "uv add",
+            "go get -u",
+            "bundle update",
+        ],
+    )
+}
+
+fn command_suggests_schema_migration(command: &str) -> bool {
+    command_contains_any(
+        command,
+        &[
+            "prisma migrate",
+            "rails db:migrate",
+            "rails db:reset",
+            "alembic upgrade",
+            "sequelize db:migrate",
+            "diesel migration run",
+            "typeorm migration:run",
+            "knex migrate",
+            "db:migrate",
+            "migrate deploy",
+            "migrate reset",
+        ],
+    )
+}
+
+fn command_suggests_large_refactor(command: &str) -> bool {
+    command_contains_any(
+        command,
+        &[
+            "codemod",
+            "jscodeshift",
+            "ruff --fix",
+            "eslint --fix",
+            "prettier --write",
+            "cargo fix",
+            "go fmt ./...",
+            "gofmt -w",
+            "rustfmt",
+        ],
+    )
+}
+
+fn command_suggests_destructive_cleanup(command: &str) -> bool {
+    command_contains_any(
+        command,
+        &[
+            "rm -rf",
+            "rm -fr",
+            "git clean -fd",
+            "git clean -df",
+            "find ",
+            " -delete",
+            "xargs rm",
+        ],
+    ) && (command.contains("rm -")
+        || command.contains("git clean")
+        || command.contains(" -delete")
+        || command.contains("xargs rm"))
+}
+
+fn command_suggests_destructive_db(command: &str) -> bool {
+    command_contains_any(
+        command,
+        &[
+            "drop table",
+            "drop database",
+            "truncate table",
+            "delete from",
+            "alter table",
+            "db:reset",
+            "migrate reset",
+            "prisma migrate reset",
+        ],
+    )
+}
+
+fn command_suggests_test_strategy_change(command: &str) -> bool {
+    command_contains_any(
+        command,
+        &[
+            "pytest -n",
+            "cargo test --workspace",
+            "npm test -- --updatesnapshot",
+            "npm test -- -u",
+            "jest -u",
+            "jest --updatesnapshot",
+            "vitest -u",
+            "vitest --updatesnapshot",
+        ],
+    )
+}
+
+fn command_mentions_lockfile(command: &str) -> bool {
+    LOCKFILE_NAMES
+        .iter()
+        .any(|lockfile| command.contains(lockfile))
+}
+
+fn path_is_lockfile(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| LOCKFILE_NAMES.contains(&name))
+}
+
+fn command_contains_any(command: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| command.contains(needle))
+}
+
+const LOCKFILE_NAMES: &[&str] = &[
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "cargo.lock",
+    "poetry.lock",
+    "uv.lock",
+    "go.sum",
+    "gemfile.lock",
+];
 
 pub(crate) fn adapt_decision_for_provider(
     mut decision: PolicyDecision,

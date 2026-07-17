@@ -5258,6 +5258,91 @@ fn policy_setup_action_parser_rejects_runtime_unsupported_warn() {
     assert!(parse_policy_action("warn").is_err());
 }
 
+#[test]
+fn fork_suggestion_detects_exploratory_command_families() {
+    let cases = [
+        (
+            "npm update && npm test",
+            ForkSuggestionReason::DependencyUpgrade,
+        ),
+        (
+            "alembic upgrade head",
+            ForkSuggestionReason::SchemaMigration,
+        ),
+        (
+            "jscodeshift -t transform.js src",
+            ForkSuggestionReason::LargeRefactor,
+        ),
+        (
+            "find . -name '*.tmp' -delete",
+            ForkSuggestionReason::DestructiveFileCleanup,
+        ),
+        (
+            "psql -c 'DROP TABLE users'",
+            ForkSuggestionReason::DestructiveDatabaseCommand,
+        ),
+        (
+            "cargo test --workspace",
+            ForkSuggestionReason::TestStrategyChange,
+        ),
+    ];
+
+    for (command, expected) in cases {
+        assert_eq!(fork_suggestion_reason(command, &[]), Some(expected));
+    }
+}
+
+#[test]
+fn fork_suggestion_detects_lockfile_writes_from_subjects() {
+    let subjects = vec![PolicySubject {
+        source: "bash",
+        operation: "write".to_string(),
+        path: "/repo/Cargo.lock".to_string(),
+    }];
+
+    assert_eq!(
+        fork_suggestion_reason("echo update > Cargo.lock", &subjects),
+        Some(ForkSuggestionReason::LockfileChange)
+    );
+}
+
+#[test]
+fn fork_suggestion_message_uses_current_run_id_when_available() {
+    let payload = pretool_bash_payload("s1", "/repo", "npm update");
+    let event = super::build_hook_event(&payload, PROVIDER_CLAUDE_CODE).unwrap();
+
+    let finding = fork_suggestion_finding(&event, &[], Some("run_123")).unwrap();
+
+    assert_eq!(finding.action, PolicyAction::Allow);
+    assert_eq!(finding.rule_id, "policy_fork_suggested");
+    assert!(finding
+        .message
+        .contains("gensee run fork run_123 --name try-upgrade"));
+    assert!(finding.message.contains("gensee run shell try-upgrade"));
+    assert_eq!(finding.evidence["reason"], json!("dependency_upgrade"));
+}
+
+#[test]
+fn hook_records_fork_suggestion_without_blocking() {
+    let (store, workspace) = temp_store_and_workspace("fork-suggestion");
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), "npm update");
+    let event = super::build_hook_event(&payload, PROVIDER_CLAUDE_CODE).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .expect("Claude Code PreToolUse should return allow output with reason");
+
+    assert!(output.contains("\"permissionDecision\":\"allow\""));
+    assert!(output.contains("forked run"));
+    let alerts = store.list_alerts().unwrap();
+    assert!(alerts.iter().any(|alert| {
+        alert.rule_id == "policy_fork_suggested"
+            && alert.action == "allow"
+            && alert.severity == "info"
+    }));
+    std::fs::remove_dir_all(workspace).ok();
+}
+
 fn test_resource_config() -> ResourceGovernanceConfig {
     ResourceGovernanceConfig {
         max_read_bytes: 4,

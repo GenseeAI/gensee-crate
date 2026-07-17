@@ -151,6 +151,9 @@ The default policy:
   persistence/startup files (`.bashrc`, `.zshrc`, `.profile`, `.gitconfig`,
   `.git/hooks/*`, `.vscode/tasks.json`), permission/ownership changes, wildcard
   file operations, and environment-variable dumps (`env`, `printenv`).
+- **suggests a forked run** for exploratory commands such as dependency
+  upgrades, migrations, broad refactors, lockfile changes, destructive cleanup,
+  test-strategy changes, and destructive database commands.
 
 Source files (`.rs`, `.ts`, `.go`, `.css`, …) are never treated as secrets, so
 `tokenizer.rs` or `secret_test.go` are not blocked. Set

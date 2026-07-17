@@ -61,6 +61,9 @@ Codex `PreToolUse`:
 - `allow` findings emit no hook output, so Codex proceeds normally.
 - `ask` findings are recorded as `warn` alerts and emit no hook output, so
   Codex proceeds while the dashboard/timeline still surfaces the concern.
+- Fork suggestions for exploratory commands are recorded as `allow` alerts in
+  the dashboard/timeline. Codex `PreToolUse` stays silent for these non-blocking
+  suggestions because Codex does not accept a visible allow-level message today.
 - `block` findings emit a Codex `deny`.
 
 Codex `PermissionRequest`:
