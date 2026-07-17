@@ -6,6 +6,7 @@ members = [
     "crate/gensee-crate-store",
     "crate/gensee-crate-macos",
     "crate/gensee-crate-linux",
+    "crate/gensee-crate-config-audit",
     "crate/gensee-crate-cli",
     "crate/gensee-crate-ml",
     "db",

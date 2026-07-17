@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crate-docs.gensee.ai/config-audit-report.schema.json",
+  "title": "Gensee Codex configuration audit report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ruleset",
+    "target",
+    "summary",
+    "sources",
+    "effective_security_config",
+    "inventory",
+    "findings",
+    "manual_checks",
+    "limitations"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "ruleset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "workspace", "codex_home", "surfaces"],
+      "properties": {
+        "provider": { "const": "codex" },
+        "workspace": { "type": "string" },
+        "codex_home": { "type": "string" },
+        "profile": { "type": "string" },
+        "codex_version": { "type": "string" },
+        "surfaces": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assessment", "counts", "manual_checks"],
+      "properties": {
+        "assessment": { "enum": ["complete", "partial"] },
+        "max_severity": { "$ref": "#/$defs/severity" },
+        "counts": {
+          "type": "object",
+          "required": ["critical", "high", "medium", "low", "info"],
+          "properties": {
+            "critical": { "type": "integer", "minimum": 0 },
+            "high": { "type": "integer", "minimum": 0 },
+            "medium": { "type": "integer", "minimum": 0 },
+            "low": { "type": "integer", "minimum": 0 },
+            "info": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "manual_checks": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/source" }
+    },
+    "effective_security_config": { "type": "object" },
+    "inventory": { "$ref": "#/$defs/inventory" },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "manual_checks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/manualCheck" }
+    },
+    "limitations": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "severity": {
+      "enum": ["critical", "high", "medium", "low", "info"]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "exists", "applied", "trusted"],
+      "properties": {
+        "kind": { "type": "string" },
+        "path": { "type": "string" },
+        "exists": { "type": "boolean" },
+        "applied": { "type": "boolean" },
+        "trusted": { "type": "boolean" },
+        "sha256": { "type": "string" },
+        "ignored_keys": { "type": "array", "items": { "type": "string" } },
+        "errors": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "properties": {
+        "source": { "type": "string" },
+        "key": { "type": "string" },
+        "value": { "type": "string" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fingerprint",
+        "rule_id",
+        "category",
+        "severity",
+        "confidence",
+        "assessment",
+        "title",
+        "description",
+        "remediation"
+      ],
+      "properties": {
+        "fingerprint": { "type": "string" },
+        "rule_id": { "type": "string" },
+        "category": { "type": "string" },
+        "severity": { "$ref": "#/$defs/severity" },
+        "confidence": { "enum": ["high", "medium", "low"] },
+        "assessment": { "enum": ["confirmed", "potential", "not_assessable"] },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+        "remediation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["summary"],
+          "properties": {
+            "summary": { "type": "string" },
+            "suggested_values": { "type": "object", "additionalProperties": { "type": "string" } }
+          }
+        },
+        "references": { "type": "array", "items": { "type": "string" } },
+        "mappings": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "skill": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path", "scope", "enabled", "has_scripts", "review_state"],
+      "properties": {
+        "name": { "type": "string" },
+        "path": { "type": "string" },
+        "scope": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "has_scripts": { "type": "boolean" },
+        "review_state": { "type": "string" },
+        "sha256": { "type": "string" }
+      }
+    },
+    "mcpServer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "transport", "enabled", "has_tool_allowlist"],
+      "properties": {
+        "id": { "type": "string" },
+        "transport": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "has_tool_allowlist": { "type": "boolean" },
+        "endpoint": { "type": "string" }
+      }
+    },
+    "inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "skills",
+        "mcp_servers",
+        "hook_commands",
+        "plugin_manifests",
+        "marketplace_files",
+        "rule_files",
+        "instruction_files",
+        "managed_requirement_files"
+      ],
+      "properties": {
+        "skills": { "type": "array", "items": { "$ref": "#/$defs/skill" } },
+        "mcp_servers": { "type": "array", "items": { "$ref": "#/$defs/mcpServer" } },
+        "hook_commands": { "type": "integer", "minimum": 0 },
+        "plugin_manifests": { "type": "integer", "minimum": 0 },
+        "marketplace_files": { "type": "integer", "minimum": 0 },
+        "rule_files": { "type": "integer", "minimum": 0 },
+        "instruction_files": { "type": "integer", "minimum": 0 },
+        "managed_requirement_files": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "manualCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_id", "priority", "title", "reason", "action"],
+      "properties": {
+        "check_id": { "type": "string" },
+        "priority": { "type": "string" },
+        "title": { "type": "string" },
+        "reason": { "type": "string" },
+        "action": { "type": "string" },
+        "references": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
