@@ -1462,12 +1462,25 @@ if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
 fi
 base="${GENSEE_GIT_MERGE_BASE:-HEAD}"
 if git rev-parse --verify "$base^{commit}" >/dev/null 2>&1; then
-  git diff --binary "$base"
+  git diff --binary "$base" -- . \
+    ':(exclude)gensee.db' \
+    ':(exclude)gensee.db-wal' \
+    ':(exclude)gensee.db-shm' \
+    ':(exclude)gensee.key' \
+    ':(exclude)telemetry.json'
 else
   echo "gensee: warning: fork git merge base '$base' is unavailable; falling back to git diff HEAD" >&2
-  git diff --binary HEAD
+  git diff --binary HEAD -- . \
+    ':(exclude)gensee.db' \
+    ':(exclude)gensee.db-wal' \
+    ':(exclude)gensee.db-shm' \
+    ':(exclude)gensee.key' \
+    ':(exclude)telemetry.json'
 fi
 while IFS= read -r -d '' file; do
+  case "$file" in
+    gensee.db|gensee.db-wal|gensee.db-shm|gensee.key|telemetry.json) continue ;;
+  esac
   git diff --binary --no-index -- /dev/null "$file" || true
 done < <(git ls-files --others --exclude-standard -z)
 "#;
@@ -2127,7 +2140,18 @@ fn copy_path_all(source: &Path, destination: &Path) -> io::Result<()> {
 
 fn should_skip_tclone_workspace_entry(name: &str) -> bool {
     // Applied at every workspace depth to avoid copying bulky build/dependency trees.
-    matches!(name, "target" | "node_modules" | ".gensee" | ".gensee-dev") || name.ends_with(".tmp")
+    matches!(
+        name,
+        "target"
+            | "node_modules"
+            | ".gensee"
+            | ".gensee-dev"
+            | "gensee.db"
+            | "gensee.db-wal"
+            | "gensee.db-shm"
+            | "gensee.key"
+            | "telemetry.json"
+    ) || name.ends_with(".tmp")
 }
 
 fn tclone_node_mount() -> Option<(PathBuf, PathBuf)> {
@@ -2577,6 +2601,11 @@ mod tests {
         assert!(should_skip_tclone_workspace_entry("target"));
         assert!(should_skip_tclone_workspace_entry("node_modules"));
         assert!(should_skip_tclone_workspace_entry(".gensee"));
+        assert!(should_skip_tclone_workspace_entry("gensee.db"));
+        assert!(should_skip_tclone_workspace_entry("gensee.db-wal"));
+        assert!(should_skip_tclone_workspace_entry("gensee.db-shm"));
+        assert!(should_skip_tclone_workspace_entry("gensee.key"));
+        assert!(should_skip_tclone_workspace_entry("telemetry.json"));
         assert!(should_skip_tclone_workspace_entry("scratch.tmp"));
         assert!(!should_skip_tclone_workspace_entry(".git"));
         assert!(!should_skip_tclone_workspace_entry("src"));
