@@ -1044,6 +1044,98 @@ fn compatibility_payload_provider_does_not_trust_timestamp_alone_or_guess_codex(
 }
 
 #[test]
+fn imported_cursor_hook_is_suppressed_only_when_native_event_is_configured() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "cursor-session",
+        "cursor_version": "3.11.19",
+        "tool_name": "Read",
+        "tool_use_id": "tool-1"
+    })
+    .to_string();
+
+    let suppressed = route_hook_invocation(
+        PROVIDER_CLAUDE_CODE,
+        &payload,
+        |native_provider, checked_payload| {
+            assert_eq!(native_provider, PROVIDER_CURSOR);
+            assert_eq!(checked_payload, payload);
+            true
+        },
+    );
+    assert_eq!(
+        suppressed,
+        HookInvocationRoute::Suppress {
+            native_provider: PROVIDER_CURSOR
+        }
+    );
+
+    let fallback = route_hook_invocation(PROVIDER_CLAUDE_CODE, &payload, |_, _| false);
+    assert_eq!(fallback, HookInvocationRoute::ProcessAs(PROVIDER_CURSOR));
+}
+
+#[test]
+fn native_cursor_events_are_never_suppressed_even_when_tool_ids_repeat() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "cursor-session",
+        "cursor_version": "3.11.19",
+        "tool_name": "Read",
+        "tool_use_id": "reused-terminal-poll-id",
+        "tool_input": {
+            "filePath": "/home/user/.cursor/projects/project/terminals/1.txt"
+        }
+    })
+    .to_string();
+
+    for _ in 0..10 {
+        let route = route_hook_invocation(PROVIDER_CURSOR, &payload, |_, _| {
+            panic!("native config lookup must not run for an already-native invocation")
+        });
+        assert_eq!(route, HookInvocationRoute::ProcessAs(PROVIDER_CURSOR));
+    }
+}
+
+#[test]
+fn compatibility_routing_is_not_hardcoded_to_the_claude_entrypoint() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-session",
+        "timestamp": "2026-07-17T19:42:00.000Z",
+        "tool_name": "read_file",
+        "tool_use_id": "call_123__vscode-1784317320000"
+    })
+    .to_string();
+
+    let route = route_hook_invocation(PROVIDER_CODEX, &payload, |native_provider, _| {
+        assert_eq!(native_provider, PROVIDER_VSCODE);
+        true
+    });
+    assert_eq!(
+        route,
+        HookInvocationRoute::Suppress {
+            native_provider: PROVIDER_VSCODE
+        }
+    );
+}
+
+#[test]
+fn ordinary_provider_payloads_bypass_compatibility_config_lookup() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-1"
+    })
+    .to_string();
+
+    let route = route_hook_invocation(PROVIDER_CLAUDE_CODE, &payload, |_, _| {
+        panic!("ordinary provider payload must not trigger native config lookup")
+    });
+    assert_eq!(route, HookInvocationRoute::ProcessAs(PROVIDER_CLAUDE_CODE));
+}
+
+#[test]
 fn native_hook_detection_is_provider_and_event_specific_across_config_shapes() {
     let vscode = json!({
         "hooks": {

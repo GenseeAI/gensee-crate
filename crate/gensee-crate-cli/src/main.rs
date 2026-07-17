@@ -3444,31 +3444,59 @@ pub(crate) fn ingest_eslogger() -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HookInvocationRoute<'a> {
+    ProcessAs(&'a str),
+    Suppress { native_provider: &'static str },
+}
+
+fn route_hook_invocation<'a>(
+    provider: &'a str,
+    payload: &str,
+    native_hook_configured: impl FnOnce(&'static str, &str) -> bool,
+) -> HookInvocationRoute<'a> {
+    let Some(native_provider) = compatibility_payload_provider(payload) else {
+        return HookInvocationRoute::ProcessAs(provider);
+    };
+    if native_provider == provider {
+        return HookInvocationRoute::ProcessAs(provider);
+    }
+    if native_hook_configured(native_provider, payload) {
+        HookInvocationRoute::Suppress { native_provider }
+    } else {
+        HookInvocationRoute::ProcessAs(native_provider)
+    }
+}
+
 pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     let mut payload = String::new();
     io::stdin().read_to_string(&mut payload)?;
 
-    let mut effective_provider = provider;
-    if let Some(native_provider) = compatibility_payload_provider(&payload) {
-        if native_provider != provider {
-            match native_gensee_hook_configured(native_provider, &payload) {
-                Ok(true) => {
-                    telemetry_record_hook_compatibility_suppressed(provider, native_provider);
-                    return Ok(());
-                }
-                Ok(false) => effective_provider = native_provider,
-                Err(error) => {
-                    // A broken or unreadable native config is not evidence that
-                    // the native hook will run. Preserve enforcement by handling
-                    // this compatibility invocation through the native parser.
-                    eprintln!(
-                        "gensee hook: cannot verify {native_provider} native hook config ({error}); processing the compatibility invocation"
-                    );
-                    effective_provider = native_provider;
-                }
+    let mut config_error = None;
+    let route = route_hook_invocation(provider, &payload, |native_provider, payload| {
+        match native_gensee_hook_configured(native_provider, payload) {
+            Ok(configured) => configured,
+            Err(error) => {
+                config_error = Some((native_provider, error));
+                false
             }
         }
+    });
+    if let Some((native_provider, error)) = config_error {
+        // A broken or unreadable native config is not evidence that the native
+        // hook will run. Preserve enforcement by handling this compatibility
+        // invocation through the native parser.
+        eprintln!(
+            "gensee hook: cannot verify {native_provider} native hook config ({error}); processing the compatibility invocation"
+        );
     }
+    let effective_provider = match route {
+        HookInvocationRoute::ProcessAs(provider) => provider,
+        HookInvocationRoute::Suppress { native_provider } => {
+            telemetry_record_hook_compatibility_suppressed(provider, native_provider);
+            return Ok(());
+        }
+    };
 
     let event = build_hook_event(&payload, effective_provider)?;
 
