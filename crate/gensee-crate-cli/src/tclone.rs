@@ -717,21 +717,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             forked_at_ms
         )
     });
-    let clone_args = vec![
-        OsString::from("container"),
-        OsString::from("clone"),
-        OsString::from("--live"),
-        OsString::from(format!("--copies={copies}")),
-        OsString::from("--persistent=async"),
-        OsString::from("--tfork-overlay-btrfs"),
-        OsString::from("--tfork-tcp-close"),
-        OsString::from("--tfork-ghost-limit=67108864"),
-        OsString::from("--name"),
-        OsString::from(&prefix),
-        OsString::from(&source.container_name),
-    ];
-    let output =
-        run_command_capture_with_env(&podman, &clone_args, &[("PODMAN_TFORK_NO_REAP", "1")])?;
+    let output = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
     let ids = output
         .lines()
         .map(str::trim)
@@ -835,6 +821,59 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+fn run_tclone_clone_with_overlay_retry(
+    podman: &OsString,
+    copies: usize,
+    prefix: &str,
+    source: &TcloneRunRecord,
+) -> io::Result<String> {
+    let use_overlay = env::var("GENSEE_TCLONE_OVERLAY_BTRFS")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true);
+    let clone_args = tclone_clone_args(copies, prefix, &source.container_name, use_overlay);
+    match run_command_capture_with_env(podman, &clone_args, &[("PODMAN_TFORK_NO_REAP", "1")]) {
+        Ok(output) => Ok(output),
+        Err(error) if use_overlay && should_retry_tclone_without_overlay(&error.to_string()) => {
+            eprintln!(
+                "gensee: tclone overlay-btrfs clone failed; retrying without --tfork-overlay-btrfs"
+            );
+            let fallback_args = tclone_clone_args(copies, prefix, &source.container_name, false);
+            run_command_capture_with_env(podman, &fallback_args, &[("PODMAN_TFORK_NO_REAP", "1")])
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn tclone_clone_args(
+    copies: usize,
+    prefix: &str,
+    source_container: &str,
+    overlay_btrfs: bool,
+) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("container"),
+        OsString::from("clone"),
+        OsString::from("--live"),
+        OsString::from(format!("--copies={copies}")),
+        OsString::from("--persistent=async"),
+        OsString::from("--tfork-tcp-close"),
+        OsString::from("--tfork-ghost-limit=67108864"),
+        OsString::from("--name"),
+        OsString::from(prefix),
+        OsString::from(source_container),
+    ];
+    if overlay_btrfs {
+        args.insert(5, OsString::from("--tfork-overlay-btrfs"));
+    }
+    args
+}
+
+fn should_retry_tclone_without_overlay(error: &str) -> bool {
+    error.contains("spawn conmon for tfork")
+        || error.contains("conmon reported pid=-1")
+        || error.contains("clone setup failed")
 }
 
 pub(crate) fn tclone_shell(args: Vec<OsString>) -> io::Result<()> {
@@ -3682,6 +3721,27 @@ mod tests {
             Some(value) => env::set_var("GENSEE_WORKSPACE", value),
             None => env::remove_var("GENSEE_WORKSPACE"),
         }
+    }
+
+    #[test]
+    fn tclone_clone_args_can_disable_overlay_btrfs() {
+        let overlay = tclone_clone_args(2, "fork-prefix", "source", true);
+        assert!(overlay.contains(&OsString::from("--tfork-overlay-btrfs")));
+        assert!(overlay.contains(&OsString::from("--copies=2")));
+
+        let fallback = tclone_clone_args(2, "fork-prefix", "source", false);
+        assert!(!fallback.contains(&OsString::from("--tfork-overlay-btrfs")));
+        assert!(fallback.contains(&OsString::from("--copies=2")));
+    }
+
+    #[test]
+    fn tclone_overlay_retry_detects_conmon_setup_failure() {
+        assert!(should_retry_tclone_without_overlay(
+            "tfork: clone setup failed (spawn conmon for tfork: conmon reported pid=-1)"
+        ));
+        assert!(!should_retry_tclone_without_overlay(
+            "podman exited with status 125: container not found"
+        ));
     }
 
     #[test]
