@@ -154,6 +154,49 @@ fn telemetry_records_vscode_file_tool_schema_drift() {
 }
 
 #[test]
+fn telemetry_records_cursor_file_tool_schema_drift() {
+    let _guard = telemetry_test_lock();
+    let root = telemetry_test_root("cursor-schema-drift");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    env::set_var("GENSEE_HOME", &root);
+    env::set_var("GENSEE_TELEMETRY_REMOTE", "0");
+
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "cursor-session",
+        "tool_name": "moveFileV2",
+        "tool_input": { "filePath": "/workspace/src/target.ts" },
+        "tool_use_id": "tool-1",
+        "cwd": "/workspace"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    telemetry_record_policy_event(&event, &decision, &[]);
+
+    let events = fs::read_to_string(root.join("telemetry-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let drift = events
+        .iter()
+        .find(|event| event["event_name"] == json!("hook_schema_drift"))
+        .expect("schema drift should emit a dedicated telemetry event");
+    assert_eq!(drift["props"]["provider"], json!(PROVIDER_CURSOR));
+    assert_eq!(
+        drift["props"]["rule_id"],
+        json!("policy_unparsed_cursor_file_tool")
+    );
+
+    env::remove_var("GENSEE_TELEMETRY_REMOTE");
+    env::remove_var("GENSEE_HOME");
+    let _ = fs::remove_dir_all(&root);
+}
+#[test]
 fn telemetry_defaults_remote_upload_off_during_tests() {
     let _guard = telemetry_test_lock();
     let root = telemetry_test_root("test-defaults");
@@ -420,6 +463,383 @@ fn codex_hook_command_quotes_paths_with_spaces() {
     assert_eq!(
         command,
         "GENSEE_HOME='/Users/example/Gensee Store' '/Applications/Gensee Crate/gensee' hook codex"
+    );
+}
+
+#[test]
+fn cursor_setup_adds_version_and_hooks_preserving_existing() {
+    let mut settings = json!({
+        "version": 1,
+        "hooks": {
+            "afterFileEdit": [{ "command": "./format.sh" }]
+        }
+    });
+
+    apply_cursor_hook_settings(
+        &mut settings,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook cursor",
+    )
+    .unwrap();
+
+    assert_eq!(settings["version"], json!(1));
+    // Unrelated hook must survive.
+    assert_eq!(
+        settings["hooks"]["afterFileEdit"][0]["command"],
+        json!("./format.sh")
+    );
+    for event_name in [
+        "preToolUse",
+        "postToolUse",
+        "beforeShellExecution",
+        "beforeSubmitPrompt",
+        "stop",
+    ] {
+        assert_eq!(
+            settings["hooks"][event_name][0]["command"],
+            json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook cursor")
+        );
+        assert_eq!(settings["hooks"][event_name][0]["timeout"], json!(30));
+    }
+}
+
+#[test]
+fn cursor_setup_inserts_version_when_missing() {
+    let mut settings = json!({});
+    apply_cursor_hook_settings(
+        &mut settings,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook cursor",
+    )
+    .unwrap();
+    assert_eq!(settings["version"], json!(1));
+}
+
+#[test]
+fn cursor_setup_skips_unchanged_backup_and_atomic_rewrite() {
+    let root = env::temp_dir().join(format!(
+        "gensee-cursor-setup-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let hooks_path = root.join("hooks.json");
+    let command = "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook cursor";
+
+    assert!(write_cursor_hook_settings(&hooks_path, command).unwrap());
+    assert!(!write_cursor_hook_settings(&hooks_path, command).unwrap());
+
+    let entries = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, vec!["hooks.json"]);
+    serde_json::from_str::<Value>(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cursor_hook_command_quotes_paths_with_spaces() {
+    let command = cursor_hook_command(
+        Path::new("/Users/example/Gensee Store"),
+        Path::new("/Applications/Gensee Crate/gensee"),
+    );
+
+    assert_eq!(
+        command,
+        "GENSEE_HOME='/Users/example/Gensee Store' '/Applications/Gensee Crate/gensee' hook cursor"
+    );
+}
+
+#[test]
+fn cursor_hook_event_normalizes_event_names_and_maps_conversation_id() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "conv-abc123",
+        "tool_name": "Shell",
+        "tool_use_id": "use-1",
+        "tool_input": { "command": "npm test", "working_directory": "/project" },
+        "cwd": "/project",
+        "workspace_roots": ["/project"],
+        "model": "claude-sonnet-4-5",
+        "cursor_version": "1.7.2"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+
+    assert_eq!(event.provider, PROVIDER_CURSOR);
+    assert_eq!(event.hook_event_name.as_deref(), Some("PreToolUse"));
+    assert_eq!(event.session_id.as_deref(), Some("conv-abc123"));
+    assert_eq!(event.tool_name.as_deref(), Some("Shell"));
+    assert_eq!(event.tool_input_command.as_deref(), Some("npm test"));
+    assert_eq!(event.cwd.as_deref(), Some("/project"));
+}
+
+#[test]
+fn cursor_native_subjects_parse_camel_case_path_and_delete() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "conv-abc123",
+        "tool_name": "Delete",
+        "tool_use_id": "use-1",
+        "tool_input": { "filePath": "/project/obsolete.txt" },
+        "cwd": "/project"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+
+    let subjects = native_policy_subjects(&event);
+
+    assert_eq!(subjects.len(), 1);
+    assert_eq!(subjects[0].operation, "delete");
+    assert_eq!(subjects[0].path, "/project/obsolete.txt");
+}
+
+#[test]
+fn cursor_unknown_file_tool_asks_for_review() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "conv-abc123",
+        "tool_name": "moveFileV2",
+        "tool_use_id": "use-1",
+        "tool_input": { "filePath": "/project/target.txt" },
+        "cwd": "/project"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert_eq!(decision.action, PolicyAction::Ask);
+    assert!(decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_cursor_file_tool"));
+}
+
+#[test]
+fn cursor_malformed_known_file_tool_asks_for_review() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "conv-abc123",
+        "tool_name": "Write",
+        "tool_use_id": "use-1",
+        "tool_input": { "filePath": { "unexpected": "shape" } },
+        "cwd": "/project"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert_eq!(decision.action, PolicyAction::Ask);
+    assert!(decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_cursor_file_tool"));
+}
+
+#[test]
+fn cursor_unknown_non_file_tool_does_not_trigger_file_drift_guard() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "conv-abc123",
+        "tool_name": "searchWorkspaceSymbols",
+        "tool_use_id": "use-1",
+        "tool_input": { "query": "PolicyDecision" },
+        "cwd": "/project"
+    })
+    .to_string();
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+
+    let decision = evaluate_pretool_policy(&event, &[]);
+
+    assert!(!decision
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "policy_unparsed_cursor_file_tool"));
+}
+
+#[test]
+fn cursor_before_shell_execution_normalized_to_permission_request() {
+    let payload = json!({
+        "hook_event_name": "beforeShellExecution",
+        "conversation_id": "conv-xyz",
+        "command": "cat ./secret.txt",
+        "cwd": "",
+        "workspace_roots": ["", "/project"],
+        "sandbox": false,
+        "cursor_version": "1.7.2"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+
+    assert_eq!(event.hook_event_name.as_deref(), Some("PermissionRequest"));
+    assert_eq!(event.tool_name.as_deref(), Some("Shell"));
+    assert_eq!(
+        event.tool_input_command.as_deref(),
+        Some("cat ./secret.txt")
+    );
+    assert_eq!(
+        original_bash_command(&payload).as_deref(),
+        Some("cat ./secret.txt")
+    );
+    assert_eq!(event.cwd.as_deref(), Some("/project"));
+    assert_eq!(
+        file_intents_from_hook(&event, original_bash_command(&payload).as_deref())[0].path,
+        "/project/secret.txt"
+    );
+}
+
+#[test]
+fn cursor_before_submit_prompt_normalized_to_user_prompt_submit() {
+    let payload = json!({
+        "hook_event_name": "beforeSubmitPrompt",
+        "conversation_id": "conv-xyz",
+        "prompt": "Write tests for the auth module",
+        "workspace_roots": ["/project"],
+        "cursor_version": "1.7.2"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+
+    assert_eq!(event.hook_event_name.as_deref(), Some("UserPromptSubmit"));
+    assert_eq!(event.session_id.as_deref(), Some("conv-xyz"));
+    assert_eq!(event.cwd.as_deref(), Some("/project"));
+}
+
+#[test]
+fn cursor_pretool_allow_emits_no_output() {
+    let decision = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+    let output = decision_json_for_provider(&decision, PROVIDER_CURSOR, "PreToolUse");
+    assert!(
+        output.is_none(),
+        "Cursor PreToolUse allow should produce no output: {output:?}"
+    );
+}
+
+#[test]
+fn cursor_pretool_deny_emits_flat_permission_object() {
+    let decision = PolicyDecision {
+        action: PolicyAction::Block,
+        findings: vec![PolicyFinding {
+            action: PolicyAction::Block,
+            severity: "high".to_string(),
+            rule_id: "policy_write_outside_workspace".to_string(),
+            message: "Write outside workspace".to_string(),
+            path: Some("/etc/passwd".to_string()),
+            evidence: json!({}),
+        }],
+    };
+    let output = decision_json_for_provider(&decision, PROVIDER_CURSOR, "PreToolUse")
+        .expect("Block should produce output");
+    let parsed: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(parsed["permission"], json!("deny"));
+    assert!(parsed["user_message"].is_string());
+    assert!(parsed["agent_message"].is_string());
+    // Must NOT use the Claude Code hookSpecificOutput envelope.
+    assert!(parsed.get("hookSpecificOutput").is_none());
+}
+
+#[test]
+fn cursor_permission_request_ask_emits_ask_permission() {
+    let decision = PolicyDecision {
+        action: PolicyAction::Ask,
+        findings: vec![PolicyFinding {
+            action: PolicyAction::Ask,
+            severity: "medium".to_string(),
+            rule_id: "policy_write_outside_workspace".to_string(),
+            message: "Write outside workspace".to_string(),
+            path: None,
+            evidence: json!({}),
+        }],
+    };
+    let output = decision_json_for_provider(&decision, PROVIDER_CURSOR, "PermissionRequest")
+        .expect("Ask on PermissionRequest should produce output");
+    let parsed: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(parsed["permission"], json!("ask"));
+}
+
+#[test]
+fn cursor_cwd_falls_back_to_workspace_roots() {
+    let payload = json!({
+        "hook_event_name": "postToolUse",
+        "conversation_id": "conv-1",
+        "tool_name": "Shell",
+        "cwd": "   ",
+        "workspace_roots": ["", "   ", "/workspace/project"],
+        "cursor_version": "1.7.2"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+    assert_eq!(event.cwd.as_deref(), Some("/workspace/project"));
+}
+
+#[test]
+fn cursor_cwd_prefers_tool_input_working_directory_over_workspace_roots() {
+    // Cursor Shell preToolUse may omit top-level `cwd` but include
+    // tool_input.working_directory. Relative path intents must be evaluated
+    // against the shell's actual working directory, not the workspace root.
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "conv-1",
+        "tool_name": "Shell",
+        "tool_input": {
+            "command": "cat secret.txt",
+            "working_directory": "/project/subdir"
+        },
+        "cwd": "",
+        "tool_use_id": "use-1",
+        "workspace_roots": ["/project"],
+        "cursor_version": "1.7.2"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+    // Must use working_directory, not workspace_roots[0].
+    assert_eq!(event.cwd.as_deref(), Some("/project/subdir"));
+}
+
+#[test]
+fn cursor_cwd_accepts_tool_input_cwd_alias() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "conv-1",
+        "tool_name": "Shell",
+        "tool_input": {
+            "command": "cat secret.txt",
+            "working_directory": "",
+            "cwd": "/project/subdir"
+        },
+        "cwd": "",
+        "tool_use_id": "use-1",
+        "workspace_roots": ["/project"],
+        "cursor_version": "1.7.2"
+    })
+    .to_string();
+
+    let event = super::build_hook_event(&payload, PROVIDER_CURSOR).unwrap();
+    assert_eq!(event.cwd.as_deref(), Some("/project/subdir"));
+}
+
+#[test]
+fn cursor_beforesubmitprompt_poison_json_includes_user_message() {
+    let output = cursor_beforesubmitprompt_poison_json();
+    let parsed: Value = serde_json::from_str(&output).unwrap();
+    // Must allow the prompt through (non-blocking).
+    assert_eq!(parsed["continue"], json!(true));
+    // Must include a user_message so Cursor can surface it if it ever widens
+    // the display condition beyond "blocked only".
+    assert!(
+        parsed["user_message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "user_message must be non-empty: {parsed}"
     );
 }
 

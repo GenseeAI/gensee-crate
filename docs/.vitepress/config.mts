@@ -62,7 +62,8 @@ export default defineConfig({
           { text: 'Claude Code Hooks', link: '/claude-code-hooks' },
           { text: 'Codex Hooks', link: '/codex-support' },
           { text: 'Antigravity Support', link: '/antigravity-support' },
-          { text: 'VS Code / GitHub Copilot', link: '/vscode-support' }
+          { text: 'VS Code / GitHub Copilot', link: '/vscode-support' },
+          { text: 'Cursor Hooks', link: '/cursor-support' }
         ]
       },
       {

@@ -532,18 +532,19 @@ pub(crate) fn telemetry_record_policy_event(
         }),
     );
 
-    if decision
-        .findings
-        .iter()
-        .any(|finding| finding.rule_id == "policy_unparsed_vscode_file_tool")
-    {
+    if let Some(drift_finding) = decision.findings.iter().find(|finding| {
+        matches!(
+            finding.rule_id.as_str(),
+            "policy_unparsed_vscode_file_tool" | "policy_unparsed_cursor_file_tool"
+        )
+    }) {
         let _ = client.record_event(
             "hook_schema_drift",
             json!({
                 "provider": event.provider,
                 "hook_event_name": event.hook_event_name,
                 "tool_category": tool_category,
-                "rule_id": "policy_unparsed_vscode_file_tool",
+                "rule_id": drift_finding.rule_id,
             }),
         );
     }

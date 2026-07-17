@@ -37,11 +37,16 @@ pub(crate) const PROVIDER_CLAUDE_CODE: &str = "claude-code";
 pub(crate) const PROVIDER_CODEX: &str = "codex";
 pub(crate) const PROVIDER_ANTIGRAVITY: &str = "antigravity";
 pub(crate) const PROVIDER_VSCODE: &str = "vscode";
+pub(crate) const PROVIDER_CURSOR: &str = "cursor";
 
 pub(crate) fn is_supported_provider(provider: &str) -> bool {
     matches!(
         provider,
-        PROVIDER_CLAUDE_CODE | PROVIDER_CODEX | PROVIDER_ANTIGRAVITY | PROVIDER_VSCODE
+        PROVIDER_CLAUDE_CODE
+            | PROVIDER_CODEX
+            | PROVIDER_ANTIGRAVITY
+            | PROVIDER_VSCODE
+            | PROVIDER_CURSOR
     )
 }
 
@@ -805,9 +810,10 @@ pub(crate) fn handle_hook(args: Vec<OsString>) -> io::Result<()> {
         Some("codex") => handle_agent_hook(PROVIDER_CODEX),
         Some("antigravity") => handle_agent_hook(PROVIDER_ANTIGRAVITY),
         Some("vscode") => handle_agent_hook(PROVIDER_VSCODE),
+        Some("cursor") => handle_agent_hook(PROVIDER_CURSOR),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee hook <claude-code|codex|antigravity|vscode>",
+            "usage: gensee hook <claude-code|codex|antigravity|vscode|cursor>",
         )),
     }
 }
@@ -818,9 +824,10 @@ pub(crate) fn handle_setup(args: Vec<OsString>) -> io::Result<()> {
         Some("codex") => setup_codex(args[1..].to_vec()),
         Some("antigravity") => setup_antigravity(args[1..].to_vec()),
         Some("vscode") => setup_vscode(args[1..].to_vec()),
+        Some("cursor") => setup_cursor(args[1..].to_vec()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee setup <claude-code|codex|antigravity|vscode> [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
+            "usage: gensee setup <claude-code|codex|antigravity|vscode|cursor> [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
         )),
     }
 }
@@ -1242,6 +1249,201 @@ pub(crate) fn apply_vscode_hook_settings(root: &mut Value, command: &str) -> io:
 fn vscode_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
     format!(
         "GENSEE_HOME={} {} hook vscode",
+        shell_quote(&gensee_home.display().to_string()),
+        shell_quote(&bin_path.display().to_string())
+    )
+}
+
+fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let mut hooks_path = home.join(".cursor").join("hooks.json");
+    let mut gensee_home = env::var_os("GENSEE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(default_root()?);
+    let mut bin_path = env::current_exe()?;
+
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
+        })?;
+        match arg {
+            "--yes" => {
+                index += 1;
+            }
+            "--gensee-home" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "setup: --gensee-home requires a path",
+                    )
+                })?;
+                gensee_home = PathBuf::from(value);
+                index += 2;
+            }
+            "--hooks" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "setup: --hooks requires a path",
+                    )
+                })?;
+                hooks_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--bin" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "setup: --bin requires a path")
+                })?;
+                bin_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: gensee setup cursor [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                );
+                return Ok(());
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("setup: unknown argument `{arg}`"),
+                ));
+            }
+        }
+    }
+
+    gensee_home = absolutize_for_hook(&gensee_home)?;
+    bin_path = absolutize_for_hook(&bin_path)?;
+    let command = cursor_hook_command(&gensee_home, &bin_path);
+    write_cursor_hook_settings(&hooks_path, &command)?;
+
+    println!(
+        "gensee setup: configured Cursor hooks in {}",
+        hooks_path.display()
+    );
+    println!("gensee setup: hook command: {command}");
+    println!("gensee setup: fully restart Cursor before testing enforcement.");
+    Ok(())
+}
+
+fn write_cursor_hook_settings(hooks_path: &Path, command: &str) -> io::Result<bool> {
+    let existing_contents = if hooks_path.exists() {
+        Some(fs::read_to_string(hooks_path)?)
+    } else {
+        None
+    };
+    let mut root = if let Some(contents) = existing_contents.as_deref() {
+        if contents.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(contents).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not valid JSON: {err}", hooks_path.display()),
+                )
+            })?
+        }
+    } else {
+        json!({})
+    };
+    apply_cursor_hook_settings(&mut root, command)?;
+
+    let serialized = serde_json::to_string_pretty(&root)?;
+    let updated_contents = format!("{serialized}\n");
+    if existing_contents.as_deref() == Some(updated_contents.as_str()) {
+        return Ok(false);
+    }
+
+    if let Some(parent) = hooks_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    if existing_contents.is_some() {
+        let backup = backup_path(hooks_path)?;
+        fs::copy(hooks_path, &backup)?;
+        println!(
+            "gensee setup: backed up previous hooks to {}",
+            backup.display()
+        );
+    }
+    write_file_atomically(hooks_path, updated_contents.as_bytes())?;
+    Ok(true)
+}
+
+fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| io::Error::other(err.to_string()))?
+        .as_nanos();
+    let temp_path = parent.join(format!(".{file_name}.tmp.{}.{nonce}", std::process::id()));
+
+    let result = (|| {
+        let mut temp = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        temp.write_all(contents)?;
+        temp.sync_all()?;
+        if let Ok(metadata) = fs::metadata(path) {
+            fs::set_permissions(&temp_path, metadata.permissions())?;
+        }
+        fs::rename(&temp_path, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+pub(crate) fn apply_cursor_hook_settings(root: &mut Value, command: &str) -> io::Result<()> {
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Cursor hooks must be a JSON object",
+        )
+    })?;
+    root_object.entry("version".to_string()).or_insert(json!(1));
+    let hooks = root_object
+        .entry("hooks".to_string())
+        .or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let hooks_object = hooks.as_object_mut().expect("hooks is an object");
+    let hook_entry = json!([
+        {
+            "command": command,
+            "timeout": 30
+        }
+    ]);
+    for event_name in [
+        "preToolUse",
+        "postToolUse",
+        "beforeShellExecution",
+        "beforeSubmitPrompt",
+        "stop",
+    ] {
+        hooks_object.insert(event_name.to_string(), hook_entry.clone());
+    }
+    Ok(())
+}
+
+fn cursor_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
+    format!(
+        "GENSEE_HOME={} {} hook cursor",
         shell_quote(&gensee_home.display().to_string()),
         shell_quote(&bin_path.display().to_string())
     )
@@ -3123,6 +3325,8 @@ pub(crate) fn process_hook_event(
             // injects `additionalContext` for the model instead.
             if event.provider == PROVIDER_VSCODE {
                 Ok(Some(vscode_userpromptsubmit_poison_json()))
+            } else if event.provider == PROVIDER_CURSOR {
+                Ok(Some(cursor_beforesubmitprompt_poison_json()))
             } else {
                 Ok(Some(userprompt_poison_context_json()))
             }
@@ -3218,6 +3422,6 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 
 pub(crate) fn print_usage() {
     println!(
-        "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run exec <run_id-or-container> -- <command> [args...]\n  gensee run diff <run_id-or-container>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run fork run_123 --copies 2 --attach tmux:right\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
+        "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run exec <run_id-or-container> -- <command> [args...]\n  gensee run diff <run_id-or-container>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run fork run_123 --copies 2 --attach tmux:right\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
     );
 }
