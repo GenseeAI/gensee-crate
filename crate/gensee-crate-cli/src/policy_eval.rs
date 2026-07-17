@@ -341,7 +341,9 @@ fn command_suggests_dependency_upgrade(command: &str) -> bool {
             "yarn add",
             "cargo update",
             "pip install -u",
+            "pip install --upgrade",
             "pip3 install -u",
+            "pip3 install --upgrade",
             "poetry update",
             "uv lock --upgrade",
             "uv add",
@@ -395,14 +397,10 @@ fn command_suggests_destructive_cleanup(command: &str) -> bool {
             "rm -fr",
             "git clean -fd",
             "git clean -df",
-            "find ",
             " -delete",
             "xargs rm",
         ],
-    ) && (command.contains("rm -")
-        || command.contains("git clean")
-        || command.contains(" -delete")
-        || command.contains("xargs rm"))
+    )
 }
 
 fn command_suggests_destructive_db(command: &str) -> bool {
@@ -447,7 +445,8 @@ fn path_is_lockfile(path: &str) -> bool {
     Path::new(path)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| LOCKFILE_NAMES.contains(&name))
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|name| LOCKFILE_NAMES.contains(&name.as_str()))
 }
 
 fn command_contains_any(command: &str, needles: &[&str]) -> bool {

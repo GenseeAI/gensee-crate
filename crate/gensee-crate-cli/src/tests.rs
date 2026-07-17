@@ -5266,6 +5266,10 @@ fn fork_suggestion_detects_exploratory_command_families() {
             ForkSuggestionReason::DependencyUpgrade,
         ),
         (
+            "pip install --upgrade requests",
+            ForkSuggestionReason::DependencyUpgrade,
+        ),
+        (
             "alembic upgrade head",
             ForkSuggestionReason::SchemaMigration,
         ),
@@ -5301,7 +5305,7 @@ fn fork_suggestion_detects_lockfile_writes_from_subjects() {
     }];
 
     assert_eq!(
-        fork_suggestion_reason("echo update > Cargo.lock", &subjects),
+        fork_suggestion_reason("write package resolver output", &subjects),
         Some(ForkSuggestionReason::LockfileChange)
     );
 }
