@@ -808,15 +808,17 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         )),
         OsString::from("-e"),
         OsString::from("TERM=xterm-256color"),
-        OsString::from("-v"),
-        OsString::from(format!(
-            "{}:{}:rw",
-            host_control_dir.display(),
-            container_workspace_host_control_dir
-        )),
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
+    if env_flag_default_on("GENSEE_TCLONE_BIND_HOST_CONTROL") {
+        create_args.push(OsString::from("-v"));
+        create_args.push(OsString::from(format!(
+            "{}:{}:rw",
+            host_control_dir.display(),
+            container_workspace_host_control_dir
+        )));
+    }
     if let Some((name, _host, container_path)) = agent_home.as_ref() {
         create_args.push(OsString::from("-e"));
         create_args.push(OsString::from(format!("{name}={container_path}")));
@@ -3563,6 +3565,12 @@ fn env_flag(name: &str) -> bool {
     env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+fn env_flag_default_on(name: &str) -> bool {
+    env::var(name)
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 fn tclone_agent_ready_timeout(no_attach: bool) -> Duration {
