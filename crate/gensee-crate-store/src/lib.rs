@@ -511,6 +511,18 @@ impl EventStore {
             .map_err(sqlite_error)
     }
 
+    pub fn session_has_alert_evidence_string(
+        &self,
+        session_id: &str,
+        rule_id: &str,
+        evidence_key: &str,
+        evidence_value: &str,
+    ) -> io::Result<bool> {
+        let db = self.sqlite_store()?;
+        db.session_has_alert_evidence_string(session_id, rule_id, evidence_key, evidence_value)
+            .map_err(sqlite_error)
+    }
+
     pub fn session_agent_event_count(&self, session_id: &str, event_type: &str) -> io::Result<u64> {
         let db = self.sqlite_store()?;
         db.session_agent_event_count(session_id, event_type)

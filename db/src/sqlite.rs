@@ -1600,6 +1600,31 @@ impl SqliteStore {
             .map_err(SqliteError::Database)
     }
 
+    pub fn session_has_alert_evidence_string(
+        &self,
+        session_id: &str,
+        rule_id: &str,
+        evidence_key: &str,
+        evidence_value: &str,
+    ) -> Result<bool, SqliteError> {
+        let json_path = format!("$.{evidence_key}");
+        self.conn
+            .query_row(
+                "SELECT 1
+                 FROM alerts
+                 JOIN requests ON requests.request_id = alerts.request_id
+                 WHERE requests.session_id = ?1
+                   AND alerts.rule_id = ?2
+                   AND json_extract(alerts.evidence, ?3) = ?4
+                 LIMIT 1",
+                params![session_id, rule_id, json_path, evidence_value],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(SqliteError::Database)
+    }
+
     pub fn session_agent_event_count(
         &self,
         session_id: &str,
