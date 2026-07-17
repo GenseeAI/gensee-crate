@@ -315,6 +315,212 @@ fn claude_code_setup_preserves_settings_and_sets_hooks() {
 }
 
 #[test]
+fn claude_code_setup_preserves_non_gensee_hook_order() {
+    let mut settings = json!({
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Read",
+                    "hooks": [
+                        {"type": "command", "command": "./first.sh"},
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook claude-code"
+                        },
+                        {"type": "command", "command": "./second.sh"}
+                    ]
+                },
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/duplicate /duplicate/gensee hook claude-code"
+                        }
+                    ]
+                },
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "./third.sh"}
+                    ]
+                }
+            ]
+        }
+    });
+
+    apply_claude_code_hook_settings(
+        &mut settings,
+        "GENSEE_HOME=/new /new/gensee hook claude-code",
+    )
+    .unwrap();
+
+    // Claude Code runs matching hooks in parallel, so Gensee's position among
+    // matcher groups is not an execution-order contract. Preserve the relative
+    // order of every non-Gensee hook while replacing owned entries with one.
+    let commands = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .filter_map(|hook| hook["command"].as_str())
+        .collect::<Vec<_>>();
+    let non_gensee = commands
+        .iter()
+        .copied()
+        .filter(|command| !gensee_hook_command_owned_by(command, PROVIDER_CLAUDE_CODE))
+        .collect::<Vec<_>>();
+    assert_eq!(non_gensee, vec!["./first.sh", "./second.sh", "./third.sh"]);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| gensee_hook_command_owned_by(command, PROVIDER_CLAUDE_CODE))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn claude_code_setup_reports_disabled_hooks_without_changing_setting() {
+    let root = env::temp_dir().join(format!(
+        "gensee-claude-disabled-hooks-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let settings_path = root.join("settings.json");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&json!({"disableAllHooks": true})).unwrap(),
+    )
+    .unwrap();
+
+    let hooks_disabled = write_claude_code_settings(
+        &settings_path,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
+        &ClaudeCodeGatewaySettings::default(),
+    )
+    .unwrap();
+
+    assert!(hooks_disabled);
+    assert_eq!(
+        claude_code_disabled_hooks_warning(hooks_disabled),
+        Some(CLAUDE_CODE_DISABLED_HOOKS_WARNING)
+    );
+    assert_eq!(claude_code_disabled_hooks_warning(false), None);
+    let updated: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(updated["disableAllHooks"], json!(true));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_code_setup_updates_symlink_target_without_replacing_link() {
+    use std::os::unix::fs::symlink;
+
+    let root = env::temp_dir().join(format!(
+        "gensee-claude-symlink-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let settings_path = root.join("home/.claude/settings.json");
+    let target_path = root.join("dotfiles/claude-settings.json");
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+    let original = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&json!({
+            "theme": "dark",
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Read",
+                    "hooks": [{"type": "command", "command": "./existing.sh"}]
+                }]
+            }
+        }))
+        .unwrap()
+    );
+    fs::write(&target_path, &original).unwrap();
+    symlink("../../dotfiles/claude-settings.json", &settings_path).unwrap();
+
+    let hooks_disabled = write_claude_code_settings(
+        &settings_path,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
+        &ClaudeCodeGatewaySettings::default(),
+    )
+    .unwrap();
+
+    assert!(!hooks_disabled);
+    assert!(fs::symlink_metadata(&settings_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let updated: Value = serde_json::from_str(&fs::read_to_string(&target_path).unwrap()).unwrap();
+    assert_eq!(updated["theme"], json!("dark"));
+    assert!(updated["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .any(|hook| hook["command"] == json!("./existing.sh")));
+    assert_eq!(
+        updated["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().unwrap())
+            .filter(|hook| hook["command"]
+                .as_str()
+                .is_some_and(|command| gensee_hook_command_owned_by(command, PROVIDER_CLAUDE_CODE)))
+            .count(),
+        1
+    );
+    let backup = fs::read_dir(settings_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("settings.json.bak."))
+        })
+        .unwrap();
+    assert_eq!(fs::read_to_string(backup).unwrap(), original);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_code_setup_rejects_dangling_settings_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = env::temp_dir().join(format!(
+        "gensee-claude-dangling-symlink-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let settings_path = root.join("home/.claude/settings.json");
+    let missing_target = root.join("dotfiles/missing-settings.json");
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    symlink(&missing_target, &settings_path).unwrap();
+
+    let error = write_claude_code_settings(
+        &settings_path,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
+        &ClaudeCodeGatewaySettings::default(),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(fs::symlink_metadata(&settings_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(!missing_target.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn claude_code_gateway_settings_merge_into_env() {
     let mut settings = json!({
         "theme": "dark",

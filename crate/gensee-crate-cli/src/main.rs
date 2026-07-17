@@ -918,7 +918,7 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
     gensee_home = absolutize_for_hook(&gensee_home)?;
     bin_path = absolutize_for_hook(&bin_path)?;
     let command = claude_code_hook_command(&gensee_home, &bin_path);
-    write_claude_code_settings(&settings_path, &command, &gateway)?;
+    let hooks_disabled = write_claude_code_settings(&settings_path, &command, &gateway)?;
 
     println!(
         "gensee setup: configured Claude Code hooks in {}",
@@ -927,9 +927,18 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
     if !gateway.is_empty() {
         println!("gensee setup: configured Claude Code gateway routing.");
     }
+    if let Some(warning) = claude_code_disabled_hooks_warning(hooks_disabled) {
+        eprintln!("{warning}");
+    }
     println!("gensee setup: hook command: {command}");
     println!("gensee setup: fully restart Claude Code before testing enforcement.");
     Ok(())
+}
+
+const CLAUDE_CODE_DISABLED_HOOKS_WARNING: &str = "gensee setup: warning: Claude Code disableAllHooks is true; Gensee hooks are installed but will not run until it is set to false.";
+
+fn claude_code_disabled_hooks_warning(hooks_disabled: bool) -> Option<&'static str> {
+    hooks_disabled.then_some(CLAUDE_CODE_DISABLED_HOOKS_WARNING)
 }
 
 fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
@@ -1303,11 +1312,27 @@ fn write_cursor_hook_settings(hooks_path: &Path, command: &str) -> io::Result<bo
 }
 
 fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let parent = path
+    // Renaming a temporary file over a symlink replaces the link itself. Resolve
+    // an existing symlink first so dotfile-managed configurations keep the link
+    // and receive the atomic update at their real target.
+    let write_path = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::canonicalize(path).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("cannot resolve symlinked config {}: {err}", path.display()),
+                )
+            })?
+        }
+        Ok(_) => path.to_path_buf(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(err) => return Err(err),
+    };
+    let parent = write_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let file_name = path
+    let file_name = write_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("settings.json");
@@ -1324,10 +1349,10 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
             .open(&temp_path)?;
         temp.write_all(contents)?;
         temp.sync_all()?;
-        if let Ok(metadata) = fs::metadata(path) {
+        if let Ok(metadata) = fs::metadata(&write_path) {
             fs::set_permissions(&temp_path, metadata.permissions())?;
         }
-        fs::rename(&temp_path, path)
+        fs::rename(&temp_path, &write_path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -1631,17 +1656,21 @@ fn write_claude_code_settings(
     settings_path: &Path,
     command: &str,
     gateway: &ClaudeCodeGatewaySettings,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let (existing_contents, mut root) = read_json_config(settings_path)?;
     apply_claude_code_hook_settings(&mut root, command)?;
     apply_claude_code_gateway_settings(&mut root, gateway)?;
+    let hooks_disabled = root
+        .get("disableAllHooks")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     write_json_config_if_changed(
         settings_path,
         existing_contents.as_deref(),
         &root,
         "settings",
     )?;
-    Ok(())
+    Ok(hooks_disabled)
 }
 
 fn apply_claude_code_gateway_settings(
