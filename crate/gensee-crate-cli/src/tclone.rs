@@ -64,12 +64,12 @@ enum TcloneMergeScope {
 }
 
 pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Result<bool> {
-    let Some(socket_path) = env::var_os(TCLONE_HOST_CONTROL_SOCKET_ENV).map(PathBuf::from) else {
-        return Ok(false);
-    };
     if !tclone_host_control_should_proxy(args) {
         return Ok(false);
     }
+    let Some(socket_path) = tclone_host_control_socket_path() else {
+        return Ok(false);
+    };
     let mut request_args = Vec::new();
     for arg in args {
         let Some(value) = arg.to_str() else {
@@ -97,6 +97,24 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
             response.exit_code.unwrap_or(1)
         )))
     }
+}
+
+fn tclone_host_control_socket_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os(TCLONE_HOST_CONTROL_SOCKET_ENV).map(PathBuf::from) {
+        candidates.push(path);
+    }
+    if let Some(path) = env::var_os("GENSEE_HOME").map(PathBuf::from) {
+        candidates.push(path.join("host-control/control.sock"));
+    }
+    if let Some(path) = env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(path.join(".gensee/host-control/control.sock"));
+    }
+    candidates.push(PathBuf::from(
+        "/home/gensee/.gensee/host-control/control.sock",
+    ));
+
+    candidates.into_iter().find(|path| path.exists())
 }
 
 fn tclone_host_control_should_proxy(args: &[OsString]) -> bool {
@@ -3246,6 +3264,34 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn tclone_host_control_socket_falls_back_to_gensee_home() {
+        let root = temp_tree("host-control-fallback");
+        let socket = root.join("host-control/control.sock");
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        fs::write(&socket, "").unwrap();
+
+        let old_socket = env::var_os(TCLONE_HOST_CONTROL_SOCKET_ENV);
+        let old_home = env::var_os("GENSEE_HOME");
+        env::remove_var(TCLONE_HOST_CONTROL_SOCKET_ENV);
+        env::set_var("GENSEE_HOME", &root);
+
+        assert_eq!(
+            tclone_host_control_socket_path().as_deref(),
+            Some(socket.as_path())
+        );
+
+        match old_socket {
+            Some(value) => env::set_var(TCLONE_HOST_CONTROL_SOCKET_ENV, value),
+            None => env::remove_var(TCLONE_HOST_CONTROL_SOCKET_ENV),
+        }
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
