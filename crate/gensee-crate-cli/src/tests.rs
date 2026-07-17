@@ -5347,6 +5347,39 @@ fn hook_records_fork_suggestion_without_blocking() {
     std::fs::remove_dir_all(workspace).ok();
 }
 
+#[test]
+fn hook_dedups_fork_suggestions_per_session_and_reason() {
+    let (store, workspace) = temp_store_and_workspace("fork-suggestion-dedup");
+    let cwd = workspace.to_str().unwrap();
+    let first_payload = pretool_bash_payload("s1", cwd, "npm update");
+    let first_event = super::build_hook_event(&first_payload, PROVIDER_CLAUDE_CODE).unwrap();
+    let second_payload = pretool_bash_payload("s1", cwd, "npm update");
+    let second_event = super::build_hook_event(&second_payload, PROVIDER_CLAUDE_CODE).unwrap();
+    let third_payload = pretool_bash_payload("s1", cwd, "alembic upgrade head");
+    let third_event = super::build_hook_event(&third_payload, PROVIDER_CLAUDE_CODE).unwrap();
+
+    process_hook_event(&first_payload, &first_event, &store).unwrap();
+    process_hook_event(&second_payload, &second_event, &store).unwrap();
+    process_hook_event(&third_payload, &third_event, &store).unwrap();
+
+    let alerts = store
+        .list_alerts()
+        .unwrap()
+        .into_iter()
+        .filter(|alert| alert.rule_id == "policy_fork_suggested")
+        .collect::<Vec<_>>();
+    assert_eq!(alerts.len(), 2);
+    assert!(alerts.iter().any(|alert| alert
+        .evidence
+        .as_deref()
+        .is_some_and(|evidence| { evidence.contains(r#""reason":"dependency_upgrade""#) })));
+    assert!(alerts.iter().any(|alert| alert
+        .evidence
+        .as_deref()
+        .is_some_and(|evidence| { evidence.contains(r#""reason":"schema_migration""#) })));
+    std::fs::remove_dir_all(workspace).ok();
+}
+
 fn test_resource_config() -> ResourceGovernanceConfig {
     ResourceGovernanceConfig {
         max_read_bytes: 4,

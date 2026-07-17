@@ -189,11 +189,32 @@ pub(crate) fn evaluate_pretool_policy_with_store(
         if let Some(finding) =
             fork_suggestion_finding(event, &subjects, env::var("GENSEE_RUN_ID").ok().as_deref())
         {
-            findings.push(finding);
+            if !fork_suggestion_already_recorded(store, event, &finding) {
+                findings.push(finding);
+            }
         }
     }
 
     PolicyDecision { action, findings }
+}
+
+fn fork_suggestion_already_recorded(
+    store: Option<&EventStore>,
+    event: &AgentHookEvent,
+    finding: &PolicyFinding,
+) -> bool {
+    let Some(store) = store else {
+        return false;
+    };
+    let Some(session_id) = event.session_id.as_deref() else {
+        return false;
+    };
+    let Some(reason) = finding.evidence.get("reason").and_then(Value::as_str) else {
+        return false;
+    };
+    store
+        .session_has_alert_evidence_string(session_id, "policy_fork_suggested", "reason", reason)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
