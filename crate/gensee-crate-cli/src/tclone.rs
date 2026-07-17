@@ -1000,20 +1000,13 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             forked_at_ms
         )
     });
-    let tclone_copies = tclone_effective_clone_copies(copies);
-    if tclone_copies != copies {
-        eprintln!(
-            "gensee: using tclone --copies={tclone_copies} for a single visible fork to avoid os4agent's single-copy conmon path"
-        );
-    }
-    let output = run_tclone_clone(&podman, tclone_copies, &prefix, &source)?;
+    let output = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
     let ids = output
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
-    cleanup_surplus_tclone_clones(&podman, &ids, copies);
     let mut fork_run_ids = Vec::new();
     let mut fork_records = Vec::new();
     for index in 0..copies {
@@ -1113,26 +1106,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
-fn tclone_effective_clone_copies(requested_copies: usize) -> usize {
-    if requested_copies == 1 {
-        2
-    } else {
-        requested_copies
-    }
-}
-
-fn cleanup_surplus_tclone_clones(podman: &OsString, ids: &[String], requested_copies: usize) {
-    for id in ids.iter().skip(requested_copies) {
-        let container_name = inspect_container_name(podman, id).unwrap_or_else(|_| id.clone());
-        if let Err(error) = remove_tclone_container_by_name(podman, &container_name) {
-            eprintln!(
-                "gensee: warning: could not remove surplus tclone clone {container_name}: {error}"
-            );
-        }
-    }
-}
-
-fn run_tclone_clone(
+fn run_tclone_clone_with_overlay_retry(
     podman: &OsString,
     copies: usize,
     prefix: &str,
@@ -1142,7 +1116,17 @@ fn run_tclone_clone(
         .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
         .unwrap_or(true);
     let clone_args = tclone_clone_args(copies, prefix, &source.container_name, use_overlay);
-    run_command_capture_with_env(podman, &clone_args, &[("PODMAN_TFORK_NO_REAP", "1")])
+    match run_command_capture_with_env(podman, &clone_args, &[("PODMAN_TFORK_NO_REAP", "1")]) {
+        Ok(output) => Ok(output),
+        Err(error) if use_overlay && should_retry_tclone_without_overlay(&error.to_string()) => {
+            eprintln!(
+                "gensee: tclone overlay-btrfs clone failed; retrying without --tfork-overlay-btrfs"
+            );
+            let fallback_args = tclone_clone_args(copies, prefix, &source.container_name, false);
+            run_command_capture_with_env(podman, &fallback_args, &[("PODMAN_TFORK_NO_REAP", "1")])
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn tclone_clone_args(
@@ -1167,6 +1151,12 @@ fn tclone_clone_args(
         args.insert(5, OsString::from("--tfork-overlay-btrfs"));
     }
     args
+}
+
+fn should_retry_tclone_without_overlay(error: &str) -> bool {
+    error.contains("spawn conmon for tfork")
+        || error.contains("conmon reported pid=-1")
+        || error.contains("clone setup failed")
 }
 
 pub(crate) fn tclone_shell(args: Vec<OsString>) -> io::Result<()> {
@@ -4021,10 +4011,13 @@ mod tests {
     }
 
     #[test]
-    fn tclone_single_visible_fork_avoids_single_copy_conmon_path() {
-        assert_eq!(tclone_effective_clone_copies(1), 2);
-        assert_eq!(tclone_effective_clone_copies(2), 2);
-        assert_eq!(tclone_effective_clone_copies(4), 4);
+    fn tclone_overlay_retry_detects_conmon_setup_failure() {
+        assert!(should_retry_tclone_without_overlay(
+            "tfork: clone setup failed (spawn conmon for tfork: conmon reported pid=-1)"
+        ));
+        assert!(!should_retry_tclone_without_overlay(
+            "podman exited with status 125: container not found"
+        ));
     }
 
     #[test]
