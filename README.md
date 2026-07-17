@@ -443,8 +443,9 @@ alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX
 
 gensee-tclone run --runtime tclone -- codex
 gensee-tclone run list              # source id is under "Tclone containers"
-gensee-tclone run fork <source-run-id> --copies 2 --attach tmux:right
+gensee-tclone run fork <source-run-id> --copies 2 --attach tmux:right --json
 gensee-tclone run attach <fork-id> --tmux right
+gensee-tclone run send <fork-id> -- 'Run cargo test and fix failures'
 gensee-tclone run exec <fork-id> -- bash -lc 'cargo test'
 gensee-tclone run diff <fork-id>
 gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
@@ -460,7 +461,8 @@ Use a tclone image with `tmux` for reliable `gensee run attach`. From inside a
 host tmux session, `--attach tmux:right` opens the forked live agent in a new
 pane. Without tmux, `gensee run shell` still opens a new shell but does not
 reconnect to the live agent UI. Use `gensee run exec <fork-id> -- <command>` for
-non-interactive, container-scoped commands in a fork.
+non-interactive, container-scoped commands in a fork, or `gensee run send
+<fork-id> -- <prompt>` to visibly send work into the forked agent pane.
 
 </details>
 

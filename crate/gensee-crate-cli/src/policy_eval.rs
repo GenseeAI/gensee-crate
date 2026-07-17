@@ -282,7 +282,7 @@ pub(crate) fn fork_suggestion_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This looks suitable for a forked run ({reason}); suggested: gensee run fork {run_id} --name {name_hint}; gensee run shell {name_hint}",
+            "This looks suitable for a forked run ({reason}); suggested: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json; then gensee run send <fork-id> -- '<task prompt>'",
             reason = reason.label()
         )
     } else {

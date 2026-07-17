@@ -5,6 +5,8 @@ use std::io::Read;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 
 const DEFAULT_TCLONE_IMAGE: &str = "ghcr.io/wuklab/webtop:ubuntu-kde";
 const DEFAULT_CONTAINER_HOME: &str = "/home/gensee";
@@ -13,6 +15,20 @@ const TCLONE_AGENT_TMUX_SESSION: &str = "gensee-agent";
 const TCLONE_FORK_IN_PROGRESS_MARKER: &str = "/tmp/gensee-tclone-fork-in-progress";
 const TCLONE_REATTACH_MARKER: &str = "/tmp/gensee-tclone-reattach-source";
 const TCLONE_STATE_LOCK_STALE_SECS: u64 = 30;
+const TCLONE_HOST_CONTROL_SOCKET_ENV: &str = "GENSEE_TCLONE_HOST_SOCKET";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct TcloneHostControlRequest {
+    args: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct TcloneHostControlResponse {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    error: Option<String>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct TcloneRunRecord {
@@ -47,6 +63,178 @@ enum TcloneMergeScope {
     Paths(Vec<String>),
 }
 
+pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Result<bool> {
+    let Some(socket_path) = env::var_os(TCLONE_HOST_CONTROL_SOCKET_ENV).map(PathBuf::from) else {
+        return Ok(false);
+    };
+    if !tclone_host_control_should_proxy(args) {
+        return Ok(false);
+    }
+    let mut request_args = Vec::new();
+    for arg in args {
+        let Some(value) = arg.to_str() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tclone host-control commands must be valid UTF-8",
+            ));
+        };
+        request_args.push(value.to_string());
+    }
+    let response = tclone_host_control_request(
+        &socket_path,
+        &TcloneHostControlRequest { args: request_args },
+    )?;
+    print!("{}", response.stdout);
+    eprint!("{}", response.stderr);
+    if let Some(error) = response.error {
+        return Err(io::Error::other(error));
+    }
+    if response.exit_code.unwrap_or(1) == 0 {
+        Ok(true)
+    } else {
+        Err(io::Error::other(format!(
+            "host gensee exited with status {}",
+            response.exit_code.unwrap_or(1)
+        )))
+    }
+}
+
+fn tclone_host_control_should_proxy(args: &[OsString]) -> bool {
+    let Some(command) = args.first().and_then(|arg| arg.to_str()) else {
+        return false;
+    };
+    if command != "run" {
+        return false;
+    }
+    matches!(
+        args.get(1).and_then(|arg| arg.to_str()),
+        Some("fork" | "send" | "exec" | "list" | "attach" | "shell" | "diff")
+    )
+}
+
+#[cfg(unix)]
+fn tclone_host_control_request(
+    socket_path: &Path,
+    request: &TcloneHostControlRequest,
+) -> io::Result<TcloneHostControlResponse> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "could not connect to host Gensee control socket {}: {error}",
+                socket_path.display()
+            ),
+        )
+    })?;
+    serde_json::to_writer(&mut stream, request)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    serde_json::from_str(&response).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid host Gensee control response: {error}"),
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn tclone_host_control_request(
+    _socket_path: &Path,
+    _request: &TcloneHostControlRequest,
+) -> io::Result<TcloneHostControlResponse> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "tclone host control is only supported on Unix",
+    ))
+}
+
+struct TcloneHostControlServer {
+    socket_path: PathBuf,
+}
+
+impl TcloneHostControlServer {
+    fn start(socket_path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            if let Some(parent) = socket_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let _ = fs::remove_file(socket_path);
+            let listener = UnixListener::bind(socket_path)?;
+            let exe = env::current_exe()?;
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(stream) => handle_tclone_host_control_stream(stream, &exe),
+                        Err(error) => {
+                            eprintln!("gensee: tclone host-control accept failed: {error}");
+                            break;
+                        }
+                    }
+                }
+            });
+            Ok(Self {
+                socket_path: socket_path.to_path_buf(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = socket_path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "tclone host control is only supported on Unix",
+            ))
+        }
+    }
+}
+
+impl Drop for TcloneHostControlServer {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(unix)]
+fn handle_tclone_host_control_stream(mut stream: UnixStream, exe: &Path) {
+    let response = handle_tclone_host_control_request(&mut stream, exe).unwrap_or_else(|error| {
+        TcloneHostControlResponse {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(error.to_string()),
+        }
+    });
+    let _ = serde_json::to_writer(&mut stream, &response);
+}
+
+fn handle_tclone_host_control_request(
+    stream: &mut impl Read,
+    exe: &Path,
+) -> io::Result<TcloneHostControlResponse> {
+    let request: TcloneHostControlRequest = serde_json::from_reader(stream)?;
+    if !tclone_host_control_should_proxy(
+        &request.args.iter().map(OsString::from).collect::<Vec<_>>(),
+    ) {
+        return Ok(TcloneHostControlResponse {
+            exit_code: Some(64),
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some("unsupported tclone host-control command".to_string()),
+        });
+    }
+    let output = Command::new(exe)
+        .args(&request.args)
+        .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
+        .output()?;
+    Ok(TcloneHostControlResponse {
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        error: None,
+    })
+}
+
 pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     if std::env::consts::OS != "linux" {
         return Err(io::Error::new(
@@ -73,6 +261,12 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     let repo_path = find_repo_root(&original_workspace);
     let seed_root = gensee_tmp_root()?.join(&run_id).join("tclone-seed");
     let staged_workspace = seed_root.join(container_relative_path(&container_workspace)?);
+    let host_control_dir = gensee_tmp_root()?.join(&run_id).join("host-control");
+    fs::create_dir_all(&host_control_dir)?;
+    let host_control_socket = host_control_dir.join("control.sock");
+    let container_host_control_dir = format!("{container_home}/.gensee/host-control");
+    let container_host_control_socket = format!("{container_host_control_dir}/control.sock");
+    let _host_control = TcloneHostControlServer::start(&host_control_socket)?;
 
     let agent_binary = config.agent_cmd[0].to_string_lossy().to_string();
     let agent_home = detect_agent_home(&agent_binary);
@@ -125,7 +319,17 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         OsString::from("-e"),
         OsString::from(format!("GENSEE_WORKSPACE={container_workspace}")),
         OsString::from("-e"),
+        OsString::from(format!(
+            "{TCLONE_HOST_CONTROL_SOCKET_ENV}={container_host_control_socket}"
+        )),
+        OsString::from("-e"),
         OsString::from("TERM=xterm-256color"),
+        OsString::from("-v"),
+        OsString::from(format!(
+            "{}:{}",
+            host_control_dir.display(),
+            container_host_control_dir
+        )),
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
@@ -266,8 +470,9 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
 pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     let parent = tclone_target_arg(
         &args,
-        "usage: gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below]",
+        "usage: gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below] [--json]",
     )?;
+    let fork_json = arg_flag(&args, "--json");
     let host_tmux_attach = arg_value(&args, "--attach")
         .map(|value| parse_host_tmux_placement(&value))
         .transpose()?;
@@ -333,6 +538,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     let mut fork_run_ids = Vec::new();
+    let mut fork_records = Vec::new();
     for index in 0..copies {
         let run_id = format!("{}_fork_{}_{}", source.run_id, forked_at_ms, index);
         let container_name = ids
@@ -389,7 +595,17 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             updated_at_ms: observed_at,
             exit_code: None,
         })?;
-        println!("{run_id} | container={container_name}");
+        if !fork_json {
+            println!("{run_id} | container={container_name}");
+        }
+        fork_records.push(json!({
+            "run_id": &run_id,
+            "container": &container_name,
+            "container_id": ids.get(index),
+            "role": "fork",
+            "source_run_id": &source.run_id,
+            "workspace": &source.container_workspace,
+        }));
         fork_run_ids.push(run_id);
     }
     if let Some(placement) = host_tmux_attach {
@@ -405,6 +621,17 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 );
             }
         }
+    }
+    if fork_json {
+        println!(
+            "{}",
+            json!({
+                "source_run_id": &source.run_id,
+                "forked_at_ms": forked_at_ms,
+                "attach": host_tmux_attach.is_some(),
+                "forks": fork_records,
+            })
+        );
     }
     Ok(())
 }
@@ -453,22 +680,73 @@ pub(crate) fn tclone_attach(args: Vec<OsString>) -> io::Result<()> {
     }
 }
 
+pub(crate) fn tclone_send(args: Vec<OsString>) -> io::Result<()> {
+    let (target_args, prompt_args) = tclone_send_split(&args)?;
+    let target = tclone_target_arg(
+        target_args,
+        "usage: gensee run send <run_id-or-container> [--no-enter] [--json] -- <prompt>",
+    )?;
+    let enter = !arg_flag(target_args, "--no-enter");
+    let send_json = arg_flag(target_args, "--json");
+    let prompt = tclone_send_prompt_text(prompt_args)?;
+    let record = find_tclone_record(&target)?;
+    let podman = tclone_podman();
+    ensure_tclone_container_exists(&podman, &record)?;
+    tclone_send_prompt_to_agent(&podman, &record, &prompt, enter)?;
+    if send_json {
+        println!(
+            "{}",
+            json!({
+                "run_id": record.run_id,
+                "container": record.container_name,
+                "session": TCLONE_AGENT_TMUX_SESSION,
+                "entered": enter,
+                "sent": true,
+            })
+        );
+    } else {
+        println!(
+            "gensee: sent prompt to {} tmux session {}",
+            record.run_id, TCLONE_AGENT_TMUX_SESSION
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn tclone_run_exec(args: Vec<OsString>) -> io::Result<()> {
     let (target_args, command_args) = tclone_exec_split(&args)?;
     let target = tclone_target_arg(
         target_args,
-        "usage: gensee run exec <run_id-or-container> -- <command> [args...]",
+        "usage: gensee run exec <run_id-or-container> [--json] -- <command> [args...]",
     )?;
     let record = find_tclone_record(&target)?;
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &record)?;
-    let status = Command::new(&podman)
+    let exec_json = arg_flag(target_args, "--json");
+    let mut command = Command::new(&podman);
+    command
         .arg("exec")
         .arg("-w")
         .arg(&record.container_workspace)
         .args(tclone_run_exec_env_args(&record))
         .arg(&record.container_name)
-        .args(command_args)
+        .args(command_args);
+    if exec_json {
+        let output = command.output()?;
+        println!(
+            "{}",
+            json!({
+                "run_id": record.run_id,
+                "container": record.container_name,
+                "exit_code": output.status.code(),
+                "success": output.status.success(),
+                "stdout": String::from_utf8_lossy(&output.stdout),
+                "stderr": String::from_utf8_lossy(&output.stderr),
+            })
+        );
+        return Ok(());
+    }
+    let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -482,17 +760,49 @@ pub(crate) fn tclone_run_exec(args: Vec<OsString>) -> io::Result<()> {
     }
 }
 
+fn tclone_send_split(args: &[OsString]) -> io::Result<(&[OsString], &[OsString])> {
+    let usage = "usage: gensee run send <run_id-or-container> [--no-enter] [--json] -- <prompt>";
+    let Some(separator) = args.iter().position(|arg| arg == "--") else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, usage));
+    };
+    if separator + 1 >= args.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, usage));
+    }
+    Ok((&args[..separator], &args[separator + 1..]))
+}
+
+fn tclone_send_prompt_text(args: &[OsString]) -> io::Result<String> {
+    let mut parts = Vec::new();
+    for arg in args {
+        let Some(value) = arg.to_str() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "gensee run send prompt must be valid UTF-8",
+            ));
+        };
+        parts.push(value);
+    }
+    let prompt = parts.join(" ");
+    if prompt.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "gensee run send prompt cannot be empty",
+        ));
+    }
+    Ok(prompt)
+}
+
 fn tclone_exec_split(args: &[OsString]) -> io::Result<(&[OsString], &[OsString])> {
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee run exec <run_id-or-container> -- <command> [args...]",
+            "usage: gensee run exec <run_id-or-container> [--json] -- <command> [args...]",
         ));
     };
     if separator + 1 >= args.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee run exec <run_id-or-container> -- <command> [args...]",
+            "usage: gensee run exec <run_id-or-container> [--json] -- <command> [args...]",
         ));
     }
     Ok((&args[..separator], &args[separator + 1..]))
@@ -515,6 +825,104 @@ fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
         ]
     })
     .collect()
+}
+
+fn tclone_send_prompt_to_agent(
+    podman: &OsString,
+    record: &TcloneRunRecord,
+    prompt: &str,
+    enter: bool,
+) -> io::Result<()> {
+    run_command_status(
+        podman,
+        &[
+            OsString::from("exec"),
+            OsString::from(&record.container_name),
+            OsString::from("tmux"),
+            OsString::from("has-session"),
+            OsString::from("-t"),
+            OsString::from(TCLONE_AGENT_TMUX_SESSION),
+        ],
+    )?;
+    let buffer_name = format!(
+        "gensee-send-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap_or(0)
+    );
+    tclone_load_tmux_buffer(podman, &record.container_name, &buffer_name, prompt)?;
+    let paste_result = run_command_status(
+        podman,
+        &[
+            OsString::from("exec"),
+            OsString::from(&record.container_name),
+            OsString::from("tmux"),
+            OsString::from("paste-buffer"),
+            OsString::from("-b"),
+            OsString::from(&buffer_name),
+            OsString::from("-t"),
+            OsString::from(TCLONE_AGENT_TMUX_SESSION),
+        ],
+    );
+    let delete_result = run_command_status(
+        podman,
+        &[
+            OsString::from("exec"),
+            OsString::from(&record.container_name),
+            OsString::from("tmux"),
+            OsString::from("delete-buffer"),
+            OsString::from("-b"),
+            OsString::from(&buffer_name),
+        ],
+    );
+    paste_result?;
+    let _ = delete_result;
+    if enter {
+        run_command_status(
+            podman,
+            &[
+                OsString::from("exec"),
+                OsString::from(&record.container_name),
+                OsString::from("tmux"),
+                OsString::from("send-keys"),
+                OsString::from("-t"),
+                OsString::from(TCLONE_AGENT_TMUX_SESSION),
+                OsString::from("C-m"),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn tclone_load_tmux_buffer(
+    podman: &OsString,
+    container_name: &str,
+    buffer_name: &str,
+    prompt: &str,
+) -> io::Result<()> {
+    let mut child = Command::new(podman)
+        .arg("exec")
+        .arg("-i")
+        .arg(container_name)
+        .arg("tmux")
+        .arg("load-buffer")
+        .arg("-b")
+        .arg(buffer_name)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(io::Error::other("could not open tmux load-buffer stdin"));
+    };
+    stdin.write_all(prompt.as_bytes())?;
+    drop(stdin);
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "tmux load-buffer exited with status {status}"
+        )))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2950,6 +3358,34 @@ mod tests {
     }
 
     #[test]
+    fn tclone_host_control_proxies_only_tclone_run_commands() {
+        assert!(tclone_host_control_should_proxy(&[
+            OsString::from("run"),
+            OsString::from("fork"),
+            OsString::from("run_1"),
+        ]));
+        assert!(tclone_host_control_should_proxy(&[
+            OsString::from("run"),
+            OsString::from("send"),
+            OsString::from("run_1"),
+        ]));
+        assert!(tclone_host_control_should_proxy(&[
+            OsString::from("run"),
+            OsString::from("exec"),
+            OsString::from("run_1"),
+        ]));
+        assert!(!tclone_host_control_should_proxy(&[
+            OsString::from("hook"),
+            OsString::from("codex"),
+        ]));
+        assert!(!tclone_host_control_should_proxy(&[
+            OsString::from("run"),
+            OsString::from("--runtime"),
+            OsString::from("tclone"),
+        ]));
+    }
+
+    #[test]
     fn tclone_exec_split_requires_separator_and_command() {
         let missing_separator = vec![OsString::from("run_1"), OsString::from("echo")];
         assert!(tclone_exec_split(&missing_separator).is_err());
@@ -2982,6 +3418,38 @@ mod tests {
                 OsString::from("cargo test --locked"),
             ]
         );
+    }
+
+    #[test]
+    fn tclone_send_split_preserves_prompt_after_separator() {
+        let args = vec![
+            OsString::from("run_1_fork_0"),
+            OsString::from("--no-enter"),
+            OsString::from("--"),
+            OsString::from("Run"),
+            OsString::from("cargo test"),
+        ];
+
+        let (target_args, prompt_args) = tclone_send_split(&args).unwrap();
+
+        assert_eq!(
+            tclone_target_arg(target_args, "usage").unwrap(),
+            "run_1_fork_0"
+        );
+        assert!(arg_flag(target_args, "--no-enter"));
+        assert_eq!(
+            tclone_send_prompt_text(prompt_args).unwrap(),
+            "Run cargo test"
+        );
+    }
+
+    #[test]
+    fn tclone_send_split_requires_prompt() {
+        let missing_separator = vec![OsString::from("run_1"), OsString::from("prompt")];
+        assert!(tclone_send_split(&missing_separator).is_err());
+
+        let missing_prompt = vec![OsString::from("run_1"), OsString::from("--")];
+        assert!(tclone_send_split(&missing_prompt).is_err());
     }
 
     #[test]

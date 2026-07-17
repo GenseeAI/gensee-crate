@@ -6152,8 +6152,10 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert_eq!(finding.rule_id, "policy_fork_suggested");
     assert!(finding
         .message
-        .contains("gensee run fork run_123 --name try-upgrade"));
-    assert!(finding.message.contains("gensee run shell try-upgrade"));
+        .contains("gensee run fork run_123 --name try-upgrade --attach tmux:right --json"));
+    assert!(finding
+        .message
+        .contains("gensee run send <fork-id> -- '<task prompt>'"));
     assert_eq!(finding.evidence["reason"], json!("dependency_upgrade"));
 }
 
