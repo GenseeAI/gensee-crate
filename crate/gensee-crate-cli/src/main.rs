@@ -1311,7 +1311,11 @@ fn write_cursor_hook_settings(hooks_path: &Path, command: &str) -> io::Result<bo
     write_json_config_if_changed(hooks_path, existing_contents.as_deref(), &root, "hooks")
 }
 
-fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+fn write_file_atomically(
+    path: &Path,
+    contents: &[u8],
+    new_file_mode: Option<u32>,
+) -> io::Result<()> {
     // Renaming a temporary file over a symlink replaces the link itself. Resolve
     // an existing symlink first so dotfile-managed configurations keep the link
     // and receive the atomic update at their real target.
@@ -1320,7 +1324,10 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
             fs::canonicalize(path).map_err(|err| {
                 io::Error::new(
                     err.kind(),
-                    format!("cannot resolve symlinked config {}: {err}", path.display()),
+                    format!(
+                        "cannot resolve symlinked config {}: {err}; ensure the symlink target exists or fix/remove the link, then rerun setup",
+                        path.display()
+                    ),
                 )
             })?
         }
@@ -1343,10 +1350,16 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     let temp_path = parent.join(format!(".{file_name}.tmp.{}.{nonce}", std::process::id()));
 
     let result = (|| {
-        let mut temp = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = new_file_mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = new_file_mode;
+        let mut temp = options.open(&temp_path)?;
         temp.write_all(contents)?;
         temp.sync_all()?;
         if let Ok(metadata) = fs::metadata(&write_path) {
@@ -1385,6 +1398,16 @@ fn write_json_config_if_changed(
     root: &Value,
     backup_subject: &str,
 ) -> io::Result<bool> {
+    write_json_config_if_changed_with_mode(path, existing_contents, root, backup_subject, None)
+}
+
+fn write_json_config_if_changed_with_mode(
+    path: &Path,
+    existing_contents: Option<&str>,
+    root: &Value,
+    backup_subject: &str,
+    new_file_mode: Option<u32>,
+) -> io::Result<bool> {
     let serialized = serde_json::to_string_pretty(root)?;
     let updated_contents = format!("{serialized}\n");
     if existing_contents == Some(updated_contents.as_str()) {
@@ -1405,7 +1428,7 @@ fn write_json_config_if_changed(
             backup.display()
         );
     }
-    write_file_atomically(path, updated_contents.as_bytes())?;
+    write_file_atomically(path, updated_contents.as_bytes(), new_file_mode)?;
     Ok(true)
 }
 
@@ -1664,11 +1687,12 @@ fn write_claude_code_settings(
         .get("disableAllHooks")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    write_json_config_if_changed(
+    write_json_config_if_changed_with_mode(
         settings_path,
         existing_contents.as_deref(),
         &root,
         "settings",
+        Some(0o600),
     )?;
     Ok(hooks_disabled)
 }

@@ -512,11 +512,51 @@ fn claude_code_setup_rejects_dangling_settings_symlink() {
     .unwrap_err();
 
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let message = error.to_string();
+    assert!(message.contains("ensure the symlink target exists"));
+    assert!(message.contains("fix/remove the link"));
     assert!(fs::symlink_metadata(&settings_path)
         .unwrap()
         .file_type()
         .is_symlink());
     assert!(!missing_target.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_code_setup_creates_new_settings_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = env::temp_dir().join(format!(
+        "gensee-claude-private-settings-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let settings_path = root.join("home/.claude/settings.json");
+    let gateway = ClaudeCodeGatewaySettings {
+        base_url: Some("https://llm-gateway.example.com".to_string()),
+        auth_token: Some("test-gateway-token".to_string()),
+        api_key: None,
+        custom_headers: None,
+        api_key_helper: None,
+    };
+
+    write_claude_code_settings(
+        &settings_path,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
+        &gateway,
+    )
+    .unwrap();
+
+    let mode = fs::metadata(&settings_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+        json!("test-gateway-token")
+    );
     let _ = fs::remove_dir_all(root);
 }
 
