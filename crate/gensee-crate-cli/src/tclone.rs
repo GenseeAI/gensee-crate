@@ -24,9 +24,10 @@ const TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV: &str = "GENSEE_TCLONE_CONTAINER_HO
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 10;
+const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_CPU_PERCENT: f64 = 10.0;
-const TCLONE_FORK_QUIET_STABLE_SAMPLES: usize = 2;
+const TCLONE_FORK_QUIET_STABLE_SAMPLES: usize = 5;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
@@ -466,6 +467,12 @@ fn spawn_tclone_host_control_request(
         "gensee async job {}: waiting {}s before host fork",
         job.id, delay_secs
     )?;
+    let ready_timeout_secs = tclone_async_ready_timeout_secs();
+    writeln!(
+        log,
+        "gensee async job {}: using live clone ready timeout {}s",
+        job.id, ready_timeout_secs
+    )?;
     let stderr = log.try_clone()?;
     let done_path = job.done_path.clone();
     Command::new("sh")
@@ -487,11 +494,26 @@ fn spawn_tclone_host_control_request(
         .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
         .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
         .env("GENSEE_TCLONE_WAIT_QUIET_FOR_FORK", "1")
+        .env("GENSEE_TCLONE_READY_TIMEOUT_SECS", ready_timeout_secs.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
         .spawn()?;
     Ok(())
+}
+
+fn tclone_async_ready_timeout_secs() -> u64 {
+    if let Some(timeout) = env::var("GENSEE_TCLONE_ASYNC_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return timeout;
+    }
+    env::var("GENSEE_TCLONE_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS)
+        .max(TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS)
 }
 
 fn tclone_host_control_async_attach_placement(args: &[String]) -> Option<HostTmuxPlacement> {
