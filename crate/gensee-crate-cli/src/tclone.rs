@@ -40,6 +40,7 @@ struct TcloneHostControlResponse {
 struct TcloneAsyncJob {
     id: String,
     log_path: PathBuf,
+    done_path: PathBuf,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -401,7 +402,13 @@ fn execute_tclone_host_control_request(
     if tclone_host_control_should_run_async(&request.args) {
         let job = tclone_async_job(&request.args)?;
         let response = tclone_host_control_async_response(&request.args, &job);
+        let progress_placement = tclone_host_control_async_attach_placement(&request.args);
         spawn_tclone_host_control_request(request, exe.to_path_buf(), &job)?;
+        if let Some(placement) = progress_placement {
+            if let Err(error) = open_tclone_async_job_in_host_tmux(&job, placement) {
+                eprintln!("gensee: warning: could not open async tclone progress pane: {error}");
+            }
+        }
         return Ok(response);
     }
     execute_tclone_host_control_request_sync(request, exe)
@@ -433,6 +440,7 @@ fn spawn_tclone_host_control_request(
     if let Some(parent) = job.log_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let _ = fs::remove_file(&job.done_path);
     let mut log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -451,10 +459,19 @@ fn spawn_tclone_host_control_request(
         job.id, delay_secs
     )?;
     let stderr = log.try_clone()?;
+    let done_path = job.done_path.clone();
     Command::new("sh")
         .arg("-c")
-        .arg("sleep \"$1\"; shift; exec \"$@\"")
+        .arg(
+            "job_id=$1; done_path=$2; delay=$3; shift 3; \
+             sleep \"$delay\"; \"$@\"; status=$?; \
+             printf 'gensee async job %s: exited status=%s\\n' \"$job_id\" \"$status\"; \
+             printf '%s\\n' \"$status\" > \"$done_path\"; \
+             exit \"$status\"",
+        )
         .arg("gensee-tclone-async-fork")
+        .arg(&job.id)
+        .arg(&done_path)
         .arg(delay_secs.to_string())
         .arg(&exe)
         .args(&request.args)
@@ -466,6 +483,14 @@ fn spawn_tclone_host_control_request(
         .stderr(Stdio::from(stderr))
         .spawn()?;
     Ok(())
+}
+
+fn tclone_host_control_async_attach_placement(args: &[String]) -> Option<HostTmuxPlacement> {
+    arg_value(
+        &args.iter().map(OsString::from).collect::<Vec<_>>(),
+        "--attach",
+    )
+    .and_then(|value| parse_host_tmux_placement(&value).ok())
 }
 
 fn tclone_host_control_should_run_async(args: &[String]) -> bool {
@@ -493,10 +518,12 @@ fn tclone_async_job(args: &[String]) -> io::Result<TcloneAsyncJob> {
         std::process::id(),
         unix_millis().unwrap_or(0)
     );
+    let log_path = gensee_tmp_root()?
+        .join("tclone-async")
+        .join(format!("{id}.log"));
     Ok(TcloneAsyncJob {
-        log_path: gensee_tmp_root()?
-            .join("tclone-async")
-            .join(format!("{id}.log")),
+        done_path: log_path.with_extension("done"),
+        log_path,
         id,
     })
 }
@@ -513,6 +540,7 @@ fn tclone_host_control_async_response(
                 "command": "run fork",
                 "job_id": job.id,
                 "log_path": job.log_path,
+                "done_path": job.done_path,
                 "message": "gensee scheduled the tclone fork on the host",
             })
         )
@@ -1688,6 +1716,31 @@ fn open_host_tmux_pane(command: &str, placement: HostTmuxPlacement) -> io::Resul
             "tmux split-window exited with status {status}"
         )))
     }
+}
+
+fn open_tclone_async_job_in_host_tmux(
+    job: &TcloneAsyncJob,
+    placement: HostTmuxPlacement,
+) -> io::Result<()> {
+    let log_path = job.log_path.to_string_lossy();
+    let done_path = job.done_path.to_string_lossy();
+    let command = format!(
+        "job_id={job_id}; log={log}; done={done}; \
+         printf '[gensee] waiting for tclone fork job %s\\nlog: %s\\n\\n' \"$job_id\" \"$log\"; \
+         while [ ! -f \"$log\" ]; do sleep 0.2; done; \
+         tail -n +1 -f \"$log\" & tail_pid=$!; \
+         while [ ! -f \"$done\" ]; do sleep 0.5; done; \
+         sleep 0.2; \
+         kill \"$tail_pid\" 2>/dev/null || true; \
+         wait \"$tail_pid\" 2>/dev/null || true; \
+         status=$(cat \"$done\" 2>/dev/null || printf '?'); \
+         printf '\\n[gensee] tclone fork job %s finished with status %s. Press Ctrl-D to close this pane.\\n' \"$job_id\" \"$status\"; \
+         exec \"${{SHELL:-/bin/sh}}\"",
+        job_id = shell_quote(&job.id),
+        log = shell_quote(&log_path),
+        done = shell_quote(&done_path),
+    );
+    open_host_tmux_pane(&command, placement)
 }
 
 fn host_tmux_attach_command(target: &str, exe: &Path, use_sudo: bool) -> String {
@@ -4064,6 +4117,7 @@ mod tests {
         let job = TcloneAsyncJob {
             id: "job_1".to_string(),
             log_path: PathBuf::from("/tmp/gensee/job_1.log"),
+            done_path: PathBuf::from("/tmp/gensee/job_1.done"),
         };
         let response = tclone_host_control_async_response(&fork_args, &job);
         let payload: serde_json::Value = serde_json::from_str(response.stdout.trim()).unwrap();
@@ -4071,6 +4125,21 @@ mod tests {
         assert_eq!(payload["command"], "run fork");
         assert_eq!(payload["job_id"], "job_1");
         assert_eq!(payload["log_path"], "/tmp/gensee/job_1.log");
+        assert_eq!(payload["done_path"], "/tmp/gensee/job_1.done");
+    }
+
+    #[test]
+    fn tclone_host_control_async_attach_placement_parses_attach_flag() {
+        let args = vec![
+            "run".to_string(),
+            "fork".to_string(),
+            "run_1".to_string(),
+            "--attach=tmux:right".to_string(),
+        ];
+        assert_eq!(
+            tclone_host_control_async_attach_placement(&args),
+            Some(HostTmuxPlacement::Right)
+        );
     }
 
     #[test]
