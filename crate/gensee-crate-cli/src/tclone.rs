@@ -1,5 +1,6 @@
 use crate::*;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 
@@ -23,6 +24,9 @@ const TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV: &str = "GENSEE_TCLONE_CONTAINER_HO
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 10;
+const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
+const TCLONE_FORK_QUIET_CPU_PERCENT: f64 = 10.0;
+const TCLONE_FORK_QUIET_STABLE_SAMPLES: usize = 2;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
@@ -479,6 +483,7 @@ fn spawn_tclone_host_control_request(
         .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
         .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
         .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
+        .env("GENSEE_TCLONE_WAIT_QUIET_FOR_FORK", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
@@ -1029,6 +1034,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     }
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &source)?;
+    wait_for_tclone_source_quiet_if_requested(&podman, &source)?;
     ensure_tclone_agent_ready_for_fork(&podman, &source)?;
     let _detach_guard = TcloneForkDetachGuard::mark(&source.run_id)?;
     detach_tclone_tmux_clients(&podman, &source.container_name);
@@ -1896,6 +1902,143 @@ fn ensure_tclone_agent_ready_for_fork(
             )))
         }
     }
+}
+
+fn wait_for_tclone_source_quiet_if_requested(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+) -> io::Result<()> {
+    if !env_flag("GENSEE_TCLONE_WAIT_QUIET_FOR_FORK") {
+        return Ok(());
+    }
+    let timeout = env::var("GENSEE_TCLONE_FORK_QUIET_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(TCLONE_FORK_QUIET_TIMEOUT_SECS);
+    if timeout == 0 {
+        return Ok(());
+    }
+    let cpu_threshold = env::var("GENSEE_TCLONE_FORK_QUIET_CPU_PERCENT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(TCLONE_FORK_QUIET_CPU_PERCENT);
+    let stable_samples = env::var("GENSEE_TCLONE_FORK_QUIET_STABLE_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(TCLONE_FORK_QUIET_STABLE_SAMPLES);
+    let root_pid = inspect_container_pid(podman, &source.container_name)?;
+    let ticks_per_second = clock_ticks_per_second()?;
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    let interval = Duration::from_secs(1);
+    let mut stable = 0usize;
+    let mut last_ticks = descendant_proc_ticks(root_pid)?;
+    eprintln!(
+        "gensee: waiting for tclone source {} to become quiet before fork (timeout={}s cpu<{}% stable_samples={})",
+        source.run_id, timeout, cpu_threshold, stable_samples
+    );
+    loop {
+        thread::sleep(interval);
+        let current_ticks = descendant_proc_ticks(root_pid)?;
+        let delta_ticks = current_ticks.saturating_sub(last_ticks);
+        last_ticks = current_ticks;
+        let cpu_percent =
+            (delta_ticks as f64 / ticks_per_second as f64) / interval.as_secs_f64() * 100.0;
+        if cpu_percent <= cpu_threshold {
+            stable += 1;
+            eprintln!(
+                "gensee: tclone source {} quiet sample {}/{} cpu={:.1}%",
+                source.run_id, stable, stable_samples, cpu_percent
+            );
+            if stable >= stable_samples {
+                return Ok(());
+            }
+        } else {
+            stable = 0;
+            eprintln!(
+                "gensee: tclone source {} still active cpu={:.1}%",
+                source.run_id, cpu_percent
+            );
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for tclone source {} to become quiet before fork",
+                    source.run_id
+                ),
+            ));
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcStat {
+    pid: u32,
+    ppid: u32,
+    ticks: u64,
+}
+
+fn descendant_proc_ticks(root_pid: u32) -> io::Result<u64> {
+    let stats = read_proc_stats()?;
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut ticks_by_pid: HashMap<u32, u64> = HashMap::new();
+    for stat in stats {
+        children.entry(stat.ppid).or_default().push(stat.pid);
+        ticks_by_pid.insert(stat.pid, stat.ticks);
+    }
+    let mut total = 0u64;
+    let mut stack = vec![root_pid];
+    while let Some(pid) = stack.pop() {
+        total = total.saturating_add(ticks_by_pid.get(&pid).copied().unwrap_or(0));
+        if let Some(child_pids) = children.get(&pid) {
+            stack.extend(child_pids.iter().copied());
+        }
+    }
+    Ok(total)
+}
+
+fn read_proc_stats() -> io::Result<Vec<ProcStat>> {
+    let mut stats = Vec::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let stat_path = entry.path().join("stat");
+        let Ok(contents) = fs::read_to_string(stat_path) else {
+            continue;
+        };
+        if let Some(stat) = parse_proc_stat(pid, &contents) {
+            stats.push(stat);
+        }
+    }
+    Ok(stats)
+}
+
+fn parse_proc_stat(pid: u32, contents: &str) -> Option<ProcStat> {
+    let close = contents.rfind(')')?;
+    let rest = contents.get(close + 2..)?;
+    let fields = rest.split_whitespace().collect::<Vec<_>>();
+    let ppid = fields.get(1)?.parse::<u32>().ok()?;
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    Some(ProcStat {
+        pid,
+        ppid,
+        ticks: utime.saturating_add(stime),
+    })
+}
+
+fn clock_ticks_per_second() -> io::Result<u64> {
+    Ok(env::var("GENSEE_TCLONE_HOST_CLK_TCK")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4127,6 +4270,19 @@ mod tests {
             Some(value) => env::set_var("GENSEE_WORKSPACE", value),
             None => env::remove_var("GENSEE_WORKSPACE"),
         }
+    }
+
+    #[test]
+    fn tclone_proc_stat_parser_handles_comm_with_spaces() {
+        let stat = parse_proc_stat(
+            123,
+            "123 (codex worker) S 7 1 1 0 -1 4194304 1 2 3 4 50 25 0 0 20 0 1 0 12345",
+        )
+        .unwrap();
+
+        assert_eq!(stat.pid, 123);
+        assert_eq!(stat.ppid, 7);
+        assert_eq!(stat.ticks, 75);
     }
 
     #[test]
