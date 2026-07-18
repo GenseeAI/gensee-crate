@@ -1191,10 +1191,24 @@ fn run_tclone_clone_attempts(
     }
 }
 
-fn tclone_clone_env<'a>(extra_env: &'a [(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
-    let mut env = vec![("PODMAN_TFORK_NO_REAP", "1")];
-    env.extend_from_slice(extra_env);
+fn tclone_clone_env(extra_env: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("PODMAN_TFORK_NO_REAP".to_string(), "1".to_string()),
+        (
+            "PODMAN_TFORK_CLONE_READY_TIMEOUT_SECS".to_string(),
+            tclone_ready_timeout_secs_env(),
+        ),
+    ];
+    env.extend(
+        extra_env
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+    );
     env
+}
+
+fn tclone_ready_timeout_secs_env() -> String {
+    env::var("GENSEE_TCLONE_READY_TIMEOUT_SECS").unwrap_or_else(|_| "300".to_string())
 }
 
 fn tclone_clone_args(
@@ -3910,11 +3924,11 @@ fn run_command_capture(program: &OsString, args: &[OsString]) -> io::Result<Stri
 fn run_command_capture_with_env(
     program: &OsString,
     args: &[OsString],
-    envs: &[(&str, &str)],
+    envs: &[(String, String)],
 ) -> io::Result<String> {
     let output = Command::new(program)
         .args(args)
-        .envs(envs.iter().copied())
+        .envs(envs.iter().map(|(key, value)| (key, value)))
         .output()?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
