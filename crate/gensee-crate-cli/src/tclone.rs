@@ -3295,13 +3295,14 @@ fn append_tclone_status(run_id: &str, status: &str, exit_code: Option<i32>) -> i
 }
 
 fn find_tclone_record(target: &str) -> io::Result<TcloneRunRecord> {
+    let target = normalize_tclone_target(target);
     list_tclone_runs()?
         .into_iter()
         .rev()
         .find(|record| {
             record.run_id == target
                 || record.container_name == target
-                || record.container_id.as_deref() == Some(target)
+                || record.container_id.as_deref() == Some(target.as_str())
         })
         .ok_or_else(|| {
             io::Error::new(
@@ -3334,9 +3335,20 @@ fn tclone_target_arg(args: &[OsString], usage: &str) -> io::Result<String> {
             };
             continue;
         }
-        return Ok(value.to_string());
+        return Ok(normalize_tclone_target(value));
     }
     Err(io::Error::new(io::ErrorKind::InvalidInput, usage))
+}
+
+fn normalize_tclone_target(value: &str) -> String {
+    value
+        .trim_matches(|ch| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}'
+            )
+        })
+        .to_string()
 }
 
 fn tclone_option_takes_value(option: &str) -> bool {
@@ -4264,6 +4276,25 @@ mod tests {
         ];
 
         assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+    }
+
+    #[test]
+    fn tclone_target_arg_strips_wrapping_quotes() {
+        for quoted in [
+            "\"run_1\"",
+            "'run_1'",
+            "`run_1`",
+            "\u{201c}run_1\u{201d}",
+            "\u{2018}run_1\u{2019}",
+        ] {
+            let args = vec![
+                OsString::from("--name"),
+                OsString::from("fork"),
+                OsString::from(quoted),
+            ];
+
+            assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+        }
     }
 
     #[test]
