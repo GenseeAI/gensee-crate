@@ -408,6 +408,9 @@ fn execute_tclone_host_control_request(
         let job = tclone_async_job(&request.args)?;
         let response = tclone_host_control_async_response(&request.args, &job);
         let progress_placement = tclone_host_control_async_attach_placement(&request.args);
+        if progress_placement.is_some() {
+            ensure_host_tmux_available()?;
+        }
         spawn_tclone_host_control_request(request, exe.to_path_buf(), &job)?;
         if let Some(placement) = progress_placement {
             if let Err(error) = open_tclone_async_job_in_host_tmux(&job, placement) {
@@ -1570,10 +1573,12 @@ fn infer_host_tmux_context() -> Option<(String, String)> {
             return Some(context);
         }
     }
-    let tty = current_tty_path()?;
-    for socket in host_tmux_socket_candidates() {
-        if let Some(target) = tmux_pane_for_tty(&socket, &tty) {
-            return Some((socket.to_string_lossy().to_string(), target));
+    let ttys = host_tmux_tty_candidates();
+    for tty in ttys {
+        for socket in host_tmux_socket_candidates() {
+            if let Some(target) = tmux_pane_for_tty(&socket, &tty) {
+                return Some((socket.to_string_lossy().to_string(), target));
+            }
         }
     }
     None
@@ -1650,6 +1655,63 @@ fn current_tty_path() -> Option<String> {
     }
 }
 
+fn host_tmux_tty_candidates() -> Vec<String> {
+    let mut ttys = Vec::new();
+    for key in ["TMUX_PANE_TTY", "SUDO_TTY", "SSH_TTY"] {
+        if let Some(value) = env::var_os(key).map(|value| value.to_string_lossy().to_string()) {
+            if !value.is_empty() {
+                ttys.push(value);
+            }
+        }
+    }
+    if let Some(tty) = current_tty_path() {
+        ttys.push(tty);
+    }
+    for pid in parent_process_ids(std::process::id(), 6) {
+        if let Some(tty) = process_tty_path(pid) {
+            ttys.push(tty);
+        }
+    }
+    ttys.sort();
+    ttys.dedup();
+    ttys
+}
+
+fn parent_process_ids(start_pid: u32, limit: usize) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let mut pid = parent_pid_of(start_pid);
+    for _ in 0..limit {
+        let Some(current_pid) = pid else {
+            break;
+        };
+        pids.push(current_pid);
+        pid = parent_pid_of(current_pid);
+    }
+    pids
+}
+
+fn process_tty_path(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .arg("-o")
+        .arg("tty=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if tty.is_empty() || tty == "?" {
+        return None;
+    }
+    if tty.starts_with('/') {
+        Some(tty)
+    } else {
+        Some(format!("/dev/{tty}"))
+    }
+}
+
 fn host_tmux_socket_candidates() -> Vec<PathBuf> {
     let Some(uid) = env::var_os("SUDO_UID").or_else(|| current_uid_string().map(OsString::from))
     else {
@@ -1717,6 +1779,15 @@ fn open_tclone_attach_in_host_tmux_after_preflight(
 }
 
 fn ensure_host_tmux_available() -> io::Result<()> {
+    if env::var_os("TMUX").is_none()
+        && (env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV).is_none()
+            || env::var_os(TCLONE_HOST_TMUX_TARGET_ENV).is_none())
+    {
+        if let Some((socket, target)) = infer_host_tmux_context() {
+            env::set_var(TCLONE_HOST_TMUX_SOCKET_ENV, socket);
+            env::set_var(TCLONE_HOST_TMUX_TARGET_ENV, target);
+        }
+    }
     if env::var_os("TMUX").is_none()
         && (env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV).is_none()
             || env::var_os(TCLONE_HOST_TMUX_TARGET_ENV).is_none())
