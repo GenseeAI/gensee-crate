@@ -19,6 +19,7 @@ const TCLONE_HOST_CONTROL_DIR_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DIR";
 const TCLONE_HOST_CONTROL_DISABLE_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DISABLE";
 const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
 const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
+const TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV: &str = "GENSEE_TCLONE_CONTAINER_HOST_CONTROL_POLL";
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 10;
@@ -908,12 +909,16 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         &[OsString::from("start"), OsString::from(&source_container)],
     )?;
     start_tclone_agent_session(&podman, &source_container, &config.agent_cmd)?;
-    let _container_file_control = TcloneContainerFileControlServer::start(
-        &podman,
-        &source_container,
-        &container_workspace_host_control_dir,
-        Duration::from_millis(200),
-    )?;
+    let _container_file_control = if env_flag(TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV) {
+        Some(TcloneContainerFileControlServer::start(
+            &podman,
+            &source_container,
+            &container_workspace_host_control_dir,
+            Duration::from_millis(200),
+        )?)
+    } else {
+        None
+    };
     let no_attach = env_flag("GENSEE_TCLONE_NO_ATTACH");
     wait_tclone_agent_ready(
         &podman,
