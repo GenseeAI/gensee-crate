@@ -1151,18 +1151,50 @@ fn run_tclone_clone_with_overlay_retry(
     let use_overlay = env::var("GENSEE_TCLONE_OVERLAY_BTRFS")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
         .unwrap_or(true);
+    match run_tclone_clone_attempts(podman, copies, prefix, source, use_overlay, &[]) {
+        Ok(output) => Ok(output),
+        Err(error) if copies == 1 && should_retry_tclone_with_hidden_spare(&error.to_string()) => {
+            eprintln!("gensee: tclone single-copy clone failed; retrying with hidden spare copy");
+            run_tclone_clone_attempts(
+                podman,
+                copies,
+                prefix,
+                source,
+                use_overlay,
+                &[("PODMAN_TFORK_HIDDEN_SPARE_COPY", "1")],
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn run_tclone_clone_attempts(
+    podman: &OsString,
+    copies: usize,
+    prefix: &str,
+    source: &TcloneRunRecord,
+    use_overlay: bool,
+    extra_env: &[(&str, &str)],
+) -> io::Result<String> {
+    let env = tclone_clone_env(extra_env);
     let clone_args = tclone_clone_args(copies, prefix, &source.container_name, use_overlay);
-    match run_command_capture_with_env(podman, &clone_args, &[("PODMAN_TFORK_NO_REAP", "1")]) {
+    match run_command_capture_with_env(podman, &clone_args, &env) {
         Ok(output) => Ok(output),
         Err(error) if use_overlay && should_retry_tclone_without_overlay(&error.to_string()) => {
             eprintln!(
                 "gensee: tclone overlay-btrfs clone failed; retrying without --tfork-overlay-btrfs"
             );
             let fallback_args = tclone_clone_args(copies, prefix, &source.container_name, false);
-            run_command_capture_with_env(podman, &fallback_args, &[("PODMAN_TFORK_NO_REAP", "1")])
+            run_command_capture_with_env(podman, &fallback_args, &env)
         }
         Err(error) => Err(error),
     }
+}
+
+fn tclone_clone_env<'a>(extra_env: &'a [(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut env = vec![("PODMAN_TFORK_NO_REAP", "1")];
+    env.extend_from_slice(extra_env);
+    env
 }
 
 fn tclone_clone_args(
@@ -1193,6 +1225,12 @@ fn should_retry_tclone_without_overlay(error: &str) -> bool {
     error.contains("spawn conmon for tfork")
         || error.contains("conmon reported pid=-1")
         || error.contains("clone setup failed")
+}
+
+fn should_retry_tclone_with_hidden_spare(error: &str) -> bool {
+    error.contains("crun tfork exited before 1 clones came up")
+        || error.contains("timeout waiting for 1 tfork.pid")
+        || error.contains("direct single-copy")
 }
 
 pub(crate) fn tclone_shell(args: Vec<OsString>) -> io::Result<()> {
@@ -4098,6 +4136,16 @@ mod tests {
         ));
         assert!(!should_retry_tclone_without_overlay(
             "podman exited with status 125: container not found"
+        ));
+    }
+
+    #[test]
+    fn tclone_hidden_spare_retry_detects_single_copy_restore_failure() {
+        assert!(should_retry_tclone_with_hidden_spare(
+            "crun tfork exited before 1 clones came up (got 0); see /tmp/crun-tfork.log"
+        ));
+        assert!(!should_retry_tclone_with_hidden_spare(
+            "crun tfork exited before 2 clones came up (got 0); see /tmp/crun-tfork.log"
         ));
     }
 
