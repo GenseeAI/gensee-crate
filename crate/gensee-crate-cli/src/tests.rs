@@ -258,7 +258,22 @@ fn claude_code_setup_preserves_settings_and_sets_hooks() {
     let mut settings = json!({
         "theme": "dark",
         "hooks": {
-            "PreToolUse": [{"matcher": "old"}],
+            "PreToolUse": [
+                {
+                    "matcher": "old",
+                    "hooks": [
+                        {"type": "command", "command": "./existing.sh"},
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook claude-code"
+                        },
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/duplicate /duplicate/gensee hook claude-code"
+                        }
+                    ]
+                }
+            ],
             "Unrelated": [{"matcher": "keep"}]
         }
     });
@@ -271,13 +286,278 @@ fn claude_code_setup_preserves_settings_and_sets_hooks() {
 
     assert_eq!(settings["theme"], json!("dark"));
     assert_eq!(settings["hooks"]["Unrelated"][0]["matcher"], json!("keep"));
+    assert!(settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .any(|hook| hook["command"] == json!("./existing.sh")));
     for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
         assert_eq!(settings["hooks"][event_name][0]["matcher"], json!("*"));
         assert_eq!(
             settings["hooks"][event_name][0]["hooks"][0]["command"],
             json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code")
         );
+        assert_eq!(
+            settings["hooks"][event_name]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|group| group["hooks"].as_array().unwrap())
+                .filter(|hook| hook["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("GENSEE_HOME=")
+                        && command.ends_with(" hook claude-code")))
+                .count(),
+            1
+        );
     }
+}
+
+#[test]
+fn claude_code_setup_preserves_non_gensee_hook_order() {
+    let mut settings = json!({
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Read",
+                    "hooks": [
+                        {"type": "command", "command": "./first.sh"},
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook claude-code"
+                        },
+                        {"type": "command", "command": "./second.sh"}
+                    ]
+                },
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/duplicate /duplicate/gensee hook claude-code"
+                        }
+                    ]
+                },
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "./third.sh"}
+                    ]
+                }
+            ]
+        }
+    });
+
+    apply_claude_code_hook_settings(
+        &mut settings,
+        "GENSEE_HOME=/new /new/gensee hook claude-code",
+    )
+    .unwrap();
+
+    // Claude Code runs matching hooks in parallel, so Gensee's position among
+    // matcher groups is not an execution-order contract. Preserve the relative
+    // order of every non-Gensee hook while replacing owned entries with one.
+    let commands = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .filter_map(|hook| hook["command"].as_str())
+        .collect::<Vec<_>>();
+    let non_gensee = commands
+        .iter()
+        .copied()
+        .filter(|command| !gensee_hook_command_owned_by(command, PROVIDER_CLAUDE_CODE))
+        .collect::<Vec<_>>();
+    assert_eq!(non_gensee, vec!["./first.sh", "./second.sh", "./third.sh"]);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| gensee_hook_command_owned_by(command, PROVIDER_CLAUDE_CODE))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn claude_code_setup_reports_disabled_hooks_without_changing_setting() {
+    let root = env::temp_dir().join(format!(
+        "gensee-claude-disabled-hooks-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let settings_path = root.join("settings.json");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&json!({"disableAllHooks": true})).unwrap(),
+    )
+    .unwrap();
+
+    let hooks_disabled = write_claude_code_settings(
+        &settings_path,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
+        &ClaudeCodeGatewaySettings::default(),
+    )
+    .unwrap();
+
+    assert!(hooks_disabled);
+    assert_eq!(
+        claude_code_disabled_hooks_warning(hooks_disabled),
+        Some(CLAUDE_CODE_DISABLED_HOOKS_WARNING)
+    );
+    assert_eq!(claude_code_disabled_hooks_warning(false), None);
+    let updated: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(updated["disableAllHooks"], json!(true));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_code_setup_updates_symlink_target_without_replacing_link() {
+    use std::os::unix::fs::symlink;
+
+    let root = env::temp_dir().join(format!(
+        "gensee-claude-symlink-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let settings_path = root.join("home/.claude/settings.json");
+    let target_path = root.join("dotfiles/claude-settings.json");
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+    let original = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&json!({
+            "theme": "dark",
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Read",
+                    "hooks": [{"type": "command", "command": "./existing.sh"}]
+                }]
+            }
+        }))
+        .unwrap()
+    );
+    fs::write(&target_path, &original).unwrap();
+    symlink("../../dotfiles/claude-settings.json", &settings_path).unwrap();
+
+    let hooks_disabled = write_claude_code_settings(
+        &settings_path,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
+        &ClaudeCodeGatewaySettings::default(),
+    )
+    .unwrap();
+
+    assert!(!hooks_disabled);
+    assert!(fs::symlink_metadata(&settings_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let updated: Value = serde_json::from_str(&fs::read_to_string(&target_path).unwrap()).unwrap();
+    assert_eq!(updated["theme"], json!("dark"));
+    assert!(updated["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .any(|hook| hook["command"] == json!("./existing.sh")));
+    assert_eq!(
+        updated["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().unwrap())
+            .filter(|hook| hook["command"]
+                .as_str()
+                .is_some_and(|command| gensee_hook_command_owned_by(command, PROVIDER_CLAUDE_CODE)))
+            .count(),
+        1
+    );
+    let backup = fs::read_dir(settings_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("settings.json.bak."))
+        })
+        .unwrap();
+    assert_eq!(fs::read_to_string(backup).unwrap(), original);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_code_setup_rejects_dangling_settings_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = env::temp_dir().join(format!(
+        "gensee-claude-dangling-symlink-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let settings_path = root.join("home/.claude/settings.json");
+    let missing_target = root.join("dotfiles/missing-settings.json");
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    symlink(&missing_target, &settings_path).unwrap();
+
+    let error = write_claude_code_settings(
+        &settings_path,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
+        &ClaudeCodeGatewaySettings::default(),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let message = error.to_string();
+    assert!(message.contains("ensure the symlink target exists"));
+    assert!(message.contains("fix/remove the link"));
+    assert!(fs::symlink_metadata(&settings_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(!missing_target.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_code_setup_creates_new_settings_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = env::temp_dir().join(format!(
+        "gensee-claude-private-settings-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let settings_path = root.join("home/.claude/settings.json");
+    let gateway = ClaudeCodeGatewaySettings {
+        base_url: Some("https://llm-gateway.example.com".to_string()),
+        auth_token: Some("test-gateway-token".to_string()),
+        api_key: None,
+        custom_headers: None,
+        api_key_helper: None,
+    };
+
+    write_claude_code_settings(
+        &settings_path,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
+        &gateway,
+    )
+    .unwrap();
+
+    let mode = fs::metadata(&settings_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+        json!("test-gateway-token")
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -418,7 +698,18 @@ fn claude_code_hook_command_quotes_paths_with_spaces() {
 fn codex_setup_preserves_hooks_and_sets_gensee_hooks() {
     let mut settings = json!({
         "hooks": {
-            "PreToolUse": [{"matcher": "old"}],
+            "PreToolUse": [
+                {
+                    "matcher": "old",
+                    "hooks": [
+                        {"type": "command", "command": "./existing.sh"},
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook codex"
+                        }
+                    ]
+                }
+            ],
             "Unrelated": [{"matcher": "keep"}]
         }
     });
@@ -430,6 +721,12 @@ fn codex_setup_preserves_hooks_and_sets_gensee_hooks() {
     .unwrap();
 
     assert_eq!(settings["hooks"]["Unrelated"][0]["matcher"], json!("keep"));
+    assert!(settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .any(|hook| hook["command"] == json!("./existing.sh")));
     for event_name in [
         "UserPromptSubmit",
         "PreToolUse",
@@ -449,6 +746,19 @@ fn codex_setup_preserves_hooks_and_sets_gensee_hooks() {
         assert_eq!(
             settings["hooks"][event_name][0]["hooks"][0]["timeout"],
             json!(30)
+        );
+        assert_eq!(
+            settings["hooks"][event_name]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|group| group["hooks"].as_array().unwrap())
+                .filter(|hook| hook["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("GENSEE_HOME=")
+                        && command.ends_with(" hook codex")))
+                .count(),
+            1
         );
     }
 }
@@ -471,7 +781,19 @@ fn cursor_setup_adds_version_and_hooks_preserving_existing() {
     let mut settings = json!({
         "version": 1,
         "hooks": {
-            "afterFileEdit": [{ "command": "./format.sh" }]
+            "afterFileEdit": [{ "command": "./format.sh" }],
+            "preToolUse": [
+                {"command": "./existing-security-check.sh"},
+                {"command": "./wrapper hook cursor"},
+                {
+                    "command": "GENSEE_HOME=/old /old/gensee hook cursor",
+                    "timeout": 10
+                },
+                {
+                    "command": "GENSEE_HOME=/duplicate /duplicate/gensee hook cursor",
+                    "timeout": 10
+                }
+            ]
         }
     });
 
@@ -494,12 +816,55 @@ fn cursor_setup_adds_version_and_hooks_preserving_existing() {
         "beforeSubmitPrompt",
         "stop",
     ] {
+        let entries = settings["hooks"][event_name].as_array().unwrap();
+        let gensee_entries = entries
+            .iter()
+            .filter(|entry| {
+                entry["command"].as_str().is_some_and(|command| {
+                    command.contains("GENSEE_HOME=") && command.ends_with(" hook cursor")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(gensee_entries.len(), 1);
         assert_eq!(
-            settings["hooks"][event_name][0]["command"],
+            gensee_entries[0]["command"],
             json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook cursor")
         );
-        assert_eq!(settings["hooks"][event_name][0]["timeout"], json!(30));
+        assert_eq!(gensee_entries[0]["timeout"], json!(30));
     }
+    assert!(settings["hooks"]["preToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["command"] == json!("./existing-security-check.sh")));
+    assert!(settings["hooks"]["preToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["command"] == json!("./wrapper hook cursor")));
+}
+
+#[test]
+fn hook_setup_rejects_malformed_structures_instead_of_replacing_them() {
+    let mut claude = json!({"hooks": []});
+    assert!(apply_claude_code_hook_settings(&mut claude, "gensee hook claude-code").is_err());
+    assert_eq!(claude["hooks"], json!([]));
+
+    let mut codex = json!({"hooks": {"PreToolUse": {}}});
+    assert!(apply_codex_hook_settings(&mut codex, "gensee hook codex").is_err());
+    assert_eq!(codex["hooks"]["PreToolUse"], json!({}));
+
+    let mut antigravity = json!({"gensee-policy": []});
+    assert!(apply_antigravity_hook_settings(&mut antigravity, "gensee hook antigravity").is_err());
+    assert_eq!(antigravity["gensee-policy"], json!([]));
+
+    let mut vscode = json!({"hooks": {"PostToolUse": {}}});
+    assert!(apply_vscode_hook_settings(&mut vscode, "gensee hook vscode").is_err());
+    assert_eq!(vscode["hooks"]["PostToolUse"], json!({}));
+
+    let mut cursor = json!({"hooks": []});
+    assert!(apply_cursor_hook_settings(&mut cursor, "gensee hook cursor").is_err());
+    assert_eq!(cursor["hooks"], json!([]));
 }
 
 #[test]
@@ -858,6 +1223,28 @@ fn antigravity_setup_preserves_hooks_and_sets_gensee_hook() {
                     ]
                 }
             ]
+        },
+        "gensee-policy": {
+            "PreToolUse": [
+                {
+                    "matcher": "existing",
+                    "hooks": [
+                        {"type": "command", "command": "./existing-policy.sh"},
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook antigravity"
+                        }
+                    ]
+                }
+            ],
+            "PreInvocation": [
+                {"type": "command", "command": "./existing-invocation.sh"},
+                {
+                    "type": "command",
+                    "command": "GENSEE_HOME=/old /old/gensee hook antigravity"
+                }
+            ],
+            "CustomEvent": [{"command": "./custom.sh"}]
         }
     });
 
@@ -871,6 +1258,12 @@ fn antigravity_setup_preserves_hooks_and_sets_gensee_hook() {
         settings["existing-hook"]["PreToolUse"][0]["hooks"][0]["command"],
         json!("./existing.sh")
     );
+    assert!(settings["gensee-policy"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .any(|hook| hook["command"] == json!("./existing-policy.sh")));
     assert_eq!(
         settings["gensee-policy"]["PreToolUse"][0]["hooks"][0]["command"],
         json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook antigravity")
@@ -880,8 +1273,16 @@ fn antigravity_setup_preserves_hooks_and_sets_gensee_hook() {
         json!(30)
     );
     assert_eq!(
-        settings["gensee-policy"]["PreInvocation"][0]["command"],
+        settings["gensee-policy"]["PreInvocation"][1]["command"],
         json!("GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook antigravity")
+    );
+    assert_eq!(
+        settings["gensee-policy"]["PreInvocation"][0]["command"],
+        json!("./existing-invocation.sh")
+    );
+    assert_eq!(
+        settings["gensee-policy"]["CustomEvent"][0]["command"],
+        json!("./custom.sh")
     );
 }
 
@@ -1067,7 +1468,17 @@ fn antigravity_native_file_tool_paths_become_policy_subjects() {
 fn vscode_setup_adds_hooks_in_flat_format_preserving_existing() {
     let mut settings = json!({
         "hooks": {
-            "PostToolUse": [{ "type": "command", "command": "./format.sh" }]
+            "PostToolUse": [
+                { "type": "command", "command": "./format.sh" },
+                {
+                    "type": "command",
+                    "command": "GENSEE_HOME=/old /old/gensee hook vscode"
+                },
+                {
+                    "type": "command",
+                    "command": "GENSEE_HOME=/duplicate /duplicate/gensee hook vscode"
+                }
+            ]
         }
     });
 

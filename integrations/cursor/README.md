@@ -12,11 +12,12 @@ cargo build -p gensee-crate-cli
 GENSEE_HOME="$PWD/.gensee-dev" ./target/debug/gensee setup cursor
 ```
 
-The setup command writes `~/.cursor/hooks.json` atomically, backs up an existing
-file when its contents change, and prints the exact hook command it installed.
-Unchanged setup runs do not create another backup. Cursor watches `hooks.json` and
-reloads it automatically; for enforcement to take full effect, fully restart
-Cursor after running setup.
+The setup command merges Gensee into `~/.cursor/hooks.json`, preserving
+non-Gensee commands in the same events and replacing stale or duplicate Gensee
+entries. Changed files are backed up and written atomically; unchanged setup
+runs do not create another backup. Cursor watches `hooks.json` and reloads it
+automatically; for enforcement to take full effect, fully restart Cursor after
+running setup.
 
 For a custom hooks path or binary path:
 

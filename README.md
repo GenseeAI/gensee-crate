@@ -294,11 +294,15 @@ If you are running from a source checkout instead of an installed binary:
 ./target/debug/gensee setup cursor --gensee-home "$GENSEE_HOME"
 ```
 
-The setup commands back up the previous hook settings, update
+The setup commands merge Gensee into the previous hook settings, update
 `~/.claude/settings.json`, `~/.codex/hooks.json`, or
 `~/.gemini/config/hooks.json` or `~/.cursor/hooks.json`, or write
 `~/.copilot/hooks/gensee.json` by default. They use the absolute path to the
-`gensee` binary you invoked. Fully restart Claude Code, Antigravity, or Cursor
+`gensee` binary you invoked. Existing non-Gensee commands in the same event are
+preserved; stale or duplicate Gensee commands are replaced with one current
+entry. Setup rejects malformed hook structures without writing the file, and
+atomically updates and backs up a config only when its contents change. Fully
+restart Claude Code, Antigravity, or Cursor
 after changing their hook config. VS Code reloads hook files automatically.
 Open `/hooks` in Codex to review and trust the hook
 command before testing enforcement. Full manual config and what gets recorded
