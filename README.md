@@ -454,9 +454,11 @@ gensee-tclone run switch <fork-id>                         # continue from the f
 
 The tclone launcher also prints the source id directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
-Agent hooks also record fork suggestions for exploratory commands such as
-dependency upgrades, migrations, broad refactors, lockfile changes, destructive
-cleanup, and database resets.
+Agent hooks also record fork suggestions for exploratory requests and commands
+such as dependency upgrades, migrations, broad refactors, lockfile changes,
+destructive cleanup, and database resets. In Codex tclone source runs, matching
+user prompts add fork guidance before planning; matching source commands are
+blocked as a backstop so the risky work happens in a fork first.
 Use a tclone image with `tmux` for reliable `gensee run attach`. From inside a
 host tmux session, `--attach tmux:right` opens the forked live agent in a new
 pane. Without tmux, `gensee run shell` still opens a new shell but does not

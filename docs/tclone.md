@@ -51,10 +51,14 @@ gensee-tclone run delete --all                   # clean tracked runs and gensee
 The source id is the row with role `source` under the `Tclone containers`
 section of `gensee run list`. The launcher also prints it directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
-When hooks see commands that are good fork candidates, such as dependency
-upgrades, migrations, broad refactors, lockfile changes, destructive cleanup, or
-database resets, Gensee records a `policy_fork_suggested` alert with suggested
-`gensee run fork --attach tmux:right --json` and `gensee run send` commands.
+When hooks see requests or commands that are good fork candidates, such as
+dependency upgrades, migrations, broad refactors, lockfile changes, destructive
+cleanup, or database resets, Gensee records a `policy_fork_suggested` alert with
+suggested `gensee run fork --attach tmux:right --json` and `gensee run send`
+commands. In Codex source runs, matching user prompts add fork guidance before
+planning; matching source commands are blocked as a backstop so Codex can ask for
+a fork and continue the work there. Forked Codex runs are allowed to execute the
+command.
 Use the same `gensee-tclone` wrapper for `run list`, `run fork`, `run shell`,
 `run attach`, `run send`, `run exec`, `run merge`, `run switch`, and cleanup;
 otherwise Gensee may read the source record but look in a different Podman store

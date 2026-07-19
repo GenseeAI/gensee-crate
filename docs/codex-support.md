@@ -108,8 +108,12 @@ remain only where behavior or setup is intentionally provider-specific:
    (`crate/gensee-crate-cli/src/policy_eval.rs`) is provider-aware. For
    `PreToolUse`, Codex emits no output for `Allow` or warning-level findings
    and emits `deny` only for `Block`. Ask findings are recorded as `warn` for
-   Codex. For Codex `PermissionRequest`, Gensee emits an explicit allow/deny
-   response so Codex-native approval boundaries are visible in the Gensee store.
+   Codex. Fork-worthy user prompts in a tclone source run inject
+   `UserPromptSubmit` context asking Codex to request a fork before changing the
+   source container; fork-worthy source commands are promoted to `Block` as a
+   backstop.
+   For Codex `PermissionRequest`, Gensee emits an explicit response so
+   Codex-native approval boundaries are visible in the Gensee store.
 4. **PermissionRequest support** - Codex setup installs a `PermissionRequest`
    hook and the handler evaluates the same policy subjects where possible, then
    allows or denies the approval request. Codex `PermissionRequest` payloads
