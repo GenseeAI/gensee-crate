@@ -24,6 +24,7 @@ const TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV: &str = "GENSEE_TCLONE_CONTAINER_HO
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
 const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
+pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
@@ -581,9 +582,9 @@ fn tclone_host_control_async_response(
                 "scheduled": true,
                 "command": "run fork",
                 "job_id": job.id,
-                "log_path": job.log_path,
-                "done_path": job.done_path,
-                "message": "gensee scheduled the tclone fork on the host",
+                "status": "scheduled",
+                "poll_command": "gensee run list",
+                "message": "gensee scheduled the tclone fork on the host; wait for the fork to appear in gensee run list before sending work to it",
             })
         )
     } else {
@@ -1118,7 +1119,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             ended_at_ms: None,
             exit_code: None,
         })?;
-        append_tclone_record(&TcloneRunRecord {
+        let fork_record = TcloneRunRecord {
             run_id: run_id.clone(),
             parent_run_id: Some(source.run_id.clone()),
             role: "fork".to_string(),
@@ -1142,7 +1143,9 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             started_at_ms: observed_at,
             updated_at_ms: observed_at,
             exit_code: None,
-        })?;
+        };
+        append_tclone_record(&fork_record)?;
+        write_tclone_run_context_if_possible(&podman, &fork_record);
         if !fork_json {
             println!("{run_id} | container={container_name}");
         }
@@ -1336,6 +1339,7 @@ pub(crate) fn tclone_send(args: Vec<OsString>) -> io::Result<()> {
     let record = find_tclone_record(&target)?;
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &record)?;
+    write_tclone_run_context_if_possible(&podman, &record);
     let prompt = tclone_prompt_with_fork_context(&record, &prompt);
     tclone_send_prompt_to_agent(&podman, &record, &prompt, enter)?;
     if send_json {
@@ -1481,6 +1485,57 @@ fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
         ]
     })
     .collect()
+}
+
+fn tclone_run_context_payload(record: &TcloneRunRecord) -> Value {
+    json!({
+        "run_id": &record.run_id,
+        "role": &record.role,
+        "source_run_id": record.parent_run_id.as_deref().unwrap_or(&record.run_id),
+        "workspace": &record.container_workspace,
+    })
+}
+
+fn write_tclone_run_context_if_possible(podman: &OsString, record: &TcloneRunRecord) {
+    if record.role != "fork" {
+        return;
+    }
+    if let Err(error) = write_tclone_run_context(podman, record) {
+        eprintln!(
+            "gensee: warning: could not write fork run context into {}: {error}",
+            record.run_id
+        );
+    }
+}
+
+fn write_tclone_run_context(podman: &OsString, record: &TcloneRunRecord) -> io::Result<()> {
+    let payload = serde_json::to_vec(&tclone_run_context_payload(record))?;
+    let script = format!("cat > {}", shell_quote(TCLONE_RUN_CONTEXT_PATH));
+    let mut child = Command::new(podman)
+        .arg("exec")
+        .arg("-i")
+        .arg(&record.container_name)
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(io::Error::other("could not open podman exec stdin"));
+    };
+    stdin.write_all(&payload)?;
+    drop(stdin);
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "podman exec context write failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
 }
 
 fn tclone_send_prompt_to_agent(
@@ -4451,8 +4506,9 @@ mod tests {
         assert_eq!(payload["scheduled"], true);
         assert_eq!(payload["command"], "run fork");
         assert_eq!(payload["job_id"], "job_1");
-        assert_eq!(payload["log_path"], "/tmp/gensee/job_1.log");
-        assert_eq!(payload["done_path"], "/tmp/gensee/job_1.done");
+        assert_eq!(payload["poll_command"], "gensee run list");
+        assert!(payload.get("log_path").is_none());
+        assert!(payload.get("done_path").is_none());
     }
 
     #[test]
@@ -4739,6 +4795,18 @@ mod tests {
         assert!(env_args.contains(&OsString::from("GENSEE_RUN_ID=run_1_fork_0")));
         assert!(env_args.contains(&OsString::from("AGENT_SHIELD_SESSION_ID=run_1_fork_0")));
         assert!(env_args.contains(&OsString::from("GENSEE_WORKSPACE=/workspace")));
+    }
+
+    #[test]
+    fn tclone_run_context_payload_marks_forks() {
+        let fork = test_fork_record("run_1_fork_2_0", "run_1");
+
+        let payload = tclone_run_context_payload(&fork);
+
+        assert_eq!(payload["run_id"], "run_1_fork_2_0");
+        assert_eq!(payload["role"], "fork");
+        assert_eq!(payload["source_run_id"], "run_1");
+        assert_eq!(payload["workspace"], "/workspace");
     }
 
     #[test]
