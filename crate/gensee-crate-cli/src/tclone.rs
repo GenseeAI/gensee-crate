@@ -1336,6 +1336,7 @@ pub(crate) fn tclone_send(args: Vec<OsString>) -> io::Result<()> {
     let record = find_tclone_record(&target)?;
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &record)?;
+    let prompt = tclone_prompt_with_fork_context(&record, &prompt);
     tclone_send_prompt_to_agent(&podman, &record, &prompt, enter)?;
     if send_json {
         println!(
@@ -1434,6 +1435,17 @@ fn tclone_send_prompt_text(args: &[OsString]) -> io::Result<String> {
         ));
     }
     Ok(prompt)
+}
+
+fn tclone_prompt_with_fork_context(record: &TcloneRunRecord, prompt: &str) -> String {
+    if record.role == "fork" {
+        format!(
+            "Gensee context: this request is already running inside forked run {}. Do not create another fork for this task; continue the requested work in this fork.\n\n{}",
+            record.run_id, prompt
+        )
+    } else {
+        prompt.to_string()
+    }
 }
 
 fn tclone_exec_split(args: &[OsString]) -> io::Result<(&[OsString], &[OsString])> {
@@ -4685,6 +4697,24 @@ mod tests {
             tclone_send_prompt_text(prompt_args).unwrap(),
             "Run cargo test"
         );
+    }
+
+    #[test]
+    fn tclone_send_prefixes_fork_context() {
+        let fork = test_fork_record("run_1_fork_2_0", "run_1");
+        let prompt = tclone_prompt_with_fork_context(&fork, "Upgrade dependencies");
+
+        assert!(prompt.contains("already running inside forked run run_1_fork_2_0"));
+        assert!(prompt.contains("Do not create another fork"));
+        assert!(prompt.ends_with("Upgrade dependencies"));
+    }
+
+    #[test]
+    fn tclone_send_does_not_prefix_source_context() {
+        let source = test_record("run_1", "running");
+        let prompt = tclone_prompt_with_fork_context(&source, "Upgrade dependencies");
+
+        assert_eq!(prompt, "Upgrade dependencies");
     }
 
     #[test]

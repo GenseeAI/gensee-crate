@@ -6210,6 +6210,80 @@ fn codex_source_run_emits_pretool_deny_for_fork_suggestion() {
 }
 
 #[test]
+fn codex_source_allows_sending_risky_prompt_to_fork() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-send-no-recursion");
+    let command = "gensee run send run_123_fork_456_0 -- 'Upgrade the Rust dependencies, update Cargo.lock, run cargo test, and fix breakages.'";
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), command);
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store).unwrap();
+
+    assert!(
+        output.is_none(),
+        "Codex should not block fork-targeted run send commands: {output:?}"
+    );
+    assert!(!store
+        .list_alerts()
+        .unwrap()
+        .iter()
+        .any(|alert| alert.rule_id == "policy_fork_suggested"));
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_source_allows_executing_risky_command_in_fork() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-exec-no-recursion");
+    let command =
+        "gensee run exec run_123_fork_456_0 -- bash -lc 'cargo update && cargo test --workspace'";
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), command);
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store).unwrap();
+
+    assert!(
+        output.is_none(),
+        "Codex should not block fork-targeted run exec commands: {output:?}"
+    );
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_source_blocks_immediate_duplicate_fork_command() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-duplicate-fork-command");
+    let command = "gensee run fork run_123 --name try-upgrade --attach tmux:right --json";
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), command);
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let first = process_hook_event(&payload, &event, &store).unwrap();
+    let second = process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .expect("duplicate fork command should be denied");
+
+    assert!(
+        first.is_none(),
+        "first fork scheduling command should not interrupt Codex: {first:?}"
+    );
+    assert!(second.contains("\"permissionDecision\":\"deny\""));
+    assert!(second.contains("already scheduled"));
+    assert_eq!(
+        store
+            .session_alert_count("s1", "policy_tclone_fork_scheduled")
+            .unwrap(),
+        2
+    );
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
 fn fork_suggestion_detects_user_prompt_intents() {
     let cases = [
         (
@@ -6261,6 +6335,33 @@ fn codex_userpromptsubmit_injects_fork_context_for_source_run() {
                 .as_deref()
                 .is_some_and(|evidence| evidence.contains(r#""phase":"user_prompt""#))
     }));
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_userpromptsubmit_skips_prompt_already_sent_to_fork() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-context-prompt");
+    let payload = format!(
+        "{{\"session_id\":\"s1\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"{}\",\"prompt\":\"Gensee context: this request is already running inside forked run run_123_fork_456_0. Do not create another fork for this task; continue the requested work in this fork.\\n\\nUpgrade the Rust dependencies, update Cargo.lock, run cargo test, and fix breakages.\"}}",
+        workspace.display()
+    );
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store).unwrap();
+
+    assert!(
+        output.is_none(),
+        "forked prompt context should suppress recursive fork guidance: {output:?}"
+    );
+    assert_eq!(
+        store
+            .session_alert_count("s1", "policy_fork_suggested")
+            .unwrap(),
+        0
+    );
     env::remove_var("GENSEE_RUN_ID");
     std::fs::remove_dir_all(workspace).ok();
 }
