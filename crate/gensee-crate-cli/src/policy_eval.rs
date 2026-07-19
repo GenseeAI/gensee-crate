@@ -196,8 +196,8 @@ pub(crate) fn evaluate_pretool_policy_with_store(
         }
     }
     if !matches!(action, PolicyAction::Block) {
-        if let Some(finding) =
-            fork_suggestion_finding(event, &subjects, env::var("GENSEE_RUN_ID").ok().as_deref())
+        let current_run_id = current_tclone_run_id_for_event(event);
+        if let Some(finding) = fork_suggestion_finding(event, &subjects, current_run_id.as_deref())
         {
             if finding.action == PolicyAction::Block
                 || !fork_suggestion_already_recorded(store, event, &finding)
@@ -299,7 +299,7 @@ pub(crate) fn fork_suggestion_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; wait for the done_path/log_path or run gensee run list, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'",
+            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll gensee run list until the fork appears, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'",
             reason = reason.label()
         )
     } else {
@@ -338,7 +338,7 @@ pub(crate) fn fork_suggestion_prompt_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; wait for the done_path/log_path or run gensee run list, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'",
+            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll gensee run list until the fork appears, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'",
             reason = reason.label()
         )
     } else {
@@ -380,6 +380,31 @@ fn fork_suggestion_severity(event: &AgentHookEvent, current_run_id: Option<&str>
     }
 }
 
+pub(crate) fn current_tclone_run_id_for_event(_event: &AgentHookEvent) -> Option<String> {
+    tclone_context_run_id_from_marker().or_else(|| env::var("GENSEE_RUN_ID").ok())
+}
+
+fn tclone_context_run_id_from_marker() -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os("GENSEE_TCLONE_CONTEXT_PATH").map(PathBuf::from) {
+        candidates.push(path);
+    }
+    candidates.push(PathBuf::from(TCLONE_RUN_CONTEXT_PATH));
+
+    candidates.into_iter().find_map(|path| {
+        let value = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+        let run_id = value.get("run_id").and_then(Value::as_str)?.trim();
+        let role = value.get("role").and_then(Value::as_str).unwrap_or("");
+        if run_id.contains("_fork_") || role == "fork" {
+            Some(run_id.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 fn current_run_is_tclone_source(current_run_id: Option<&str>) -> bool {
     current_run_id
         .map(str::trim)
@@ -404,7 +429,7 @@ fn tclone_fork_command_finding(
     };
     let message = if duplicate {
         format!(
-            "A fork for source {source_run_id}{} was already scheduled in this session. Do not run gensee run fork again; wait for the earlier done_path/log_path, run gensee run list, then send work to the existing fork.",
+            "A fork for source {source_run_id}{} was already scheduled in this session. Do not run gensee run fork again; poll gensee run list until the fork appears, then send work to the existing fork.",
             name.as_deref()
                 .map(|name| format!(" with name {name}"))
                 .unwrap_or_default()

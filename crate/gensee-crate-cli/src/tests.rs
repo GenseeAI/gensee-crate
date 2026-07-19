@@ -5356,6 +5356,43 @@ fn codex_fork_run_allows_fork_suggestion_commands() {
 }
 
 #[test]
+fn codex_fork_context_marker_overrides_stale_source_run_env() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-context-marker");
+    let marker = workspace.join("gensee-run-context.json");
+    fs::write(
+        &marker,
+        json!({
+            "run_id": "run_123_fork_456_0",
+            "role": "fork",
+            "source_run_id": "run_123",
+            "workspace": workspace,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &marker);
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), "cargo update");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store).unwrap();
+
+    assert!(
+        output.is_none(),
+        "fork marker should prevent source-run deny despite stale env: {output:?}"
+    );
+    assert!(store.list_alerts().unwrap().iter().any(|alert| {
+        alert.rule_id == "policy_fork_suggested"
+            && alert.action == "allow"
+            && alert.severity == "info"
+    }));
+    env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
 fn codex_source_run_emits_pretool_deny_for_fork_suggestion() {
     let _guard = telemetry_test_lock();
     env::set_var("GENSEE_RUN_ID", "run_123");
