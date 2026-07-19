@@ -23,11 +23,12 @@ const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
 const TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV: &str = "GENSEE_TCLONE_CONTAINER_HOST_CONTROL_POLL";
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
-const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 10;
+const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
+const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_CPU_PERCENT: f64 = 10.0;
-const TCLONE_FORK_QUIET_STABLE_SAMPLES: usize = 5;
+const TCLONE_FORK_QUIET_STABLE_SAMPLES: usize = 3;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
@@ -408,13 +409,14 @@ fn execute_tclone_host_control_request(
     if tclone_host_control_should_run_async(&request.args) {
         let job = tclone_async_job(&request.args)?;
         let response = tclone_host_control_async_response(&request.args, &job);
-        let progress_placement = tclone_host_control_async_attach_placement(&request.args);
-        if progress_placement.is_some() {
+        let attach_placement = tclone_host_control_async_attach_placement(&request.args);
+        if attach_placement.is_some() {
             ensure_host_tmux_available()?;
         }
         spawn_tclone_host_control_request(request, exe.to_path_buf(), &job)?;
-        if let Some(placement) = progress_placement {
-            if let Err(error) = open_tclone_async_job_in_host_tmux(&job, placement) {
+        if env_flag(TCLONE_ASYNC_PROGRESS_PANE_ENV) {
+            let progress_placement = attach_placement.unwrap_or(HostTmuxPlacement::Right);
+            if let Err(error) = open_tclone_async_job_in_host_tmux(&job, progress_placement) {
                 eprintln!("gensee: warning: could not open async tclone progress pane: {error}");
             }
         }
