@@ -931,9 +931,11 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         )));
     }
     if !path_prefixes.is_empty() {
-        path_prefixes.push("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
         create_args.push(OsString::from("-e"));
-        create_args.push(OsString::from(format!("PATH={}", path_prefixes.join(":"))));
+        create_args.push(OsString::from(format!(
+            "PATH={}",
+            tclone_container_path(&path_prefixes)
+        )));
     }
     create_args.push(OsString::from(&image));
     create_args.push(OsString::from("infinity"));
@@ -3799,6 +3801,17 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn tclone_container_path(toolchain_paths: &[String]) -> String {
+    let mut entries = vec!["/usr/local/sbin".to_string(), "/usr/local/bin".to_string()];
+    entries.extend(toolchain_paths.iter().cloned());
+    entries.extend(
+        ["/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+            .into_iter()
+            .map(str::to_string),
+    );
+    entries.join(":")
+}
+
 fn prepare_tclone_seed(
     seed_root: &Path,
     original_workspace: &Path,
@@ -4938,6 +4951,24 @@ mod tests {
         assert!(script.contains("exit 0"));
         assert!(!script.contains("exec sleep infinity"));
         assert!(!script.contains("while :; do"));
+    }
+
+    #[test]
+    fn tclone_container_path_prefers_container_local_gensee() {
+        let path = tclone_container_path(&[
+            "/home/yiying/.nvm/versions/node/v24.18.0/bin".to_string(),
+            "/home/yiying/.cargo/bin".to_string(),
+        ]);
+        let entries = path.split(':').collect::<Vec<_>>();
+
+        assert_eq!(entries[0], "/usr/local/sbin");
+        assert_eq!(entries[1], "/usr/local/bin");
+        assert!(
+            entries.iter().position(|entry| *entry == "/usr/local/bin")
+                < entries
+                    .iter()
+                    .position(|entry| *entry == "/home/yiying/.cargo/bin")
+        );
     }
 
     #[cfg(unix)]
