@@ -84,6 +84,11 @@ FORK_ID=$(gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmu
 gensee-tclone run send "$FORK_ID" -- 'Try the dependency upgrade, run tests, and summarize the result.'
 ```
 
+When a fork is scheduled asynchronously from inside an agent, the JSON response
+includes `status_command`. Poll it until `status=succeeded`, then use
+`forks[0].run_id`; if it returns `status=failed`, stop and inspect the included
+log summary.
+
 Use `gensee run exec <id> -- <command>` for non-interactive work in a fork,
 such as commands requested by an agent. The command runs inside the container
 workspace without attaching to the live agent UI, and receives the container's
