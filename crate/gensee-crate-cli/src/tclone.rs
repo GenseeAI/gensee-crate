@@ -480,8 +480,16 @@ fn spawn_tclone_host_control_request(
     Command::new("sh")
         .arg("-c")
         .arg(
-            "job_id=$1; done_path=$2; delay=$3; shift 3; \
+            "job_id=$1; done_path=$2; log_path=$3; delay=$4; shift 4; \
              sleep \"$delay\"; \"$@\"; status=$?; \
+             if [ \"$status\" != 0 ]; then \
+               message=\"Gensee tclone fork failed; see $log_path\"; \
+               if [ -n \"${GENSEE_HOST_TMUX_SOCKET:-}\" ] && [ -n \"${GENSEE_HOST_TMUX_TARGET:-}\" ]; then \
+                 tmux -S \"$GENSEE_HOST_TMUX_SOCKET\" display-message -t \"$GENSEE_HOST_TMUX_TARGET\" \"$message\" 2>/dev/null || true; \
+               elif [ -n \"${TMUX:-}\" ]; then \
+                 tmux display-message \"$message\" 2>/dev/null || true; \
+               fi; \
+             fi; \
              printf 'gensee async job %s: exited status=%s\\n' \"$job_id\" \"$status\"; \
              printf '%s\\n' \"$status\" > \"$done_path\"; \
              exit \"$status\"",
@@ -489,6 +497,7 @@ fn spawn_tclone_host_control_request(
         .arg("gensee-tclone-async-fork")
         .arg(&job.id)
         .arg(&done_path)
+        .arg(&job.log_path)
         .arg(delay_secs.to_string())
         .arg(&exe)
         .args(&request.args)
@@ -1067,13 +1076,8 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     detach_tclone_tmux_clients(&podman, &source.container_name);
     let forked_at_ms = unix_millis()?;
     let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
-    let prefix = arg_value(&args, "--name").unwrap_or_else(|| {
-        format!(
-            "gensee-tclone-fork-{}-{}",
-            parent.replace(['_', '/'], "-"),
-            forked_at_ms
-        )
-    });
+    let name_hint = arg_value(&args, "--name");
+    let prefix = tclone_fork_name_prefix(&parent, name_hint.as_deref(), forked_at_ms);
     let output = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
     let ids = output
         .lines()
@@ -1190,6 +1194,17 @@ fn run_tclone_clone_with_overlay_retry(
         .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
         .unwrap_or(true);
     run_tclone_clone_attempts(podman, copies, prefix, source, use_overlay, &[])
+}
+
+fn tclone_fork_name_prefix(parent: &str, name_hint: Option<&str>, forked_at_ms: u64) -> String {
+    match name_hint {
+        Some(name) => format!("{}-{forked_at_ms}", name.trim_end_matches('-')),
+        None => format!(
+            "gensee-tclone-fork-{}-{}",
+            parent.replace(['_', '/'], "-"),
+            forked_at_ms
+        ),
+    }
 }
 
 fn run_tclone_clone_attempts(
@@ -4439,6 +4454,22 @@ mod tests {
         assert_eq!(
             tclone_host_control_async_attach_placement(&args),
             Some(HostTmuxPlacement::Right)
+        );
+    }
+
+    #[test]
+    fn tclone_fork_name_hint_is_unique_prefix() {
+        assert_eq!(
+            tclone_fork_name_prefix("run_1", Some("try-upgrade"), 123),
+            "try-upgrade-123"
+        );
+        assert_eq!(
+            tclone_fork_name_prefix("run_1", Some("try-upgrade-"), 123),
+            "try-upgrade-123"
+        );
+        assert_eq!(
+            tclone_fork_name_prefix("run_1/2", None, 123),
+            "gensee-tclone-fork-run-1-2-123"
         );
     }
 
