@@ -299,7 +299,7 @@ pub(crate) fn fork_suggestion_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll gensee run list until the fork appears, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'",
+            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. If status=failed, stop and report the failure.",
             reason = reason.label()
         )
     } else {
@@ -338,7 +338,7 @@ pub(crate) fn fork_suggestion_prompt_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll gensee run list until the fork appears, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'",
+            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. If status=failed, stop and report the failure.",
             reason = reason.label()
         )
     } else {
@@ -429,7 +429,7 @@ fn tclone_fork_command_finding(
     };
     let message = if duplicate {
         format!(
-            "A fork for source {source_run_id}{} was already scheduled in this session. Do not run gensee run fork again; poll gensee run list until the fork appears, then send work to the existing fork.",
+            "A fork for source {source_run_id}{} was already scheduled in this session. Do not run gensee run fork again; poll the previous fork-status command if available, otherwise poll gensee run list until the fork appears, then send work to the existing fork.",
             name.as_deref()
                 .map(|name| format!(" with name {name}"))
                 .unwrap_or_default()

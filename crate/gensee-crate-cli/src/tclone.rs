@@ -178,7 +178,7 @@ fn tclone_host_control_should_proxy(args: &[OsString]) -> bool {
     }
     matches!(
         args.get(1).and_then(|arg| arg.to_str()),
-        Some("fork" | "send" | "exec" | "list" | "attach" | "shell" | "diff")
+        Some("fork" | "fork-status" | "send" | "exec" | "list" | "attach" | "shell" | "diff")
     )
 }
 
@@ -578,10 +578,33 @@ fn tclone_async_job(args: &[String]) -> io::Result<TcloneAsyncJob> {
     })
 }
 
+fn tclone_async_job_from_id(job_id: &str) -> io::Result<TcloneAsyncJob> {
+    let job_id = job_id.trim();
+    if job_id.is_empty() || job_id.contains('/') || job_id.contains('\\') || job_id.contains("..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee run fork-status <job-id> [--json]",
+        ));
+    }
+    let log_path = gensee_tmp_root()?
+        .join("tclone-async")
+        .join(format!("{job_id}.log"));
+    Ok(TcloneAsyncJob {
+        done_path: log_path.with_extension("done"),
+        log_path,
+        id: job_id.to_string(),
+    })
+}
+
+fn tclone_async_job_status_command(job_id: &str) -> String {
+    format!("gensee run fork-status {job_id} --json")
+}
+
 fn tclone_host_control_async_response(
     args: &[String],
     job: &TcloneAsyncJob,
 ) -> TcloneHostControlResponse {
+    let status_command = tclone_async_job_status_command(&job.id);
     let stdout = if args.iter().any(|arg| arg == "--json") {
         format!(
             "{}\n",
@@ -590,15 +613,15 @@ fn tclone_host_control_async_response(
                 "command": "run fork",
                 "job_id": job.id,
                 "status": "scheduled",
-                "poll_command": "gensee run list",
-                "message": "gensee scheduled the tclone fork on the host; wait for the fork to appear in gensee run list before sending work to it",
+                "status_command": status_command,
+                "poll_command": status_command,
+                "message": "gensee scheduled the tclone fork on the host; poll status_command until status=succeeded, then send work to forks[0].run_id",
             })
         )
     } else {
         format!(
-            "gensee: scheduled tclone fork on host job_id={} log_path={}\n",
-            job.id,
-            job.log_path.display()
+            "gensee: scheduled tclone fork on host job_id={}; poll with `{}`\n",
+            job.id, status_command
         )
     };
     TcloneHostControlResponse {
@@ -607,6 +630,80 @@ fn tclone_host_control_async_response(
         stderr: String::new(),
         error: None,
     }
+}
+
+fn parse_tclone_async_fork_payload(log_text: &str) -> Option<Value> {
+    log_text.lines().rev().find_map(|line| {
+        let value = serde_json::from_str::<Value>(line.trim()).ok()?;
+        if value.get("source_run_id").is_some() && value.get("forks").is_some() {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn tclone_async_job_last_log_lines(log_text: &str, count: usize) -> Vec<String> {
+    let mut lines = log_text
+        .lines()
+        .rev()
+        .take(count)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    lines
+}
+
+fn tclone_async_job_status_payload(job: &TcloneAsyncJob) -> Value {
+    let log_text = fs::read_to_string(&job.log_path).ok();
+    let done_text = fs::read_to_string(&job.done_path).ok();
+    let exit_code = done_text
+        .as_deref()
+        .and_then(|text| text.trim().parse::<i32>().ok());
+    let status = match exit_code {
+        Some(0) => "succeeded",
+        Some(_) => "failed",
+        None if log_text.is_some() => "running",
+        None => "unknown",
+    };
+    let mut payload = json!({
+        "command": "run fork-status",
+        "job_id": job.id,
+        "status": status,
+        "exit_code": exit_code,
+    });
+
+    if let Some(fork_payload) = log_text
+        .as_deref()
+        .and_then(parse_tclone_async_fork_payload)
+    {
+        if let Some(source_run_id) = fork_payload.get("source_run_id") {
+            payload["source_run_id"] = source_run_id.clone();
+        }
+        if let Some(forked_at_ms) = fork_payload.get("forked_at_ms") {
+            payload["forked_at_ms"] = forked_at_ms.clone();
+        }
+        if let Some(forks) = fork_payload.get("forks") {
+            payload["forks"] = forks.clone();
+        }
+    }
+
+    if status == "failed" {
+        payload["last_log_lines"] = json!(log_text
+            .as_deref()
+            .map(|text| tclone_async_job_last_log_lines(text, 20))
+            .unwrap_or_default());
+    }
+    if status == "running" {
+        payload["message"] = json!("tclone fork job is still running; poll this command again");
+    } else if status == "unknown" {
+        payload["message"] =
+            json!("unknown tclone fork job; no log or completion marker was found");
+    } else if status == "succeeded" && payload.get("forks").is_none() {
+        payload["message"] =
+            json!("tclone fork job succeeded, but no fork metadata was found in the job log");
+    }
+    payload
 }
 
 fn drain_tclone_host_control_file_requests(control_dir: &Path, exe: &Path) -> io::Result<()> {
@@ -1219,6 +1316,44 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 "forks": fork_records,
             })
         );
+    }
+    Ok(())
+}
+
+pub(crate) fn tclone_fork_status(args: Vec<OsString>) -> io::Result<()> {
+    let job_id = tclone_target_arg(&args, "usage: gensee run fork-status <job-id> [--json]")?;
+    let as_json = arg_flag(&args, "--json");
+    let job = tclone_async_job_from_id(&job_id)?;
+    let payload = tclone_async_job_status_payload(&job);
+    if as_json {
+        println!("{payload}");
+        return Ok(());
+    }
+
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    println!("{} | status={status}", job.id);
+    if let Some(exit_code) = payload.get("exit_code").and_then(Value::as_i64) {
+        println!("exit_code={exit_code}");
+    }
+    if let Some(forks) = payload.get("forks").and_then(Value::as_array) {
+        for fork in forks {
+            if let Some(run_id) = fork.get("run_id").and_then(Value::as_str) {
+                let container = fork.get("container").and_then(Value::as_str).unwrap_or("-");
+                println!("{run_id} | container={container}");
+            }
+        }
+    }
+    if status == "failed" {
+        if let Some(lines) = payload.get("last_log_lines").and_then(Value::as_array) {
+            for line in lines.iter().filter_map(Value::as_str) {
+                eprintln!("{line}");
+            }
+        }
+    } else if let Some(message) = payload.get("message").and_then(Value::as_str) {
+        println!("{message}");
     }
     Ok(())
 }
@@ -4625,9 +4760,35 @@ mod tests {
         assert_eq!(payload["scheduled"], true);
         assert_eq!(payload["command"], "run fork");
         assert_eq!(payload["job_id"], "job_1");
-        assert_eq!(payload["poll_command"], "gensee run list");
+        assert_eq!(
+            payload["poll_command"],
+            "gensee run fork-status job_1 --json"
+        );
+        assert_eq!(
+            payload["status_command"],
+            "gensee run fork-status job_1 --json"
+        );
         assert!(payload.get("log_path").is_none());
         assert!(payload.get("done_path").is_none());
+    }
+
+    #[test]
+    fn tclone_async_status_parses_fork_payload_from_log() {
+        let log = r#"gensee async job job_1: /tmp/gensee ["run", "fork"]
+noise
+{"source_run_id":"run_1","forked_at_ms":42,"attach":true,"forks":[{"run_id":"run_1_fork_42_0","container":"fork-0"}]}
+gensee async job job_1: exited status=0
+"#;
+        let payload = parse_tclone_async_fork_payload(log).unwrap();
+        assert_eq!(payload["source_run_id"], "run_1");
+        assert_eq!(payload["forks"][0]["run_id"], "run_1_fork_42_0");
+    }
+
+    #[test]
+    fn tclone_async_status_rejects_path_like_job_ids() {
+        assert!(tclone_async_job_from_id("../job").is_err());
+        assert!(tclone_async_job_from_id("dir/job").is_err());
+        assert!(tclone_async_job_from_id("").is_err());
     }
 
     #[test]
@@ -4804,6 +4965,11 @@ mod tests {
             OsString::from("run"),
             OsString::from("exec"),
             OsString::from("run_1"),
+        ]));
+        assert!(tclone_host_control_should_proxy(&[
+            OsString::from("run"),
+            OsString::from("fork-status"),
+            OsString::from("job_1"),
         ]));
         assert!(!tclone_host_control_should_proxy(&[
             OsString::from("hook"),
