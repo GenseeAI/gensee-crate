@@ -894,6 +894,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         create_args.push(OsString::from("-e"));
         create_args.push(OsString::from(format!("{name}={container_path}")));
     }
+    let mut path_prefixes = Vec::new();
     if let Some((node_root, node_bin)) = tclone_node_mount() {
         create_args.push(OsString::from("-v"));
         create_args.push(OsString::from(format!(
@@ -901,12 +902,38 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
             node_root.display(),
             node_root.display()
         )));
+        path_prefixes.push(node_bin.to_string_lossy().to_string());
+    }
+    if let Some((cargo_bin, rustup_home)) = tclone_rust_mount() {
+        create_args.push(OsString::from("-v"));
+        create_args.push(OsString::from(format!(
+            "{}:{}:ro",
+            cargo_bin.display(),
+            cargo_bin.display()
+        )));
+        path_prefixes.push(cargo_bin.to_string_lossy().to_string());
+        if let Some(rustup_home) = rustup_home {
+            create_args.push(OsString::from("-v"));
+            create_args.push(OsString::from(format!(
+                "{}:{}:ro",
+                rustup_home.display(),
+                rustup_home.display()
+            )));
+            create_args.push(OsString::from("-e"));
+            create_args.push(OsString::from(format!(
+                "RUSTUP_HOME={}",
+                rustup_home.display()
+            )));
+        }
         create_args.push(OsString::from("-e"));
         create_args.push(OsString::from(format!(
-            "PATH={}:{}",
-            node_bin.display(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            "CARGO_HOME={container_home}/.cargo"
         )));
+    }
+    if !path_prefixes.is_empty() {
+        path_prefixes.push("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!("PATH={}", path_prefixes.join(":"))));
     }
     create_args.push(OsString::from(&image));
     create_args.push(OsString::from("infinity"));
@@ -3989,6 +4016,21 @@ fn tclone_node_mount() -> Option<(PathBuf, PathBuf)> {
         .map(PathBuf::from)
         .or_else(|| find_command("node").and_then(|path| path.parent().map(Path::to_path_buf)))?;
     Some((root, node_bin))
+}
+
+fn tclone_rust_mount() -> Option<(PathBuf, Option<PathBuf>)> {
+    let cargo_bin = env::var_os("GENSEE_TCLONE_CARGO_BIN")
+        .map(PathBuf::from)
+        .or_else(|| find_command("cargo").and_then(|path| path.parent().map(Path::to_path_buf)))?;
+    if !cargo_bin.exists() {
+        return None;
+    }
+    let rustup_home = env::var_os("GENSEE_TCLONE_RUSTUP_HOME")
+        .or_else(|| env::var_os("RUSTUP_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+        .filter(|path| path.exists());
+    Some((cargo_bin, rustup_home))
 }
 
 fn tclone_podman() -> OsString {
