@@ -30,6 +30,7 @@ const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_CPU_PERCENT: f64 = 10.0;
 const TCLONE_FORK_QUIET_STABLE_SAMPLES: usize = 3;
+const TCLONE_ATTACH_RETRY_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
@@ -482,14 +483,20 @@ fn spawn_tclone_host_control_request(
         .arg("-c")
         .arg(
             "job_id=$1; done_path=$2; log_path=$3; delay=$4; shift 4; \
+             gensee_tmux_message() { \
+               message=$1; \
+               if [ -n \"${GENSEE_HOST_TMUX_SOCKET:-}\" ] && [ -n \"${GENSEE_HOST_TMUX_TARGET:-}\" ]; then \
+                 tmux -S \"$GENSEE_HOST_TMUX_SOCKET\" display-message -d 4000 -t \"$GENSEE_HOST_TMUX_TARGET\" \"$message\" 2>/dev/null || true; \
+               elif [ -n \"${TMUX:-}\" ]; then \
+                 tmux display-message -d 4000 \"$message\" 2>/dev/null || true; \
+               fi; \
+             }; \
+             gensee_tmux_message \"Gensee is preparing a fork; the source agent may pause briefly.\"; \
              sleep \"$delay\"; \"$@\"; status=$?; \
              if [ \"$status\" != 0 ]; then \
-               message=\"Gensee tclone fork failed; see $log_path\"; \
-               if [ -n \"${GENSEE_HOST_TMUX_SOCKET:-}\" ] && [ -n \"${GENSEE_HOST_TMUX_TARGET:-}\" ]; then \
-                 tmux -S \"$GENSEE_HOST_TMUX_SOCKET\" display-message -t \"$GENSEE_HOST_TMUX_TARGET\" \"$message\" 2>/dev/null || true; \
-               elif [ -n \"${TMUX:-}\" ]; then \
-                 tmux display-message \"$message\" 2>/dev/null || true; \
-               fi; \
+               gensee_tmux_message \"Gensee fork failed; see $log_path\"; \
+             else \
+               gensee_tmux_message \"Gensee fork is ready.\"; \
              fi; \
              printf 'gensee async job %s: exited status=%s\\n' \"$job_id\" \"$status\"; \
              printf '%s\\n' \"$status\" > \"$done_path\"; \
@@ -2047,11 +2054,35 @@ fn tclone_attach_container(
             .status();
         match tmux_status {
             Ok(status) if status.success() => {
-                if consume_tclone_host_fork_marker(podman, container_name, attach_started_ms) {
-                    eprintln!("gensee: reattaching to source after tclone fork");
+                if should_reattach_after_tclone_fork_marker(
+                    podman,
+                    container_name,
+                    attach_started_ms,
+                ) {
+                    eprintln!("gensee: source agent paused for fork; reattaching");
                     continue;
                 }
                 return Ok(status);
+            }
+            Ok(_)
+                if should_reattach_after_tclone_fork_marker(
+                    podman,
+                    container_name,
+                    attach_started_ms,
+                ) =>
+            {
+                eprintln!("gensee: source agent paused for fork; reattaching");
+                continue;
+            }
+            Err(error)
+                if should_reattach_after_tclone_fork_marker(
+                    podman,
+                    container_name,
+                    attach_started_ms,
+                ) =>
+            {
+                eprintln!("gensee: source attach interrupted during fork ({error}); reattaching");
+                continue;
             }
             Ok(_) | Err(_) => {
                 return Command::new(podman)
@@ -2352,7 +2383,7 @@ impl Drop for TcloneForkDetachGuard {
     }
 }
 
-fn consume_tclone_host_fork_marker(
+fn should_reattach_after_tclone_fork_marker(
     podman: &OsString,
     container_name: &str,
     attach_started_ms: u64,
@@ -2377,17 +2408,11 @@ fn consume_tclone_host_fork_marker(
         return false;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5 * 60);
-    while Instant::now() < deadline {
-        if !marker_path.exists() {
-            wait_tclone_container_exec_ready(podman, container_name, Duration::from_secs(15));
-            return true;
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-
-    wait_tclone_container_exec_ready(podman, container_name, Duration::from_secs(15));
-    let _ = fs::remove_file(&marker_path);
+    wait_tclone_container_exec_ready(
+        podman,
+        container_name,
+        Duration::from_secs(TCLONE_ATTACH_RETRY_TIMEOUT_SECS),
+    );
     true
 }
 
