@@ -30,6 +30,22 @@ const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_CPU_PERCENT: f64 = 10.0;
 const TCLONE_FORK_QUIET_STABLE_SAMPLES: usize = 3;
+const TCLONE_FORK_TRANSIENT_MOUNT_PREFIXES: &[&str] = &[
+    "/tmp/.codex",
+    "/tmp/.agents",
+    "/tmp/.git",
+    "/workspace/.codex",
+    "/workspace/.agents",
+    "/workspace/.git",
+];
+const TCLONE_FORK_TRANSIENT_DEVICE_MOUNTS: &[&str] = &[
+    "/dev/tty",
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+];
 const TCLONE_ATTACH_RETRY_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -2305,6 +2321,7 @@ fn wait_for_tclone_source_quiet_if_requested(
     let interval = Duration::from_secs(1);
     let mut stable = 0usize;
     let mut last_ticks = descendant_proc_ticks(root_pid)?;
+    let mut last_not_quiet_reason = String::new();
     eprintln!(
         "gensee: waiting for tclone source {} to become quiet before fork (timeout={}s cpu<{}% stable_samples={})",
         source.run_id, timeout, cpu_threshold, stable_samples
@@ -2317,6 +2334,24 @@ fn wait_for_tclone_source_quiet_if_requested(
         let cpu_percent =
             (delta_ticks as f64 / ticks_per_second as f64) / interval.as_secs_f64() * 100.0;
         if cpu_percent <= cpu_threshold {
+            if let Some(reason) = tclone_source_quiet_probe(podman, source)? {
+                stable = 0;
+                last_not_quiet_reason = reason;
+                eprintln!(
+                    "gensee: tclone source {} still active cpu={:.1}% reason={}",
+                    source.run_id, cpu_percent, last_not_quiet_reason
+                );
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out waiting for tclone source {} to become quiet before fork: {}",
+                            source.run_id, last_not_quiet_reason
+                        ),
+                    ));
+                }
+                continue;
+            }
             stable += 1;
             eprintln!(
                 "gensee: tclone source {} quiet sample {}/{} cpu={:.1}%",
@@ -2327,6 +2362,7 @@ fn wait_for_tclone_source_quiet_if_requested(
             }
         } else {
             stable = 0;
+            last_not_quiet_reason = format!("cpu={cpu_percent:.1}%");
             eprintln!(
                 "gensee: tclone source {} still active cpu={:.1}%",
                 source.run_id, cpu_percent
@@ -2336,12 +2372,141 @@ fn wait_for_tclone_source_quiet_if_requested(
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "timed out waiting for tclone source {} to become quiet before fork",
-                    source.run_id
+                    "timed out waiting for tclone source {} to become quiet before fork{}",
+                    source.run_id,
+                    if last_not_quiet_reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {last_not_quiet_reason}")
+                    }
                 ),
             ));
         }
     }
+}
+
+fn tclone_source_quiet_probe(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+) -> io::Result<Option<String>> {
+    let mut reasons = Vec::new();
+    if env::var("GENSEE_TCLONE_FORK_QUIET_MOUNTS").as_deref() != Ok("0") {
+        let mounts = tclone_exec_capture_env(
+            podman,
+            &source.container_name,
+            &[],
+            &["sh", "-lc", "mount | awk '{print $3}'"],
+        )?;
+        let transient_mounts = mounts
+            .lines()
+            .map(str::trim)
+            .filter(|path| tclone_is_transient_fork_mount(path))
+            .take(6)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !transient_mounts.is_empty() {
+            reasons.push(format!("transient mounts {}", transient_mounts.join(", ")));
+        }
+    }
+
+    if env::var("GENSEE_TCLONE_FORK_QUIET_PROCESSES").as_deref() != Ok("0") {
+        let processes = tclone_exec_capture_env(
+            podman,
+            &source.container_name,
+            &[],
+            &["sh", "-lc", "ps -eo pid=,ppid=,stat=,args="],
+        )?;
+        let active_processes = processes
+            .lines()
+            .filter_map(parse_tclone_quiet_process_line)
+            .filter(tclone_is_transient_fork_process)
+            .take(4)
+            .map(|process| format!("{} {}", process.pid, process.command))
+            .collect::<Vec<_>>();
+        if !active_processes.is_empty() {
+            reasons.push(format!(
+                "transient processes {}",
+                active_processes.join("; ")
+            ));
+        }
+    }
+
+    if reasons.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(reasons.join("; ")))
+    }
+}
+
+fn tclone_is_transient_fork_mount(path: &str) -> bool {
+    TCLONE_FORK_TRANSIENT_MOUNT_PREFIXES
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+        || TCLONE_FORK_TRANSIENT_DEVICE_MOUNTS.contains(&path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcloneQuietProcess {
+    pid: u32,
+    stat: String,
+    command: String,
+}
+
+fn parse_tclone_quiet_process_line(line: &str) -> Option<TcloneQuietProcess> {
+    let mut parts = line.split_whitespace();
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let _ppid = parts.next()?.parse::<u32>().ok()?;
+    let stat = parts.next()?.to_string();
+    let command = parts.collect::<Vec<_>>().join(" ");
+    if command.is_empty() {
+        return None;
+    }
+    Some(TcloneQuietProcess { pid, stat, command })
+}
+
+fn tclone_is_transient_fork_process(process: &TcloneQuietProcess) -> bool {
+    if process.stat.contains('Z') {
+        return false;
+    }
+    let command = process.command.as_str();
+    if tclone_is_baseline_fork_process(command) {
+        return false;
+    }
+    tclone_is_known_active_fork_process(command)
+}
+
+fn tclone_is_baseline_fork_process(command: &str) -> bool {
+    command == "/bin/sleep infinity"
+        || command.contains("tmux new-session -d -s gensee-agent")
+        || command.contains("tmux attach-session -t gensee-agent")
+        || command.contains("ps -eo pid=,ppid=,stat=,args=")
+        || command.contains("/node ") && command.contains("/codex")
+        || command.contains("/node ") && command.contains("@openai/codex")
+        || command.contains("/node_modules/@openai/codex/")
+}
+
+fn tclone_is_known_active_fork_process(command: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "codex-linux-sandbox",
+        "bwrap ",
+        "gensee hook",
+        "gensee run",
+        "cargo ",
+        "git ",
+        "npm ",
+        "pnpm ",
+        "yarn ",
+        "python ",
+        "python3 ",
+        "node ",
+        "bash -lc",
+        "sh -lc",
+        "curl ",
+        "rg ",
+        "grep ",
+        "find ",
+    ];
+    MARKERS.iter().any(|marker| command.contains(marker))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
