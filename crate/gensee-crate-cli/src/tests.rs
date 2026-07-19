@@ -5333,6 +5333,136 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
 }
 
 #[test]
+fn codex_source_run_blocks_fork_suggestion_commands() {
+    let payload = pretool_bash_payload("s1", "/repo", "cargo update");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let finding = fork_suggestion_finding(&event, &[], Some("run_123")).unwrap();
+
+    assert_eq!(finding.action, PolicyAction::Block);
+    assert_eq!(finding.severity, "medium");
+    assert!(finding.message.contains("gensee run fork run_123"));
+}
+
+#[test]
+fn codex_fork_run_allows_fork_suggestion_commands() {
+    let payload = pretool_bash_payload("s1", "/repo", "cargo update");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let finding = fork_suggestion_finding(&event, &[], Some("run_123_fork_456_0")).unwrap();
+
+    assert_eq!(finding.action, PolicyAction::Allow);
+    assert_eq!(finding.severity, "info");
+}
+
+#[test]
+fn codex_source_run_emits_pretool_deny_for_fork_suggestion() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-suggestion-block");
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), "cargo update");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .expect("Codex source run should receive a PreToolUse deny");
+
+    assert!(output.contains("\"permissionDecision\":\"deny\""));
+    assert!(output.contains("forked run"));
+    assert!(store.list_alerts().unwrap().iter().any(|alert| {
+        alert.rule_id == "policy_fork_suggested"
+            && alert.action == "block"
+            && alert.severity == "medium"
+    }));
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn fork_suggestion_detects_user_prompt_intents() {
+    let cases = [
+        (
+            "Upgrade the Rust dependencies in this repo where appropriate, update Cargo.lock, run cargo test, and fix any breakages.",
+            ForkSuggestionReason::DependencyUpgrade,
+        ),
+        (
+            "Clean up generated and temporary files across the repo, remove anything obsolete, then run tests to make sure nothing important was deleted.",
+            ForkSuggestionReason::DestructiveFileCleanup,
+        ),
+        (
+            "Add a database migration for tracking agent run status history, update the code that writes run status, and verify the migration works.",
+            ForkSuggestionReason::SchemaMigration,
+        ),
+    ];
+
+    for (prompt, expected) in cases {
+        assert_eq!(fork_suggestion_reason_for_prompt(prompt), Some(expected));
+    }
+}
+
+#[test]
+fn codex_userpromptsubmit_injects_fork_context_for_source_run() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-prompt");
+    let payload = format!(
+        "{{\"session_id\":\"s1\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"{}\",\"prompt\":\"Upgrade the Rust dependencies in this repo where appropriate, update Cargo.lock, run cargo test, and fix any breakages.\"}}",
+        workspace.display()
+    );
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .expect("Codex source run should receive fork guidance before planning");
+
+    assert!(output.contains("\"additionalContext\""));
+    assert!(output.contains("forked run"));
+    assert!(output.contains("approve a forked run"));
+    assert!(
+        output.contains("gensee run fork run_123 --name try-upgrade --attach tmux:right --json")
+    );
+    assert!(store.list_alerts().unwrap().iter().any(|alert| {
+        alert.rule_id == "policy_fork_suggested"
+            && alert.action == "allow"
+            && alert.severity == "info"
+            && alert
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains(r#""phase":"user_prompt""#))
+    }));
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_userpromptsubmit_dedups_fork_context_per_reason() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-prompt-dedup");
+    let payload = format!(
+        "{{\"session_id\":\"s1\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"{}\",\"prompt\":\"Upgrade the Rust dependencies and update Cargo.lock.\"}}",
+        workspace.display()
+    );
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    assert!(process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .is_some());
+    assert!(process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .session_alert_count("s1", "policy_fork_suggested")
+            .unwrap(),
+        1
+    );
+
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
 fn hook_records_fork_suggestion_without_blocking() {
     let (store, workspace) = temp_store_and_workspace("fork-suggestion");
     let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), "npm update");
