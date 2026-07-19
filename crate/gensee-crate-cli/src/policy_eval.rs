@@ -186,6 +186,16 @@ pub(crate) fn evaluate_pretool_policy_with_store(
         }
     }
     if !matches!(action, PolicyAction::Block) {
+        if let Some(finding) = tclone_fork_command_finding(event, store) {
+            findings.push(finding);
+            action = findings
+                .iter()
+                .map(|finding| finding.action)
+                .max()
+                .unwrap_or(PolicyAction::Allow);
+        }
+    }
+    if !matches!(action, PolicyAction::Block) {
         if let Some(finding) =
             fork_suggestion_finding(event, &subjects, env::var("GENSEE_RUN_ID").ok().as_deref())
         {
@@ -282,11 +292,14 @@ pub(crate) fn fork_suggestion_finding(
         return None;
     }
     let command = event.tool_input_command.as_deref()?;
+    if tclone_control_targets_fork(command) {
+        return None;
+    }
     let reason = fork_suggestion_reason(command, subjects)?;
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run, then run: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json; then gensee run send <fork-id> -- '<task prompt>'",
+            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; wait for the done_path/log_path or run gensee run list, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'",
             reason = reason.label()
         )
     } else {
@@ -325,7 +338,7 @@ pub(crate) fn fork_suggestion_prompt_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json; then gensee run send <fork-id> -- '<task prompt>'",
+            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; wait for the done_path/log_path or run gensee run list, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'",
             reason = reason.label()
         )
     } else {
@@ -373,6 +386,93 @@ fn current_run_is_tclone_source(current_run_id: Option<&str>) -> bool {
         .is_some_and(|run_id| !run_id.is_empty() && !run_id.contains("_fork_"))
 }
 
+fn tclone_fork_command_finding(
+    event: &AgentHookEvent,
+    store: Option<&EventStore>,
+) -> Option<PolicyFinding> {
+    if event.hook_event_name.as_deref() != Some("PreToolUse") {
+        return None;
+    }
+    let command = event.tool_input_command.as_deref()?;
+    let (source_run_id, name) = parse_tclone_fork_command(command)?;
+    let fork_key = format!("{source_run_id}:{}", name.as_deref().unwrap_or(""));
+    let duplicate = recent_tclone_fork_command_already_recorded(store, event, &fork_key);
+    let action = if duplicate && event.provider == PROVIDER_CODEX {
+        PolicyAction::Block
+    } else {
+        PolicyAction::Allow
+    };
+    let message = if duplicate {
+        format!(
+            "A fork for source {source_run_id}{} was already scheduled in this session. Do not run gensee run fork again; wait for the earlier done_path/log_path, run gensee run list, then send work to the existing fork.",
+            name.as_deref()
+                .map(|name| format!(" with name {name}"))
+                .unwrap_or_default()
+        )
+    } else {
+        format!(
+            "Gensee recorded a tclone fork request for source {source_run_id}{}.",
+            name.as_deref()
+                .map(|name| format!(" with name {name}"))
+                .unwrap_or_default()
+        )
+    };
+    Some(PolicyFinding {
+        action,
+        severity: if duplicate { "medium" } else { "info" }.to_string(),
+        rule_id: "policy_tclone_fork_scheduled".to_string(),
+        message,
+        path: event.cwd.clone(),
+        evidence: json!({
+            "source": "tclone_control",
+            "source_run_id": source_run_id,
+            "fork_name": name,
+            "fork_key": fork_key,
+            "duplicate": duplicate,
+            "provider": event.provider,
+            "tool_name": event.tool_name.as_deref(),
+            "tool_use_id": event.tool_use_id.as_deref(),
+        }),
+    })
+}
+
+fn recent_tclone_fork_command_already_recorded(
+    store: Option<&EventStore>,
+    event: &AgentHookEvent,
+    fork_key: &str,
+) -> bool {
+    const DUPLICATE_WINDOW_MS: u64 = 5 * 60 * 1000;
+    let Some(store) = store else {
+        return false;
+    };
+    let Some(session_id) = event.session_id.as_deref() else {
+        return false;
+    };
+    let Ok(alerts) = store.list_alerts() else {
+        return false;
+    };
+    alerts.into_iter().any(|alert| {
+        alert.session_id.as_deref() == Some(session_id)
+            && alert.rule_id == "policy_tclone_fork_scheduled"
+            && event
+                .observed_at_ms
+                .saturating_sub(alert.created_at.max(0) as u64)
+                <= DUPLICATE_WINDOW_MS
+            && alert.evidence.as_deref().is_some_and(|evidence| {
+                serde_json::from_str::<Value>(evidence)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("fork_key")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some(fork_key)
+            })
+    })
+}
+
 pub(crate) fn fork_suggestion_reason(
     command: &str,
     subjects: &[PolicySubject],
@@ -407,6 +507,9 @@ pub(crate) fn fork_suggestion_reason(
 
 pub(crate) fn fork_suggestion_reason_for_prompt(prompt: &str) -> Option<ForkSuggestionReason> {
     let normalized = normalize_command_for_matching(prompt);
+    if prompt_is_already_in_fork_context(&normalized) {
+        return None;
+    }
     if prompt_suggests_destructive_db(&normalized) {
         return Some(ForkSuggestionReason::DestructiveDatabaseCommand);
     }
@@ -437,6 +540,136 @@ fn normalize_command_for_matching(command: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn prompt_is_already_in_fork_context(prompt: &str) -> bool {
+    prompt.contains("gensee context:")
+        && prompt.contains("already running inside forked run")
+        && prompt.contains("do not create another fork")
+}
+
+fn tclone_control_targets_fork(command: &str) -> bool {
+    parse_tclone_control_target(command).is_some_and(|(_, target)| target.contains("_fork_"))
+}
+
+fn parse_tclone_fork_command(command: &str) -> Option<(String, Option<String>)> {
+    let tokens = shellish_words(command);
+    let index = find_gensee_run_subcommand(&tokens, "fork")?;
+    let source = tokens.get(index + 3)?.trim();
+    if source.is_empty() || source.starts_with('-') {
+        return None;
+    }
+    let name = option_value(&tokens[index + 4..], "--name");
+    Some((source.to_string(), name))
+}
+
+fn parse_tclone_control_target(command: &str) -> Option<(&'static str, String)> {
+    let tokens = shellish_words(command);
+    for subcommand in [
+        "send", "exec", "shell", "attach", "diff", "merge", "switch", "keep", "discard", "delete",
+    ] {
+        let Some(index) = find_gensee_run_subcommand(&tokens, subcommand) else {
+            continue;
+        };
+        let Some(target) = first_non_option_after(&tokens, index + 3) else {
+            continue;
+        };
+        return Some((subcommand, target.to_string()));
+    }
+    None
+}
+
+fn find_gensee_run_subcommand(tokens: &[String], subcommand: &str) -> Option<usize> {
+    tokens.windows(3).position(|window| {
+        command_basename(&window[0]) == "gensee" && window[1] == "run" && window[2] == subcommand
+    })
+}
+
+fn command_basename(command: &str) -> &str {
+    command.rsplit('/').next().unwrap_or(command)
+}
+
+fn first_non_option_after(tokens: &[String], mut index: usize) -> Option<&str> {
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if token == "--" {
+            return None;
+        }
+        if token.starts_with('-') {
+            index += if token.contains('=') || !tclone_option_takes_value(token) {
+                1
+            } else {
+                2
+            };
+            continue;
+        }
+        return Some(token);
+    }
+    None
+}
+
+fn tclone_option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "--name" | "--copies" | "--attach" | "--tmux" | "--into" | "--to" | "--paths"
+    )
+}
+
+fn option_value(tokens: &[String], name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if token == name {
+            return tokens.get(index + 1).cloned();
+        }
+        if let Some(value) = token.strip_prefix(&prefix) {
+            return Some(value.to_string());
+        }
+        index += 1;
+    }
+    None
+}
+
+fn shellish_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 fn command_suggests_dependency_upgrade(command: &str) -> bool {
