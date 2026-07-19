@@ -3815,12 +3815,16 @@ fn prepare_tclone_seed(
     let workspace_seed = seed_root.join(container_relative_path(container_workspace)?);
     copy_tclone_workspace(original_workspace, &workspace_seed)?;
 
-    if let Some((_, host_home, container_path)) = agent_home.filter(|(_, path, _)| path.exists()) {
+    if let Some((name, host_home, container_path)) = agent_home.filter(|(_, path, _)| path.exists())
+    {
         copy_path_all(
             host_home,
             &seed_root.join(container_relative_path(container_path)?),
         )?;
         install_tclone_host_path_compatibility(seed_root, host_home, container_path)?;
+        if name == "CODEX_HOME" {
+            rewrite_tclone_codex_hooks(seed_root, container_path, container_home)?;
+        }
     }
     if let Some(gensee_home) = gensee_home.filter(|path| path.exists()) {
         copy_path_all(
@@ -3832,6 +3836,41 @@ fn prepare_tclone_seed(
         install_tclone_gensee_home_compatibility(seed_root, gensee_home, container_home)?;
     }
     Ok(())
+}
+
+fn rewrite_tclone_codex_hooks(
+    seed_root: &Path,
+    container_codex_home: &str,
+    container_home: &str,
+) -> io::Result<()> {
+    let hooks_path = seed_root.join(container_relative_path(&format!(
+        "{container_codex_home}/hooks.json"
+    ))?);
+    let mut root = if hooks_path.exists() {
+        let contents = fs::read_to_string(&hooks_path)?;
+        if contents.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&contents).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not valid JSON: {err}", hooks_path.display()),
+                )
+            })?
+        }
+    } else {
+        json!({})
+    };
+
+    let gensee_home = PathBuf::from(format!("{container_home}/.gensee"));
+    let command = codex_hook_command(&gensee_home, Path::new("/usr/local/bin/gensee"));
+    apply_codex_hook_settings(&mut root, &command)?;
+
+    if let Some(parent) = hooks_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let serialized = serde_json::to_string_pretty(&root)?;
+    fs::write(hooks_path, format!("{serialized}\n"))
 }
 
 fn install_tclone_host_path_compatibility(
@@ -4912,7 +4951,11 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         fs::write(workspace.join("README.md"), "demo").unwrap();
         fs::create_dir_all(&host_home).unwrap();
-        fs::write(host_home.join("hooks.json"), "{}").unwrap();
+        fs::write(
+            host_home.join("hooks.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"matcher":"*","hooks":[{"type":"command","command":"GENSEE_HOME=/home/yiying/.gensee /home/yiying/.cargo/bin/gensee hook codex"}]}]}}"#,
+        )
+        .unwrap();
         fs::create_dir_all(&gensee_home).unwrap();
         fs::write(gensee_home.join("policy.json"), "{}").unwrap();
 
@@ -4931,6 +4974,9 @@ mod tests {
         .unwrap();
 
         assert!(seed.join("home/gensee/.codex/hooks.json").exists());
+        let hooks = fs::read_to_string(seed.join("home/gensee/.codex/hooks.json")).unwrap();
+        assert!(hooks.contains("GENSEE_HOME=/home/gensee/.gensee /usr/local/bin/gensee hook codex"));
+        assert!(!hooks.contains("/home/yiying/.cargo/bin/gensee hook codex"));
         assert_eq!(
             fs::read_link(seed.join(host_home.strip_prefix("/").unwrap())).unwrap(),
             PathBuf::from("/home/gensee/.codex")
