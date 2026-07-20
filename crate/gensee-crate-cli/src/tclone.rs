@@ -47,7 +47,9 @@ const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
 const TCLONE_ASYNC_JOB_TIMEOUT_SECS: u64 = 10 * 60;
 const TCLONE_ASYNC_JOB_STALE_GRACE_SECS: u64 = 30;
+const TCLONE_ASYNC_TIMEOUT_ESCALATION_SECS: u64 = 2;
 const TCLONE_ASYNC_TIMEOUT_CLAIM_STALE_SECS: u64 = 30;
+const _: () = assert!(TCLONE_ASYNC_TIMEOUT_CLAIM_STALE_SECS > TCLONE_ASYNC_TIMEOUT_ESCALATION_SECS);
 const TCLONE_ASYNC_MAX_ACTIVE_JOBS: usize = 4;
 const TCLONE_ASYNC_JOB_RETENTION_SECS: u64 = 24 * 60 * 60;
 const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
@@ -101,6 +103,7 @@ struct TcloneAsyncJob {
 }
 
 static TCLONE_ASYNC_SCHEDULE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TCLONE_HOST_FILE_TIMEOUT_CLAMP_WARNING: OnceLock<()> = OnceLock::new();
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct TcloneRunRecord {
@@ -519,9 +522,11 @@ fn tclone_host_control_file_timeout_secs() -> u64 {
 fn clamp_tclone_host_control_file_timeout_secs(configured: u64) -> u64 {
     let maximum = TCLONE_HOST_CONTROL_REQUEST_MAX_AGE_SECS.saturating_sub(1);
     if configured > maximum {
-        eprintln!(
-            "gensee: warning: clamping tclone host file timeout from {configured}s to {maximum}s so requests remain fresh"
-        );
+        TCLONE_HOST_FILE_TIMEOUT_CLAMP_WARNING.get_or_init(|| {
+            eprintln!(
+                "gensee: warning: clamping tclone host file timeout from {configured}s to {maximum}s so requests remain fresh"
+            );
+        });
     }
     configured.min(maximum)
 }
@@ -1117,7 +1122,7 @@ fn spawn_tclone_host_control_request(
     Command::new("sh")
         .arg("-c")
         .arg(
-            "job_id=$1; done_path=$2; log_path=$3; delay=$4; timeout_secs=$5; shift 5; \
+            "job_id=$1; done_path=$2; log_path=$3; delay=$4; timeout_secs=$5; escalation_secs=$6; shift 6; \
              gensee_tmux_message() { \
                message=$1; \
                if [ -n \"${GENSEE_HOST_TMUX_SOCKET:-}\" ] && [ -n \"${GENSEE_HOST_TMUX_TARGET:-}\" ]; then \
@@ -1135,7 +1140,7 @@ fn spawn_tclone_host_control_request(
                if mkdir \"$claim_path\" 2>/dev/null; then \
                  if kill -0 \"$command_pid\" 2>/dev/null; then \
                    if [ \"$use_group\" = 1 ]; then kill -TERM \"-$command_pid\" 2>/dev/null || true; else kill -TERM \"$command_pid\" 2>/dev/null || true; fi; \
-                   sleep 2; \
+                   sleep \"$escalation_secs\"; \
                    if [ \"$use_group\" = 1 ]; then kill -KILL \"-$command_pid\" 2>/dev/null || true; else kill -KILL \"$command_pid\" 2>/dev/null || true; fi; \
                  else \
                    rmdir \"$claim_path\" 2>/dev/null || true; \
@@ -1166,6 +1171,7 @@ fn spawn_tclone_host_control_request(
         .arg(&job.log_path)
         .arg(delay_secs.to_string())
         .arg(job_timeout_secs.to_string())
+        .arg(TCLONE_ASYNC_TIMEOUT_ESCALATION_SECS.to_string())
         .arg(&exe)
         .args(&request.args)
         .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
