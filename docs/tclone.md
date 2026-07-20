@@ -107,8 +107,10 @@ any live in-container agent, so concurrent writes to the same workspace files ca
 race. For shell features or a series of commands, wrap them explicitly:
 
 From the host, `run exec` may target any selected run. Through the in-container
-host-control bridge, a run may execute or diff only itself; a source hands work
-to its direct child forks with `run send` instead of executing commands in them.
+host-control bridge, a run may execute only in itself. A source hands work to
+direct child forks with `run send`, can inspect those children with scoped
+`run list --json`, `run diff --json`, and `run summary --json`, and can resolve
+them with merge, switch, or discard after user approval.
 
 ```bash
 gensee-tclone run exec <fork-id> -- bash -lc 'npm install && npm test'
@@ -175,9 +177,11 @@ The current integration is host-owned:
 
 Container-to-host control uses a per-run capability in the run context. Requests
 are signed, short-lived, and replay-protected. A source capability may fork that
-source, poll its own fork jobs, and send prompts to its direct child forks. A
-fork cannot control its source or siblings, and `run list`, `run attach`, and
-`run shell` remain host-only.
+source, poll its own fork jobs, send prompts to direct child forks, inspect their
+results, and resolve them after approval. JSON run listings are scoped to the
+caller and its direct children. A fork cannot control its source or siblings;
+`run attach`, `run shell`, and human-readable global run listings remain
+host-only.
 
 The capability authenticates the container, not an individual agent process:
 any process that can read `/tmp/gensee-run-context.json` inside that container
