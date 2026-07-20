@@ -305,7 +305,7 @@ pub(crate) fn fork_suggestion_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. If status=failed, stop and report the failure.",
+            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, or stop and report the failure if status=failed. Once status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. Poll `gensee run list --json` until that fork has task_status=completed, then run `gensee run summary <fork-id> --json` and present the changed files and tests in chat. Do not auto-merge and do not ask the user to type Gensee lifecycle commands. Offer three choices: merge the changes back, keep working in the fork, or discard the fork. Wait for explicit user approval before running `gensee run merge`, `gensee run switch`, or `gensee run discard` internally.",
             reason = reason.label()
         )
     } else {
@@ -378,7 +378,7 @@ pub(crate) fn fork_suggestion_prompt_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. If status=failed, stop and report the failure.",
+            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, or stop and report the failure if status=failed. Once status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. Poll `gensee run list --json` until that fork has task_status=completed, then run `gensee run summary <fork-id> --json` and present the changed files and tests in chat. Do not auto-merge and do not ask the user to type Gensee lifecycle commands. Offer three choices: merge the changes back, keep working in the fork, or discard the fork. Wait for explicit user approval before running `gensee run merge`, `gensee run switch`, or `gensee run discard` internally.",
             reason = reason.label()
         )
     } else {

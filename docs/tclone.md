@@ -30,6 +30,7 @@ Use a second terminal to fork the running source container:
 
 ```bash
 gensee-tclone run list
+gensee-tclone run list --json
 gensee-tclone run fork <source-run-id> --copies 2
 gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right --json
 gensee-tclone run shell <run_id-or-container>
@@ -37,7 +38,8 @@ gensee-tclone run attach <run_id-or-container>
 gensee-tclone run attach <run_id-or-container> --tmux right
 gensee-tclone run send <run_id-or-container> -- 'Run npm test and fix failures'
 gensee-tclone run exec <run_id-or-container> -- bash -lc 'cargo test'
-gensee-tclone run diff <run_id-or-container>
+gensee-tclone run diff <run_id-or-container> [--json]
+gensee-tclone run summary <fork-id> --json
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
 gensee-tclone run merge <fork-id> --into <source-id> --filesystem
 gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.codex
@@ -47,6 +49,11 @@ gensee-tclone run discard <run_id-or-container>
 gensee-tclone run delete <run_id-or-container>   # remove container and hide from run list
 gensee-tclone run delete --all                   # clean tracked runs and gensee-tclone-* orphans
 ```
+
+When Codex starts work in a fork, these lifecycle commands are internal agent
+controls. Codex polls `run list --json`, reads `run summary <fork-id> --json`,
+and presents the changed files, tests, and keep-working/merge/discard choices in
+chat. It must not merge, switch, or discard until the user approves that choice.
 
 The source id is the row with role `source` under the `Tclone containers`
 section of `gensee run list`. The launcher also prints it directly:

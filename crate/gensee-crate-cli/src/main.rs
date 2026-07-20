@@ -109,7 +109,7 @@ pub(crate) fn run_cli() -> io::Result<()> {
             args.remove(0);
             if args.first().and_then(|arg| arg.to_str()) == Some("list") {
                 args.remove(0);
-                return list_runs();
+                return list_runs(args);
             }
             if args.first().and_then(|arg| arg.to_str()) == Some("fork") {
                 args.remove(0);
@@ -138,6 +138,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             if args.first().and_then(|arg| arg.to_str()) == Some("diff") {
                 args.remove(0);
                 return tclone_diff(args);
+            }
+            if args.first().and_then(|arg| arg.to_str()) == Some("summary") {
+                args.remove(0);
+                return tclone_summary(args);
             }
             if args.first().and_then(|arg| arg.to_str()) == Some("merge") {
                 args.remove(0);
@@ -176,7 +180,7 @@ pub(crate) fn run_cli() -> io::Result<()> {
         Some("session") => {
             args.remove(0);
             match args.first().and_then(|arg| arg.to_str()) {
-                Some("list") => list_runs(),
+                Some("list") => list_runs(args[1..].to_vec()),
                 _ => {
                     print_usage();
                     Ok(())
@@ -3364,6 +3368,7 @@ pub(crate) fn process_hook_event(
     store: &EventStore,
 ) -> io::Result<Option<String>> {
     store.append_hook_event(event)?;
+    record_tclone_fork_hook_lifecycle(event);
 
     if matches!(
         event.hook_event_name.as_deref(),
@@ -3565,6 +3570,6 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 
 pub(crate) fn print_usage() {
     println!(
-        "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run fork run_123 --copies 2 --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
+        "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container> [--json]\n  gensee run summary <fork-id> [--json]\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list [--json]\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run fork run_123 --copies 2 --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
     );
 }

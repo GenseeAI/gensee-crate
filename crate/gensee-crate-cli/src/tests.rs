@@ -6160,6 +6160,14 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert!(finding
         .message
         .contains("gensee run send <fork-id> -- '<task prompt>'"));
+    assert!(finding.message.contains("gensee run list --json"));
+    assert!(finding
+        .message
+        .contains("gensee run summary <fork-id> --json"));
+    assert!(finding.message.contains("Do not auto-merge"));
+    assert!(finding
+        .message
+        .contains("Wait for explicit user approval before running"));
     assert_eq!(finding.evidence["reason"], json!("dependency_upgrade"));
 }
 

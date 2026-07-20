@@ -443,14 +443,20 @@ alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX
 
 gensee-tclone run --runtime tclone -- codex
 gensee-tclone run list              # source id is under "Tclone containers"
+gensee-tclone run list --json       # agent-facing completion polling
 gensee-tclone run fork <source-run-id> --copies 2 --attach tmux:right --json
 gensee-tclone run attach <fork-id> --tmux right
 gensee-tclone run send <fork-id> -- 'Run cargo test and fix failures'
 gensee-tclone run exec <fork-id> -- bash -lc 'cargo test'
-gensee-tclone run diff <fork-id>
+gensee-tclone run diff <fork-id> [--json]
+gensee-tclone run summary <fork-id> --json
 gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
 gensee-tclone run switch <fork-id>                         # continue from the fork
 ```
+
+Codex should mediate fork resolution: summarize the fork in chat, offer merge,
+keep-working, and discard choices, and run the selected lifecycle command only
+after explicit user approval.
 
 The tclone launcher also prints the source id directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
