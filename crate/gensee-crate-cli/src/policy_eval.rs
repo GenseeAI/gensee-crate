@@ -844,25 +844,45 @@ fn prompt_suggests_dependency_upgrade(prompt: &str) -> bool {
 }
 
 fn prompt_suggests_schema_migration(prompt: &str) -> bool {
-    (prompt.contains("database migration")
-        || prompt.contains("db migration")
-        || prompt.contains("schema migration")
-        || prompt.contains("migration"))
-        && command_contains_any(
-            prompt,
-            &[
-                "add",
-                "create",
-                "write",
-                "run",
-                "apply",
-                "verify",
-                "status history",
-                "schema",
-                "database",
-                "db",
-            ],
-        )
+    command_contains_any(
+        prompt,
+        &[
+            "add a database migration",
+            "add database migration",
+            "add a db migration",
+            "add db migration",
+            "add a schema migration",
+            "add schema migration",
+            "create a database migration",
+            "create database migration",
+            "create a db migration",
+            "create db migration",
+            "create a schema migration",
+            "create schema migration",
+            "write a database migration",
+            "write a db migration",
+            "write a schema migration",
+            "run the database migration",
+            "run database migration",
+            "run the db migration",
+            "run db migration",
+            "run the schema migration",
+            "run schema migration",
+            "apply the database migration",
+            "apply database migration",
+            "apply the db migration",
+            "apply db migration",
+            "apply the schema migration",
+            "apply schema migration",
+            "verify the database migration",
+            "verify the db migration",
+            "verify the schema migration",
+            "database migration status",
+            "db migration status",
+            "schema migration status",
+            "migration status history",
+        ],
+    )
 }
 
 fn prompt_suggests_destructive_cleanup(prompt: &str) -> bool {
@@ -1941,6 +1961,9 @@ pub(crate) fn decision_json_for_provider(
         if matches!(decision.action, PolicyAction::Allow) && decision.findings.is_empty() {
             return None;
         }
+        // Codex PermissionRequest currently accepts systemMessage output but not
+        // Claude-style permissionDecision fields. This is an advisory policy
+        // message, not an enforced deny; tests must describe that distinction.
         return Some(json!({ "systemMessage": reason }).to_string());
     }
     if provider == PROVIDER_ANTIGRAVITY {
@@ -2358,4 +2381,57 @@ pub(crate) fn policy_findings_for_subject(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod matcher_tests {
+    use super::*;
+
+    #[test]
+    fn shellish_words_preserves_quoted_and_escaped_arguments() {
+        assert_eq!(
+            shellish_words(r#"gensee run send run_1 -- "two words" escaped\ value"#),
+            vec![
+                "gensee",
+                "run",
+                "send",
+                "run_1",
+                "--",
+                "two words",
+                "escaped value",
+            ]
+        );
+    }
+
+    #[test]
+    fn tclone_control_target_parser_skips_options_with_values() {
+        assert_eq!(
+            parse_tclone_control_target("gensee run attach --tmux tmux:right run_1_fork_2_0"),
+            Some(("attach", "run_1_fork_2_0".to_string()))
+        );
+        assert_eq!(
+            first_non_option_after(
+                &[
+                    "--tmux".to_string(),
+                    "tmux:right".to_string(),
+                    "run_1".to_string(),
+                ],
+                0,
+            ),
+            Some("run_1")
+        );
+    }
+
+    #[test]
+    fn schema_migration_prompt_matcher_avoids_broad_substring_false_positives() {
+        assert!(prompt_suggests_schema_migration(
+            "create a schema migration for the accounts table"
+        ));
+        assert!(!prompt_suggests_schema_migration(
+            "add logging to the migration documentation"
+        ));
+        assert!(!prompt_suggests_schema_migration(
+            "verify that the migration guide describes the database"
+        ));
+    }
 }
