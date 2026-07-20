@@ -459,8 +459,11 @@ such as dependency upgrades, migrations, broad refactors, lockfile changes,
 destructive cleanup, and database resets. In Codex tclone source runs, matching
 user prompts add fork guidance before planning; matching source commands are
 blocked as a backstop so the risky work happens in a fork first.
-Async fork JSON includes `status_command`; poll it until `status=succeeded`,
-then send work to `forks[0].run_id`.
+Async fork JSON includes `status_command`; poll it only until
+`status=succeeded`, then send work to `forks[0].run_id`. After sending work
+with `gensee run send`, do not poll Gensee for task completion: the fork is an
+interactive agent session attached in tmux, so ask the user to report the fork
+result.
 Use a tclone image with `tmux` for reliable `gensee run attach`. From inside a
 host tmux session, `--attach tmux:right` opens the forked live agent in a new
 pane. Without tmux, `gensee run shell` still opens a new shell but does not

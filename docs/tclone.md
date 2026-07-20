@@ -76,7 +76,9 @@ an existing run or fork in a new host pane.
 Use `gensee run send <id> -- <prompt>` to paste a prompt into the fork's
 in-container `gensee-agent` tmux session and press Enter. If that fork is
 attached in a host tmux pane, the pane visibly shows the forked agent receiving
-and executing the work:
+and executing the work. Because the fork is an interactive agent session, do not
+poll Gensee for task completion after sending the prompt; ask the user to report
+the fork result from the attached pane:
 
 ```bash
 FORK_ID=$(gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right --json \
@@ -85,9 +87,9 @@ gensee-tclone run send "$FORK_ID" -- 'Try the dependency upgrade, run tests, and
 ```
 
 When a fork is scheduled asynchronously from inside an agent, the JSON response
-includes `status_command`. Poll it until `status=succeeded`, then use
-`forks[0].run_id`; if it returns `status=failed`, stop and inspect the included
-log summary.
+includes `status_command`. Poll it only until `status=succeeded`, then use
+`forks[0].run_id` for `gensee run send`; if it returns `status=failed`, stop and
+inspect the included log summary.
 
 Use `gensee run exec <id> -- <command>` for non-interactive work in a fork,
 such as commands requested by an agent. The command runs inside the container
