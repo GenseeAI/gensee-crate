@@ -99,6 +99,10 @@ use it only for commands you intend to execute in that fork. It runs alongside
 any live in-container agent, so concurrent writes to the same workspace files can
 race. For shell features or a series of commands, wrap them explicitly:
 
+From the host, `run exec` may target any selected run. Through the in-container
+host-control bridge, a run may execute or diff only itself; a source hands work
+to its direct child forks with `run send` instead of executing commands in them.
+
 ```bash
 gensee-tclone run exec <fork-id> -- bash -lc 'npm install && npm test'
 ```
@@ -162,9 +166,19 @@ The current integration is host-owned:
 - in-container hooks and policy config are copied in with the agent config
 - forked containers can be inspected, copied out, or discarded from the host
 
-This keeps fork/snapshot/rollback outside the agent trust boundary. Future work
-should add a post-fork rebind handshake so in-container hooks can rotate from
-the source `GENSEE_RUN_ID` to a fork-specific run id after live cloning.
+Container-to-host control uses a per-run capability in the run context. Requests
+are signed, short-lived, and replay-protected. A source capability may fork that
+source, poll its own fork jobs, and send prompts to its direct child forks. A
+fork cannot control its source or siblings, and `run list`, `run attach`, and
+`run shell` remain host-only.
+
+The capability authenticates the container, not an individual agent process:
+any process that can read `/tmp/gensee-run-context.json` inside that container
+inherits that run's limited authority. It does not gain another run's capability
+or broader host command execution. Fork/snapshot/rollback mechanics and the run
+registry remain host-owned. Future work should add a post-fork rebind handshake
+so in-container hooks can rotate from the source `GENSEE_RUN_ID` to a
+fork-specific run id after live cloning.
 
 ## Current Limitations
 
