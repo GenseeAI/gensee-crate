@@ -229,3 +229,138 @@ export interface PaginatedResult<T> {
   limit: number;
   offset: number;
 }
+
+// ---------------------------------------------------------------------------
+// Static coding-agent configuration audit.
+// Mirrors gensee-crate-config-audit schema version 1.
+// ---------------------------------------------------------------------------
+
+export type AuditSeverity = AlertSeverity;
+export type AuditAssessment = 'confirmed' | 'potential' | 'not_assessable';
+
+export interface AuditEvidence {
+  source: string;
+  key?: string;
+  value?: string;
+}
+
+export interface AuditFinding {
+  fingerprint: string;
+  rule_id: string;
+  category: string;
+  severity: AuditSeverity;
+  confidence: 'high' | 'medium' | 'low';
+  assessment: AuditAssessment;
+  title: string;
+  description: string;
+  evidence?: AuditEvidence[];
+  remediation: {
+    summary: string;
+    suggested_values?: Record<string, string>;
+  };
+  references?: string[];
+  mappings?: string[];
+}
+
+export interface AuditSource {
+  kind: string;
+  path: string;
+  exists: boolean;
+  applied: boolean;
+  trusted: boolean;
+  sha256?: string;
+  ignored_keys?: string[];
+  errors?: string[];
+}
+
+export interface AuditSkill {
+  name: string;
+  path: string;
+  scope: string;
+  enabled: boolean;
+  has_scripts: boolean;
+  review_state: string;
+  sha256?: string;
+}
+
+export interface AuditMcpServer {
+  id: string;
+  transport: string;
+  enabled: boolean;
+  has_tool_allowlist: boolean;
+  endpoint?: string;
+}
+
+export interface AuditInventory {
+  skills: AuditSkill[];
+  mcp_servers: AuditMcpServer[];
+  hook_commands: number;
+  plugin_manifests: number;
+  marketplace_files: number;
+  rule_files: number;
+  instruction_files: number;
+  managed_requirement_files: number;
+  extensions?: AuditExtension[];
+  custom_agents?: number;
+}
+
+export interface AuditExtension {
+  id: string;
+  version: string;
+  path: string;
+  enabled_state: string;
+  capabilities?: string[];
+}
+
+export interface AuditManualCheck {
+  check_id: string;
+  priority: string;
+  title: string;
+  reason: string;
+  action: string;
+  references?: string[];
+}
+
+export interface ConfigAuditReport {
+  schema_version: 1;
+  ruleset: { id: string; version: string };
+  target: {
+    provider: string;
+    workspace: string;
+    codex_home?: string;
+    profile?: string;
+    codex_version?: string;
+    surfaces: string[];
+    vscode_user_data?: string;
+    vscode_profile?: string;
+  };
+  summary: {
+    assessment: 'complete' | 'partial';
+    max_severity?: AuditSeverity;
+    counts: Record<AuditSeverity, number>;
+    manual_checks: number;
+  };
+  sources: AuditSource[];
+  effective_security_config: Record<string, unknown>;
+  inventory: AuditInventory;
+  findings: AuditFinding[];
+  manual_checks: AuditManualCheck[];
+  limitations: string[];
+}
+
+export type AuditApplicability = 'applicable' | 'partial' | 'not_detected';
+
+export interface TargetConfigAuditReport {
+  target: 'codex-cli' | 'github-copilot-vscode' | 'vscode-agent-host';
+  applicability: AuditApplicability;
+  applicability_reason?: string;
+  report: ConfigAuditReport;
+}
+
+export interface ConfigAuditBundle {
+  schema_version: 1;
+  requested_target: 'codex' | 'vscode' | 'codex-cli' | 'github-copilot-vscode' | 'vscode-agent-host';
+  resolved_targets: string[];
+  summary: ConfigAuditReport['summary'];
+  reports: TargetConfigAuditReport[];
+}

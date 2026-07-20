@@ -1,33 +1,46 @@
-# `gensee audit config` — Codex configuration review
+# `gensee audit` — coding-agent configuration review
 
-`gensee audit config` performs a static, read-only security and privacy review
-of local Codex configuration. It inventories the effective local settings and
-extension surfaces, reports concrete and potential risks, and identifies
-account-side checks that cannot be proven from files.
+`gensee audit` performs a static, read-only security and privacy review of local
+Codex and VS Code agent configuration. It inventories effective local settings
+and extension surfaces, reports concrete and potential risks, and preserves
+account-side or runtime-only checks instead of treating them as passed.
 
-The prototype supports Codex CLI and the Codex IDE extension. It does not start
-Codex or execute configured MCP servers, hooks, skills, plugins, command rules,
-or package launchers.
+The implementation has three leaf audit targets and two convenience aliases:
+
+| Requested target | Resolved leaf targets |
+| --- | --- |
+| `codex` | `codex-cli` |
+| `vscode` | `vscode-agent-host`, `github-copilot-vscode` |
+| `codex-cli` | `codex-cli` only |
+| `github-copilot-vscode` | `github-copilot-vscode` only |
+| `vscode-agent-host` | `vscode-agent-host` only |
+
+The auditor does not start Codex, VS Code, extensions, MCP servers, hooks,
+skills, plugins, command rules, or package launchers.
 
 ## Run an audit
 
-Audit the current workspace using `CODEX_HOME`, or `~/.codex` when the
+Audit Codex CLI configuration using `CODEX_HOME`, or `~/.codex` when the
 environment variable is unset:
-
-```bash
-gensee audit config
-```
-
-The Codex-specific shorthand is equivalent:
 
 ```bash
 gensee audit codex
 ```
 
+Audit the complete VS Code bundle. The GitHub Copilot leaf remains visible but is
+excluded from summary counts and `--fail-on` when its extension is not detected:
+
+```bash
+gensee audit vscode
+```
+
 Audit another workspace or a named Codex profile:
 
 ```bash
-gensee audit codex --workspace /path/to/repo --profile sensitive
+gensee audit codex --workspace /path/to/repo --codex-profile sensitive
+
+gensee audit vscode --workspace /path/to/repo \
+  --vscode-user-data /path/to/Code/User --vscode-profile profile-id
 ```
 
 Emit the versioned machine-readable report and make high-or-critical findings
@@ -41,17 +54,37 @@ Options:
 
 | Option | Meaning |
 | --- | --- |
-| `--provider codex` | Explicit provider selection. Other providers are not supported yet. |
+| `--target NAME` | Explicit alias or leaf target. |
+| `--provider codex\|vscode` | Alternate spelling for selecting a top-level alias. |
 | `--workspace PATH` | Workspace whose trusted project layer and repository extensions are inspected. Defaults to the current directory. |
 | `--codex-home PATH` | Override `CODEX_HOME` discovery. |
-| `--profile NAME` | Apply `$CODEX_HOME/NAME.config.toml` after the user config. |
+| `--codex-profile NAME` | Apply `$CODEX_HOME/NAME.config.toml` after the user config. |
+| `--profile NAME` | Alias for `--codex-profile`. |
+| `--vscode-user-data PATH` | VS Code `User` directory containing `settings.json` and profile data. |
+| `--vscode-profile ID` | Apply `profiles/ID/settings.json` and `mcp.json`. |
 | `--json` | Print JSON instead of the human review. |
 | `--fail-on LEVEL` | Exit 1 for actionable findings at or above `critical`, `high`, `medium`, `low`, or `info`. Use `none` to disable. |
 
 Without `--fail-on`, findings do not change the exit status. Parse and I/O
 failures still return an error.
 
-## What is inspected
+## Dashboard view
+
+The native dashboard includes **Config Audit** under Configuration. It defaults
+to the `vscode` bundle and exposes only the `vscode` and `codex` user-facing
+targets. Leaf coverage remains visible in the result and raw JSON. It uses the
+same Rust rulesets and versioned bundle as the CLI, with filters,
+expandable evidence and remediation, capability inventory, manual account-side
+checks, source provenance, limitations, and raw JSON. The view communicates
+through local Tauri IPC and does not launch the CLI or configured extensions.
+
+## Codex CLI target
+
+`codex-cli` audits the local OpenAI Codex command-line tool. It does not model
+the OpenAI Codex VS Code extension. The `codex` alias resolves only to this
+leaf.
+
+### What is inspected
 
 The auditor reconstructs the local Codex view as far as static files permit:
 
@@ -72,7 +105,7 @@ The auditor reconstructs the local Codex view as far as static files permit:
 Discovery is bounded to eight directory levels and text files of at most 256
 KiB. Symlinked directories are not traversed.
 
-## Findings and categories
+### Findings and categories
 
 The initial ruleset is `codex-local-v1`, version `1.0.0`. Rules report a
 severity, confidence, and assessment:
@@ -145,7 +178,56 @@ the referenced variable name as a literal secret.
 | `CAX-HOK-001` | High | A hook downloads and executes remote content. |
 | `CAX-PLG-001`, `002` | Medium | A plugin combines several capability surfaces or a marketplace uses a mutable revision. |
 | `CAX-COV-001` | Medium | Active effective hooks do not include `gensee hook codex`, or Codex hooks are disabled. |
-| `CAX-IDE-001` | Low | On Windows, the workspace does not select documented WSL execution for the Codex IDE. |
+
+## VS Code agent-host target
+
+`vscode-agent-host` reconstructs user, selected-profile, and workspace settings
+using JSON-with-comments parsing and VS Code's documented precedence. It also
+inspects workspace/profile `mcp.json`, project and personal skills, instruction
+files, custom agents, hooks, and locally installed extension manifests.
+
+### Approvals, sandbox, networking, and trust
+
+| Rule | Default severity | Criterion |
+| --- | --- | --- |
+| `VSC-CFG-001`–`004` | Medium–High | An active settings/MCP layer is invalid, a selected profile is absent, or a control-plane file is symlinked or writable by another principal. |
+| `VSC-AUT-001`, `002` | High | Global tool auto-approval or a default Bypass Approvals/Autopilot posture is configured. |
+| `VSC-AUT-003` | Critical | Approval bypass is combined with the agent sandbox being off. |
+| `VSC-AUT-004`–`006` | High | Built-in terminal rules are ignored, a broad terminal command is auto-approved, or sensitive edits are broadly auto-approved. |
+| `VSC-SBX-001`–`003` | Medium–High | Sandboxed commands have unrestricted networking, may retry outside the sandbox, or receive broad filesystem exceptions. |
+| `VSC-NET-001`–`003` | High | An autonomous posture disables network filtering, permits `*`, or broadly auto-approves URL requests/responses. |
+| `VSC-TRU-001`, `002` | Medium–High | Workspace Trust is disabled or an extension is forced to run in untrusted workspaces. |
+| `VSC-PRV-001` | Low | Full VS Code usage telemetry is enabled. This does not imply that extension telemetry is disabled. |
+
+### Native MCP, skills, instructions, hooks, and extensions
+
+| Rule | Default severity | Criterion |
+| --- | --- | --- |
+| `VSC-MCP-001`–`003` | High | MCP configuration is invalid, obtains input by executing an editor command, or grants broad sandbox access. |
+| `VSC-MCP-004`–`009` | Medium–High | An endpoint is plaintext or embeds credentials, a server launches through a shell or mutable package, a local server is unsandboxed, or configuration embeds a secret. |
+| `VSC-SKL-001`–`004` | Info–High | Skills contain scripts, poisoning/download-to-shell indicators, auto-invocable executable workflows, or an unusually large auto-invocable executable set. |
+| `VSC-INS-001`, `VSC-AGT-001` | Medium–High | Instructions/custom agents contain dangerous content or request a broad tool surface. |
+| `VSC-HOK-001` | High | A lifecycle hook downloads and executes remote content. |
+| `VSC-EXT-001` | Info | An installed extension contributes agent tools, skills, MCP, or agent participants and needs publisher/version review. |
+
+## GitHub Copilot VS Code target
+
+`github-copilot-vscode` evaluates the provider-specific GitHub Copilot
+extension layer. It records `applicable`, `partial`, or `not_detected` based on
+installed extension manifests, Copilot settings, and workspace extension
+recommendations. The generic VS Code host target retains responsibility for
+approvals, sandboxing, trust, MCP, skills, hooks, and extension-host risks.
+
+### Copilot privacy and telemetry
+
+| Rule | Default severity | Criterion |
+| --- | --- | --- |
+| `VSC-PRV-002` | High | Copilot OpenTelemetry captures full prompts, responses, instructions, tool arguments, or results. |
+| `VSC-PRV-003`, `004` | Medium–High | Copilot traces use a plaintext remote collector or are written to a plaintext file. |
+
+GitHub Copilot account training/data-use controls, current VS Code runtime
+approvals and trust, and remote/policy layers remain manual checks
+(`VSC-PRV-005`, `VSC-TRU-003`, and `VSC-REM-001`).
 
 ## Account-side privacy checks
 
@@ -163,27 +245,38 @@ that account-side sharing is disabled.
 ## JSON contract
 
 The complete schema is [config-audit-report.schema.json](config-audit-report.schema.json).
-The top-level contract is:
+
+Every command emits the same bundle shape. Each leaf report keeps its own
+ruleset, inventory, sources, findings, manual checks, and limitations:
 
 ```json
 {
   "schema_version": 1,
-  "ruleset": { "id": "codex-local-v1", "version": "1.0.0" },
-  "target": {},
+  "requested_target": "vscode",
+  "resolved_targets": ["vscode-agent-host", "github-copilot-vscode"],
   "summary": {},
-  "sources": [],
-  "effective_security_config": {},
-  "inventory": {},
-  "findings": [],
-  "manual_checks": [],
-  "limitations": []
+  "reports": [
+    {
+      "target": "vscode-agent-host",
+      "applicability": "applicable",
+      "report": {}
+    },
+    {
+      "target": "github-copilot-vscode",
+      "applicability": "not_detected",
+      "applicability_reason": "...",
+      "report": {}
+    }
+  ]
 }
 ```
 
-`schema_version` changes only for incompatible report-shape changes. The
-ruleset version changes when criteria or severity decisions change. Finding
-fingerprints hash the rule ID and evidence locations/keys, not secret values,
-so automation can track a finding without leaking its content.
+`not_detected` reports remain visible but do not contribute to the bundle
+summary or `--fail-on`. `partial` reports do contribute, with their uncertainty
+preserved. Schema version changes are reserved for incompatible bundle changes;
+individual ruleset versions change when criteria or severity decisions change.
+Finding fingerprints hash the rule ID and evidence locations/keys, not secret
+values, so automation can track findings without leaking their contents.
 
 ## Limits and threat model
 
@@ -192,6 +285,9 @@ so automation can track a finding without leaking its content.
 - Cloud-fetched enterprise requirements, MDM preferences, account settings,
   runtime OAuth grants, remote server behavior, and provider retention cannot
   be proven by an offline local scan.
+- Local VS Code extension discovery covers the standard stable, Insiders, and
+  common VSCodium extension directories. Portable installations and custom
+  `--extensions-dir` locations are not detected yet.
 - Static pattern checks identify review targets; they do not prove malicious
   intent or fully parse Starlark, shell, Markdown, or every plugin format.
 - The audit reports configuration risk. It is not a source-code vulnerability
@@ -218,3 +314,12 @@ Primary Codex references:
 - [Managed configuration](https://learn.chatgpt.com/docs/enterprise/managed-configuration)
 - [MCP](https://learn.chatgpt.com/docs/extend/mcp)
 - [Skills](https://learn.chatgpt.com/docs/build-skills)
+
+Primary VS Code and Copilot references:
+
+- [Agent security](https://code.visualstudio.com/docs/agents/security)
+- [Agent approvals](https://code.visualstudio.com/docs/agents/approvals)
+- [MCP configuration](https://code.visualstudio.com/docs/agents/reference/mcp-configuration)
+- [Agent skills](https://code.visualstudio.com/docs/agent-customization/agent-skills)
+- [Agent hooks](https://code.visualstudio.com/docs/agent-customization/hooks)
+- [Copilot policy and data controls](https://docs.github.com/en/copilot/how-tos/manage-your-account/manage-policies)

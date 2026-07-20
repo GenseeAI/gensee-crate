@@ -4,6 +4,12 @@ Native Tauri dashboard for the Gensee Crate security monitor. The React
 frontend communicates with the Rust backend through process-local Tauri IPC;
 the dashboard does not start an HTTP API server.
 
+The **Config Audit** view runs the shared static coding-agent audit library
+directly inside the Tauri process. It supports the `codex` and `vscode` bundles
+while showing their internal leaf coverage, findings, evidence, remediation, extension
+inventory, account-side checks, provenance, limitations, and versioned JSON
+without executing an agent or configured extension.
+
 ## Requirements
 
 - Node 18 or newer
@@ -59,6 +65,7 @@ GENSEE_OPEN_DEVTOOLS=1 GENSEE_HOME="$HOME/.gensee" cargo tauri dev
 | `GENSEE_HOME` | `~/.gensee` | Path to the Gensee data directory containing `gensee.db` |
 | `GENSEE_DB_PATH` | `$GENSEE_HOME/gensee.db` | Override the SQLite database path directly |
 | `GENSEE_BIN` | auto-detected | Path to the `gensee` binary for policy validation |
+| `GENSEE_WORKSPACE` | process working directory | Initial workspace for the Config Audit view |
 
 ## Architecture
 
@@ -67,6 +74,7 @@ Tauri WebView                    Rust backend (same native process)
    React + TypeScript  ──IPC invoke()──▶  src-tauri/src/lib.rs
    src/                                  SQLite + policy filesystem access
    src/api/client.ts                     Tauri events for live activity
+                                         Static coding-agent configuration audit
 ```
 
 Vite uses `http://localhost:5174` only during `cargo tauri dev` to serve

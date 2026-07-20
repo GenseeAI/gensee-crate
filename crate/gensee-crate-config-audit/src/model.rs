@@ -154,6 +154,24 @@ pub struct AuditInventory {
     pub rule_files: usize,
     pub instruction_files: usize,
     pub managed_requirement_files: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<ExtensionInventory>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub custom_agents: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionInventory {
+    pub id: String,
+    pub version: String,
+    pub path: String,
+    pub enabled_state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,12 +187,17 @@ pub struct AuditSummary {
 pub struct AuditTarget {
     pub provider: String,
     pub workspace: String,
-    pub codex_home: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_version: Option<String>,
     pub surfaces: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vscode_user_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vscode_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,4 +212,30 @@ pub struct AuditReport {
     pub findings: Vec<AuditFinding>,
     pub manual_checks: Vec<ManualCheck>,
     pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditApplicability {
+    Applicable,
+    Partial,
+    NotDetected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetAuditReport {
+    pub target: String,
+    pub applicability: AuditApplicability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicability_reason: Option<String>,
+    pub report: AuditReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditBundle {
+    pub schema_version: u32,
+    pub requested_target: String,
+    pub resolved_targets: Vec<String>,
+    pub summary: AuditSummary,
+    pub reports: Vec<TargetAuditReport>,
 }

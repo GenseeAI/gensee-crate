@@ -190,7 +190,6 @@ pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
         &mut inventory,
         &mut findings,
     );
-    inspect_windows_vscode_setting(&workspace, &mut sources, &mut findings);
     scan_source_integrity(&sources, &mut findings);
 
     let manual_checks = privacy_manual_checks();
@@ -211,10 +210,12 @@ pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
         target: AuditTarget {
             provider: "codex".to_string(),
             workspace: display_path(&workspace),
-            codex_home: display_path(&codex_home),
+            codex_home: Some(display_path(&codex_home)),
             profile: options.profile.clone(),
             codex_version: None,
-            surfaces: vec!["cli".to_string(), "ide".to_string()],
+            surfaces: vec!["cli".to_string()],
+            vscode_user_data: None,
+            vscode_profile: None,
         },
         summary,
         sources,
@@ -1595,54 +1596,6 @@ fn discover_plugins_and_marketplaces(
         }
         sources.push(source);
     }
-}
-
-#[cfg(windows)]
-fn inspect_windows_vscode_setting(
-    workspace: &Path,
-    sources: &mut Vec<AuditSource>,
-    findings: &mut Vec<AuditFinding>,
-) {
-    let path = workspace.join(".vscode/settings.json");
-    let mut source = source_for(&path, "vscode_settings", true, true);
-    let mut wsl_enabled = false;
-    if path.exists() {
-        if let Ok(text) = read_limited_text(&path) {
-            source.sha256 = Some(hash_bytes(text.as_bytes()));
-            wsl_enabled = serde_json::from_str::<JsonValue>(&text)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("chatgpt.runCodexInWindowsSubsystemForLinux")
-                        .and_then(JsonValue::as_bool)
-                })
-                .unwrap_or(false);
-        }
-    }
-    sources.push(source);
-    if !wsl_enabled {
-        findings.push(make_finding(
-            "CAX-IDE-001",
-            "coverage_observability",
-            Severity::Low,
-            "medium",
-            Assessment::Potential,
-            "Codex IDE is not pinned to WSL2 sandbox semantics",
-            "On Windows systems with WSL2 available, the Codex IDE extension can inherit the Linux sandbox boundary.",
-            vec![evidence(&path, Some("chatgpt.runCodexInWindowsSubsystemForLinux"), Some("false-or-unset"))],
-            "Enable the documented VS Code setting when WSL2 is the intended security boundary.",
-            &[SECURITY_REFERENCE],
-            &["OWASP-ASI03"],
-        ));
-    }
-}
-
-#[cfg(not(windows))]
-fn inspect_windows_vscode_setting(
-    _workspace: &Path,
-    _sources: &mut Vec<AuditSource>,
-    _findings: &mut Vec<AuditFinding>,
-) {
 }
 
 fn scan_source_integrity(sources: &[AuditSource], findings: &mut Vec<AuditFinding>) {

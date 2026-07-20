@@ -20,12 +20,29 @@ import type {
   SystemEvent,
   TodayMetrics,
   TransactionEvent,
+  ConfigAuditBundle,
 } from './types';
 
 export const api = {
   // Dashboard state
   state: () => invoke<DashboardState>('get_state'),
   storeSecurity: () => invoke<StoreSecurityStatus>('get_store_security'),
+  configAudit: (params?: Partial<{
+    target: string;
+    workspace: string;
+    codexHome: string;
+    codexProfile: string;
+    vscodeUserData: string;
+    vscodeProfile: string;
+  }>) =>
+    invoke<ConfigAuditBundle>('get_config_audit', {
+      target: params?.target,
+      workspace: params?.workspace,
+      codexHome: params?.codexHome,
+      codexProfile: params?.codexProfile,
+      vscodeUserData: params?.vscodeUserData,
+      vscodeProfile: params?.vscodeProfile,
+    }),
 
   // Sessions
   sessions: (limit = 50, offset = 0, hideEmpty = false) =>
