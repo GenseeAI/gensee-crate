@@ -47,6 +47,7 @@ const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
 const TCLONE_ASYNC_JOB_TIMEOUT_SECS: u64 = 10 * 60;
 const TCLONE_ASYNC_JOB_STALE_GRACE_SECS: u64 = 30;
+const TCLONE_ASYNC_TIMEOUT_CLAIM_STALE_SECS: u64 = 30;
 const TCLONE_ASYNC_MAX_ACTIVE_JOBS: usize = 4;
 const TCLONE_ASYNC_JOB_RETENTION_SECS: u64 = 24 * 60 * 60;
 const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
@@ -475,13 +476,7 @@ fn tclone_host_control_file_request(
 
     write_atomic_nofollow(&request_path, &serde_json::to_vec(request)?, 0o600)?;
 
-    let deadline = Instant::now()
-        + Duration::from_secs(
-            env::var("GENSEE_TCLONE_HOST_FILE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS),
-        );
+    let deadline = Instant::now() + Duration::from_secs(tclone_host_control_file_timeout_secs());
     loop {
         match open_nofollow_read(&response_path) {
             Ok(mut file) => {
@@ -511,6 +506,24 @@ fn tclone_host_control_file_request(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn tclone_host_control_file_timeout_secs() -> u64 {
+    let configured = env::var("GENSEE_TCLONE_HOST_FILE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS);
+    clamp_tclone_host_control_file_timeout_secs(configured)
+}
+
+fn clamp_tclone_host_control_file_timeout_secs(configured: u64) -> u64 {
+    let maximum = TCLONE_HOST_CONTROL_REQUEST_MAX_AGE_SECS.saturating_sub(1);
+    if configured > maximum {
+        eprintln!(
+            "gensee: warning: clamping tclone host file timeout from {configured}s to {maximum}s so requests remain fresh"
+        );
+    }
+    configured.min(maximum)
 }
 
 struct TcloneHostControlServer {
@@ -1120,9 +1133,13 @@ fn spawn_tclone_host_control_request(
              ( \
                sleep \"$timeout_secs\"; \
                if mkdir \"$claim_path\" 2>/dev/null; then \
-                 if [ \"$use_group\" = 1 ]; then kill -TERM \"-$command_pid\" 2>/dev/null || true; else kill -TERM \"$command_pid\" 2>/dev/null || true; fi; \
-                 sleep 2; \
-                 if [ \"$use_group\" = 1 ]; then kill -KILL \"-$command_pid\" 2>/dev/null || true; else kill -KILL \"$command_pid\" 2>/dev/null || true; fi; \
+                 if kill -0 \"$command_pid\" 2>/dev/null; then \
+                   if [ \"$use_group\" = 1 ]; then kill -TERM \"-$command_pid\" 2>/dev/null || true; else kill -TERM \"$command_pid\" 2>/dev/null || true; fi; \
+                   sleep 2; \
+                   if [ \"$use_group\" = 1 ]; then kill -KILL \"-$command_pid\" 2>/dev/null || true; else kill -KILL \"$command_pid\" 2>/dev/null || true; fi; \
+                 else \
+                   rmdir \"$claim_path\" 2>/dev/null || true; \
+                 fi; \
                fi; \
              ) & watchdog_pid=$!; \
              wait \"$command_pid\" 2>/dev/null; status=$?; \
@@ -1301,6 +1318,10 @@ fn prune_tclone_async_jobs() -> io::Result<()> {
     let now = SystemTime::now();
     for entry in entries {
         let path = entry?.path();
+        if tclone_async_timeout_claim_path(&path) {
+            prune_tclone_async_timeout_claim(&path, now);
+            continue;
+        }
         let extension = path.extension().and_then(|extension| extension.to_str());
         if !matches!(extension, Some("done" | "log" | "owner")) {
             continue;
@@ -1330,6 +1351,27 @@ fn prune_tclone_async_jobs() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn tclone_async_timeout_claim_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(".done.timeout-claim."))
+}
+
+fn prune_tclone_async_timeout_claim(path: &Path, now: SystemTime) {
+    let is_stale_directory = fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.is_dir())
+        && tclone_path_age_at_least(path, now, TCLONE_ASYNC_TIMEOUT_CLAIM_STALE_SECS);
+    if is_stale_directory {
+        if let Err(error) = fs::remove_dir(path) {
+            eprintln!(
+                "gensee: warning: could not prune stale async timeout claim ({}): {error}",
+                path.display()
+            );
+        }
+    }
 }
 
 fn tclone_path_exists(path: &Path) -> bool {
@@ -5928,6 +5970,20 @@ mod tests {
     }
 
     #[test]
+    fn tclone_host_file_timeout_is_clamped_before_freshness_expiry() {
+        assert_eq!(
+            clamp_tclone_host_control_file_timeout_secs(TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS),
+            TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            clamp_tclone_host_control_file_timeout_secs(
+                TCLONE_HOST_CONTROL_REQUEST_MAX_AGE_SECS + 100,
+            ),
+            TCLONE_HOST_CONTROL_REQUEST_MAX_AGE_SECS - 1
+        );
+    }
+
+    #[test]
     fn tclone_safe_token_rejects_path_traversal_components() {
         assert!(!tclone_is_safe_token("."));
         assert!(!tclone_is_safe_token(".."));
@@ -6113,6 +6169,23 @@ mod tests {
         let _ = fs::remove_file(&job.log_path);
         let _ = fs::remove_file(&job.done_path);
         let _ = fs::remove_file(tclone_async_job_owner_path(&job));
+    }
+
+    #[test]
+    fn tclone_async_prunes_stale_timeout_claim_directories() {
+        let _guard = tclone_test_env_lock();
+        let unique = format!("{}_{}", std::process::id(), unix_millis().unwrap());
+        let claim_path = tclone_async_jobs_dir()
+            .unwrap()
+            .join(format!("orphan_{unique}.done.timeout-claim.123"));
+        create_restrictive_dir_all(&claim_path).unwrap();
+
+        assert!(tclone_async_timeout_claim_path(&claim_path));
+        prune_tclone_async_timeout_claim(
+            &claim_path,
+            SystemTime::now() + Duration::from_secs(TCLONE_ASYNC_TIMEOUT_CLAIM_STALE_SECS + 1),
+        );
+        assert!(!tclone_path_exists(&claim_path));
     }
 
     #[cfg(unix)]
