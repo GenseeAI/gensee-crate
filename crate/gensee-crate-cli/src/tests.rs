@@ -2079,7 +2079,7 @@ fn codex_ask_pretool_records_warn_and_returns_no_hook_output() {
 }
 
 #[test]
-fn codex_permission_request_records_and_denies_destructive_command() {
+fn codex_permission_request_records_and_advises_on_destructive_command() {
     let (store, workspace) = temp_store_and_workspace("codex-permission-request");
     let payload = json!({
         "session_id": "s1",
@@ -2114,7 +2114,7 @@ fn codex_permission_request_records_and_denies_destructive_command() {
 }
 
 #[test]
-fn codex_permission_request_without_command_fails_closed() {
+fn codex_permission_request_without_command_emits_advisory_system_message() {
     let (store, workspace) = temp_store_and_workspace("codex-permission-request-missing-command");
     let payload = json!({
         "session_id": "s1",

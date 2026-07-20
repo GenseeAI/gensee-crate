@@ -1,11 +1,14 @@
 use crate::*;
+use hmac::{Hmac, Mac};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
+use std::sync::{Mutex, OnceLock};
+use uuid::Uuid;
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -20,6 +23,9 @@ const TCLONE_HOST_CONTROL_DIR_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DIR";
 const TCLONE_HOST_CONTROL_DISABLE_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DISABLE";
 const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
 const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
+const TCLONE_HOST_CONTROL_COMMAND_TIMEOUT_SECS: u64 = 300;
+const TCLONE_HOST_CONTROL_AUTH_DIR: &str = "host-control-auth";
+const TCLONE_HOST_CONTROL_MAX_NONCES_PER_CAPABILITY: usize = 10_000;
 const TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV: &str = "GENSEE_TCLONE_CONTAINER_HOST_CONTROL_POLL";
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
@@ -28,6 +34,9 @@ const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
+const TCLONE_ASYNC_JOB_TIMEOUT_SECS: u64 = 10 * 60;
+const TCLONE_ASYNC_MAX_ACTIVE_JOBS: usize = 4;
+const TCLONE_ASYNC_JOB_RETENTION_SECS: u64 = 24 * 60 * 60;
 const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_CPU_PERCENT: f64 = 10.0;
 const TCLONE_FORK_QUIET_STABLE_SAMPLES: usize = 3;
@@ -52,6 +61,12 @@ const TCLONE_FORK_MARKER_WAIT_TIMEOUT_SECS: u64 = 5 * 60;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
+    #[serde(default)]
+    caller_run_id: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
+    authenticator: Option<String>,
     args: Vec<String>,
 }
 
@@ -69,6 +84,8 @@ struct TcloneAsyncJob {
     log_path: PathBuf,
     done_path: PathBuf,
 }
+
+static TCLONE_ASYNC_SCHEDULE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct TcloneRunRecord {
@@ -120,7 +137,34 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
         };
         request_args.push(value.to_string());
     }
-    let request = TcloneHostControlRequest { args: request_args };
+    let context = read_tclone_run_context().ok();
+    let caller_run_id = context
+        .as_ref()
+        .and_then(|value| value.get("run_id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| env::var("GENSEE_RUN_ID").ok())
+        .filter(|value| tclone_is_safe_token(value));
+    let capability = context
+        .as_ref()
+        .and_then(|value| value.get("host_control_capability"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .filter(|value| tclone_is_safe_token(value));
+    let nonce = Uuid::new_v4().to_string();
+    let authenticator = caller_run_id
+        .as_deref()
+        .zip(capability.as_deref())
+        .map(|(caller_run_id, capability)| {
+            tclone_host_control_authenticator(caller_run_id, &nonce, &request_args, capability)
+        })
+        .transpose()?;
+    let request = TcloneHostControlRequest {
+        caller_run_id,
+        nonce: Some(nonce),
+        authenticator,
+        args: request_args,
+    };
     let response = match tclone_host_control_socket_path() {
         Some(socket_path) => match tclone_host_control_request(&socket_path, &request) {
             Ok(response) => response,
@@ -152,6 +196,144 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
             response.exit_code.unwrap_or(1)
         )))
     }
+}
+
+fn read_tclone_run_context() -> io::Result<Value> {
+    let text = fs::read_to_string(TCLONE_RUN_CONTEXT_PATH)?;
+    serde_json::from_str(&text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid tclone run context: {error}"),
+        )
+    })
+}
+
+fn tclone_is_safe_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn tclone_host_control_capability_path(run_id: &str) -> io::Result<PathBuf> {
+    if !tclone_is_safe_token(run_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid tclone run id for host-control capability",
+        ));
+    }
+    Ok(gensee_tmp_root()?
+        .join(run_id)
+        .join(TCLONE_HOST_CONTROL_AUTH_DIR)
+        .join("capability"))
+}
+
+fn read_tclone_host_control_capability(run_id: &str) -> io::Result<String> {
+    let path = tclone_host_control_capability_path(run_id)?;
+    let mut file = open_nofollow_read(&path).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("no valid host-control capability for tclone run {run_id}: {error}"),
+        )
+    })?;
+    let mut value = String::new();
+    file.read_to_string(&mut value)?;
+    let value = value.trim().to_string();
+    if !tclone_is_safe_token(&value) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid stored tclone host-control capability",
+        ));
+    }
+    Ok(value)
+}
+
+fn ensure_tclone_host_control_capability(run_id: &str) -> io::Result<String> {
+    if let Ok(value) = read_tclone_host_control_capability(run_id) {
+        return Ok(value);
+    }
+    rotate_tclone_host_control_capability(run_id)
+}
+
+fn rotate_tclone_host_control_capability(run_id: &str) -> io::Result<String> {
+    let path = tclone_host_control_capability_path(run_id)?;
+    if let Some(parent) = path.parent() {
+        create_restrictive_dir_all(parent)?;
+        let nonces_dir = parent.join("nonces");
+        match fs::symlink_metadata(&nonces_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                fs::remove_file(&nonces_dir)?;
+            }
+            Ok(_) => fs::remove_dir_all(&nonces_dir)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let capability = Uuid::new_v4().to_string();
+    write_atomic_nofollow(&path, format!("{capability}\n").as_bytes(), 0o600)?;
+    Ok(capability)
+}
+
+fn revoke_tclone_host_control_capability(run_id: &str) -> io::Result<()> {
+    let path = tclone_host_control_capability_path(run_id)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn create_restrictive_dir_all(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn open_nofollow_read(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+fn write_atomic_nofollow(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic write path has no parent",
+        )
+    })?;
+    create_restrictive_dir_all(parent)?;
+    let temp_path = parent.join(format!(".gensee-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            options.mode(mode).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn tclone_host_control_socket_path() -> Option<PathBuf> {
@@ -248,21 +430,16 @@ fn tclone_host_control_file_request(
     };
     let requests_dir = control_dir.join("requests");
     let responses_dir = control_dir.join("responses");
-    fs::create_dir_all(&requests_dir)?;
-    fs::create_dir_all(&responses_dir)?;
+    create_restrictive_dir_all(&requests_dir)?;
+    create_restrictive_dir_all(&responses_dir)?;
 
-    let request_id = format!("{}_{}", std::process::id(), unix_millis().unwrap_or(0));
+    let request_id = Uuid::new_v4().to_string();
     let request_path = requests_dir.join(format!("{request_id}.json"));
-    let request_tmp = requests_dir.join(format!("{request_id}.tmp"));
     let response_path = responses_dir.join(format!("{request_id}.json"));
-    let response_tmp = responses_dir.join(format!("{request_id}.tmp"));
     let _ = fs::remove_file(&request_path);
-    let _ = fs::remove_file(&request_tmp);
     let _ = fs::remove_file(&response_path);
-    let _ = fs::remove_file(&response_tmp);
 
-    fs::write(&request_tmp, serde_json::to_vec(request)?)?;
-    fs::rename(&request_tmp, &request_path)?;
+    write_atomic_nofollow(&request_path, &serde_json::to_vec(request)?, 0o600)?;
 
     let deadline = Instant::now()
         + Duration::from_secs(
@@ -272,8 +449,10 @@ fn tclone_host_control_file_request(
                 .unwrap_or(TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS),
         );
     loop {
-        match fs::read_to_string(&response_path) {
-            Ok(text) => {
+        match open_nofollow_read(&response_path) {
+            Ok(mut file) => {
+                let mut text = String::new();
+                file.read_to_string(&mut text)?;
                 let _ = fs::remove_file(&response_path);
                 let _ = fs::remove_file(&request_path);
                 return serde_json::from_str(&text).map_err(|error| {
@@ -309,8 +488,9 @@ struct TcloneContainerFileControlServer;
 
 impl TcloneHostControlServer {
     fn start(socket_path: &Path, control_dir: &Path) -> io::Result<Self> {
-        fs::create_dir_all(control_dir.join("requests"))?;
-        fs::create_dir_all(control_dir.join("responses"))?;
+        create_restrictive_dir_all(control_dir)?;
+        create_restrictive_dir_all(&control_dir.join("requests"))?;
+        create_restrictive_dir_all(&control_dir.join("responses"))?;
         let file_exe = env::current_exe()?;
         let file_control_dir = control_dir.to_path_buf();
         thread::spawn(move || loop {
@@ -416,20 +596,34 @@ fn execute_tclone_host_control_request(
     request: TcloneHostControlRequest,
     exe: &Path,
 ) -> io::Result<TcloneHostControlResponse> {
-    if !tclone_host_control_should_proxy(
-        &request.args.iter().map(OsString::from).collect::<Vec<_>>(),
-    ) {
+    if let Err(error) = validate_tclone_host_control_request(&request) {
         return Ok(TcloneHostControlResponse {
             exit_code: Some(64),
             stdout: String::new(),
             stderr: String::new(),
-            error: Some("unsupported tclone host-control command".to_string()),
+            error: Some(error.to_string()),
         });
     }
     if tclone_host_control_should_run_async(&request.args) {
+        let schedule_lock = TCLONE_ASYNC_SCHEDULE_LOCK.get_or_init(|| Mutex::new(()));
+        let _schedule_guard = schedule_lock
+            .lock()
+            .map_err(|_| io::Error::other("tclone async scheduler lock poisoned"))?;
+        prune_tclone_async_jobs()?;
+        let active_jobs = count_active_tclone_async_jobs()?;
+        if active_jobs >= TCLONE_ASYNC_MAX_ACTIVE_JOBS {
+            return Ok(TcloneHostControlResponse {
+                exit_code: Some(75),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(format!(
+                    "too many active tclone fork jobs ({active_jobs}); wait for one to finish"
+                )),
+            });
+        }
         let job = tclone_async_job(&request.args)?;
         let response = tclone_host_control_async_response(&request.args, &job);
-        let attach_placement = tclone_host_control_async_attach_placement(&request.args);
+        let attach_placement = tclone_host_control_async_attach_placement(&request.args)?;
         if attach_placement.is_some() {
             ensure_host_tmux_available()?;
         }
@@ -445,20 +639,277 @@ fn execute_tclone_host_control_request(
     execute_tclone_host_control_request_sync(request, exe)
 }
 
+fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> io::Result<()> {
+    let args = request.args.iter().map(OsString::from).collect::<Vec<_>>();
+    if !tclone_host_control_should_proxy(&args) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsupported tclone host-control command",
+        ));
+    }
+    let caller_run_id = request
+        .caller_run_id
+        .as_deref()
+        .filter(|value| tclone_is_safe_token(value))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tclone host-control request is missing a valid caller run id",
+            )
+        })?;
+    let nonce = request
+        .nonce
+        .as_deref()
+        .filter(|value| tclone_is_safe_token(value))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tclone host-control request is missing a valid nonce",
+            )
+        })?;
+    let supplied_authenticator = request
+        .authenticator
+        .as_deref()
+        .filter(|value| tclone_is_safe_token(value))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "tclone host-control request is missing its authenticator",
+            )
+        })?;
+    let capability = read_tclone_host_control_capability(caller_run_id)?;
+    let expected_authenticator =
+        tclone_host_control_authenticator(caller_run_id, nonce, &request.args, &capability)?;
+    if !constant_time_bytes_eq(
+        supplied_authenticator.as_bytes(),
+        expected_authenticator.as_bytes(),
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid tclone host-control request authenticator",
+        ));
+    }
+    claim_tclone_host_control_nonce(caller_run_id, nonce)?;
+
+    let subcommand = request.args.get(1).map(String::as_str).unwrap_or_default();
+    match subcommand {
+        "fork" => {
+            let caller = find_tclone_record(caller_run_id)?;
+            if caller.role != "source" {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "only a tclone source may request a fork",
+                ));
+            }
+            validate_tclone_host_control_target(&request.args[2..], caller_run_id)?;
+        }
+        "send" => {
+            let (target_args, _) = tclone_send_split(&args[2..])?;
+            validate_tclone_host_control_target_strings(target_args, caller_run_id)?;
+        }
+        "exec" => {
+            let (target_args, _) = tclone_exec_split(&args[2..])?;
+            validate_tclone_host_control_target_strings(target_args, caller_run_id)?;
+        }
+        "diff" => validate_tclone_host_control_target(&request.args[2..], caller_run_id)?,
+        "fork-status" => {
+            let job_id = request.args.get(2).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing tclone fork job id")
+            })?;
+            let job = tclone_async_job_from_id(job_id)?;
+            let owner = fs::read_to_string(tclone_async_job_owner_path(&job))?;
+            if owner.trim() != caller_run_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "tclone fork job belongs to a different run",
+                ));
+            }
+        }
+        // These commands either expose global run state or manipulate the host's
+        // interactive terminal. They are intentionally host-only.
+        "list" | "attach" | "shell" => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("`run {subcommand}` is not available through container host control"),
+            ));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsupported tclone host-control command",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tclone_host_control_target(args: &[String], caller_run_id: &str) -> io::Result<()> {
+    let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+    validate_tclone_host_control_target_strings(&args, caller_run_id)
+}
+
+fn validate_tclone_host_control_target_strings(
+    args: &[OsString],
+    caller_run_id: &str,
+) -> io::Result<()> {
+    let target = tclone_target_arg(args, "missing tclone host-control target")?;
+    let target_record = find_tclone_record(&target)?;
+    if !tclone_host_control_target_is_authorized(caller_run_id, &target_record) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "tclone run {caller_run_id} may not control {}",
+                target_record.run_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn tclone_host_control_target_is_authorized(caller_run_id: &str, target: &TcloneRunRecord) -> bool {
+    target.run_id == caller_run_id
+}
+
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn tclone_host_control_authenticator(
+    caller_run_id: &str,
+    nonce: &str,
+    args: &[String],
+    capability: &str,
+) -> io::Result<String> {
+    let encoded_args = serde_json::to_vec(args)?;
+    let mut authenticator = Hmac::<Sha256>::new_from_slice(capability.as_bytes())
+        .map_err(|_| io::Error::other("could not initialize host-control authenticator"))?;
+    authenticator.update(b"gensee-tclone-host-control-v1\0");
+    for field in [caller_run_id.as_bytes(), nonce.as_bytes(), &encoded_args] {
+        authenticator.update(&(field.len() as u64).to_be_bytes());
+        authenticator.update(field);
+    }
+    Ok(authenticator
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn claim_tclone_host_control_nonce(run_id: &str, nonce: &str) -> io::Result<()> {
+    if !tclone_is_safe_token(nonce) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid tclone host-control request nonce",
+        ));
+    }
+    let capability_path = tclone_host_control_capability_path(run_id)?;
+    let nonces_dir = capability_path
+        .parent()
+        .ok_or_else(|| io::Error::other("capability path has no parent"))?
+        .join("nonces");
+    create_restrictive_dir_all(&nonces_dir)?;
+    if fs::read_dir(&nonces_dir)?
+        .take(TCLONE_HOST_CONTROL_MAX_NONCES_PER_CAPABILITY + 1)
+        .count()
+        >= TCLONE_HOST_CONTROL_MAX_NONCES_PER_CAPABILITY
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "tclone host-control request limit reached; rotate the run capability",
+        ));
+    }
+    let nonce_path = nonces_dir.join(nonce);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(&nonce_path)
+        .and_then(|mut file| writeln!(file, "{}", unix_millis().unwrap_or(0)))
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "replayed tclone host-control request",
+                )
+            } else {
+                error
+            }
+        })
+}
+
 fn execute_tclone_host_control_request_sync(
     request: TcloneHostControlRequest,
     exe: &Path,
 ) -> io::Result<TcloneHostControlResponse> {
-    let output = Command::new(exe)
+    let mut child = Command::new(exe)
         .args(&request.args)
         .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
         .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
         .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
-        .output()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("could not capture host-control stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("could not capture host-control stderr"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let timeout = env::var("GENSEE_TCLONE_HOST_COMMAND_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(TCLONE_HOST_CONTROL_COMMAND_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Ok(TcloneHostControlResponse {
+                exit_code: Some(124),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(format!(
+                    "tclone host-control command timed out after {timeout}s"
+                )),
+            });
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| io::Error::other("host-control stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("host-control stderr reader panicked"))??;
     Ok(TcloneHostControlResponse {
-        exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: status.code(),
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
         error: None,
     })
 }
@@ -471,6 +922,17 @@ fn spawn_tclone_host_control_request(
     if let Some(parent) = job.log_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let owner = request.caller_run_id.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "async tclone host-control request has no caller run id",
+        )
+    })?;
+    write_atomic_nofollow(
+        &tclone_async_job_owner_path(job),
+        format!("{owner}\n").as_bytes(),
+        0o600,
+    )?;
     let _ = fs::remove_file(&job.done_path);
     let mut log = fs::OpenOptions::new()
         .create(true)
@@ -490,6 +952,10 @@ fn spawn_tclone_host_control_request(
         job.id, delay_secs
     )?;
     let ready_timeout_secs = tclone_async_ready_timeout_secs();
+    let job_timeout_secs = env::var("GENSEE_TCLONE_ASYNC_JOB_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(TCLONE_ASYNC_JOB_TIMEOUT_SECS);
     writeln!(
         log,
         "gensee async job {}: using live clone ready timeout {}s",
@@ -500,17 +966,32 @@ fn spawn_tclone_host_control_request(
     Command::new("sh")
         .arg("-c")
         .arg(
-            "job_id=$1; done_path=$2; log_path=$3; delay=$4; shift 4; \
+            "job_id=$1; done_path=$2; log_path=$3; delay=$4; timeout_secs=$5; shift 5; \
              gensee_tmux_message() { \
                message=$1; \
                if [ -n \"${GENSEE_HOST_TMUX_SOCKET:-}\" ] && [ -n \"${GENSEE_HOST_TMUX_TARGET:-}\" ]; then \
-                 tmux -S \"$GENSEE_HOST_TMUX_SOCKET\" display-message -d 4000 -t \"$GENSEE_HOST_TMUX_TARGET\" \"$message\" 2>/dev/null || true; \
+                 tmux -S \"$GENSEE_HOST_TMUX_SOCKET\" display-message -l -d 4000 -t \"$GENSEE_HOST_TMUX_TARGET\" \"$message\" 2>/dev/null || true; \
                elif [ -n \"${TMUX:-}\" ]; then \
-                 tmux display-message -d 4000 \"$message\" 2>/dev/null || true; \
+                 tmux display-message -l -d 4000 \"$message\" 2>/dev/null || true; \
                fi; \
              }; \
              gensee_tmux_message \"Gensee is preparing a fork; the source agent may pause briefly.\"; \
-             sleep \"$delay\"; \"$@\"; status=$?; \
+             sleep \"$delay\"; \
+             if command -v setsid >/dev/null 2>&1; then setsid \"$@\" & use_group=1; else \"$@\" & use_group=0; fi; \
+             command_pid=$!; started=$(date +%s); timed_out=0; \
+             while kill -0 \"$command_pid\" 2>/dev/null; do \
+               now=$(date +%s); \
+               if [ $((now - started)) -ge \"$timeout_secs\" ]; then \
+                 timed_out=1; \
+                 if [ \"$use_group\" = 1 ]; then kill -TERM \"-$command_pid\" 2>/dev/null || true; else kill -TERM \"$command_pid\" 2>/dev/null || true; fi; \
+                 sleep 2; \
+                 if [ \"$use_group\" = 1 ]; then kill -KILL \"-$command_pid\" 2>/dev/null || true; else kill -KILL \"$command_pid\" 2>/dev/null || true; fi; \
+                 break; \
+               fi; \
+               sleep 1; \
+             done; \
+             wait \"$command_pid\" 2>/dev/null; status=$?; \
+             if [ \"$timed_out\" = 1 ]; then status=124; printf 'gensee async job %s: timed out after %ss\\n' \"$job_id\" \"$timeout_secs\"; fi; \
              if [ \"$status\" != 0 ]; then \
                gensee_tmux_message \"Gensee fork failed; see $log_path\"; \
              else \
@@ -525,12 +1006,12 @@ fn spawn_tclone_host_control_request(
         .arg(&done_path)
         .arg(&job.log_path)
         .arg(delay_secs.to_string())
+        .arg(job_timeout_secs.to_string())
         .arg(&exe)
         .args(&request.args)
         .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
         .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
         .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
-        .env("GENSEE_TCLONE_WAIT_QUIET_FOR_FORK", "1")
         .env("GENSEE_TCLONE_READY_TIMEOUT_SECS", ready_timeout_secs.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -553,12 +1034,15 @@ fn tclone_async_ready_timeout_secs() -> u64 {
         .max(TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS)
 }
 
-fn tclone_host_control_async_attach_placement(args: &[String]) -> Option<HostTmuxPlacement> {
+fn tclone_host_control_async_attach_placement(
+    args: &[String],
+) -> io::Result<Option<HostTmuxPlacement>> {
     arg_value(
         &args.iter().map(OsString::from).collect::<Vec<_>>(),
         "--attach",
     )
-    .and_then(|value| parse_host_tmux_placement(&value).ok())
+    .map(|value| parse_host_tmux_placement(&value))
+    .transpose()
 }
 
 fn tclone_host_control_should_run_async(args: &[String]) -> bool {
@@ -578,7 +1062,7 @@ fn tclone_async_job(args: &[String]) -> io::Result<TcloneAsyncJob> {
         .iter()
         .skip(2)
         .find(|arg| !arg.starts_with("--"))
-        .map(|arg| arg.replace(['/', ':'], "_"))
+        .map(|arg| tclone_safe_job_component(arg))
         .unwrap_or_else(|| "tclone".to_string());
     let id = format!(
         "{}_{}_{}",
@@ -594,6 +1078,88 @@ fn tclone_async_job(args: &[String]) -> io::Result<TcloneAsyncJob> {
         log_path,
         id,
     })
+}
+
+fn tclone_safe_job_component(value: &str) -> String {
+    let value = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect::<String>();
+    if value.is_empty() {
+        "tclone".to_string()
+    } else {
+        value
+    }
+}
+
+fn tclone_async_job_owner_path(job: &TcloneAsyncJob) -> PathBuf {
+    job.log_path.with_extension("owner")
+}
+
+fn tclone_async_jobs_dir() -> io::Result<PathBuf> {
+    Ok(gensee_tmp_root()?.join("tclone-async"))
+}
+
+fn count_active_tclone_async_jobs() -> io::Result<usize> {
+    let dir = tclone_async_jobs_dir()?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut active = 0usize;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("log") {
+            continue;
+        }
+        if !path.with_extension("done").exists() {
+            active += 1;
+        }
+    }
+    Ok(active)
+}
+
+fn prune_tclone_async_jobs() -> io::Result<()> {
+    let dir = tclone_async_jobs_dir()?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let now = SystemTime::now();
+    for entry in entries {
+        let path = entry?.path();
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        if !matches!(extension, Some("done" | "log")) {
+            continue;
+        }
+        let old_enough = path
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_secs() >= TCLONE_ASYNC_JOB_RETENTION_SECS);
+        if !old_enough {
+            continue;
+        }
+        if extension == Some("done") || !path.with_extension("done").exists() {
+            let log_path = path.with_extension("log");
+            let done_path = path.with_extension("done");
+            let owner_path = path.with_extension("owner");
+            let _ = fs::remove_file(log_path);
+            let _ = fs::remove_file(done_path);
+            let _ = fs::remove_file(owner_path);
+        }
+    }
+    Ok(())
 }
 
 fn tclone_async_job_from_id(job_id: &str) -> io::Result<TcloneAsyncJob> {
@@ -741,12 +1307,16 @@ fn drain_tclone_host_control_file_requests(control_dir: &Path, exe: &Path) -> io
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let response_path = responses_dir.join(format!("{stem}.json"));
-        if response_path.exists() {
+        if !tclone_is_safe_token(stem) {
             let _ = fs::remove_file(&path);
             continue;
         }
-        let response = match fs::File::open(&path)
+        let response_path = responses_dir.join(format!("{stem}.json"));
+        if fs::symlink_metadata(&response_path).is_ok() {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        let response = match open_nofollow_read(&path)
             .and_then(|file| serde_json::from_reader(file).map_err(io::Error::other))
             .and_then(|request| execute_tclone_host_control_request(request, exe))
         {
@@ -758,9 +1328,7 @@ fn drain_tclone_host_control_file_requests(control_dir: &Path, exe: &Path) -> io
                 error: Some(error.to_string()),
             },
         };
-        let response_tmp = responses_dir.join(format!("{stem}.tmp"));
-        fs::write(&response_tmp, serde_json::to_vec(&response)?)?;
-        fs::rename(response_tmp, response_path)?;
+        write_atomic_nofollow(&response_path, &serde_json::to_vec(&response)?, 0o600)?;
         let _ = fs::remove_file(&path);
     }
     Ok(())
@@ -810,41 +1378,15 @@ fn drain_tclone_container_host_control_file_requests(
             }
             _ => continue,
         };
-        let parsed_request = serde_json::from_str::<TcloneHostControlRequest>(&request_json)
-            .map_err(io::Error::other);
-        let response =
-            match parsed_request {
-                Ok(request) if tclone_host_control_should_run_async(&request.args) => {
-                    let job = tclone_async_job(&request.args)?;
-                    let response = tclone_host_control_async_response(&request.args, &job);
-                    write_tclone_container_host_control_response(
-                        podman,
-                        container_name,
-                        &request_path,
-                        &response_path,
-                        &response,
-                    )?;
-                    if let Err(error) =
-                        spawn_tclone_host_control_request(request, exe.to_path_buf(), &job)
-                    {
-                        eprintln!("gensee: async tclone host command failed to start: {error}");
-                    }
-                    continue;
-                }
-                Ok(request) => execute_tclone_host_control_request_sync(request, exe)
-                    .unwrap_or_else(|error| TcloneHostControlResponse {
-                        exit_code: Some(1),
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        error: Some(error.to_string()),
-                    }),
-                Err(error) => TcloneHostControlResponse {
-                    exit_code: Some(1),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    error: Some(error.to_string()),
-                },
-            };
+        let response = serde_json::from_str::<TcloneHostControlRequest>(&request_json)
+            .map_err(io::Error::other)
+            .and_then(|request| execute_tclone_host_control_request(request, exe))
+            .unwrap_or_else(|error| TcloneHostControlResponse {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(error.to_string()),
+            });
         write_tclone_container_host_control_response(
             podman,
             container_name,
@@ -927,7 +1469,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     let seed_root = gensee_tmp_root()?.join(&run_id).join("tclone-seed");
     let staged_workspace = seed_root.join(container_relative_path(&container_workspace)?);
     let host_control_dir = gensee_tmp_root()?.join(&run_id).join("host-control");
-    fs::create_dir_all(&host_control_dir)?;
+    create_restrictive_dir_all(&host_control_dir)?;
     let host_control_socket = host_control_dir.join("control.sock");
     let container_workspace_host_control_dir =
         format!("{container_workspace}/{TCLONE_HOST_CONTROL_WORKSPACE_DIR}");
@@ -1070,7 +1612,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     let output = run_command_capture(&podman, &create_args)?;
     let container_id = output.lines().next().map(str::trim).map(str::to_string);
     let cleanup_guard = TcloneContainerCleanup::new(&podman, &source_container);
-    append_tclone_record(&TcloneRunRecord {
+    let source_record = TcloneRunRecord {
         run_id: run_id.clone(),
         parent_run_id: None,
         role: "source".to_string(),
@@ -1090,7 +1632,8 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         started_at_ms,
         updated_at_ms: started_at_ms,
         exit_code: None,
-    })?;
+    };
+    append_tclone_record(&source_record)?;
     eprintln!(
         "gensee: preparing tclone run {run_id} source_container={source_container} workspace={}",
         original_workspace.display()
@@ -1101,6 +1644,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         &podman,
         &[OsString::from("start"), OsString::from(&source_container)],
     )?;
+    write_tclone_run_context(&podman, &source_record)?;
     start_tclone_agent_session(&podman, &source_container, &config.agent_cmd)?;
     let _container_file_control = if env_flag(TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV) {
         Some(TcloneContainerFileControlServer::start(
@@ -1230,13 +1774,21 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
     let name_hint = arg_value(&args, "--name");
     let prefix = tclone_fork_name_prefix(&parent, name_hint.as_deref(), forked_at_ms);
+    let mut capability_guard = TcloneCapabilityRotationGuard::revoke(&podman, source.clone())?;
     let output = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
+    capability_guard.restore()?;
     let ids = output
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
+    if ids.len() != copies {
+        return Err(io::Error::other(format!(
+            "podman returned {} cloned container id(s), expected {copies}",
+            ids.len()
+        )));
+    }
     let mut fork_run_ids = Vec::new();
     let mut fork_records = Vec::new();
     for index in 0..copies {
@@ -1415,7 +1967,15 @@ fn run_tclone_clone_attempts(
             eprintln!(
                 "gensee: tclone overlay-btrfs clone failed; retrying without --tfork-overlay-btrfs"
             );
-            let fallback_args = tclone_clone_args(copies, prefix, &source.container_name, false);
+            // The failed clone may already have consumed one or more names from
+            // the requested prefix. A distinct retry prefix avoids masking the
+            // original failure with a secondary container-name conflict.
+            let fallback_prefix = format!(
+                "{prefix}-no-overlay-{}",
+                unix_millis().unwrap_or(std::process::id() as u64)
+            );
+            let fallback_args =
+                tclone_clone_args(copies, &fallback_prefix, &source.container_name, false);
             run_command_capture_with_env(podman, &fallback_args, &env)
         }
         Err(error) => Err(error),
@@ -1676,12 +2236,13 @@ fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
     .collect()
 }
 
-fn tclone_run_context_payload(record: &TcloneRunRecord) -> Value {
+fn tclone_run_context_payload(record: &TcloneRunRecord, capability: &str) -> Value {
     json!({
         "run_id": &record.run_id,
         "role": &record.role,
         "source_run_id": record.parent_run_id.as_deref().unwrap_or(&record.run_id),
         "workspace": &record.container_workspace,
+        "host_control_capability": capability,
     })
 }
 
@@ -1698,7 +2259,8 @@ fn write_tclone_run_context_if_possible(podman: &OsString, record: &TcloneRunRec
 }
 
 fn write_tclone_run_context(podman: &OsString, record: &TcloneRunRecord) -> io::Result<()> {
-    let payload = serde_json::to_vec(&tclone_run_context_payload(record))?;
+    let capability = ensure_tclone_host_control_capability(&record.run_id)?;
+    let payload = serde_json::to_vec(&tclone_run_context_payload(record, &capability))?;
     let script = format!("cat > {}", shell_quote(TCLONE_RUN_CONTEXT_PATH));
     let mut child = Command::new(podman)
         .arg("exec")
@@ -1757,6 +2319,7 @@ fn tclone_send_prompt_to_agent(
             OsString::from(&record.container_name),
             OsString::from("tmux"),
             OsString::from("paste-buffer"),
+            OsString::from("-p"),
             OsString::from("-b"),
             OsString::from(&buffer_name),
             OsString::from("-t"),
@@ -2077,15 +2640,7 @@ fn ensure_host_tmux_available() -> io::Result<()> {
     if env::var_os("TMUX").is_none()
         && (env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV).is_none()
             || env::var_os(TCLONE_HOST_TMUX_TARGET_ENV).is_none())
-    {
-        if let Some((socket, target)) = infer_host_tmux_context() {
-            env::set_var(TCLONE_HOST_TMUX_SOCKET_ENV, socket);
-            env::set_var(TCLONE_HOST_TMUX_TARGET_ENV, target);
-        }
-    }
-    if env::var_os("TMUX").is_none()
-        && (env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV).is_none()
-            || env::var_os(TCLONE_HOST_TMUX_TARGET_ENV).is_none())
+        && infer_host_tmux_context().is_none()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2106,12 +2661,28 @@ fn open_host_tmux_pane(command: &str, placement: HostTmuxPlacement) -> io::Resul
         HostTmuxPlacement::Right => "-h",
         HostTmuxPlacement::Below => "-v",
     };
+    let inferred_context = if env::var_os("TMUX").is_none()
+        && (env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV).is_none()
+            || env::var_os(TCLONE_HOST_TMUX_TARGET_ENV).is_none())
+    {
+        infer_host_tmux_context()
+    } else {
+        None
+    };
     let mut tmux = Command::new("tmux");
-    if let Some(socket) = env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV) {
+    if let Some(socket) = env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV).or_else(|| {
+        inferred_context
+            .as_ref()
+            .map(|(socket, _)| OsString::from(socket))
+    }) {
         tmux.arg("-S").arg(socket);
     }
     tmux.arg("split-window").arg(split_flag);
-    if let Some(target) = env::var_os(TCLONE_HOST_TMUX_TARGET_ENV) {
+    if let Some(target) = env::var_os(TCLONE_HOST_TMUX_TARGET_ENV).or_else(|| {
+        inferred_context
+            .as_ref()
+            .map(|(_, target)| OsString::from(target))
+    }) {
         tmux.arg("-t").arg(target);
     }
     if let Ok(cwd) = env::current_dir() {
@@ -2331,12 +2902,29 @@ fn wait_for_tclone_source_quiet_if_requested(
     loop {
         thread::sleep(interval);
         let current_ticks = descendant_proc_ticks(root_pid)?;
-        let delta_ticks = current_ticks.saturating_sub(last_ticks);
+        let (delta_ticks, descendant_exited) =
+            descendant_proc_tick_delta(&last_ticks, &current_ticks);
         last_ticks = current_ticks;
         let cpu_percent =
             (delta_ticks as f64 / ticks_per_second as f64) / interval.as_secs_f64() * 100.0;
+        if descendant_exited {
+            stable = 0;
+            last_not_quiet_reason = "a source process exited during the sample".to_string();
+            eprintln!(
+                "gensee: tclone source {} still settling after a process exit",
+                source.run_id
+            );
+            if Instant::now() >= deadline {
+                return tclone_quiet_timeout(&source.run_id, &last_not_quiet_reason);
+            }
+            continue;
+        }
         if cpu_percent <= cpu_threshold {
             if let Some(reason) = tclone_source_quiet_probe(podman, source)? {
+                // The probe itself executes in the container's process tree. Sample
+                // again after it completes so probe CPU is not charged to the next
+                // quiet interval.
+                last_ticks = descendant_proc_ticks(root_pid)?;
                 stable = 0;
                 last_not_quiet_reason = reason;
                 eprintln!(
@@ -2344,16 +2932,11 @@ fn wait_for_tclone_source_quiet_if_requested(
                     source.run_id, cpu_percent, last_not_quiet_reason
                 );
                 if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!(
-                            "timed out waiting for tclone source {} to become quiet before fork: {}",
-                            source.run_id, last_not_quiet_reason
-                        ),
-                    ));
+                    return tclone_quiet_timeout(&source.run_id, &last_not_quiet_reason);
                 }
                 continue;
             }
+            last_ticks = descendant_proc_ticks(root_pid)?;
             stable += 1;
             eprintln!(
                 "gensee: tclone source {} quiet sample {}/{} cpu={:.1}%",
@@ -2371,19 +2954,24 @@ fn wait_for_tclone_source_quiet_if_requested(
             );
         }
         if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "timed out waiting for tclone source {} to become quiet before fork{}",
-                    source.run_id,
-                    if last_not_quiet_reason.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {last_not_quiet_reason}")
-                    }
-                ),
-            ));
+            return tclone_quiet_timeout(&source.run_id, &last_not_quiet_reason);
         }
+    }
+}
+
+fn tclone_quiet_timeout(run_id: &str, reason: &str) -> io::Result<()> {
+    let detail = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(": {reason}")
+    };
+    let message =
+        format!("timed out waiting for tclone source {run_id} to become quiet before fork{detail}");
+    if env_flag("GENSEE_TCLONE_FORK_QUIET_STRICT") {
+        Err(io::Error::new(io::ErrorKind::TimedOut, message))
+    } else {
+        eprintln!("gensee: warning: {message}; proceeding with the live fork");
+        Ok(())
     }
 }
 
@@ -2530,7 +3118,12 @@ struct ProcStat {
     ticks: u64,
 }
 
-fn descendant_proc_ticks(root_pid: u32) -> io::Result<u64> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DescendantProcTicks {
+    ticks_by_pid: HashMap<u32, u64>,
+}
+
+fn descendant_proc_ticks(root_pid: u32) -> io::Result<DescendantProcTicks> {
     let stats = read_proc_stats()?;
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut ticks_by_pid: HashMap<u32, u64> = HashMap::new();
@@ -2538,15 +3131,36 @@ fn descendant_proc_ticks(root_pid: u32) -> io::Result<u64> {
         children.entry(stat.ppid).or_default().push(stat.pid);
         ticks_by_pid.insert(stat.pid, stat.ticks);
     }
-    let mut total = 0u64;
+    let mut descendants = HashMap::new();
     let mut stack = vec![root_pid];
     while let Some(pid) = stack.pop() {
-        total = total.saturating_add(ticks_by_pid.get(&pid).copied().unwrap_or(0));
+        if let Some(ticks) = ticks_by_pid.get(&pid) {
+            descendants.insert(pid, *ticks);
+        }
         if let Some(child_pids) = children.get(&pid) {
             stack.extend(child_pids.iter().copied());
         }
     }
-    Ok(total)
+    Ok(DescendantProcTicks {
+        ticks_by_pid: descendants,
+    })
+}
+
+fn descendant_proc_tick_delta(
+    previous: &DescendantProcTicks,
+    current: &DescendantProcTicks,
+) -> (u64, bool) {
+    let mut delta = 0u64;
+    for (pid, current_ticks) in &current.ticks_by_pid {
+        if let Some(previous_ticks) = previous.ticks_by_pid.get(pid) {
+            delta = delta.saturating_add(current_ticks.saturating_sub(*previous_ticks));
+        }
+    }
+    let descendant_exited = previous
+        .ticks_by_pid
+        .keys()
+        .any(|pid| !current.ticks_by_pid.contains_key(pid));
+    (delta, descendant_exited)
 }
 
 fn read_proc_stats() -> io::Result<Vec<ProcStat>> {
@@ -2679,6 +3293,39 @@ struct TcloneForkDetachGuard {
     marker_path: PathBuf,
 }
 
+struct TcloneCapabilityRotationGuard {
+    podman: OsString,
+    source: TcloneRunRecord,
+    restored: bool,
+}
+
+impl TcloneCapabilityRotationGuard {
+    fn revoke(podman: &OsString, source: TcloneRunRecord) -> io::Result<Self> {
+        revoke_tclone_host_control_capability(&source.run_id)?;
+        Ok(Self {
+            podman: podman.clone(),
+            source,
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        rotate_tclone_host_control_capability(&self.source.run_id)?;
+        write_tclone_run_context(&self.podman, &self.source)?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TcloneCapabilityRotationGuard {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = rotate_tclone_host_control_capability(&self.source.run_id);
+            let _ = write_tclone_run_context(&self.podman, &self.source);
+        }
+    }
+}
+
 impl TcloneForkDetachGuard {
     fn mark(run_id: &str) -> io::Result<Self> {
         let timestamp = unix_millis()?;
@@ -2700,7 +3347,7 @@ impl Drop for TcloneForkDetachGuard {
 fn should_reattach_after_tclone_fork_marker(
     podman: &OsString,
     container_name: &str,
-    attach_started_ms: u64,
+    _attach_started_ms: u64,
 ) -> bool {
     let Ok(record) = find_tclone_record(container_name) else {
         return false;
@@ -2714,8 +3361,7 @@ fn should_reattach_after_tclone_fork_marker(
     else {
         return false;
     };
-    if tclone_fork_marker_is_stale(marker_ms) || marker_ms.saturating_add(2_000) < attach_started_ms
-    {
+    if tclone_fork_marker_is_stale(marker_ms) {
         let _ = fs::remove_file(&marker_path);
         return false;
     }
@@ -4110,7 +4756,7 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
 fn tclone_agent_start_script(agent_cmd: &[OsString]) -> String {
     let command = shell_join(agent_cmd);
     format!(
-        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\n",
+        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\nagent_pid=$!\nsleep 2\nif ! kill -0 \"$agent_pid\" 2>/dev/null; then\n  printf 'gensee agent exited during startup\\n' >> \"$log\"\n  cat \"$log\" >&2\n  exit 127\nfi\nprintf 'gensee agent started without tmux pid=%s\\n' \"$agent_pid\" >> \"$log\"\n",
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
@@ -4219,37 +4865,31 @@ fn install_tclone_init(seed_root: &Path) -> io::Result<()> {
     }
     fs::write(
         &init_path,
-        r#"#!/usr/bin/env bash
-set -Eeuo pipefail
+        r#"#!/bin/sh
+set -eu
 
 term=0
 sleep_pid=
 
-reap_one() {
-  wait -n 2>/dev/null || true
-}
-
 shutdown() {
   term=1
+  trap - TERM INT
+  kill -TERM -1 2>/dev/null || true
   if [ -n "${sleep_pid:-}" ]; then
     kill -TERM "$sleep_pid" 2>/dev/null || true
   fi
 }
 
 trap shutdown TERM INT
-trap reap_one CHLD
 
 while [ "$term" = 0 ]; do
   sleep 30 &
   sleep_pid=$!
   wait "$sleep_pid" 2>/dev/null || true
   sleep_pid=
-  reap_one
 done
 
-while wait -n 2>/dev/null; do
-  :
-done
+wait 2>/dev/null || true
 "#,
     )?;
     #[cfg(unix)]
@@ -4954,6 +5594,106 @@ mod tests {
     }
 
     #[test]
+    fn tclone_host_control_dispatch_rejects_non_allowlisted_commands() {
+        let request = TcloneHostControlRequest {
+            caller_run_id: None,
+            nonce: None,
+            authenticator: None,
+            args: vec![
+                "run".to_string(),
+                "--sandbox".to_string(),
+                "none".to_string(),
+                "--".to_string(),
+                "/bin/sh".to_string(),
+            ],
+        };
+
+        let response =
+            execute_tclone_host_control_request(request, Path::new("/definitely/not/executed"))
+                .unwrap();
+
+        assert_eq!(response.exit_code, Some(64));
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unsupported")));
+    }
+
+    #[test]
+    fn tclone_host_control_target_authority_is_run_scoped() {
+        let source = test_record("run_source", "running");
+        let sibling = test_fork_record("run_source_fork_1_0", "run_source");
+
+        assert!(tclone_host_control_target_is_authorized(
+            "run_source",
+            &source
+        ));
+        assert!(!tclone_host_control_target_is_authorized(
+            "run_source",
+            &sibling
+        ));
+    }
+
+    #[test]
+    fn tclone_host_control_authenticator_binds_args_and_nonce() {
+        let args = vec!["run".to_string(), "diff".to_string(), "run_1".to_string()];
+        let first =
+            tclone_host_control_authenticator("run_1", "nonce-1", &args, "secret-1").unwrap();
+        let second =
+            tclone_host_control_authenticator("run_1", "nonce-2", &args, "secret-1").unwrap();
+        let changed_args = tclone_host_control_authenticator(
+            "run_1",
+            "nonce-1",
+            &["run".to_string(), "diff".to_string(), "run_2".to_string()],
+            "secret-1",
+        )
+        .unwrap();
+
+        assert_ne!(first, second);
+        assert_ne!(first, changed_args);
+        assert!(!first.contains("secret-1"));
+    }
+
+    #[test]
+    fn tclone_host_control_nonce_is_single_use() {
+        let run_id = format!(
+            "nonce_test_{}_{}",
+            std::process::id(),
+            unix_millis().unwrap()
+        );
+        let root = gensee_tmp_root().unwrap().join(&run_id);
+        rotate_tclone_host_control_capability(&run_id).unwrap();
+
+        claim_tclone_host_control_nonce(&run_id, "nonce-1").unwrap();
+        let error = claim_tclone_host_control_nonce(&run_id, "nonce-1").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_atomic_response_write_replaces_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_tree("nofollow-response");
+        let outside = root.join("outside");
+        let response = root.join("response.json");
+        fs::write(&outside, "keep").unwrap();
+        symlink(&outside, &response).unwrap();
+
+        write_atomic_nofollow(&response, br#"{"ok":true}"#, 0o600).unwrap();
+
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(&response).unwrap(), r#"{"ok":true}"#);
+        assert!(!fs::symlink_metadata(&response)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn tclone_proc_stat_parser_handles_comm_with_spaces() {
         let stat = parse_proc_stat(
             123,
@@ -4964,6 +5704,18 @@ mod tests {
         assert_eq!(stat.pid, 123);
         assert_eq!(stat.ppid, 7);
         assert_eq!(stat.ticks, 75);
+    }
+
+    #[test]
+    fn tclone_proc_tick_delta_marks_disappearing_children_as_active() {
+        let previous = DescendantProcTicks {
+            ticks_by_pid: HashMap::from([(1, 10), (2, 500)]),
+        };
+        let current = DescendantProcTicks {
+            ticks_by_pid: HashMap::from([(1, 12)]),
+        };
+
+        assert_eq!(descendant_proc_tick_delta(&previous, &current), (2, true));
     }
 
     #[test]
@@ -5114,8 +5866,24 @@ gensee async job job_1: exited status=0
             "--attach=tmux:right".to_string(),
         ];
         assert_eq!(
-            tclone_host_control_async_attach_placement(&args),
+            tclone_host_control_async_attach_placement(&args).unwrap(),
             Some(HostTmuxPlacement::Right)
+        );
+
+        let invalid = vec![
+            "run".to_string(),
+            "fork".to_string(),
+            "run_1".to_string(),
+            "--attach=tmux:sideways".to_string(),
+        ];
+        assert!(tclone_host_control_async_attach_placement(&invalid).is_err());
+    }
+
+    #[test]
+    fn tclone_async_job_component_cannot_inject_tmux_formats() {
+        assert_eq!(
+            tclone_safe_job_component("#(touch /tmp/pwned):run"),
+            "__touch__tmp_pwned__run"
         );
     }
 
@@ -5410,12 +6178,13 @@ gensee async job job_1: exited status=0
     fn tclone_run_context_payload_marks_forks() {
         let fork = test_fork_record("run_1_fork_2_0", "run_1");
 
-        let payload = tclone_run_context_payload(&fork);
+        let payload = tclone_run_context_payload(&fork, "capability-1");
 
         assert_eq!(payload["run_id"], "run_1_fork_2_0");
         assert_eq!(payload["role"], "fork");
         assert_eq!(payload["source_run_id"], "run_1");
         assert_eq!(payload["workspace"], "/workspace");
+        assert_eq!(payload["host_control_capability"], "capability-1");
     }
 
     #[test]
@@ -5499,8 +6268,9 @@ gensee async job job_1: exited status=0
 
         let init = seed.join("usr/local/bin/gensee-tclone-init");
         let contents = fs::read_to_string(&init).unwrap();
-        assert!(contents.contains("wait -n"));
-        assert!(contents.contains("trap reap_one CHLD"));
+        assert!(contents.starts_with("#!/bin/sh\n"));
+        assert!(contents.contains("kill -TERM -1"));
+        assert!(!contents.contains("wait -n"));
         assert_eq!(
             fs::metadata(&init).unwrap().permissions().mode() & 0o111,
             0o111
