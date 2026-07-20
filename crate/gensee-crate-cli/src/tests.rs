@@ -5329,6 +5329,12 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert!(finding
         .message
         .contains("gensee run send <fork-id> -- '<task prompt>'"));
+    assert!(finding
+        .message
+        .contains("After sending the prompt, do not poll gensee for task completion"));
+    assert!(finding
+        .message
+        .contains("ask the user to report the fork result"));
     assert_eq!(finding.evidence["reason"], json!("dependency_upgrade"));
 }
 

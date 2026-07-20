@@ -302,7 +302,7 @@ pub(crate) fn fork_suggestion_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. If status=failed, stop and report the failure.",
+            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, or stop and report the failure if status=failed. Once status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. After sending the prompt, do not poll gensee for task completion. The fork is an interactive agent session attached in tmux; ask the user to report the fork result.",
             reason = reason.label()
         )
     } else {
@@ -375,7 +375,7 @@ pub(crate) fn fork_suggestion_prompt_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. If status=failed, stop and report the failure.",
+            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, or stop and report the failure if status=failed. Once status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. After sending the prompt, do not poll gensee for task completion. The fork is an interactive agent session attached in tmux; ask the user to report the fork result.",
             reason = reason.label()
         )
     } else {
