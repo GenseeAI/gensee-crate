@@ -47,9 +47,17 @@ const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
 const TCLONE_ASYNC_JOB_TIMEOUT_SECS: u64 = 10 * 60;
 const TCLONE_ASYNC_JOB_STALE_GRACE_SECS: u64 = 30;
+// Keep this non-configurable: the compile-time claim-lifetime invariant must
+// cover the watchdog's runtime TERM-to-KILL delay.
 const TCLONE_ASYNC_TIMEOUT_ESCALATION_SECS: u64 = 2;
+// Allow the main shell time to observe/reap the killed child before pruning
+// can remove the watchdog's timeout claim.
+const TCLONE_ASYNC_CLAIM_REAP_SLACK_SECS: u64 = 10;
 const TCLONE_ASYNC_TIMEOUT_CLAIM_STALE_SECS: u64 = 30;
-const _: () = assert!(TCLONE_ASYNC_TIMEOUT_CLAIM_STALE_SECS > TCLONE_ASYNC_TIMEOUT_ESCALATION_SECS);
+const _: () = assert!(
+    TCLONE_ASYNC_TIMEOUT_CLAIM_STALE_SECS
+        > TCLONE_ASYNC_TIMEOUT_ESCALATION_SECS + TCLONE_ASYNC_CLAIM_REAP_SLACK_SECS
+);
 const TCLONE_ASYNC_MAX_ACTIVE_JOBS: usize = 4;
 const TCLONE_ASYNC_JOB_RETENTION_SECS: u64 = 24 * 60 * 60;
 const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
