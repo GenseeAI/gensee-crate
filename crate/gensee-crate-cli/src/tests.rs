@@ -6295,6 +6295,31 @@ fn codex_source_steers_fork_targeted_exec_to_send() {
 }
 
 #[test]
+fn claude_source_steers_fork_targeted_exec_to_send() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("claude-fork-exec-host-only");
+    let command = "gensee run exec run_123_fork_456_0 -- cargo test --workspace";
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), command);
+    let event = super::build_hook_event(&payload, PROVIDER_CLAUDE_CODE).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .expect("source-side exec into a fork should be denied for Claude Code too");
+
+    assert!(output.contains("\"permissionDecision\":\"deny\""));
+    assert!(output.contains("host-only"));
+    assert!(output.contains("gensee run send"));
+    assert!(store.list_alerts().unwrap().iter().any(|alert| {
+        alert.rule_id == "policy_tclone_exec_host_only"
+            && alert.action == "block"
+            && alert.severity == "medium"
+    }));
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
 fn codex_fork_allows_exec_in_its_own_run() {
     let _guard = telemetry_test_lock();
     env::set_var("GENSEE_RUN_ID", "run_123_fork_456_0");

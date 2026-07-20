@@ -345,8 +345,11 @@ fn tclone_source_exec_into_fork_finding(
         return None;
     }
     Some(PolicyFinding {
-        action: fork_suggestion_action(event, current_run_id),
-        severity: fork_suggestion_severity(event, current_run_id).to_string(),
+        // The host-control bridge rejects this command for every provider, so
+        // the policy layer must steer every source agent before it hits that
+        // provider-independent denial.
+        action: PolicyAction::Block,
+        severity: "medium".to_string(),
         rule_id: "policy_tclone_exec_host_only".to_string(),
         message: format!(
             "`gensee run exec {target}` is host-only from a tclone source container. Hand the task to the fork agent with `gensee run send {target} -- '<task prompt>'`, or run `gensee run exec` from a host terminal."
