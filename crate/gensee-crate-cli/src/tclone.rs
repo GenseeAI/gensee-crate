@@ -24,6 +24,7 @@ const TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV: &str = "GENSEE_TCLONE_CONTAINER_HO
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
 const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
+const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
@@ -972,7 +973,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         OsString::from("--name"),
         OsString::from(&source_container),
         OsString::from("--entrypoint"),
-        OsString::from("/bin/sleep"),
+        OsString::from(TCLONE_CONTAINER_INIT_PATH),
         OsString::from("--log-driver=k8s-file"),
         OsString::from("--security-opt"),
         OsString::from("seccomp=unconfined"),
@@ -1059,7 +1060,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         )));
     }
     create_args.push(OsString::from(&image));
-    create_args.push(OsString::from("infinity"));
+    create_args.push(OsString::from("idle"));
     let agent_cmd_strings = config
         .agent_cmd
         .iter()
@@ -2478,6 +2479,8 @@ fn tclone_is_transient_fork_process(process: &TcloneQuietProcess) -> bool {
 
 fn tclone_is_baseline_fork_process(command: &str) -> bool {
     command == "/bin/sleep infinity"
+        || command.contains(TCLONE_CONTAINER_INIT_PATH)
+        || command == "sleep 30"
         || command.contains("tmux new-session -d -s gensee-agent")
         || command.contains("tmux attach-session -t gensee-agent")
         || command.contains("ps -eo pid=,ppid=,stat=,args=")
@@ -4181,6 +4184,7 @@ fn prepare_tclone_seed(
         fs::remove_dir_all(seed_root)?;
     }
     fs::create_dir_all(seed_root)?;
+    install_tclone_init(seed_root)?;
 
     let workspace_seed = seed_root.join(container_relative_path(container_workspace)?);
     copy_tclone_workspace(original_workspace, &workspace_seed)?;
@@ -4204,6 +4208,55 @@ fn prepare_tclone_seed(
             ))?),
         )?;
         install_tclone_gensee_home_compatibility(seed_root, gensee_home, container_home)?;
+    }
+    Ok(())
+}
+
+fn install_tclone_init(seed_root: &Path) -> io::Result<()> {
+    let init_path = seed_root.join(container_relative_path(TCLONE_CONTAINER_INIT_PATH)?);
+    if let Some(parent) = init_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &init_path,
+        r#"#!/usr/bin/env bash
+set -Eeuo pipefail
+
+term=0
+sleep_pid=
+
+reap_one() {
+  wait -n 2>/dev/null || true
+}
+
+shutdown() {
+  term=1
+  if [ -n "${sleep_pid:-}" ]; then
+    kill -TERM "$sleep_pid" 2>/dev/null || true
+  fi
+}
+
+trap shutdown TERM INT
+trap reap_one CHLD
+
+while [ "$term" = 0 ]; do
+  sleep 30 &
+  sleep_pid=$!
+  wait "$sleep_pid" 2>/dev/null || true
+  sleep_pid=
+  reap_one
+done
+
+while wait -n 2>/dev/null; do
+  :
+done
+"#,
+    )?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&init_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&init_path, permissions)?;
     }
     Ok(())
 }
@@ -4942,6 +4995,23 @@ mod tests {
     }
 
     #[test]
+    fn tclone_quiet_probe_treats_tclone_init_as_baseline() {
+        let init = TcloneQuietProcess {
+            pid: 1,
+            stat: "Ss".to_string(),
+            command: "/usr/bin/env bash /usr/local/bin/gensee-tclone-init idle".to_string(),
+        };
+        let sleeper = TcloneQuietProcess {
+            pid: 12,
+            stat: "S".to_string(),
+            command: "sleep 30".to_string(),
+        };
+
+        assert!(!tclone_is_transient_fork_process(&init));
+        assert!(!tclone_is_transient_fork_process(&sleeper));
+    }
+
+    #[test]
     fn tclone_quiet_probe_keeps_sandbox_helpers_transient() {
         let sandbox = TcloneQuietProcess {
             pid: 31,
@@ -5414,6 +5484,28 @@ gensee async job job_1: exited status=0
                     .iter()
                     .position(|entry| *entry == "/home/yiying/.cargo/bin")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_seed_installs_reaping_init() {
+        let root = temp_tree("reaping-init");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+
+        prepare_tclone_seed(&seed, &workspace, None, None, "/workspace", "/home/gensee").unwrap();
+
+        let init = seed.join("usr/local/bin/gensee-tclone-init");
+        let contents = fs::read_to_string(&init).unwrap();
+        assert!(contents.contains("wait -n"));
+        assert!(contents.contains("trap reap_one CHLD"));
+        assert_eq!(
+            fs::metadata(&init).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
