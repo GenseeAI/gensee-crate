@@ -18,6 +18,7 @@ quick start, then dive into the topic guides below.
 - [Codex integration](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/codex) — setup commands, hook samples, and smoke-test payloads.
 - [Antigravity support](antigravity-support.md) — global hook setup, `.agents` policy coverage, and sidecar audit.
 - [VS Code / GitHub Copilot hooks](vscode-support.md) — configure VS Code agent hooks, native tool parsing, and policy enforcement.
+- [Cursor hooks](cursor-support.md) — native hook setup, enforcement behavior, and runtime verification.
 - [Omnigent integration](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/omnigent) — thin `watch`/`run` support and the deeper policy-bridge plan.
 - [Safety policy](policy.md) — the data-driven allow/ask/deny policy engine and how to customize it.
 - [Dashboard](dashboard.md) — inspect live activity, lineage, policy decisions, alerts, and policy edits.

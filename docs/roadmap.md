@@ -95,7 +95,8 @@ use.
 
 Planned integration areas include:
 
-- Additional coding agents and assistants such as ChatGPT, Gemini, and Cursor.
+- Additional coding agents and assistants such as ChatGPT and Gemini. Cursor
+  and GitHub Copilot hook support are available today.
 - Agent orchestration frameworks such as Omnigent.
 - Security tooling such as CrowdStrike and other endpoint or detection systems.
 - LLM gateways, MCP servers, and policy/control-plane tools.

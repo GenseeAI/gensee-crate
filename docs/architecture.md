@@ -39,6 +39,7 @@ profile for dangerous syscalls, and cgroup/nftables network controls. See
 | `integrations/codex` | Codex hook bridge |
 | `integrations/omnigent` | Thin Omnigent sidecar/managed-launch integration |
 | `integrations/vscode` | VS Code / GitHub Copilot hook bridge and setup guide |
+| `integrations/cursor` | Cursor native hook bridge |
 | `integrations/mcp` | Optional MCP bridge |
 | `integrations/generic-launcher` | `gensee run -- <agent>` launcher integration |
 | `models` | Future model artifacts and notes |

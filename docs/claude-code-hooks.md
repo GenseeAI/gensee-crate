@@ -30,9 +30,10 @@ When running from a source checkout, invoke the binary you built:
 ./target/debug/gensee setup claude-code --gensee-home "$GENSEE_HOME"
 ```
 
-The setup command backs up the previous settings file, preserves unrelated
-settings, and installs hooks for `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
-and `Stop`.
+The setup command preserves unrelated settings and non-Gensee commands in the
+same events, replaces stale or duplicate Gensee commands, and installs hooks
+for `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`. Changed files
+are backed up and written atomically; unchanged setup runs do not rewrite them.
 
 To route Claude Code traffic through an inspecting company gateway at the same
 time, pass the gateway URL and one credential source:

@@ -37,11 +37,16 @@ pub(crate) const PROVIDER_CLAUDE_CODE: &str = "claude-code";
 pub(crate) const PROVIDER_CODEX: &str = "codex";
 pub(crate) const PROVIDER_ANTIGRAVITY: &str = "antigravity";
 pub(crate) const PROVIDER_VSCODE: &str = "vscode";
+pub(crate) const PROVIDER_CURSOR: &str = "cursor";
 
 pub(crate) fn is_supported_provider(provider: &str) -> bool {
     matches!(
         provider,
-        PROVIDER_CLAUDE_CODE | PROVIDER_CODEX | PROVIDER_ANTIGRAVITY | PROVIDER_VSCODE
+        PROVIDER_CLAUDE_CODE
+            | PROVIDER_CODEX
+            | PROVIDER_ANTIGRAVITY
+            | PROVIDER_VSCODE
+            | PROVIDER_CURSOR
     )
 }
 
@@ -816,9 +821,10 @@ pub(crate) fn handle_hook(args: Vec<OsString>) -> io::Result<()> {
         Some("codex") => handle_agent_hook(PROVIDER_CODEX),
         Some("antigravity") => handle_agent_hook(PROVIDER_ANTIGRAVITY),
         Some("vscode") => handle_agent_hook(PROVIDER_VSCODE),
+        Some("cursor") => handle_agent_hook(PROVIDER_CURSOR),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee hook <claude-code|codex|antigravity|vscode>",
+            "usage: gensee hook <claude-code|codex|antigravity|vscode|cursor>",
         )),
     }
 }
@@ -829,9 +835,10 @@ pub(crate) fn handle_setup(args: Vec<OsString>) -> io::Result<()> {
         Some("codex") => setup_codex(args[1..].to_vec()),
         Some("antigravity") => setup_antigravity(args[1..].to_vec()),
         Some("vscode") => setup_vscode(args[1..].to_vec()),
+        Some("cursor") => setup_cursor(args[1..].to_vec()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee setup <claude-code|codex|antigravity|vscode> [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
+            "usage: gensee setup <claude-code|codex|antigravity|vscode|cursor> [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
         )),
     }
 }
@@ -922,7 +929,7 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
     gensee_home = absolutize_for_hook(&gensee_home)?;
     bin_path = absolutize_for_hook(&bin_path)?;
     let command = claude_code_hook_command(&gensee_home, &bin_path);
-    write_claude_code_settings(&settings_path, &command, &gateway)?;
+    let hooks_disabled = write_claude_code_settings(&settings_path, &command, &gateway)?;
 
     println!(
         "gensee setup: configured Claude Code hooks in {}",
@@ -931,9 +938,18 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
     if !gateway.is_empty() {
         println!("gensee setup: configured Claude Code gateway routing.");
     }
+    if let Some(warning) = claude_code_disabled_hooks_warning(hooks_disabled) {
+        eprintln!("{warning}");
+    }
     println!("gensee setup: hook command: {command}");
     println!("gensee setup: fully restart Claude Code before testing enforcement.");
     Ok(())
+}
+
+const CLAUDE_CODE_DISABLED_HOOKS_WARNING: &str = "gensee setup: warning: Claude Code disableAllHooks is true; Gensee hooks are installed but will not run until it is set to false.";
+
+fn claude_code_disabled_hooks_warning(hooks_disabled: bool) -> Option<&'static str> {
+    hooks_disabled.then_some(CLAUDE_CODE_DISABLED_HOOKS_WARNING)
 }
 
 fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
@@ -1173,36 +1189,9 @@ fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
 }
 
 fn write_vscode_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()> {
-    let mut root = if hooks_path.exists() {
-        let contents = fs::read_to_string(hooks_path)?;
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", hooks_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+    let (existing_contents, mut root) = read_json_config(hooks_path)?;
     apply_vscode_hook_settings(&mut root, command)?;
-
-    if let Some(parent) = hooks_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if hooks_path.exists() {
-        let backup = backup_path(hooks_path)?;
-        fs::copy(hooks_path, &backup)?;
-        println!(
-            "gensee setup: backed up previous hooks to {}",
-            backup.display()
-        );
-    }
-    let serialized = serde_json::to_string_pretty(&root)?;
-    fs::write(hooks_path, format!("{serialized}\n"))?;
+    write_json_config_if_changed(hooks_path, existing_contents.as_deref(), &root, "hooks")?;
     Ok(())
 }
 
@@ -1217,7 +1206,10 @@ pub(crate) fn apply_vscode_hook_settings(root: &mut Value, command: &str) -> io:
         .entry("hooks".to_string())
         .or_insert_with(|| json!({}));
     if !hooks.is_object() {
-        *hooks = json!({});
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VS Code hooks field must be a JSON object",
+        ));
     }
     let hooks_object = hooks.as_object_mut().expect("hooks is an object");
     // VS Code hooks use a flat entry format: each hook is directly
@@ -1230,22 +1222,13 @@ pub(crate) fn apply_vscode_hook_settings(root: &mut Value, command: &str) -> io:
         "timeout": 30
     });
     for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
-        let entries = hooks_object
-            .entry(event_name.to_string())
-            .or_insert_with(|| json!([]));
-        if !entries.is_array() {
-            *entries = json!([]);
-        }
-        let entries = entries.as_array_mut().expect("hook entries are an array");
-        // Replace a previous Gensee entry so rerunning setup is idempotent and
-        // updates changed paths, while preserving unrelated commands.
-        entries.retain(|entry| {
-            !entry
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|existing| existing.ends_with(" hook vscode"))
-        });
-        entries.push(hook_entry.clone());
+        merge_flat_hook_event(
+            hooks_object,
+            event_name,
+            PROVIDER_VSCODE,
+            hook_entry.clone(),
+            "VS Code",
+        )?;
     }
     Ok(())
 }
@@ -1253,6 +1236,396 @@ pub(crate) fn apply_vscode_hook_settings(root: &mut Value, command: &str) -> io:
 fn vscode_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
     format!(
         "GENSEE_HOME={} {} hook vscode",
+        shell_quote(&gensee_home.display().to_string()),
+        shell_quote(&bin_path.display().to_string())
+    )
+}
+
+fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let mut hooks_path = home.join(".cursor").join("hooks.json");
+    let mut gensee_home = env::var_os("GENSEE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(default_root()?);
+    let mut bin_path = env::current_exe()?;
+
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
+        })?;
+        match arg {
+            "--yes" => {
+                index += 1;
+            }
+            "--gensee-home" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "setup: --gensee-home requires a path",
+                    )
+                })?;
+                gensee_home = PathBuf::from(value);
+                index += 2;
+            }
+            "--hooks" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "setup: --hooks requires a path",
+                    )
+                })?;
+                hooks_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--bin" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "setup: --bin requires a path")
+                })?;
+                bin_path = PathBuf::from(value);
+                index += 2;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: gensee setup cursor [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                );
+                return Ok(());
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("setup: unknown argument `{arg}`"),
+                ));
+            }
+        }
+    }
+
+    gensee_home = absolutize_for_hook(&gensee_home)?;
+    bin_path = absolutize_for_hook(&bin_path)?;
+    let command = cursor_hook_command(&gensee_home, &bin_path);
+    write_cursor_hook_settings(&hooks_path, &command)?;
+
+    println!(
+        "gensee setup: configured Cursor hooks in {}",
+        hooks_path.display()
+    );
+    println!("gensee setup: hook command: {command}");
+    println!("gensee setup: fully restart Cursor before testing enforcement.");
+    Ok(())
+}
+
+fn write_cursor_hook_settings(hooks_path: &Path, command: &str) -> io::Result<bool> {
+    let (existing_contents, mut root) = read_json_config(hooks_path)?;
+    apply_cursor_hook_settings(&mut root, command)?;
+    write_json_config_if_changed(hooks_path, existing_contents.as_deref(), &root, "hooks")
+}
+
+fn write_file_atomically(
+    path: &Path,
+    contents: &[u8],
+    new_file_mode: Option<u32>,
+) -> io::Result<()> {
+    // Renaming a temporary file over a symlink replaces the link itself. Resolve
+    // an existing symlink first so dotfile-managed configurations keep the link
+    // and receive the atomic update at their real target.
+    let write_path = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::canonicalize(path).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "cannot resolve symlinked config {}: {err}; ensure the symlink target exists or fix/remove the link, then rerun setup",
+                        path.display()
+                    ),
+                )
+            })?
+        }
+        Ok(_) => path.to_path_buf(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(err) => return Err(err),
+    };
+    let parent = write_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = write_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| io::Error::other(err.to_string()))?
+        .as_nanos();
+    let temp_path = parent.join(format!(".{file_name}.tmp.{}.{nonce}", std::process::id()));
+
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = new_file_mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = new_file_mode;
+        let mut temp = options.open(&temp_path)?;
+        temp.write_all(contents)?;
+        temp.sync_all()?;
+        if let Ok(metadata) = fs::metadata(&write_path) {
+            fs::set_permissions(&temp_path, metadata.permissions())?;
+        }
+        fs::rename(&temp_path, &write_path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn read_json_config(path: &Path) -> io::Result<(Option<String>, Value)> {
+    let existing_contents = if path.exists() {
+        Some(fs::read_to_string(path)?)
+    } else {
+        None
+    };
+    let root = match existing_contents.as_deref() {
+        Some(contents) if contents.trim().is_empty() => json!({}),
+        Some(contents) => serde_json::from_str(contents).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not valid JSON: {err}", path.display()),
+            )
+        })?,
+        None => json!({}),
+    };
+    Ok((existing_contents, root))
+}
+
+fn write_json_config_if_changed(
+    path: &Path,
+    existing_contents: Option<&str>,
+    root: &Value,
+    backup_subject: &str,
+) -> io::Result<bool> {
+    write_json_config_if_changed_with_mode(path, existing_contents, root, backup_subject, None)
+}
+
+fn write_json_config_if_changed_with_mode(
+    path: &Path,
+    existing_contents: Option<&str>,
+    root: &Value,
+    backup_subject: &str,
+    new_file_mode: Option<u32>,
+) -> io::Result<bool> {
+    let serialized = serde_json::to_string_pretty(root)?;
+    let updated_contents = format!("{serialized}\n");
+    if existing_contents == Some(updated_contents.as_str()) {
+        return Ok(false);
+    }
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    if existing_contents.is_some() {
+        let backup = backup_path(path)?;
+        fs::copy(path, &backup)?;
+        println!(
+            "gensee setup: backed up previous {backup_subject} to {}",
+            backup.display()
+        );
+    }
+    write_file_atomically(path, updated_contents.as_bytes(), new_file_mode)?;
+    Ok(true)
+}
+
+fn gensee_hook_command_owned_by(command: &str, provider: &str) -> bool {
+    command.contains("GENSEE_HOME=") && command.trim_end().ends_with(&format!(" hook {provider}"))
+}
+
+fn command_hook_owned_by(entry: &Value, provider: &str, context: &str) -> io::Result<bool> {
+    let object = entry.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{context} hook entry must be a JSON object"),
+        )
+    })?;
+    match object.get("command") {
+        Some(Value::String(command)) => Ok(gensee_hook_command_owned_by(command, provider)),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{context} hook command must be a string"),
+        )),
+        None => Ok(false),
+    }
+}
+
+fn merge_flat_hook_event(
+    hooks: &mut serde_json::Map<String, Value>,
+    event_name: &str,
+    provider: &str,
+    hook_entry: Value,
+    integration: &str,
+) -> io::Result<()> {
+    let entries = hooks
+        .entry(event_name.to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{integration} {event_name} hooks must be a JSON array"),
+            )
+        })?;
+    let context = format!("{integration} {event_name}");
+    let mut owned = Vec::with_capacity(entries.len());
+    for entry in entries.iter() {
+        owned.push(command_hook_owned_by(entry, provider, &context)?);
+    }
+    let insert_at = owned
+        .iter()
+        .position(|is_owned| *is_owned)
+        .unwrap_or(entries.len());
+    let mut index = 0;
+    entries.retain(|_| {
+        let keep = !owned[index];
+        index += 1;
+        keep
+    });
+    entries.insert(insert_at.min(entries.len()), hook_entry);
+    Ok(())
+}
+
+fn validate_nested_hook_groups(
+    entries: &[Value],
+    provider: &str,
+    context: &str,
+) -> io::Result<Vec<Vec<bool>>> {
+    let mut owned = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let group = entry.as_object().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{context} matcher entry must be a JSON object"),
+            )
+        })?;
+        let commands = group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{context} matcher hooks must be a JSON array"),
+                )
+            })?;
+        let mut group_owned = Vec::with_capacity(commands.len());
+        for command in commands {
+            group_owned.push(command_hook_owned_by(command, provider, context)?);
+        }
+        owned.push(group_owned);
+    }
+    Ok(owned)
+}
+
+fn merge_nested_hook_event(
+    hooks: &mut serde_json::Map<String, Value>,
+    event_name: &str,
+    provider: &str,
+    hook_entry: Value,
+    integration: &str,
+) -> io::Result<()> {
+    let entries = hooks
+        .entry(event_name.to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{integration} {event_name} hooks must be a JSON array"),
+            )
+        })?;
+    let context = format!("{integration} {event_name}");
+    let owned = validate_nested_hook_groups(entries, provider, &context)?;
+    let first_owned_group = owned
+        .iter()
+        .position(|group| group.iter().any(|is_owned| *is_owned));
+
+    for (entry, group_owned) in entries.iter_mut().zip(owned.iter()) {
+        let commands = entry
+            .get_mut("hooks")
+            .and_then(Value::as_array_mut)
+            .expect("nested hook groups were validated");
+        let mut index = 0;
+        commands.retain(|_| {
+            let keep = !group_owned[index];
+            index += 1;
+            keep
+        });
+    }
+    let mut group_index = 0;
+    entries.retain(|entry| {
+        let removed_owned_command = owned[group_index].iter().any(|is_owned| *is_owned);
+        group_index += 1;
+        !removed_owned_command
+            || entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|commands| !commands.is_empty())
+    });
+    let insert_at = first_owned_group
+        .unwrap_or(entries.len())
+        .min(entries.len());
+    entries.insert(insert_at, hook_entry);
+    Ok(())
+}
+
+pub(crate) fn apply_cursor_hook_settings(root: &mut Value, command: &str) -> io::Result<()> {
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Cursor hooks must be a JSON object",
+        )
+    })?;
+    root_object.entry("version".to_string()).or_insert(json!(1));
+    let hooks = root_object
+        .entry("hooks".to_string())
+        .or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Cursor hooks field must be a JSON object",
+        ));
+    }
+    let hooks_object = hooks.as_object_mut().expect("hooks is an object");
+    let hook_entry = json!({
+        "command": command,
+        "timeout": 30
+    });
+    for event_name in [
+        "preToolUse",
+        "postToolUse",
+        "beforeShellExecution",
+        "beforeSubmitPrompt",
+        "stop",
+    ] {
+        merge_flat_hook_event(
+            hooks_object,
+            event_name,
+            PROVIDER_CURSOR,
+            hook_entry.clone(),
+            "Cursor",
+        )?;
+    }
+    Ok(())
+}
+
+fn cursor_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
+    format!(
+        "GENSEE_HOME={} {} hook cursor",
         shell_quote(&gensee_home.display().to_string()),
         shell_quote(&bin_path.display().to_string())
     )
@@ -1317,39 +1690,22 @@ fn write_claude_code_settings(
     settings_path: &Path,
     command: &str,
     gateway: &ClaudeCodeGatewaySettings,
-) -> io::Result<()> {
-    let mut root = if settings_path.exists() {
-        let contents = fs::read_to_string(settings_path)?;
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", settings_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+) -> io::Result<bool> {
+    let (existing_contents, mut root) = read_json_config(settings_path)?;
     apply_claude_code_hook_settings(&mut root, command)?;
     apply_claude_code_gateway_settings(&mut root, gateway)?;
-
-    if let Some(parent) = settings_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if settings_path.exists() {
-        let backup = backup_path(settings_path)?;
-        fs::copy(settings_path, &backup)?;
-        println!(
-            "gensee setup: backed up previous settings to {}",
-            backup.display()
-        );
-    }
-    let serialized = serde_json::to_string_pretty(&root)?;
-    fs::write(settings_path, format!("{serialized}\n"))?;
-    Ok(())
+    let hooks_disabled = root
+        .get("disableAllHooks")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    write_json_config_if_changed_with_mode(
+        settings_path,
+        existing_contents.as_deref(),
+        &root,
+        "settings",
+        Some(0o600),
+    )?;
+    Ok(hooks_disabled)
 }
 
 fn apply_claude_code_gateway_settings(
@@ -1407,70 +1763,16 @@ fn apply_claude_code_gateway_settings(
 }
 
 fn write_codex_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()> {
-    let mut root = if hooks_path.exists() {
-        let contents = fs::read_to_string(hooks_path)?;
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", hooks_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+    let (existing_contents, mut root) = read_json_config(hooks_path)?;
     apply_codex_hook_settings(&mut root, command)?;
-
-    if let Some(parent) = hooks_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if hooks_path.exists() {
-        let backup = backup_path(hooks_path)?;
-        fs::copy(hooks_path, &backup)?;
-        println!(
-            "gensee setup: backed up previous hooks to {}",
-            backup.display()
-        );
-    }
-    let serialized = serde_json::to_string_pretty(&root)?;
-    fs::write(hooks_path, format!("{serialized}\n"))?;
+    write_json_config_if_changed(hooks_path, existing_contents.as_deref(), &root, "hooks")?;
     Ok(())
 }
 
 fn write_antigravity_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()> {
-    let mut root = if hooks_path.exists() {
-        let contents = fs::read_to_string(hooks_path)?;
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", hooks_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+    let (existing_contents, mut root) = read_json_config(hooks_path)?;
     apply_antigravity_hook_settings(&mut root, command)?;
-
-    if let Some(parent) = hooks_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if hooks_path.exists() {
-        let backup = backup_path(hooks_path)?;
-        fs::copy(hooks_path, &backup)?;
-        println!(
-            "gensee setup: backed up previous hooks to {}",
-            backup.display()
-        );
-    }
-    let serialized = serde_json::to_string_pretty(&root)?;
-    fs::write(hooks_path, format!("{serialized}\n"))?;
+    write_json_config_if_changed(hooks_path, existing_contents.as_deref(), &root, "hooks")?;
     Ok(())
 }
 
@@ -1485,22 +1787,29 @@ fn apply_claude_code_hook_settings(root: &mut Value, command: &str) -> io::Resul
         .entry("hooks".to_string())
         .or_insert_with(|| json!({}));
     if !hooks.is_object() {
-        *hooks = json!({});
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Claude Code hooks field must be a JSON object",
+        ));
     }
     let hooks_object = hooks.as_object_mut().expect("hooks is an object");
-    let hook_entry = json!([
-        {
-            "matcher": "*",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command
-                }
-            ]
-        }
-    ]);
+    let hook_entry = json!({
+        "matcher": "*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": command
+            }
+        ]
+    });
     for event_name in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"] {
-        hooks_object.insert(event_name.to_string(), hook_entry.clone());
+        merge_nested_hook_event(
+            hooks_object,
+            event_name,
+            PROVIDER_CLAUDE_CODE,
+            hook_entry.clone(),
+            "Claude Code",
+        )?;
     }
     Ok(())
 }
@@ -1516,22 +1825,23 @@ fn apply_codex_hook_settings(root: &mut Value, command: &str) -> io::Result<()> 
         .entry("hooks".to_string())
         .or_insert_with(|| json!({}));
     if !hooks.is_object() {
-        *hooks = json!({});
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex hooks field must be a JSON object",
+        ));
     }
     let hooks_object = hooks.as_object_mut().expect("hooks is an object");
-    let hook_entry = json!([
-        {
-            "matcher": "*",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": command,
-                    "statusMessage": "Checking Gensee policy",
-                    "timeout": 30
-                }
-            ]
-        }
-    ]);
+    let hook_entry = json!({
+        "matcher": "*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "statusMessage": "Checking Gensee policy",
+                "timeout": 30
+            }
+        ]
+    });
     for event_name in [
         "UserPromptSubmit",
         "PreToolUse",
@@ -1539,7 +1849,13 @@ fn apply_codex_hook_settings(root: &mut Value, command: &str) -> io::Result<()> 
         "PostToolUse",
         "Stop",
     ] {
-        hooks_object.insert(event_name.to_string(), hook_entry.clone());
+        merge_nested_hook_event(
+            hooks_object,
+            event_name,
+            PROVIDER_CODEX,
+            hook_entry.clone(),
+            "Codex",
+        )?;
     }
     Ok(())
 }
@@ -1551,42 +1867,45 @@ fn apply_antigravity_hook_settings(root: &mut Value, command: &str) -> io::Resul
             "Antigravity hooks must be a JSON object",
         )
     })?;
-    root_object.insert(
-        "gensee-policy".to_string(),
+    let policy = root_object
+        .entry("gensee-policy".to_string())
+        .or_insert_with(|| json!({}));
+    let policy = policy.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Antigravity gensee-policy field must be a JSON object",
+        )
+    })?;
+    let nested_hook_entry = json!({
+        "matcher": "*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "timeout": 30
+            }
+        ]
+    });
+    for event_name in ["PreToolUse", "PostToolUse"] {
+        merge_nested_hook_event(
+            policy,
+            event_name,
+            PROVIDER_ANTIGRAVITY,
+            nested_hook_entry.clone(),
+            "Antigravity",
+        )?;
+    }
+    merge_flat_hook_event(
+        policy,
+        "PreInvocation",
+        PROVIDER_ANTIGRAVITY,
         json!({
-            "PreToolUse": [
-                {
-                    "matcher": "*",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": command,
-                            "timeout": 30
-                        }
-                    ]
-                }
-            ],
-            "PostToolUse": [
-                {
-                    "matcher": "*",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": command,
-                            "timeout": 30
-                        }
-                    ]
-                }
-            ],
-            "PreInvocation": [
-                {
-                    "type": "command",
-                    "command": command,
-                    "timeout": 30
-                }
-            ]
+            "type": "command",
+            "command": command,
+            "timeout": 30
         }),
-    );
+        "Antigravity",
+    )?;
     Ok(())
 }
 
@@ -3147,6 +3466,8 @@ pub(crate) fn process_hook_event(
             // injects `additionalContext` for the model instead.
             if event.provider == PROVIDER_VSCODE && memory_context_added && contexts.len() == 1 {
                 Ok(Some(vscode_userpromptsubmit_poison_json()))
+            } else if event.provider == PROVIDER_CURSOR {
+                Ok(Some(cursor_beforesubmitprompt_poison_json()))
             } else {
                 Ok(Some(userprompt_additional_context_json(
                     &contexts.join("\n\n"),
@@ -3244,6 +3565,6 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 
 pub(crate) fn print_usage() {
     println!(
-        "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run fork run_123 --copies 2 --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
+        "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run fork run_123 --copies 2 --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
     );
 }

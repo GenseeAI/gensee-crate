@@ -12,8 +12,11 @@ cargo build -p gensee-crate-cli
 GENSEE_HOME="$PWD/.gensee-dev" ./target/debug/gensee setup codex
 ```
 
-The setup command writes `~/.codex/hooks.json`, backs up an existing file, and
-prints the exact hook command it installed. Open `/hooks` in Codex and trust the
+The setup command merges Gensee into `~/.codex/hooks.json`, preserving
+non-Gensee commands in the same events and replacing stale or duplicate Gensee
+entries. Changed files are backed up and written atomically; unchanged setup
+runs do not rewrite them. The command prints the exact hook it installed. Open
+`/hooks` in Codex and trust the
 Gensee hook before testing enforcement. Codex records trust against the hook
 definition, so re-trust it when the binary path, command, or `GENSEE_HOME`
 changes.
