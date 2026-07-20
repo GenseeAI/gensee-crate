@@ -31,10 +31,11 @@ Use a second terminal to fork the running source container:
 ```bash
 gensee-tclone run list
 gensee-tclone run fork <source-run-id> --copies 2
-gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right
+gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right --json
 gensee-tclone run shell <run_id-or-container>
 gensee-tclone run attach <run_id-or-container>
 gensee-tclone run attach <run_id-or-container> --tmux right
+gensee-tclone run send <run_id-or-container> -- 'Run npm test and fix failures'
 gensee-tclone run exec <run_id-or-container> -- bash -lc 'cargo test'
 gensee-tclone run diff <run_id-or-container>
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
@@ -50,22 +51,45 @@ gensee-tclone run delete --all                   # clean tracked runs and gensee
 The source id is the row with role `source` under the `Tclone containers`
 section of `gensee run list`. The launcher also prints it directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
-When hooks see commands that are good fork candidates, such as dependency
-upgrades, migrations, broad refactors, lockfile changes, destructive cleanup, or
-database resets, Gensee records a `policy_fork_suggested` alert with suggested
-`gensee run fork` and `gensee run shell` commands.
+When hooks see requests or commands that are good fork candidates, such as
+dependency upgrades, migrations, broad refactors, lockfile changes, destructive
+cleanup, or database resets, Gensee records a `policy_fork_suggested` alert with
+suggested `gensee run fork --attach tmux:right --json` and `gensee run send`
+commands. In Codex source runs, matching user prompts add fork guidance before
+planning; matching source commands are blocked as a backstop so Codex can ask for
+a fork and continue the work there. Forked Codex runs are allowed to execute the
+command.
 Use the same `gensee-tclone` wrapper for `run list`, `run fork`, `run shell`,
-`run attach`, `run exec`, `run merge`, `run switch`, and cleanup; otherwise
-Gensee may read the source record but look in a different Podman store and
-report that the container is missing.
-Before cloning a tmux-backed source, `gensee run fork` detaches active
-`gensee-agent` clients so tclone can checkpoint a stable process tree; reattach
-to the source or fork with `gensee-tclone run attach <id>`. If the host command
-runs inside tmux and the sudo wrapper preserves `TMUX`, `gensee run fork
---attach tmux:right` opens the new fork in a right-side pane and reconnects to
-the cloned in-container `gensee-agent` session. With `--copies 2`, additional
-forks are opened below the first fork pane. `gensee run attach <id> --tmux
-right` can open an existing run or fork in a new host pane.
+`run attach`, `run send`, `run exec`, `run merge`, `run switch`, and cleanup;
+otherwise Gensee may read the source record but look in a different Podman store
+and report that the container is missing.
+Before cloning a tmux-backed source, `gensee run fork` may briefly detach the
+active `gensee-agent` client so tclone can checkpoint a stable process tree.
+Gensee shows a short tmux status message and automatically reattaches the source
+session as soon as the container is ready. If the host command runs inside tmux
+and the sudo wrapper preserves `TMUX`, `gensee run fork --attach tmux:right`
+opens the new fork in a right-side pane and reconnects to the cloned
+in-container `gensee-agent` session. With `--copies 2`, additional forks are
+opened below the first fork pane. `gensee run attach <id> --tmux right` can open
+an existing run or fork in a new host pane.
+
+Use `gensee run send <id> -- <prompt>` to paste a prompt into the fork's
+in-container `gensee-agent` tmux session and press Enter. If that fork is
+attached in a host tmux pane, the pane visibly shows the forked agent receiving
+and executing the work. Because the fork is an interactive agent session, do not
+poll Gensee for task completion after sending the prompt; ask the user to report
+the fork result from the attached pane:
+
+```bash
+FORK_ID=$(gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right --json \
+  | jq -r '.forks[0].run_id')
+gensee-tclone run send "$FORK_ID" -- 'Try the dependency upgrade, run tests, and summarize the result.'
+```
+
+When a fork is scheduled asynchronously from inside an agent, the JSON response
+includes `status_command`. Poll it only until `status=succeeded`, then use
+`forks[0].run_id` for `gensee run send`; if it returns `status=failed`, stop and
+inspect the included log summary.
 
 Use `gensee run exec <id> -- <command>` for non-interactive work in a fork,
 such as commands requested by an agent. The command runs inside the container
@@ -76,6 +100,10 @@ control command and does not run the command through the agent PreToolUse hook;
 use it only for commands you intend to execute in that fork. It runs alongside
 any live in-container agent, so concurrent writes to the same workspace files can
 race. For shell features or a series of commands, wrap them explicitly:
+
+From the host, `run exec` may target any selected run. Through the in-container
+host-control bridge, a run may execute or diff only itself; a source hands work
+to its direct child forks with `run send` instead of executing commands in them.
 
 ```bash
 gensee-tclone run exec <fork-id> -- bash -lc 'npm install && npm test'
@@ -140,9 +168,19 @@ The current integration is host-owned:
 - in-container hooks and policy config are copied in with the agent config
 - forked containers can be inspected, copied out, or discarded from the host
 
-This keeps fork/snapshot/rollback outside the agent trust boundary. Future work
-should add a post-fork rebind handshake so in-container hooks can rotate from
-the source `GENSEE_RUN_ID` to a fork-specific run id after live cloning.
+Container-to-host control uses a per-run capability in the run context. Requests
+are signed, short-lived, and replay-protected. A source capability may fork that
+source, poll its own fork jobs, and send prompts to its direct child forks. A
+fork cannot control its source or siblings, and `run list`, `run attach`, and
+`run shell` remain host-only.
+
+The capability authenticates the container, not an individual agent process:
+any process that can read `/tmp/gensee-run-context.json` inside that container
+inherits that run's limited authority. It does not gain another run's capability
+or broader host command execution. Fork/snapshot/rollback mechanics and the run
+registry remain host-owned. Future work should add a post-fork rebind handshake
+so in-container hooks can rotate from the source `GENSEE_RUN_ID` to a
+fork-specific run id after live cloning.
 
 ## Current Limitations
 

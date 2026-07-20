@@ -2079,7 +2079,7 @@ fn codex_ask_pretool_records_warn_and_returns_no_hook_output() {
 }
 
 #[test]
-fn codex_permission_request_records_and_denies_destructive_command() {
+fn codex_permission_request_records_and_advises_on_destructive_command() {
     let (store, workspace) = temp_store_and_workspace("codex-permission-request");
     let payload = json!({
         "session_id": "s1",
@@ -2097,14 +2097,14 @@ fn codex_permission_request_records_and_denies_destructive_command() {
 
     let output = process_hook_event(&payload, &event, &store).unwrap();
 
-    let output = output.expect("destructive permission request should return a deny decision");
+    let output = output.expect("destructive permission request should return a system message");
     assert!(
-        output.contains("\"hookEventName\":\"PermissionRequest\""),
-        "expected PermissionRequest-specific output: {output}"
+        output.contains("\"systemMessage\""),
+        "expected Codex-supported PermissionRequest output: {output}"
     );
     assert!(
-        output.contains("\"permissionDecision\":\"deny\""),
-        "expected destructive permission request to be denied: {output}"
+        !output.contains("\"permissionDecision\""),
+        "Codex PermissionRequest does not accept permissionDecision output: {output}"
     );
     assert!(store
         .list_alerts()
@@ -2114,7 +2114,7 @@ fn codex_permission_request_records_and_denies_destructive_command() {
 }
 
 #[test]
-fn codex_permission_request_without_command_fails_closed() {
+fn codex_permission_request_without_command_emits_advisory_system_message() {
     let (store, workspace) = temp_store_and_workspace("codex-permission-request-missing-command");
     let payload = json!({
         "session_id": "s1",
@@ -2129,10 +2129,14 @@ fn codex_permission_request_without_command_fails_closed() {
 
     let output = process_hook_event(&payload, &event, &store).unwrap();
 
-    let output = output.expect("unparseable permission request should return a deny decision");
+    let output = output.expect("unparseable permission request should return a system message");
     assert!(
-        output.contains("\"permissionDecision\":\"deny\""),
-        "expected unparseable permission request to be denied: {output}"
+        output.contains("\"systemMessage\""),
+        "expected Codex-supported PermissionRequest output: {output}"
+    );
+    assert!(
+        !output.contains("\"permissionDecision\""),
+        "Codex PermissionRequest does not accept permissionDecision output: {output}"
     );
     assert!(store
         .list_alerts()
@@ -6152,9 +6156,334 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert_eq!(finding.rule_id, "policy_fork_suggested");
     assert!(finding
         .message
-        .contains("gensee run fork run_123 --name try-upgrade"));
-    assert!(finding.message.contains("gensee run shell try-upgrade"));
+        .contains("gensee run fork run_123 --name try-upgrade --attach tmux:right --json"));
+    assert!(finding
+        .message
+        .contains("gensee run send <fork-id> -- '<task prompt>'"));
+    assert!(finding
+        .message
+        .contains("After sending the prompt, do not poll gensee for task completion"));
+    assert!(finding
+        .message
+        .contains("ask the user to report the fork result"));
     assert_eq!(finding.evidence["reason"], json!("dependency_upgrade"));
+}
+
+#[test]
+fn codex_source_run_blocks_fork_suggestion_commands() {
+    let payload = pretool_bash_payload("s1", "/repo", "cargo update");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let finding = fork_suggestion_finding(&event, &[], Some("run_123")).unwrap();
+
+    assert_eq!(finding.action, PolicyAction::Block);
+    assert_eq!(finding.severity, "medium");
+    assert!(finding.message.contains("gensee run fork run_123"));
+}
+
+#[test]
+fn codex_fork_run_allows_fork_suggestion_commands() {
+    let payload = pretool_bash_payload("s1", "/repo", "cargo update");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let finding = fork_suggestion_finding(&event, &[], Some("run_123_fork_456_0")).unwrap();
+
+    assert_eq!(finding.action, PolicyAction::Allow);
+    assert_eq!(finding.severity, "info");
+}
+
+#[test]
+fn codex_fork_context_marker_overrides_stale_source_run_env() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-context-marker");
+    let marker = workspace.join("gensee-run-context.json");
+    fs::write(
+        &marker,
+        json!({
+            "run_id": "run_123_fork_456_0",
+            "role": "fork",
+            "source_run_id": "run_123",
+            "workspace": workspace,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &marker);
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), "cargo update");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store).unwrap();
+
+    assert!(
+        output.is_none(),
+        "fork marker should prevent source-run deny despite stale env: {output:?}"
+    );
+    assert!(store.list_alerts().unwrap().iter().any(|alert| {
+        alert.rule_id == "policy_fork_suggested"
+            && alert.action == "allow"
+            && alert.severity == "info"
+    }));
+    env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_source_run_emits_pretool_deny_for_fork_suggestion() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-suggestion-block");
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), "cargo update");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .expect("Codex source run should receive a PreToolUse deny");
+
+    assert!(output.contains("\"permissionDecision\":\"deny\""));
+    assert!(output.contains("forked run"));
+    assert!(store.list_alerts().unwrap().iter().any(|alert| {
+        alert.rule_id == "policy_fork_suggested"
+            && alert.action == "block"
+            && alert.severity == "medium"
+    }));
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_source_allows_sending_risky_prompt_to_fork() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-send-no-recursion");
+    let command = "gensee run send run_123_fork_456_0 -- 'Upgrade the Rust dependencies, update Cargo.lock, run cargo test, and fix breakages.'";
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), command);
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store).unwrap();
+
+    assert!(
+        output.is_none(),
+        "Codex should not block fork-targeted run send commands: {output:?}"
+    );
+    assert!(!store
+        .list_alerts()
+        .unwrap()
+        .iter()
+        .any(|alert| alert.rule_id == "policy_fork_suggested"));
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_source_steers_fork_targeted_exec_to_send() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-exec-no-recursion");
+    let command =
+        "gensee run exec run_123_fork_456_0 -- bash -lc 'cargo update && cargo test --workspace'";
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), command);
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .expect("source-side exec into a fork should be denied with guidance");
+
+    assert!(output.contains("\"permissionDecision\":\"deny\""));
+    assert!(output.contains("host-only"));
+    assert!(output.contains("gensee run send"));
+    assert!(store.list_alerts().unwrap().iter().any(|alert| {
+        alert.rule_id == "policy_tclone_exec_host_only" && alert.action == "block"
+    }));
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn claude_source_steers_fork_targeted_exec_to_send() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("claude-fork-exec-host-only");
+    let command = "gensee run exec run_123_fork_456_0 -- cargo test --workspace";
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), command);
+    let event = super::build_hook_event(&payload, PROVIDER_CLAUDE_CODE).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .expect("source-side exec into a fork should be denied for Claude Code too");
+
+    assert!(output.contains("\"permissionDecision\":\"deny\""));
+    assert!(output.contains("host-only"));
+    assert!(output.contains("gensee run send"));
+    assert!(store.list_alerts().unwrap().iter().any(|alert| {
+        alert.rule_id == "policy_tclone_exec_host_only"
+            && alert.action == "block"
+            && alert.severity == "medium"
+    }));
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_fork_allows_exec_in_its_own_run() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123_fork_456_0");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-exec-self");
+    let command =
+        "gensee run exec run_123_fork_456_0 -- bash -lc 'cargo update && cargo test --workspace'";
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), command);
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store).unwrap();
+
+    assert!(
+        output.is_none(),
+        "a fork may execute commands in its own run: {output:?}"
+    );
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_source_blocks_immediate_duplicate_fork_command() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-duplicate-fork-command");
+    let command = "gensee run fork run_123 --name try-upgrade --attach tmux:right --json";
+    let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), command);
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let first = process_hook_event(&payload, &event, &store).unwrap();
+    let second = process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .expect("duplicate fork command should be denied");
+
+    assert!(
+        first.is_none(),
+        "first fork scheduling command should not interrupt Codex: {first:?}"
+    );
+    assert!(second.contains("\"permissionDecision\":\"deny\""));
+    assert!(second.contains("already scheduled"));
+    assert_eq!(
+        store
+            .session_alert_count("s1", "policy_tclone_fork_scheduled")
+            .unwrap(),
+        2
+    );
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn fork_suggestion_detects_user_prompt_intents() {
+    let cases = [
+        (
+            "Upgrade the Rust dependencies in this repo where appropriate, update Cargo.lock, run cargo test, and fix any breakages.",
+            ForkSuggestionReason::DependencyUpgrade,
+        ),
+        (
+            "Clean up generated and temporary files across the repo, remove anything obsolete, then run tests to make sure nothing important was deleted.",
+            ForkSuggestionReason::DestructiveFileCleanup,
+        ),
+        (
+            "Add a database migration for tracking agent run status history, update the code that writes run status, and verify the migration works.",
+            ForkSuggestionReason::SchemaMigration,
+        ),
+    ];
+
+    for (prompt, expected) in cases {
+        assert_eq!(fork_suggestion_reason_for_prompt(prompt), Some(expected));
+    }
+}
+
+#[test]
+fn codex_userpromptsubmit_injects_fork_context_for_source_run() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-prompt");
+    let payload = format!(
+        "{{\"session_id\":\"s1\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"{}\",\"prompt\":\"Upgrade the Rust dependencies in this repo where appropriate, update Cargo.lock, run cargo test, and fix any breakages.\"}}",
+        workspace.display()
+    );
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .expect("Codex source run should receive fork guidance before planning");
+
+    assert!(output.contains("\"additionalContext\""));
+    assert!(output.contains("forked run"));
+    assert!(output.contains("approve a forked run"));
+    assert!(
+        output.contains("gensee run fork run_123 --name try-upgrade --attach tmux:right --json")
+    );
+    assert!(store.list_alerts().unwrap().iter().any(|alert| {
+        alert.rule_id == "policy_fork_suggested"
+            && alert.action == "allow"
+            && alert.severity == "info"
+            && alert
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains(r#""phase":"user_prompt""#))
+    }));
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_userpromptsubmit_skips_prompt_already_sent_to_fork() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-context-prompt");
+    let payload = format!(
+        "{{\"session_id\":\"s1\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"{}\",\"prompt\":\"Gensee context: this request is already running inside forked run run_123_fork_456_0. Do not create another fork for this task; continue the requested work in this fork.\\n\\nUpgrade the Rust dependencies, update Cargo.lock, run cargo test, and fix breakages.\"}}",
+        workspace.display()
+    );
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let output = process_hook_event(&payload, &event, &store).unwrap();
+
+    assert!(
+        output.is_none(),
+        "forked prompt context should suppress recursive fork guidance: {output:?}"
+    );
+    assert_eq!(
+        store
+            .session_alert_count("s1", "policy_fork_suggested")
+            .unwrap(),
+        0
+    );
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn codex_userpromptsubmit_dedups_fork_context_per_reason() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123");
+    let (store, workspace) = temp_store_and_workspace("codex-fork-prompt-dedup");
+    let payload = format!(
+        "{{\"session_id\":\"s1\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"{}\",\"prompt\":\"Upgrade the Rust dependencies and update Cargo.lock.\"}}",
+        workspace.display()
+    );
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    assert!(process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .is_some());
+    assert!(process_hook_event(&payload, &event, &store)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .session_alert_count("s1", "policy_fork_suggested")
+            .unwrap(),
+        1
+    );
+
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
 }
 
 #[test]
