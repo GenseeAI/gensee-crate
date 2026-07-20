@@ -292,6 +292,9 @@ pub(crate) fn fork_suggestion_finding(
         return None;
     }
     let command = event.tool_input_command.as_deref()?;
+    if let Some(finding) = tclone_source_exec_into_fork_finding(event, command, current_run_id) {
+        return Some(finding);
+    }
     if tclone_control_targets_fork(command) {
         return None;
     }
@@ -319,6 +322,37 @@ pub(crate) fn fork_suggestion_finding(
             "reason": reason.code(),
             "suggested_name": name_hint,
             "current_run_id": current_run_id,
+            "provider": event.provider,
+            "tool_name": event.tool_name.as_deref(),
+            "tool_use_id": event.tool_use_id.as_deref(),
+        }),
+    })
+}
+
+fn tclone_source_exec_into_fork_finding(
+    event: &AgentHookEvent,
+    command: &str,
+    current_run_id: Option<&str>,
+) -> Option<PolicyFinding> {
+    if !current_run_is_tclone_source(current_run_id) {
+        return None;
+    }
+    let (subcommand, target) = parse_tclone_control_target(command)?;
+    if subcommand != "exec" || !target.contains("_fork_") {
+        return None;
+    }
+    Some(PolicyFinding {
+        action: fork_suggestion_action(event, current_run_id),
+        severity: fork_suggestion_severity(event, current_run_id).to_string(),
+        rule_id: "policy_tclone_exec_host_only".to_string(),
+        message: format!(
+            "`gensee run exec {target}` is host-only from a tclone source container. Hand the task to the fork agent with `gensee run send {target} -- '<task prompt>'`, or run `gensee run exec` from a host terminal."
+        ),
+        path: event.cwd.clone(),
+        evidence: json!({
+            "source": "tclone_control",
+            "current_run_id": current_run_id,
+            "target_run_id": target,
             "provider": event.provider,
             "tool_name": event.tool_name.as_deref(),
             "tool_use_id": event.tool_use_id.as_deref(),

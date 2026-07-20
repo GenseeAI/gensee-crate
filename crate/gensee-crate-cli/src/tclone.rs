@@ -26,9 +26,17 @@ const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
 const TCLONE_HOST_CONTROL_COMMAND_TIMEOUT_SECS: u64 = 300;
 const TCLONE_HOST_CONTROL_AUTH_DIR: &str = "host-control-auth";
 const TCLONE_HOST_CONTROL_MAX_NONCES_PER_CAPABILITY: usize = 10_000;
-const TCLONE_HOST_CONTROL_REQUEST_MAX_AGE_SECS: u64 = 5 * 60;
+// A request must remain fresh longer than the file client's response wait, and
+// its nonce must remain claimed beyond the full age plus accepted future skew.
+const TCLONE_HOST_CONTROL_REQUEST_MAX_AGE_SECS: u64 = 10 * 60;
 const TCLONE_HOST_CONTROL_REQUEST_FUTURE_SKEW_SECS: u64 = 30;
-const TCLONE_HOST_CONTROL_NONCE_RETENTION_SECS: u64 = 6 * 60;
+const TCLONE_HOST_CONTROL_NONCE_RETENTION_SECS: u64 = 12 * 60;
+const _: () =
+    assert!(TCLONE_HOST_CONTROL_REQUEST_MAX_AGE_SECS > TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS);
+const _: () = assert!(
+    TCLONE_HOST_CONTROL_NONCE_RETENTION_SECS
+        > TCLONE_HOST_CONTROL_REQUEST_MAX_AGE_SECS + TCLONE_HOST_CONTROL_REQUEST_FUTURE_SKEW_SECS
+);
 const TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV: &str = "GENSEE_TCLONE_CONTAINER_HOST_CONTROL_POLL";
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
@@ -1090,8 +1098,9 @@ fn spawn_tclone_host_control_request(
     // Rust starts this non-interactive wrapper in the parent's process group,
     // so the wrapper is not a process-group leader. `setsid` therefore execs
     // the command in place, making `$!` both the child pid and new group id.
-    // The main shell blocks in `wait` (and reaps promptly); a separate watchdog
-    // is responsible only for terminating a command that truly exceeds timeout.
+    // The main shell blocks in `wait` (and reaps promptly). It and the watchdog
+    // race to atomically create a claim directory: if the watchdog wins, the
+    // main shell waits for its full TERM/KILL escalation before reporting 124.
     Command::new("sh")
         .arg("-c")
         .arg(
@@ -1107,20 +1116,24 @@ fn spawn_tclone_host_control_request(
              gensee_tmux_message \"Gensee is preparing a fork; the source agent may pause briefly.\"; \
              sleep \"$delay\"; \
              if command -v setsid >/dev/null 2>&1; then setsid \"$@\" & use_group=1; else \"$@\" & use_group=0; fi; \
-             command_pid=$!; timeout_marker=$done_path.timeout.$$; rm -f \"$timeout_marker\"; \
+             command_pid=$!; claim_path=$done_path.timeout-claim.$$; rmdir \"$claim_path\" 2>/dev/null || true; \
              ( \
                sleep \"$timeout_secs\"; \
-               if kill -0 \"$command_pid\" 2>/dev/null; then \
-                 printf '1\\n' > \"$timeout_marker\"; \
+               if mkdir \"$claim_path\" 2>/dev/null; then \
                  if [ \"$use_group\" = 1 ]; then kill -TERM \"-$command_pid\" 2>/dev/null || true; else kill -TERM \"$command_pid\" 2>/dev/null || true; fi; \
                  sleep 2; \
                  if [ \"$use_group\" = 1 ]; then kill -KILL \"-$command_pid\" 2>/dev/null || true; else kill -KILL \"$command_pid\" 2>/dev/null || true; fi; \
                fi; \
              ) & watchdog_pid=$!; \
              wait \"$command_pid\" 2>/dev/null; status=$?; \
-             kill \"$watchdog_pid\" 2>/dev/null || true; wait \"$watchdog_pid\" 2>/dev/null || true; \
-             if [ -f \"$timeout_marker\" ]; then status=124; printf 'gensee async job %s: timed out after %ss\\n' \"$job_id\" \"$timeout_secs\"; fi; \
-             rm -f \"$timeout_marker\"; \
+             timed_out=0; \
+             if mkdir \"$claim_path\" 2>/dev/null; then \
+               kill \"$watchdog_pid\" 2>/dev/null || true; wait \"$watchdog_pid\" 2>/dev/null || true; \
+             else \
+               timed_out=1; wait \"$watchdog_pid\" 2>/dev/null || true; \
+             fi; \
+             rmdir \"$claim_path\" 2>/dev/null || true; \
+             if [ \"$timed_out\" = 1 ] && [ \"$status\" != 0 ]; then status=124; printf 'gensee async job %s: timed out after %ss\\n' \"$job_id\" \"$timeout_secs\"; fi; \
              if [ \"$status\" != 0 ]; then \
                gensee_tmux_message \"Gensee fork failed; see $log_path\"; \
              else \
@@ -1263,12 +1276,16 @@ fn count_active_tclone_async_jobs(caller_run_id: &str) -> io::Result<usize> {
         {
             continue;
         }
-        let owner = match read_nofollow_to_string(&path.with_extension("owner")) {
-            Ok(owner) => owner,
-            Err(_) => continue,
-        };
-        if owner.trim() == caller_run_id {
-            active += 1;
+        match read_nofollow_to_string(&path.with_extension("owner")) {
+            Ok(owner) if owner.trim() == caller_run_id => active += 1,
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!(
+                    "gensee: warning: counting async job with unreadable owner as active ({}): {error}",
+                    path.display()
+                );
+                active += 1;
+            }
         }
     }
     Ok(active)
@@ -1295,7 +1312,12 @@ fn prune_tclone_async_jobs() -> io::Result<()> {
             && !tclone_path_exists(&done_path)
             && tclone_async_job_log_is_stale(&log_path, now, tclone_async_job_timeout_secs())
         {
-            write_atomic_nofollow(&done_path, b"124\n", 0o600)?;
+            if let Err(error) = write_atomic_nofollow(&done_path, b"124\n", 0o600) {
+                eprintln!(
+                    "gensee: warning: could not mark stale async job complete ({}): {error}",
+                    done_path.display()
+                );
+            }
         }
         let old_enough = tclone_path_age_at_least(&path, now, TCLONE_ASYNC_JOB_RETENTION_SECS);
         let orphaned_owner = extension == Some("owner")
@@ -5915,6 +5937,7 @@ mod tests {
 
     #[test]
     fn tclone_host_control_nonce_is_single_use() {
+        let _guard = tclone_test_env_lock();
         let run_id = format!(
             "nonce_test_{}_{}",
             std::process::id(),
@@ -6061,6 +6084,7 @@ mod tests {
 
     #[test]
     fn tclone_async_job_cap_is_per_run_and_stale_logs_are_inactive() {
+        let _guard = tclone_test_env_lock();
         let unique = format!("{}_{}", std::process::id(), unix_millis().unwrap());
         let owner = format!("async_owner_{unique}");
         let job = tclone_async_job_from_id(&format!("async_job_{unique}")).unwrap();
@@ -6074,6 +6098,9 @@ mod tests {
 
         assert_eq!(count_active_tclone_async_jobs(&owner).unwrap(), 1);
         assert_eq!(count_active_tclone_async_jobs("different-run").unwrap(), 0);
+        fs::remove_file(tclone_async_job_owner_path(&job)).unwrap();
+        assert!(count_active_tclone_async_jobs(&owner).unwrap() >= 1);
+        assert!(count_active_tclone_async_jobs("different-run").unwrap() >= 1);
         assert!(tclone_async_job_log_is_stale(
             &job.log_path,
             SystemTime::now()
