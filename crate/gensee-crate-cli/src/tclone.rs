@@ -2480,9 +2480,19 @@ fn tclone_is_baseline_fork_process(command: &str) -> bool {
         || command.contains("tmux new-session -d -s gensee-agent")
         || command.contains("tmux attach-session -t gensee-agent")
         || command.contains("ps -eo pid=,ppid=,stat=,args=")
-        || command.contains("/node ") && command.contains("/codex")
-        || command.contains("/node ") && command.contains("@openai/codex")
-        || command.contains("/node_modules/@openai/codex/")
+        || command.contains("gensee hook codex")
+        || command.contains("gensee run fork-status")
+        || command.contains("gensee run list")
+        || tclone_is_codex_agent_process(command)
+}
+
+fn tclone_is_codex_agent_process(command: &str) -> bool {
+    !command.contains("codex-linux-sandbox")
+        && (command == "codex"
+            || command.ends_with("/bin/codex")
+            || command.contains(" /bin/codex")
+            || command.contains("@openai/codex")
+            || command.contains("/node_modules/@openai/codex/"))
 }
 
 fn tclone_is_known_active_fork_process(command: &str) -> bool {
@@ -4879,6 +4889,53 @@ mod tests {
         assert_eq!(stat.pid, 123);
         assert_eq!(stat.ppid, 7);
         assert_eq!(stat.ticks, 75);
+    }
+
+    #[test]
+    fn tclone_quiet_probe_treats_codex_agent_as_baseline() {
+        let process = TcloneQuietProcess {
+            pid: 11,
+            stat: "Ssl+".to_string(),
+            command: "node /home/yiying/.nvm/versions/node/v24.18.0/bin/codex".to_string(),
+        };
+
+        assert!(!tclone_is_transient_fork_process(&process));
+    }
+
+    #[test]
+    fn tclone_quiet_probe_treats_polling_as_baseline() {
+        let hook = TcloneQuietProcess {
+            pid: 2171,
+            stat: "S".to_string(),
+            command: "/usr/local/bin/gensee hook codex".to_string(),
+        };
+        let status = TcloneQuietProcess {
+            pid: 2172,
+            stat: "S".to_string(),
+            command: "/usr/local/bin/gensee run fork-status job_1 --json".to_string(),
+        };
+
+        assert!(!tclone_is_transient_fork_process(&hook));
+        assert!(!tclone_is_transient_fork_process(&status));
+    }
+
+    #[test]
+    fn tclone_quiet_probe_keeps_sandbox_helpers_transient() {
+        let sandbox = TcloneQuietProcess {
+            pid: 31,
+            stat: "S".to_string(),
+            command:
+                "/home/gensee/.codex/tmp/arg0/codex-linux-sandbox --sandbox-policy-cwd /workspace"
+                    .to_string(),
+        };
+        let bwrap = TcloneQuietProcess {
+            pid: 32,
+            stat: "S".to_string(),
+            command: "bwrap --new-session --bind /tmp /tmp".to_string(),
+        };
+
+        assert!(tclone_is_transient_fork_process(&sandbox));
+        assert!(tclone_is_transient_fork_process(&bwrap));
     }
 
     #[test]
