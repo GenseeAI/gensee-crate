@@ -47,6 +47,7 @@ const TCLONE_FORK_TRANSIENT_DEVICE_MOUNTS: &[&str] = &[
     "/dev/urandom",
 ];
 const TCLONE_ATTACH_RETRY_TIMEOUT_SECS: u64 = 15;
+const TCLONE_FORK_MARKER_WAIT_TIMEOUT_SECS: u64 = 5 * 60;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
@@ -2710,20 +2711,33 @@ fn should_reattach_after_tclone_fork_marker(
     else {
         return false;
     };
-    let now_ms = unix_millis().unwrap_or(marker_ms);
-    if marker_ms.saturating_add(5 * 60 * 1_000) < now_ms
-        || marker_ms.saturating_add(2_000) < attach_started_ms
+    if tclone_fork_marker_is_stale(marker_ms) || marker_ms.saturating_add(2_000) < attach_started_ms
     {
         let _ = fs::remove_file(&marker_path);
         return false;
     }
 
+    wait_for_tclone_fork_marker_to_clear(&marker_path, marker_ms);
     wait_tclone_container_exec_ready(
         podman,
         container_name,
         Duration::from_secs(TCLONE_ATTACH_RETRY_TIMEOUT_SECS),
     );
     true
+}
+
+fn wait_for_tclone_fork_marker_to_clear(marker_path: &Path, marker_ms: u64) {
+    while marker_path.exists() && !tclone_fork_marker_is_stale(marker_ms) {
+        thread::sleep(Duration::from_millis(250));
+    }
+    if tclone_fork_marker_is_stale(marker_ms) {
+        let _ = fs::remove_file(marker_path);
+    }
+}
+
+fn tclone_fork_marker_is_stale(marker_ms: u64) -> bool {
+    let now_ms = unix_millis().unwrap_or(marker_ms);
+    marker_ms.saturating_add(TCLONE_FORK_MARKER_WAIT_TIMEOUT_SECS * 1_000) < now_ms
 }
 
 fn tclone_host_fork_marker_path(run_id: &str) -> io::Result<PathBuf> {
@@ -2755,22 +2769,7 @@ fn tclone_exec_ready(podman: &OsString, container_name: &str) -> bool {
 }
 
 fn detach_tclone_tmux_clients(podman: &OsString, container_name: &str) {
-    let script = format!(
-        r#"if command -v tmux >/dev/null 2>&1 && tmux has-session -t {session} 2>/dev/null; then
-  tmux list-clients -t {session} -F '#{{client_tty}}' 2>/dev/null |
-    while IFS= read -r client_tty; do
-      [ -n "$client_tty" ] && tmux detach-client -t "$client_tty" 2>/dev/null || true
-    done
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if ! tmux list-clients -t {session} 2>/dev/null | grep -q .; then
-      exit 0
-    fi
-    sleep 0.1
-  done
-fi
-"#,
-        session = shell_quote(TCLONE_AGENT_TMUX_SESSION),
-    );
+    let script = tclone_tmux_detach_script();
     let _ = Command::new(podman)
         .arg("exec")
         .arg(container_name)
@@ -2780,7 +2779,30 @@ fi
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    thread::sleep(Duration::from_millis(250));
+    thread::sleep(Duration::from_millis(500));
+}
+
+fn tclone_tmux_detach_script() -> String {
+    format!(
+        r#"if command -v tmux >/dev/null 2>&1 && tmux has-session -t {session} 2>/dev/null; then
+  tmux display-message -t {session} 'Gensee is forking this run; reconnecting shortly.' 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    clients="$(tmux list-clients -t {session} -F '#{{client_pid}}' 2>/dev/null || true)"
+    [ -z "$clients" ] && exit 0
+    tmux detach-client -a -s {session} 2>/dev/null || true
+    printf '%s\n' "$clients" |
+      while IFS= read -r client_pid; do
+        case "$client_pid" in
+          ''|*[!0-9]*) ;;
+          *) kill -HUP "$client_pid" 2>/dev/null || true ;;
+        esac
+      done
+    sleep 0.1
+  done
+fi
+"#,
+        session = shell_quote(TCLONE_AGENT_TMUX_SESSION),
+    )
 }
 
 pub(crate) fn tclone_diff(args: Vec<OsString>) -> io::Result<()> {
@@ -5025,6 +5047,16 @@ gensee async job job_1: exited status=0
             tclone_host_control_async_attach_placement(&args),
             Some(HostTmuxPlacement::Right)
         );
+    }
+
+    #[test]
+    fn tclone_tmux_detach_script_drains_attached_clients() {
+        let script = tclone_tmux_detach_script();
+        assert!(script.contains("display-message"));
+        assert!(script.contains("list-clients"));
+        assert!(script.contains("client_pid"));
+        assert!(script.contains("detach-client -a -s"));
+        assert!(script.contains("kill -HUP"));
     }
 
     #[test]
