@@ -444,14 +444,22 @@ alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX
 
 gensee-tclone run --runtime tclone -- codex
 gensee-tclone run list              # source id is under "Tclone containers"
+gensee-tclone run list --json       # agent-facing completion polling
 gensee-tclone run fork <source-run-id> --copies 2 --attach tmux:right --json
 gensee-tclone run attach <fork-id> --tmux right
 gensee-tclone run send <fork-id> -- 'Run cargo test and fix failures'
 gensee-tclone run exec <fork-id> -- bash -lc 'cargo test'
-gensee-tclone run diff <fork-id>
+gensee-tclone run diff <fork-id> [--json]
+gensee-tclone run summary <fork-id> --json
 gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
-gensee-tclone run switch <fork-id>                         # continue from the fork
+gensee-tclone run switch <fork-id>                         # promote fork; end old source
 ```
+
+Codex should mediate fork resolution: summarize the fork in chat, offer merge,
+promote-to-main-and-end-source, and discard choices, and run the selected
+lifecycle command only after explicit user approval. For container-mediated lifecycle commands, the
+host bridge enforces a matching, unconsumed choice recorded by a later
+`UserPromptSubmit` hook; failed or stalled fork tasks cannot be merged.
 
 The tclone launcher also prints the source id directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
@@ -460,11 +468,25 @@ such as dependency upgrades, migrations, broad refactors, lockfile changes,
 destructive cleanup, and database resets. In Codex tclone source runs, matching
 user prompts add fork guidance before planning; matching source commands are
 blocked as a backstop so the risky work happens in a fork first.
-Async fork JSON includes `status_command`; poll it only until
-`status=succeeded`, then send work to `forks[0].run_id`. After sending work
-with `gensee run send`, do not poll Gensee for task completion: the fork is an
-interactive agent session attached in tmux, so ask the user to report the fork
-result.
+Async fork JSON includes `status_command`; poll it immediately and keep retrying
+that same command while `status=running`. The active status poll is intentionally
+inherited by the live clone so the forked Codex turn can stop source
+orchestration and continue the original approved task. Async agent forks ignore
+`GENSEE_TCLONE_WAIT_QUIET_FOR_FORK` because waiting for an idle source is
+incompatible with cloning the active turn. The source must not resend the prompt.
+A transient
+capability-rotation, empty-success, or checkpoint-interrupted response uses
+`status=running` and `transient=true`; retry the same status command rather than
+creating another fork. Running status JSON includes recent log lines so agents
+can report quiet-wait or clone progress. JSON status polls use a short
+control-bridge timeout so a response inherited by the clone cannot leave the
+source agent stuck waiting. If the fork inherits a source `fork-status` poll,
+Gensee tells that pane to stop source orchestration, continue the original task,
+then summarize and offer merge, promote-to-main-and-end-source, or discard. The fork may run only
+its own approved lifecycle action against its direct source. `run send` remains
+available for later follow-up prompts and marks those prompts queued before tmux
+input. Fork creation does not report success until the child has received its
+authoritative fork context.
 Use a tclone image with `tmux` for reliable `gensee run attach`. From inside a
 host tmux session, `--attach tmux:right` opens the forked live agent in a new
 pane. Without tmux, `gensee run shell` still opens a new shell but does not

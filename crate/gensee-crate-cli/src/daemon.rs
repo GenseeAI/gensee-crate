@@ -12,7 +12,7 @@
 //!     evaluates against the already-open store/policy.
 //!   * **UserPromptSubmit / Antigravity PreInvocation** (synchronous, advisory):
 //!     the client waits for optional counter-instructions.
-//!   * **PostToolUse / Stop** for providers with no stdout contract
+//!   * **PostToolUse / Stop** for providers with no blocking response
 //!     (observational, never block): the client writes and returns immediately —
 //!     the store write happens on the daemon, off the agent's critical path.
 //!     Full lineage is still recorded; it just no longer costs the agent
@@ -203,6 +203,9 @@ pub(crate) fn daemon_response_mode(event: &AgentHookEvent) -> DaemonResponseMode
     match event.hook_event_name.as_deref() {
         Some("PreToolUse" | "PermissionRequest") => DaemonResponseMode::Required,
         Some("UserPromptSubmit") => DaemonResponseMode::Optional,
+        // A newly live-cloned fork can use Stop to force one continuation when
+        // the inherited orchestration turn ends before task work begins.
+        Some("Stop") if event.provider == PROVIDER_CODEX => DaemonResponseMode::Optional,
         Some("PreInvocation" | "PostToolUse" | "Stop")
             if event.provider == PROVIDER_ANTIGRAVITY =>
         {

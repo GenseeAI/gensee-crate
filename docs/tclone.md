@@ -30,6 +30,7 @@ Use a second terminal to fork the running source container:
 
 ```bash
 gensee-tclone run list
+gensee-tclone run list --json
 gensee-tclone run fork <source-run-id> --copies 2
 gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right --json
 gensee-tclone run shell <run_id-or-container>
@@ -37,10 +38,11 @@ gensee-tclone run attach <run_id-or-container>
 gensee-tclone run attach <run_id-or-container> --tmux right
 gensee-tclone run send <run_id-or-container> -- 'Run npm test and fix failures'
 gensee-tclone run exec <run_id-or-container> -- bash -lc 'cargo test'
-gensee-tclone run diff <run_id-or-container>
+gensee-tclone run diff <run_id-or-container> [--json]
+gensee-tclone run summary <fork-id> --json
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
 gensee-tclone run merge <fork-id> --into <source-id> --filesystem
-gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.codex
+gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace/src /workspace/Cargo.toml
 gensee-tclone run switch <fork-id>
 gensee-tclone run keep <run_id-or-container> --to /tmp/kept-workspace
 gensee-tclone run discard <run_id-or-container>
@@ -48,17 +50,32 @@ gensee-tclone run delete <run_id-or-container>   # remove container and hide fro
 gensee-tclone run delete --all                   # clean tracked runs and gensee-tclone-* orphans
 ```
 
+When Codex starts work in a fork, these lifecycle commands are internal agent
+controls. Codex polls `run list --json`, reads `run summary <fork-id> --json`,
+and presents the changed files, tests, and merge/promote-to-main/discard choices
+in chat. It must not merge, switch, or discard until the user approves that choice.
+The host-control bridge checks that a later `UserPromptSubmit` hook recorded the
+same choice and consumes that approval after the command succeeds. An agent
+command without that state is denied. Direct commands entered at the host CLI
+remain an explicit host-user authorization.
+
+This is a workflow-integrity gate, not an isolation boundary against a malicious
+same-user process inside the fork. Tclone currently trusts the fork agent and
+does not prevent it from tampering with its own hook state; the gate prevents an
+ordinary confused agent from skipping the user-choice turn.
+
 The source id is the row with role `source` under the `Tclone containers`
 section of `gensee run list`. The launcher also prints it directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
 When hooks see requests or commands that are good fork candidates, such as
 dependency upgrades, migrations, broad refactors, lockfile changes, destructive
 cleanup, or database resets, Gensee records a `policy_fork_suggested` alert with
-suggested `gensee run fork --attach tmux:right --json` and `gensee run send`
-commands. In Codex source runs, matching user prompts add fork guidance before
-planning; matching source commands are blocked as a backstop so Codex can ask for
-a fork and continue the work there. Forked Codex runs are allowed to execute the
-command.
+suggested `gensee run fork --attach tmux:right --json` guidance. In Codex source
+runs, matching user prompts add fork guidance before planning; matching source
+commands are blocked as a backstop so Codex can ask for a fork and continue the
+work there. The live-cloned Codex turn continues the original approved task
+automatically; the source does not resend the prompt. Forked Codex runs are
+allowed to execute the command.
 Use the same `gensee-tclone` wrapper for `run list`, `run fork`, `run shell`,
 `run attach`, `run send`, `run exec`, `run merge`, `run switch`, and cleanup;
 otherwise Gensee may read the source record but look in a different Podman store
@@ -76,9 +93,7 @@ an existing run or fork in a new host pane.
 Use `gensee run send <id> -- <prompt>` to paste a prompt into the fork's
 in-container `gensee-agent` tmux session and press Enter. If that fork is
 attached in a host tmux pane, the pane visibly shows the forked agent receiving
-and executing the work. Because the fork is an interactive agent session, do not
-poll Gensee for task completion after sending the prompt; ask the user to report
-the fork result from the attached pane:
+and executing the work:
 
 ```bash
 FORK_ID=$(gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right --json \
@@ -87,9 +102,29 @@ gensee-tclone run send "$FORK_ID" -- 'Try the dependency upgrade, run tests, and
 ```
 
 When a fork is scheduled asynchronously from inside an agent, the JSON response
-includes `status_command`. Poll it only until `status=succeeded`, then use
-`forks[0].run_id` for `gensee run send`; if it returns `status=failed`, stop and
-inspect the included log summary.
+includes `status_command` and `retry_after_ms`. Poll immediately and keep
+retrying that same status command while `status=running`. The active poll is
+intentionally inherited by the live clone, allowing the forked Codex turn to
+stop source orchestration and continue the task automatically. Async agent forks
+ignore `GENSEE_TCLONE_WAIT_QUIET_FOR_FORK`; waiting for an idle source would
+prevent the active turn from being handed off. Do not resend the original prompt.
+If status is
+`failed`, stop and inspect the included log summary. While running, status JSON
+includes recent log lines so agents can explain quiet-wait or clone failures
+instead of spinning blindly. During live-clone capability rotation, or when the
+clone inherits an in-flight control response, a poll may temporarily return
+`status=running`, `transient=true`, and `retry_after_ms`; retry the same status
+command and never schedule a replacement fork. JSON status polls use a short
+control-bridge timeout so the source cannot
+wait on a response consumed by the clone. If the fork inherits the source's
+status poll, Gensee tells the fork pane to stop source orchestration, continue
+the original task, run its internal completion summary, and offer merge,
+promote-to-main-and-end-source, or discard. After explicit approval, the fork can invoke only its
+own lifecycle action against its direct source. Container-mediated `run send`
+remains source-to-direct-child only and is used for later follow-up prompts.
+Before follow-up tmux input is sent, Gensee marks the child task `queued`. Fork
+creation reports success only after the child has received its authoritative
+fork context.
 
 Use `gensee run exec <id> -- <command>` for non-interactive work in a fork,
 such as commands requested by an agent. The command runs inside the container
@@ -102,8 +137,10 @@ any live in-container agent, so concurrent writes to the same workspace files ca
 race. For shell features or a series of commands, wrap them explicitly:
 
 From the host, `run exec` may target any selected run. Through the in-container
-host-control bridge, a run may execute or diff only itself; a source hands work
-to its direct child forks with `run send` instead of executing commands in them.
+host-control bridge, a run may execute only in itself. A source hands work to
+direct child forks with `run send`, can inspect those children with scoped
+`run list --json`, `run diff --json`, and `run summary --json`, and can resolve
+them with merge, switch, or discard after user approval.
 
 ```bash
 gensee-tclone run exec <fork-id> -- bash -lc 'npm install && npm test'
@@ -118,26 +155,49 @@ If a fork was created before fork-point metadata existed, `--git` falls back to
 `git diff HEAD`, which includes staged and unstaged working-tree changes but not
 already committed fork work.
 
-`--filesystem` merges persistent container filesystem changes from the fork into
-the source container. `--paths` does the same for selected container paths. Both
-use the fork's tclone overlay lowerdir as the merge base and upperdir as the
-fork delta, then stop with a conflict report if the source and fork changed the
-same path differently. These scopes do not merge live memory, running process
-state, or pseudo filesystems such as `/proc`, `/sys`, `/dev`, `/run`, and `/tmp`.
+`--filesystem` merges persistent changes under the container workspace from the
+fork into the source container. `--paths` does the same for selected paths under
+that workspace; absolute paths outside the workspace and `..` escapes are
+rejected. Both use the fork's tclone overlay lowerdir as the merge base and
+upperdir as the fork delta, then stop with a conflict report if the source and
+fork changed the same path differently. Eligible changes are copied into a
+private staging tree and applied with rollback backups so a failed copy/apply
+does not leave a delete-before-copy partial merge. These scopes do not merge
+live memory, running process state, or pseudo filesystems such as `/proc`,
+`/sys`, `/dev`, `/run`, and `/tmp`.
 Gensee passes tclone's `--tfork-overlay-btrfs` flag internally when creating
 forks, so users do not need to set it. Older plain btrfs-snapshot forks must be
 recreated before filesystem merge.
 
-`gensee run switch` does not merge files. It marks the selected fork as the
-active source container for future shells, forks, and merge targets, and marks
-the previous source as switched away when Gensee knows the parent source.
+`gensee run switch` does not merge files. It promotes the selected fork to the
+main source environment for future work, rewrites its lifecycle context so it
+can create and resolve new forks, transfers the host-control bridge to it, ends
+the previous source container, and closes the previous source pane. The
+user-facing choice is therefore “Promote this fork to the main environment and
+end the old source,” rather than the ambiguous “Keep working.” Chained
+promotions serialize ownership of the shared host-control endpoint so the new
+source cannot rebind it while the previous server is still active.
 
-`gensee run discard <run_id-or-container>` removes the container and keeps a
-`discarded` record for history. `gensee run delete <run_id-or-container>`
+`gensee run discard <run_id-or-container>` first records the fork as
+`discarded` and returns the lifecycle response. A delayed cleanup then removes
+the fork container, closes its attached pane, focuses the source pane, and
+keeps the `discarded` record for history. Cleanup for container-proxied merge,
+promotion, and discard waits for an authenticated acknowledgement emitted after
+the lifecycle response has been printed and flushed; it does not depend on a
+fixed sleep being long enough. Direct host-CLI resolutions retain a short grace
+period because there is no container proxy to acknowledge delivery. Detached
+cleanup and promotion diagnostics are written under
+the private Gensee temporary root's `tclone-resolution/` directory (normally
+`/tmp/gensee-agent-guard/tclone-resolution/`), and the lifecycle response
+prints the exact log path. `gensee run delete <run_id-or-container>`
 removes the container and removes that tclone record from `gensee run list`.
 Use `gensee run delete --all` to clean tracked tclone containers, clear the
 tclone section of the run list, and reap untracked `gensee-tclone-*` orphan
-containers in the same Podman store.
+containers in the same Podman store. If a response acknowledgement is lost,
+cleanup fails safe and leaves the environment running; either delete command
+can reap that stranded environment. Lifecycle logs and acknowledgement markers
+are retained for seven days and pruned opportunistically when another
+lifecycle action runs.
 
 ## Requirements
 
@@ -148,6 +208,8 @@ containers in the same Podman store.
   that makes Node-based shims such as Codex available.
 - `tmux` inside the image for `gensee run attach` with live/forked interactive
   agents. `gensee run shell` only opens a new shell and does not require tmux.
+- `setsid` from util-linux on the host for `gensee run switch`; promotion uses
+  it to keep the host-control handoff alive while the old source is retired.
 
 Environment overrides:
 
@@ -170,9 +232,11 @@ The current integration is host-owned:
 
 Container-to-host control uses a per-run capability in the run context. Requests
 are signed, short-lived, and replay-protected. A source capability may fork that
-source, poll its own fork jobs, and send prompts to its direct child forks. A
-fork cannot control its source or siblings, and `run list`, `run attach`, and
-`run shell` remain host-only.
+source, poll its own fork jobs, send prompts to direct child forks, inspect their
+results, and resolve them after approval. JSON run listings are scoped to the
+caller and its direct children. A fork cannot control its source or siblings;
+`run attach`, `run shell`, and human-readable global run listings remain
+host-only.
 
 The capability authenticates the container, not an individual agent process:
 any process that can read `/tmp/gensee-run-context.json` inside that container
@@ -194,10 +258,10 @@ fork-specific run id after live cloning.
   source run until post-fork rebind is implemented.
 - `gensee run merge` defaults to `--git`, which merges repo changes from the
   fork into the source container. `--filesystem` and `--paths` merge persistent
-  container filesystem changes with conflict detection. None of the merge scopes
-  merge process memory or external side effects.
+  workspace changes with conflict detection and transactional rollback. None
+  of the merge scopes merge process memory or external side effects.
 - Merge into an active source container can race with writes from the running
   source agent. Prefer merging when the source agent is idle, stopped, or at a
   known checkpoint.
-- `gensee run keep` copies a forked workspace out to a destination directory for
-  inspection/debugging.
+- `gensee run keep` copies a forked workspace to a new, absolute destination
+  directory for inspection/debugging; it refuses existing destinations.

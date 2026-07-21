@@ -305,7 +305,7 @@ pub(crate) fn fork_suggestion_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, or stop and report the failure if status=failed. Once status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. After sending the prompt, do not poll gensee for task completion. The fork is an interactive agent session attached in tmux; ask the user to report the fork result.",
+            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If the fork command returns scheduled=true, do not run fork again, do not poll fork-status, and do not perform the task locally. End this source turn normally so Gensee can clone the idle Codex session; Gensee will submit the saved original request to the fork automatically and open its pane. The fork will summarize its own changed files and tests, ask whether to merge, promote the fork to main and end the old source, or discard, and wait for explicit user approval before running the selected lifecycle command internally. Do not auto-merge, do not resend the prompt with `gensee run send`, and do not ask the user to type Gensee lifecycle commands.",
             reason = reason.label()
         )
     } else {
@@ -378,7 +378,7 @@ pub(crate) fn fork_suggestion_prompt_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If it returns scheduled=true, do not run fork again; poll the returned status_command until status=succeeded, or stop and report the failure if status=failed. Once status=succeeded, use forks[0].run_id, then send the original task to the fork with: gensee run send <fork-id> -- '<task prompt>'. After sending the prompt, do not poll gensee for task completion. The fork is an interactive agent session attached in tmux; ask the user to report the fork result.",
+            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If the fork command returns scheduled=true, do not run fork again, do not poll fork-status, and do not perform the task locally. End this source turn normally so Gensee can clone the idle Codex session; Gensee will submit the saved original request to the fork automatically and open its pane. The fork will summarize its own changed files and tests, ask whether to merge, promote the fork to main and end the old source, or discard, and wait for explicit user approval before running the selected lifecycle command internally. Do not auto-merge, do not resend the prompt with `gensee run send`, and do not ask the user to type Gensee lifecycle commands.",
             reason = reason.label()
         )
     } else {
@@ -469,7 +469,7 @@ fn tclone_fork_command_finding(
     };
     let message = if duplicate {
         format!(
-            "A fork for source {source_run_id}{} was already scheduled in this session. Do not run gensee run fork again; poll the previous fork-status command if available, otherwise poll gensee run list until the fork appears, then send work to the existing fork.",
+            "A fork for source {source_run_id}{} was already scheduled in this session. Do not run gensee run fork again, do not poll fork-status, and do not resend the original prompt. End the source turn normally; Gensee will submit the saved request to the idle-cloned fork automatically.",
             name.as_deref()
                 .map(|name| format!(" with name {name}"))
                 .unwrap_or_default()
@@ -646,7 +646,9 @@ fn parse_tclone_control_target(command: &str) -> Option<(&'static str, String)> 
 
 fn find_gensee_run_subcommand(tokens: &[String], subcommand: &str) -> Option<usize> {
     tokens.windows(3).position(|window| {
-        command_basename(&window[0]) == "gensee" && window[1] == "run" && window[2] == subcommand
+        matches!(command_basename(&window[0]), "gensee" | "gensee-tclone")
+            && window[1] == "run"
+            && window[2] == subcommand
     })
 }
 
@@ -2528,6 +2530,17 @@ pub(crate) fn policy_findings_for_subject(
 #[cfg(test)]
 mod matcher_tests {
     use super::*;
+
+    #[test]
+    fn gensee_tclone_alias_is_recognized_by_run_policy_matchers() {
+        let tokens = vec![
+            "/usr/local/bin/gensee-tclone".to_string(),
+            "run".to_string(),
+            "fork".to_string(),
+            "run_source".to_string(),
+        ];
+        assert_eq!(find_gensee_run_subcommand(&tokens, "fork"), Some(0));
+    }
 
     #[test]
     fn shellish_words_preserves_quoted_and_escaped_arguments() {

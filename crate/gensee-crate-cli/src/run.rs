@@ -1,5 +1,8 @@
 use crate::*;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 pub(crate) fn current_dir_string() -> Option<String> {
     env::current_dir()
         .ok()
@@ -1150,6 +1153,8 @@ pub(crate) fn sbpl_escape(path: &Path) -> String {
 pub(crate) fn gensee_tmp_root() -> io::Result<PathBuf> {
     let root = env::temp_dir().join("gensee-agent-guard");
     fs::create_dir_all(&root)?;
+    #[cfg(unix)]
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
     Ok(root)
 }
 
