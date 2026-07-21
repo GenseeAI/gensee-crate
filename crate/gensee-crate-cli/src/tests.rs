@@ -6163,26 +6163,17 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert!(finding
         .message
         .contains("do not resend the prompt with `gensee run send`"));
-    assert!(finding.message.contains("gensee run list --json"));
     assert!(finding
         .message
-        .contains("status=running with retry_after_ms"));
+        .contains("Immediately poll the returned status_command"));
     assert!(finding
         .message
-        .contains("without running source-container shell commands"));
+        .contains("active poll is intentionally inherited"));
     assert!(finding
         .message
-        .contains("Shell wait commands can be captured"));
-    assert!(finding
-        .message
-        .contains("retrying that same status command"));
-    assert!(finding
-        .message
-        .contains("gensee run summary <fork-id> --json"));
+        .contains("fork will summarize its own changed files and tests"));
     assert!(finding.message.contains("Do not auto-merge"));
-    assert!(finding
-        .message
-        .contains("Wait for explicit user approval before running"));
+    assert!(finding.message.contains("wait for explicit user approval"));
     assert_eq!(finding.evidence["reason"], json!("dependency_upgrade"));
 }
 

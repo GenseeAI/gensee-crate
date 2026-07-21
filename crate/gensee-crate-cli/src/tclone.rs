@@ -42,11 +42,12 @@ const TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV: &str = "GENSEE_TCLONE_CONTAINER_HO
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
 const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
+const TCLONE_WAIT_QUIET_FOR_FORK_ENV: &str = "GENSEE_TCLONE_WAIT_QUIET_FOR_FORK";
 const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
-const TCLONE_ASYNC_INITIAL_POLL_DELAY_MS: u64 = 15_000;
+const TCLONE_ASYNC_INITIAL_POLL_DELAY_MS: u64 = 500;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
 const TCLONE_ASYNC_JOB_TIMEOUT_SECS: u64 = 10 * 60;
 const TCLONE_ASYNC_JOB_STALE_GRACE_SECS: u64 = 30;
@@ -1179,34 +1180,42 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
                 TcloneHostControlTargetScope::CallerOnly,
             )?;
         }
-        "diff" | "summary" => validate_tclone_host_control_target(
-            &request.args[2..],
-            caller_run_id,
-            TcloneHostControlTargetScope::CallerOrDirectChild,
-        )?,
+        "diff" | "summary" => {
+            let completing_self =
+                subcommand == "summary" && request.args.iter().any(|arg| arg == "--complete");
+            if completing_self {
+                let caller = find_tclone_record(caller_run_id)?;
+                if caller.role != "fork" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "only a fork may mark its own task complete",
+                    ));
+                }
+                validate_tclone_host_control_target(
+                    &request.args[2..],
+                    caller_run_id,
+                    TcloneHostControlTargetScope::CallerOnly,
+                )?;
+            } else {
+                validate_tclone_host_control_target(
+                    &request.args[2..],
+                    caller_run_id,
+                    TcloneHostControlTargetScope::CallerOrDirectChild,
+                )?;
+            }
+        }
         "merge" => {
-            validate_tclone_source_caller(caller_run_id)?;
-            validate_tclone_host_control_target(
-                &request.args[2..],
-                caller_run_id,
-                TcloneHostControlTargetScope::DirectChild,
-            )?;
             let source_target = arg_value(&args[2..], "--into").ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing merge --into target")
             })?;
-            validate_tclone_host_control_target_strings(
-                &[OsString::from(source_target)],
+            validate_tclone_resolution_authority(
                 caller_run_id,
-                TcloneHostControlTargetScope::CallerOnly,
+                &request.args[2..],
+                Some(&source_target),
             )?;
         }
         "switch" | "discard" => {
-            validate_tclone_source_caller(caller_run_id)?;
-            validate_tclone_host_control_target(
-                &request.args[2..],
-                caller_run_id,
-                TcloneHostControlTargetScope::DirectChild,
-            )?;
+            validate_tclone_resolution_authority(caller_run_id, &request.args[2..], None)?;
         }
         "fork-status" => {
             let job_id = request.args.get(2).ok_or_else(|| {
@@ -1251,6 +1260,50 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
     Ok(())
 }
 
+fn validate_tclone_resolution_authority(
+    caller_run_id: &str,
+    target_args: &[String],
+    merge_source_target: Option<&str>,
+) -> io::Result<()> {
+    let caller = find_tclone_record(caller_run_id)?;
+    if caller.role == "source" {
+        validate_tclone_host_control_target(
+            target_args,
+            caller_run_id,
+            TcloneHostControlTargetScope::DirectChild,
+        )?;
+        if let Some(source_target) = merge_source_target {
+            validate_tclone_host_control_target_strings(
+                &[OsString::from(source_target)],
+                caller_run_id,
+                TcloneHostControlTargetScope::CallerOnly,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if caller.role != "fork" {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "only a tclone source or resolving fork may run lifecycle commands",
+        ));
+    }
+    validate_tclone_host_control_target(
+        target_args,
+        caller_run_id,
+        TcloneHostControlTargetScope::CallerOnly,
+    )?;
+    if let Some(source_target) = merge_source_target {
+        if caller.parent_run_id.as_deref() != Some(source_target) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "a fork may only merge itself into its direct source",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn tclone_async_job_owner_matches_caller(owner_run_id: &str, caller_run_id: &str) -> bool {
     if owner_run_id == caller_run_id {
         return true;
@@ -1284,6 +1337,7 @@ fn tclone_child_observer_fork_status_response(
     if caller.parent_run_id.as_deref() != Some(owner_run_id) {
         return Ok(None);
     }
+    let completion_command = format!("gensee run summary {caller_run_id} --json --complete");
     let payload = json!({
         "command": "run fork-status",
         "job_id": job.id,
@@ -1292,7 +1346,25 @@ fn tclone_child_observer_fork_status_response(
         "source_run_id": owner_run_id,
         "caller_run_id": caller_run_id,
         "retryable": false,
-        "message": "this fork-status job belongs to the source run that created this fork; stop source fork orchestration in this pane and continue the user's original approved task now. This pane is the live-cloned fork and does not need the source to resend the prompt.",
+        "completion_command": completion_command,
+        "actions": [
+            {
+                "choice": "merge",
+                "label": "Keep these changes and merge them back",
+                "command": format!("gensee run merge {caller_run_id} --into {owner_run_id}"),
+            },
+            {
+                "choice": "switch",
+                "label": "Keep working in the fork",
+                "command": format!("gensee run switch {caller_run_id}"),
+            },
+            {
+                "choice": "discard",
+                "label": "Discard the fork",
+                "command": format!("gensee run discard {caller_run_id}"),
+            }
+        ],
+        "message": format!("this fork-status job belongs to source run {owner_run_id}. Stop source fork orchestration in this pane and continue the user's original approved task now; the live-cloned fork does not need the source to resend the prompt. After finishing and testing the task, run `{completion_command}` internally, present the changed files and tests, and ask whether to merge the changes back, keep working in this fork, or discard it. Do not auto-merge and do not ask the user to type Gensee lifecycle commands. Wait for explicit approval, then run the selected lifecycle command internally."),
     });
     Ok(Some(TcloneHostControlResponse {
         exit_code: Some(0),
@@ -1613,7 +1685,8 @@ fn spawn_tclone_host_control_request(
     // The main shell blocks in `wait` (and reaps promptly). It and the watchdog
     // race to atomically create a claim directory: if the watchdog wins, the
     // main shell waits for its full TERM/KILL escalation before reporting 124.
-    Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(
             "job_id=$1; done_path=$2; log_path=$3; delay=$4; timeout_secs=$5; escalation_secs=$6; shift 6; \
@@ -1667,16 +1740,28 @@ fn spawn_tclone_host_control_request(
         .arg(job_timeout_secs.to_string())
         .arg(TCLONE_ASYNC_TIMEOUT_ESCALATION_SECS.to_string())
         .arg(&exe)
-        .args(&request.args)
-        .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
-        .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
-        .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
-        .env("GENSEE_TCLONE_READY_TIMEOUT_SECS", ready_timeout_secs.to_string())
+        .args(&request.args);
+    configure_tclone_async_fork_environment(&mut command, ready_timeout_secs);
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
         .spawn()?;
     Ok(())
+}
+
+fn configure_tclone_async_fork_environment(command: &mut Command, ready_timeout_secs: u64) {
+    command
+        .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
+        .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
+        .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
+        // Automatic continuation clones this active Codex turn. Waiting for
+        // the source to become idle is incompatible with that async handoff.
+        .env_remove(TCLONE_WAIT_QUIET_FOR_FORK_ENV)
+        .env(
+            "GENSEE_TCLONE_READY_TIMEOUT_SECS",
+            ready_timeout_secs.to_string(),
+        );
 }
 
 fn tclone_async_ready_timeout_secs() -> u64 {
@@ -1932,7 +2017,7 @@ fn tclone_host_control_async_response(
                 "retry_after_ms": TCLONE_ASYNC_INITIAL_POLL_DELAY_MS,
                 "status_command": status_command,
                 "poll_command": status_command,
-                "message": "gensee scheduled the tclone fork on the host; the live-cloned Codex turn continues the original task automatically in the fork. In the source, wait retry_after_ms before the first status poll, then poll status_command until status=succeeded; do not resend the original prompt",
+                "message": "gensee scheduled the tclone fork on the host. Poll status_command immediately and keep retrying that same command while status=running; the active poll is intentionally inherited so the live-cloned Codex turn can stop source orchestration and continue the approved task. Never schedule a replacement fork or resend the original prompt",
             })
         )
     } else {
@@ -2027,7 +2112,7 @@ fn tclone_async_job_status_payload(job: &TcloneAsyncJob) -> Value {
             .as_deref()
             .map(|text| tclone_async_job_last_log_lines(text, 12))
             .unwrap_or_default());
-        payload["message"] = json!("tclone fork job is still running; pause without running source-container shell commands such as sleep, then poll this command again");
+        payload["message"] = json!("tclone fork job is still running; poll this same status command again so the active Codex turn can be handed to the live clone");
     } else if status == "unknown" {
         payload["message"] =
             json!("unknown tclone fork job; no log or completion marker was found");
@@ -2876,9 +2961,38 @@ fn mark_tclone_fork_task_queued(podman: &OsString, record: &TcloneRunRecord) -> 
         assistant_summary: None,
         tests: Vec::new(),
     };
+    write_tclone_fork_result_to_container(podman, record, &result, "queued")
+}
+
+fn mark_tclone_fork_task_completed(
+    podman: &OsString,
+    record: &TcloneRunRecord,
+) -> io::Result<TcloneForkResult> {
+    let completed_at_ms = unix_millis()?;
+    let mut result = read_tclone_fork_result(podman, record)?.unwrap_or_else(|| TcloneForkResult {
+        run_id: record.run_id.clone(),
+        status: "running".to_string(),
+        started_at_ms: completed_at_ms,
+        completed_at_ms: None,
+        assistant_summary: None,
+        tests: Vec::new(),
+    });
+    result.status = "completed".to_string();
+    result.completed_at_ms = Some(completed_at_ms);
+    write_tclone_fork_result_to_container(podman, record, &result, "completed")?;
+    Ok(result)
+}
+
+fn write_tclone_fork_result_to_container(
+    podman: &OsString,
+    record: &TcloneRunRecord,
+    result: &TcloneForkResult,
+    label: &str,
+) -> io::Result<()> {
     let temporary_path = format!(
-        "{TCLONE_FORK_RESULT_PATH}.queued-{}-{queued_at_ms}",
-        std::process::id()
+        "{TCLONE_FORK_RESULT_PATH}.{label}-{}-{}",
+        std::process::id(),
+        unix_millis()?
     );
     let script = format!(
         "umask 077; cat > {temporary_path} && mv -f {temporary_path} {result_path}",
@@ -2993,9 +3107,10 @@ fn tclone_send_prompt_text(args: &[OsString]) -> io::Result<String> {
 
 fn tclone_prompt_with_fork_context(record: &TcloneRunRecord, prompt: &str) -> String {
     if record.role == "fork" {
+        let source_run_id = record.parent_run_id.as_deref().unwrap_or("the source run");
         format!(
-            "Gensee context: this request is already running inside forked run {}. Do not create another fork for this task; continue the requested work in this fork.\n\n{}",
-            record.run_id, prompt
+            "Gensee context: this request is already running inside forked run {fork_run_id}. Do not create another fork for this task; continue the requested work in this fork. After finishing and testing, run `gensee run summary {fork_run_id} --json --complete` internally, present the changed files and tests, and ask whether to merge the changes back, keep working in this fork, or discard it. Do not auto-merge. Wait for explicit approval, then run `gensee run merge {fork_run_id} --into {source_run_id}`, `gensee run switch {fork_run_id}`, or `gensee run discard {fork_run_id}` internally. Do not ask the user to type those commands.\n\n{prompt}",
+            fork_run_id = record.run_id,
         )
     } else {
         prompt.to_string()
@@ -3699,7 +3814,7 @@ fn wait_for_tclone_source_quiet_if_requested(
     podman: &OsString,
     source: &TcloneRunRecord,
 ) -> io::Result<()> {
-    if !env_flag("GENSEE_TCLONE_WAIT_QUIET_FOR_FORK") {
+    if !env_flag(TCLONE_WAIT_QUIET_FOR_FORK_ENV) {
         return Ok(());
     }
     let timeout = env::var("GENSEE_TCLONE_FORK_QUIET_TIMEOUT_SECS")
@@ -4487,7 +4602,10 @@ fn tclone_run_list_entry_with_result(
 }
 
 pub(crate) fn tclone_summary(args: Vec<OsString>) -> io::Result<()> {
-    let target = tclone_target_arg(&args, "usage: gensee run summary <fork-id> [--json]")?;
+    let target = tclone_target_arg(
+        &args,
+        "usage: gensee run summary <fork-id> [--json] [--complete]",
+    )?;
     let record = find_tclone_record(&target)?;
     if record.role != "fork" {
         return Err(io::Error::new(
@@ -4497,7 +4615,18 @@ pub(crate) fn tclone_summary(args: Vec<OsString>) -> io::Result<()> {
     }
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &record)?;
-    let result = read_tclone_fork_result(&podman, &record)?;
+    let result = if arg_flag(&args, "--complete") {
+        let caller = env::var("GENSEE_TCLONE_HOST_CONTROL_CALLER").unwrap_or_default();
+        if caller != record.run_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "--complete may only be used internally by the fork summarizing itself",
+            ));
+        }
+        Some(mark_tclone_fork_task_completed(&podman, &record)?)
+    } else {
+        read_tclone_fork_result(&podman, &record)?
+    };
     let diff = collect_tclone_diff(&record)?;
     let source_run_id = record.parent_run_id.clone();
     let task_completed = result
@@ -7191,6 +7320,44 @@ mod tests {
             validate_tclone_host_control_request(&request).unwrap();
         }
 
+        for (nonce, args) in [
+            (
+                "flow-fork-complete",
+                vec![
+                    "run".to_string(),
+                    "summary".to_string(),
+                    fork_run_id.clone(),
+                    "--json".to_string(),
+                    "--complete".to_string(),
+                ],
+            ),
+            (
+                "flow-fork-merge",
+                vec![
+                    "run".to_string(),
+                    "merge".to_string(),
+                    fork_run_id.clone(),
+                    "--into".to_string(),
+                    source_run_id.clone(),
+                ],
+            ),
+            (
+                "flow-fork-switch",
+                vec!["run".to_string(), "switch".to_string(), fork_run_id.clone()],
+            ),
+            (
+                "flow-fork-discard",
+                vec![
+                    "run".to_string(),
+                    "discard".to_string(),
+                    fork_run_id.clone(),
+                ],
+            ),
+        ] {
+            let request = signed_host_control_request(&fork_run_id, &fork_capability, nonce, args);
+            validate_tclone_host_control_request(&request).unwrap();
+        }
+
         let discard_source_request = signed_host_control_request(
             &source_run_id,
             &capability,
@@ -7283,10 +7450,19 @@ mod tests {
             serde_json::from_str(child_status_response.stdout.trim()).unwrap();
         assert_eq!(child_status_payload["status"], "delegated");
         assert_eq!(child_status_payload["source_run_id"], source_run_id);
+        assert_eq!(
+            child_status_payload["completion_command"],
+            format!("gensee run summary {fork_run_id} --json --complete")
+        );
+        assert_eq!(child_status_payload["actions"].as_array().unwrap().len(), 3);
         assert!(child_status_payload["message"]
             .as_str()
             .unwrap()
             .contains("continue the user's original approved task now"));
+        assert!(child_status_payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("Do not auto-merge"));
 
         let replay =
             signed_host_control_request(&source_run_id, &capability, "flow-send", send_args);
@@ -7549,6 +7725,29 @@ mod tests {
     }
 
     #[test]
+    fn tclone_async_fork_disables_incompatible_quiet_wait() {
+        let mut command = Command::new("true");
+        command.env(TCLONE_WAIT_QUIET_FOR_FORK_ENV, "1");
+
+        configure_tclone_async_fork_environment(&mut command, 123);
+
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(environment.get(TCLONE_WAIT_QUIET_FOR_FORK_ENV), Some(&None));
+        assert_eq!(
+            environment.get("GENSEE_TCLONE_READY_TIMEOUT_SECS"),
+            Some(&Some("123".to_string()))
+        );
+    }
+
+    #[test]
     fn tclone_async_status_parses_fork_payload_from_log() {
         let log = r#"gensee async job job_1: /tmp/gensee ["run", "fork"]
 noise
@@ -7588,7 +7787,7 @@ gensee async job job_1: exited status=0
         assert!(payload["message"]
             .as_str()
             .unwrap()
-            .contains("without running source-container shell commands"));
+            .contains("active Codex turn can be handed to the live clone"));
         assert!(payload["last_log_lines"]
             .as_array()
             .unwrap()
@@ -8030,6 +8229,9 @@ gensee async job job_1: exited status=0
 
         assert!(prompt.contains("already running inside forked run run_1_fork_2_0"));
         assert!(prompt.contains("Do not create another fork"));
+        assert!(prompt.contains("gensee run summary run_1_fork_2_0 --json --complete"));
+        assert!(prompt.contains("gensee run merge run_1_fork_2_0 --into run_1"));
+        assert!(prompt.contains("Do not auto-merge"));
         assert!(prompt.ends_with("Upgrade dependencies"));
     }
 
