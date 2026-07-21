@@ -3895,7 +3895,9 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     detach_tclone_tmux_clients(&podman, &source.container_name);
     let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
     let mut capability_guard = TcloneCapabilityRotationGuard::revoke(&podman, source.clone())?;
-    let output = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
+    let clone = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
+    let prefix = clone.prefix;
+    let output = clone.output;
     capability_guard.restore()?;
     let ids = output
         .lines()
@@ -4189,12 +4191,17 @@ pub(crate) fn tclone_fork_status(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
+struct TcloneCloneOutput {
+    prefix: String,
+    output: String,
+}
+
 fn run_tclone_clone_with_overlay_retry(
     podman: &OsString,
     copies: usize,
     prefix: &str,
     source: &TcloneRunRecord,
-) -> io::Result<String> {
+) -> io::Result<TcloneCloneOutput> {
     let use_overlay = env::var("GENSEE_TCLONE_OVERLAY_BTRFS")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
         .unwrap_or(true);
@@ -4339,11 +4346,14 @@ fn run_tclone_clone_attempts(
     source: &TcloneRunRecord,
     use_overlay: bool,
     extra_env: &[(&str, &str)],
-) -> io::Result<String> {
+) -> io::Result<TcloneCloneOutput> {
     let env = tclone_clone_env(extra_env);
     let clone_args = tclone_clone_args(copies, prefix, &source.container_name, use_overlay);
     match run_command_capture_with_env(podman, &clone_args, &env) {
-        Ok(output) => Ok(output),
+        Ok(output) => Ok(TcloneCloneOutput {
+            prefix: prefix.to_string(),
+            output,
+        }),
         Err(error) if use_overlay && should_retry_tclone_without_overlay(&error.to_string()) => {
             eprintln!(
                 "gensee: tclone overlay-btrfs clone failed; retrying without --tfork-overlay-btrfs"
@@ -4357,9 +4367,76 @@ fn run_tclone_clone_attempts(
             );
             let fallback_args =
                 tclone_clone_args(copies, &fallback_prefix, &source.container_name, false);
-            run_command_capture_with_env(podman, &fallback_args, &env)
+            match run_command_capture_with_env(podman, &fallback_args, &env) {
+                Ok(output) => Ok(TcloneCloneOutput {
+                    prefix: fallback_prefix,
+                    output,
+                }),
+                Err(error) => retry_tclone_partial_multicopy_clone(
+                    podman,
+                    copies,
+                    &fallback_prefix,
+                    source,
+                    false,
+                    &env,
+                    error,
+                ),
+            }
         }
-        Err(error) => Err(error),
+        Err(error) => retry_tclone_partial_multicopy_clone(
+            podman,
+            copies,
+            prefix,
+            source,
+            use_overlay,
+            &env,
+            error,
+        ),
+    }
+}
+
+fn retry_tclone_partial_multicopy_clone(
+    podman: &OsString,
+    copies: usize,
+    prefix: &str,
+    source: &TcloneRunRecord,
+    use_overlay: bool,
+    env: &[(String, String)],
+    error: io::Error,
+) -> io::Result<TcloneCloneOutput> {
+    if copies <= 1 || !should_retry_tclone_partial_multicopy(&error.to_string()) {
+        return Err(error);
+    }
+    cleanup_tclone_partial_clone_names(podman, copies, prefix);
+    let retry_prefix = tclone_timestamped_fork_name_prefix(
+        &format!("{}-retry", prefix.trim_end_matches('-')),
+        unix_millis().unwrap_or(std::process::id() as u64),
+    );
+    eprintln!(
+        "gensee: tclone created only part of the requested fork group; retrying with prefix `{retry_prefix}`"
+    );
+    let retry_args = tclone_clone_args(copies, &retry_prefix, &source.container_name, use_overlay);
+    run_command_capture_with_env(podman, &retry_args, env).map(|output| TcloneCloneOutput {
+        prefix: retry_prefix,
+        output,
+    })
+}
+
+fn cleanup_tclone_partial_clone_names(podman: &OsString, copies: usize, prefix: &str) {
+    for index in 0..copies {
+        let name = if copies == 1 {
+            prefix.to_string()
+        } else {
+            format!("{prefix}-{index}")
+        };
+        let args = [
+            OsString::from("rm"),
+            OsString::from("-f"),
+            OsString::from(&name),
+        ];
+        if let Err(error) = run_command_capture(podman, &args) {
+            eprintln!("gensee: warning: could not remove partial clone `{name}`: {error}");
+        }
     }
 }
 
@@ -4411,6 +4488,12 @@ fn should_retry_tclone_without_overlay(error: &str) -> bool {
     error.contains("spawn conmon for tfork")
         || error.contains("conmon reported pid=-1")
         || error.contains("clone setup failed")
+}
+
+fn should_retry_tclone_partial_multicopy(error: &str) -> bool {
+    error.contains("tfork exited before")
+        || error.contains("clones came up")
+        || error.contains("criu_tfork failed")
 }
 
 pub(crate) fn tclone_shell(args: Vec<OsString>) -> io::Result<()> {
@@ -10877,6 +10960,19 @@ mod tests {
             "tfork: clone setup failed (spawn conmon for tfork: conmon reported pid=-1)"
         ));
         assert!(!should_retry_tclone_without_overlay(
+            "podman exited with status 125: container not found"
+        ));
+    }
+
+    #[test]
+    fn tclone_partial_multicopy_retry_detects_crun_short_clone() {
+        assert!(should_retry_tclone_partial_multicopy(
+            "crun tfork exited before 2 clones came up (got 1)"
+        ));
+        assert!(should_retry_tclone_partial_multicopy(
+            "Error: criu_tfork failed: -52"
+        ));
+        assert!(!should_retry_tclone_partial_multicopy(
             "podman exited with status 125: container not found"
         ));
     }
