@@ -3153,7 +3153,7 @@ fn record_tclone_transaction_best_effort(
         None,
         metadata,
     ) {
-        eprintln!("gensee: warning: could not record transactional completion: {error}");
+        eprintln!("gensee: warning: could not record transactional event: {error}");
     }
 }
 
@@ -3171,7 +3171,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     let run_id = format!("run_{}_{}", std::process::id(), started_at_ms);
     let operation_id = tclone_operation_id("source");
     let workspace = canonicalize_or_original(&config.workspace);
-    record_tclone_transaction(
+    record_tclone_transaction_best_effort(
         &operation_id,
         "source",
         "started",
@@ -3181,8 +3181,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         Some(&workspace.to_string_lossy()),
         format!("Preparing transactional source {run_id}"),
         None,
-        None,
-    )?;
+    );
     let result = run_tclone_agent_inner(config, started_at_ms, &run_id, &operation_id);
     if let Err(error) = &result {
         if let Err(record_error) = record_tclone_transaction(
@@ -3552,7 +3551,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         "copies": copies,
         "requested_name": requested_name.clone(),
     });
-    record_tclone_transaction(
+    record_tclone_transaction_best_effort(
         &operation_id,
         "fork",
         "started",
@@ -3561,9 +3560,8 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         source.parent_run_id.as_deref(),
         Some(&source.workspace),
         format!("Creating {copies} fork(s) from {}", source.run_id),
-        None,
         Some(metadata.clone()),
-    )?;
+    );
 
     let result: io::Result<()> = (|| {
         let podman = tclone_podman();
@@ -5858,7 +5856,7 @@ pub(crate) fn tclone_merge(args: Vec<OsString>) -> io::Result<()> {
         "dry_run": dry_run,
         "force": force,
     });
-    record_tclone_transaction(
+    record_tclone_transaction_best_effort(
         &operation_id,
         "merge",
         "started",
@@ -5867,9 +5865,8 @@ pub(crate) fn tclone_merge(args: Vec<OsString>) -> io::Result<()> {
         fork.parent_run_id.as_deref(),
         Some(&fork.workspace),
         format!("Merging {} into {}", fork.run_id, source.run_id),
-        None,
         Some(metadata.clone()),
-    )?;
+    );
 
     let result = (|| {
         validate_tclone_merge_pair(&fork, &source, force)?;
@@ -6183,7 +6180,7 @@ pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
         ));
     }
     let operation_id = tclone_operation_id("switch");
-    record_tclone_transaction(
+    record_tclone_transaction_best_effort(
         &operation_id,
         "switch",
         "started",
@@ -6193,8 +6190,7 @@ pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
         Some(&fork.workspace),
         format!("Switching active source to {}", fork.run_id),
         None,
-        None,
-    )?;
+    );
 
     let result = (|| {
         let podman = tclone_podman();
@@ -6536,7 +6532,7 @@ pub(crate) fn tclone_delete(args: Vec<OsString>) -> io::Result<()> {
     )?;
     let record = find_tclone_record(&target)?;
     let operation_id = tclone_operation_id("delete");
-    record_tclone_transaction(
+    record_tclone_transaction_best_effort(
         &operation_id,
         "delete",
         "started",
@@ -6546,8 +6542,7 @@ pub(crate) fn tclone_delete(args: Vec<OsString>) -> io::Result<()> {
         Some(&record.workspace),
         format!("Deleting {}", record.run_id),
         None,
-        None,
-    )?;
+    );
     let result = (|| {
         let removed_container = remove_tclone_container(&record).map_err(|error| {
             io::Error::other(format!(
@@ -6611,7 +6606,7 @@ fn tclone_delete_all() -> io::Result<()> {
         println!("gensee: no tclone runs to delete");
         return Ok(());
     }
-    record_tclone_transaction(
+    record_tclone_transaction_best_effort(
         &operation_id,
         "delete",
         "started",
@@ -6620,9 +6615,8 @@ fn tclone_delete_all() -> io::Result<()> {
         None,
         None,
         format!("Deleting {} transactional run(s)", records.len()),
-        None,
         Some(json!({ "all": true, "run_count": records.len() })),
-    )?;
+    );
 
     let mut removed_containers = 0;
     let mut already_gone = 0;
@@ -7394,7 +7388,7 @@ pub(crate) fn tclone_keep(args: Vec<OsString>) -> io::Result<()> {
     let record = find_tclone_record(&target)?;
     let operation_id = tclone_operation_id("keep");
     let metadata = json!({ "destination": &destination });
-    record_tclone_transaction(
+    record_tclone_transaction_best_effort(
         &operation_id,
         "keep",
         "started",
@@ -7403,9 +7397,8 @@ pub(crate) fn tclone_keep(args: Vec<OsString>) -> io::Result<()> {
         record.parent_run_id.as_deref(),
         Some(&record.workspace),
         format!("Copying {} workspace out", record.run_id),
-        None,
         Some(metadata.clone()),
-    )?;
+    );
     let result = (|| {
         if record.role != "fork" {
             return Err(io::Error::new(
@@ -7872,7 +7865,7 @@ pub(crate) fn tclone_discard_if_exists(target: &str) -> io::Result<bool> {
         return Ok(false);
     };
     let operation_id = tclone_operation_id("discard");
-    record_tclone_transaction(
+    record_tclone_transaction_best_effort(
         &operation_id,
         "discard",
         "started",
@@ -7882,8 +7875,7 @@ pub(crate) fn tclone_discard_if_exists(target: &str) -> io::Result<bool> {
         Some(&record.workspace),
         format!("Discarding {}", record.run_id),
         None,
-        None,
-    )?;
+    );
     let result = (|| {
         if record.role != "fork" {
             return Err(io::Error::new(
@@ -8948,6 +8940,34 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn transaction_recording_best_effort_ignores_an_unavailable_store() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("transaction-store-unavailable");
+        let unavailable_root = root.join("not-a-directory");
+        fs::write(&unavailable_root, "file blocks store directory creation").unwrap();
+        let old_home = env::var_os("GENSEE_HOME");
+        env::set_var("GENSEE_HOME", &unavailable_root);
+
+        record_tclone_transaction_best_effort(
+            "fork_test",
+            "fork",
+            "started",
+            Some("source-run"),
+            None,
+            None,
+            Some("/workspace"),
+            "Starting fork",
+            None,
+        );
+
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn signed_host_control_request(
