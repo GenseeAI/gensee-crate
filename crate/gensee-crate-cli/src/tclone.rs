@@ -4833,6 +4833,13 @@ pub(crate) fn tclone_cleanup_resolved(args: Vec<OsString>) -> io::Result<()> {
         ));
     }
 
+    let podman = tclone_podman();
+    if let Err(error) = interrupt_tclone_source_agent_turn(&podman, &record) {
+        eprintln!(
+            "gensee: warning: could not interrupt resolved fork source turn for {}: {error}",
+            record.run_id
+        );
+    }
     remove_tclone_container(&record).map_err(|error| {
         io::Error::other(format!(
             "could not remove resolved fork container {}: {error}",
@@ -4841,6 +4848,51 @@ pub(crate) fn tclone_cleanup_resolved(args: Vec<OsString>) -> io::Result<()> {
     })?;
     focus_tclone_source_host_pane();
     Ok(())
+}
+
+fn interrupt_tclone_source_agent_turn(podman: &OsString, fork: &TcloneRunRecord) -> io::Result<()> {
+    let source_run_id = fork.parent_run_id.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("resolved fork {} has no source run", fork.run_id),
+        )
+    })?;
+    let source = find_tclone_record(source_run_id)?;
+    if source.role != "source" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "resolved fork source {} has unexpected role={}",
+                source.run_id, source.role
+            ),
+        ));
+    }
+    if fork.source_container.as_deref() != Some(source.container_name.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "resolved fork {} does not belong to source container {}",
+                fork.run_id, source.container_name
+            ),
+        ));
+    }
+
+    run_command_status(
+        podman,
+        &tclone_source_agent_interrupt_args(&source.container_name),
+    )
+}
+
+fn tclone_source_agent_interrupt_args(container_name: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("exec"),
+        OsString::from(container_name),
+        OsString::from("tmux"),
+        OsString::from("send-keys"),
+        OsString::from("-t"),
+        OsString::from(TCLONE_AGENT_TMUX_SESSION),
+        OsString::from("C-c"),
+    ]
 }
 
 fn tclone_record_is_ready_for_resolution_cleanup(record: &TcloneRunRecord) -> bool {
@@ -8534,6 +8586,27 @@ gensee async job job_1: exited status=0
         record.status = "discarded".to_string();
         record.role = "source".to_string();
         assert!(!tclone_record_is_ready_for_resolution_cleanup(&record));
+    }
+
+    #[test]
+    fn tclone_resolution_cleanup_interrupts_the_source_codex_turn() {
+        let args = tclone_source_agent_interrupt_args("source-container")
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            [
+                "exec",
+                "source-container",
+                "tmux",
+                "send-keys",
+                "-t",
+                TCLONE_AGENT_TMUX_SESSION,
+                "C-c",
+            ]
+        );
     }
 
     #[test]
