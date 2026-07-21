@@ -97,7 +97,7 @@ const TCLONE_FORK_TRANSIENT_DEVICE_MOUNTS: &[&str] = &[
 const TCLONE_ATTACH_RETRY_TIMEOUT_SECS: u64 = 15;
 const TCLONE_FORK_MARKER_WAIT_TIMEOUT_SECS: u64 = 5 * 60;
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct TcloneHostControlRequest {
     #[serde(default)]
     caller_run_id: Option<String>,
@@ -223,6 +223,17 @@ struct TcloneParallelChoiceOffer {
     group_id: String,
     offered_at_ms: u64,
     options: Vec<TcloneParallelChoiceOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval: Option<TcloneParallelChoiceApproval>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct TcloneParallelChoiceApproval {
+    run_id: String,
+    choice: String,
+    approved_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consumed_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -655,13 +666,13 @@ fn tclone_command_is_source_fork(command: &str) -> bool {
 }
 
 fn tclone_source_fork_handoff_path() -> io::Result<PathBuf> {
-    let directory = env::var_os(TCLONE_HOST_CONTROL_DIR_ENV).ok_or_else(|| {
+    let directory = tclone_host_control_dir_path().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "source fork handoff requires the tclone host-control directory",
         )
     })?;
-    Ok(PathBuf::from(directory).join(TCLONE_SOURCE_FORK_HANDOFF_FILE))
+    Ok(directory.join(TCLONE_SOURCE_FORK_HANDOFF_FILE))
 }
 
 fn read_tclone_source_fork_handoff() -> Option<TcloneSourceForkHandoff> {
@@ -676,13 +687,13 @@ fn write_tclone_source_fork_handoff(handoff: &TcloneSourceForkHandoff) -> io::Re
 }
 
 fn tclone_parallel_choice_offer_path() -> io::Result<PathBuf> {
-    let directory = env::var_os(TCLONE_HOST_CONTROL_DIR_ENV).ok_or_else(|| {
+    let directory = tclone_host_control_dir_path().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "parallel choice offer requires the tclone host-control directory",
         )
     })?;
-    Ok(PathBuf::from(directory).join(TCLONE_PARALLEL_CHOICE_OFFER_FILE))
+    Ok(directory.join(TCLONE_PARALLEL_CHOICE_OFFER_FILE))
 }
 
 fn read_tclone_parallel_choice_offer() -> Option<TcloneParallelChoiceOffer> {
@@ -696,6 +707,11 @@ fn write_tclone_parallel_choice_offer_to_source(
     offer: &TcloneParallelChoiceOffer,
 ) -> io::Result<()> {
     let path = tclone_parallel_choice_offer_host_path(source)?;
+    write_atomic_nofollow(&path, &serde_json::to_vec(offer)?, 0o600)
+}
+
+fn write_tclone_parallel_choice_offer(offer: &TcloneParallelChoiceOffer) -> io::Result<()> {
+    let path = tclone_parallel_choice_offer_path()?;
     write_atomic_nofollow(&path, &serde_json::to_vec(offer)?, 0o600)
 }
 
@@ -898,7 +914,7 @@ fn try_record_tclone_source_parallel_choice_approval(
     let Some(source_run_id) = context.get("run_id").and_then(Value::as_str) else {
         return Ok(());
     };
-    let Some(offer) = read_tclone_parallel_choice_offer() else {
+    let Some(mut offer) = read_tclone_parallel_choice_offer() else {
         return Ok(());
     };
     if offer.source_run_id != source_run_id {
@@ -914,13 +930,23 @@ fn try_record_tclone_source_parallel_choice_approval(
     if target.parent_run_id.as_deref() != Some(source_run_id) {
         return Ok(());
     }
+    offer.approval = Some(TcloneParallelChoiceApproval {
+        run_id: target_run_id.clone(),
+        choice: choice.to_string(),
+        approved_at_ms: event.observed_at_ms,
+        consumed_at_ms: None,
+    });
+    write_tclone_parallel_choice_offer(&offer)?;
+
     let podman = tclone_podman();
-    let mut result = read_tclone_fork_result(&podman, &target)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("parallel choice target {} has no result", target.run_id),
-        )
-    })?;
+    let result = read_tclone_fork_result(&podman, &target);
+    let Some(mut result) = result? else {
+        eprintln!(
+            "gensee: warning: recorded parallel choice approval, but target {} has no result",
+            target.run_id
+        );
+        return Ok(());
+    };
     if result.resolution_offered_at_ms.is_none() {
         result.resolution_offered_at_ms = Some(offer.offered_at_ms);
     }
@@ -929,7 +955,15 @@ fn try_record_tclone_source_parallel_choice_approval(
         approved_at_ms: event.observed_at_ms,
         consumed_at_ms: None,
     });
-    write_tclone_fork_result_to_container(&podman, &target, &result, "parallel-approval")
+    if let Err(error) =
+        write_tclone_fork_result_to_container(&podman, &target, &result, "parallel-approval")
+    {
+        eprintln!(
+            "gensee: warning: recorded parallel choice approval, but could not mirror it to target {}: {error}",
+            target.run_id
+        );
+    }
+    Ok(())
 }
 
 fn tclone_hook_event_is_internal_lifecycle_command(event: &AgentHookEvent) -> bool {
@@ -1894,12 +1928,19 @@ fn execute_tclone_host_control_request(
             .lock()
             .map_err(|_| io::Error::other("tclone lifecycle approval lock poisoned"))?;
         let record = validate_tclone_lifecycle_approval(&request, choice)?;
-        let response = execute_tclone_host_control_request_sync(request, exe)?;
+        let is_choose = request.args.get(1).map(String::as_str) == Some("choose");
+        let response = execute_tclone_host_control_request_sync(request.clone(), exe)?;
         // Merge leaves the fork result available long enough to record
         // consumption. Switch changes the record to a source and discard
         // removes the container, so their terminal state is already the
         // single-use guard and a post-command read would only emit noise.
-        if response.exit_code == Some(0) && choice == "merge" {
+        if response.exit_code == Some(0) && is_choose {
+            if let Err(error) = consume_tclone_parallel_choice_approval(&request, choice) {
+                eprintln!(
+                    "gensee: warning: parallel choice command succeeded but approval consumption could not be recorded: {error}"
+                );
+            }
+        } else if response.exit_code == Some(0) && choice == "merge" {
             if let Err(error) = consume_tclone_lifecycle_approval(&record, choice) {
                 eprintln!(
                     "gensee: warning: lifecycle command succeeded but approval consumption could not be recorded: {error}"
@@ -1968,7 +2009,14 @@ fn validate_tclone_lifecycle_approval(
             }
         }
         if source_controls_child_group {
-            target
+            validate_tclone_parallel_choice_approval(&caller, &target, choice, unix_millis()?)?;
+            if target.role != "fork" || target.status != "running" {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "lifecycle target must be an unresolved tclone fork",
+                ));
+            }
+            return Ok(target);
         } else {
             caller
         }
@@ -1995,6 +2043,65 @@ fn validate_tclone_lifecycle_approval(
         request.args.get(1).map(String::as_str) != Some("choose"),
     )?;
     Ok(record)
+}
+
+fn validate_tclone_parallel_choice_approval(
+    source: &TcloneRunRecord,
+    target: &TcloneRunRecord,
+    choice: &str,
+    now_ms: u64,
+) -> io::Result<()> {
+    let offer = read_tclone_parallel_choice_offer_for_source(source)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "parallel choice has not been presented to the source user",
+        )
+    })?;
+    if offer.source_run_id != source.run_id
+        || target.fork_group_id.as_deref() != Some(offer.group_id.as_str())
+        || !offer
+            .options
+            .iter()
+            .any(|option| option.run_id == target.run_id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "parallel choice offer does not match the selected fork",
+        ));
+    }
+    let approval = offer.approval.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "explicit user approval is required before merge, switch, or discard",
+        )
+    })?;
+    if approval.run_id != target.run_id
+        || approval.choice != choice
+        || approval.approved_at_ms < offer.offered_at_ms
+        || approval.approved_at_ms > now_ms
+        || now_ms.saturating_sub(approval.approved_at_ms)
+            > TCLONE_LIFECYCLE_APPROVAL_MAX_AGE_SECS * 1_000
+        || approval.consumed_at_ms.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("no current unconsumed user approval for `{choice}`"),
+        ));
+    }
+    Ok(())
+}
+
+fn read_tclone_parallel_choice_offer_for_source(
+    source: &TcloneRunRecord,
+) -> io::Result<Option<TcloneParallelChoiceOffer>> {
+    let path = tclone_parallel_choice_offer_host_path(source)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = read_nofollow_to_string(&path)?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
 }
 
 #[cfg(test)]
@@ -2067,6 +2174,43 @@ fn consume_tclone_lifecycle_approval(record: &TcloneRunRecord, choice: &str) -> 
     }
     approval.consumed_at_ms = Some(unix_millis()?);
     write_tclone_fork_result_to_container(&podman, record, &result, "approval-consumed")
+}
+
+fn consume_tclone_parallel_choice_approval(
+    request: &TcloneHostControlRequest,
+    choice: &str,
+) -> io::Result<()> {
+    let target = find_tclone_record(&tclone_lifecycle_request_target(request)?)?;
+    let caller_run_id = request.caller_run_id.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "parallel choice has no caller",
+        )
+    })?;
+    let source = find_tclone_record(caller_run_id)?;
+    if source.role != "source" || target.parent_run_id.as_deref() != Some(source.run_id.as_str()) {
+        return Ok(());
+    }
+    let mut offer = read_tclone_parallel_choice_offer_for_source(&source)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "parallel choice offer disappeared")
+    })?;
+    let approval = offer.approval.as_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "parallel choice approval disappeared",
+        )
+    })?;
+    if approval.run_id != target.run_id
+        || approval.choice != choice
+        || approval.consumed_at_ms.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "parallel choice approval no longer matches the completed lifecycle command",
+        ));
+    }
+    approval.consumed_at_ms = Some(unix_millis()?);
+    write_tclone_parallel_choice_offer_to_source(&source, &offer)
 }
 
 fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> io::Result<()> {
@@ -6457,6 +6601,7 @@ fn record_tclone_parallel_choice_offer_for_source(
                     .unwrap_or_else(|| "unspecified approach".to_string()),
             })
             .collect(),
+        approval: None,
     };
     write_tclone_parallel_choice_offer_to_source(&source, &offer)
 }
@@ -9620,6 +9765,69 @@ mod tests {
     }
 
     #[test]
+    fn tclone_parallel_choice_approval_validates_from_source_offer() {
+        let _guard = tclone_test_env_lock();
+        let mut source = test_record("run_1", "running");
+        source.role = "source".to_string();
+        let mut target = test_fork_record("run_1_fork_2_0", "run_1");
+        target.fork_group_id = Some("group_1".to_string());
+        let offer = TcloneParallelChoiceOffer {
+            source_run_id: "run_1".to_string(),
+            group_id: "group_1".to_string(),
+            offered_at_ms: 10,
+            options: vec![TcloneParallelChoiceOption {
+                label: "Approach A".to_string(),
+                run_id: target.run_id.clone(),
+                approach: "minimal compatible upgrade".to_string(),
+            }],
+            approval: Some(TcloneParallelChoiceApproval {
+                run_id: target.run_id.clone(),
+                choice: "merge".to_string(),
+                approved_at_ms: 11,
+                consumed_at_ms: None,
+            }),
+        };
+        let path = tclone_parallel_choice_offer_host_path(&source).unwrap();
+        if let Some(parent) = path.parent() {
+            fs::remove_dir_all(parent).ok();
+            fs::create_dir_all(parent).unwrap();
+        }
+        write_tclone_parallel_choice_offer_to_source(&source, &offer).unwrap();
+
+        validate_tclone_parallel_choice_approval(&source, &target, "merge", 12).unwrap();
+        assert!(validate_tclone_parallel_choice_approval(&source, &target, "switch", 12).is_err());
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn tclone_parallel_choice_offer_path_falls_back_to_workspace_bridge() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("parallel-choice-workspace-bridge");
+        let control_dir = root.join(TCLONE_HOST_CONTROL_WORKSPACE_DIR);
+        fs::create_dir_all(&control_dir).unwrap();
+        let old_dir = env::var_os(TCLONE_HOST_CONTROL_DIR_ENV);
+        let old_workspace = env::var_os("GENSEE_WORKSPACE");
+        env::remove_var(TCLONE_HOST_CONTROL_DIR_ENV);
+        env::set_var("GENSEE_WORKSPACE", &root);
+
+        assert_eq!(
+            tclone_parallel_choice_offer_path().unwrap(),
+            control_dir.join(TCLONE_PARALLEL_CHOICE_OFFER_FILE)
+        );
+
+        match old_dir {
+            Some(value) => env::set_var(TCLONE_HOST_CONTROL_DIR_ENV, value),
+            None => env::remove_var(TCLONE_HOST_CONTROL_DIR_ENV),
+        }
+        match old_workspace {
+            Some(value) => env::set_var("GENSEE_WORKSPACE", value),
+            None => env::remove_var("GENSEE_WORKSPACE"),
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn tclone_lifecycle_approval_expires() {
         let result = TcloneForkResult {
             run_id: "run_source_fork_1_0".to_string(),
@@ -11342,6 +11550,7 @@ gensee async job job_1: exited status=0
                     approach: "aggressive latest-version upgrade".to_string(),
                 },
             ],
+            approval: None,
         };
 
         assert_eq!(
