@@ -46,10 +46,13 @@ command written by `gensee setup vscode`:
 | `~/.claude/settings.json` | Also read by VS Code (Claude Code compat) |
 
 Note: VS Code also reads `.claude/settings.json` natively, so an existing
-`gensee setup claude-code` installation already fires hooks inside VS Code.
-The `vscode` provider adds correct parsing of VS Code-specific tool names
-(e.g. `runTerminalCommand` and `runInTerminal` for shell commands) that the
-`claude-code` provider does not handle.
+`gensee setup claude-code` installation can also fire inside VS Code. Gensee
+detects those compatibility payloads. An imported Claude invocation is
+suppressed only after Gensee observes the matching native VS Code invocation for
+the same session, event, and tool or timestamp; configuration presence alone is
+not sufficient. Without matching recent evidence, it is routed through the
+`vscode` parser so VS Code-specific tool names and response formats are still
+handled correctly.
 
 ## Installed Hooks
 

@@ -70,6 +70,8 @@ mod daemon;
 pub(crate) use daemon::*;
 mod telemetry;
 pub(crate) use telemetry::*;
+mod hook_compatibility;
+pub(crate) use hook_compatibility::*;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -105,11 +107,19 @@ pub(crate) fn run_cli() -> io::Result<()> {
             args.remove(0);
             linux_exec_wrapper(args)
         }
+        Some("__tclone-cleanup-resolved") => {
+            args.remove(0);
+            tclone_cleanup_resolved(args)
+        }
+        Some("__tclone-complete-switch") => {
+            args.remove(0);
+            tclone_complete_switch(args)
+        }
         Some("run") => {
             args.remove(0);
             if args.first().and_then(|arg| arg.to_str()) == Some("list") {
                 args.remove(0);
-                return list_runs();
+                return list_runs(args);
             }
             if args.first().and_then(|arg| arg.to_str()) == Some("fork") {
                 args.remove(0);
@@ -138,6 +148,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             if args.first().and_then(|arg| arg.to_str()) == Some("diff") {
                 args.remove(0);
                 return tclone_diff(args);
+            }
+            if args.first().and_then(|arg| arg.to_str()) == Some("summary") {
+                args.remove(0);
+                return tclone_summary(args);
             }
             if args.first().and_then(|arg| arg.to_str()) == Some("merge") {
                 args.remove(0);
@@ -176,7 +190,7 @@ pub(crate) fn run_cli() -> io::Result<()> {
         Some("session") => {
             args.remove(0);
             match args.first().and_then(|arg| arg.to_str()) {
-                Some("list") => list_runs(),
+                Some("list") => list_runs(args[1..].to_vec()),
                 _ => {
                     print_usage();
                     Ok(())
@@ -1116,6 +1130,13 @@ fn default_vscode_hooks_path() -> io::Result<PathBuf> {
     Ok(home.join(".copilot").join("hooks").join("gensee.json"))
 }
 
+fn default_cursor_hooks_path() -> io::Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    Ok(home.join(".cursor").join("hooks.json"))
+}
+
 fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
     let mut hooks_path = default_vscode_hooks_path()?;
     let mut gensee_home = env::var_os("GENSEE_HOME")
@@ -1242,10 +1263,7 @@ fn vscode_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
 }
 
 fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    let mut hooks_path = home.join(".cursor").join("hooks.json");
+    let mut hooks_path = default_cursor_hooks_path()?;
     let mut gensee_home = env::var_os("GENSEE_HOME")
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
@@ -3335,7 +3353,45 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     let mut payload = String::new();
     io::stdin().read_to_string(&mut payload)?;
 
-    let event = build_hook_event(&payload, provider)?;
+    // Record proof that the host actually invoked the native hook before doing
+    // any parsing, policy, daemon, or store work. A concurrently launched
+    // compatibility hook can use this short-lived evidence to suppress itself.
+    if matches!(provider, PROVIDER_CURSOR | PROVIDER_VSCODE) {
+        if let Err(error) = record_native_hook_invocation_evidence(provider, &payload) {
+            // Evidence failure must not interfere with the native hook. The
+            // compatibility invocation will process normally, yielding at most
+            // a duplicate rather than a gap in enforcement.
+            eprintln!(
+                "gensee hook: cannot record native {provider} invocation evidence ({error}); compatibility hooks will not be suppressed"
+            );
+        }
+    }
+
+    let mut evidence_error = None;
+    let route = route_hook_invocation(provider, &payload, |native_provider, payload| {
+        match take_recent_native_hook_invocation_evidence(native_provider, payload) {
+            Ok(observed) => observed,
+            Err(error) => {
+                evidence_error = Some((native_provider, error));
+                false
+            }
+        }
+    });
+    if let Some((native_provider, error)) = evidence_error {
+        eprintln!(
+            "gensee hook: cannot verify recent native {native_provider} invocation evidence ({error}); processing the compatibility invocation"
+        );
+    }
+    let effective_provider = match route {
+        HookInvocationRoute::ProcessAs(provider) => provider,
+        HookInvocationRoute::Suppress { native_provider } => {
+            warn_hook_compatibility_suppressed(provider, native_provider);
+            telemetry_record_hook_compatibility_suppressed(provider, native_provider);
+            return Ok(());
+        }
+    };
+
+    let event = build_hook_event(&payload, effective_provider)?;
 
     // Fast path: if the warm daemon is up, hand off over its socket — PreToolUse
     // waits for the decision (warm eval, no per-call store open), observational
@@ -3364,6 +3420,19 @@ pub(crate) fn process_hook_event(
     store: &EventStore,
 ) -> io::Result<Option<String>> {
     store.append_hook_event(event)?;
+    let fork_stop_continuation = tclone_codex_stop_continuation(event);
+    record_tclone_fork_hook_lifecycle(event);
+    record_tclone_source_fork_handoff_lifecycle(event);
+
+    if let Some(reason) = fork_stop_continuation {
+        return Ok(Some(
+            json!({
+                "decision": "block",
+                "reason": reason,
+            })
+            .to_string(),
+        ));
+    }
 
     if matches!(
         event.hook_event_name.as_deref(),
@@ -3452,6 +3521,7 @@ pub(crate) fn process_hook_event(
 
         let current_run_id = current_tclone_run_id_for_event(event);
         if let Some(finding) = fork_suggestion_prompt_finding(event, current_run_id.as_deref()) {
+            prepare_tclone_source_fork_handoff(event);
             if !fork_suggestion_already_recorded(Some(store), event, &finding) {
                 store.append_policy_alert(&finding.to_policy_alert(event))?;
                 contexts.push(format!("Gensee safety notice: {}", finding.message));
@@ -3565,6 +3635,6 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 
 pub(crate) fn print_usage() {
     println!(
-        "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run fork run_123 --copies 2 --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
+        "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container> [--json]\n  gensee run summary <fork-id> [--json]\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list [--json]\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run fork run_123 --copies 2 --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
     );
 }

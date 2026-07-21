@@ -173,12 +173,14 @@ From another terminal, fork and inspect the running source container:
 
 ```bash
 gensee-tclone run list
+gensee-tclone run list --json
 gensee-tclone fork <source-run-id> --copies 2
 gensee-tclone run shell <run_id-or-container>
-gensee-tclone run diff <run_id-or-container>
+gensee-tclone run diff <run_id-or-container> [--json]
+gensee-tclone run summary <fork-id> --json
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
 gensee-tclone run merge <fork-id> --into <source-id> --filesystem
-gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.codex
+gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace/src /workspace/Cargo.toml
 gensee-tclone run switch <fork-id>
 gensee-tclone run keep <run_id-or-container> --to /tmp/kept-workspace
 gensee-tclone run discard <run_id-or-container>

@@ -32,10 +32,21 @@ curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/
 ```
 
 VS Code also loads Claude-compatible hooks from `~/.claude/settings.json`. If
-Claude Code hooks are already installed, they may run inside VS Code too. Avoid
-configuring both the Claude Code and VS Code providers for the same VS Code
-sessions, because that can invoke Gensee twice. The dedicated `vscode` provider
-is preferred when VS Code-native tool names must be parsed correctly.
+Claude Code hooks are already installed, VS Code may invoke those commands too.
+Gensee recognizes VS Code compatibility payloads using multiple runtime markers.
+The Claude compatibility invocation exits successfully without evaluating or
+recording only after the matching native VS Code invocation has been observed
+recently for the same session, event, and tool or timestamp. Hook configuration
+on disk is not treated as proof that a native hook is live. If the compatibility
+invocation wins a startup race, required identifiers are absent, or evidence
+cannot be read, it is processed through the VS Code parser. This can produce a
+duplicate event but preserves enforcement and the correct response format.
+
+A suppressed invocation records the local telemetry event
+`hook_compatibility_duplicate_suppressed`. Gensee also writes a warning to the
+host hook log on the first suppression and periodically thereafter; the notice
+is rate-limited per native provider and does not depend on telemetry collection
+being enabled.
 
 ## Custom hook locations
 

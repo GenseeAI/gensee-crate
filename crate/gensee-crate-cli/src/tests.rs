@@ -110,6 +110,124 @@ fn telemetry_policy_event_does_not_create_upload_artifacts_on_hook_path() {
 }
 
 #[test]
+fn telemetry_records_suppressed_compatibility_invocation_without_flushing() {
+    let _guard = telemetry_test_lock();
+    let root = telemetry_test_root("hook-compatibility-suppressed");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    env::set_var("GENSEE_HOME", &root);
+    env::set_var("GENSEE_TELEMETRY_REMOTE", "1");
+    telemetry_record_hook_compatibility_suppressed(PROVIDER_CLAUDE_CODE, PROVIDER_CURSOR);
+
+    let events = fs::read_to_string(root.join("telemetry-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0]["event_name"],
+        json!("hook_compatibility_duplicate_suppressed")
+    );
+    assert_eq!(
+        events[0]["props"]["source_provider"],
+        json!(PROVIDER_CLAUDE_CODE)
+    );
+    assert_eq!(
+        events[0]["props"]["native_provider"],
+        json!(PROVIDER_CURSOR)
+    );
+    assert!(!root.join("telemetry-events-upload.jsonl").exists());
+    assert!(!root.join("telemetry-flush.lock").exists());
+
+    env::remove_var("GENSEE_TELEMETRY_REMOTE");
+    env::remove_var("GENSEE_HOME");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn compatibility_suppression_notice_is_rate_limited_per_native_provider() {
+    let root = telemetry_test_root("hook-compatibility-notice");
+    let _ = fs::remove_dir_all(&root);
+
+    let first_notice_ms = 1_000_000;
+    assert!(hook_compatibility_notice_due(&root, PROVIDER_CURSOR, first_notice_ms).unwrap());
+    assert!(!hook_compatibility_notice_due(
+        &root,
+        PROVIDER_CURSOR,
+        first_notice_ms + HOOK_COMPATIBILITY_NOTICE_INTERVAL_MS - 1,
+    )
+    .unwrap());
+    assert!(hook_compatibility_notice_due(&root, PROVIDER_VSCODE, first_notice_ms + 1,).unwrap());
+    assert!(hook_compatibility_notice_due(
+        &root,
+        PROVIDER_CURSOR,
+        first_notice_ms + HOOK_COMPATIBILITY_NOTICE_INTERVAL_MS,
+    )
+    .unwrap());
+
+    let state: Value = serde_json::from_str(
+        &fs::read_to_string(root.join(HOOK_COMPATIBILITY_NOTICE_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["last_notice_at_ms"][PROVIDER_CURSOR],
+        json!(first_notice_ms + HOOK_COMPATIBILITY_NOTICE_INTERVAL_MS)
+    );
+    assert_eq!(
+        state["last_notice_at_ms"][PROVIDER_VSCODE],
+        json!(first_notice_ms + 1)
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(root.join(HOOK_COMPATIBILITY_NOTICE_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn compatibility_suppression_notice_recovers_from_invalid_or_future_state() {
+    let root = telemetry_test_root("hook-compatibility-notice-invalid");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join(HOOK_COMPATIBILITY_NOTICE_FILE);
+
+    fs::write(&path, "not json").unwrap();
+    assert!(hook_compatibility_notice_due(&root, PROVIDER_CURSOR, 10).unwrap());
+
+    fs::write(
+        &path,
+        json!({
+            "schema_version": HOOK_COMPATIBILITY_NOTICE_SCHEMA_VERSION + 1,
+            "last_notice_at_ms": { PROVIDER_CURSOR: 10 }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(hook_compatibility_notice_due(&root, PROVIDER_CURSOR, 11).unwrap());
+
+    // A wall-clock rollback must not hide the warning until the clock catches up.
+    assert!(hook_compatibility_notice_due(&root, PROVIDER_CURSOR, 5).unwrap());
+
+    let warning = hook_compatibility_suppression_warning(PROVIDER_CLAUDE_CODE, PROVIDER_CURSOR);
+    assert!(warning.contains("matching native cursor invocation"));
+    assert!(warning.contains("inspect the host hook log"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn telemetry_records_vscode_file_tool_schema_drift() {
     let _guard = telemetry_test_lock();
     let root = telemetry_test_root("vscode-schema-drift");
@@ -912,6 +1030,436 @@ fn cursor_hook_command_quotes_paths_with_spaces() {
         command,
         "GENSEE_HOME='/Users/example/Gensee Store' '/Applications/Gensee Crate/gensee' hook cursor"
     );
+}
+
+#[test]
+fn compatibility_payload_provider_detects_cursor_with_independent_markers() {
+    let payload = json!({
+        "hook_event_name": "beforeSubmitPrompt",
+        "conversation_id": "conv-123",
+        "cursor_version": "3.11.19",
+        "transcript_path": null
+    })
+    .to_string();
+
+    assert_eq!(
+        compatibility_payload_provider(&payload),
+        Some(PROVIDER_CURSOR)
+    );
+
+    let transcript_payload = json!({
+        "hook_event_name": "stop",
+        "cursor_version": "3.11.19",
+        "transcript_path": "/tmp/.cursor/projects/repo/agent-transcripts/conv.jsonl"
+    })
+    .to_string();
+    assert_eq!(
+        compatibility_payload_provider(&transcript_payload),
+        Some(PROVIDER_CURSOR)
+    );
+}
+
+#[test]
+fn compatibility_payload_provider_does_not_trust_cursor_version_alone() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session",
+        "cursor_version": "unexpected-user-field",
+        "transcript_path": "/tmp/.claude/transcript.jsonl"
+    })
+    .to_string();
+
+    assert_eq!(compatibility_payload_provider(&payload), None);
+}
+
+#[test]
+fn compatibility_payload_provider_detects_vscode_runtime_payload() {
+    let payload = json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "vscode-session",
+        "timestamp": "2026-07-16T06:19:24.635Z",
+        "transcript_path": "/home/user/.vscode-server/data/User/workspaceStorage/hash/GitHub.copilot-chat/transcripts/session.jsonl"
+    })
+    .to_string();
+
+    assert_eq!(
+        compatibility_payload_provider(&payload),
+        Some(PROVIDER_VSCODE)
+    );
+
+    let tool_payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-session",
+        "timestamp": "2026-07-16T06:19:25.000Z",
+        "tool_name": "read_file",
+        "tool_use_id": "call_123__vscode-1784135936211"
+    })
+    .to_string();
+    assert_eq!(
+        compatibility_payload_provider(&tool_payload),
+        Some(PROVIDER_VSCODE)
+    );
+}
+
+#[test]
+fn compatibility_payload_provider_does_not_trust_timestamp_alone_or_guess_codex() {
+    let claude_payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session",
+        "timestamp": "2026-07-16T06:19:25.000Z",
+        "tool_name": "Bash",
+        "transcript_path": "/tmp/.claude/transcript.jsonl"
+    })
+    .to_string();
+    assert_eq!(compatibility_payload_provider(&claude_payload), None);
+
+    let codex_payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "codex-session",
+        "turn_id": "turn-1",
+        "model": "gpt-5",
+        "tool_name": "Bash"
+    })
+    .to_string();
+    assert_eq!(compatibility_payload_provider(&codex_payload), None);
+}
+
+#[test]
+fn imported_cursor_hook_is_suppressed_only_when_native_invocation_was_observed() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "cursor-session",
+        "cursor_version": "3.11.19",
+        "tool_name": "Read",
+        "tool_use_id": "tool-1"
+    })
+    .to_string();
+
+    let suppressed = route_hook_invocation(
+        PROVIDER_CLAUDE_CODE,
+        &payload,
+        |native_provider, checked_payload| {
+            assert_eq!(native_provider, PROVIDER_CURSOR);
+            assert_eq!(checked_payload, payload);
+            true
+        },
+    );
+    assert_eq!(
+        suppressed,
+        HookInvocationRoute::Suppress {
+            native_provider: PROVIDER_CURSOR
+        }
+    );
+
+    let fallback = route_hook_invocation(PROVIDER_CLAUDE_CODE, &payload, |_, _| false);
+    assert_eq!(fallback, HookInvocationRoute::ProcessAs(PROVIDER_CURSOR));
+}
+
+#[test]
+fn native_cursor_events_are_never_suppressed_even_when_tool_ids_repeat() {
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "cursor-session",
+        "cursor_version": "3.11.19",
+        "tool_name": "Read",
+        "tool_use_id": "reused-terminal-poll-id",
+        "tool_input": {
+            "filePath": "/home/user/.cursor/projects/project/terminals/1.txt"
+        }
+    })
+    .to_string();
+
+    for _ in 0..10 {
+        let route = route_hook_invocation(PROVIDER_CURSOR, &payload, |_, _| {
+            panic!("native evidence lookup must not run for an already-native invocation")
+        });
+        assert_eq!(route, HookInvocationRoute::ProcessAs(PROVIDER_CURSOR));
+    }
+}
+
+#[test]
+fn compatibility_routing_is_not_hardcoded_to_the_claude_entrypoint() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-session",
+        "timestamp": "2026-07-17T19:42:00.000Z",
+        "tool_name": "read_file",
+        "tool_use_id": "call_123__vscode-1784317320000"
+    })
+    .to_string();
+
+    let route = route_hook_invocation(PROVIDER_CODEX, &payload, |native_provider, _| {
+        assert_eq!(native_provider, PROVIDER_VSCODE);
+        true
+    });
+    assert_eq!(
+        route,
+        HookInvocationRoute::Suppress {
+            native_provider: PROVIDER_VSCODE
+        }
+    );
+}
+
+#[test]
+fn ordinary_provider_payloads_bypass_native_evidence_lookup() {
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "claude-session",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-1"
+    })
+    .to_string();
+
+    let route = route_hook_invocation(PROVIDER_CLAUDE_CODE, &payload, |_, _| {
+        panic!("ordinary provider payload must not trigger native evidence lookup")
+    });
+    assert_eq!(route, HookInvocationRoute::ProcessAs(PROVIDER_CLAUDE_CODE));
+}
+
+#[test]
+fn native_hook_invocation_keys_normalize_cursor_and_vscode_payloads() {
+    let cursor = native_hook_invocation_key(
+        PROVIDER_CURSOR,
+        &json!({
+            "hook_event_name": "beforeShellExecution",
+            "conversation_id": "cursor-session",
+            "generation_id": "generation-1",
+            "tool_use_id": "tool-1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(cursor.provider, PROVIDER_CURSOR);
+    assert_eq!(cursor.session_id, "cursor-session");
+    assert_eq!(cursor.event_name, "PermissionRequest");
+    assert_eq!(cursor.tool_use_id.as_deref(), Some("tool-1"));
+    assert_eq!(cursor.invocation_id, None);
+
+    let vscode = native_hook_invocation_key(
+        PROVIDER_VSCODE,
+        &json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "vscode-session",
+            "timestamp": "2026-07-20T12:00:00Z",
+            "tool_use_id": "tool-2"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(vscode.provider, PROVIDER_VSCODE);
+    assert_eq!(vscode.session_id, "vscode-session");
+    assert_eq!(vscode.event_name, "PreToolUse");
+    assert_eq!(vscode.tool_use_id.as_deref(), Some("tool-2"));
+    assert_eq!(vscode.invocation_id, None);
+}
+
+#[test]
+fn native_hook_invocation_key_requires_strong_correlation_fields() {
+    let valid_cursor_lifecycle = json!({
+        "hook_event_name": "beforeSubmitPrompt",
+        "conversation_id": "cursor-session",
+        "generation_id": "generation-1"
+    })
+    .to_string();
+    let lifecycle_key =
+        native_hook_invocation_key(PROVIDER_CURSOR, &valid_cursor_lifecycle).unwrap();
+    assert_eq!(lifecycle_key.tool_use_id, None);
+    assert_eq!(lifecycle_key.invocation_id.as_deref(), Some("generation-1"));
+
+    for payload in [
+        json!({
+            "hook_event_name": "preToolUse",
+            "tool_use_id": "tool-1"
+        }),
+        json!({
+            "conversation_id": "cursor-session",
+            "tool_use_id": "tool-1"
+        }),
+        json!({
+            "hook_event_name": "beforeSubmitPrompt",
+            "conversation_id": "cursor-session"
+        }),
+    ] {
+        assert!(native_hook_invocation_key(PROVIDER_CURSOR, &payload.to_string()).is_none());
+    }
+    assert!(native_hook_invocation_key(PROVIDER_CURSOR, "not json").is_none());
+    assert!(native_hook_invocation_key(PROVIDER_CLAUDE_CODE, &valid_cursor_lifecycle).is_none());
+}
+
+#[test]
+fn recent_native_hook_evidence_matches_every_identity_field_and_handles_races() {
+    let root = telemetry_test_root("native-hook-evidence-match");
+    let _ = fs::remove_dir_all(&root);
+    let now = 5_000_000;
+    let payload = json!({
+        "hook_event_name": "preToolUse",
+        "conversation_id": "cursor-session",
+        "generation_id": "generation-1",
+        "cursor_version": "3.12.17",
+        "tool_name": "Read",
+        "tool_use_id": "tool-1"
+    });
+
+    // Compatibility wins the startup race: no suppression evidence exists yet.
+    assert!(!take_recent_native_hook_invocation_evidence_at(
+        &root,
+        PROVIDER_CURSOR,
+        &payload.to_string(),
+        now,
+    )
+    .unwrap());
+    assert!(record_native_hook_invocation_evidence_at(
+        &root,
+        PROVIDER_CURSOR,
+        &payload.to_string(),
+        now,
+    )
+    .unwrap());
+    for (field, value) in [
+        ("conversation_id", "other-session"),
+        ("hook_event_name", "postToolUse"),
+        ("tool_use_id", "tool-2"),
+    ] {
+        let mut changed = payload.clone();
+        changed[field] = json!(value);
+        assert!(!take_recent_native_hook_invocation_evidence_at(
+            &root,
+            PROVIDER_CURSOR,
+            &changed.to_string(),
+            now + 1,
+        )
+        .unwrap());
+    }
+    assert!(!take_recent_native_hook_invocation_evidence_at(
+        &root,
+        PROVIDER_VSCODE,
+        &payload.to_string(),
+        now + 1,
+    )
+    .unwrap());
+    assert!(take_recent_native_hook_invocation_evidence_at(
+        &root,
+        PROVIDER_CURSOR,
+        &payload.to_string(),
+        now + 1,
+    )
+    .unwrap());
+    // Evidence is single-use, so a reused tool ID cannot suppress a later
+    // compatibility invocation without another observed native invocation.
+    assert!(!take_recent_native_hook_invocation_evidence_at(
+        &root,
+        PROVIDER_CURSOR,
+        &payload.to_string(),
+        now + 2,
+    )
+    .unwrap());
+
+    assert!(record_native_hook_invocation_evidence_at(
+        &root,
+        PROVIDER_CURSOR,
+        &payload.to_string(),
+        now + 2,
+    )
+    .unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root.join(NATIVE_HOOK_EVIDENCE_DIR);
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let marker = fs::read_dir(dir).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(
+            fs::metadata(marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn native_hook_evidence_expires_rejects_future_and_corrupt_markers_and_prunes() {
+    let root = telemetry_test_root("native-hook-evidence-expiry");
+    let _ = fs::remove_dir_all(&root);
+    let first = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-session",
+        "timestamp": "2026-07-20T12:00:00Z",
+        "tool_use_id": "tool-1"
+    })
+    .to_string();
+    let second = json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-session",
+        "timestamp": "2026-07-20T12:01:01Z",
+        "tool_use_id": "tool-2"
+    })
+    .to_string();
+
+    assert!(
+        record_native_hook_invocation_evidence_at(&root, PROVIDER_VSCODE, &first, 100).unwrap()
+    );
+    assert!(take_recent_native_hook_invocation_evidence_at(
+        &root,
+        PROVIDER_VSCODE,
+        &first,
+        100 + NATIVE_HOOK_EVIDENCE_TTL_MS,
+    )
+    .unwrap());
+    assert!(
+        record_native_hook_invocation_evidence_at(&root, PROVIDER_VSCODE, &first, 100).unwrap()
+    );
+    assert!(!take_recent_native_hook_invocation_evidence_at(
+        &root,
+        PROVIDER_VSCODE,
+        &first,
+        101 + NATIVE_HOOK_EVIDENCE_TTL_MS,
+    )
+    .unwrap());
+
+    assert!(
+        record_native_hook_invocation_evidence_at(&root, PROVIDER_VSCODE, &first, 1_000).unwrap()
+    );
+    assert!(
+        !take_recent_native_hook_invocation_evidence_at(&root, PROVIDER_VSCODE, &first, 999,)
+            .unwrap()
+    );
+
+    assert!(
+        record_native_hook_invocation_evidence_at(&root, PROVIDER_VSCODE, &first, 2_000).unwrap()
+    );
+    let marker = fs::read_dir(root.join(NATIVE_HOOK_EVIDENCE_DIR))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::write(&marker, "corrupt").unwrap();
+    assert!(
+        !take_recent_native_hook_invocation_evidence_at(&root, PROVIDER_VSCODE, &first, 2_001,)
+            .unwrap()
+    );
+
+    assert!(
+        record_native_hook_invocation_evidence_at(&root, PROVIDER_VSCODE, &first, 3_000).unwrap()
+    );
+    assert!(record_native_hook_invocation_evidence_at(
+        &root,
+        PROVIDER_VSCODE,
+        &second,
+        3_001 + NATIVE_HOOK_EVIDENCE_TTL_MS,
+    )
+    .unwrap());
+    assert_eq!(
+        fs::read_dir(root.join(NATIVE_HOOK_EVIDENCE_DIR))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2903,7 +3451,7 @@ fn daemon_request_rejects_unwrapped_or_missing_provider() {
 }
 
 #[test]
-fn daemon_waits_for_antigravity_stdout_events() {
+fn daemon_waits_for_hook_events_that_can_return_stdout() {
     assert_eq!(
         daemon_response_mode(&test_hook_event(PROVIDER_ANTIGRAVITY, "PreToolUse")),
         DaemonResponseMode::Required
@@ -2918,6 +3466,11 @@ fn daemon_waits_for_antigravity_stdout_events() {
     assert_eq!(
         daemon_response_mode(&test_hook_event(PROVIDER_CLAUDE_CODE, "PostToolUse")),
         DaemonResponseMode::FireAndForget
+    );
+    assert_eq!(
+        daemon_response_mode(&test_hook_event(PROVIDER_CODEX, "Stop")),
+        DaemonResponseMode::Optional,
+        "Codex Stop can return a fork continuation prompt"
     );
 }
 
@@ -6157,15 +6710,19 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert!(finding
         .message
         .contains("gensee run fork run_123 --name try-upgrade --attach tmux:right --json"));
+    assert!(finding.message.contains("End this source turn normally"));
     assert!(finding
         .message
-        .contains("gensee run send <fork-id> -- '<task prompt>'"));
+        .contains("do not resend the prompt with `gensee run send`"));
+    assert!(finding.message.contains("do not poll fork-status"));
     assert!(finding
         .message
-        .contains("After sending the prompt, do not poll gensee for task completion"));
+        .contains("saved original request to the fork automatically"));
     assert!(finding
         .message
-        .contains("ask the user to report the fork result"));
+        .contains("fork will summarize its own changed files and tests"));
+    assert!(finding.message.contains("Do not auto-merge"));
+    assert!(finding.message.contains("wait for explicit user approval"));
     assert_eq!(finding.evidence["reason"], json!("dependency_upgrade"));
 }
 

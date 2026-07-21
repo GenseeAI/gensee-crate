@@ -592,6 +592,26 @@ pub(crate) fn telemetry_record_policy_event(
     // telemetry transport issues; upload on non-hook paths instead.
 }
 
+pub(crate) fn telemetry_record_hook_compatibility_suppressed(
+    source_provider: &str,
+    native_provider: &str,
+) {
+    let client = match TelemetryClient::load_default() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("gensee telemetry: {error}");
+            return;
+        }
+    };
+    let _ = client.record_event(
+        "hook_compatibility_duplicate_suppressed",
+        json!({
+            "source_provider": source_provider,
+            "native_provider": native_provider,
+        }),
+    );
+}
+
 pub(crate) fn telemetry_record_policy_change(kind: &str, props: Value) {
     telemetry_record_dashboard_event(kind, props);
 }
