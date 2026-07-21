@@ -46,7 +46,9 @@ GENSEE_HOME=/absolute/gensee-home /absolute/path/to/gensee hook cursor
 
 Cursor may also load Claude-compatible hook settings. Gensee detects imported
 Claude invocations from conservative Cursor runtime markers and suppresses one
-only when a native Gensee Cursor hook covers the same event. Otherwise the
+only after observing the matching native invocation for the same conversation,
+event, and tool or generation ID. Configuration presence alone never suppresses
+a hook. If evidence is absent or the compatibility invocation wins the race, the
 payload is processed through the Cursor parser, preserving enforcement without
 requiring users to remove either configuration.
 

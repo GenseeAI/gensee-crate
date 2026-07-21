@@ -70,6 +70,8 @@ mod daemon;
 pub(crate) use daemon::*;
 mod telemetry;
 pub(crate) use telemetry::*;
+mod hook_compatibility;
+pub(crate) use hook_compatibility::*;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -1438,126 +1440,6 @@ fn write_json_config_if_changed_with_mode(
 
 fn gensee_hook_command_owned_by(command: &str, provider: &str) -> bool {
     command.contains("GENSEE_HOME=") && command.trim_end().ends_with(&format!(" hook {provider}"))
-}
-
-fn config_has_owned_hook_for_event(root: &Value, provider: &str, event_name: &str) -> bool {
-    fn contains_owned_command(value: &Value, provider: &str) -> bool {
-        match value {
-            Value::Object(object) => {
-                object
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(|command| gensee_hook_command_owned_by(command, provider))
-                    || object
-                        .values()
-                        .any(|value| contains_owned_command(value, provider))
-            }
-            Value::Array(values) => values
-                .iter()
-                .any(|value| contains_owned_command(value, provider)),
-            _ => false,
-        }
-    }
-
-    root.get("hooks")
-        .and_then(|hooks| hooks.get(event_name))
-        .is_some_and(|event| contains_owned_command(event, provider))
-}
-
-fn native_hook_config_paths(provider: &str, payload: &Value) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        match provider {
-            PROVIDER_CURSOR => paths.push(home.join(".cursor").join("hooks.json")),
-            PROVIDER_VSCODE => paths.push(home.join(".copilot").join("hooks").join("gensee.json")),
-            _ => {}
-        }
-    }
-
-    let mut workspace_roots = payload
-        .get("workspace_roots")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|root| !root.trim().is_empty())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    if let Some(cwd) = payload
-        .get("cwd")
-        .and_then(Value::as_str)
-        .filter(|cwd| !cwd.trim().is_empty())
-    {
-        workspace_roots.push(PathBuf::from(cwd));
-    }
-
-    for root in workspace_roots {
-        let path = match provider {
-            PROVIDER_CURSOR => root.join(".cursor").join("hooks.json"),
-            PROVIDER_VSCODE => root.join(".github").join("hooks").join("gensee.json"),
-            _ => continue,
-        };
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    paths
-}
-
-fn native_gensee_hook_configured(provider: &str, payload: &str) -> io::Result<bool> {
-    let payload_value: Value = serde_json::from_str(payload).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("compatibility payload is not valid JSON: {error}"),
-        )
-    })?;
-    let Some(event_name) = payload_value
-        .get("hook_event_name")
-        .and_then(Value::as_str)
-        .filter(|event_name| !event_name.trim().is_empty())
-    else {
-        return Ok(false);
-    };
-
-    let mut first_error = None;
-    for path in native_hook_config_paths(provider, &payload_value) {
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                first_error.get_or_insert_with(|| {
-                    io::Error::new(
-                        error.kind(),
-                        format!("cannot read native hook config {}: {error}", path.display()),
-                    )
-                });
-                continue;
-            }
-        };
-        let root = match serde_json::from_str::<Value>(&contents) {
-            Ok(root) => root,
-            Err(error) => {
-                first_error.get_or_insert_with(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "native hook config {} is not valid JSON: {error}",
-                            path.display()
-                        ),
-                    )
-                });
-                continue;
-            }
-        };
-        if config_has_owned_hook_for_event(&root, provider, event_name) {
-            return Ok(true);
-        }
-    }
-
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(false),
-    }
 }
 
 fn command_hook_owned_by(entry: &Value, provider: &str, context: &str) -> io::Result<bool> {
@@ -3444,55 +3326,43 @@ pub(crate) fn ingest_eslogger() -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum HookInvocationRoute<'a> {
-    ProcessAs(&'a str),
-    Suppress { native_provider: &'static str },
-}
-
-fn route_hook_invocation<'a>(
-    provider: &'a str,
-    payload: &str,
-    native_hook_configured: impl FnOnce(&'static str, &str) -> bool,
-) -> HookInvocationRoute<'a> {
-    let Some(native_provider) = compatibility_payload_provider(payload) else {
-        return HookInvocationRoute::ProcessAs(provider);
-    };
-    if native_provider == provider {
-        return HookInvocationRoute::ProcessAs(provider);
-    }
-    if native_hook_configured(native_provider, payload) {
-        HookInvocationRoute::Suppress { native_provider }
-    } else {
-        HookInvocationRoute::ProcessAs(native_provider)
-    }
-}
-
 pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     let mut payload = String::new();
     io::stdin().read_to_string(&mut payload)?;
 
-    let mut config_error = None;
+    // Record proof that the host actually invoked the native hook before doing
+    // any parsing, policy, daemon, or store work. A concurrently launched
+    // compatibility hook can use this short-lived evidence to suppress itself.
+    if matches!(provider, PROVIDER_CURSOR | PROVIDER_VSCODE) {
+        if let Err(error) = record_native_hook_invocation_evidence(provider, &payload) {
+            // Evidence failure must not interfere with the native hook. The
+            // compatibility invocation will process normally, yielding at most
+            // a duplicate rather than a gap in enforcement.
+            eprintln!(
+                "gensee hook: cannot record native {provider} invocation evidence ({error}); compatibility hooks will not be suppressed"
+            );
+        }
+    }
+
+    let mut evidence_error = None;
     let route = route_hook_invocation(provider, &payload, |native_provider, payload| {
-        match native_gensee_hook_configured(native_provider, payload) {
-            Ok(configured) => configured,
+        match take_recent_native_hook_invocation_evidence(native_provider, payload) {
+            Ok(observed) => observed,
             Err(error) => {
-                config_error = Some((native_provider, error));
+                evidence_error = Some((native_provider, error));
                 false
             }
         }
     });
-    if let Some((native_provider, error)) = config_error {
-        // A broken or unreadable native config is not evidence that the native
-        // hook will run. Preserve enforcement by handling this compatibility
-        // invocation through the native parser.
+    if let Some((native_provider, error)) = evidence_error {
         eprintln!(
-            "gensee hook: cannot verify {native_provider} native hook config ({error}); processing the compatibility invocation"
+            "gensee hook: cannot verify recent native {native_provider} invocation evidence ({error}); processing the compatibility invocation"
         );
     }
     let effective_provider = match route {
         HookInvocationRoute::ProcessAs(provider) => provider,
         HookInvocationRoute::Suppress { native_provider } => {
+            warn_hook_compatibility_suppressed(provider, native_provider);
             telemetry_record_hook_compatibility_suppressed(provider, native_provider);
             return Ok(());
         }

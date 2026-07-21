@@ -91,8 +91,8 @@ curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/
 
 To configure VS Code / GitHub Copilot hooks, use the VS Code toggle. VS Code
 also loads Claude-compatible hook settings; when both Gensee integrations are
-installed, Gensee detects the VS Code payload and suppresses the imported
-Claude invocation for events covered by the native VS Code hook:
+installed, Gensee suppresses an imported Claude invocation only after observing
+the matching native VS Code invocation for the same session, event, and tool:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_VSCODE=1 bash

@@ -20,9 +20,16 @@ additional backups. Restart Cursor after setup.
 Cursor can also import Claude-compatible hook settings. If Gensee's Claude Code
 hooks are present, Gensee recognizes Cursor payloads using `cursor_version` plus
 an independent conversation or transcript marker. A Claude compatibility
-invocation is suppressed only when the native Cursor config contains a Gensee
-hook for that same event. If the native hook is absent, the invocation continues
-through the Cursor parser so enforcement and provider attribution are preserved.
+invocation is suppressed only after the matching native Cursor invocation has
+been observed recently for the same conversation, normalized event, and tool or
+generation ID. Hook configuration on disk is not treated as proof that a native
+hook is live. If the compatibility invocation wins a startup race, required
+identifiers are absent, or evidence cannot be read, it continues through the
+Cursor parser. This can produce a duplicate event but preserves enforcement.
+
+Gensee writes a warning to the host hook log on the first suppressed
+compatibility invocation and periodically thereafter. The notice is rate-limited
+per native provider and does not depend on telemetry collection being enabled.
 
 The one-line installer can configure Cursor non-interactively:
 

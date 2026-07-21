@@ -531,23 +531,25 @@ fn build_vscode_hook_event(value: Value, observed_at_ms: u64) -> io::Result<Agen
 /// event names (`preToolUse`, `beforeShellExecution`, …) and uses
 /// `conversation_id` where other providers use `session_id`. Normalize both so
 /// the shared `process_hook_event` path works without change.
+pub(crate) fn normalize_cursor_hook_event_name(name: &str) -> &str {
+    match name {
+        "preToolUse" => "PreToolUse",
+        "postToolUse" => "PostToolUse",
+        "beforeShellExecution" => "PermissionRequest",
+        "beforeSubmitPrompt" => "UserPromptSubmit",
+        "stop" => "Stop",
+        other => other,
+    }
+}
+
 fn build_cursor_hook_event(value: Value, observed_at_ms: u64) -> io::Result<AgentHookEvent> {
     let raw_event_name = v_str(&value, "hook_event_name");
     // Map Cursor camelCase event names to the PascalCase names expected by the
     // shared processing path.
-    let hook_event_name = raw_event_name.as_deref().map(|name| {
-        match name {
-            "preToolUse" => "PreToolUse",
-            "postToolUse" => "PostToolUse",
-            // beforeShellExecution carries a top-level `command` field like
-            // Codex PermissionRequest; reuse that evaluation path.
-            "beforeShellExecution" => "PermissionRequest",
-            "beforeSubmitPrompt" => "UserPromptSubmit",
-            "stop" => "Stop",
-            other => other,
-        }
-        .to_string()
-    });
+    let hook_event_name = raw_event_name
+        .as_deref()
+        .map(normalize_cursor_hook_event_name)
+        .map(ToString::to_string);
 
     // beforeShellExecution has the shell command at the top level.
     let top_level_shell_command = raw_event_name
