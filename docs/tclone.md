@@ -94,7 +94,9 @@ gensee-tclone run send "$FORK_ID" -- 'Try the dependency upgrade, run tests, and
 When a fork is scheduled asynchronously from inside an agent, the JSON response
 includes `status_command`. Poll it until `status=succeeded`, then use
 `forks[0].run_id`; if it returns `status=failed`, stop and inspect the included
-log summary.
+log summary. During live-clone capability rotation, a poll may temporarily
+return `status=running`, `transient=true`, and `retry_after_ms`; retry the same
+status command after that delay and never schedule a replacement fork.
 
 Use `gensee run exec <id> -- <command>` for non-interactive work in a fork,
 such as commands requested by an agent. The command runs inside the container

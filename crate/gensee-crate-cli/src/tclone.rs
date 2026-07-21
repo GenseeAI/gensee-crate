@@ -264,6 +264,10 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
     print!("{}", response.stdout);
     eprint!("{}", response.stderr);
     if let Some(error) = response.error {
+        if let Some(payload) = tclone_retryable_fork_status_payload(&request.args, &error) {
+            println!("{}", serde_json::to_string(&payload)?);
+            return Ok(true);
+        }
         return Err(io::Error::other(error));
     }
     if response.exit_code.unwrap_or(1) == 0 {
@@ -274,6 +278,47 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
             response.exit_code.unwrap_or(1)
         )))
     }
+}
+
+fn tclone_retryable_fork_status_payload(args: &[String], error: &str) -> Option<Value> {
+    let is_json_status_poll = args.first().map(String::as_str) == Some("run")
+        && args.get(1).map(String::as_str) == Some("fork-status")
+        && args.iter().any(|arg| arg == "--json");
+    let capability_is_rotating = error.contains("host-control capability rotation in progress");
+    if !is_json_status_poll || !capability_is_rotating {
+        return None;
+    }
+    let job_id = args.get(2)?.to_string();
+    if !tclone_is_safe_token(&job_id) {
+        return None;
+    }
+    let poll_command = format!("gensee run fork-status {job_id} --json");
+    Some(json!({
+        "command": "run fork-status",
+        "job_id": job_id,
+        "status": "running",
+        "transient": true,
+        "retryable": true,
+        "retry_after_ms": 500,
+        "status_command": poll_command,
+        "poll_command": poll_command,
+        "message": "the source host-control capability is rotating while the fork is prepared; retry this same status command and do not create another fork",
+    }))
+}
+
+fn tclone_host_control_capability_rotation_in_progress(run_id: &str) -> bool {
+    tclone_host_fork_marker_path(run_id)
+        .and_then(fs::read_to_string)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|marker_ms| !tclone_fork_marker_is_stale(marker_ms))
+}
+
+fn tclone_host_control_capability_rotation_error(run_id: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("host-control capability rotation in progress for tclone run {run_id}"),
+    )
 }
 
 fn read_tclone_run_context() -> io::Result<Value> {
@@ -946,6 +991,7 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
                 "tclone host-control request is missing a valid caller run id",
             )
         })?;
+    let subcommand = request.args.get(1).map(String::as_str).unwrap_or_default();
     let nonce = request
         .nonce
         .as_deref()
@@ -973,7 +1019,16 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
                 "tclone host-control request is missing its authenticator",
             )
         })?;
-    let capability = read_tclone_host_control_capability(caller_run_id)?;
+    let capability = match read_tclone_host_control_capability(caller_run_id) {
+        Ok(capability) => capability,
+        Err(_)
+            if subcommand == "fork-status"
+                && tclone_host_control_capability_rotation_in_progress(caller_run_id) =>
+        {
+            return Err(tclone_host_control_capability_rotation_error(caller_run_id));
+        }
+        Err(error) => return Err(error),
+    };
     let expected_authenticator = tclone_host_control_authenticator(
         caller_run_id,
         nonce,
@@ -985,12 +1040,16 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
         supplied_authenticator.as_bytes(),
         expected_authenticator.as_bytes(),
     ) {
+        if subcommand == "fork-status"
+            && tclone_host_control_capability_rotation_in_progress(caller_run_id)
+        {
+            return Err(tclone_host_control_capability_rotation_error(caller_run_id));
+        }
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "invalid tclone host-control request authenticator",
         ));
     }
-    let subcommand = request.args.get(1).map(String::as_str).unwrap_or_default();
     match subcommand {
         "fork" => {
             let caller = find_tclone_record(caller_run_id)?;
@@ -6637,6 +6696,61 @@ mod tests {
     }
 
     #[test]
+    fn tclone_host_control_marks_only_active_rotation_auth_failures_retryable() {
+        let _guard = tclone_test_env_lock();
+        let run_id = format!(
+            "rotation_source_{}_{}",
+            std::process::id(),
+            unix_millis().unwrap()
+        );
+        let run_root = gensee_tmp_root().unwrap().join(&run_id);
+        let marker = tclone_host_fork_marker_path(&run_id).unwrap();
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, format!("{}\n", unix_millis().unwrap())).unwrap();
+        let args = vec![
+            "run".to_string(),
+            "fork-status".to_string(),
+            "rotation_job_1".to_string(),
+            "--json".to_string(),
+        ];
+
+        let missing_capability = signed_host_control_request(
+            &run_id,
+            "previous-capability",
+            "rotation-missing",
+            args.clone(),
+        );
+        let error = validate_tclone_host_control_request(&missing_capability).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error
+            .to_string()
+            .contains("host-control capability rotation in progress"));
+
+        fs::remove_file(&marker).unwrap();
+        let error = validate_tclone_host_control_request(&missing_capability).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error
+            .to_string()
+            .contains("no valid host-control capability"));
+
+        fs::write(&marker, format!("{}\n", unix_millis().unwrap())).unwrap();
+        rotate_tclone_host_control_capability(&run_id).unwrap();
+        let stale_authenticator =
+            signed_host_control_request(&run_id, "previous-capability", "rotation-stale", args);
+        let error = validate_tclone_host_control_request(&stale_authenticator).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        fs::remove_file(&marker).unwrap();
+        let error = validate_tclone_host_control_request(&stale_authenticator).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error
+            .to_string()
+            .contains("invalid tclone host-control request authenticator"));
+
+        fs::remove_dir_all(run_root).ok();
+    }
+
+    #[test]
     fn tclone_host_control_authenticator_binds_args_nonce_and_time() {
         let args = vec!["run".to_string(), "diff".to_string(), "run_1".to_string()];
         let first = tclone_host_control_authenticator("run_1", "nonce-1", 1_000, &args, "secret-1")
@@ -7363,6 +7477,55 @@ gensee async job job_1: exited status=0
             OsString::from("--runtime"),
             OsString::from("tclone"),
         ]));
+    }
+
+    #[test]
+    fn tclone_fork_status_treats_capability_rotation_as_retryable() {
+        let args = vec![
+            "run".to_string(),
+            "fork-status".to_string(),
+            "run_source_job_1".to_string(),
+            "--json".to_string(),
+        ];
+
+        let error = "host-control capability rotation in progress for tclone run run_source";
+        let payload = tclone_retryable_fork_status_payload(&args, error).unwrap();
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["transient"], true);
+        assert_eq!(payload["retryable"], true);
+        assert_eq!(payload["retry_after_ms"], 500);
+        assert_eq!(payload["job_id"], "run_source_job_1");
+        assert_eq!(
+            payload["status_command"],
+            "gensee run fork-status run_source_job_1 --json"
+        );
+        assert!(payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("do not create another fork"));
+    }
+
+    #[test]
+    fn tclone_fork_status_keeps_non_rotation_errors_terminal() {
+        let status_args = vec![
+            "run".to_string(),
+            "fork-status".to_string(),
+            "run_source_job_1".to_string(),
+            "--json".to_string(),
+        ];
+        let list_args = vec!["run".to_string(), "list".to_string(), "--json".to_string()];
+
+        assert!(tclone_retryable_fork_status_payload(&status_args, "fork job failed").is_none());
+        assert!(tclone_retryable_fork_status_payload(
+            &list_args,
+            "host-control capability rotation in progress for tclone run run_source"
+        )
+        .is_none());
+        assert!(tclone_retryable_fork_status_payload(
+            &status_args,
+            "no valid host-control capability for tclone run run_source"
+        )
+        .is_none());
     }
 
     #[test]
