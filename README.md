@@ -466,9 +466,15 @@ destructive cleanup, and database resets. In Codex tclone source runs, matching
 user prompts add fork guidance before planning; matching source commands are
 blocked as a backstop so the risky work happens in a fork first.
 Async fork JSON includes `status_command`; poll it until `status=succeeded`,
-then send work to `forks[0].run_id`. A transient capability-rotation response
-uses `status=running` and `transient=true`; retry the same status command rather
-than creating another fork.
+then send work to `forks[0].run_id`. A transient capability-rotation or
+checkpoint-interrupted response uses `status=running` and `transient=true`;
+retry the same status command rather than creating another fork. JSON status
+polls use a short control-bridge timeout so a response inherited by the clone
+cannot leave the source agent stuck waiting. Only the source may send work to a
+direct child, so an inherited orchestration turn cannot make the fork send the
+task to itself. Sending a task also marks it queued before tmux input; completion
+is accepted only after that prompt starts, so the inherited source turn cannot
+be mistaken for the fork task finishing.
 Use a tclone image with `tmux` for reliable `gensee run attach`. From inside a
 host tmux session, `--attach tmux:right` opens the forked live agent in a new
 pane. Without tmux, `gensee run shell` still opens a new shell but does not

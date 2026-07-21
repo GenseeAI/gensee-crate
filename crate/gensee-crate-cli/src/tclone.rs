@@ -24,6 +24,7 @@ const TCLONE_HOST_CONTROL_DISABLE_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DISABL
 const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
 const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
 const TCLONE_HOST_CONTROL_COMMAND_TIMEOUT_SECS: u64 = 300;
+const TCLONE_FORK_STATUS_CONTROL_TIMEOUT_SECS: u64 = 2;
 const TCLONE_HOST_CONTROL_AUTH_DIR: &str = "host-control-auth";
 const TCLONE_HOST_CONTROL_MAX_NONCES_PER_CAPABILITY: usize = 10_000;
 // A request must remain fresh longer than the file client's response wait, and
@@ -102,6 +103,12 @@ struct TcloneHostControlResponse {
     stdout: String,
     stderr: String,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcloneForkStatusTransient {
+    CapabilityRotation,
+    TransportInterrupted,
 }
 
 #[derive(Debug, Clone)]
@@ -252,21 +259,33 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
                     io::ErrorKind::PermissionDenied | io::ErrorKind::ConnectionRefused
                 ) =>
             {
-                tclone_host_control_file_request(&request)?
+                match tclone_host_control_file_request(&request) {
+                    Ok(response) => response,
+                    Err(error) => return tclone_host_control_transport_error(&request.args, error),
+                }
             }
-            Err(error) => return Err(error),
+            Err(error) => return tclone_host_control_transport_error(&request.args, error),
         },
         None if tclone_host_control_dir_path().is_some() => {
-            tclone_host_control_file_request(&request)?
+            match tclone_host_control_file_request(&request) {
+                Ok(response) => response,
+                Err(error) => return tclone_host_control_transport_error(&request.args, error),
+            }
         }
         None => return Ok(false),
     };
     print!("{}", response.stdout);
     eprint!("{}", response.stderr);
     if let Some(error) = response.error {
-        if let Some(payload) = tclone_retryable_fork_status_payload(&request.args, &error) {
-            println!("{}", serde_json::to_string(&payload)?);
-            return Ok(true);
+        if error.contains("host-control capability rotation in progress") {
+            let payload = tclone_retryable_fork_status_payload(
+                &request.args,
+                TcloneForkStatusTransient::CapabilityRotation,
+            );
+            if let Some(payload) = payload {
+                println!("{}", serde_json::to_string(&payload)?);
+                return Ok(true);
+            }
         }
         return Err(io::Error::other(error));
     }
@@ -280,12 +299,32 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
     }
 }
 
-fn tclone_retryable_fork_status_payload(args: &[String], error: &str) -> Option<Value> {
-    let is_json_status_poll = args.first().map(String::as_str) == Some("run")
-        && args.get(1).map(String::as_str) == Some("fork-status")
-        && args.iter().any(|arg| arg == "--json");
-    let capability_is_rotating = error.contains("host-control capability rotation in progress");
-    if !is_json_status_poll || !capability_is_rotating {
+fn tclone_host_control_transport_error(args: &[String], error: io::Error) -> io::Result<bool> {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    ) {
+        if let Some(payload) = tclone_retryable_fork_status_payload(
+            args,
+            TcloneForkStatusTransient::TransportInterrupted,
+        ) {
+            println!("{}", serde_json::to_string(&payload)?);
+            return Ok(true);
+        }
+    }
+    Err(error)
+}
+
+fn tclone_retryable_fork_status_payload(
+    args: &[String],
+    reason: TcloneForkStatusTransient,
+) -> Option<Value> {
+    if !tclone_is_json_fork_status_poll(args) {
         return None;
     }
     let job_id = args.get(2)?.to_string();
@@ -293,6 +332,14 @@ fn tclone_retryable_fork_status_payload(args: &[String], error: &str) -> Option<
         return None;
     }
     let poll_command = format!("gensee run fork-status {job_id} --json");
+    let message = match reason {
+        TcloneForkStatusTransient::CapabilityRotation => {
+            "the source host-control capability is rotating while the fork is prepared; retry this same status command and do not create another fork"
+        }
+        TcloneForkStatusTransient::TransportInterrupted => {
+            "the fork-status response was interrupted while the source was checkpointed; retry this same status command and do not create another fork"
+        }
+    };
     Some(json!({
         "command": "run fork-status",
         "job_id": job_id,
@@ -302,7 +349,7 @@ fn tclone_retryable_fork_status_payload(args: &[String], error: &str) -> Option<
         "retry_after_ms": 500,
         "status_command": poll_command,
         "poll_command": poll_command,
-        "message": "the source host-control capability is rotating while the fork is prepared; retry this same status command and do not create another fork",
+        "message": message,
     }))
 }
 
@@ -387,23 +434,28 @@ fn try_record_tclone_fork_hook_lifecycle(event: &AgentHookEvent) -> io::Result<(
             result.tests.clear();
         }
         Some("PostToolUse") => {
-            if let Some(command) = event
-                .tool_input_command
-                .as_deref()
-                .filter(|command| tclone_command_is_test(command))
-            {
-                let (exit_code, success) = tclone_hook_command_outcome(event);
-                let output = tclone_hook_output_excerpt(event);
-                result.tests.push(TcloneForkTestResult {
-                    command: command.to_string(),
-                    success,
-                    exit_code,
-                    interrupted: event.tool_response_interrupted.unwrap_or(false),
-                    output,
-                });
+            if result.status == "running" {
+                if let Some(command) = event
+                    .tool_input_command
+                    .as_deref()
+                    .filter(|command| tclone_command_is_test(command))
+                {
+                    let (exit_code, success) = tclone_hook_command_outcome(event);
+                    let output = tclone_hook_output_excerpt(event);
+                    result.tests.push(TcloneForkTestResult {
+                        command: command.to_string(),
+                        success,
+                        exit_code,
+                        interrupted: event.tool_response_interrupted.unwrap_or(false),
+                        output,
+                    });
+                }
             }
         }
         Some("Stop") => {
+            if result.status == "queued" {
+                return Ok(());
+            }
             result.status = "completed".to_string();
             result.completed_at_ms = Some(event.observed_at_ms);
             result.assistant_summary = assistant_response_from_hook(event);
@@ -710,6 +762,11 @@ fn tclone_host_control_request(
             ),
         )
     })?;
+    if tclone_is_json_fork_status_poll(&request.args) {
+        let timeout = Some(Duration::from_secs(TCLONE_FORK_STATUS_CONTROL_TIMEOUT_SECS));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+    }
     serde_json::to_writer(&mut stream, request)?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();
@@ -755,7 +812,8 @@ fn tclone_host_control_file_request(
 
     write_atomic_nofollow(&request_path, &serde_json::to_vec(request)?, 0o600)?;
 
-    let deadline = Instant::now() + Duration::from_secs(tclone_host_control_file_timeout_secs());
+    let deadline = Instant::now()
+        + Duration::from_secs(tclone_host_control_file_timeout_secs_for_request(request));
     loop {
         match open_nofollow_read(&response_path) {
             Ok(mut file) => {
@@ -793,6 +851,24 @@ fn tclone_host_control_file_timeout_secs() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS);
     clamp_tclone_host_control_file_timeout_secs(configured)
+}
+
+fn tclone_host_control_file_timeout_secs_for_request(request: &TcloneHostControlRequest) -> u64 {
+    let configured = tclone_host_control_file_timeout_secs();
+    if tclone_is_json_fork_status_poll(&request.args) {
+        configured.min(TCLONE_FORK_STATUS_CONTROL_TIMEOUT_SECS)
+    } else {
+        configured
+    }
+}
+
+fn tclone_is_json_fork_status_poll(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("run")
+        && args.get(1).map(String::as_str) == Some("fork-status")
+        && args
+            .get(2)
+            .is_some_and(|job_id| tclone_is_safe_token(job_id))
+        && args.iter().any(|arg| arg == "--json")
 }
 
 fn clamp_tclone_host_control_file_timeout_secs(configured: u64) -> u64 {
@@ -1066,11 +1142,12 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
             )?;
         }
         "send" => {
+            validate_tclone_source_caller(caller_run_id)?;
             let (target_args, _) = tclone_send_split(&args[2..])?;
             validate_tclone_host_control_target_strings(
                 target_args,
                 caller_run_id,
-                TcloneHostControlTargetScope::CallerOrDirectChild,
+                TcloneHostControlTargetScope::DirectChild,
             )?;
         }
         "exec" => {
@@ -2683,6 +2760,9 @@ pub(crate) fn tclone_send(args: Vec<OsString>) -> io::Result<()> {
     ensure_tclone_container_exists(&podman, &record)?;
     write_tclone_run_context_if_possible(&podman, &record);
     let prompt = tclone_prompt_with_fork_context(&record, &prompt);
+    if enter && record.role == "fork" {
+        mark_tclone_fork_task_queued(&podman, &record)?;
+    }
     tclone_send_prompt_to_agent(&podman, &record, &prompt, enter)?;
     if send_json {
         println!(
@@ -2702,6 +2782,52 @@ pub(crate) fn tclone_send(args: Vec<OsString>) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+fn mark_tclone_fork_task_queued(podman: &OsString, record: &TcloneRunRecord) -> io::Result<()> {
+    let queued_at_ms = unix_millis()?;
+    let result = TcloneForkResult {
+        run_id: record.run_id.clone(),
+        status: "queued".to_string(),
+        started_at_ms: queued_at_ms,
+        completed_at_ms: None,
+        assistant_summary: None,
+        tests: Vec::new(),
+    };
+    let temporary_path = format!(
+        "{TCLONE_FORK_RESULT_PATH}.queued-{}-{queued_at_ms}",
+        std::process::id()
+    );
+    let script = format!(
+        "umask 077; cat > {temporary_path} && mv -f {temporary_path} {result_path}",
+        temporary_path = shell_quote(&temporary_path),
+        result_path = shell_quote(TCLONE_FORK_RESULT_PATH),
+    );
+    let mut child = Command::new(podman)
+        .arg("exec")
+        .arg("-i")
+        .arg(&record.container_name)
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(io::Error::other("could not open fork task marker stdin"));
+    };
+    stdin.write_all(&serde_json::to_vec(&result)?)?;
+    drop(stdin);
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "podman exec fork task marker write failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
 }
 
 pub(crate) fn tclone_run_exec(args: Vec<OsString>) -> io::Result<()> {
@@ -6462,6 +6588,27 @@ mod tests {
         env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
         env::set_var("GENSEE_TCLONE_RESULT_PATH", &result_path);
 
+        write_tclone_fork_result_to_path(
+            &result_path,
+            &TcloneForkResult {
+                run_id: "run_source_fork_1_0".to_string(),
+                status: "queued".to_string(),
+                started_at_ms: 5,
+                completed_at_ms: None,
+                assistant_summary: None,
+                tests: Vec::new(),
+            },
+        )
+        .unwrap();
+        let inherited_stop = test_hook_event("Stop", 6);
+        try_record_tclone_fork_hook_lifecycle(&inherited_stop).unwrap();
+        assert_eq!(
+            read_tclone_fork_result_from_path(&result_path)
+                .unwrap()
+                .status,
+            "queued"
+        );
+
         try_record_tclone_fork_hook_lifecycle(&test_hook_event("UserPromptSubmit", 10)).unwrap();
 
         let mut test_event = test_hook_event("PostToolUse", 20);
@@ -6881,6 +7028,23 @@ mod tests {
         );
         validate_tclone_host_control_request(&send_request).unwrap();
 
+        let fork_capability = rotate_tclone_host_control_capability(&fork_run_id).unwrap();
+        let self_send_request = signed_host_control_request(
+            &fork_run_id,
+            &fork_capability,
+            "flow-self-send",
+            vec![
+                "run".to_string(),
+                "send".to_string(),
+                fork_run_id.clone(),
+                "--".to_string(),
+                "duplicate inherited task".to_string(),
+            ],
+        );
+        let error = validate_tclone_host_control_request(&self_send_request).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("only a tclone source"));
+
         for (nonce, args) in [
             (
                 "flow-list",
@@ -6994,6 +7158,7 @@ mod tests {
         let _ = fs::remove_file(&job.done_path);
         let _ = fs::remove_file(tclone_async_job_owner_path(&job));
         let _ = fs::remove_dir_all(gensee_tmp_root().unwrap().join(&source_run_id));
+        let _ = fs::remove_dir_all(gensee_tmp_root().unwrap().join(&fork_run_id));
         match old_home {
             Some(value) => env::set_var("GENSEE_HOME", value),
             None => env::remove_var("GENSEE_HOME"),
@@ -7488,8 +7653,11 @@ gensee async job job_1: exited status=0
             "--json".to_string(),
         ];
 
-        let error = "host-control capability rotation in progress for tclone run run_source";
-        let payload = tclone_retryable_fork_status_payload(&args, error).unwrap();
+        let payload = tclone_retryable_fork_status_payload(
+            &args,
+            TcloneForkStatusTransient::CapabilityRotation,
+        )
+        .unwrap();
         assert_eq!(payload["status"], "running");
         assert_eq!(payload["transient"], true);
         assert_eq!(payload["retryable"], true);
@@ -7506,7 +7674,34 @@ gensee async job job_1: exited status=0
     }
 
     #[test]
-    fn tclone_fork_status_keeps_non_rotation_errors_terminal() {
+    fn tclone_fork_status_treats_checkpointed_transport_as_retryable() {
+        let args = vec![
+            "run".to_string(),
+            "fork-status".to_string(),
+            "run_source_job_1".to_string(),
+            "--json".to_string(),
+        ];
+
+        let payload = tclone_retryable_fork_status_payload(
+            &args,
+            TcloneForkStatusTransient::TransportInterrupted,
+        )
+        .unwrap();
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["transient"], true);
+        assert!(payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("source was checkpointed"));
+        assert!(tclone_host_control_transport_error(
+            &args,
+            io::Error::new(io::ErrorKind::TimedOut, "response was consumed by clone")
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn tclone_fork_status_keeps_other_commands_and_errors_terminal() {
         let status_args = vec![
             "run".to_string(),
             "fork-status".to_string(),
@@ -7515,17 +7710,65 @@ gensee async job job_1: exited status=0
         ];
         let list_args = vec!["run".to_string(), "list".to_string(), "--json".to_string()];
 
-        assert!(tclone_retryable_fork_status_payload(&status_args, "fork job failed").is_none());
         assert!(tclone_retryable_fork_status_payload(
             &list_args,
-            "host-control capability rotation in progress for tclone run run_source"
+            TcloneForkStatusTransient::TransportInterrupted,
         )
         .is_none());
-        assert!(tclone_retryable_fork_status_payload(
+        let list_error = tclone_host_control_transport_error(
+            &list_args,
+            io::Error::new(io::ErrorKind::TimedOut, "list timed out"),
+        )
+        .unwrap_err();
+        assert_eq!(list_error.kind(), io::ErrorKind::TimedOut);
+        let auth_error = tclone_host_control_transport_error(
             &status_args,
-            "no valid host-control capability for tclone run run_source"
+            io::Error::new(io::ErrorKind::PermissionDenied, "invalid authenticator"),
         )
-        .is_none());
+        .unwrap_err();
+        assert_eq!(auth_error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn tclone_fork_status_uses_a_short_file_bridge_timeout() {
+        let _guard = tclone_test_env_lock();
+        env::remove_var("GENSEE_TCLONE_HOST_FILE_TIMEOUT_SECS");
+        let status_request = TcloneHostControlRequest {
+            caller_run_id: None,
+            nonce: None,
+            issued_at_ms: None,
+            authenticator: None,
+            args: vec![
+                "run".to_string(),
+                "fork-status".to_string(),
+                "run_source_job_1".to_string(),
+                "--json".to_string(),
+            ],
+        };
+        let list_request = TcloneHostControlRequest {
+            args: vec!["run".to_string(), "list".to_string(), "--json".to_string()],
+            ..status_request
+        };
+
+        assert_eq!(
+            tclone_host_control_file_timeout_secs_for_request(&list_request),
+            TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            tclone_host_control_file_timeout_secs_for_request(&TcloneHostControlRequest {
+                caller_run_id: None,
+                nonce: None,
+                issued_at_ms: None,
+                authenticator: None,
+                args: vec![
+                    "run".to_string(),
+                    "fork-status".to_string(),
+                    "run_source_job_1".to_string(),
+                    "--json".to_string(),
+                ],
+            }),
+            TCLONE_FORK_STATUS_CONTROL_TIMEOUT_SECS
+        );
     }
 
     #[test]
