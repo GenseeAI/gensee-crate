@@ -92,16 +92,20 @@ gensee-tclone run send "$FORK_ID" -- 'Try the dependency upgrade, run tests, and
 ```
 
 When a fork is scheduled asynchronously from inside an agent, the JSON response
-includes `status_command` and `retry_after_ms`. Wait that delay before the first
-poll so the poll process is not captured by the live clone. Then poll until
+includes `status_command` and `retry_after_ms`. Pause before polling, but do not
+run source-container shell wait commands such as `sleep`; live clone may capture
+those wait processes and make the source uncloneable. Then poll until
 `status=succeeded` and use `forks[0].run_id`; if it returns `status=failed`, stop
-and inspect the included log summary. During live-clone capability rotation, or
-when the clone inherits an in-flight control response, a poll may temporarily return `status=running`,
-`transient=true`, and `retry_after_ms`; retry the same status command after that
-delay and never schedule a replacement fork. JSON status polls use a short
-control-bridge timeout so the source cannot wait on a response consumed by the
-clone. Container-mediated `run send` is source-to-direct-child only; a fork may
-not send to itself if it inherits the source's in-progress orchestration turn.
+and inspect the included log summary. While running, status JSON includes recent
+log lines so agents can explain quiet-wait or clone failures instead of spinning
+blindly. During live-clone capability rotation, or when the clone inherits an
+in-flight control response, a poll may temporarily return `status=running`,
+`transient=true`, and `retry_after_ms`; retry the same status command after
+pausing without shell commands and never schedule a replacement fork. JSON
+status polls use a short control-bridge timeout so the source cannot wait on a
+response consumed by the clone. Container-mediated `run send` is
+source-to-direct-child only; a fork may not send to itself if it inherits the
+source's in-progress orchestration turn.
 Before tmux input is sent, Gensee marks the child task `queued`; an inherited
 turn's Stop hook is ignored until the sent prompt reaches `UserPromptSubmit`.
 Fork creation reports success only after the child has received its

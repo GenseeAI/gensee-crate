@@ -1968,7 +1968,12 @@ fn tclone_async_job_status_payload(job: &TcloneAsyncJob) -> Value {
             .unwrap_or_default());
     }
     if status == "running" {
-        payload["message"] = json!("tclone fork job is still running; poll this command again");
+        payload["retry_after_ms"] = json!(TCLONE_ASYNC_INITIAL_POLL_DELAY_MS);
+        payload["last_log_lines"] = json!(log_text
+            .as_deref()
+            .map(|text| tclone_async_job_last_log_lines(text, 12))
+            .unwrap_or_default());
+        payload["message"] = json!("tclone fork job is still running; pause without running source-container shell commands such as sleep, then poll this command again");
     } else if status == "unknown" {
         payload["message"] =
             json!("unknown tclone fork job; no log or completion marker was found");
@@ -7467,6 +7472,44 @@ gensee async job job_1: exited status=0
         let payload = parse_tclone_async_fork_payload(log).unwrap();
         assert_eq!(payload["source_run_id"], "run_1");
         assert_eq!(payload["forks"][0]["run_id"], "run_1_fork_42_0");
+    }
+
+    #[test]
+    fn tclone_async_running_status_includes_retry_guidance_and_log_lines() {
+        let unique = format!("{}-{}", std::process::id(), unix_millis().unwrap_or(0));
+        let dir = env::temp_dir().join(format!("gensee-tclone-async-running-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("job_1.log");
+        let done_path = dir.join("job_1.done");
+        fs::write(
+            &log_path,
+            "gensee async job job_1: waiting 2s before host fork\n\
+             gensee: waiting for tclone source run_1 to become quiet before fork\n",
+        )
+        .unwrap();
+        let job = TcloneAsyncJob {
+            id: "job_1".to_string(),
+            log_path,
+            done_path,
+        };
+
+        let payload = tclone_async_job_status_payload(&job);
+        assert_eq!(payload["status"], "running");
+        assert_eq!(
+            payload["retry_after_ms"],
+            TCLONE_ASYNC_INITIAL_POLL_DELAY_MS
+        );
+        assert!(payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("without running source-container shell commands"));
+        assert!(payload["last_log_lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("become quiet")));
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -466,12 +466,14 @@ destructive cleanup, and database resets. In Codex tclone source runs, matching
 user prompts add fork guidance before planning; matching source commands are
 blocked as a backstop so the risky work happens in a fork first.
 Async fork JSON includes `status_command`; poll it until `status=succeeded`,
-and includes `retry_after_ms`; wait that long before the first poll so the poll
-process is not captured by the live clone. Then send work to
-`forks[0].run_id`. A transient capability-rotation, empty-success, or
-checkpoint-interrupted response uses `status=running` and `transient=true`;
-retry the same status command rather than creating another fork. JSON status
-polls use a short control-bridge timeout so a response inherited by the clone
+and includes `retry_after_ms`; pause before polling, but do not run
+source-container shell wait commands such as `sleep` because live clone can
+capture those processes. Then send work to `forks[0].run_id`. A transient
+capability-rotation, empty-success, or checkpoint-interrupted response uses
+`status=running` and `transient=true`; retry the same status command rather than
+creating another fork. Running status JSON includes recent log lines so agents
+can report quiet-wait or clone progress. JSON status polls use a short
+control-bridge timeout so a response inherited by the clone
 cannot leave the source agent stuck waiting. Only the source may send work to a
 direct child, so an inherited orchestration turn cannot make the fork send the
 task to itself. Sending a task also marks it queued before tmux input; completion
