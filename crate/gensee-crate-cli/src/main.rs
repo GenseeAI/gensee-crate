@@ -105,6 +105,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             args.remove(0);
             linux_exec_wrapper(args)
         }
+        Some("__tclone-cleanup-resolved") => {
+            args.remove(0);
+            tclone_cleanup_resolved(args)
+        }
         Some("run") => {
             args.remove(0);
             if args.first().and_then(|arg| arg.to_str()) == Some("list") {

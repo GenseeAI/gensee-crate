@@ -3734,10 +3734,7 @@ fn host_tmux_attach_command(target: &str, exe: &Path, use_sudo: bool) -> String 
     parts.push("run".to_string());
     parts.push("attach".to_string());
     parts.push(shell_quote(target));
-    format!(
-        "{}; status=$?; printf '\\n[gensee] attach exited with status %s. Press Ctrl-D to close this pane.\\n' \"$status\"; exec \"${{SHELL:-/bin/sh}}\"",
-        parts.join(" ")
-    )
+    parts.join(" ")
 }
 
 const TCLONE_HOST_TMUX_ENV_KEYS: &[&str] = &[
@@ -4774,7 +4771,99 @@ pub(crate) fn tclone_merge(args: Vec<OsString>) -> io::Result<()> {
         TcloneMergeScope::Paths(paths) => {
             tclone_merge_filesystem(&podman, &fork, &source, Some(paths), dry_run)
         }
+    }?;
+
+    if !dry_run {
+        // A successful no-op merge is still a completed resolution. Keep the
+        // record as an audit trail, but tear down the now-resolved fork after
+        // the merge response has had time to reach the agent in that fork.
+        if find_tclone_record(&fork.run_id)?.status != "merged" {
+            append_tclone_status(&fork.run_id, "merged", None)?;
+        }
+        match schedule_tclone_resolution_cleanup(&fork.run_id) {
+            Ok(()) => println!(
+                "gensee: scheduled resolved fork cleanup for {}",
+                fork.run_id
+            ),
+            Err(error) => eprintln!(
+                "gensee: merge succeeded, but resolved fork cleanup could not be scheduled: {error}"
+            ),
+        }
     }
+    Ok(())
+}
+
+const TCLONE_RESOLUTION_CLEANUP_DELAY_MS: u64 = 2_500;
+const TCLONE_RESOLUTION_CLEANUP_DELAY_ENV: &str = "GENSEE_TCLONE_RESOLUTION_CLEANUP_DELAY_MS";
+
+fn schedule_tclone_resolution_cleanup(run_id: &str) -> io::Result<()> {
+    let exe = env::current_exe()?;
+    Command::new(exe)
+        .arg("__tclone-cleanup-resolved")
+        .arg(run_id)
+        .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            io::Error::other(format!(
+                "merge succeeded, but could not schedule cleanup for {run_id}: {error}"
+            ))
+        })
+}
+
+pub(crate) fn tclone_cleanup_resolved(args: Vec<OsString>) -> io::Result<()> {
+    let target = tclone_target_arg(&args, "usage: gensee __tclone-cleanup-resolved <fork-id>")?;
+    let delay_ms = env::var(TCLONE_RESOLUTION_CLEANUP_DELAY_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(TCLONE_RESOLUTION_CLEANUP_DELAY_MS);
+    thread::sleep(Duration::from_millis(delay_ms));
+
+    let record = find_tclone_record(&target)?;
+    if !tclone_record_is_ready_for_resolution_cleanup(&record) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to clean up unresolved tclone run {} role={} status={}",
+                record.run_id, record.role, record.status
+            ),
+        ));
+    }
+
+    remove_tclone_container(&record).map_err(|error| {
+        io::Error::other(format!(
+            "could not remove resolved fork container {}: {error}",
+            record.container_name
+        ))
+    })?;
+    focus_tclone_source_host_pane();
+    Ok(())
+}
+
+fn tclone_record_is_ready_for_resolution_cleanup(record: &TcloneRunRecord) -> bool {
+    record.role == "fork" && matches!(record.status.as_str(), "merged" | "discarded")
+}
+
+fn focus_tclone_source_host_pane() {
+    let (Some(socket), Some(target)) = (
+        env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV),
+        env::var_os(TCLONE_HOST_TMUX_TARGET_ENV),
+    ) else {
+        return;
+    };
+    let _ = Command::new("tmux")
+        .arg("-S")
+        .arg(socket)
+        .arg("select-pane")
+        .arg("-t")
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
@@ -8421,8 +8510,8 @@ gensee async job job_1: exited status=0
         assert!(command.contains("'/tmp/gensee' run attach 'run_1_fork_0'"));
         assert!(command.starts_with("env "));
         assert!(!command.starts_with("sudo "));
-        assert!(command.contains("attach exited with status"));
-        assert!(command.contains("exec \"${SHELL:-/bin/sh}\""));
+        assert!(!command.contains("attach exited with status"));
+        assert!(!command.contains("exec \"${SHELL:-/bin/sh}\""));
     }
 
     #[test]
@@ -8431,6 +8520,20 @@ gensee async job job_1: exited status=0
 
         assert!(command.starts_with("sudo env "));
         assert!(command.contains("'/tmp/gensee' run attach 'run_1_fork_0'"));
+    }
+
+    #[test]
+    fn tclone_resolution_cleanup_only_accepts_resolved_forks() {
+        let mut record = test_fork_record("run_1_fork_0", "run_1");
+        record.status = "merged".to_string();
+        assert!(tclone_record_is_ready_for_resolution_cleanup(&record));
+
+        record.status = "completed".to_string();
+        assert!(!tclone_record_is_ready_for_resolution_cleanup(&record));
+
+        record.status = "discarded".to_string();
+        record.role = "source".to_string();
+        assert!(!tclone_record_is_ready_for_resolution_cleanup(&record));
     }
 
     #[test]
