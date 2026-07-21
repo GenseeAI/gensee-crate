@@ -146,6 +146,14 @@ pub(crate) struct TcloneRunRecord {
     #[serde(default)]
     pub(crate) host_control_owner_run_id: Option<String>,
     pub(crate) fork_prefix: Option<String>,
+    #[serde(default)]
+    pub(crate) fork_group_id: Option<String>,
+    #[serde(default)]
+    pub(crate) fork_index: Option<usize>,
+    #[serde(default)]
+    pub(crate) fork_count: Option<usize>,
+    #[serde(default)]
+    pub(crate) fork_approach: Option<String>,
     pub(crate) image: String,
     pub(crate) workspace: String,
     pub(crate) container_workspace: String,
@@ -839,6 +847,10 @@ fn tclone_hook_event_is_internal_lifecycle_command(event: &AgentHookEvent) -> bo
             "gensee-tclone run summary",
             "gensee run diff",
             "gensee-tclone run diff",
+            "gensee run compare",
+            "gensee-tclone run compare",
+            "gensee run choose",
+            "gensee-tclone run choose",
             "gensee run merge",
             "gensee-tclone run merge",
             "gensee run switch",
@@ -984,9 +996,24 @@ pub(crate) fn tclone_codex_stop_continuation(event: &AgentHookEvent) -> Option<S
         return None;
     }
 
-    Some(format!(
-        "You are the live-cloned Gensee fork `{run_id}`, not the source orchestrator and not a separate future worker. The user already approved this fork. Continue the original user request from the conversation history now. Do not announce that another fork will do the work, do not wait for another prompt, and do not run fork-status again. Use the necessary tools to perform and verify the task in this fork. After the work is finished, run `gensee run summary {run_id} --json --complete` internally, present the changed files and tests, and ask the user whether to merge the changes back, promote this fork to the main environment and end the old source, or discard it. Do not auto-merge. After explicit approval, run the chosen command internally: `gensee run merge {run_id} --into {source_run_id}`, `gensee run switch {run_id}`, or `gensee run discard {run_id}`."
-    ))
+    if context
+        .get("fork_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        > 1
+    {
+        let approach = context
+            .get("fork_approach")
+            .and_then(Value::as_str)
+            .unwrap_or("the assigned approach");
+        Some(format!(
+            "You are live parallel Gensee fork `{run_id}`. The user already approved this fork group. Continue the original request now using only your assigned approach: {approach}. Do not create another fork, wait for another prompt, or run fork-status. Perform and verify the work, then run `gensee run summary {run_id} --json --complete`. Follow the parallel comparison instructions already present in your prompt; do not auto-merge."
+        ))
+    } else {
+        Some(format!(
+            "You are the live-cloned Gensee fork `{run_id}`, not the source orchestrator and not a separate future worker. The user already approved this fork. Continue the original user request from the conversation history now. Do not announce that another fork will do the work, do not wait for another prompt, and do not run fork-status again. Use the necessary tools to perform and verify the task in this fork. After the work is finished, run `gensee run summary {run_id} --json --complete` internally, present the changed files and tests, and ask the user whether to merge the changes back, promote this fork to the main environment and end the old source, or discard it. Do not auto-merge. After explicit approval, run the chosen command internally: `gensee run merge {run_id} --into {source_run_id}`, `gensee run switch {run_id}`, or `gensee run discard {run_id}`."
+        ))
+    }
 }
 
 fn read_tclone_fork_result_from_path(path: &Path) -> Option<TcloneForkResult> {
@@ -1265,6 +1292,8 @@ fn tclone_host_control_should_proxy(args: &[OsString]) -> bool {
                 | "shell"
                 | "diff"
                 | "summary"
+                | "compare"
+                | "choose"
                 | "merge"
                 | "switch"
                 | "discard"
@@ -1691,6 +1720,9 @@ fn tclone_lifecycle_request_choice(request: &TcloneHostControlRequest) -> Option
         Some("merge") => Some("merge"),
         Some("switch") => Some("switch"),
         Some("discard") => Some("discard"),
+        Some("choose") if request.args.iter().any(|arg| arg == "--merge") => Some("merge"),
+        Some("choose") if request.args.iter().any(|arg| arg == "--promote") => Some("switch"),
+        Some("choose") if request.args.iter().any(|arg| arg == "--discard-all") => Some("discard"),
         _ => None,
     }
 }
@@ -1707,7 +1739,40 @@ fn validate_tclone_lifecycle_approval(
     request: &TcloneHostControlRequest,
     choice: &str,
 ) -> io::Result<TcloneRunRecord> {
-    let record = find_tclone_record(&tclone_lifecycle_request_target(request)?)?;
+    let target = find_tclone_record(&tclone_lifecycle_request_target(request)?)?;
+    let record = if request.args.get(1).map(String::as_str) == Some("choose") {
+        let caller_run_id = request.caller_run_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "parallel choice has no caller",
+            )
+        })?;
+        let caller = find_tclone_record(caller_run_id)?;
+        if !tclone_records_share_fork_group(&caller, &target) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "selected winner is not in the caller's fork group",
+            ));
+        }
+        if choice == "merge" {
+            let winner_result =
+                read_tclone_fork_result(&tclone_podman(), &target)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "selected winner has no result",
+                    )
+                })?;
+            if !tclone_fork_result_ready_for_merge(&winner_result) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "selected winner is not ready to merge",
+                ));
+            }
+        }
+        caller
+    } else {
+        target
+    };
     if record.role != "fork" || record.status != "running" {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1721,18 +1786,29 @@ fn validate_tclone_lifecycle_approval(
             "fork has not presented a result for user approval",
         )
     })?;
-    validate_tclone_lifecycle_result(&result, choice)?;
+    validate_tclone_lifecycle_result_at_with_merge_readiness(
+        &result,
+        choice,
+        unix_millis()?,
+        request.args.get(1).map(String::as_str) != Some("choose"),
+    )?;
     Ok(record)
 }
 
-fn validate_tclone_lifecycle_result(result: &TcloneForkResult, choice: &str) -> io::Result<()> {
-    validate_tclone_lifecycle_result_at(result, choice, unix_millis()?)
-}
-
+#[cfg(test)]
 fn validate_tclone_lifecycle_result_at(
     result: &TcloneForkResult,
     choice: &str,
     now_ms: u64,
+) -> io::Result<()> {
+    validate_tclone_lifecycle_result_at_with_merge_readiness(result, choice, now_ms, true)
+}
+
+fn validate_tclone_lifecycle_result_at_with_merge_readiness(
+    result: &TcloneForkResult,
+    choice: &str,
+    now_ms: u64,
+    require_approver_merge_readiness: bool,
 ) -> io::Result<()> {
     let offered_at_ms = result.resolution_offered_at_ms.ok_or_else(|| {
         io::Error::new(
@@ -1758,7 +1834,10 @@ fn validate_tclone_lifecycle_result_at(
             format!("no current unconsumed user approval for `{choice}`"),
         ));
     }
-    if choice == "merge" && !tclone_fork_result_ready_for_merge(result) {
+    if choice == "merge"
+        && require_approver_merge_readiness
+        && !tclone_fork_result_ready_for_merge(result)
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "fork task is failed, stalled, or otherwise not ready to merge",
@@ -1921,6 +2000,8 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
                 )?;
             }
         }
+        "compare" => validate_tclone_parallel_target(caller_run_id, &request.args[2..])?,
+        "choose" => validate_tclone_parallel_choice_request(caller_run_id, &request.args[2..])?,
         "merge" => {
             let source_target = arg_value(&args[2..], "--into").ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing merge --into target")
@@ -1997,7 +2078,10 @@ fn validate_tclone_lifecycle_response_ack(args: &[String], caller_run_id: &str) 
         "switch" => record.role == "source" && record.status == "active",
         _ => false,
     };
-    let authorized = if target == caller_run_id {
+    let same_parallel_group = caller.fork_group_id.is_some()
+        && caller.fork_group_id == record.fork_group_id
+        && tclone_host_control_owner_run_id(&caller) == tclone_host_control_owner_run_id(&record);
+    let authorized = if target == caller_run_id || same_parallel_group {
         true
     } else if matches!(choice, "merge" | "discard") {
         caller.role == "source" && record.parent_run_id.as_deref() == Some(caller_run_id)
@@ -2083,6 +2167,45 @@ fn validate_tclone_resolution_authority(
                 "a fork may only merge itself into its direct source",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_tclone_parallel_target(caller_run_id: &str, target_args: &[String]) -> io::Result<()> {
+    let caller = find_tclone_record(caller_run_id)?;
+    let target = tclone_target_arg(
+        &target_args.iter().map(OsString::from).collect::<Vec<_>>(),
+        "missing parallel fork target",
+    )?;
+    let target = find_tclone_record(&target)?;
+    if !tclone_records_share_fork_group(&caller, &target) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "parallel comparison target is not in the caller's fork group",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tclone_parallel_choice_request(
+    caller_run_id: &str,
+    target_args: &[String],
+) -> io::Result<()> {
+    validate_tclone_parallel_target(caller_run_id, target_args)?;
+    let args = target_args.iter().map(OsString::from).collect::<Vec<_>>();
+    let choices = ["--merge", "--promote", "--discard-all"]
+        .into_iter()
+        .filter(|choice| arg_flag(&args, choice))
+        .count();
+    if choices != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "choose exactly one of --merge, --promote, or --discard-all",
+        ));
+    }
+    if !arg_flag(&args, "--discard-all") {
+        let target = tclone_target_arg(&args, "missing parallel fork target")?;
+        ensure_tclone_parallel_group_terminal(&find_tclone_record(&target)?)?;
     }
     Ok(())
 }
@@ -3241,6 +3364,10 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         source_container: Some(source_container.clone()),
         host_control_owner_run_id: None,
         fork_prefix: Some(fork_prefix),
+        fork_group_id: None,
+        fork_index: None,
+        fork_count: None,
+        fork_approach: None,
         image,
         workspace: original_workspace.to_string_lossy().to_string(),
         container_workspace: container_workspace.clone(),
@@ -3352,7 +3479,7 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
 pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     let parent = tclone_target_arg(
         &args,
-        "usage: gensee run fork <run_id> [--copies N] [--name <prefix>] [--attach tmux:right|tmux:below] [--json]",
+        "usage: gensee run fork <run_id> [--copies N] [--name <prefix>] [--approach <description>]... [--attach tmux:right|tmux:below] [--json]",
     )?;
     let fork_json = arg_flag(&args, "--json");
     let host_tmux_attach = arg_value(&args, "--attach")
@@ -3377,6 +3504,28 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             "--copies must be greater than zero",
         ));
     }
+    let approaches = tclone_repeated_arg_values(&args, "--approach");
+    if !approaches.is_empty() && approaches.len() != copies {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "received {} --approach value(s), but --copies is {copies}; provide one approach per fork",
+                approaches.len()
+            ),
+        ));
+    }
+    if approaches.iter().any(|approach| approach.trim().is_empty())
+        || approaches.iter().enumerate().any(|(index, approach)| {
+            approaches[..index]
+                .iter()
+                .any(|previous| previous.trim().eq_ignore_ascii_case(approach.trim()))
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--approach values must be non-empty and distinct",
+        ));
+    }
     let source = find_tclone_record(&parent)?;
     if source.status == "preparing" {
         return Err(io::Error::other(format!(
@@ -3386,15 +3535,18 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     }
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &source)?;
+    let forked_at_ms = unix_millis()?;
+    let name_hint = arg_value(&args, "--name");
+    let prefix = tclone_fork_name_prefix(&parent, name_hint.as_deref(), forked_at_ms, copies);
+    validate_tclone_fork_prefix(&prefix)?;
+    ensure_tclone_fork_names_available(&prefix, copies)?;
+    let group_id = format!("{}_parallel_{}", source.run_id, forked_at_ms);
     let source_handoff = wait_for_tclone_source_fork_handoff(&source)?;
     wait_for_tclone_source_quiet_if_requested(&podman, &source)?;
     ensure_tclone_agent_ready_for_fork(&podman, &source)?;
     let _detach_guard = TcloneForkDetachGuard::mark(&source.run_id)?;
     detach_tclone_tmux_clients(&podman, &source.container_name);
-    let forked_at_ms = unix_millis()?;
     let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
-    let name_hint = arg_value(&args, "--name");
-    let prefix = tclone_fork_name_prefix(&parent, name_hint.as_deref(), forked_at_ms);
     let mut capability_guard = TcloneCapabilityRotationGuard::revoke(&podman, source.clone())?;
     let output = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
     capability_guard.restore()?;
@@ -3453,6 +3605,10 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             source_container: Some(source.container_name.clone()),
             host_control_owner_run_id: Some(tclone_host_control_owner_run_id(&source).to_string()),
             fork_prefix: Some(prefix.clone()),
+            fork_group_id: Some(group_id.clone()),
+            fork_index: Some(index),
+            fork_count: Some(copies),
+            fork_approach: Some(tclone_fork_approach(&approaches, index, copies)),
             image: source.image.clone(),
             workspace: source.workspace.clone(),
             container_workspace: source.container_workspace.clone(),
@@ -3490,6 +3646,9 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             "role": "fork",
             "source_run_id": &source.run_id,
             "workspace": &source.container_workspace,
+            "group_id": &group_id,
+            "index": index,
+            "approach": fork_record.fork_approach.as_deref(),
         }));
         fork_run_ids.push(run_id);
     }
@@ -3502,16 +3661,16 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         }
     }
     if let Some(placement) = host_tmux_attach {
+        let mut previous_pane = None;
         for (index, run_id) in fork_run_ids.iter().enumerate() {
-            let placement = if index == 0 {
-                placement
-            } else {
-                HostTmuxPlacement::Below
-            };
-            if let Err(err) = open_tclone_attach_in_host_tmux_after_preflight(run_id, placement) {
-                eprintln!(
+            let (placement, pane_target) =
+                tclone_parallel_pane_layout(index, placement, previous_pane.as_deref());
+            match open_tclone_attach_in_host_tmux_after_preflight_at(run_id, placement, pane_target)
+            {
+                Ok(pane) => previous_pane = Some(pane),
+                Err(err) => eprintln!(
                     "gensee: warning: fork {run_id} was created, but tmux attach failed: {err}"
-                );
+                ),
             }
         }
     }
@@ -3521,12 +3680,25 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             json!({
                 "source_run_id": &source.run_id,
                 "forked_at_ms": forked_at_ms,
+                "group_id": group_id,
                 "attach": host_tmux_attach.is_some(),
                 "forks": fork_records,
             })
         );
     }
     Ok(())
+}
+
+fn tclone_parallel_pane_layout<'a>(
+    index: usize,
+    initial: HostTmuxPlacement,
+    previous_pane: Option<&'a str>,
+) -> (HostTmuxPlacement, Option<&'a str>) {
+    if index == 0 {
+        (initial, None)
+    } else {
+        (HostTmuxPlacement::Below, previous_pane)
+    }
 }
 
 fn restart_tclone_source_codex_after_fork(
@@ -3682,8 +3854,14 @@ fn run_tclone_clone_with_overlay_retry(
     run_tclone_clone_attempts(podman, copies, prefix, source, use_overlay, &[])
 }
 
-fn tclone_fork_name_prefix(parent: &str, name_hint: Option<&str>, forked_at_ms: u64) -> String {
+fn tclone_fork_name_prefix(
+    parent: &str,
+    name_hint: Option<&str>,
+    forked_at_ms: u64,
+    copies: usize,
+) -> String {
     match name_hint {
+        Some(name) if copies > 1 => name.trim_end_matches('-').to_string(),
         Some(name) => format!("{}-{forked_at_ms}", name.trim_end_matches('-')),
         None => format!(
             "gensee-tclone-fork-{}-{}",
@@ -3691,6 +3869,81 @@ fn tclone_fork_name_prefix(parent: &str, name_hint: Option<&str>, forked_at_ms: 
             forked_at_ms
         ),
     }
+}
+
+fn validate_tclone_fork_prefix(prefix: &str) -> io::Result<()> {
+    if prefix.is_empty()
+        || prefix.len() > 96
+        || !prefix
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--name must contain only ASCII letters, digits, '-' or '_' and be at most 96 characters",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_tclone_fork_names_available(prefix: &str, copies: usize) -> io::Result<()> {
+    let records = list_tclone_runs()?;
+    for index in 0..copies {
+        let name = if copies == 1 {
+            prefix.to_string()
+        } else {
+            format!("{prefix}-{index}")
+        };
+        if records.iter().any(|record| {
+            record.container_name == name
+                && !matches!(
+                    record.status.as_str(),
+                    "merged" | "discarded" | "agent-ended"
+                )
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("fork container name `{name}` is already in use; choose another --name"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn tclone_repeated_arg_values(args: &[OsString], name: &str) -> Vec<String> {
+    let prefix = format!("{name}=");
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index].to_str() == Some(name) {
+            if let Some(value) = args.get(index + 1).and_then(|value| value.to_str()) {
+                values.push(value.to_string());
+                index += 2;
+                continue;
+            }
+        } else if let Some(value) = args[index]
+            .to_str()
+            .and_then(|value| value.strip_prefix(&prefix))
+        {
+            values.push(value.to_string());
+        }
+        index += 1;
+    }
+    values
+}
+
+fn tclone_fork_approach(approaches: &[String], index: usize, copies: usize) -> String {
+    approaches.get(index).cloned().unwrap_or_else(|| {
+        if copies == 1 {
+            "requested approach".to_string()
+        } else if index == 0 {
+            "minimal compatible approach".to_string()
+        } else if index == 1 {
+            "aggressive latest-version approach".to_string()
+        } else {
+            format!("alternative approach {}", index + 1)
+        }
+    })
 }
 
 fn run_tclone_clone_attempts(
@@ -4025,10 +4278,36 @@ fn tclone_send_prompt_text(args: &[OsString]) -> io::Result<String> {
 fn tclone_prompt_with_fork_context(record: &TcloneRunRecord, prompt: &str) -> String {
     if record.role == "fork" {
         let source_run_id = record.parent_run_id.as_deref().unwrap_or("the source run");
-        format!(
-            "<gensee-user-request>\n{prompt}\n</gensee-user-request>\n\nGensee trusted lifecycle context: this request is already running inside forked run {fork_run_id}. Do not create another fork for this task; continue the user request above in this fork. After finishing and testing, run `gensee run summary {fork_run_id} --json --complete` internally, present the changed files and tests, and ask whether to merge the changes back, promote this fork to the main environment and end the old source, or discard it. Do not auto-merge. A lifecycle command is code-gated until a later user message explicitly chooses that exact action. After approval, run `gensee run merge {fork_run_id} --into {source_run_id}`, `gensee run switch {fork_run_id}`, or `gensee run discard {fork_run_id}` internally. Do not ask the user to type those commands.",
-            fork_run_id = record.run_id,
-        )
+        let fork_run_id = &record.run_id;
+        let approach = record
+            .fork_approach
+            .as_deref()
+            .unwrap_or("the requested approach");
+        if record.fork_count.unwrap_or(1) > 1 {
+            let position = record.fork_index.unwrap_or(0);
+            let coordination = if position == 0 {
+                format!(
+                    "You are the comparison coordinator. After completing your own summary, poll `gensee run compare {fork_run_id} --json` until all_terminal=true. Present every approach's changed files and tests, state the recommended winner, and ask whether to merge that winner, promote it, or discard the entire group. After explicit approval, run the exact `gensee run choose` command returned in actions."
+                )
+            } else {
+                format!(
+                    "After completing your own summary, do not offer an individual lifecycle decision; the coordinator in {} will compare all approaches and present one group decision.",
+                    record
+                        .fork_prefix
+                        .as_deref()
+                        .map(|prefix| format!("{prefix}-0"))
+                        .unwrap_or_else(|| "the first fork".to_string())
+                )
+            };
+            format!(
+                "<gensee-user-request>\n{prompt}\n</gensee-user-request>\n\nGensee trusted parallel-fork context: this request is already running inside fork {fork_run_id} of group {group}. Do not create another fork. Your assigned approach is: {approach}. Work only on that approach and verify it independently. After finishing, run `gensee run summary {fork_run_id} --json --complete` internally. {coordination} Do not auto-merge and do not ask the user to type Gensee lifecycle commands.",
+                group = record.fork_group_id.as_deref().unwrap_or("unknown"),
+            )
+        } else {
+            format!(
+                "<gensee-user-request>\n{prompt}\n</gensee-user-request>\n\nGensee trusted lifecycle context: this request is already running inside forked run {fork_run_id}. Do not create another fork for this task; continue the user request above in this fork. After finishing and testing, run `gensee run summary {fork_run_id} --json --complete` internally, present the changed files and tests, and ask whether to merge the changes back, promote this fork to the main environment and end the old source, or discard it. Do not auto-merge. A lifecycle command is code-gated until a later user message explicitly chooses that exact action. After approval, run `gensee run merge {fork_run_id} --into {source_run_id}`, `gensee run switch {fork_run_id}`, or `gensee run discard {fork_run_id}` internally. Do not ask the user to type those commands."
+            )
+        }
     } else {
         prompt.to_string()
     }
@@ -4075,6 +4354,10 @@ fn tclone_run_context_payload(record: &TcloneRunRecord, capability: &str) -> Val
         "role": &record.role,
         "source_run_id": record.parent_run_id.as_deref().unwrap_or(&record.run_id),
         "workspace": &record.container_workspace,
+        "fork_group_id": &record.fork_group_id,
+        "fork_index": record.fork_index,
+        "fork_count": record.fork_count,
+        "fork_approach": &record.fork_approach,
         "host_control_capability": capability,
     })
 }
@@ -4493,9 +4776,17 @@ fn open_tclone_attach_in_host_tmux_after_preflight(
     target: &str,
     placement: HostTmuxPlacement,
 ) -> io::Result<()> {
+    open_tclone_attach_in_host_tmux_after_preflight_at(target, placement, None).map(|_| ())
+}
+
+fn open_tclone_attach_in_host_tmux_after_preflight_at(
+    target: &str,
+    placement: HostTmuxPlacement,
+    pane_target: Option<&str>,
+) -> io::Result<String> {
     let exe = env::current_exe()?;
     let command = host_tmux_attach_command(target, &exe, env::var_os("SUDO_USER").is_some());
-    open_host_tmux_pane(&command, placement)
+    open_host_tmux_pane_at(&command, placement, pane_target)
 }
 
 fn ensure_host_tmux_available() -> io::Result<()> {
@@ -4519,6 +4810,14 @@ fn ensure_host_tmux_available() -> io::Result<()> {
 }
 
 fn open_host_tmux_pane(command: &str, placement: HostTmuxPlacement) -> io::Result<()> {
+    open_host_tmux_pane_at(command, placement, None).map(|_| ())
+}
+
+fn open_host_tmux_pane_at(
+    command: &str,
+    placement: HostTmuxPlacement,
+    pane_target: Option<&str>,
+) -> io::Result<String> {
     let split_flag = match placement {
         HostTmuxPlacement::Right => "-h",
         HostTmuxPlacement::Below => "-v",
@@ -4539,23 +4838,40 @@ fn open_host_tmux_pane(command: &str, placement: HostTmuxPlacement) -> io::Resul
     }) {
         tmux.arg("-S").arg(socket);
     }
-    tmux.arg("split-window").arg(split_flag);
-    if let Some(target) = env::var_os(TCLONE_HOST_TMUX_TARGET_ENV).or_else(|| {
-        inferred_context
-            .as_ref()
-            .map(|(_, target)| OsString::from(target))
-    }) {
+    tmux.arg("split-window")
+        .arg(split_flag)
+        .arg("-P")
+        .arg("-F")
+        .arg("#{pane_id}");
+    if let Some(target) = pane_target
+        .map(OsString::from)
+        .or_else(|| env::var_os(TCLONE_HOST_TMUX_TARGET_ENV))
+        .or_else(|| {
+            inferred_context
+                .as_ref()
+                .map(|(_, target)| OsString::from(target))
+        })
+    {
         tmux.arg("-t").arg(target);
     }
     if let Ok(cwd) = env::current_dir() {
         tmux.arg("-c").arg(cwd);
     }
-    let status = tmux.arg(command).status()?;
-    if status.success() {
-        Ok(())
+    let output = tmux.arg(command).output()?;
+    if output.status.success() {
+        let pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if pane.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tmux did not report the created pane id",
+            ));
+        }
+        Ok(pane)
     } else {
         Err(io::Error::other(format!(
-            "tmux split-window exited with status {status}"
+            "tmux split-window exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         )))
     }
 }
@@ -5553,9 +5869,10 @@ pub(crate) fn tclone_summary(args: Vec<OsString>) -> io::Result<()> {
     let ready_for_resolution = result
         .as_ref()
         .is_some_and(tclone_fork_result_ready_for_merge);
+    let parallel = record.fork_count.unwrap_or(1) > 1;
     let actions = source_run_id.as_deref().and_then(|source| {
         let result = result.as_ref()?;
-        if !tclone_fork_result_is_terminal(result) {
+        if !tclone_fork_result_is_terminal(result) || parallel {
             return None;
         }
         let mut actions = Vec::new();
@@ -5593,7 +5910,17 @@ pub(crate) fn tclone_summary(args: Vec<OsString>) -> io::Result<()> {
         "assistant_summary": result.as_ref().and_then(|result| result.assistant_summary.as_deref()),
         "approval_required": true,
         "auto_merge": false,
-        "agent_guidance": "Summarize changed files and tests in chat, offer merge/promote-to-main-and-end-source/discard, and wait for explicit user approval before running a lifecycle command.",
+        "parallel_group": parallel,
+        "compare_command": parallel.then(|| format!("gensee run compare {} --json", record.run_id)),
+        "agent_guidance": if parallel {
+            if record.fork_index == Some(0) {
+                "This is the coordinator fork. Wait for every sibling, run the compare command, present the comparison and recommendation, and ask for one group-level lifecycle decision."
+            } else {
+                "This is a non-coordinator parallel fork. Report completion, but leave comparison and lifecycle choices to fork index 0."
+            }
+        } else {
+            "Summarize changed files and tests in chat, offer merge/promote-to-main-and-end-source/discard, and wait for explicit user approval before running a lifecycle command."
+        },
         "actions": actions,
         "diff_command": format!("gensee run diff {} --json", record.run_id),
     });
@@ -5614,6 +5941,238 @@ pub(crate) fn tclone_summary(args: Vec<OsString>) -> io::Result<()> {
         );
         println!("Approval is required before merge, switch, or discard.");
     }
+    Ok(())
+}
+
+fn tclone_records_share_fork_group(left: &TcloneRunRecord, right: &TcloneRunRecord) -> bool {
+    left.role == "fork"
+        && right.role == "fork"
+        && left.parent_run_id == right.parent_run_id
+        && left.fork_group_id.is_some()
+        && left.fork_group_id == right.fork_group_id
+}
+
+fn tclone_parallel_group(record: &TcloneRunRecord) -> io::Result<Vec<TcloneRunRecord>> {
+    if record.role != "fork" || record.fork_group_id.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target is not part of a parallel fork group",
+        ));
+    }
+    let mut group = list_tclone_runs()?
+        .into_iter()
+        .filter(|candidate| tclone_records_share_fork_group(record, candidate))
+        .collect::<Vec<_>>();
+    group.sort_by_key(|candidate| candidate.fork_index.unwrap_or(usize::MAX));
+    Ok(group)
+}
+
+fn ensure_tclone_parallel_group_terminal(record: &TcloneRunRecord) -> io::Result<()> {
+    let podman = tclone_podman();
+    let group = tclone_parallel_group(record)?;
+    let incomplete = group
+        .iter()
+        .filter(|candidate| {
+            read_tclone_fork_result(&podman, candidate)
+                .ok()
+                .flatten()
+                .is_none_or(|result| !tclone_fork_result_is_terminal(&result))
+        })
+        .map(|candidate| candidate.run_id.as_str())
+        .collect::<Vec<_>>();
+    if incomplete.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "parallel fork group is not finished; still waiting for {}",
+                incomplete.join(", ")
+            ),
+        ))
+    }
+}
+
+fn tclone_approach_label(index: usize) -> String {
+    if index < 26 {
+        format!("Approach {}", (b'A' + index as u8) as char)
+    } else {
+        format!("Approach {}", index + 1)
+    }
+}
+
+pub(crate) fn tclone_compare(args: Vec<OsString>) -> io::Result<()> {
+    let target = tclone_target_arg(
+        &args,
+        "usage: gensee run compare <parallel-fork-id> [--json]",
+    )?;
+    let target = find_tclone_record(&target)?;
+    let group = tclone_parallel_group(&target)?;
+    let podman = tclone_podman();
+    let mut approaches = Vec::new();
+    let mut candidates = Vec::new();
+    let mut all_terminal = true;
+    for (position, record) in group.iter().enumerate() {
+        let result = read_tclone_fork_result(&podman, record).ok().flatten();
+        let diff = collect_tclone_diff(record).ok();
+        let task_status = result
+            .as_ref()
+            .map(|result| result.status.as_str())
+            .unwrap_or("unknown");
+        let terminal = result.as_ref().is_some_and(tclone_fork_result_is_terminal);
+        all_terminal &= terminal;
+        let ready = result
+            .as_ref()
+            .is_some_and(tclone_fork_result_ready_for_merge);
+        let changed_count = diff.as_ref().map_or(0, |diff| diff.changed.len());
+        if ready {
+            candidates.push((changed_count, position, record.run_id.clone()));
+        }
+        approaches.push(json!({
+            "label": tclone_approach_label(position),
+            "run_id": &record.run_id,
+            "container": &record.container_name,
+            "approach": record.fork_approach.as_deref().unwrap_or("unspecified approach"),
+            "task_status": task_status,
+            "changed_count": changed_count,
+            "changed": diff.as_ref().map(|diff| diff.changed.as_slice()).unwrap_or(&[]),
+            "tests": result.as_ref().map(|result| result.tests.as_slice()).unwrap_or(&[]),
+            "tests_passed": result.as_ref().is_some_and(tclone_fork_tests_succeeded),
+            "ready_for_resolution": ready,
+            "assistant_summary": result.as_ref().and_then(|result| result.assistant_summary.as_deref()),
+        }));
+    }
+    candidates.sort_by_key(|candidate| (candidate.0, candidate.1));
+    let recommendation = candidates.first().map(|(changed, position, run_id)| {
+        json!({
+            "label": tclone_approach_label(*position),
+            "run_id": run_id,
+            "reason": format!("tests passed and it has the smallest ready diff ({changed} changed file(s))"),
+        })
+    });
+    let actions = if all_terminal {
+        let mut actions = Vec::new();
+        for (_, position, winner) in &candidates {
+            let label = tclone_approach_label(*position);
+            actions.push(json!({
+                "choice": "merge",
+                "winner": winner,
+                "label": format!("Merge {label} and discard the other forks"),
+                "command": format!("gensee run choose {winner} --merge"),
+            }));
+            actions.push(json!({
+                "choice": "switch",
+                "winner": winner,
+                "label": format!("Promote {label} and discard the other forks"),
+                "command": format!("gensee run choose {winner} --promote"),
+            }));
+        }
+        actions.push(json!({
+            "choice": "discard",
+            "label": "Discard every fork in this parallel group",
+            "command": format!("gensee run choose {} --discard-all", target.run_id),
+        }));
+        Some(actions)
+    } else {
+        None
+    };
+    let payload = json!({
+        "command": "run compare",
+        "group_id": target.fork_group_id,
+        "source_run_id": target.parent_run_id,
+        "all_terminal": all_terminal,
+        "approaches": approaches,
+        "recommended": recommendation,
+        "approval_required": true,
+        "auto_merge": false,
+        "actions": actions,
+        "agent_guidance": if all_terminal {
+            "Present each approach's diff and test outcome, state the recommendation, then wait for explicit approval before choosing merge, promote, or discard-all."
+        } else {
+            "Some approaches are still running; poll run compare --json before presenting a final recommendation."
+        },
+    });
+    if arg_flag(&args, "--json") {
+        println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        for approach in payload["approaches"].as_array().into_iter().flatten() {
+            println!(
+                "{}: {} changed file(s), task_status={}, tests_passed={}",
+                approach["label"].as_str().unwrap_or("Approach"),
+                approach["changed_count"],
+                approach["task_status"].as_str().unwrap_or("unknown"),
+                approach["tests_passed"]
+            );
+        }
+        if let Some(recommended) = payload.get("recommended").filter(|value| !value.is_null()) {
+            println!(
+                "Recommended: {} ({})",
+                recommended["label"].as_str().unwrap_or("none"),
+                recommended["reason"].as_str().unwrap_or("no reason")
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn tclone_choose(args: Vec<OsString>) -> io::Result<()> {
+    let target = tclone_target_arg(
+        &args,
+        "usage: gensee run choose <parallel-fork-id> <--merge|--promote|--discard-all>",
+    )?;
+    let winner = find_tclone_record(&target)?;
+    let group = tclone_parallel_group(&winner)?;
+    let choices = ["--merge", "--promote", "--discard-all"]
+        .into_iter()
+        .filter(|choice| arg_flag(&args, choice))
+        .collect::<Vec<_>>();
+    if choices.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "choose exactly one of --merge, --promote, or --discard-all",
+        ));
+    }
+    if choices[0] != "--discard-all" {
+        ensure_tclone_parallel_group_terminal(&winner)?;
+    }
+    let source = winner.parent_run_id.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "parallel fork has no source run",
+        )
+    })?;
+    match choices[0] {
+        "--merge" => tclone_merge(vec![
+            OsString::from(&winner.run_id),
+            OsString::from("--into"),
+            OsString::from(source),
+        ])?,
+        "--promote" => tclone_switch(vec![OsString::from(&winner.run_id)])?,
+        "--discard-all" => mark_tclone_parallel_loser_discarded(
+            &winner,
+            tclone_resolution_requires_response_ack(),
+        )?,
+        _ => unreachable!(),
+    }
+    for sibling in group
+        .iter()
+        .filter(|record| record.run_id != winner.run_id && record.status == "running")
+    {
+        mark_tclone_parallel_loser_discarded(sibling, false)?;
+    }
+    println!(
+        "gensee: resolved parallel fork group {}; non-selected forks were discarded",
+        winner.fork_group_id.as_deref().unwrap_or("unknown")
+    );
+    Ok(())
+}
+
+fn mark_tclone_parallel_loser_discarded(
+    record: &TcloneRunRecord,
+    wait_for_response_ack: bool,
+) -> io::Result<()> {
+    append_tclone_status(&record.run_id, "discarded", None)?;
+    schedule_tclone_resolution_cleanup_with_ack(&record.run_id, wait_for_response_ack)?;
     Ok(())
 }
 
@@ -5682,8 +6241,14 @@ const TCLONE_RESOLUTION_WAIT_FOR_ACK_FLAG: &str = "--wait-for-response-ack";
 const TCLONE_HOST_CONTROL_CALLER_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_CALLER";
 
 fn schedule_tclone_resolution_cleanup(run_id: &str) -> io::Result<PathBuf> {
+    schedule_tclone_resolution_cleanup_with_ack(run_id, tclone_resolution_requires_response_ack())
+}
+
+fn schedule_tclone_resolution_cleanup_with_ack(
+    run_id: &str,
+    wait_for_ack: bool,
+) -> io::Result<PathBuf> {
     let exe = env::current_exe()?;
-    let wait_for_ack = tclone_resolution_requires_response_ack();
     let ack_path = tclone_resolution_ack_path(run_id, "resolved")?;
     let _ = fs::remove_file(&ack_path);
     let (log, log_path) = open_tclone_resolution_log(run_id, "resolved")?;
@@ -7598,7 +8163,15 @@ fn normalize_tclone_target(value: &str) -> String {
 fn tclone_option_takes_value(option: &str) -> bool {
     matches!(
         option,
-        "--copies" | "--name" | "--attach" | "--tmux" | "--shell" | "--to" | "--into" | "--paths"
+        "--copies"
+            | "--name"
+            | "--approach"
+            | "--attach"
+            | "--tmux"
+            | "--shell"
+            | "--to"
+            | "--into"
+            | "--paths"
     )
 }
 
@@ -8373,6 +8946,10 @@ mod tests {
             source_container: None,
             host_control_owner_run_id: None,
             fork_prefix: None,
+            fork_group_id: None,
+            fork_index: None,
+            fork_count: None,
+            fork_approach: None,
             image: "image".to_string(),
             workspace: "/repo".to_string(),
             container_workspace: "/workspace".to_string(),
@@ -8668,6 +9245,32 @@ mod tests {
         assert!(validate_tclone_lifecycle_result_at(&result, "merge", 31).is_ok());
         result.lifecycle_approval.as_mut().unwrap().consumed_at_ms = Some(32);
         assert!(validate_tclone_lifecycle_result_at(&result, "merge", 32).is_err());
+    }
+
+    #[test]
+    fn tclone_parallel_approval_does_not_require_coordinator_to_be_the_winner() {
+        let result = TcloneForkResult {
+            run_id: "run_source_fork_1_0".to_string(),
+            status: "failed".to_string(),
+            started_at_ms: 10,
+            completed_at_ms: Some(20),
+            assistant_summary: None,
+            tests: Vec::new(),
+            work_tool_calls: 1,
+            last_work_tool_success: Some(false),
+            resolution_offered_at_ms: Some(30),
+            lifecycle_approval: Some(TcloneLifecycleApproval {
+                choice: "merge".to_string(),
+                approved_at_ms: 31,
+                consumed_at_ms: None,
+            }),
+        };
+
+        assert!(validate_tclone_lifecycle_result_at(&result, "merge", 31).is_err());
+        assert!(validate_tclone_lifecycle_result_at_with_merge_readiness(
+            &result, "merge", 31, false
+        )
+        .is_ok());
     }
 
     #[test]
@@ -9890,19 +10493,26 @@ gensee async job job_1: exited status=0
     }
 
     #[test]
-    fn tclone_fork_name_hint_is_unique_prefix() {
+    fn tclone_fork_name_hint_is_clean_prefix() {
         assert_eq!(
-            tclone_fork_name_prefix("run_1", Some("try-upgrade"), 123),
+            tclone_fork_name_prefix("run_1", Some("try-upgrade"), 123, 2),
+            "try-upgrade"
+        );
+        assert_eq!(
+            tclone_fork_name_prefix("run_1", Some("try-upgrade-"), 123, 2),
+            "try-upgrade"
+        );
+        assert_eq!(
+            tclone_fork_name_prefix("run_1", Some("try-upgrade"), 123, 1),
             "try-upgrade-123"
         );
         assert_eq!(
-            tclone_fork_name_prefix("run_1", Some("try-upgrade-"), 123),
-            "try-upgrade-123"
-        );
-        assert_eq!(
-            tclone_fork_name_prefix("run_1/2", None, 123),
+            tclone_fork_name_prefix("run_1/2", None, 123, 2),
             "gensee-tclone-fork-run-1-2-123"
         );
+        assert!(validate_tclone_fork_prefix("try-upgrade").is_ok());
+        assert!(validate_tclone_fork_prefix("try upgrade").is_err());
+        assert!(validate_tclone_fork_prefix("").is_err());
     }
 
     #[test]
@@ -9989,6 +10599,10 @@ gensee async job job_1: exited status=0
             OsString::from("2"),
             OsString::from("--name"),
             OsString::from("fork-prefix"),
+            OsString::from("--approach"),
+            OsString::from("minimal compatible upgrade"),
+            OsString::from("--approach"),
+            OsString::from("aggressive latest upgrade"),
             OsString::from("--attach"),
             OsString::from("tmux:right"),
             OsString::from("run_1"),
@@ -10059,6 +10673,8 @@ gensee async job job_1: exited status=0
             "list",
             "diff",
             "summary",
+            "compare",
+            "choose",
             "merge",
             "switch",
             "discard",
@@ -10290,6 +10906,68 @@ gensee async job job_1: exited status=0
     }
 
     #[test]
+    fn tclone_parallel_prompts_assign_distinct_approaches_and_one_coordinator() {
+        let mut first = test_fork_record("run_1_fork_2_0", "run_1");
+        first.fork_prefix = Some("try-upgrade".to_string());
+        first.fork_group_id = Some("run_1_parallel_2".to_string());
+        first.fork_index = Some(0);
+        first.fork_count = Some(2);
+        first.fork_approach = Some("minimal compatible upgrade".to_string());
+        let mut second = first.clone();
+        second.run_id = "run_1_fork_2_1".to_string();
+        second.container_name = "try-upgrade-1".to_string();
+        second.fork_index = Some(1);
+        second.fork_approach = Some("aggressive latest-version upgrade".to_string());
+
+        let first_prompt = tclone_prompt_with_fork_context(&first, "Upgrade dependencies");
+        let second_prompt = tclone_prompt_with_fork_context(&second, "Upgrade dependencies");
+
+        assert!(first_prompt.contains("minimal compatible upgrade"));
+        assert!(first_prompt.contains("comparison coordinator"));
+        assert!(first_prompt.contains("gensee run compare run_1_fork_2_0 --json"));
+        assert!(second_prompt.contains("aggressive latest-version upgrade"));
+        assert!(second_prompt.contains("do not offer an individual lifecycle decision"));
+        assert_ne!(first_prompt, second_prompt);
+    }
+
+    #[test]
+    fn tclone_parallel_group_requires_matching_source_and_group_id() {
+        let mut first = test_fork_record("run_1_fork_2_0", "run_1");
+        first.fork_group_id = Some("group-1".to_string());
+        let mut sibling = test_fork_record("run_1_fork_2_1", "run_1");
+        sibling.fork_group_id = Some("group-1".to_string());
+        let mut unrelated = test_fork_record("run_1_fork_3_0", "run_1");
+        unrelated.fork_group_id = Some("group-2".to_string());
+
+        assert!(tclone_records_share_fork_group(&first, &sibling));
+        assert!(!tclone_records_share_fork_group(&first, &unrelated));
+        sibling.parent_run_id = Some("run_2".to_string());
+        assert!(!tclone_records_share_fork_group(&first, &sibling));
+    }
+
+    #[test]
+    fn tclone_repeated_approaches_preserve_order_and_equals_form() {
+        let args = vec![
+            OsString::from("--approach"),
+            OsString::from("minimal"),
+            OsString::from("--approach=aggressive"),
+        ];
+
+        assert_eq!(
+            tclone_repeated_arg_values(&args, "--approach"),
+            vec!["minimal".to_string(), "aggressive".to_string()]
+        );
+        assert_eq!(
+            tclone_fork_approach(&[], 0, 2),
+            "minimal compatible approach"
+        );
+        assert_eq!(
+            tclone_fork_approach(&[], 1, 2),
+            "aggressive latest-version approach"
+        );
+    }
+
+    #[test]
     fn tclone_send_does_not_prefix_source_context() {
         let source = test_record("run_1", "running");
         let prompt = tclone_prompt_with_fork_context(&source, "Upgrade dependencies");
@@ -10345,6 +11023,22 @@ gensee async job job_1: exited status=0
             HostTmuxPlacement::Below
         );
         assert!(parse_host_tmux_placement("tmux:grid").is_err());
+    }
+
+    #[test]
+    fn tclone_parallel_layout_keeps_source_left_and_stacks_forks_right() {
+        assert_eq!(
+            tclone_parallel_pane_layout(0, HostTmuxPlacement::Right, None),
+            (HostTmuxPlacement::Right, None)
+        );
+        assert_eq!(
+            tclone_parallel_pane_layout(1, HostTmuxPlacement::Right, Some("%7")),
+            (HostTmuxPlacement::Below, Some("%7"))
+        );
+        assert_eq!(
+            tclone_parallel_pane_layout(2, HostTmuxPlacement::Right, Some("%8")),
+            (HostTmuxPlacement::Below, Some("%8"))
+        );
     }
 
     #[test]

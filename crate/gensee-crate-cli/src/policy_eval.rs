@@ -305,7 +305,7 @@ pub(crate) fn fork_suggestion_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If the fork command returns scheduled=true, do not run fork again, do not poll fork-status, and do not perform the task locally. End this source turn normally so Gensee can clone the idle Codex session; Gensee will submit the saved original request to the fork automatically and open its pane. The fork will summarize its own changed files and tests, ask whether to merge, promote the fork to main and end the old source, or discard, and wait for explicit user approval before running the selected lifecycle command internally. Do not auto-merge, do not resend the prompt with `gensee run send`, and do not ask the user to type Gensee lifecycle commands.",
+            "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. When two materially different approaches are useful, propose both approaches in chat first, then after approval run one grouped command: gensee run fork {run_id} --copies 2 --name {name_hint} --approach '<approach A>' --approach '<approach B>' --attach tmux:right --json. Otherwise run: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If the fork command returns scheduled=true, do not run fork again, do not poll fork-status, and do not perform the task locally. End this source turn normally so Gensee can clone the idle Codex session. Gensee will submit the saved original request to the fork automatically, adding a distinct assigned approach to each parallel copy. The fork will summarize its own changed files and tests; a parallel coordinator will place the panes in a right-hand stack, compare the results, recommend a winner, and wait for explicit user approval before merging or promoting that winner and discarding the other forks. Do not auto-merge, do not resend the prompt with `gensee run send`, and do not ask the user to type Gensee lifecycle commands.",
             reason = reason.label()
         )
     } else {
@@ -378,7 +378,7 @@ pub(crate) fn fork_suggestion_prompt_finding(
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
-            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. If approved, run this once: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If the fork command returns scheduled=true, do not run fork again, do not poll fork-status, and do not perform the task locally. End this source turn normally so Gensee can clone the idle Codex session; Gensee will submit the saved original request to the fork automatically and open its pane. The fork will summarize its own changed files and tests, ask whether to merge, promote the fork to main and end the old source, or discard, and wait for explicit user approval before running the selected lifecycle command internally. Do not auto-merge, do not resend the prompt with `gensee run send`, and do not ask the user to type Gensee lifecycle commands.",
+            "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. When two materially different approaches are useful, propose both approaches in chat first, then after approval run one grouped command: gensee run fork {run_id} --copies 2 --name {name_hint} --approach '<approach A>' --approach '<approach B>' --attach tmux:right --json. Otherwise run: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If the fork command returns scheduled=true, do not run fork again, do not poll fork-status, and do not perform the task locally. End this source turn normally so Gensee can clone the idle Codex session. Gensee will submit the saved original request to the fork automatically, adding a distinct assigned approach to each parallel copy. The fork will summarize its own changed files and tests; a parallel coordinator will place the panes in a right-hand stack, compare the results, recommend a winner, and wait for explicit user approval before merging or promoting that winner and discarding the other forks. Do not auto-merge, do not resend the prompt with `gensee run send`, and do not ask the user to type Gensee lifecycle commands.",
             reason = reason.label()
         )
     } else {
@@ -678,7 +678,14 @@ fn first_non_option_after(tokens: &[String], mut index: usize) -> Option<&str> {
 fn tclone_option_takes_value(option: &str) -> bool {
     matches!(
         option,
-        "--name" | "--copies" | "--attach" | "--tmux" | "--into" | "--to" | "--paths"
+        "--name"
+            | "--copies"
+            | "--approach"
+            | "--attach"
+            | "--tmux"
+            | "--into"
+            | "--to"
+            | "--paths"
     )
 }
 
