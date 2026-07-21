@@ -174,12 +174,22 @@ main source environment for future work, rewrites its lifecycle context so it
 can create and resolve new forks, transfers the host-control bridge to it, ends
 the previous source container, and closes the previous source pane. The
 user-facing choice is therefore “Promote this fork to the main environment and
-end the old source,” rather than the ambiguous “Keep working.”
+end the old source,” rather than the ambiguous “Keep working.” Chained
+promotions serialize ownership of the shared host-control endpoint so the new
+source cannot rebind it while the previous server is still active.
 
 `gensee run discard <run_id-or-container>` first records the fork as
 `discarded` and returns the lifecycle response. A delayed cleanup then removes
 the fork container, closes its attached pane, focuses the source pane, and
-keeps the `discarded` record for history. `gensee run delete <run_id-or-container>`
+keeps the `discarded` record for history. Cleanup for container-proxied merge,
+promotion, and discard waits for an authenticated acknowledgement emitted after
+the lifecycle response has been printed and flushed; it does not depend on a
+fixed sleep being long enough. Direct host-CLI resolutions retain a short grace
+period because there is no container proxy to acknowledge delivery. Detached
+cleanup and promotion diagnostics are written under
+the private Gensee temporary root's `tclone-resolution/` directory (normally
+`/tmp/gensee-agent-guard/tclone-resolution/`), and the lifecycle response
+prints the exact log path. `gensee run delete <run_id-or-container>`
 removes the container and removes that tclone record from `gensee run list`.
 Use `gensee run delete --all` to clean tracked tclone containers, clear the
 tclone section of the run list, and reap untracked `gensee-tclone-*` orphan
@@ -194,6 +204,8 @@ containers in the same Podman store.
   that makes Node-based shims such as Codex available.
 - `tmux` inside the image for `gensee run attach` with live/forked interactive
   agents. `gensee run shell` only opens a new shell and does not require tmux.
+- `setsid` from util-linux on the host for `gensee run switch`; promotion uses
+  it to keep the host-control handoff alive while the old source is retired.
 
 Environment overrides:
 

@@ -4,11 +4,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -33,6 +36,7 @@ const TCLONE_HOST_CONTROL_REQUEST_MAX_AGE_SECS: u64 = 10 * 60;
 const TCLONE_LIFECYCLE_APPROVAL_MAX_AGE_SECS: u64 = 10 * 60;
 const TCLONE_HOST_CONTROL_REQUEST_FUTURE_SKEW_SECS: u64 = 30;
 const TCLONE_HOST_CONTROL_NONCE_RETENTION_SECS: u64 = 12 * 60;
+const TCLONE_HOST_CONTROL_HANDOFF_TIMEOUT_SECS: u64 = 15;
 const _: () =
     assert!(TCLONE_HOST_CONTROL_REQUEST_MAX_AGE_SECS > TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS);
 const _: () = assert!(
@@ -42,6 +46,7 @@ const _: () = assert!(
 const TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV: &str = "GENSEE_TCLONE_CONTAINER_HOST_CONTROL_POLL";
 const TCLONE_HOST_TMUX_SOCKET_ENV: &str = "GENSEE_HOST_TMUX_SOCKET";
 const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
+const TCLONE_HOST_TMUX_RUN_OPTION: &str = "@gensee_run_id";
 const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
 const TCLONE_WAIT_QUIET_FOR_FORK_ENV: &str = "GENSEE_TCLONE_WAIT_QUIET_FOR_FORK";
 const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
@@ -316,6 +321,15 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
     }
     print!("{}", response.stdout);
     eprint!("{}", response.stderr);
+    io::stdout().flush()?;
+    io::stderr().flush()?;
+    if response.error.is_none() && response.exit_code == Some(0) {
+        if let Err(error) = acknowledge_tclone_lifecycle_response(&request, capability.as_deref()) {
+            eprintln!(
+                "gensee: warning: lifecycle response was delivered, but cleanup acknowledgement failed: {error}"
+            );
+        }
+    }
     if let Some(error) = response.error {
         if error.contains("host-control capability rotation in progress") {
             let payload = tclone_retryable_fork_status_payload(
@@ -337,6 +351,78 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
             response.exit_code.unwrap_or(1)
         )))
     }
+}
+
+fn acknowledge_tclone_lifecycle_response(
+    request: &TcloneHostControlRequest,
+    capability: Option<&str>,
+) -> io::Result<()> {
+    let Some(choice) = tclone_lifecycle_request_choice(request) else {
+        return Ok(());
+    };
+    let caller_run_id = request
+        .caller_run_id
+        .as_deref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "missing caller run id"))?;
+    let capability = capability.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "missing host-control capability for lifecycle acknowledgement",
+        )
+    })?;
+    let target = tclone_lifecycle_request_target(request)?;
+    let args = vec![
+        "run".to_string(),
+        "lifecycle-ack".to_string(),
+        target,
+        choice.to_string(),
+    ];
+    let nonce = Uuid::new_v4().to_string();
+    let issued_at_ms = unix_millis()?;
+    let authenticator =
+        tclone_host_control_authenticator(caller_run_id, &nonce, issued_at_ms, &args, capability)?;
+    let ack_request = TcloneHostControlRequest {
+        caller_run_id: Some(caller_run_id.to_string()),
+        nonce: Some(nonce),
+        issued_at_ms: Some(issued_at_ms),
+        authenticator: Some(authenticator),
+        args,
+    };
+    let ack_response = match tclone_host_control_socket_path() {
+        Some(socket_path) => match tclone_host_control_request(&socket_path, &ack_request) {
+            Ok(response) => response,
+            Err(socket_error) if tclone_host_control_dir_path().is_some() => {
+                tclone_host_control_file_request(&ack_request).map_err(|file_error| {
+                    io::Error::new(
+                        file_error.kind(),
+                        format!(
+                            "socket acknowledgement failed ({socket_error}); file acknowledgement failed ({file_error})"
+                        ),
+                    )
+                })?
+            }
+            Err(error) => return Err(error),
+        },
+        None if tclone_host_control_dir_path().is_some() => {
+            tclone_host_control_file_request(&ack_request)?
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "host-control transport disappeared before lifecycle acknowledgement",
+            ));
+        }
+    };
+    if let Some(error) = ack_response.error {
+        return Err(io::Error::other(error));
+    }
+    if ack_response.exit_code != Some(0) {
+        return Err(io::Error::other(format!(
+            "host rejected lifecycle acknowledgement with status {}",
+            ack_response.exit_code.unwrap_or(1)
+        )));
+    }
+    Ok(())
 }
 
 fn tclone_retryable_empty_fork_status_payload(
@@ -1181,6 +1267,7 @@ fn tclone_host_control_should_proxy(args: &[OsString]) -> bool {
                 | "merge"
                 | "switch"
                 | "discard"
+                | "lifecycle-ack"
         )
     )
 }
@@ -1323,6 +1410,10 @@ fn clamp_tclone_host_control_file_timeout_secs(configured: u64) -> u64 {
 struct TcloneHostControlServer {
     socket_path: PathBuf,
     control_dir: PathBuf,
+    stop: Arc<AtomicBool>,
+    file_thread: Option<thread::JoinHandle<()>>,
+    socket_thread: Option<thread::JoinHandle<()>>,
+    _lease: fs::File,
 }
 
 struct TcloneContainerFileControlServer;
@@ -1330,18 +1421,15 @@ struct TcloneContainerFileControlServer;
 impl TcloneHostControlServer {
     fn start(socket_path: &Path, control_dir: &Path) -> io::Result<Self> {
         create_restrictive_dir_all(control_dir)?;
+        let lease = acquire_tclone_host_control_lease(control_dir).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not acquire tclone host-control lease: {error}"),
+            )
+        })?;
         create_restrictive_dir_all(&control_dir.join("requests"))?;
         create_restrictive_dir_all(&control_dir.join("responses"))?;
-        let file_exe = env::current_exe()?;
-        let file_control_dir = control_dir.to_path_buf();
-        thread::spawn(move || loop {
-            if let Err(error) =
-                drain_tclone_host_control_file_requests(&file_control_dir, &file_exe)
-            {
-                eprintln!("gensee: tclone host-control file bridge failed: {error}");
-            }
-            thread::sleep(Duration::from_millis(50));
-        });
+        let stop = Arc::new(AtomicBool::new(false));
 
         #[cfg(unix)]
         {
@@ -1349,12 +1437,38 @@ impl TcloneHostControlServer {
                 fs::create_dir_all(parent)?;
             }
             let _ = fs::remove_file(socket_path);
-            let listener = UnixListener::bind(socket_path)?;
-            let exe = env::current_exe()?;
-            thread::spawn(move || {
-                for stream in listener.incoming() {
-                    match stream {
-                        Ok(stream) => handle_tclone_host_control_stream(stream, &exe),
+            let listener = UnixListener::bind(socket_path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not bind tclone host-control socket {}: {error}",
+                        socket_path.display()
+                    ),
+                )
+            })?;
+            listener.set_nonblocking(true)?;
+            let file_exe = env::current_exe()?;
+            let exe = file_exe.clone();
+            let file_control_dir = control_dir.to_path_buf();
+            let file_stop = Arc::clone(&stop);
+            let file_thread = thread::spawn(move || {
+                while !file_stop.load(Ordering::Acquire) {
+                    if let Err(error) =
+                        drain_tclone_host_control_file_requests(&file_control_dir, &file_exe)
+                    {
+                        eprintln!("gensee: tclone host-control file bridge failed: {error}");
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+            let socket_stop = Arc::clone(&stop);
+            let socket_thread = thread::spawn(move || {
+                while !socket_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => handle_tclone_host_control_stream(stream, &exe),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(50));
+                        }
                         Err(error) => {
                             eprintln!("gensee: tclone host-control accept failed: {error}");
                             break;
@@ -1365,6 +1479,10 @@ impl TcloneHostControlServer {
             Ok(Self {
                 socket_path: socket_path.to_path_buf(),
                 control_dir: control_dir.to_path_buf(),
+                stop,
+                file_thread: Some(file_thread),
+                socket_thread: Some(socket_thread),
+                _lease: lease,
             })
         }
         #[cfg(not(unix))]
@@ -1406,10 +1524,65 @@ impl TcloneContainerFileControlServer {
 
 impl Drop for TcloneHostControlServer {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.file_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.socket_thread.take() {
+            let _ = thread.join();
+        }
         let _ = fs::remove_file(&self.socket_path);
         let _ = fs::remove_dir_all(self.control_dir.join("requests"));
         let _ = fs::remove_dir_all(self.control_dir.join("responses"));
     }
+}
+
+#[cfg(unix)]
+fn acquire_tclone_host_control_lease(control_dir: &Path) -> io::Result<fs::File> {
+    let lease_path = control_dir.join("server.lock");
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    let lease = options.open(&lease_path)?;
+    if !lease.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", lease_path.display()),
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(TCLONE_HOST_CONTROL_HANDOFF_TIMEOUT_SECS);
+    loop {
+        let result = unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(lease);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(error);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for the previous tclone host-control server to release {}",
+                    lease_path.display()
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(unix))]
+fn acquire_tclone_host_control_lease(_control_dir: &Path) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "tclone host control is only supported on Unix",
+    ))
 }
 
 #[cfg(unix)]
@@ -1485,6 +1658,9 @@ fn execute_tclone_host_control_request(
             }
         }
         return Ok(response);
+    }
+    if request.args.get(1).map(String::as_str) == Some("lifecycle-ack") {
+        return record_tclone_lifecycle_response_ack(&request);
     }
     if let Some(choice) = tclone_lifecycle_request_choice(&request) {
         let approval_lock = TCLONE_LIFECYCLE_APPROVAL_LOCK.get_or_init(|| Mutex::new(()));
@@ -1757,6 +1933,9 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
         "switch" | "discard" => {
             validate_tclone_resolution_authority(caller_run_id, &request.args[2..], None)?;
         }
+        "lifecycle-ack" => {
+            validate_tclone_lifecycle_response_ack(&request.args, caller_run_id)?;
+        }
         "fork-status" => {
             let job_id = request.args.get(2).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing tclone fork job id")
@@ -1798,6 +1977,66 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
     // make a captured request replayable.
     claim_tclone_host_control_nonce(caller_run_id, nonce)?;
     Ok(())
+}
+
+fn validate_tclone_lifecycle_response_ack(args: &[String], caller_run_id: &str) -> io::Result<()> {
+    if args.len() != 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee run lifecycle-ack <run-id> <merge|switch|discard>",
+        ));
+    }
+    let target = args[2].as_str();
+    let choice = args[3].as_str();
+    let record = find_tclone_record(target)?;
+    let caller = find_tclone_record(caller_run_id)?;
+    let resolved = match choice {
+        "merge" => record.role == "fork" && record.status == "merged",
+        "discard" => record.role == "fork" && record.status == "discarded",
+        "switch" => record.role == "source" && record.status == "active",
+        _ => false,
+    };
+    let authorized = if target == caller_run_id {
+        true
+    } else if matches!(choice, "merge" | "discard") {
+        caller.role == "source" && record.parent_run_id.as_deref() == Some(caller_run_id)
+    } else if choice == "switch" {
+        caller.role == "source"
+            && caller.status == "switched-away"
+            && tclone_host_control_owner_run_id(&caller)
+                == tclone_host_control_owner_run_id(&record)
+    } else {
+        false
+    };
+    if !resolved || !authorized {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "cannot acknowledge unauthorized or unresolved lifecycle action `{choice}` for {}",
+                record.run_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn record_tclone_lifecycle_response_ack(
+    request: &TcloneHostControlRequest,
+) -> io::Result<TcloneHostControlResponse> {
+    let run_id = request.args[2].as_str();
+    let action = if request.args[3] == "switch" {
+        "switch"
+    } else {
+        "resolved"
+    };
+    let path = tclone_resolution_ack_path(run_id, action)?;
+    write_atomic_nofollow(&path, b"response-delivered\n", 0o600)?;
+    Ok(TcloneHostControlResponse {
+        exit_code: Some(0),
+        stdout: String::new(),
+        stderr: String::new(),
+        error: None,
+    })
 }
 
 fn validate_tclone_resolution_authority(
@@ -4357,7 +4596,11 @@ fn host_tmux_attach_command(target: &str, exe: &Path, use_sudo: bool) -> String 
     parts.push("run".to_string());
     parts.push("attach".to_string());
     parts.push(shell_quote(target));
-    parts.join(" ")
+    format!(
+        "tmux set-option -p -t \"$TMUX_PANE\" {TCLONE_HOST_TMUX_RUN_OPTION} {}; exec {}",
+        shell_quote(target),
+        parts.join(" ")
+    )
 }
 
 const TCLONE_HOST_TMUX_ENV_KEYS: &[&str] = &[
@@ -5410,9 +5653,10 @@ pub(crate) fn tclone_merge(args: Vec<OsString>) -> io::Result<()> {
             append_tclone_status(&fork.run_id, "merged", None)?;
         }
         match schedule_tclone_resolution_cleanup(&fork.run_id) {
-            Ok(()) => println!(
-                "gensee: scheduled resolved fork cleanup for {}",
-                fork.run_id
+            Ok(log_path) => println!(
+                "gensee: scheduled resolved fork cleanup for {}; log: {}",
+                fork.run_id,
+                log_path.display()
             ),
             Err(error) => eprintln!(
                 "gensee: merge succeeded, but resolved fork cleanup could not be scheduled: {error}"
@@ -5422,41 +5666,67 @@ pub(crate) fn tclone_merge(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
+// Direct host-CLI resolutions have no proxy response to acknowledge, so their
+// detached cleanup retains a short grace period. Container-proxied lifecycle
+// actions do not rely on this delay: cleanup waits for an authenticated ack
+// sent only after the lifecycle response has been printed and flushed.
 const TCLONE_RESOLUTION_CLEANUP_DELAY_MS: u64 = 2_500;
 const TCLONE_RESOLUTION_CLEANUP_DELAY_ENV: &str = "GENSEE_TCLONE_RESOLUTION_CLEANUP_DELAY_MS";
+const TCLONE_RESOLUTION_ACK_TIMEOUT_MS: u64 = 30_000;
+const TCLONE_RESOLUTION_ACK_TIMEOUT_ENV: &str = "GENSEE_TCLONE_RESOLUTION_ACK_TIMEOUT_MS";
+const TCLONE_RESOLUTION_WAIT_FOR_ACK_FLAG: &str = "--wait-for-response-ack";
+const TCLONE_HOST_CONTROL_CALLER_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_CALLER";
 
-fn schedule_tclone_resolution_cleanup(run_id: &str) -> io::Result<()> {
+fn schedule_tclone_resolution_cleanup(run_id: &str) -> io::Result<PathBuf> {
     let exe = env::current_exe()?;
-    Command::new(exe)
-        .arg("__tclone-cleanup-resolved")
-        .arg(run_id)
+    let wait_for_ack = tclone_resolution_requires_response_ack();
+    let ack_path = tclone_resolution_ack_path(run_id, "resolved")?;
+    let _ = fs::remove_file(&ack_path);
+    let (log, log_path) = open_tclone_resolution_log(run_id, "resolved")?;
+    let stderr = log.try_clone()?;
+    let mut command = Command::new(exe);
+    command.arg("__tclone-cleanup-resolved").arg(run_id);
+    if wait_for_ack {
+        command.arg(TCLONE_RESOLUTION_WAIT_FOR_ACK_FLAG);
+    }
+    command
         .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
         .spawn()
-        .map(|_| ())
         .map_err(|error| {
             io::Error::other(format!(
                 "resolved fork cleanup could not be scheduled for {run_id}: {error}"
             ))
-        })
+        })?;
+    Ok(log_path)
 }
 
 pub(crate) fn tclone_cleanup_resolved(args: Vec<OsString>) -> io::Result<()> {
     let target = tclone_target_arg(&args, "usage: gensee __tclone-cleanup-resolved <fork-id>")?;
-    let delay_ms = env::var(TCLONE_RESOLUTION_CLEANUP_DELAY_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(TCLONE_RESOLUTION_CLEANUP_DELAY_MS);
-    thread::sleep(Duration::from_millis(delay_ms));
-
     let record = find_tclone_record(&target)?;
     if !tclone_record_is_ready_for_resolution_cleanup(&record) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "refusing to clean up unresolved tclone run {} role={} status={}",
+                record.run_id, record.role, record.status
+            ),
+        ));
+    }
+    wait_for_tclone_resolution_response(
+        &record.run_id,
+        "resolved",
+        args.iter()
+            .any(|arg| arg == TCLONE_RESOLUTION_WAIT_FOR_ACK_FLAG),
+    )?;
+    let record = find_tclone_record(&target)?;
+    if !tclone_record_is_ready_for_resolution_cleanup(&record) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to clean up tclone run whose resolution changed: {} role={} status={}",
                 record.run_id, record.role, record.status
             ),
         ));
@@ -5474,6 +5744,92 @@ pub(crate) fn tclone_cleanup_resolved(args: Vec<OsString>) -> io::Result<()> {
     }
     focus_tclone_source_host_pane();
     Ok(())
+}
+
+fn tclone_resolution_requires_response_ack() -> bool {
+    env::var(TCLONE_HOST_CONTROL_CALLER_ENV)
+        .ok()
+        .is_some_and(|caller| !caller.is_empty())
+}
+
+fn tclone_resolution_log_path(run_id: &str, action: &str) -> io::Result<PathBuf> {
+    Ok(gensee_tmp_root()?.join("tclone-resolution").join(format!(
+        "{}-{}.log",
+        tclone_safe_job_component(run_id),
+        tclone_safe_job_component(action)
+    )))
+}
+
+fn tclone_resolution_ack_path(run_id: &str, action: &str) -> io::Result<PathBuf> {
+    Ok(gensee_tmp_root()?.join("tclone-resolution").join(format!(
+        "{}-{}.ack",
+        tclone_safe_job_component(run_id),
+        tclone_safe_job_component(action)
+    )))
+}
+
+fn open_tclone_resolution_log(run_id: &str, action: &str) -> io::Result<(fs::File, PathBuf)> {
+    let path = tclone_resolution_log_path(run_id, action)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("tclone resolution log has no parent"))?;
+    create_restrictive_dir_all(parent)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    writeln!(
+        file,
+        "gensee: starting detached {action} worker for {run_id}"
+    )?;
+    Ok((file, path))
+}
+
+fn wait_for_tclone_resolution_response(
+    run_id: &str,
+    action: &str,
+    wait_for_ack: bool,
+) -> io::Result<()> {
+    if !wait_for_ack {
+        let delay_ms = env::var(TCLONE_RESOLUTION_CLEANUP_DELAY_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(TCLONE_RESOLUTION_CLEANUP_DELAY_MS);
+        thread::sleep(Duration::from_millis(delay_ms));
+        return Ok(());
+    }
+
+    let ack_path = tclone_resolution_ack_path(run_id, action)?;
+    let timeout_ms = env::var(TCLONE_RESOLUTION_ACK_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(TCLONE_RESOLUTION_ACK_TIMEOUT_MS);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if tclone_path_exists(&ack_path) {
+            let _ = fs::remove_file(&ack_path);
+            // Let the tiny ack response leave the host-control socket before a
+            // switch or discard tears down the caller's container.
+            thread::sleep(Duration::from_millis(100));
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "did not observe lifecycle response delivery for {run_id}; cleanup was skipped"
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn tclone_record_is_ready_for_resolution_cleanup(record: &TcloneRunRecord) -> bool {
@@ -5533,47 +5889,88 @@ pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
     retired_source.status = "switched-away".to_string();
     retired_source.updated_at_ms = switched_at_ms;
     let switched = switched_tclone_source_record(fork.clone(), switched_at_ms)?;
-    append_tclone_record(&retired_source)?;
-    append_tclone_record(&switched)?;
+    append_tclone_records_atomically(&[retired_source, switched.clone()])?;
 
-    if let Err(error) = schedule_tclone_switch_completion(&switched.run_id, &previous_source.run_id)
-    {
-        append_tclone_record(&previous_source)?;
-        append_tclone_record(&fork)?;
-        return Err(error);
-    }
     if let Err(error) = write_tclone_run_context(&podman, &switched) {
-        append_tclone_record(&previous_source)?;
-        append_tclone_record(&fork)?;
-        return Err(io::Error::new(
+        let failure = io::Error::new(
             error.kind(),
             format!("could not promote fork context to source: {error}"),
-        ));
+        );
+        let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
+        return Err(tclone_switch_error_with_rollback(failure, rollback));
     }
+    let completion_log =
+        match schedule_tclone_switch_completion(&switched.run_id, &previous_source.run_id) {
+            Ok(log_path) => log_path,
+            Err(error) => {
+                let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
+                return Err(tclone_switch_error_with_rollback(error, rollback));
+            }
+        };
     if let Err(error) = tclone_exec(
         &podman,
         &switched.container_name,
         &["rm", "-f", TCLONE_FORK_RESULT_PATH],
     ) {
-        let _ = write_tclone_run_context(&podman, &fork);
-        append_tclone_record(&previous_source)?;
-        append_tclone_record(&fork)?;
-        return Err(io::Error::new(
+        let failure = io::Error::new(
             error.kind(),
             format!("could not reset promoted source lifecycle state: {error}"),
-        ));
+        );
+        let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
+        return Err(tclone_switch_error_with_rollback(failure, rollback));
     }
     println!(
-        "gensee: promoted {} ({}) to the main environment; the old source will be ended",
-        switched.run_id, switched.container_name
+        "gensee: promoted {} ({}) to the main environment; the old source will be ended; completion log: {}",
+        switched.run_id,
+        switched.container_name,
+        completion_log.display()
     );
     Ok(())
+}
+
+fn rollback_tclone_switch(
+    podman: &OsString,
+    previous_source: &TcloneRunRecord,
+    fork: &TcloneRunRecord,
+    restore_context: bool,
+) -> io::Result<()> {
+    let context_error = if restore_context {
+        write_tclone_run_context(podman, fork).err()
+    } else {
+        None
+    };
+    let state_error =
+        append_tclone_records_atomically(&[previous_source.clone(), fork.clone()]).err();
+    match (context_error, state_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) => Err(io::Error::new(
+            error.kind(),
+            format!("could not restore fork context: {error}"),
+        )),
+        (None, Some(error)) => Err(io::Error::new(
+            error.kind(),
+            format!("could not restore tclone records: {error}"),
+        )),
+        (Some(context), Some(state)) => Err(io::Error::other(format!(
+            "could not restore fork context ({context}) or tclone records ({state})"
+        ))),
+    }
+}
+
+fn tclone_switch_error_with_rollback(error: io::Error, rollback: io::Result<()>) -> io::Error {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback_error) => io::Error::new(
+            error.kind(),
+            format!("{error}; rollback also failed: {rollback_error}"),
+        ),
+    }
 }
 
 fn schedule_tclone_switch_completion(
     promoted_run_id: &str,
     previous_source_run_id: &str,
-) -> io::Result<()> {
+) -> io::Result<PathBuf> {
     let exe = env::current_exe()?;
     let setsid = find_command("setsid").ok_or_else(|| {
         io::Error::new(
@@ -5581,26 +5978,36 @@ fn schedule_tclone_switch_completion(
             "switch promotion requires `setsid` to transfer host control safely",
         )
     })?;
-    Command::new(setsid)
+    let wait_for_ack = tclone_resolution_requires_response_ack();
+    let ack_path = tclone_resolution_ack_path(promoted_run_id, "switch")?;
+    let _ = fs::remove_file(&ack_path);
+    let (log, log_path) = open_tclone_resolution_log(promoted_run_id, "switch")?;
+    let stderr = log.try_clone()?;
+    let mut command = Command::new(setsid);
+    command
         .arg(exe)
         .arg("__tclone-complete-switch")
         .arg(promoted_run_id)
-        .arg(previous_source_run_id)
+        .arg(previous_source_run_id);
+    if wait_for_ack {
+        command.arg(TCLONE_RESOLUTION_WAIT_FOR_ACK_FLAG);
+    }
+    command
         .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
         .spawn()
-        .map(|_| ())
         .map_err(|error| {
             io::Error::other(format!(
                 "could not schedule source retirement for promoted run {promoted_run_id}: {error}"
             ))
-        })
+        })?;
+    Ok(log_path)
 }
 
 pub(crate) fn tclone_complete_switch(args: Vec<OsString>) -> io::Result<()> {
-    if args.len() != 2 {
+    if args.len() < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "usage: gensee __tclone-complete-switch <promoted-run-id> <previous-source-run-id>",
@@ -5619,12 +6026,6 @@ pub(crate) fn tclone_complete_switch(args: Vec<OsString>) -> io::Result<()> {
                 "invalid previous source run id",
             )
         })?;
-    let delay_ms = env::var(TCLONE_RESOLUTION_CLEANUP_DELAY_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(TCLONE_RESOLUTION_CLEANUP_DELAY_MS);
-    thread::sleep(Duration::from_millis(delay_ms));
-
     let promoted = find_tclone_record(promoted_run_id)?;
     let previous_source = find_tclone_record(previous_source_run_id)?;
     if promoted.role != "source"
@@ -5635,6 +6036,24 @@ pub(crate) fn tclone_complete_switch(args: Vec<OsString>) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "refusing to retire source because the switch is no longer active",
+        ));
+    }
+    wait_for_tclone_resolution_response(
+        promoted_run_id,
+        "switch",
+        args.iter()
+            .any(|arg| arg == TCLONE_RESOLUTION_WAIT_FOR_ACK_FLAG),
+    )?;
+    let promoted = find_tclone_record(promoted_run_id)?;
+    let previous_source = find_tclone_record(previous_source_run_id)?;
+    if promoted.role != "source"
+        || promoted.status != "active"
+        || previous_source.role != "source"
+        || previous_source.status != "switched-away"
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to retire source because the switch changed before response delivery",
         ));
     }
 
@@ -5715,22 +6134,33 @@ fn tclone_host_tmux_pane_for_run(record: &TcloneRunRecord) -> Option<String> {
         .arg("list-panes")
         .arg("-a")
         .arg("-F")
-        .arg("#{pane_id}\t#{pane_start_command}")
+        .arg(format!(
+            "#{{pane_id}}\t#{{{TCLONE_HOST_TMUX_RUN_OPTION}}}\t#{{pane_start_command}}"
+        ))
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .find_map(|(pane_id, command)| {
-            if command.contains(&record.run_id) || command.contains(&record.container_name) {
-                Some(pane_id.to_string())
-            } else {
-                None
-            }
-        })
+    tclone_host_tmux_pane_from_listing(&String::from_utf8_lossy(&output.stdout), &record.run_id)
+}
+
+fn tclone_host_tmux_pane_from_listing(listing: &str, run_id: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let mut fields = line.splitn(3, '\t');
+        let pane_id = fields.next()?;
+        let pane_run_id = fields.next()?;
+        let start_command = fields.next().unwrap_or_default();
+        let legacy_exact_match = start_command
+            .split_whitespace()
+            .map(normalize_tclone_target)
+            .any(|token| token == run_id);
+        if pane_run_id == run_id || (pane_run_id.is_empty() && legacy_exact_match) {
+            Some(pane_id.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn tclone_delete(args: Vec<OsString>) -> io::Result<()> {
@@ -6911,13 +7341,18 @@ pub(crate) fn tclone_discard_if_exists(target: &str) -> io::Result<bool> {
     // Record the terminal resolution now, but delay destructive cleanup so
     // the successful lifecycle response can reach the agent in this fork.
     append_tclone_status(&record.run_id, "discarded", None)?;
-    if let Err(error) = schedule_tclone_resolution_cleanup(&record.run_id) {
-        append_tclone_record(&record)?;
-        return Err(error);
-    }
+    let log_path = match schedule_tclone_resolution_cleanup(&record.run_id) {
+        Ok(log_path) => log_path,
+        Err(error) => {
+            append_tclone_record(&record)?;
+            return Err(error);
+        }
+    };
     println!(
-        "gensee: marked tclone fork {} ({}) discarded; cleanup is scheduled",
-        record.run_id, record.container_name
+        "gensee: marked tclone fork {} ({}) discarded; cleanup is scheduled; log: {}",
+        record.run_id,
+        record.container_name,
+        log_path.display()
     );
     Ok(true)
 }
@@ -6977,6 +7412,10 @@ fn write_tclone_runs_to_path(path: &Path, records: &[TcloneRunRecord]) -> io::Re
         fs::create_dir_all(parent)?;
     }
     let _lock = TcloneStateLock::acquire(path)?;
+    write_tclone_runs_to_path_locked(path, records)
+}
+
+fn write_tclone_runs_to_path_locked(path: &Path, records: &[TcloneRunRecord]) -> io::Result<()> {
     let temp_path = path.with_extension("jsonl.tmp");
     {
         let mut file = fs::OpenOptions::new()
@@ -6992,6 +7431,43 @@ fn write_tclone_runs_to_path(path: &Path, records: &[TcloneRunRecord]) -> io::Re
     }
     fs::rename(temp_path, path)?;
     Ok(())
+}
+
+fn append_tclone_records_atomically(updates: &[TcloneRunRecord]) -> io::Result<()> {
+    let path = tclone_state_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("tclone state path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let _lock = TcloneStateLock::acquire(&path)?;
+    let existing = match read_nofollow_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let temp_path = parent.join(format!(".tclone-state-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(&temp_path)?;
+        file.write_all(existing.as_bytes())?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            writeln!(file)?;
+        }
+        for update in updates {
+            let line = serde_json::to_string(update)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            writeln!(file, "{line}")?;
+        }
+        file.sync_all()?;
+        fs::rename(&temp_path, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn append_tclone_record(record: &TcloneRunRecord) -> io::Result<()> {
@@ -9535,7 +10011,15 @@ gensee async job job_1: exited status=0
             OsString::from("fork-status"),
             OsString::from("job_1"),
         ]));
-        for subcommand in ["list", "diff", "summary", "merge", "switch", "discard"] {
+        for subcommand in [
+            "list",
+            "diff",
+            "summary",
+            "merge",
+            "switch",
+            "discard",
+            "lifecycle-ack",
+        ] {
             assert!(tclone_host_control_should_proxy(&[
                 OsString::from("run"),
                 OsString::from(subcommand),
@@ -9824,8 +10308,9 @@ gensee async job job_1: exited status=0
         let command = host_tmux_attach_command("run_1_fork_0", Path::new("/tmp/gensee"), false);
 
         assert!(command.contains("'/tmp/gensee' run attach 'run_1_fork_0'"));
-        assert!(command.starts_with("env "));
-        assert!(!command.starts_with("sudo "));
+        assert!(command.starts_with("tmux set-option -p"));
+        assert!(command.contains("@gensee_run_id 'run_1_fork_0'; exec env "));
+        assert!(!command.contains("; exec sudo env "));
         assert!(!command.contains("attach exited with status"));
         assert!(!command.contains("exec \"${SHELL:-/bin/sh}\""));
     }
@@ -9834,8 +10319,29 @@ gensee async job job_1: exited status=0
     fn tclone_host_tmux_attach_command_can_reenter_with_sudo() {
         let command = host_tmux_attach_command("run_1_fork_0", Path::new("/tmp/gensee"), true);
 
-        assert!(command.starts_with("sudo env "));
+        assert!(command.contains("; exec sudo env "));
         assert!(command.contains("'/tmp/gensee' run attach 'run_1_fork_0'"));
+    }
+
+    #[test]
+    fn tclone_host_tmux_pane_lookup_uses_exact_run_metadata() {
+        let listing = "%1\trun_123_fork_456\n%2\trun_123\n";
+
+        assert_eq!(
+            tclone_host_tmux_pane_from_listing(listing, "run_123"),
+            Some("%2".to_string())
+        );
+        assert_eq!(
+            tclone_host_tmux_pane_from_listing(listing, "run_123_fork_456"),
+            Some("%1".to_string())
+        );
+        assert_eq!(tclone_host_tmux_pane_from_listing(listing, "run_12"), None);
+        let legacy = "%3\t\tgensee run attach 'run_123_fork_456'\n";
+        assert_eq!(
+            tclone_host_tmux_pane_from_listing(legacy, "run_123_fork_456"),
+            Some("%3".to_string())
+        );
+        assert_eq!(tclone_host_tmux_pane_from_listing(legacy, "run_123"), None);
     }
 
     #[test]
@@ -9853,6 +10359,186 @@ gensee async job job_1: exited status=0
         record.status = "discarded".to_string();
         record.role = "source".to_string();
         assert!(!tclone_record_is_ready_for_resolution_cleanup(&record));
+    }
+
+    #[test]
+    fn tclone_resolution_worker_log_is_private_and_durable() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("resolution-log");
+        let old_home = env::var_os("GENSEE_HOME");
+        env::set_var("GENSEE_HOME", &root);
+
+        let (mut log, path) = open_tclone_resolution_log("run_1_fork_0", "switch").unwrap();
+        writeln!(log, "diagnostic detail").unwrap();
+        drop(log);
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("starting detached switch worker"));
+        assert!(contents.contains("diagnostic detail"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_resolution_waits_for_printed_response_ack() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("resolution-ack");
+        let old_home = env::var_os("GENSEE_HOME");
+        let old_timeout = env::var_os(TCLONE_RESOLUTION_ACK_TIMEOUT_ENV);
+        env::set_var("GENSEE_HOME", &root);
+        env::set_var(TCLONE_RESOLUTION_ACK_TIMEOUT_ENV, "1000");
+        let ack_path = tclone_resolution_ack_path("run_1_fork_0", "resolved").unwrap();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            write_atomic_nofollow(&ack_path, b"response-delivered\n", 0o600).unwrap();
+        });
+
+        wait_for_tclone_resolution_response("run_1_fork_0", "resolved", true).unwrap();
+        writer.join().unwrap();
+        assert!(!tclone_path_exists(
+            &tclone_resolution_ack_path("run_1_fork_0", "resolved").unwrap()
+        ));
+
+        match old_timeout {
+            Some(value) => env::set_var(TCLONE_RESOLUTION_ACK_TIMEOUT_ENV, value),
+            None => env::remove_var(TCLONE_RESOLUTION_ACK_TIMEOUT_ENV),
+        }
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_lifecycle_ack_requires_matching_terminal_state() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("lifecycle-ack-state");
+        let old_home = env::var_os("GENSEE_HOME");
+        env::set_var("GENSEE_HOME", &root);
+        let mut fork = test_fork_record("run_1_fork_0", "run_1");
+        fork.status = "merged".to_string();
+        let source = test_record("run_1", "running");
+        write_tclone_runs_to_path(
+            &tclone_state_path().unwrap(),
+            &[source.clone(), fork.clone()],
+        )
+        .unwrap();
+
+        let merge_ack = vec![
+            "run".to_string(),
+            "lifecycle-ack".to_string(),
+            "run_1_fork_0".to_string(),
+            "merge".to_string(),
+        ];
+        validate_tclone_lifecycle_response_ack(&merge_ack, "run_1_fork_0").unwrap();
+        validate_tclone_lifecycle_response_ack(&merge_ack, "run_1").unwrap();
+        let mut wrong_choice = merge_ack;
+        wrong_choice[3] = "switch".to_string();
+        assert_eq!(
+            validate_tclone_lifecycle_response_ack(&wrong_choice, "run_1_fork_0")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let mut retired = source;
+        retired.status = "switched-away".to_string();
+        let mut promoted = fork;
+        promoted.role = "source".to_string();
+        promoted.status = "active".to_string();
+        promoted.parent_run_id = None;
+        append_tclone_records_atomically(&[retired, promoted]).unwrap();
+        let switch_ack = vec![
+            "run".to_string(),
+            "lifecycle-ack".to_string(),
+            "run_1_fork_0".to_string(),
+            "switch".to_string(),
+        ];
+        validate_tclone_lifecycle_response_ack(&switch_ack, "run_1").unwrap();
+
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_record_pair_replacement_is_atomic() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("record-pair-update");
+        let old_home = env::var_os("GENSEE_HOME");
+        env::set_var("GENSEE_HOME", &root);
+        let source = test_record("run_1", "running");
+        let fork = test_fork_record("run_1_fork_0", "run_1");
+        write_tclone_runs_to_path(
+            &tclone_state_path().unwrap(),
+            &[source.clone(), fork.clone()],
+        )
+        .unwrap();
+        let mut retired = source;
+        retired.status = "switched-away".to_string();
+        let mut promoted = fork;
+        promoted.role = "source".to_string();
+        promoted.status = "active".to_string();
+
+        append_tclone_records_atomically(&[retired, promoted]).unwrap();
+        assert_eq!(
+            fs::read_to_string(tclone_state_path().unwrap())
+                .unwrap()
+                .lines()
+                .count(),
+            4,
+            "the atomic pair update must preserve append-only history"
+        );
+        let records = read_tclone_runs_from_path(&tclone_state_path().unwrap()).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .any(|record| record.run_id == "run_1" && record.status == "switched-away"));
+        assert!(records.iter().any(|record| {
+            record.run_id == "run_1_fork_0" && record.role == "source" && record.status == "active"
+        }));
+
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tclone_host_control_server_handoff_waits_for_previous_owner() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "gensee-handoff-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let socket = root.join("control.sock");
+        let first = TcloneHostControlServer::start(&socket, &root).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            drop(first);
+        });
+
+        let second = TcloneHostControlServer::start(&socket, &root).unwrap();
+        release.join().unwrap();
+        assert!(socket.exists());
+        drop(second);
+        assert!(!socket.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
