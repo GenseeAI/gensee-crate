@@ -73,6 +73,7 @@ const _: () = assert!(
 );
 const TCLONE_ASYNC_MAX_ACTIVE_JOBS: usize = 4;
 const TCLONE_ASYNC_JOB_RETENTION_SECS: u64 = 24 * 60 * 60;
+const TCLONE_RESOLUTION_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const TCLONE_FORK_QUIET_TIMEOUT_SECS: u64 = 120;
 const TCLONE_FORK_QUIET_CPU_PERCENT: f64 = 10.0;
 const TCLONE_FORK_QUIET_STABLE_SAMPLES: usize = 3;
@@ -2029,6 +2030,9 @@ fn record_tclone_lifecycle_response_ack(
     } else {
         "resolved"
     };
+    if let Err(error) = prune_tclone_resolution_artifacts() {
+        eprintln!("gensee: warning: could not prune stale lifecycle artifacts: {error}");
+    }
     let path = tclone_resolution_ack_path(run_id, action)?;
     write_atomic_nofollow(&path, b"response-delivered\n", 0o600)?;
     Ok(TcloneHostControlResponse {
@@ -5753,7 +5757,7 @@ fn tclone_resolution_requires_response_ack() -> bool {
 }
 
 fn tclone_resolution_log_path(run_id: &str, action: &str) -> io::Result<PathBuf> {
-    Ok(gensee_tmp_root()?.join("tclone-resolution").join(format!(
+    Ok(tclone_resolution_dir()?.join(format!(
         "{}-{}.log",
         tclone_safe_job_component(run_id),
         tclone_safe_job_component(action)
@@ -5761,14 +5765,52 @@ fn tclone_resolution_log_path(run_id: &str, action: &str) -> io::Result<PathBuf>
 }
 
 fn tclone_resolution_ack_path(run_id: &str, action: &str) -> io::Result<PathBuf> {
-    Ok(gensee_tmp_root()?.join("tclone-resolution").join(format!(
+    Ok(tclone_resolution_dir()?.join(format!(
         "{}-{}.ack",
         tclone_safe_job_component(run_id),
         tclone_safe_job_component(action)
     )))
 }
 
+fn tclone_resolution_dir() -> io::Result<PathBuf> {
+    Ok(gensee_tmp_root()?.join("tclone-resolution"))
+}
+
+fn prune_tclone_resolution_artifacts() -> io::Result<()> {
+    prune_tclone_resolution_artifacts_at(SystemTime::now())
+}
+
+fn prune_tclone_resolution_artifacts_at(now: SystemTime) -> io::Result<()> {
+    let dir = tclone_resolution_dir()?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        if !matches!(extension, Some("ack" | "log"))
+            || !entry.file_type()?.is_file()
+            || !tclone_path_age_at_least(&path, now, TCLONE_RESOLUTION_RETENTION_SECS)
+        {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(&path) {
+            eprintln!(
+                "gensee: warning: could not prune stale lifecycle artifact ({}): {error}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn open_tclone_resolution_log(run_id: &str, action: &str) -> io::Result<(fs::File, PathBuf)> {
+    if let Err(error) = prune_tclone_resolution_artifacts() {
+        eprintln!("gensee: warning: could not prune stale lifecycle artifacts: {error}");
+    }
     let path = tclone_resolution_log_path(run_id, action)?;
     let parent = path
         .parent()
@@ -5816,7 +5858,9 @@ fn wait_for_tclone_resolution_response(
         if tclone_path_exists(&ack_path) {
             let _ = fs::remove_file(&ack_path);
             // Let the tiny ack response leave the host-control socket before a
-            // switch or discard tears down the caller's container.
+            // switch or discard tears down the caller's container. This is
+            // not the cleanup gate: observing the authenticated marker above
+            // is the required signal, and this grace only improves delivery.
             thread::sleep(Duration::from_millis(100));
             return Ok(());
         }
@@ -5824,7 +5868,7 @@ fn wait_for_tclone_resolution_response(
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "did not observe lifecycle response delivery for {run_id}; cleanup was skipped"
+                    "did not observe lifecycle response delivery for {run_id}; lifecycle cleanup was skipped to preserve the environment. Use `gensee run list --json` to identify the lingering run and `gensee run delete <run-id>` (or `gensee run delete --all`) to reap it"
                 ),
             ));
         }
@@ -10379,6 +10423,41 @@ gensee async job job_1: exited status=0
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_resolution_artifacts_are_pruned_after_retention() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("resolution-retention");
+        let old_home = env::var_os("GENSEE_HOME");
+        env::set_var("GENSEE_HOME", &root);
+        let dir = tclone_resolution_dir().unwrap();
+        create_restrictive_dir_all(&dir).unwrap();
+        let stale_log = dir.join("stale.log");
+        let stale_ack = dir.join("stale.ack");
+        let unrelated = dir.join("keep.txt");
+        fs::write(&stale_log, "log").unwrap();
+        fs::write(&stale_ack, "ack").unwrap();
+        fs::write(&unrelated, "keep").unwrap();
+
+        prune_tclone_resolution_artifacts_at(
+            SystemTime::now() + Duration::from_secs(TCLONE_RESOLUTION_RETENTION_SECS + 1),
+        )
+        .unwrap();
+        assert!(!tclone_path_exists(&stale_log));
+        assert!(!tclone_path_exists(&stale_ack));
+        assert!(tclone_path_exists(&unrelated));
+
+        let fresh_log = dir.join("fresh.log");
+        fs::write(&fresh_log, "fresh").unwrap();
+        prune_tclone_resolution_artifacts().unwrap();
+        assert!(tclone_path_exists(&fresh_log));
 
         match old_home {
             Some(value) => env::set_var("GENSEE_HOME", value),

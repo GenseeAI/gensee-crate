@@ -193,7 +193,11 @@ prints the exact log path. `gensee run delete <run_id-or-container>`
 removes the container and removes that tclone record from `gensee run list`.
 Use `gensee run delete --all` to clean tracked tclone containers, clear the
 tclone section of the run list, and reap untracked `gensee-tclone-*` orphan
-containers in the same Podman store.
+containers in the same Podman store. If a response acknowledgement is lost,
+cleanup fails safe and leaves the environment running; either delete command
+can reap that stranded environment. Lifecycle logs and acknowledgement markers
+are retained for seven days and pruned opportunistically when another
+lifecycle action runs.
 
 ## Requirements
 
