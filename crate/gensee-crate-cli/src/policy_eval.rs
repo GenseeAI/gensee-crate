@@ -646,7 +646,9 @@ fn parse_tclone_control_target(command: &str) -> Option<(&'static str, String)> 
 
 fn find_gensee_run_subcommand(tokens: &[String], subcommand: &str) -> Option<usize> {
     tokens.windows(3).position(|window| {
-        command_basename(&window[0]) == "gensee" && window[1] == "run" && window[2] == subcommand
+        matches!(command_basename(&window[0]), "gensee" | "gensee-tclone")
+            && window[1] == "run"
+            && window[2] == subcommand
     })
 }
 
@@ -2528,6 +2530,17 @@ pub(crate) fn policy_findings_for_subject(
 #[cfg(test)]
 mod matcher_tests {
     use super::*;
+
+    #[test]
+    fn gensee_tclone_alias_is_recognized_by_run_policy_matchers() {
+        let tokens = vec![
+            "/usr/local/bin/gensee-tclone".to_string(),
+            "run".to_string(),
+            "fork".to_string(),
+            "run_source".to_string(),
+        ];
+        assert_eq!(find_gensee_run_subcommand(&tokens, "fork"), Some(0));
+    }
 
     #[test]
     fn shellish_words_preserves_quoted_and_escaped_arguments() {

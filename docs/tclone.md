@@ -42,7 +42,7 @@ gensee-tclone run diff <run_id-or-container> [--json]
 gensee-tclone run summary <fork-id> --json
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
 gensee-tclone run merge <fork-id> --into <source-id> --filesystem
-gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace /home/gensee/.codex
+gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace/src /workspace/Cargo.toml
 gensee-tclone run switch <fork-id>
 gensee-tclone run keep <run_id-or-container> --to /tmp/kept-workspace
 gensee-tclone run discard <run_id-or-container>
@@ -54,6 +54,15 @@ When Codex starts work in a fork, these lifecycle commands are internal agent
 controls. Codex polls `run list --json`, reads `run summary <fork-id> --json`,
 and presents the changed files, tests, and keep-working/merge/discard choices in
 chat. It must not merge, switch, or discard until the user approves that choice.
+The host-control bridge checks that a later `UserPromptSubmit` hook recorded the
+same choice and consumes that approval after the command succeeds. An agent
+command without that state is denied. Direct commands entered at the host CLI
+remain an explicit host-user authorization.
+
+This is a workflow-integrity gate, not an isolation boundary against a malicious
+same-user process inside the fork. Tclone currently trusts the fork agent and
+does not prevent it from tampering with its own hook state; the gate prevents an
+ordinary confused agent from skipping the user-choice turn.
 
 The source id is the row with role `source` under the `Tclone containers`
 section of `gensee run list`. The launcher also prints it directly:
@@ -146,12 +155,16 @@ If a fork was created before fork-point metadata existed, `--git` falls back to
 `git diff HEAD`, which includes staged and unstaged working-tree changes but not
 already committed fork work.
 
-`--filesystem` merges persistent container filesystem changes from the fork into
-the source container. `--paths` does the same for selected container paths. Both
-use the fork's tclone overlay lowerdir as the merge base and upperdir as the
-fork delta, then stop with a conflict report if the source and fork changed the
-same path differently. These scopes do not merge live memory, running process
-state, or pseudo filesystems such as `/proc`, `/sys`, `/dev`, `/run`, and `/tmp`.
+`--filesystem` merges persistent changes under the container workspace from the
+fork into the source container. `--paths` does the same for selected paths under
+that workspace; absolute paths outside the workspace and `..` escapes are
+rejected. Both use the fork's tclone overlay lowerdir as the merge base and
+upperdir as the fork delta, then stop with a conflict report if the source and
+fork changed the same path differently. Eligible changes are copied into a
+private staging tree and applied with rollback backups so a failed copy/apply
+does not leave a delete-before-copy partial merge. These scopes do not merge
+live memory, running process state, or pseudo filesystems such as `/proc`,
+`/sys`, `/dev`, `/run`, and `/tmp`.
 Gensee passes tclone's `--tfork-overlay-btrfs` flag internally when creating
 forks, so users do not need to set it. Older plain btrfs-snapshot forks must be
 recreated before filesystem merge.
@@ -224,10 +237,10 @@ fork-specific run id after live cloning.
   source run until post-fork rebind is implemented.
 - `gensee run merge` defaults to `--git`, which merges repo changes from the
   fork into the source container. `--filesystem` and `--paths` merge persistent
-  container filesystem changes with conflict detection. None of the merge scopes
-  merge process memory or external side effects.
+  workspace changes with conflict detection and transactional rollback. None
+  of the merge scopes merge process memory or external side effects.
 - Merge into an active source container can race with writes from the running
   source agent. Prefer merging when the source agent is idle, stopped, or at a
   known checkpoint.
-- `gensee run keep` copies a forked workspace out to a destination directory for
-  inspection/debugging.
+- `gensee run keep` copies a forked workspace to a new, absolute destination
+  directory for inspection/debugging; it refuses existing destinations.

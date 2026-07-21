@@ -124,6 +124,7 @@ struct TcloneAsyncJob {
 }
 
 static TCLONE_ASYNC_SCHEDULE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TCLONE_LIFECYCLE_APPROVAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TCLONE_HOST_FILE_TIMEOUT_CLAMP_WARNING: OnceLock<()> = OnceLock::new();
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -173,6 +174,22 @@ struct TcloneForkResult {
     assistant_summary: Option<String>,
     #[serde(default)]
     tests: Vec<TcloneForkTestResult>,
+    #[serde(default)]
+    work_tool_calls: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_work_tool_success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution_offered_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lifecycle_approval: Option<TcloneLifecycleApproval>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct TcloneLifecycleApproval {
+    choice: String,
+    approved_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consumed_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -623,15 +640,39 @@ fn try_record_tclone_fork_hook_lifecycle(event: &AgentHookEvent) -> io::Result<(
             completed_at_ms: None,
             assistant_summary: None,
             tests: Vec::new(),
+            work_tool_calls: 0,
+            last_work_tool_success: None,
+            resolution_offered_at_ms: None,
+            lifecycle_approval: None,
         });
 
     match event_name {
         Some("UserPromptSubmit") => {
+            if result.resolution_offered_at_ms.is_some() {
+                if let Some(choice) = user_prompt_from_hook(event)
+                    .as_deref()
+                    .and_then(tclone_lifecycle_choice_from_prompt)
+                {
+                    result.lifecycle_approval = Some(TcloneLifecycleApproval {
+                        choice: choice.to_string(),
+                        approved_at_ms: event.observed_at_ms,
+                        consumed_at_ms: None,
+                    });
+                    return write_tclone_fork_result_to_path(&path, &result);
+                }
+                // Once a result has been presented, an unrelated follow-up is
+                // not evidence of lifecycle approval and must not erase the
+                // terminal result that the user is still deciding about.
+                return Ok(());
+            }
             result.status = "running".to_string();
             result.started_at_ms = event.observed_at_ms;
             result.completed_at_ms = None;
             result.assistant_summary = None;
             result.tests.clear();
+            result.work_tool_calls = 0;
+            result.last_work_tool_success = None;
+            result.lifecycle_approval = None;
         }
         Some("PreToolUse") => {
             // The live clone inherits the source's in-flight fork-status call.
@@ -649,6 +690,16 @@ fn try_record_tclone_fork_hook_lifecycle(event: &AgentHookEvent) -> io::Result<(
         }
         Some("PostToolUse") => {
             if result.status == "running" {
+                if !tclone_hook_event_is_internal_lifecycle_command(event) {
+                    result.work_tool_calls = result.work_tool_calls.saturating_add(1);
+                    let (_, success) = tclone_hook_command_outcome(event);
+                    result.last_work_tool_success =
+                        if event.tool_response_interrupted.unwrap_or(false) {
+                            Some(false)
+                        } else {
+                            success
+                        };
+                }
                 if let Some(command) = event
                     .tool_input_command
                     .as_deref()
@@ -670,14 +721,94 @@ fn try_record_tclone_fork_hook_lifecycle(event: &AgentHookEvent) -> io::Result<(
             if result.status == "queued" {
                 return Ok(());
             }
-            result.status = "completed".to_string();
-            result.completed_at_ms = Some(event.observed_at_ms);
-            result.assistant_summary = assistant_response_from_hook(event);
+            if !tclone_fork_result_is_terminal(&result) {
+                finish_tclone_fork_result(&mut result, event.observed_at_ms);
+                result.assistant_summary = assistant_response_from_hook(event);
+            }
         }
         _ => return Ok(()),
     }
 
     write_tclone_fork_result_to_path(&path, &result)
+}
+
+fn tclone_hook_event_is_internal_lifecycle_command(event: &AgentHookEvent) -> bool {
+    event.tool_input_command.as_deref().is_some_and(|command| {
+        let normalized = command.to_ascii_lowercase();
+        [
+            "gensee run fork-status",
+            "gensee-tclone run fork-status",
+            "gensee run summary",
+            "gensee-tclone run summary",
+            "gensee run diff",
+            "gensee-tclone run diff",
+            "gensee run merge",
+            "gensee-tclone run merge",
+            "gensee run switch",
+            "gensee-tclone run switch",
+            "gensee run discard",
+            "gensee-tclone run discard",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+    })
+}
+
+fn tclone_fork_tests_succeeded(result: &TcloneForkResult) -> bool {
+    let mut latest_by_command = HashMap::new();
+    for test in &result.tests {
+        latest_by_command.insert(test.command.as_str(), test);
+    }
+    latest_by_command.values().all(|test| {
+        !test.interrupted
+            && test.success != Some(false)
+            && test.exit_code.is_none_or(|code| code == 0)
+    })
+}
+
+fn tclone_fork_result_is_terminal(result: &TcloneForkResult) -> bool {
+    matches!(result.status.as_str(), "completed" | "failed" | "stalled")
+}
+
+fn tclone_fork_result_ready_for_merge(result: &TcloneForkResult) -> bool {
+    result.status == "completed"
+        && result.work_tool_calls > 0
+        && result.last_work_tool_success != Some(false)
+        && tclone_fork_tests_succeeded(result)
+}
+
+fn finish_tclone_fork_result(result: &mut TcloneForkResult, completed_at_ms: u64) {
+    result.status = if result.work_tool_calls == 0 {
+        "stalled"
+    } else if result.last_work_tool_success == Some(false) || !tclone_fork_tests_succeeded(result) {
+        "failed"
+    } else {
+        "completed"
+    }
+    .to_string();
+    result.completed_at_ms = Some(completed_at_ms);
+}
+
+fn tclone_lifecycle_choice_from_prompt(prompt: &str) -> Option<&'static str> {
+    let normalized = prompt
+        .trim()
+        .trim_matches(|ch: char| ch.is_ascii_punctuation())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "1"
+        | "merge"
+        | "merge the changes"
+        | "merge these changes"
+        | "merge these changes back"
+        | "merge these fork changes back"
+        | "keep these changes and merge them back" => Some("merge"),
+        "2" | "switch" | "keep working" | "keep working in the fork" => Some("switch"),
+        "3" | "discard" | "discard the fork" => Some("discard"),
+        _ => None,
+    }
 }
 
 /// Return a Codex Stop-hook continuation prompt when a live-cloned fork tries
@@ -706,6 +837,9 @@ pub(crate) fn tclone_codex_stop_continuation(event: &AgentHookEvent) -> Option<S
         .get("source_run_id")
         .or_else(|| context.get("parent_run_id"))
         .and_then(Value::as_str)?;
+    if !tclone_is_safe_token(run_id) || !tclone_is_safe_token(source_run_id) {
+        return None;
+    }
     let result = read_tclone_fork_result_from_path(&tclone_fork_result_path())?;
     if result.run_id != run_id || result.status != "queued" {
         return None;
@@ -742,6 +876,7 @@ fn tclone_command_is_test(command: &str) -> bool {
         "./gradlew test",
         "dotnet test",
         "swift test",
+        "git diff --check",
     ]
     .iter()
     .any(|test_command| normalized.contains(test_command))
@@ -1299,7 +1434,114 @@ fn execute_tclone_host_control_request(
         }
         return Ok(response);
     }
+    if let Some(choice) = tclone_lifecycle_request_choice(&request) {
+        let approval_lock = TCLONE_LIFECYCLE_APPROVAL_LOCK.get_or_init(|| Mutex::new(()));
+        let _approval_guard = approval_lock
+            .lock()
+            .map_err(|_| io::Error::other("tclone lifecycle approval lock poisoned"))?;
+        let record = validate_tclone_lifecycle_approval(&request, choice)?;
+        let response = execute_tclone_host_control_request_sync(request, exe)?;
+        if response.exit_code == Some(0) {
+            if let Err(error) = consume_tclone_lifecycle_approval(&record, choice) {
+                eprintln!(
+                    "gensee: warning: lifecycle command succeeded but approval consumption could not be recorded: {error}"
+                );
+            }
+        }
+        return Ok(response);
+    }
     execute_tclone_host_control_request_sync(request, exe)
+}
+
+fn tclone_lifecycle_request_choice(request: &TcloneHostControlRequest) -> Option<&'static str> {
+    match request.args.get(1).map(String::as_str) {
+        Some("merge") => Some("merge"),
+        Some("switch") => Some("switch"),
+        Some("discard") => Some("discard"),
+        _ => None,
+    }
+}
+
+fn tclone_lifecycle_request_target(request: &TcloneHostControlRequest) -> io::Result<String> {
+    let args = request.args[2..]
+        .iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    tclone_target_arg(&args, "missing tclone lifecycle target")
+}
+
+fn validate_tclone_lifecycle_approval(
+    request: &TcloneHostControlRequest,
+    choice: &str,
+) -> io::Result<TcloneRunRecord> {
+    let record = find_tclone_record(&tclone_lifecycle_request_target(request)?)?;
+    if record.role != "fork" || record.status != "running" {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lifecycle target must be an unresolved tclone fork",
+        ));
+    }
+    let podman = tclone_podman();
+    let result = read_tclone_fork_result(&podman, &record)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fork has not presented a result for user approval",
+        )
+    })?;
+    validate_tclone_lifecycle_result(&result, choice)?;
+    Ok(record)
+}
+
+fn validate_tclone_lifecycle_result(result: &TcloneForkResult, choice: &str) -> io::Result<()> {
+    let offered_at_ms = result.resolution_offered_at_ms.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fork has not presented lifecycle choices to the user",
+        )
+    })?;
+    let approval = result.lifecycle_approval.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "explicit user approval is required before merge, switch, or discard",
+        )
+    })?;
+    if approval.choice != choice
+        || approval.approved_at_ms < offered_at_ms
+        || approval.consumed_at_ms.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("no current unconsumed user approval for `{choice}`"),
+        ));
+    }
+    if choice == "merge" && !tclone_fork_result_ready_for_merge(result) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fork task is failed, stalled, or otherwise not ready to merge",
+        ));
+    }
+    Ok(())
+}
+
+fn consume_tclone_lifecycle_approval(record: &TcloneRunRecord, choice: &str) -> io::Result<()> {
+    let podman = tclone_podman();
+    let mut result = read_tclone_fork_result(&podman, record)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "fork approval record disappeared")
+    })?;
+    let approval = result.lifecycle_approval.as_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fork approval record disappeared",
+        )
+    })?;
+    if approval.choice != choice || approval.consumed_at_ms.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fork approval no longer matches the completed lifecycle command",
+        ));
+    }
+    approval.consumed_at_ms = Some(unix_millis()?);
+    write_tclone_fork_result_to_container(&podman, record, &result, "approval-consumed")
 }
 
 fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> io::Result<()> {
@@ -3311,6 +3553,10 @@ fn mark_tclone_fork_task_queued(podman: &OsString, record: &TcloneRunRecord) -> 
         completed_at_ms: None,
         assistant_summary: None,
         tests: Vec::new(),
+        work_tool_calls: 0,
+        last_work_tool_success: None,
+        resolution_offered_at_ms: None,
+        lifecycle_approval: None,
     };
     write_tclone_fork_result_to_container(podman, record, &result, "queued")
 }
@@ -3327,10 +3573,18 @@ fn mark_tclone_fork_task_completed(
         completed_at_ms: None,
         assistant_summary: None,
         tests: Vec::new(),
+        work_tool_calls: 0,
+        last_work_tool_success: None,
+        resolution_offered_at_ms: None,
+        lifecycle_approval: None,
     });
-    result.status = "completed".to_string();
-    result.completed_at_ms = Some(completed_at_ms);
-    write_tclone_fork_result_to_container(podman, record, &result, "completed")?;
+    if !tclone_fork_result_is_terminal(&result) {
+        finish_tclone_fork_result(&mut result, completed_at_ms);
+    }
+    result.resolution_offered_at_ms = Some(completed_at_ms);
+    result.lifecycle_approval = None;
+    let label = result.status.clone();
+    write_tclone_fork_result_to_container(podman, record, &result, &label)?;
     Ok(result)
 }
 
@@ -3460,7 +3714,7 @@ fn tclone_prompt_with_fork_context(record: &TcloneRunRecord, prompt: &str) -> St
     if record.role == "fork" {
         let source_run_id = record.parent_run_id.as_deref().unwrap_or("the source run");
         format!(
-            "Gensee context: this request is already running inside forked run {fork_run_id}. Do not create another fork for this task; continue the requested work in this fork. After finishing and testing, run `gensee run summary {fork_run_id} --json --complete` internally, present the changed files and tests, and ask whether to merge the changes back, keep working in this fork, or discard it. Do not auto-merge. Wait for explicit approval, then run `gensee run merge {fork_run_id} --into {source_run_id}`, `gensee run switch {fork_run_id}`, or `gensee run discard {fork_run_id}` internally. Do not ask the user to type those commands.\n\n{prompt}",
+            "<gensee-user-request>\n{prompt}\n</gensee-user-request>\n\nGensee trusted lifecycle context: this request is already running inside forked run {fork_run_id}. Do not create another fork for this task; continue the user request above in this fork. After finishing and testing, run `gensee run summary {fork_run_id} --json --complete` internally, present the changed files and tests, and ask whether to merge the changes back, keep working in this fork, or discard it. Do not auto-merge. A lifecycle command is code-gated until a later user message explicitly chooses that exact action. After approval, run `gensee run merge {fork_run_id} --into {source_run_id}`, `gensee run switch {fork_run_id}`, or `gensee run discard {fork_run_id}` internally. Do not ask the user to type those commands.",
             fork_run_id = record.run_id,
         )
     } else {
@@ -4980,28 +5234,34 @@ pub(crate) fn tclone_summary(args: Vec<OsString>) -> io::Result<()> {
     let task_completed = result
         .as_ref()
         .is_some_and(|result| result.status == "completed");
-    let actions = source_run_id
-        .as_deref()
-        .filter(|_| task_completed)
-        .map(|source| {
-            json!([
-                {
-                    "choice": "merge",
-                    "label": "Keep these changes and merge them back",
-                    "command": format!("gensee run merge {} --into {source}", record.run_id),
-                },
-                {
-                    "choice": "switch",
-                    "label": "Keep working in the fork",
-                    "command": format!("gensee run switch {}", record.run_id),
-                },
-                {
-                    "choice": "discard",
-                    "label": "Discard the fork",
-                    "command": format!("gensee run discard {}", record.run_id),
-                }
-            ])
-        });
+    let ready_for_resolution = result
+        .as_ref()
+        .is_some_and(tclone_fork_result_ready_for_merge);
+    let actions = source_run_id.as_deref().and_then(|source| {
+        let result = result.as_ref()?;
+        if !tclone_fork_result_is_terminal(result) {
+            return None;
+        }
+        let mut actions = Vec::new();
+        if ready_for_resolution {
+            actions.push(json!({
+                "choice": "merge",
+                "label": "Keep these changes and merge them back",
+                "command": format!("gensee run merge {} --into {source}", record.run_id),
+            }));
+        }
+        actions.push(json!({
+            "choice": "switch",
+            "label": "Keep working in the fork",
+            "command": format!("gensee run switch {}", record.run_id),
+        }));
+        actions.push(json!({
+            "choice": "discard",
+            "label": "Discard the fork",
+            "command": format!("gensee run discard {}", record.run_id),
+        }));
+        Some(Value::Array(actions))
+    });
     let payload = json!({
         "command": "run summary",
         "run_id": &record.run_id,
@@ -5009,7 +5269,7 @@ pub(crate) fn tclone_summary(args: Vec<OsString>) -> io::Result<()> {
         "run_status": &record.status,
         "task_status": result.as_ref().map(|result| result.status.as_str()).unwrap_or("unknown"),
         "task_completed": task_completed,
-        "ready_for_resolution": task_completed,
+        "ready_for_resolution": ready_for_resolution,
         "completed_at_ms": result.as_ref().and_then(|result| result.completed_at_ms),
         "changed": &diff.changed,
         "stat": &diff.stat,
@@ -5406,10 +5666,8 @@ fn tclone_merge_git(
     let source_files_id = format!("gensee-source-files-{}.txt", unix_millis()?);
     let host_source_files = gensee_tmp_root()?.join(&source_files_id);
     let fork_source_files = format!("/tmp/{source_files_id}");
-    fs::write(
-        &host_source_files,
-        tclone_source_workspace_file_list(podman, source)?,
-    )?;
+    let source_files = tclone_source_workspace_file_list(podman, source)?;
+    write_atomic_nofollow(&host_source_files, source_files.as_bytes(), 0o600)?;
     let patch = (|| {
         podman_cp(
             podman,
@@ -5435,7 +5693,7 @@ fn tclone_merge_git(
 
     let patch_id = format!("gensee-merge-{}.patch", unix_millis()?);
     let host_patch = gensee_tmp_root()?.join(&patch_id);
-    fs::write(&host_patch, patch)?;
+    write_atomic_nofollow(&host_patch, patch.as_bytes(), 0o600)?;
     let container_patch = format!("/tmp/{patch_id}");
     let result = (|| {
         podman_cp(
@@ -5501,12 +5759,23 @@ fn tclone_merge_filesystem(
     let fork_overlay = inspect_tclone_overlay_rootfs(podman, &fork.container_name)
         .or_else(|_| recorded_tclone_overlay_rootfs(fork))?;
     let source_rootfs = inspect_tclone_rootfs(podman, &source.container_name)?;
-    let filter = paths.map(|paths| {
-        paths
-            .into_iter()
-            .map(|path| normalize_tclone_merge_path(&path))
-            .collect::<Vec<_>>()
-    });
+    let workspace_filter = normalize_tclone_workspace_merge_path(
+        &source.container_workspace,
+        &source.container_workspace,
+    )?;
+    let filter = match paths {
+        Some(paths) => Some(
+            paths
+                .into_iter()
+                .map(|path| {
+                    normalize_tclone_workspace_merge_path(&path, &source.container_workspace)
+                })
+                .collect::<io::Result<Vec<_>>>()?,
+        ),
+        // Filesystem merge is intentionally workspace-confined. Changes to
+        // /etc, /root, binaries, and other container state are never eligible.
+        None => Some(vec![workspace_filter]),
+    };
     let plan = build_tclone_overlay_merge_plan(
         &fork_overlay.lowerdir,
         &fork_overlay.upperdir,
@@ -5730,59 +5999,166 @@ fn apply_tclone_overlay_merge(
     source: &TcloneRunRecord,
     plan: &TcloneOverlayMergePlan,
 ) -> io::Result<()> {
-    for change in plan.deletions() {
-        let destination = format!("/{}", change.path);
-        tclone_exec(
+    let transaction_root = format!("/tmp/gensee-merge-{}", Uuid::new_v4().simple());
+    let stage_root = format!("{transaction_root}/stage");
+    let backup_root = format!("{transaction_root}/backup");
+    let marker_root = format!("{transaction_root}/applied");
+    tclone_exec(
+        podman,
+        &source.container_name,
+        &["mkdir", "-p", "--", &stage_root, &backup_root, &marker_root],
+    )?;
+
+    let stage_result = (|| {
+        for change in plan.upserts() {
+            if change.op != TcloneOverlayMergeOp::UpsertFile {
+                continue;
+            }
+            let overlay_source = change.source.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing overlay source for {}", change.path),
+                )
+            })?;
+            let staged = format!("{stage_root}/{}", change.path);
+            let parent = Path::new(&staged)
+                .parent()
+                .and_then(Path::to_str)
+                .ok_or_else(|| io::Error::other("staged merge path has no parent"))?;
+            tclone_exec(
+                podman,
+                &source.container_name,
+                &["mkdir", "-p", "--", parent],
+            )?;
+            podman_cp(
+                podman,
+                overlay_source,
+                &format!("{}:{staged}", source.container_name),
+            )?;
+        }
+        Ok::<(), io::Error>(())
+    })();
+    if let Err(error) = stage_result {
+        let _ = tclone_exec(
             podman,
             &source.container_name,
-            &["rm", "-rf", "--", &destination],
-        )?;
+            &["rm", "-rf", "--", &transaction_root],
+        );
+        return Err(error);
     }
-    for change in plan.upserts() {
+
+    let mut ordered = plan.deletions().collect::<Vec<_>>();
+    ordered.extend(plan.upserts());
+    let mut script = String::from("set -eu\nrollback() {\nset +e\n");
+    for (index, change) in ordered.iter().enumerate().rev() {
         let destination = format!("/{}", change.path);
+        let backup = format!("{backup_root}/{}", change.path);
+        script.push_str(&format!(
+            "if [ -e {marker} ]; then rm -rf -- {destination}; if [ -e {backup} ] || [ -L {backup} ]; then mkdir -p -- {parent}; mv -- {backup} {destination}; fi; fi\n",
+            marker = shell_quote(&format!("{marker_root}/{index}")),
+            destination = shell_quote(&destination),
+            backup = shell_quote(&backup),
+            parent = shell_quote(
+                Path::new(&destination)
+                    .parent()
+                    .and_then(Path::to_str)
+                    .unwrap_or("/")
+            ),
+        ));
+    }
+    script.push_str(&format!(
+        "rm -rf -- {}\n}}\ntrap rollback EXIT HUP INT TERM\n",
+        shell_quote(&transaction_root)
+    ));
+    for (index, change) in ordered.iter().enumerate() {
+        let destination = format!("/{}", change.path);
+        let backup = format!("{backup_root}/{}", change.path);
+        let destination_parent = Path::new(&destination)
+            .parent()
+            .and_then(Path::to_str)
+            .unwrap_or("/");
+        let backup_parent = Path::new(&backup)
+            .parent()
+            .and_then(Path::to_str)
+            .unwrap_or(&backup_root);
+        script.push_str(&format!(
+            "mkdir -p -- {backup_parent}; if [ -e {destination} ] || [ -L {destination} ]; then mv -- {destination} {backup}; fi; touch {marker}; mkdir -p -- {destination_parent}; ",
+            backup_parent = shell_quote(backup_parent),
+            destination = shell_quote(&destination),
+            backup = shell_quote(&backup),
+            marker = shell_quote(&format!("{marker_root}/{index}")),
+            destination_parent = shell_quote(destination_parent),
+        ));
         match change.op {
+            TcloneOverlayMergeOp::Delete => script.push_str("true\n"),
             TcloneOverlayMergeOp::CreateDir => {
-                tclone_exec(
-                    podman,
-                    &source.container_name,
-                    &["mkdir", "-p", "--", &destination],
-                )?;
+                script.push_str(&format!("mkdir -- {}\n", shell_quote(&destination)));
             }
             TcloneOverlayMergeOp::UpsertFile => {
-                let overlay_source = change.source.as_ref().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("missing overlay source for {}", change.path),
-                    )
-                })?;
-                if let Some(parent) = Path::new(&destination).parent().and_then(Path::to_str) {
-                    tclone_exec(
-                        podman,
-                        &source.container_name,
-                        &["mkdir", "-p", "--", parent],
-                    )?;
-                }
-                tclone_exec(
-                    podman,
-                    &source.container_name,
-                    &["rm", "-rf", "--", &destination],
-                )?;
-                podman_cp(
-                    podman,
-                    overlay_source,
-                    &format!("{}:{destination}", source.container_name),
-                )?;
+                let staged = format!("{stage_root}/{}", change.path);
+                script.push_str(&format!(
+                    "mv -- {} {}\n",
+                    shell_quote(&staged),
+                    shell_quote(&destination)
+                ));
             }
-            TcloneOverlayMergeOp::Delete => {}
         }
     }
-    Ok(())
+    script.push_str(&format!(
+        "trap - EXIT HUP INT TERM\nrm -rf -- {}\n",
+        shell_quote(&transaction_root)
+    ));
+    let result = tclone_exec(podman, &source.container_name, &["sh", "-lc", &script]);
+    if result.is_err() {
+        let _ = tclone_exec(
+            podman,
+            &source.container_name,
+            &["rm", "-rf", "--", &transaction_root],
+        );
+    }
+    result
 }
 
-fn normalize_tclone_merge_path(path: &str) -> String {
-    path.trim_start_matches('/')
-        .trim_end_matches('/')
-        .to_string()
+fn normalize_tclone_workspace_merge_path(
+    path: &str,
+    container_workspace: &str,
+) -> io::Result<String> {
+    let workspace = container_workspace.trim_matches('/');
+    if workspace.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing filesystem merge with a root container workspace",
+        ));
+    }
+    let raw = path.trim();
+    let candidate = if raw.starts_with('/') {
+        raw.trim_matches('/').to_string()
+    } else if raw.is_empty() {
+        workspace.to_string()
+    } else {
+        format!("{workspace}/{}", raw.trim_matches('/'))
+    };
+    let mut normalized = Vec::new();
+    for component in candidate.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("merge path escapes the workspace: {path}"),
+                ));
+            }
+            value => normalized.push(value),
+        }
+    }
+    let normalized = normalized.join("/");
+    if normalized != workspace && !normalized.starts_with(&format!("{workspace}/")) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("merge path is outside {container_workspace}: {path}"),
+        ));
+    }
+    Ok(normalized)
 }
 
 fn path_matches_tclone_merge_filter(path: &str, filter: &Option<Vec<String>>) -> bool {
@@ -5806,20 +6182,52 @@ pub(crate) fn tclone_keep(args: Vec<OsString>) -> io::Result<()> {
         )
     })?;
     let record = find_tclone_record(&target)?;
-    fs::create_dir_all(&destination)?;
+    if record.role != "fork" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "gensee run keep only accepts a fork",
+        ));
+    }
+    let destination = PathBuf::from(destination);
+    if !destination.is_absolute()
+        || destination
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || destination.parent().is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "keep destination must be a non-root absolute path without `..`",
+        ));
+    }
+    if destination.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to overwrite existing keep destination {}",
+                destination.display()
+            ),
+        ));
+    }
+    fs::create_dir(&destination)?;
     let podman = tclone_podman();
     let target = format!("{}:{}/.", record.container_name, record.container_workspace);
-    run_command_status(
+    let copy_result = run_command_status(
         &podman,
         &[
             OsString::from("cp"),
             OsString::from(target),
-            OsString::from(&destination),
+            destination.as_os_str().to_os_string(),
         ],
-    )?;
+    );
+    if let Err(error) = copy_result {
+        let _ = fs::remove_dir_all(&destination);
+        return Err(error);
+    }
     println!(
         "gensee: copied tclone workspace {} -> {}",
-        record.run_id, destination
+        record.run_id,
+        destination.display()
     );
     Ok(())
 }
@@ -6209,6 +6617,12 @@ pub(crate) fn tclone_discard_if_exists(target: &str) -> io::Result<bool> {
     let Ok(record) = find_tclone_record(target) else {
         return Ok(false);
     };
+    if record.role != "fork" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("discard target must be a fork, got role={}", record.role),
+        ));
+    }
     run_command_status(
         &tclone_podman(),
         &[
@@ -7271,6 +7685,10 @@ mod tests {
                 completed_at_ms: None,
                 assistant_summary: None,
                 tests: Vec::new(),
+                work_tool_calls: 0,
+                last_work_tool_success: None,
+                resolution_offered_at_ms: None,
+                lifecycle_approval: None,
             },
         )
         .unwrap();
@@ -7331,6 +7749,120 @@ mod tests {
         env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
         env::remove_var("GENSEE_TCLONE_RESULT_PATH");
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tclone_fork_failed_test_is_not_ready_for_merge() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("fork-result-failed-test");
+        let context_path = root.join("context.json");
+        let result_path = root.join("result.json");
+        fs::write(
+            &context_path,
+            json!({
+                "run_id": "run_source_fork_failed_0",
+                "role": "fork",
+                "source_run_id": "run_source",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+        env::set_var("GENSEE_TCLONE_RESULT_PATH", &result_path);
+
+        let mut prompt = test_hook_event("UserPromptSubmit", 10);
+        prompt.raw_json = json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "make the change",
+        })
+        .to_string();
+        try_record_tclone_fork_hook_lifecycle(&prompt).unwrap();
+
+        let mut failed_test = test_hook_event("PostToolUse", 20);
+        failed_test.tool_input_command = Some("cargo test --workspace".to_string());
+        failed_test.raw_json = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_response": { "exit_code": 1, "success": false }
+        })
+        .to_string();
+        try_record_tclone_fork_hook_lifecycle(&failed_test).unwrap();
+        try_record_tclone_fork_hook_lifecycle(&test_hook_event("Stop", 30)).unwrap();
+
+        let result = read_tclone_fork_result_from_path(&result_path).unwrap();
+        assert_eq!(result.status, "failed");
+        assert!(!tclone_fork_result_ready_for_merge(&result));
+        assert_eq!(result.tests.len(), 1);
+        assert_eq!(result.tests[0].success, Some(false));
+
+        env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
+        env::remove_var("GENSEE_TCLONE_RESULT_PATH");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tclone_fork_pure_text_stop_is_stalled() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("fork-result-stalled");
+        let context_path = root.join("context.json");
+        let result_path = root.join("result.json");
+        fs::write(
+            &context_path,
+            json!({
+                "run_id": "run_source_fork_stalled_0",
+                "role": "fork",
+                "source_run_id": "run_source",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+        env::set_var("GENSEE_TCLONE_RESULT_PATH", &result_path);
+
+        try_record_tclone_fork_hook_lifecycle(&test_hook_event("UserPromptSubmit", 10)).unwrap();
+        try_record_tclone_fork_hook_lifecycle(&test_hook_event("Stop", 20)).unwrap();
+
+        let result = read_tclone_fork_result_from_path(&result_path).unwrap();
+        assert_eq!(result.status, "stalled");
+        assert!(!tclone_fork_result_ready_for_merge(&result));
+
+        env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
+        env::remove_var("GENSEE_TCLONE_RESULT_PATH");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tclone_lifecycle_requires_matching_post_summary_user_approval() {
+        let mut result = TcloneForkResult {
+            run_id: "run_source_fork_1_0".to_string(),
+            status: "completed".to_string(),
+            started_at_ms: 10,
+            completed_at_ms: Some(20),
+            assistant_summary: None,
+            tests: Vec::new(),
+            work_tool_calls: 1,
+            last_work_tool_success: Some(true),
+            resolution_offered_at_ms: Some(30),
+            lifecycle_approval: None,
+        };
+        assert_eq!(
+            validate_tclone_lifecycle_result(&result, "merge")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        result.lifecycle_approval = Some(TcloneLifecycleApproval {
+            choice: "discard".to_string(),
+            approved_at_ms: 31,
+            consumed_at_ms: None,
+        });
+        assert!(validate_tclone_lifecycle_result(&result, "merge").is_err());
+        assert!(validate_tclone_lifecycle_result(&result, "discard").is_ok());
+
+        result.lifecycle_approval.as_mut().unwrap().choice = "merge".to_string();
+        assert!(validate_tclone_lifecycle_result(&result, "merge").is_ok());
+        result.lifecycle_approval.as_mut().unwrap().consumed_at_ms = Some(32);
+        assert!(validate_tclone_lifecycle_result(&result, "merge").is_err());
     }
 
     #[test]
@@ -7435,6 +7967,10 @@ mod tests {
                 completed_at_ms: None,
                 assistant_summary: None,
                 tests: Vec::new(),
+                work_tool_calls: 0,
+                last_work_tool_success: None,
+                resolution_offered_at_ms: None,
+                lifecycle_approval: None,
             },
         )
         .unwrap();
@@ -7502,6 +8038,10 @@ mod tests {
             completed_at_ms: Some(30),
             assistant_summary: None,
             tests: Vec::new(),
+            work_tool_calls: 1,
+            last_work_tool_success: Some(true),
+            resolution_offered_at_ms: Some(30),
+            lifecycle_approval: None,
         };
 
         let entry = tclone_run_list_entry_with_result(&record, Some(&result));
@@ -8823,7 +9363,8 @@ gensee async job job_1: exited status=0
         assert!(prompt.contains("gensee run summary run_1_fork_2_0 --json --complete"));
         assert!(prompt.contains("gensee run merge run_1_fork_2_0 --into run_1"));
         assert!(prompt.contains("Do not auto-merge"));
-        assert!(prompt.ends_with("Upgrade dependencies"));
+        assert!(prompt.starts_with("<gensee-user-request>\nUpgrade dependencies"));
+        assert!(prompt.ends_with("Do not ask the user to type those commands."));
     }
 
     #[test]
@@ -9128,6 +9669,24 @@ gensee async job job_1: exited status=0
         ];
 
         assert!(tclone_merge_scope(&args).is_err());
+    }
+
+    #[test]
+    fn tclone_filesystem_merge_paths_are_workspace_confined() {
+        assert_eq!(
+            normalize_tclone_workspace_merge_path("src/lib.rs", "/workspace").unwrap(),
+            "workspace/src/lib.rs"
+        );
+        assert_eq!(
+            normalize_tclone_workspace_merge_path("/workspace/Cargo.toml", "/workspace").unwrap(),
+            "workspace/Cargo.toml"
+        );
+        assert!(normalize_tclone_workspace_merge_path("../etc/passwd", "/workspace").is_err());
+        assert!(normalize_tclone_workspace_merge_path("/etc/passwd", "/workspace").is_err());
+        assert!(
+            normalize_tclone_workspace_merge_path("/workspace/../etc/passwd", "/workspace")
+                .is_err()
+        );
     }
 
     #[test]

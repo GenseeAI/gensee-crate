@@ -456,7 +456,9 @@ gensee-tclone run switch <fork-id>                         # continue from the f
 
 Codex should mediate fork resolution: summarize the fork in chat, offer merge,
 keep-working, and discard choices, and run the selected lifecycle command only
-after explicit user approval.
+after explicit user approval. For container-mediated lifecycle commands, the
+host bridge enforces a matching, unconsumed choice recorded by a later
+`UserPromptSubmit` hook; failed or stalled fork tasks cannot be merged.
 
 The tclone launcher also prints the source id directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
