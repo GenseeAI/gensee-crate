@@ -3726,7 +3726,7 @@ fn wait_for_tclone_source_quiet_if_requested(
     let mut last_ticks = descendant_proc_ticks(root_pid)?;
     let mut last_not_quiet_reason = String::new();
     eprintln!(
-        "gensee: waiting for tclone source {} to become quiet before fork (timeout={}s cpu<{}% stable_samples={})",
+        "gensee: waiting for tclone source {} to become quiet before fork (timeout={}s cpu_advisory<{}% stable_samples={})",
         source.run_id, timeout, cpu_threshold, stable_samples
     );
     loop {
@@ -3734,54 +3734,48 @@ fn wait_for_tclone_source_quiet_if_requested(
         let current_ticks = descendant_proc_ticks(root_pid)?;
         let (delta_ticks, descendant_exited) =
             descendant_proc_tick_delta(&last_ticks, &current_ticks);
-        last_ticks = current_ticks;
         let cpu_percent =
             (delta_ticks as f64 / ticks_per_second as f64) / interval.as_secs_f64() * 100.0;
-        if descendant_exited {
+        if let Some(reason) = tclone_source_quiet_probe(podman, source)? {
+            // The probe itself executes in the container's process tree. Sample
+            // again after it completes so probe CPU is not charged to the next
+            // quiet interval.
+            last_ticks = descendant_proc_ticks(root_pid)?;
             stable = 0;
-            last_not_quiet_reason = "a source process exited during the sample".to_string();
+            last_not_quiet_reason = reason;
             eprintln!(
-                "gensee: tclone source {} still settling after a process exit",
-                source.run_id
+                "gensee: tclone source {} still active cpu={:.1}% reason={}",
+                source.run_id, cpu_percent, last_not_quiet_reason
             );
             if Instant::now() >= deadline {
                 return tclone_quiet_timeout(&source.run_id, &last_not_quiet_reason);
             }
             continue;
         }
-        if cpu_percent <= cpu_threshold {
-            if let Some(reason) = tclone_source_quiet_probe(podman, source)? {
-                // The probe itself executes in the container's process tree. Sample
-                // again after it completes so probe CPU is not charged to the next
-                // quiet interval.
-                last_ticks = descendant_proc_ticks(root_pid)?;
-                stable = 0;
-                last_not_quiet_reason = reason;
-                eprintln!(
-                    "gensee: tclone source {} still active cpu={:.1}% reason={}",
-                    source.run_id, cpu_percent, last_not_quiet_reason
-                );
-                if Instant::now() >= deadline {
-                    return tclone_quiet_timeout(&source.run_id, &last_not_quiet_reason);
-                }
-                continue;
-            }
-            last_ticks = descendant_proc_ticks(root_pid)?;
-            stable += 1;
-            eprintln!(
-                "gensee: tclone source {} quiet sample {}/{} cpu={:.1}%",
-                source.run_id, stable, stable_samples, cpu_percent
-            );
-            if stable >= stable_samples {
-                return Ok(());
-            }
+
+        last_ticks = descendant_proc_ticks(root_pid)?;
+        stable += 1;
+        let mut notes = Vec::new();
+        if cpu_percent > cpu_threshold {
+            notes.push(format!(
+                "cpu above advisory threshold {:.1}%",
+                cpu_threshold
+            ));
+        }
+        if descendant_exited {
+            notes.push("source process exited during sample".to_string());
+        }
+        let detail = if notes.is_empty() {
+            String::new()
         } else {
-            stable = 0;
-            last_not_quiet_reason = format!("cpu={cpu_percent:.1}%");
-            eprintln!(
-                "gensee: tclone source {} still active cpu={:.1}%",
-                source.run_id, cpu_percent
-            );
+            format!(" ({})", notes.join("; "))
+        };
+        eprintln!(
+            "gensee: tclone source {} quiet sample {}/{} cpu={:.1}%{}",
+            source.run_id, stable, stable_samples, cpu_percent, detail
+        );
+        if stable >= stable_samples {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return tclone_quiet_timeout(&source.run_id, &last_not_quiet_reason);
