@@ -451,12 +451,12 @@ gensee-tclone run exec <fork-id> -- bash -lc 'cargo test'
 gensee-tclone run diff <fork-id> [--json]
 gensee-tclone run summary <fork-id> --json
 gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
-gensee-tclone run switch <fork-id>                         # continue from the fork
+gensee-tclone run switch <fork-id>                         # promote fork; end old source
 ```
 
 Codex should mediate fork resolution: summarize the fork in chat, offer merge,
-keep-working, and discard choices, and run the selected lifecycle command only
-after explicit user approval. For container-mediated lifecycle commands, the
+promote-to-main-and-end-source, and discard choices, and run the selected
+lifecycle command only after explicit user approval. For container-mediated lifecycle commands, the
 host bridge enforces a matching, unconsumed choice recorded by a later
 `UserPromptSubmit` hook; failed or stalled fork tasks cannot be merged.
 
@@ -481,7 +481,7 @@ can report quiet-wait or clone progress. JSON status polls use a short
 control-bridge timeout so a response inherited by the clone cannot leave the
 source agent stuck waiting. If the fork inherits a source `fork-status` poll,
 Gensee tells that pane to stop source orchestration, continue the original task,
-then summarize and offer merge, keep-working, or discard. The fork may run only
+then summarize and offer merge, promote-to-main-and-end-source, or discard. The fork may run only
 its own approved lifecycle action against its direct source. `run send` remains
 available for later follow-up prompts and marks those prompts queued before tmux
 input. Fork creation does not report success until the child has received its

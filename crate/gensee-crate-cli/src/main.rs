@@ -109,6 +109,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             args.remove(0);
             tclone_cleanup_resolved(args)
         }
+        Some("__tclone-complete-switch") => {
+            args.remove(0);
+            tclone_complete_switch(args)
+        }
         Some("run") => {
             args.remove(0);
             if args.first().and_then(|arg| arg.to_str()) == Some("list") {

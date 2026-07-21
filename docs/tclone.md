@@ -52,8 +52,8 @@ gensee-tclone run delete --all                   # clean tracked runs and gensee
 
 When Codex starts work in a fork, these lifecycle commands are internal agent
 controls. Codex polls `run list --json`, reads `run summary <fork-id> --json`,
-and presents the changed files, tests, and keep-working/merge/discard choices in
-chat. It must not merge, switch, or discard until the user approves that choice.
+and presents the changed files, tests, and merge/promote-to-main/discard choices
+in chat. It must not merge, switch, or discard until the user approves that choice.
 The host-control bridge checks that a later `UserPromptSubmit` hook recorded the
 same choice and consumes that approval after the command succeeds. An agent
 command without that state is denied. Direct commands entered at the host CLI
@@ -119,7 +119,7 @@ control-bridge timeout so the source cannot
 wait on a response consumed by the clone. If the fork inherits the source's
 status poll, Gensee tells the fork pane to stop source orchestration, continue
 the original task, run its internal completion summary, and offer merge,
-keep-working, or discard. After explicit approval, the fork can invoke only its
+promote-to-main-and-end-source, or discard. After explicit approval, the fork can invoke only its
 own lifecycle action against its direct source. Container-mediated `run send`
 remains source-to-direct-child only and is used for later follow-up prompts.
 Before follow-up tmux input is sent, Gensee marks the child task `queued`. Fork
@@ -169,9 +169,12 @@ Gensee passes tclone's `--tfork-overlay-btrfs` flag internally when creating
 forks, so users do not need to set it. Older plain btrfs-snapshot forks must be
 recreated before filesystem merge.
 
-`gensee run switch` does not merge files. It marks the selected fork as the
-active source container for future shells, forks, and merge targets, and marks
-the previous source as switched away when Gensee knows the parent source.
+`gensee run switch` does not merge files. It promotes the selected fork to the
+main source environment for future work, rewrites its lifecycle context so it
+can create and resolve new forks, transfers the host-control bridge to it, ends
+the previous source container, and closes the previous source pane. The
+user-facing choice is therefore “Promote this fork to the main environment and
+end the old source,” rather than the ambiguous “Keep working.”
 
 `gensee run discard <run_id-or-container>` removes the container and keeps a
 `discarded` record for history. `gensee run delete <run_id-or-container>`
