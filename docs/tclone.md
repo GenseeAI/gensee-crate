@@ -92,10 +92,11 @@ gensee-tclone run send "$FORK_ID" -- 'Try the dependency upgrade, run tests, and
 ```
 
 When a fork is scheduled asynchronously from inside an agent, the JSON response
-includes `status_command`. Poll it until `status=succeeded`, then use
-`forks[0].run_id`; if it returns `status=failed`, stop and inspect the included
-log summary. During live-clone capability rotation, or when the clone inherits
-an in-flight control response, a poll may temporarily return `status=running`,
+includes `status_command` and `retry_after_ms`. Wait that delay before the first
+poll so the poll process is not captured by the live clone. Then poll until
+`status=succeeded` and use `forks[0].run_id`; if it returns `status=failed`, stop
+and inspect the included log summary. During live-clone capability rotation, or
+when the clone inherits an in-flight control response, a poll may temporarily return `status=running`,
 `transient=true`, and `retry_after_ms`; retry the same status command after that
 delay and never schedule a replacement fork. JSON status polls use a short
 control-bridge timeout so the source cannot wait on a response consumed by the
@@ -103,6 +104,8 @@ clone. Container-mediated `run send` is source-to-direct-child only; a fork may
 not send to itself if it inherits the source's in-progress orchestration turn.
 Before tmux input is sent, Gensee marks the child task `queued`; an inherited
 turn's Stop hook is ignored until the sent prompt reaches `UserPromptSubmit`.
+Fork creation reports success only after the child has received its
+authoritative fork context.
 
 Use `gensee run exec <id> -- <command>` for non-interactive work in a fork,
 such as commands requested by an agent. The command runs inside the container

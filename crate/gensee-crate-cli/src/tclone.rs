@@ -46,6 +46,7 @@ const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
+const TCLONE_ASYNC_INITIAL_POLL_DELAY_MS: u64 = 15_000;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
 const TCLONE_ASYNC_JOB_TIMEOUT_SECS: u64 = 10 * 60;
 const TCLONE_ASYNC_JOB_STALE_GRACE_SECS: u64 = 30;
@@ -274,6 +275,10 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
         }
         None => return Ok(false),
     };
+    if let Some(payload) = tclone_retryable_empty_fork_status_payload(&request.args, &response) {
+        println!("{}", serde_json::to_string(&payload)?);
+        return Ok(true);
+    }
     print!("{}", response.stdout);
     eprint!("{}", response.stderr);
     if let Some(error) = response.error {
@@ -297,6 +302,19 @@ pub(crate) fn proxy_tclone_host_control_if_needed(args: &[OsString]) -> io::Resu
             response.exit_code.unwrap_or(1)
         )))
     }
+}
+
+fn tclone_retryable_empty_fork_status_payload(
+    args: &[String],
+    response: &TcloneHostControlResponse,
+) -> Option<Value> {
+    if response.error.is_some()
+        || response.exit_code != Some(0)
+        || !response.stdout.trim().is_empty()
+    {
+        return None;
+    }
+    tclone_retryable_fork_status_payload(args, TcloneForkStatusTransient::TransportInterrupted)
 }
 
 fn tclone_host_control_transport_error(args: &[String], error: io::Error) -> io::Result<bool> {
@@ -1857,9 +1875,10 @@ fn tclone_host_control_async_response(
                 "command": "run fork",
                 "job_id": job.id,
                 "status": "scheduled",
+                "retry_after_ms": TCLONE_ASYNC_INITIAL_POLL_DELAY_MS,
                 "status_command": status_command,
                 "poll_command": status_command,
-                "message": "gensee scheduled the tclone fork on the host; poll status_command until status=succeeded, then send work to forks[0].run_id",
+                "message": "gensee scheduled the tclone fork on the host; wait retry_after_ms before the first status poll, then poll status_command until status=succeeded and send work to forks[0].run_id",
             })
         )
     } else {
@@ -2518,7 +2537,11 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             exit_code: None,
         };
         append_tclone_record(&fork_record)?;
-        write_tclone_run_context_if_possible(&podman, &fork_record);
+        write_tclone_run_context_with_retry(
+            &podman,
+            &fork_record,
+            Duration::from_secs(TCLONE_ATTACH_RETRY_TIMEOUT_SECS),
+        )?;
         if !fork_json {
             println!("{run_id} | container={container_name}");
         }
@@ -2974,6 +2997,35 @@ fn write_tclone_run_context_if_possible(podman: &OsString, record: &TcloneRunRec
             "gensee: warning: could not write fork run context into {}: {error}",
             record.run_id
         );
+    }
+}
+
+fn write_tclone_run_context_with_retry(
+    podman: &OsString,
+    record: &TcloneRunRecord,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match write_tclone_run_context(podman, record) {
+            Ok(()) => return Ok(()),
+            Err(error) if Instant::now() < deadline => {
+                eprintln!(
+                    "gensee: waiting to install fork context in {}: {error}",
+                    record.run_id
+                );
+                thread::sleep(Duration::from_millis(250));
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not install authoritative fork context in {}: {error}",
+                        record.run_id
+                    ),
+                ));
+            }
+        }
     }
 }
 
@@ -7390,6 +7442,10 @@ mod tests {
         assert_eq!(payload["command"], "run fork");
         assert_eq!(payload["job_id"], "job_1");
         assert_eq!(
+            payload["retry_after_ms"],
+            TCLONE_ASYNC_INITIAL_POLL_DELAY_MS
+        );
+        assert_eq!(
             payload["poll_command"],
             "gensee run fork-status job_1 --json"
         );
@@ -7698,6 +7754,15 @@ gensee async job job_1: exited status=0
             io::Error::new(io::ErrorKind::TimedOut, "response was consumed by clone")
         )
         .unwrap());
+        let empty_success = TcloneHostControlResponse {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+        };
+        let empty_payload =
+            tclone_retryable_empty_fork_status_payload(&args, &empty_success).unwrap();
+        assert_eq!(empty_payload["transient"], true);
     }
 
     #[test]

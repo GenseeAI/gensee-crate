@@ -6164,6 +6164,7 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert!(finding
         .message
         .contains("status=running with transient=true"));
+    assert!(finding.message.contains("before the first status poll"));
     assert!(finding.message.contains("retry that same status command"));
     assert!(finding
         .message
