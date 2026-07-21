@@ -48,6 +48,7 @@ pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
 const TCLONE_SOURCE_FORK_HANDOFF_FILE: &str = "source-fork-handoff.json";
 const TCLONE_SOURCE_FORK_HANDOFF_TIMEOUT_SECS: u64 = 30;
+const TCLONE_SOURCE_CODEX_RESTART_TIMEOUT_SECS: u64 = 15;
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
 const TCLONE_ASYNC_INITIAL_POLL_DELAY_MS: u64 = 500;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
@@ -2940,6 +2941,11 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     }
     if source_handoff.is_some() {
         let _ = fs::remove_file(tclone_source_fork_handoff_host_path(&source.run_id)?);
+        if let Err(error) = restart_tclone_source_codex_after_fork(&podman, &source) {
+            eprintln!(
+                "gensee: warning: fork succeeded, but source Codex could not be restarted: {error}"
+            );
+        }
     }
     if let Some(placement) = host_tmux_attach {
         for (index, run_id) in fork_run_ids.iter().enumerate() {
@@ -2967,6 +2973,109 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+fn restart_tclone_source_codex_after_fork(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+) -> io::Result<bool> {
+    let Some(respawn_args) = tclone_source_codex_fork_args(source) else {
+        return Ok(false);
+    };
+
+    // A live tclone preserves the forked Codex process, but the original
+    // process can no longer accept new turns. The source turn already reached
+    // its normal Stop hook, so two idle Ctrl-C presses perform Codex's clean
+    // exit path without interrupting a conversation.
+    for _ in 0..2 {
+        if tclone_agent_pane_is_dead(podman, &source.container_name)? {
+            break;
+        }
+        run_command_status(
+            podman,
+            &[
+                OsString::from("exec"),
+                OsString::from(&source.container_name),
+                OsString::from("tmux"),
+                OsString::from("send-keys"),
+                OsString::from("-t"),
+                OsString::from(TCLONE_AGENT_TMUX_SESSION),
+                OsString::from("C-c"),
+            ],
+        )?;
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(TCLONE_SOURCE_CODEX_RESTART_TIMEOUT_SECS);
+    while !tclone_agent_pane_is_dead(podman, &source.container_name)? {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for source Codex {} to exit cleanly",
+                    source.run_id
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    run_command_status(podman, &respawn_args)?;
+    wait_tclone_agent_ready(
+        podman,
+        &source.container_name,
+        &source.agent_cmd,
+        true,
+        Duration::from_secs(TCLONE_SOURCE_CODEX_RESTART_TIMEOUT_SECS),
+    )?;
+    Ok(true)
+}
+
+fn tclone_source_codex_fork_args(source: &TcloneRunRecord) -> Option<Vec<OsString>> {
+    let executable = source.agent_cmd.first()?;
+    let binary = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())?
+        .to_ascii_lowercase();
+    if binary != "codex" {
+        return None;
+    }
+
+    let mut resumed = vec![
+        OsString::from(executable),
+        OsString::from("fork"),
+        OsString::from("--last"),
+        OsString::from("-c"),
+        OsString::from("check_for_update_on_startup=false"),
+    ];
+    resumed.extend(source.agent_cmd.iter().skip(1).map(OsString::from));
+    let command = format!("exec {}", shell_join(&resumed));
+    Some(vec![
+        OsString::from("exec"),
+        OsString::from(&source.container_name),
+        OsString::from("tmux"),
+        OsString::from("respawn-pane"),
+        OsString::from("-t"),
+        OsString::from(TCLONE_AGENT_TMUX_SESSION),
+        OsString::from(command),
+    ])
+}
+
+fn tclone_agent_pane_is_dead(podman: &OsString, container_name: &str) -> io::Result<bool> {
+    let output = run_command_capture(
+        podman,
+        &[
+            OsString::from("exec"),
+            OsString::from(container_name),
+            OsString::from("tmux"),
+            OsString::from("list-panes"),
+            OsString::from("-t"),
+            OsString::from(TCLONE_AGENT_TMUX_SESSION),
+            OsString::from("-F"),
+            OsString::from("#{pane_dead}"),
+        ],
+    )?;
+    Ok(output.lines().any(|line| line.trim() == "1"))
 }
 
 pub(crate) fn tclone_fork_status(args: Vec<OsString>) -> io::Result<()> {
@@ -7268,6 +7377,35 @@ mod tests {
         env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
         env::remove_var(TCLONE_HOST_CONTROL_DIR_ENV);
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tclone_source_codex_restarts_as_an_independent_conversation_fork() {
+        let mut source = test_record("run_source", "running");
+        source.container_name = "source-container".to_string();
+        source.agent_cmd = vec!["/usr/local/bin/codex".to_string(), "--search".to_string()];
+
+        let args = tclone_source_codex_fork_args(&source)
+            .unwrap()
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            [
+                "exec",
+                "source-container",
+                "tmux",
+                "respawn-pane",
+                "-t",
+                TCLONE_AGENT_TMUX_SESSION,
+                "exec '/usr/local/bin/codex' 'fork' '--last' '-c' 'check_for_update_on_startup=false' '--search'",
+            ]
+        );
+
+        source.agent_cmd = vec!["claude".to_string()];
+        assert!(tclone_source_codex_fork_args(&source).is_none());
     }
 
     #[test]
