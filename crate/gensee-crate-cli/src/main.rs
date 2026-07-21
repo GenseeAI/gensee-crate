@@ -70,6 +70,8 @@ mod daemon;
 pub(crate) use daemon::*;
 mod telemetry;
 pub(crate) use telemetry::*;
+mod hook_compatibility;
+pub(crate) use hook_compatibility::*;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -1116,6 +1118,13 @@ fn default_vscode_hooks_path() -> io::Result<PathBuf> {
     Ok(home.join(".copilot").join("hooks").join("gensee.json"))
 }
 
+fn default_cursor_hooks_path() -> io::Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    Ok(home.join(".cursor").join("hooks.json"))
+}
+
 fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
     let mut hooks_path = default_vscode_hooks_path()?;
     let mut gensee_home = env::var_os("GENSEE_HOME")
@@ -1242,10 +1251,7 @@ fn vscode_hook_command(gensee_home: &Path, bin_path: &Path) -> String {
 }
 
 fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    let mut hooks_path = home.join(".cursor").join("hooks.json");
+    let mut hooks_path = default_cursor_hooks_path()?;
     let mut gensee_home = env::var_os("GENSEE_HOME")
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
@@ -3335,7 +3341,45 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     let mut payload = String::new();
     io::stdin().read_to_string(&mut payload)?;
 
-    let event = build_hook_event(&payload, provider)?;
+    // Record proof that the host actually invoked the native hook before doing
+    // any parsing, policy, daemon, or store work. A concurrently launched
+    // compatibility hook can use this short-lived evidence to suppress itself.
+    if matches!(provider, PROVIDER_CURSOR | PROVIDER_VSCODE) {
+        if let Err(error) = record_native_hook_invocation_evidence(provider, &payload) {
+            // Evidence failure must not interfere with the native hook. The
+            // compatibility invocation will process normally, yielding at most
+            // a duplicate rather than a gap in enforcement.
+            eprintln!(
+                "gensee hook: cannot record native {provider} invocation evidence ({error}); compatibility hooks will not be suppressed"
+            );
+        }
+    }
+
+    let mut evidence_error = None;
+    let route = route_hook_invocation(provider, &payload, |native_provider, payload| {
+        match take_recent_native_hook_invocation_evidence(native_provider, payload) {
+            Ok(observed) => observed,
+            Err(error) => {
+                evidence_error = Some((native_provider, error));
+                false
+            }
+        }
+    });
+    if let Some((native_provider, error)) = evidence_error {
+        eprintln!(
+            "gensee hook: cannot verify recent native {native_provider} invocation evidence ({error}); processing the compatibility invocation"
+        );
+    }
+    let effective_provider = match route {
+        HookInvocationRoute::ProcessAs(provider) => provider,
+        HookInvocationRoute::Suppress { native_provider } => {
+            warn_hook_compatibility_suppressed(provider, native_provider);
+            telemetry_record_hook_compatibility_suppressed(provider, native_provider);
+            return Ok(());
+        }
+    };
+
+    let event = build_hook_event(&payload, effective_provider)?;
 
     // Fast path: if the warm daemon is up, hand off over its socket — PreToolUse
     // waits for the decision (warm eval, no per-call store open), observational
