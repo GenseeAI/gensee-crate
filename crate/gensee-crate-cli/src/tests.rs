@@ -6162,18 +6162,14 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert!(finding
         .message
         .contains("gensee run fork run_123 --name try-upgrade --attach tmux:right --json"));
-    assert!(finding
-        .message
-        .contains("live-cloned Codex turn continues the original task automatically"));
+    assert!(finding.message.contains("End this source turn normally"));
     assert!(finding
         .message
         .contains("do not resend the prompt with `gensee run send`"));
+    assert!(finding.message.contains("do not poll fork-status"));
     assert!(finding
         .message
-        .contains("Immediately poll the returned status_command"));
-    assert!(finding
-        .message
-        .contains("active poll is intentionally inherited"));
+        .contains("saved original request to the fork automatically"));
     assert!(finding
         .message
         .contains("fork will summarize its own changed files and tests"));

@@ -46,6 +46,8 @@ const TCLONE_WAIT_QUIET_FOR_FORK_ENV: &str = "GENSEE_TCLONE_WAIT_QUIET_FOR_FORK"
 const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
+const TCLONE_SOURCE_FORK_HANDOFF_FILE: &str = "source-fork-handoff.json";
+const TCLONE_SOURCE_FORK_HANDOFF_TIMEOUT_SECS: u64 = 30;
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
 const TCLONE_ASYNC_INITIAL_POLL_DELAY_MS: u64 = 500;
 const TCLONE_ASYNC_FORK_READY_TIMEOUT_SECS: u64 = 120;
@@ -170,6 +172,17 @@ struct TcloneForkResult {
     assistant_summary: Option<String>,
     #[serde(default)]
     tests: Vec<TcloneForkTestResult>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct TcloneSourceForkHandoff {
+    source_run_id: String,
+    prompt: String,
+    requested_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fork_command_completed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_turn_stopped_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -412,6 +425,173 @@ fn tclone_fork_result_path() -> PathBuf {
 pub(crate) fn record_tclone_fork_hook_lifecycle(event: &AgentHookEvent) {
     if let Err(error) = try_record_tclone_fork_hook_lifecycle(event) {
         eprintln!("gensee: warning: could not update fork result marker: {error}");
+    }
+}
+
+pub(crate) fn prepare_tclone_source_fork_handoff(event: &AgentHookEvent) {
+    if let Err(error) = try_prepare_tclone_source_fork_handoff(event) {
+        eprintln!("gensee: warning: could not save source fork handoff: {error}");
+    }
+}
+
+fn try_prepare_tclone_source_fork_handoff(event: &AgentHookEvent) -> io::Result<()> {
+    if event.hook_event_name.as_deref() != Some("UserPromptSubmit") {
+        return Ok(());
+    }
+    let context = match read_tclone_run_context() {
+        Ok(context) => context,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if context.get("role").and_then(Value::as_str) != Some("source") {
+        return Ok(());
+    }
+    let source_run_id = context
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "source context has no run_id")
+        })?;
+    let prompt = user_prompt_from_hook(event)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "source hook has no prompt"))?;
+    let handoff = TcloneSourceForkHandoff {
+        source_run_id: source_run_id.to_string(),
+        prompt,
+        requested_at_ms: event.observed_at_ms,
+        fork_command_completed_at_ms: None,
+        source_turn_stopped_at_ms: None,
+    };
+    write_tclone_source_fork_handoff(&handoff)
+}
+
+pub(crate) fn record_tclone_source_fork_handoff_lifecycle(event: &AgentHookEvent) {
+    if let Err(error) = try_record_tclone_source_fork_handoff_lifecycle(event) {
+        eprintln!("gensee: warning: could not update source fork handoff: {error}");
+    }
+}
+
+fn try_record_tclone_source_fork_handoff_lifecycle(event: &AgentHookEvent) -> io::Result<()> {
+    if !matches!(
+        event.hook_event_name.as_deref(),
+        Some("PostToolUse" | "Stop")
+    ) {
+        return Ok(());
+    }
+    let context = match read_tclone_run_context() {
+        Ok(context) => context,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if context.get("role").and_then(Value::as_str) != Some("source") {
+        return Ok(());
+    }
+    let source_run_id = context
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "source context has no run_id")
+        })?;
+    let Some(mut handoff) = read_tclone_source_fork_handoff() else {
+        return Ok(());
+    };
+    if handoff.source_run_id != source_run_id {
+        return Ok(());
+    }
+
+    match event.hook_event_name.as_deref() {
+        Some("PostToolUse") => {
+            let fork_command = event
+                .tool_input_command
+                .as_deref()
+                .is_some_and(tclone_command_is_source_fork);
+            if !fork_command {
+                return Ok(());
+            }
+            handoff.fork_command_completed_at_ms = Some(event.observed_at_ms);
+            handoff.source_turn_stopped_at_ms = None;
+        }
+        Some("Stop") if handoff.fork_command_completed_at_ms.is_some() => {
+            handoff.source_turn_stopped_at_ms = Some(event.observed_at_ms);
+        }
+        _ => return Ok(()),
+    }
+    write_tclone_source_fork_handoff(&handoff)
+}
+
+fn tclone_command_is_source_fork(command: &str) -> bool {
+    command.contains("gensee run fork ") && !command.contains("gensee run fork-status ")
+}
+
+fn tclone_source_fork_handoff_path() -> io::Result<PathBuf> {
+    let directory = env::var_os(TCLONE_HOST_CONTROL_DIR_ENV).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "source fork handoff requires the tclone host-control directory",
+        )
+    })?;
+    Ok(PathBuf::from(directory).join(TCLONE_SOURCE_FORK_HANDOFF_FILE))
+}
+
+fn read_tclone_source_fork_handoff() -> Option<TcloneSourceForkHandoff> {
+    let path = tclone_source_fork_handoff_path().ok()?;
+    let text = read_nofollow_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_tclone_source_fork_handoff(handoff: &TcloneSourceForkHandoff) -> io::Result<()> {
+    let path = tclone_source_fork_handoff_path()?;
+    write_atomic_nofollow(&path, &serde_json::to_vec(handoff)?, 0o600)
+}
+
+fn tclone_source_fork_handoff_host_path(source_run_id: &str) -> io::Result<PathBuf> {
+    Ok(gensee_tmp_root()?
+        .join(source_run_id)
+        .join("host-control")
+        .join(TCLONE_SOURCE_FORK_HANDOFF_FILE))
+}
+
+fn wait_for_tclone_source_fork_handoff(
+    source: &TcloneRunRecord,
+) -> io::Result<Option<TcloneSourceForkHandoff>> {
+    let path = tclone_source_fork_handoff_host_path(&source.run_id)?;
+    if !tclone_path_exists(&path) {
+        return Ok(None);
+    }
+    let deadline = Instant::now() + Duration::from_secs(TCLONE_SOURCE_FORK_HANDOFF_TIMEOUT_SECS);
+    loop {
+        let text = read_nofollow_to_string(&path)?;
+        let handoff = serde_json::from_str::<TcloneSourceForkHandoff>(&text).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid source fork handoff: {error}"),
+            )
+        })?;
+        if handoff.source_run_id != source.run_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "source fork handoff belongs to {}, expected {}",
+                    handoff.source_run_id, source.run_id
+                ),
+            ));
+        }
+        if handoff.fork_command_completed_at_ms.is_some()
+            && handoff.source_turn_stopped_at_ms.is_some()
+        {
+            // Let Codex finish restoring terminal state after its Stop hook.
+            thread::sleep(Duration::from_millis(250));
+            return Ok(Some(handoff));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for source Codex turn {} to end normally",
+                    source.run_id
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -1806,8 +1986,8 @@ fn configure_tclone_async_fork_environment(command: &mut Command, ready_timeout_
         .env_remove(TCLONE_HOST_CONTROL_SOCKET_ENV)
         .env_remove(TCLONE_HOST_CONTROL_DIR_ENV)
         .env(TCLONE_HOST_CONTROL_DISABLE_ENV, "1")
-        // Automatic continuation clones this active Codex turn. Waiting for
-        // the source to become idle is incompatible with that async handoff.
+        // The source Stop-hook handoff is the idle boundary. Avoid layering
+        // the older CPU quiet sampler on top of that deterministic signal.
         .env_remove(TCLONE_WAIT_QUIET_FOR_FORK_ENV)
         .env(
             "GENSEE_TCLONE_READY_TIMEOUT_SECS",
@@ -2068,7 +2248,9 @@ fn tclone_host_control_async_response(
                 "retry_after_ms": TCLONE_ASYNC_INITIAL_POLL_DELAY_MS,
                 "status_command": status_command,
                 "poll_command": status_command,
-                "message": "gensee scheduled the tclone fork on the host. Poll status_command immediately and keep retrying that same command while status=running; the active poll is intentionally inherited so the live-cloned Codex turn can stop source orchestration and continue the approved task. Never schedule a replacement fork or resend the original prompt",
+                "source_action": "end_turn",
+                "prompt_delivery": "automatic",
+                "message": "gensee scheduled the tclone fork on the host. Do not poll fork-status and do not perform the task locally. End this source turn normally; Gensee will wait for the Stop hook, clone the idle Codex session, submit the saved original request to the fork automatically, and open its pane. Never schedule a replacement fork or resend the original prompt",
             })
         )
     } else {
@@ -2650,6 +2832,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     }
     let podman = tclone_podman();
     ensure_tclone_container_exists(&podman, &source)?;
+    let source_handoff = wait_for_tclone_source_fork_handoff(&source)?;
     wait_for_tclone_source_quiet_if_requested(&podman, &source)?;
     ensure_tclone_agent_ready_for_fork(&podman, &source)?;
     let _detach_guard = TcloneForkDetachGuard::mark(&source.run_id)?;
@@ -2737,6 +2920,11 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             &fork_record,
             Duration::from_secs(TCLONE_ATTACH_RETRY_TIMEOUT_SECS),
         )?;
+        if let Some(handoff) = source_handoff.as_ref() {
+            mark_tclone_fork_task_queued(&podman, &fork_record)?;
+            let prompt = tclone_prompt_with_fork_context(&fork_record, &handoff.prompt);
+            tclone_send_prompt_to_agent(&podman, &fork_record, &prompt, true)?;
+        }
         if !fork_json {
             println!("{run_id} | container={container_name}");
         }
@@ -2749,6 +2937,9 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             "workspace": &source.container_workspace,
         }));
         fork_run_ids.push(run_id);
+    }
+    if source_handoff.is_some() {
+        let _ = fs::remove_file(tclone_source_fork_handoff_host_path(&source.run_id)?);
     }
     if let Some(placement) = host_tmux_attach {
         for (index, run_id) in fork_run_ids.iter().enumerate() {
@@ -4833,13 +5024,6 @@ pub(crate) fn tclone_cleanup_resolved(args: Vec<OsString>) -> io::Result<()> {
         ));
     }
 
-    let podman = tclone_podman();
-    if let Err(error) = interrupt_tclone_source_agent_turn(&podman, &record) {
-        eprintln!(
-            "gensee: warning: could not interrupt resolved fork source turn for {}: {error}",
-            record.run_id
-        );
-    }
     remove_tclone_container(&record).map_err(|error| {
         io::Error::other(format!(
             "could not remove resolved fork container {}: {error}",
@@ -4848,51 +5032,6 @@ pub(crate) fn tclone_cleanup_resolved(args: Vec<OsString>) -> io::Result<()> {
     })?;
     focus_tclone_source_host_pane();
     Ok(())
-}
-
-fn interrupt_tclone_source_agent_turn(podman: &OsString, fork: &TcloneRunRecord) -> io::Result<()> {
-    let source_run_id = fork.parent_run_id.as_deref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("resolved fork {} has no source run", fork.run_id),
-        )
-    })?;
-    let source = find_tclone_record(source_run_id)?;
-    if source.role != "source" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "resolved fork source {} has unexpected role={}",
-                source.run_id, source.role
-            ),
-        ));
-    }
-    if fork.source_container.as_deref() != Some(source.container_name.as_str()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "resolved fork {} does not belong to source container {}",
-                fork.run_id, source.container_name
-            ),
-        ));
-    }
-
-    run_command_status(
-        podman,
-        &tclone_source_agent_interrupt_args(&source.container_name),
-    )
-}
-
-fn tclone_source_agent_interrupt_args(container_name: &str) -> Vec<OsString> {
-    vec![
-        OsString::from("exec"),
-        OsString::from(container_name),
-        OsString::from("tmux"),
-        OsString::from("send-keys"),
-        OsString::from("-t"),
-        OsString::from(TCLONE_AGENT_TMUX_SESSION),
-        OsString::from("C-c"),
-    ]
 }
 
 fn tclone_record_is_ready_for_resolution_cleanup(record: &TcloneRunRecord) -> bool {
@@ -7086,6 +7225,52 @@ mod tests {
     }
 
     #[test]
+    fn tclone_source_handoff_saves_prompt_and_waits_for_normal_stop() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("source-fork-handoff");
+        let context_path = root.join("context.json");
+        let control_dir = root.join("host-control");
+        fs::create_dir_all(&control_dir).unwrap();
+        fs::write(
+            &context_path,
+            json!({
+                "run_id": "run_source",
+                "role": "source",
+                "source_run_id": "run_source",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+        env::set_var(TCLONE_HOST_CONTROL_DIR_ENV, &control_dir);
+
+        let mut prompt_event = test_hook_event("UserPromptSubmit", 10);
+        prompt_event.raw_json = json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "session-1",
+            "prompt": "create the requested smoke test",
+        })
+        .to_string();
+        try_prepare_tclone_source_fork_handoff(&prompt_event).unwrap();
+
+        let mut post_fork = test_hook_event("PostToolUse", 20);
+        post_fork.tool_input_command =
+            Some("gensee run fork run_source --attach tmux:right --json".to_string());
+        try_record_tclone_source_fork_handoff_lifecycle(&post_fork).unwrap();
+        try_record_tclone_source_fork_handoff_lifecycle(&test_hook_event("Stop", 30)).unwrap();
+
+        let handoff = read_tclone_source_fork_handoff().unwrap();
+        assert_eq!(handoff.source_run_id, "run_source");
+        assert_eq!(handoff.prompt, "create the requested smoke test");
+        assert_eq!(handoff.fork_command_completed_at_ms, Some(20));
+        assert_eq!(handoff.source_turn_stopped_at_ms, Some(30));
+
+        env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
+        env::remove_var(TCLONE_HOST_CONTROL_DIR_ENV);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn tclone_fork_first_real_tool_call_leaves_queued_state() {
         let _guard = tclone_test_env_lock();
         let root = temp_tree("fork-result-first-tool");
@@ -7982,6 +8167,12 @@ mod tests {
             payload["status_command"],
             "gensee run fork-status job_1 --json"
         );
+        assert_eq!(payload["source_action"], "end_turn");
+        assert_eq!(payload["prompt_delivery"], "automatic");
+        assert!(payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("Do not poll fork-status"));
         assert!(payload.get("log_path").is_none());
         assert!(payload.get("done_path").is_none());
     }
@@ -8586,27 +8777,6 @@ gensee async job job_1: exited status=0
         record.status = "discarded".to_string();
         record.role = "source".to_string();
         assert!(!tclone_record_is_ready_for_resolution_cleanup(&record));
-    }
-
-    #[test]
-    fn tclone_resolution_cleanup_interrupts_the_source_codex_turn() {
-        let args = tclone_source_agent_interrupt_args("source-container")
-            .into_iter()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            args,
-            [
-                "exec",
-                "source-container",
-                "tmux",
-                "send-keys",
-                "-t",
-                TCLONE_AGENT_TMUX_SESSION,
-                "C-c",
-            ]
-        );
     }
 
     #[test]

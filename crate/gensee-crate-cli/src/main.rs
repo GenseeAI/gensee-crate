@@ -3374,6 +3374,7 @@ pub(crate) fn process_hook_event(
     store.append_hook_event(event)?;
     let fork_stop_continuation = tclone_codex_stop_continuation(event);
     record_tclone_fork_hook_lifecycle(event);
+    record_tclone_source_fork_handoff_lifecycle(event);
 
     if let Some(reason) = fork_stop_continuation {
         return Ok(Some(
@@ -3472,6 +3473,7 @@ pub(crate) fn process_hook_event(
 
         let current_run_id = current_tclone_run_id_for_event(event);
         if let Some(finding) = fork_suggestion_prompt_finding(event, current_run_id.as_deref()) {
+            prepare_tclone_source_fork_handoff(event);
             if !fork_suggestion_already_recorded(Some(store), event, &finding) {
                 store.append_policy_alert(&finding.to_policy_alert(event))?;
                 contexts.push(format!("Gensee safety notice: {}", finding.message));
