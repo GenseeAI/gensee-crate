@@ -36,6 +36,84 @@ npm install
 GENSEE_HOME="$HOME/.gensee" cargo tauri dev
 ```
 
+## Transactions showcase data
+
+Create a dedicated plaintext development database with two real-world workflows:
+
+- A checkout reliability incident forks retry-guard, load-shedding, and
+  queue-redesign approaches, then exercises validated and conflicting merges,
+  discard, switch, keep, and delete.
+- A Stripe SDK upgrade follows PR #23's visible-fork workflow: policy guidance,
+  approval, one async host-owned fork, status polling, duplicate prevention,
+  right-hand tmux attachment, prompt handoff, preserved tooling, recursive-fork
+  suppression, and structured `exec --json` follow-up. After that fork merges,
+  the updated source fans out into webhook security, a conflicting ledger
+  backfill, and a reconciliation redesign that becomes active.
+
+```bash
+GENSEE_SHOWCASE_HOME="$(cd .. && pwd)/.gensee-dev"
+mkdir -p "$GENSEE_SHOWCASE_HOME"
+sqlite3 "$GENSEE_SHOWCASE_HOME/gensee.db" < ../db/schema.sql
+sqlite3 "$GENSEE_SHOWCASE_HOME/gensee.db" < showcase/transactions.sql
+sqlite3 "$GENSEE_SHOWCASE_HOME/gensee.db" < showcase/visible-fork-workflow.sql
+GENSEE_HOME="$GENSEE_SHOWCASE_HOME" cargo tauri dev
+```
+
+The fixtures use reserved `checkout-*` / `txn-checkout-*` and `billing-*` /
+`txn-billing-*` identifiers. They are safe to rerun and replace only
+their own rows. Both create matching Timeline sessions and tool events so run
+links in Transactions have drill-down content. The database is deliberately
+project-local and ignored by Git. Settings will identify it as plaintext because
+it is synthetic development data, not production telemetry.
+
+The visible-fork fixture also inserts five synthetic policy decisions for the
+Alerts view: the initial fork suggestion, the source-command backstop, the
+approved schedule, a prevented duplicate schedule, and a blocked source-to-child
+`exec` redirected to `send`. They are unchained fixture rows; production alerts
+are appended through the tamper-evident store path.
+
+Use an absolute `GENSEE_HOME` as above: the Tauri development process may use a
+different working directory from the shell that launched it, so a relative path
+such as `../.gensee-dev` is not reliable at runtime.
+
+## README screenshot showcase
+
+For screenshots of the rest of the product, create a separate database and load
+the non-transactional product tour by itself:
+
+```bash
+GENSEE_README_HOME="$(cd .. && pwd)/.gensee-dev/readme"
+mkdir -p "$GENSEE_README_HOME"
+sqlite3 "$GENSEE_README_HOME/gensee.db" < ../db/schema.sql
+sqlite3 "$GENSEE_README_HOME/gensee.db" < showcase/product-tour.sql
+GENSEE_HOME="$GENSEE_README_HOME" cargo tauri dev
+```
+
+This fixture tells connected, realistic stories rather than presenting random
+sample rows:
+
+- **Dashboard:** activity is distributed across the last 24 hours and all seven
+  days, with a complete alert-severity donut and recent policy decisions.
+- **Timeline:** a duplicate-payment incident, OAuth security hardening, and
+  release readiness include sequential and parallel tools, durations, policy
+  outcomes, blocked actions, and filesystem effects.
+- **Today's Highlight:** current sessions cover file reads and edits, web
+  research, test commands, and every policy action.
+- **Lineage Graph:** six artifacts connect incident evidence and operational
+  guidance to the payment fix, replay tests, release workflow, and protected
+  production manifest.
+- **Alerts, Sessions, and Feedback:** the same stories provide filterable risk
+  decisions, flagged sessions, approvals, overrides, and a false negative.
+
+The fixture never inserts transaction history and uses only reserved
+`showcase-*` sessions and IDs from 9501 upward. It is safe to rerun. To capture
+the **Live Feed**, open that page first and replay a short burst from another
+terminal (the replay intentionally appends new rows each time):
+
+```bash
+sqlite3 "$GENSEE_README_HOME/gensee.db" < showcase/live-feed-replay.sql
+```
+
 To open the WebView developer tools while debugging the frontend, opt in
 explicitly:
 
@@ -90,6 +168,18 @@ network restrictions.
 agent prompts, file paths, tool names, policy findings, and bounded metadata for
 WebSearch, WebFetch, and ToolSearch calls. Treat the Gensee home directory as
 private user data and do not share the database without review.
+
+The **Transactions** page reads append-only transactional environment events
+from the same encrypted database. Its History view groups state-changing tclone
+operations chronologically, while Dependencies shows which runs were forked and
+which successful merges contributed changes to another run. Run identifiers
+link to a session-filtered Timeline. New operations update Transactions live and
+also appear under the **Transactional environment** category in Live Feed.
+
+Discarding or deleting a tclone container does not erase its transaction
+history. Stored failure details are bounded: Gensee records structured operation
+metadata and short diagnostic messages, but not full patches, environment
+variables, or unrestricted command output.
 
 The store does not generically copy arbitrary non-file tool-input objects. Each
 persisted tool-input JSON record is capped at 16 KiB; oversized inputs are

@@ -91,6 +91,24 @@ includes `status_command`. Poll it only until `status=succeeded`, then use
 `forks[0].run_id` for `gensee run send`; if it returns `status=failed`, stop and
 inspect the included log summary.
 
+## Transaction History in the Dashboard
+
+The native dashboard's **Transactions** page records the state-changing tclone
+lifecycle: source start/end, fork, merge, switch, keep, discard, and delete.
+Started, successful, failed, forced, and merge dry-run outcomes are retained in
+the encrypted Gensee SQLite store. Multi-copy forks are grouped as one operation
+with individually addressable child runs.
+
+Use Dependencies for the default fork-and-merge relationship graph, or History
+for a chronological, branch-aware view. Selecting a run opens Timeline filtered
+to that source or fork. While the dashboard is running, new operations appear
+live in Transactions and in Live Feed under **Transactional environment**.
+
+Container deletion is resource cleanup only: it adds a terminal history event
+and does not remove prior provenance. Interactive commands such as `attach`,
+`shell`, `exec`, and `diff` are not lifecycle transactions and remain outside
+this view.
+
 Use `gensee run exec <id> -- <command>` for non-interactive work in a fork,
 such as commands requested by an agent. The command runs inside the container
 workspace without attaching to the live agent UI, and receives the container's

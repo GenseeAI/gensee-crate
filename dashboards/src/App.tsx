@@ -16,6 +16,7 @@ import LineageGraph from '@/pages/LineageGraph';
 import Feedback    from '@/pages/Feedback';
 import Policy      from '@/pages/Policy';
 import Settings    from '@/pages/Settings';
+import Transactions from '@/pages/Transactions';
 
 // ---------------------------------------------------------------------------
 // ThemedApp is a separate component so it can read from ThemeContext.
@@ -34,6 +35,7 @@ function ThemedApp() {
               <Route path="today"      element={<TodayHighlight />} />
               <Route path="live-feed"  element={<LiveFeed />}     />
               <Route path="timeline"   element={<Timeline />}     />
+              <Route path="transactions" element={<Transactions />} />
               <Route path="sessions"   element={<Sessions />}     />
               <Route path="sessions/:sessionId" element={<Sessions />} />
               <Route path="alerts"     element={<Alerts />}       />
