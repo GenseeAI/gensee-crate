@@ -1,9 +1,43 @@
 use crate::*;
 
-pub(crate) fn list_runs() -> io::Result<()> {
+pub(crate) fn list_runs(args: Vec<OsString>) -> io::Result<()> {
     let store = EventStore::default_local()?;
-    let sessions = compact_sessions(store.list_sessions()?);
+    let mut sessions = compact_sessions(store.list_sessions()?);
     let tclone_runs = list_tclone_runs()?;
+    let scope_run_id =
+        env::var_os("GENSEE_TCLONE_HOST_CONTROL_CALLER").and_then(|value| value.into_string().ok());
+
+    if let Some(scope_run_id) = scope_run_id.as_deref() {
+        let allowed_run_ids = tclone_runs
+            .iter()
+            .filter(|run| {
+                run.run_id == scope_run_id || run.parent_run_id.as_deref() == Some(scope_run_id)
+            })
+            .map(|run| run.run_id.as_str())
+            .collect::<HashSet<_>>();
+        sessions.retain(|session| allowed_run_ids.contains(session.session_id.as_str()));
+    }
+
+    if arg_flag(&args, "--json") {
+        let tclone_runs = tclone_runs
+            .iter()
+            .filter(|run| {
+                scope_run_id.as_deref().is_none_or(|scope| {
+                    run.run_id == scope || run.parent_run_id.as_deref() == Some(scope)
+                })
+            })
+            .map(tclone_run_list_entry)
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "command": "run list",
+                "sessions": sessions,
+                "tclone_runs": tclone_runs,
+            }))?
+        );
+        return Ok(());
+    }
 
     if sessions.is_empty() && tclone_runs.is_empty() {
         println!("No runs found.");

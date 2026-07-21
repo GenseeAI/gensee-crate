@@ -3451,7 +3451,7 @@ fn daemon_request_rejects_unwrapped_or_missing_provider() {
 }
 
 #[test]
-fn daemon_waits_for_antigravity_stdout_events() {
+fn daemon_waits_for_hook_events_that_can_return_stdout() {
     assert_eq!(
         daemon_response_mode(&test_hook_event(PROVIDER_ANTIGRAVITY, "PreToolUse")),
         DaemonResponseMode::Required
@@ -3466,6 +3466,11 @@ fn daemon_waits_for_antigravity_stdout_events() {
     assert_eq!(
         daemon_response_mode(&test_hook_event(PROVIDER_CLAUDE_CODE, "PostToolUse")),
         DaemonResponseMode::FireAndForget
+    );
+    assert_eq!(
+        daemon_response_mode(&test_hook_event(PROVIDER_CODEX, "Stop")),
+        DaemonResponseMode::Optional,
+        "Codex Stop can return a fork continuation prompt"
     );
 }
 
@@ -6705,15 +6710,19 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert!(finding
         .message
         .contains("gensee run fork run_123 --name try-upgrade --attach tmux:right --json"));
+    assert!(finding.message.contains("End this source turn normally"));
     assert!(finding
         .message
-        .contains("gensee run send <fork-id> -- '<task prompt>'"));
+        .contains("do not resend the prompt with `gensee run send`"));
+    assert!(finding.message.contains("do not poll fork-status"));
     assert!(finding
         .message
-        .contains("After sending the prompt, do not poll gensee for task completion"));
+        .contains("saved original request to the fork automatically"));
     assert!(finding
         .message
-        .contains("ask the user to report the fork result"));
+        .contains("fork will summarize its own changed files and tests"));
+    assert!(finding.message.contains("Do not auto-merge"));
+    assert!(finding.message.contains("wait for explicit user approval"));
     assert_eq!(finding.evidence["reason"], json!("dependency_upgrade"));
 }
 
