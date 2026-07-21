@@ -5438,7 +5438,7 @@ fn schedule_tclone_resolution_cleanup(run_id: &str) -> io::Result<()> {
         .map(|_| ())
         .map_err(|error| {
             io::Error::other(format!(
-                "merge succeeded, but could not schedule cleanup for {run_id}: {error}"
+                "resolved fork cleanup could not be scheduled for {run_id}: {error}"
             ))
         })
 }
@@ -5462,12 +5462,16 @@ pub(crate) fn tclone_cleanup_resolved(args: Vec<OsString>) -> io::Result<()> {
         ));
     }
 
+    let fork_pane = tclone_host_tmux_pane_for_run(&record);
     remove_tclone_container(&record).map_err(|error| {
         io::Error::other(format!(
             "could not remove resolved fork container {}: {error}",
             record.container_name
         ))
     })?;
+    if let Some(fork_pane) = fork_pane {
+        kill_tclone_host_pane(OsString::from(fork_pane));
+    }
     focus_tclone_source_host_pane();
     Ok(())
 }
@@ -5681,10 +5685,14 @@ pub(crate) fn tclone_complete_switch(args: Vec<OsString>) -> io::Result<()> {
 }
 
 fn kill_tclone_source_host_pane() {
-    let (Some(socket), Some(target)) = (
-        env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV),
-        env::var_os(TCLONE_HOST_TMUX_TARGET_ENV),
-    ) else {
+    let Some(target) = env::var_os(TCLONE_HOST_TMUX_TARGET_ENV) else {
+        return;
+    };
+    kill_tclone_host_pane(target);
+}
+
+fn kill_tclone_host_pane(target: OsString) {
+    let Some(socket) = env::var_os(TCLONE_HOST_TMUX_SOCKET_ENV) else {
         return;
     };
     let _ = Command::new("tmux")
@@ -6900,17 +6908,15 @@ pub(crate) fn tclone_discard_if_exists(target: &str) -> io::Result<bool> {
             format!("discard target must be a fork, got role={}", record.role),
         ));
     }
-    run_command_status(
-        &tclone_podman(),
-        &[
-            OsString::from("rm"),
-            OsString::from("-f"),
-            OsString::from(&record.container_name),
-        ],
-    )?;
+    // Record the terminal resolution now, but delay destructive cleanup so
+    // the successful lifecycle response can reach the agent in this fork.
     append_tclone_status(&record.run_id, "discarded", None)?;
+    if let Err(error) = schedule_tclone_resolution_cleanup(&record.run_id) {
+        append_tclone_record(&record)?;
+        return Err(error);
+    }
     println!(
-        "gensee: discarded tclone container {} ({})",
+        "gensee: marked tclone fork {} ({}) discarded; cleanup is scheduled",
         record.run_id, record.container_name
     );
     Ok(true)
@@ -9836,6 +9842,9 @@ gensee async job job_1: exited status=0
     fn tclone_resolution_cleanup_only_accepts_resolved_forks() {
         let mut record = test_fork_record("run_1_fork_0", "run_1");
         record.status = "merged".to_string();
+        assert!(tclone_record_is_ready_for_resolution_cleanup(&record));
+
+        record.status = "discarded".to_string();
         assert!(tclone_record_is_ready_for_resolution_cleanup(&record));
 
         record.status = "completed".to_string();

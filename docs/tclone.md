@@ -176,8 +176,10 @@ the previous source container, and closes the previous source pane. The
 user-facing choice is therefore “Promote this fork to the main environment and
 end the old source,” rather than the ambiguous “Keep working.”
 
-`gensee run discard <run_id-or-container>` removes the container and keeps a
-`discarded` record for history. `gensee run delete <run_id-or-container>`
+`gensee run discard <run_id-or-container>` first records the fork as
+`discarded` and returns the lifecycle response. A delayed cleanup then removes
+the fork container, closes its attached pane, focuses the source pane, and
+keeps the `discarded` record for history. `gensee run delete <run_id-or-container>`
 removes the container and removes that tclone record from `gensee run list`.
 Use `gensee run delete --all` to clean tracked tclone containers, clear the
 tclone section of the run list, and reap untracked `gensee-tclone-*` orphan
