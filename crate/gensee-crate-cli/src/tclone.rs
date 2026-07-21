@@ -3741,9 +3741,8 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     ensure_tclone_container_exists(&podman, &source)?;
     let forked_at_ms = unix_millis()?;
     let name_hint = arg_value(&args, "--name");
-    let prefix = tclone_fork_name_prefix(&parent, name_hint.as_deref(), forked_at_ms, copies);
-    validate_tclone_fork_prefix(&prefix)?;
-    ensure_tclone_fork_names_available(&prefix, copies)?;
+    let prefix =
+        choose_tclone_fork_name_prefix(&parent, name_hint.as_deref(), forked_at_ms, copies)?;
     let group_id = format!("{}_parallel_{}", source.run_id, forked_at_ms);
     let source_handoff = wait_for_tclone_source_fork_handoff(&source)?;
     wait_for_tclone_source_quiet_if_requested(&podman, &source)?;
@@ -4073,6 +4072,45 @@ fn tclone_fork_name_prefix(
             forked_at_ms
         ),
     }
+}
+
+fn choose_tclone_fork_name_prefix(
+    parent: &str,
+    name_hint: Option<&str>,
+    forked_at_ms: u64,
+    copies: usize,
+) -> io::Result<String> {
+    let prefix = tclone_fork_name_prefix(parent, name_hint, forked_at_ms, copies);
+    validate_tclone_fork_prefix(&prefix)?;
+    match ensure_tclone_fork_names_available(&prefix, copies) {
+        Ok(()) => Ok(prefix),
+        Err(error)
+            if copies > 1
+                && name_hint.is_some()
+                && error.kind() == io::ErrorKind::AlreadyExists =>
+        {
+            let fallback = tclone_timestamped_fork_name_prefix(&prefix, forked_at_ms);
+            validate_tclone_fork_prefix(&fallback)?;
+            ensure_tclone_fork_names_available(&fallback, copies)?;
+            eprintln!("gensee: fork name prefix `{prefix}` is already in use; using `{fallback}`");
+            Ok(fallback)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn tclone_timestamped_fork_name_prefix(prefix: &str, forked_at_ms: u64) -> String {
+    let suffix = format!("-{forked_at_ms}");
+    let max_base_len = 96_usize.saturating_sub(suffix.len()).max(1);
+    let base = prefix
+        .trim_end_matches('-')
+        .chars()
+        .take(max_base_len)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string();
+    let base = if base.is_empty() { "fork" } else { &base };
+    format!("{base}{suffix}")
 }
 
 fn validate_tclone_fork_prefix(prefix: &str) -> io::Result<()> {
@@ -10821,6 +10859,53 @@ gensee async job job_1: exited status=0
         assert!(validate_tclone_fork_prefix("try-upgrade").is_ok());
         assert!(validate_tclone_fork_prefix("try upgrade").is_err());
         assert!(validate_tclone_fork_prefix("").is_err());
+    }
+
+    #[test]
+    fn tclone_fork_name_hint_falls_back_when_parallel_prefix_is_in_use() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("parallel-name-conflict");
+        let old_home = env::var_os("GENSEE_HOME");
+        env::set_var("GENSEE_HOME", &root);
+
+        let mut existing = test_fork_record("run_existing_fork_0", "run_existing");
+        existing.container_name = "try-upgrade-0".to_string();
+        write_tclone_runs_to_path(&tclone_state_path().unwrap(), &[existing]).unwrap();
+
+        assert_eq!(
+            choose_tclone_fork_name_prefix("run_1", Some("try-upgrade"), 123, 2).unwrap(),
+            "try-upgrade-123"
+        );
+
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_fork_name_hint_keeps_parallel_prefix_when_only_resolved_forks_exist() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("parallel-name-resolved");
+        let old_home = env::var_os("GENSEE_HOME");
+        env::set_var("GENSEE_HOME", &root);
+
+        let mut existing = test_fork_record("run_existing_fork_0", "run_existing");
+        existing.container_name = "try-upgrade-0".to_string();
+        existing.status = "discarded".to_string();
+        write_tclone_runs_to_path(&tclone_state_path().unwrap(), &[existing]).unwrap();
+
+        assert_eq!(
+            choose_tclone_fork_name_prefix("run_1", Some("try-upgrade"), 123, 2).unwrap(),
+            "try-upgrade"
+        );
+
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

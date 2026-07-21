@@ -457,8 +457,11 @@ gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
 gensee-tclone run switch <fork-id>                         # promote fork; end old source
 ```
 
-Named parallel groups use stable indexed container names (`try-upgrade-0`,
-`try-upgrade-1`). Their panes form a vertical stack to the right of the source.
+Named parallel groups use stable indexed container names when available
+(`try-upgrade-0`, `try-upgrade-1`). If an unresolved older run still owns those
+names, Gensee automatically falls back to a timestamped prefix for the new group
+instead of failing the fork request. Panes form a vertical stack to the right of
+the source.
 Codex assigns the repeated approaches in order, compares the completed diffs
 and tests, recommends a winner, and—only after approval—merges or promotes that
 winner while discarding the other group members.

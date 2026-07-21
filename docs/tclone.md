@@ -70,12 +70,15 @@ ordinary confused agent from skipping the user-choice turn.
 
 For parallel work, Codex proposes distinct approaches before asking for one
 approval. A named `--copies 2` group creates clean container names such as
-`try-upgrade-0` and `try-upgrade-1`; repeated `--approach` values are assigned
-in index order and included in each fork's trusted task context. The first fork
-no longer coordinates the user-facing decision; every fork reports only its own
-completion. When all forks finish, Gensee sends the source Codex a comparison
-prompt. The source runs `run compare --json`, which reports each approach's
-changed files, tests, readiness, and a smallest-passing-diff recommendation.
+`try-upgrade-0` and `try-upgrade-1` when those names are free. If an unresolved
+older run still owns the clean names, Gensee automatically appends a timestamped
+suffix to the new group's prefix so repeated smoke tests can fork without manual
+cleanup. Repeated `--approach` values are assigned in index order and included
+in each fork's trusted task context. The first fork no longer coordinates the
+user-facing decision; every fork reports only its own completion. When all forks
+finish, Gensee sends the source Codex a comparison prompt. The source runs
+`run compare --json`, which reports each approach's changed files, tests,
+readiness, and a smallest-passing-diff recommendation.
 After the user selects an approach and lifecycle action in the source pane,
 `run choose` merges or promotes that winner and schedules every other group
 member for discard. `--discard-all` retires the whole group. These remain
