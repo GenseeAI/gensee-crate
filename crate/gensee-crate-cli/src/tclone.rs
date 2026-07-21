@@ -1292,7 +1292,7 @@ fn tclone_child_observer_fork_status_response(
         "source_run_id": owner_run_id,
         "caller_run_id": caller_run_id,
         "retryable": false,
-        "message": "this fork-status job belongs to the source run that created this fork; this fork pane should not continue source fork orchestration. Wait for the source run to send the original task into this fork.",
+        "message": "this fork-status job belongs to the source run that created this fork; stop source fork orchestration in this pane and continue the user's original approved task now. This pane is the live-cloned fork and does not need the source to resend the prompt.",
     });
     Ok(Some(TcloneHostControlResponse {
         exit_code: Some(0),
@@ -1932,7 +1932,7 @@ fn tclone_host_control_async_response(
                 "retry_after_ms": TCLONE_ASYNC_INITIAL_POLL_DELAY_MS,
                 "status_command": status_command,
                 "poll_command": status_command,
-                "message": "gensee scheduled the tclone fork on the host; wait retry_after_ms before the first status poll, then poll status_command until status=succeeded and send work to forks[0].run_id",
+                "message": "gensee scheduled the tclone fork on the host; the live-cloned Codex turn continues the original task automatically in the fork. In the source, wait retry_after_ms before the first status poll, then poll status_command until status=succeeded; do not resend the original prompt",
             })
         )
     } else {
@@ -7286,7 +7286,7 @@ mod tests {
         assert!(child_status_payload["message"]
             .as_str()
             .unwrap()
-            .contains("should not continue source fork orchestration"));
+            .contains("continue the user's original approved task now"));
 
         let replay =
             signed_host_control_request(&source_run_id, &capability, "flow-send", send_args);

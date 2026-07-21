@@ -6159,7 +6159,10 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
         .contains("gensee run fork run_123 --name try-upgrade --attach tmux:right --json"));
     assert!(finding
         .message
-        .contains("gensee run send <fork-id> -- '<task prompt>'"));
+        .contains("live-cloned Codex turn continues the original task automatically"));
+    assert!(finding
+        .message
+        .contains("do not resend the prompt with `gensee run send`"));
     assert!(finding.message.contains("gensee run list --json"));
     assert!(finding
         .message
