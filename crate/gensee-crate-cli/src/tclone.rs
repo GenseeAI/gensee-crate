@@ -53,6 +53,7 @@ const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
 const TCLONE_SOURCE_FORK_HANDOFF_FILE: &str = "source-fork-handoff.json";
+const TCLONE_PARALLEL_CHOICE_OFFER_FILE: &str = "parallel-choice-offer.json";
 const TCLONE_SOURCE_FORK_HANDOFF_TIMEOUT_SECS: u64 = 30;
 const TCLONE_SOURCE_CODEX_RESTART_TIMEOUT_SECS: u64 = 15;
 const TCLONE_ASYNC_FORK_DELAY_SECS: u64 = 2;
@@ -207,6 +208,21 @@ struct TcloneLifecycleApproval {
     approved_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     consumed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct TcloneParallelChoiceOption {
+    label: String,
+    run_id: String,
+    approach: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct TcloneParallelChoiceOffer {
+    source_run_id: String,
+    group_id: String,
+    offered_at_ms: u64,
+    options: Vec<TcloneParallelChoiceOption>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -659,6 +675,30 @@ fn write_tclone_source_fork_handoff(handoff: &TcloneSourceForkHandoff) -> io::Re
     write_atomic_nofollow(&path, &serde_json::to_vec(handoff)?, 0o600)
 }
 
+fn tclone_parallel_choice_offer_path() -> io::Result<PathBuf> {
+    let directory = env::var_os(TCLONE_HOST_CONTROL_DIR_ENV).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "parallel choice offer requires the tclone host-control directory",
+        )
+    })?;
+    Ok(PathBuf::from(directory).join(TCLONE_PARALLEL_CHOICE_OFFER_FILE))
+}
+
+fn read_tclone_parallel_choice_offer() -> Option<TcloneParallelChoiceOffer> {
+    let path = tclone_parallel_choice_offer_path().ok()?;
+    let text = read_nofollow_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_tclone_parallel_choice_offer_to_source(
+    source: &TcloneRunRecord,
+    offer: &TcloneParallelChoiceOffer,
+) -> io::Result<()> {
+    let path = tclone_parallel_choice_offer_host_path(source)?;
+    write_atomic_nofollow(&path, &serde_json::to_vec(offer)?, 0o600)
+}
+
 fn tclone_host_control_owner_run_id(record: &TcloneRunRecord) -> &str {
     record
         .host_control_owner_run_id
@@ -671,6 +711,13 @@ fn tclone_source_fork_handoff_host_path(source: &TcloneRunRecord) -> io::Result<
         .join(tclone_host_control_owner_run_id(source))
         .join("host-control")
         .join(TCLONE_SOURCE_FORK_HANDOFF_FILE))
+}
+
+fn tclone_parallel_choice_offer_host_path(source: &TcloneRunRecord) -> io::Result<PathBuf> {
+    Ok(gensee_tmp_root()?
+        .join(tclone_host_control_owner_run_id(source))
+        .join("host-control")
+        .join(TCLONE_PARALLEL_CHOICE_OFFER_FILE))
 }
 
 fn wait_for_tclone_source_fork_handoff(
@@ -724,7 +771,11 @@ fn try_record_tclone_fork_hook_lifecycle(event: &AgentHookEvent) -> io::Result<(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    if context.get("role").and_then(Value::as_str) != Some("fork") {
+    let role = context.get("role").and_then(Value::as_str);
+    if role == Some("source") {
+        return try_record_tclone_source_parallel_choice_approval(event, &context);
+    }
+    if role != Some("fork") {
         return Ok(());
     }
     let Some(run_id) = context.get("run_id").and_then(Value::as_str) else {
@@ -837,6 +888,50 @@ fn try_record_tclone_fork_hook_lifecycle(event: &AgentHookEvent) -> io::Result<(
     write_tclone_fork_result_to_path(&path, &result)
 }
 
+fn try_record_tclone_source_parallel_choice_approval(
+    event: &AgentHookEvent,
+    context: &Value,
+) -> io::Result<()> {
+    if event.hook_event_name.as_deref() != Some("UserPromptSubmit") {
+        return Ok(());
+    }
+    let Some(source_run_id) = context.get("run_id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(offer) = read_tclone_parallel_choice_offer() else {
+        return Ok(());
+    };
+    if offer.source_run_id != source_run_id {
+        return Ok(());
+    }
+    let Some(prompt) = user_prompt_from_hook(event) else {
+        return Ok(());
+    };
+    let Some((target_run_id, choice)) = tclone_parallel_choice_from_prompt(&prompt, &offer) else {
+        return Ok(());
+    };
+    let target = find_tclone_record(&target_run_id)?;
+    if target.parent_run_id.as_deref() != Some(source_run_id) {
+        return Ok(());
+    }
+    let podman = tclone_podman();
+    let mut result = read_tclone_fork_result(&podman, &target)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("parallel choice target {} has no result", target.run_id),
+        )
+    })?;
+    if result.resolution_offered_at_ms.is_none() {
+        result.resolution_offered_at_ms = Some(offer.offered_at_ms);
+    }
+    result.lifecycle_approval = Some(TcloneLifecycleApproval {
+        choice: choice.to_string(),
+        approved_at_ms: event.observed_at_ms,
+        consumed_at_ms: None,
+    });
+    write_tclone_fork_result_to_container(&podman, &target, &result, "parallel-approval")
+}
+
 fn tclone_hook_event_is_internal_lifecycle_command(event: &AgentHookEvent) -> bool {
     event.tool_input_command.as_deref().is_some_and(|command| {
         let normalized = command.to_ascii_lowercase();
@@ -899,19 +994,7 @@ fn finish_tclone_fork_result(result: &mut TcloneForkResult, completed_at_ms: u64
 }
 
 fn tclone_lifecycle_choice_from_prompt(prompt: &str) -> Option<&'static str> {
-    let normalized = prompt
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized = normalize_tclone_choice_text(prompt);
     if normalized.is_empty() {
         return None;
     }
@@ -959,6 +1042,119 @@ fn tclone_lifecycle_choice_from_prompt(prompt: &str) -> Option<&'static str> {
         (false, true, false) => Some("switch"),
         (false, false, true) => Some("discard"),
         _ => None,
+    }
+}
+
+fn normalize_tclone_choice_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn tclone_parallel_lifecycle_choice_from_prompt(prompt: &str) -> Option<&'static str> {
+    if let Some(choice) = tclone_lifecycle_choice_from_prompt(prompt) {
+        return Some(choice);
+    }
+    let normalized = normalize_tclone_choice_text(prompt);
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    if words
+        .iter()
+        .any(|word| matches!(*word, "no" | "not" | "never" | "dont" | "don"))
+    {
+        return None;
+    }
+    let clearly_directive = words
+        .first()
+        .is_some_and(|word| matches!(*word, "merge" | "switch" | "promote" | "keep" | "discard"))
+        || words.contains(&"please")
+        || words
+            .iter()
+            .any(|word| matches!(*word, "approve" | "approved"))
+        || normalized.contains("go ahead")
+        || normalized.contains("i choose")
+        || normalized.contains("i want");
+    if !clearly_directive {
+        return None;
+    }
+    if words.contains(&"merge") {
+        Some("merge")
+    } else if words.contains(&"switch") || words.contains(&"promote") {
+        Some("switch")
+    } else if words.contains(&"discard") {
+        Some("discard")
+    } else {
+        None
+    }
+}
+
+fn tclone_parallel_choice_from_prompt(
+    prompt: &str,
+    offer: &TcloneParallelChoiceOffer,
+) -> Option<(String, &'static str)> {
+    let choice = tclone_parallel_lifecycle_choice_from_prompt(prompt)?;
+    let normalized = normalize_tclone_choice_text(prompt);
+    if choice == "discard"
+        && (normalized.contains("discard all")
+            || normalized.contains("entire group")
+            || normalized.contains("whole group"))
+    {
+        return offer
+            .options
+            .first()
+            .map(|option| (option.run_id.clone(), choice));
+    }
+
+    let action_words: &[&str] = match choice {
+        "merge" => &["merge"],
+        "switch" => &["promote", "switch"],
+        "discard" => &["discard"],
+        _ => &[],
+    };
+    let action_matched = offer
+        .options
+        .iter()
+        .filter(|option| {
+            let label = normalize_tclone_choice_text(&option.label);
+            let approach = normalize_tclone_choice_text(&option.approach);
+            action_words.iter().any(|action| {
+                let label_matches = !label.is_empty()
+                    && (normalized.contains(&format!("{action} {label}"))
+                        || normalized.contains(&format!("{action} the {label}")));
+                let approach_matches = !approach.is_empty()
+                    && (normalized.contains(&format!("{action} {approach}"))
+                        || normalized.contains(&format!("{action} the {approach}")));
+                label_matches || approach_matches
+            })
+        })
+        .collect::<Vec<_>>();
+    if action_matched.len() == 1 {
+        return Some((action_matched[0].run_id.clone(), choice));
+    }
+
+    let mut matched = offer
+        .options
+        .iter()
+        .filter(|option| {
+            let label = normalize_tclone_choice_text(&option.label);
+            let approach = normalize_tclone_choice_text(&option.approach);
+            (!label.is_empty() && normalized.contains(&label))
+                || (!approach.is_empty() && normalized.contains(&approach))
+        })
+        .collect::<Vec<_>>();
+    matched.dedup_by(|left, right| left.run_id == right.run_id);
+    if matched.len() == 1 {
+        Some((matched[0].run_id.clone(), choice))
+    } else {
+        None
     }
 }
 
@@ -1748,10 +1944,12 @@ fn validate_tclone_lifecycle_approval(
             )
         })?;
         let caller = find_tclone_record(caller_run_id)?;
-        if !tclone_records_share_fork_group(&caller, &target) {
+        let source_controls_child_group =
+            caller.role == "source" && target.parent_run_id.as_deref() == Some(caller_run_id);
+        if !source_controls_child_group && !tclone_records_share_fork_group(&caller, &target) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "selected winner is not in the caller's fork group",
+                "selected winner is not in the caller's fork group or direct child group",
             ));
         }
         if choice == "merge" {
@@ -1769,7 +1967,11 @@ fn validate_tclone_lifecycle_approval(
                 ));
             }
         }
-        caller
+        if source_controls_child_group {
+            target
+        } else {
+            caller
+        }
     } else {
         target
     };
@@ -2178,10 +2380,12 @@ fn validate_tclone_parallel_target(caller_run_id: &str, target_args: &[String]) 
         "missing parallel fork target",
     )?;
     let target = find_tclone_record(&target)?;
-    if !tclone_records_share_fork_group(&caller, &target) {
+    let source_controls_child_group =
+        caller.role == "source" && target.parent_run_id.as_deref() == Some(caller_run_id);
+    if !source_controls_child_group && !tclone_records_share_fork_group(&caller, &target) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "parallel comparison target is not in the caller's fork group",
+            "parallel target is not in the caller's fork group or direct child group",
         ));
     }
     Ok(())
@@ -4153,6 +4357,81 @@ fn mark_tclone_fork_task_completed(
     Ok(result)
 }
 
+fn notify_tclone_source_when_parallel_group_ready(
+    podman: &OsString,
+    record: &TcloneRunRecord,
+) -> io::Result<bool> {
+    let group_id = match record.fork_group_id.as_deref() {
+        Some(group_id) => group_id,
+        None => return Ok(false),
+    };
+    let Some(source_run_id) = record.parent_run_id.as_deref() else {
+        return Ok(false);
+    };
+    let group = tclone_parallel_group(record)?;
+    let incomplete = group.iter().any(|candidate| {
+        read_tclone_fork_result(podman, candidate)
+            .ok()
+            .flatten()
+            .is_none_or(|result| !tclone_fork_result_is_terminal(&result))
+    });
+    if incomplete {
+        return Ok(false);
+    }
+    let source = find_tclone_record(source_run_id)?;
+    if !claim_tclone_parallel_source_notification(&source, group_id)? {
+        return Ok(false);
+    }
+    ensure_tclone_container_exists(podman, &source)?;
+    write_tclone_run_context_if_possible(podman, &source);
+    let compare_target = group
+        .first()
+        .map(|candidate| candidate.run_id.as_str())
+        .unwrap_or(&record.run_id);
+    let prompt = format!(
+        "Gensee parallel fork group `{group_id}` has completed. You are the source Codex. Do not edit files locally for this notification. Run `gensee run compare {compare_target} --json` internally, present each approach's changed files and test outcome, state the recommended winner, and ask the user whether to merge the winner, promote it, or discard the entire group. After explicit user approval, run the exact `gensee run choose` command returned in the compare actions. Do not ask the user to type Gensee lifecycle commands."
+    );
+    if let Err(error) = tclone_send_prompt_to_agent(podman, &source, &prompt, true) {
+        let _ = fs::remove_file(tclone_parallel_source_notification_marker_host_path(
+            &source, group_id,
+        )?);
+        return Err(error);
+    }
+    Ok(true)
+}
+
+fn claim_tclone_parallel_source_notification(
+    source: &TcloneRunRecord,
+    group_id: &str,
+) -> io::Result<bool> {
+    let path = tclone_parallel_source_notification_marker_host_path(source, group_id)?;
+    if let Some(parent) = path.parent() {
+        create_restrictive_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(format!("{}\n", unix_millis()?).as_bytes())?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn tclone_parallel_source_notification_marker_host_path(
+    source: &TcloneRunRecord,
+    group_id: &str,
+) -> io::Result<PathBuf> {
+    Ok(gensee_tmp_root()?
+        .join(tclone_host_control_owner_run_id(source))
+        .join("host-control")
+        .join(format!("parallel-choice-notified-{group_id}.txt")))
+}
+
 fn write_tclone_fork_result_to_container(
     podman: &OsString,
     record: &TcloneRunRecord,
@@ -4284,23 +4563,8 @@ fn tclone_prompt_with_fork_context(record: &TcloneRunRecord, prompt: &str) -> St
             .as_deref()
             .unwrap_or("the requested approach");
         if record.fork_count.unwrap_or(1) > 1 {
-            let position = record.fork_index.unwrap_or(0);
-            let coordination = if position == 0 {
-                format!(
-                    "You are the comparison coordinator. After completing your own summary, poll `gensee run compare {fork_run_id} --json` until all_terminal=true. Present every approach's changed files and tests, state the recommended winner, and ask whether to merge that winner, promote it, or discard the entire group. After explicit approval, run the exact `gensee run choose` command returned in actions."
-                )
-            } else {
-                format!(
-                    "After completing your own summary, do not offer an individual lifecycle decision; the coordinator in {} will compare all approaches and present one group decision.",
-                    record
-                        .fork_prefix
-                        .as_deref()
-                        .map(|prefix| format!("{prefix}-0"))
-                        .unwrap_or_else(|| "the first fork".to_string())
-                )
-            };
             format!(
-                "<gensee-user-request>\n{prompt}\n</gensee-user-request>\n\nGensee trusted parallel-fork context: this request is already running inside fork {fork_run_id} of group {group}. Do not create another fork. Your assigned approach is: {approach}. Work only on that approach and verify it independently. After finishing, run `gensee run summary {fork_run_id} --json --complete` internally. {coordination} Do not auto-merge and do not ask the user to type Gensee lifecycle commands.",
+                "<gensee-user-request>\n{prompt}\n</gensee-user-request>\n\nGensee trusted parallel-fork context: this request is already running inside fork {fork_run_id} of group {group}. Do not create another fork. Your assigned approach is: {approach}. Work only on that approach and verify it independently. After finishing, run `gensee run summary {fork_run_id} --json --complete` internally and briefly report this fork's result. Do not offer merge, promote, discard, or any individual lifecycle decision. When every parallel fork has completed, Gensee will return control to the source Codex, where the source will compare all approaches and ask for one group decision. Do not auto-merge and do not ask the user to type Gensee lifecycle commands.",
                 group = record.fork_group_id.as_deref().unwrap_or("unknown"),
             )
         } else {
@@ -5857,7 +6121,15 @@ pub(crate) fn tclone_summary(args: Vec<OsString>) -> io::Result<()> {
                 "--complete may only be used internally by the fork summarizing itself",
             ));
         }
-        Some(mark_tclone_fork_task_completed(&podman, &record)?)
+        let result = mark_tclone_fork_task_completed(&podman, &record)?;
+        if record.fork_count.unwrap_or(1) > 1 {
+            if let Err(error) = notify_tclone_source_when_parallel_group_ready(&podman, &record) {
+                eprintln!(
+                    "gensee: warning: could not notify source that parallel forks are ready: {error}"
+                );
+            }
+        }
+        Some(result)
     } else {
         read_tclone_fork_result(&podman, &record)?
     };
@@ -5913,11 +6185,7 @@ pub(crate) fn tclone_summary(args: Vec<OsString>) -> io::Result<()> {
         "parallel_group": parallel,
         "compare_command": parallel.then(|| format!("gensee run compare {} --json", record.run_id)),
         "agent_guidance": if parallel {
-            if record.fork_index == Some(0) {
-                "This is the coordinator fork. Wait for every sibling, run the compare command, present the comparison and recommendation, and ask for one group-level lifecycle decision."
-            } else {
-                "This is a non-coordinator parallel fork. Report completion, but leave comparison and lifecycle choices to fork index 0."
-            }
+            "This is a parallel worker fork. Report this fork's completion only; the source Codex will compare all approaches and ask for one group-level lifecycle decision."
         } else {
             "Summarize changed files and tests in chat, offer merge/promote-to-main-and-end-source/discard, and wait for explicit user approval before running a lifecycle command."
         },
@@ -6076,6 +6344,11 @@ pub(crate) fn tclone_compare(args: Vec<OsString>) -> io::Result<()> {
     } else {
         None
     };
+    if all_terminal {
+        if let Err(error) = record_tclone_parallel_choice_offer_for_source(&target, &group) {
+            eprintln!("gensee: warning: could not record parallel choice offer: {error}");
+        }
+    }
     let payload = json!({
         "command": "run compare",
         "group_id": target.fork_group_id,
@@ -6113,6 +6386,41 @@ pub(crate) fn tclone_compare(args: Vec<OsString>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn record_tclone_parallel_choice_offer_for_source(
+    target: &TcloneRunRecord,
+    group: &[TcloneRunRecord],
+) -> io::Result<()> {
+    let caller = env::var("GENSEE_TCLONE_HOST_CONTROL_CALLER").unwrap_or_default();
+    let Some(source_run_id) = target.parent_run_id.as_deref() else {
+        return Ok(());
+    };
+    if caller != source_run_id {
+        return Ok(());
+    }
+    let source = find_tclone_record(source_run_id)?;
+    let offer = TcloneParallelChoiceOffer {
+        source_run_id: source_run_id.to_string(),
+        group_id: target
+            .fork_group_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        offered_at_ms: unix_millis()?,
+        options: group
+            .iter()
+            .enumerate()
+            .map(|(position, record)| TcloneParallelChoiceOption {
+                label: tclone_approach_label(position),
+                run_id: record.run_id.clone(),
+                approach: record
+                    .fork_approach
+                    .clone()
+                    .unwrap_or_else(|| "unspecified approach".to_string()),
+            })
+            .collect(),
+    };
+    write_tclone_parallel_choice_offer_to_source(&source, &offer)
 }
 
 pub(crate) fn tclone_choose(args: Vec<OsString>) -> io::Result<()> {
@@ -10906,7 +11214,7 @@ gensee async job job_1: exited status=0
     }
 
     #[test]
-    fn tclone_parallel_prompts_assign_distinct_approaches_and_one_coordinator() {
+    fn tclone_parallel_prompts_assign_distinct_worker_approaches() {
         let mut first = test_fork_record("run_1_fork_2_0", "run_1");
         first.fork_prefix = Some("try-upgrade".to_string());
         first.fork_group_id = Some("run_1_parallel_2".to_string());
@@ -10923,11 +11231,49 @@ gensee async job job_1: exited status=0
         let second_prompt = tclone_prompt_with_fork_context(&second, "Upgrade dependencies");
 
         assert!(first_prompt.contains("minimal compatible upgrade"));
-        assert!(first_prompt.contains("comparison coordinator"));
-        assert!(first_prompt.contains("gensee run compare run_1_fork_2_0 --json"));
+        assert!(first_prompt.contains("Do not offer merge, promote, discard"));
+        assert!(first_prompt.contains("source Codex"));
         assert!(second_prompt.contains("aggressive latest-version upgrade"));
-        assert!(second_prompt.contains("do not offer an individual lifecycle decision"));
+        assert!(second_prompt.contains("Do not offer merge, promote, discard"));
+        assert!(second_prompt.contains("source Codex"));
         assert_ne!(first_prompt, second_prompt);
+    }
+
+    #[test]
+    fn tclone_parallel_choice_accepts_merge_and_discard_wording() {
+        let offer = TcloneParallelChoiceOffer {
+            source_run_id: "run_1".to_string(),
+            group_id: "group_1".to_string(),
+            offered_at_ms: 10,
+            options: vec![
+                TcloneParallelChoiceOption {
+                    label: "Approach A".to_string(),
+                    run_id: "run_1_fork_2_0".to_string(),
+                    approach: "minimal compatible upgrade".to_string(),
+                },
+                TcloneParallelChoiceOption {
+                    label: "Approach B".to_string(),
+                    run_id: "run_1_fork_2_1".to_string(),
+                    approach: "aggressive latest-version upgrade".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            tclone_parallel_choice_from_prompt("merge Approach A and discard Approach B", &offer),
+            Some(("run_1_fork_2_0".to_string(), "merge"))
+        );
+        assert_eq!(
+            tclone_parallel_choice_from_prompt(
+                "promote the aggressive latest-version upgrade",
+                &offer
+            ),
+            Some(("run_1_fork_2_1".to_string(), "switch"))
+        );
+        assert_eq!(
+            tclone_parallel_choice_from_prompt("discard the entire group", &offer),
+            Some(("run_1_fork_2_0".to_string(), "discard"))
+        );
     }
 
     #[test]
@@ -10943,6 +11289,33 @@ gensee async job job_1: exited status=0
         assert!(!tclone_records_share_fork_group(&first, &unrelated));
         sibling.parent_run_id = Some("run_2".to_string());
         assert!(!tclone_records_share_fork_group(&first, &sibling));
+    }
+
+    #[test]
+    fn tclone_parallel_target_allows_source_direct_child_group() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("parallel-source-target");
+        let old_home = env::var_os("GENSEE_HOME");
+        env::set_var("GENSEE_HOME", &root);
+
+        let source = test_record("run_1", "running");
+        let mut first = test_fork_record("run_1_fork_2_0", "run_1");
+        first.fork_group_id = Some("group-1".to_string());
+        first.fork_index = Some(0);
+        first.fork_count = Some(2);
+        let mut second = test_fork_record("run_1_fork_2_1", "run_1");
+        second.fork_group_id = Some("group-1".to_string());
+        second.fork_index = Some(1);
+        second.fork_count = Some(2);
+        append_tclone_records_atomically(&[source, first, second]).unwrap();
+
+        assert!(validate_tclone_parallel_target("run_1", &["run_1_fork_2_0".to_string()]).is_ok());
+
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

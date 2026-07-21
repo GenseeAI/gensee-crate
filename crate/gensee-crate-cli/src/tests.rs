@@ -6717,12 +6717,15 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert!(finding.message.contains("do not poll fork-status"));
     assert!(finding
         .message
-        .contains("saved original request to the fork automatically"));
+        .contains("saved original request to each fork automatically"));
     assert!(finding
         .message
-        .contains("fork will summarize its own changed files and tests"));
+        .contains("Parallel forks summarize only their own changed files and tests"));
+    assert!(finding
+        .message
+        .contains("Gensee returns control to the source Codex"));
     assert!(finding.message.contains("Do not auto-merge"));
-    assert!(finding.message.contains("wait for explicit user approval"));
+    assert!(finding.message.contains("waits for explicit user approval"));
     assert_eq!(finding.evidence["reason"], json!("dependency_upgrade"));
 }
 

@@ -72,12 +72,15 @@ For parallel work, Codex proposes distinct approaches before asking for one
 approval. A named `--copies 2` group creates clean container names such as
 `try-upgrade-0` and `try-upgrade-1`; repeated `--approach` values are assigned
 in index order and included in each fork's trusted task context. The first fork
-coordinates `run compare --json`, which reports each approach's changed files,
-tests, readiness, and a smallest-passing-diff recommendation. After the user
-selects an approach and lifecycle action, `run choose` merges or promotes that
-winner and schedules every other group member for discard. `--discard-all`
-retires the whole group. These remain agent-facing commands protected by the
-same later-user-approval gate as single-fork lifecycle commands.
+no longer coordinates the user-facing decision; every fork reports only its own
+completion. When all forks finish, Gensee sends the source Codex a comparison
+prompt. The source runs `run compare --json`, which reports each approach's
+changed files, tests, readiness, and a smallest-passing-diff recommendation.
+After the user selects an approach and lifecycle action in the source pane,
+`run choose` merges or promotes that winner and schedules every other group
+member for discard. `--discard-all` retires the whole group. These remain
+agent-facing commands protected by the same later-user-approval gate as
+single-fork lifecycle commands.
 
 The source id is the row with role `source` under the `Tclone containers`
 section of `gensee run list`. The launcher also prints it directly:
