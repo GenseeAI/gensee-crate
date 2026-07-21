@@ -2903,7 +2903,7 @@ fn daemon_request_rejects_unwrapped_or_missing_provider() {
 }
 
 #[test]
-fn daemon_waits_for_antigravity_stdout_events() {
+fn daemon_waits_for_hook_events_that_can_return_stdout() {
     assert_eq!(
         daemon_response_mode(&test_hook_event(PROVIDER_ANTIGRAVITY, "PreToolUse")),
         DaemonResponseMode::Required
@@ -2918,6 +2918,11 @@ fn daemon_waits_for_antigravity_stdout_events() {
     assert_eq!(
         daemon_response_mode(&test_hook_event(PROVIDER_CLAUDE_CODE, "PostToolUse")),
         DaemonResponseMode::FireAndForget
+    );
+    assert_eq!(
+        daemon_response_mode(&test_hook_event(PROVIDER_CODEX, "Stop")),
+        DaemonResponseMode::Optional,
+        "Codex Stop can return a fork continuation prompt"
     );
 }
 

@@ -3368,7 +3368,18 @@ pub(crate) fn process_hook_event(
     store: &EventStore,
 ) -> io::Result<Option<String>> {
     store.append_hook_event(event)?;
+    let fork_stop_continuation = tclone_codex_stop_continuation(event);
     record_tclone_fork_hook_lifecycle(event);
+
+    if let Some(reason) = fork_stop_continuation {
+        return Ok(Some(
+            json!({
+                "decision": "block",
+                "reason": reason,
+            })
+            .to_string(),
+        ));
+    }
 
     if matches!(
         event.hook_event_name.as_deref(),

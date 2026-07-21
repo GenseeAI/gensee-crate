@@ -452,6 +452,20 @@ fn try_record_tclone_fork_hook_lifecycle(event: &AgentHookEvent) -> io::Result<(
             result.assistant_summary = None;
             result.tests.clear();
         }
+        Some("PreToolUse") => {
+            // The live clone inherits the source's in-flight fork-status call.
+            // Keep the result queued for that observer call so a premature
+            // final answer can be continued by the Stop hook. The first real
+            // task tool call proves that the fork has begun executing work.
+            let inherited_fork_status = event
+                .tool_input_command
+                .as_deref()
+                .is_some_and(|command| command.contains("gensee run fork-status"));
+            if result.status != "queued" || inherited_fork_status {
+                return Ok(());
+            }
+            result.status = "running".to_string();
+        }
         Some("PostToolUse") => {
             if result.status == "running" {
                 if let Some(command) = event
@@ -483,6 +497,42 @@ fn try_record_tclone_fork_hook_lifecycle(event: &AgentHookEvent) -> io::Result<(
     }
 
     write_tclone_fork_result_to_path(&path, &result)
+}
+
+/// Return a Codex Stop-hook continuation prompt when a live-cloned fork tries
+/// to end the inherited orchestration turn before starting the approved task.
+/// Codex sets `stop_hook_active` on the resulting continuation, preventing a
+/// hook loop if the model still chooses to stop without acting.
+pub(crate) fn tclone_codex_stop_continuation(event: &AgentHookEvent) -> Option<String> {
+    if event.provider != PROVIDER_CODEX || event.hook_event_name.as_deref() != Some("Stop") {
+        return None;
+    }
+    let hook_payload = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+    if hook_payload
+        .get("stop_hook_active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let context = read_tclone_run_context().ok()?;
+    if context.get("role").and_then(Value::as_str) != Some("fork") {
+        return None;
+    }
+    let run_id = context.get("run_id").and_then(Value::as_str)?;
+    let source_run_id = context
+        .get("source_run_id")
+        .or_else(|| context.get("parent_run_id"))
+        .and_then(Value::as_str)?;
+    let result = read_tclone_fork_result_from_path(&tclone_fork_result_path())?;
+    if result.run_id != run_id || result.status != "queued" {
+        return None;
+    }
+
+    Some(format!(
+        "You are the live-cloned Gensee fork `{run_id}`, not the source orchestrator and not a separate future worker. The user already approved this fork. Continue the original user request from the conversation history now. Do not announce that another fork will do the work, do not wait for another prompt, and do not run fork-status again. Use the necessary tools to perform and verify the task in this fork. After the work is finished, run `gensee run summary {run_id} --json --complete` internally, present the changed files and tests, and ask the user whether to merge the changes back, keep working in this fork, or discard it. Do not auto-merge. After explicit approval, run the chosen command internally: `gensee run merge {run_id} --into {source_run_id}`, `gensee run switch {run_id}`, or `gensee run discard {run_id}`."
+    ))
 }
 
 fn read_tclone_fork_result_from_path(path: &Path) -> Option<TcloneForkResult> {
@@ -1341,11 +1391,12 @@ fn tclone_child_observer_fork_status_response(
     let payload = json!({
         "command": "run fork-status",
         "job_id": job.id,
-        "status": "delegated",
+        "status": "continue_required",
         "exit_code": null,
         "source_run_id": owner_run_id,
         "caller_run_id": caller_run_id,
         "retryable": false,
+        "task_continuation_required": true,
         "completion_command": completion_command,
         "actions": [
             {
@@ -1364,7 +1415,7 @@ fn tclone_child_observer_fork_status_response(
                 "command": format!("gensee run discard {caller_run_id}"),
             }
         ],
-        "message": format!("this fork-status job belongs to source run {owner_run_id}. Stop source fork orchestration in this pane and continue the user's original approved task now; the live-cloned fork does not need the source to resend the prompt. After finishing and testing the task, run `{completion_command}` internally, present the changed files and tests, and ask whether to merge the changes back, keep working in this fork, or discard it. Do not auto-merge and do not ask the user to type Gensee lifecycle commands. Wait for explicit approval, then run the selected lifecycle command internally."),
+        "message": format!("YOU ARE THE LIVE-CLONED FORK `{caller_run_id}`. This fork-status job belongs to source run {owner_run_id}; stop source orchestration in this pane and execute the user's original approved task now. Do not merely report that the fork will work later, do not wait for another prompt, do not run fork-status again, and do not ask the source to resend the prompt. After finishing and testing the task, run `{completion_command}` internally, present the changed files and tests, and ask whether to merge the changes back, keep working in this fork, or discard it. Do not auto-merge and do not ask the user to type Gensee lifecycle commands. Wait for explicit approval, then run the selected lifecycle command internally."),
     });
     Ok(Some(TcloneHostControlResponse {
         exit_code: Some(0),
@@ -6842,6 +6893,18 @@ mod tests {
                 .status,
             "queued"
         );
+        let continuation = tclone_codex_stop_continuation(&inherited_stop).unwrap();
+        assert!(continuation.contains("You are the live-cloned Gensee fork"));
+        assert!(continuation.contains("Continue the original user request"));
+        assert!(continuation.contains("gensee run summary run_source_fork_1_0 --json --complete"));
+
+        let mut already_continued_stop = inherited_stop.clone();
+        already_continued_stop.raw_json = json!({
+            "hook_event_name": "Stop",
+            "stop_hook_active": true,
+        })
+        .to_string();
+        assert!(tclone_codex_stop_continuation(&already_continued_stop).is_none());
 
         try_record_tclone_fork_hook_lifecycle(&test_hook_event("UserPromptSubmit", 10)).unwrap();
 
@@ -6874,6 +6937,63 @@ mod tests {
         assert_eq!(
             result.assistant_summary.as_deref(),
             Some("Implemented the change and tests pass.")
+        );
+
+        env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
+        env::remove_var("GENSEE_TCLONE_RESULT_PATH");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tclone_fork_first_real_tool_call_leaves_queued_state() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("fork-result-first-tool");
+        let context_path = root.join("context.json");
+        let result_path = root.join("result.json");
+        fs::write(
+            &context_path,
+            json!({
+                "run_id": "run_source_fork_1_0",
+                "role": "fork",
+                "source_run_id": "run_source",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+        env::set_var("GENSEE_TCLONE_RESULT_PATH", &result_path);
+        write_tclone_fork_result_to_path(
+            &result_path,
+            &TcloneForkResult {
+                run_id: "run_source_fork_1_0".to_string(),
+                status: "queued".to_string(),
+                started_at_ms: 5,
+                completed_at_ms: None,
+                assistant_summary: None,
+                tests: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let mut inherited_status = test_hook_event("PreToolUse", 6);
+        inherited_status.tool_input_command =
+            Some("gensee run fork-status run_source_job --json".to_string());
+        try_record_tclone_fork_hook_lifecycle(&inherited_status).unwrap();
+        assert_eq!(
+            read_tclone_fork_result_from_path(&result_path)
+                .unwrap()
+                .status,
+            "queued"
+        );
+
+        let mut task_tool = test_hook_event("PreToolUse", 7);
+        task_tool.tool_name = Some("apply_patch".to_string());
+        try_record_tclone_fork_hook_lifecycle(&task_tool).unwrap();
+        assert_eq!(
+            read_tclone_fork_result_from_path(&result_path)
+                .unwrap()
+                .status,
+            "running"
         );
 
         env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
@@ -7448,7 +7568,8 @@ mod tests {
         assert_eq!(child_status_response.exit_code, Some(0));
         let child_status_payload: Value =
             serde_json::from_str(child_status_response.stdout.trim()).unwrap();
-        assert_eq!(child_status_payload["status"], "delegated");
+        assert_eq!(child_status_payload["status"], "continue_required");
+        assert_eq!(child_status_payload["task_continuation_required"], true);
         assert_eq!(child_status_payload["source_run_id"], source_run_id);
         assert_eq!(
             child_status_payload["completion_command"],
@@ -7458,7 +7579,7 @@ mod tests {
         assert!(child_status_payload["message"]
             .as_str()
             .unwrap()
-            .contains("continue the user's original approved task now"));
+            .contains("execute the user's original approved task now"));
         assert!(child_status_payload["message"]
             .as_str()
             .unwrap()
