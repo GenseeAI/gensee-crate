@@ -1026,6 +1026,9 @@ fn execute_tclone_host_control_request(
             error: Some(error.to_string()),
         });
     }
+    if let Some(response) = tclone_child_observer_fork_status_response(&request)? {
+        return Ok(response);
+    }
     if tclone_host_control_should_run_async(&request.args) {
         let schedule_lock = TCLONE_ASYNC_SCHEDULE_LOCK.get_or_init(|| Mutex::new(()));
         let _schedule_guard = schedule_lock
@@ -1211,7 +1214,7 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
             })?;
             let job = tclone_async_job_from_id(job_id)?;
             let owner = read_nofollow_to_string(&tclone_async_job_owner_path(&job))?;
-            if owner.trim() != caller_run_id {
+            if !tclone_async_job_owner_matches_caller(owner.trim(), caller_run_id) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "tclone fork job belongs to a different run",
@@ -1246,6 +1249,57 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
     // make a captured request replayable.
     claim_tclone_host_control_nonce(caller_run_id, nonce)?;
     Ok(())
+}
+
+fn tclone_async_job_owner_matches_caller(owner_run_id: &str, caller_run_id: &str) -> bool {
+    if owner_run_id == caller_run_id {
+        return true;
+    }
+    find_tclone_record(caller_run_id)
+        .ok()
+        .and_then(|record| record.parent_run_id)
+        .as_deref()
+        == Some(owner_run_id)
+}
+
+fn tclone_child_observer_fork_status_response(
+    request: &TcloneHostControlRequest,
+) -> io::Result<Option<TcloneHostControlResponse>> {
+    if request.args.get(1).map(String::as_str) != Some("fork-status") {
+        return Ok(None);
+    }
+    let Some(caller_run_id) = request.caller_run_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(job_id) = request.args.get(2) else {
+        return Ok(None);
+    };
+    let job = tclone_async_job_from_id(job_id)?;
+    let owner = read_nofollow_to_string(&tclone_async_job_owner_path(&job))?;
+    let owner_run_id = owner.trim();
+    if owner_run_id == caller_run_id {
+        return Ok(None);
+    }
+    let caller = find_tclone_record(caller_run_id)?;
+    if caller.parent_run_id.as_deref() != Some(owner_run_id) {
+        return Ok(None);
+    }
+    let payload = json!({
+        "command": "run fork-status",
+        "job_id": job.id,
+        "status": "delegated",
+        "exit_code": null,
+        "source_run_id": owner_run_id,
+        "caller_run_id": caller_run_id,
+        "retryable": false,
+        "message": "this fork-status job belongs to the source run that created this fork; this fork pane should not continue source fork orchestration. Wait for the source run to send the original task into this fork.",
+    });
+    Ok(Some(TcloneHostControlResponse {
+        exit_code: Some(0),
+        stdout: format!("{payload}\n"),
+        stderr: String::new(),
+        error: None,
+    }))
 }
 
 fn validate_tclone_source_caller(caller_run_id: &str) -> io::Result<()> {
@@ -7196,11 +7250,49 @@ mod tests {
             vec![
                 "run".to_string(),
                 "fork-status".to_string(),
-                job_id,
+                job_id.clone(),
                 "--json".to_string(),
             ],
         );
         validate_tclone_host_control_request(&status_request).unwrap();
+        assert!(tclone_async_job_owner_matches_caller(
+            &source_run_id,
+            &source_run_id
+        ));
+        assert!(tclone_async_job_owner_matches_caller(
+            &source_run_id,
+            &fork_run_id
+        ));
+        assert!(!tclone_async_job_owner_matches_caller(
+            &fork_run_id,
+            &source_run_id
+        ));
+
+        let child_status_request = signed_host_control_request(
+            &fork_run_id,
+            &fork_capability,
+            "flow-status-from-child",
+            vec![
+                "run".to_string(),
+                "fork-status".to_string(),
+                job_id,
+                "--json".to_string(),
+            ],
+        );
+        validate_tclone_host_control_request(&child_status_request).unwrap();
+        let child_status_response =
+            tclone_child_observer_fork_status_response(&child_status_request)
+                .unwrap()
+                .unwrap();
+        assert_eq!(child_status_response.exit_code, Some(0));
+        let child_status_payload: Value =
+            serde_json::from_str(child_status_response.stdout.trim()).unwrap();
+        assert_eq!(child_status_payload["status"], "delegated");
+        assert_eq!(child_status_payload["source_run_id"], source_run_id);
+        assert!(child_status_payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("should not continue source fork orchestration"));
 
         let replay =
             signed_host_control_request(&source_run_id, &capability, "flow-send", send_args);
