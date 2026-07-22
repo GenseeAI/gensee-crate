@@ -33,6 +33,25 @@ die() {
   exit 1
 }
 
+resolve_executable() {
+  local candidate=$1
+  local resolved
+
+  if [[ $candidate == */* ]]; then
+    if [[ $candidate = /* ]]; then
+      resolved=$candidate
+    else
+      resolved=$(cd -- "$(dirname -- "$candidate")" && pwd -P)/$(basename -- "$candidate")
+    fi
+  else
+    resolved=$(command -v -- "$candidate" 2>/dev/null || true)
+  fi
+
+  [[ $resolved = /* && -x $resolved ]] || die \
+    "could not resolve executable to an absolute path: $candidate"
+  printf '%s\n' "$resolved"
+}
+
 quote_command() {
   printf '  '
   printf '%q ' "$@"
@@ -81,9 +100,20 @@ done
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd -- "$script_dir/.." && pwd -P)
 gensee_home=${GENSEE_HOME:-$HOME/.gensee}
-podman_command=${GENSEE_TCLONE_PODMAN:-${PODMAN_TFORK:-podman}}
+podman_candidate=${GENSEE_TCLONE_PODMAN:-${PODMAN_TFORK:-podman}}
 tclone_image=${GENSEE_TCLONE_IMAGE:-gensee-tclone-webtop:tmux}
 [[ $gensee_home = /* ]] || die "GENSEE_HOME must be an absolute path"
+
+env_command=$(resolve_executable env)
+rm_command=$(resolve_executable rm)
+install_command=$(resolve_executable install)
+podman_command=$(resolve_executable "$podman_candidate")
+
+if ((EUID == 0)); then
+  sudo_command=""
+else
+  sudo_command=$(resolve_executable sudo)
+fi
 
 if [[ -z $install_to ]]; then
   install_to=$(command -v gensee 2>/dev/null || true)
@@ -92,44 +122,59 @@ fi
 [[ $install_to = /* ]] || die "--install-to must be an absolute path"
 
 tmp_root=${TMPDIR:-/tmp}
-tmp_root=${tmp_root%/}
+[[ $tmp_root = /* ]] || die "TMPDIR must be an absolute path"
+[[ -d $tmp_root ]] || die "TMPDIR does not exist or is not a directory: $tmp_root"
+[[ -w $tmp_root ]] || die "TMPDIR is not writable by the invoking user: $tmp_root"
+tmp_root=$(cd -- "$tmp_root" && pwd -P)
+[[ $tmp_root != / ]] || die "refusing to use the filesystem root as TMPDIR"
 gensee_tmp="$tmp_root/gensee-agent-guard"
-home_async_tmp="$gensee_home/tmp/tclone-async"
+[[ $(dirname -- "$gensee_tmp") = "$tmp_root" ]] || die \
+  "refusing temporary path outside TMPDIR: $gensee_tmp"
+[[ $(basename -- "$gensee_tmp") = gensee-agent-guard ]] || die \
+  "refusing unexpected Gensee temporary path: $gensee_tmp"
 
-case "$gensee_tmp" in
-  /tmp/gensee-agent-guard|/private/tmp/gensee-agent-guard|/var/tmp/gensee-agent-guard) ;;
-  *) die "refusing unexpected Gensee temporary path: $gensee_tmp" ;;
-esac
-case "$home_async_tmp" in
-  "$gensee_home"/tmp/tclone-async) ;;
-  *) die "refusing unexpected Gensee home temporary path: $home_async_tmp" ;;
-esac
-
-host_env=(env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$gensee_home")
+host_env=(
+  "$env_command"
+  "PATH=$PATH"
+  "HOME=$HOME"
+  "TMPDIR=$tmp_root"
+  "GENSEE_HOME=$gensee_home"
+  "GENSEE_TCLONE_PODMAN=$podman_command"
+)
 [[ -z ${TERM:-} ]] || host_env+=("TERM=$TERM")
 [[ -z ${TMUX:-} ]] || host_env+=("TMUX=$TMUX")
 [[ -z ${GENSEE_TCLONE_IMAGE:-} ]] || host_env+=("GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE")
-[[ -z ${GENSEE_TCLONE_PODMAN:-} ]] || host_env+=("GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN")
-
-if ((EUID == 0)); then
-  privileged=()
-else
-  command -v sudo >/dev/null 2>&1 || die "sudo is required to clean the host Podman store"
-  privileged=(sudo)
-fi
 
 run() {
   quote_command "$@"
   ((dry_run)) || "$@"
 }
 
+run_root() {
+  if ((EUID == 0)); then
+    run "$@"
+  else
+    run "$sudo_command" "$@"
+  fi
+}
+
 run_privileged() {
-  run "${privileged[@]}" "${host_env[@]}" "$@"
+  if ((EUID == 0)); then
+    run "${host_env[@]}" "$@"
+  else
+    run "$sudo_command" "${host_env[@]}" "$@"
+  fi
 }
 
 remove_named_tclone_containers() {
-  local list_command=("${privileged[@]}" "${host_env[@]}" "$podman_command" ps -a --format '{{.Names}}')
+  local list_command
   local names
+
+  if ((EUID == 0)); then
+    list_command=("${host_env[@]}" "$podman_command" ps -a --format '{{.Names}}')
+  else
+    list_command=("$sudo_command" "${host_env[@]}" "$podman_command" ps -a --format '{{.Names}}')
+  fi
 
   if ((dry_run)); then
     quote_command "${list_command[@]}"
@@ -152,7 +197,9 @@ remove_named_tclone_containers() {
 remove_path() {
   local path=$1
   if ((dry_run)) || [[ -e $path ]]; then
-    run "${privileged[@]}" rm -rf -- "$path"
+    # Failure is fatal by design: do not report a successful rebuild after an
+    # explicitly selected temporary-state deletion was only partially applied.
+    run_root "$rm_command" -rf -- "$path"
   fi
 }
 
@@ -170,8 +217,8 @@ if command -v df >/dev/null 2>&1; then
 fi
 
 if ((!assume_yes && !dry_run)); then
-  printf '\nThis removes Gensee tclone containers, %s, %s, and Cargo build artifacts.\n' \
-    "$gensee_tmp" "$home_async_tmp"
+  printf '\nThis removes Gensee tclone containers, %s, and Cargo build artifacts.\n' \
+    "$gensee_tmp"
   if ((all_podman_data)); then
     printf 'It also removes every container and unused volume in the configured Podman store.\n'
   fi
@@ -188,6 +235,7 @@ if [[ -z $cleanup_gensee && -x $repo_root/target/release/gensee ]]; then
   cleanup_gensee=$repo_root/target/release/gensee
 fi
 if [[ -n $cleanup_gensee ]]; then
+  cleanup_gensee=$(resolve_executable "$cleanup_gensee")
   if ((dry_run)); then
     run_privileged "$cleanup_gensee" run delete --all
   elif ! run_privileged "$cleanup_gensee" run delete --all; then
@@ -209,7 +257,6 @@ fi
 
 printf '\nRemoving Gensee temporary state:\n'
 remove_path "$gensee_tmp"
-remove_path "$home_async_tmp"
 
 printf '\nRebuilding the Gensee executable:\n'
 if ((cargo_clean)); then
@@ -218,19 +265,15 @@ fi
 run cargo build --release -p gensee-crate-cli --manifest-path "$repo_root/Cargo.toml"
 
 release_binary="$repo_root/target/release/gensee"
-if ((dry_run)); then
-  if [[ $install_to != "$release_binary" ]]; then
-    run "${privileged[@]}" install -m 0755 "$release_binary" "$install_to"
-  fi
-else
+if ((!dry_run)); then
   [[ -x $release_binary ]] || die "release build did not create $release_binary"
-  if [[ $install_to != "$release_binary" ]]; then
-    install_parent=$(dirname -- "$install_to")
-    if [[ -d $install_parent && -w $install_parent && (! -e $install_to || -w $install_to) ]]; then
-      run install -m 0755 "$release_binary" "$install_to"
-    else
-      run "${privileged[@]}" install -m 0755 "$release_binary" "$install_to"
-    fi
+fi
+if [[ $install_to != "$release_binary" ]]; then
+  install_parent=$(dirname -- "$install_to")
+  if [[ -d $install_parent && -w $install_parent && (! -e $install_to || -w $install_to) ]]; then
+    run "$install_command" -m 0755 "$release_binary" "$install_to"
+  else
+    run_root "$install_command" -m 0755 "$release_binary" "$install_to"
   fi
 fi
 
