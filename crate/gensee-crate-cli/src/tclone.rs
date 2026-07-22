@@ -3061,6 +3061,102 @@ fn write_tclone_container_host_control_response(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TcloneMergeStats {
+    changed: usize,
+    upserted: usize,
+    deleted: usize,
+}
+
+fn tclone_operation_id(operation: &str) -> String {
+    format!("{operation}_{}", uuid::Uuid::new_v4())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_tclone_transaction(
+    operation_id: &str,
+    operation: &str,
+    phase: &str,
+    source_run_id: Option<&str>,
+    target_run_id: Option<&str>,
+    parent_run_id: Option<&str>,
+    workspace: Option<&str>,
+    summary: impl Into<String>,
+    error: Option<&io::Error>,
+    metadata: Option<Value>,
+) -> io::Result<()> {
+    EventStore::default_local()?
+        .append_transaction_event(&TransactionEventInput {
+            operation_id: operation_id.to_string(),
+            environment_kind: "tclone".to_string(),
+            operation: operation.to_string(),
+            phase: phase.to_string(),
+            source_run_id: source_run_id.map(ToString::to_string),
+            target_run_id: target_run_id.map(ToString::to_string),
+            parent_run_id: parent_run_id.map(ToString::to_string),
+            workspace: workspace.map(ToString::to_string),
+            summary: summary.into(),
+            error_kind: error.map(|error| format!("{:?}", error.kind()).to_ascii_lowercase()),
+            error_message: error.map(ToString::to_string),
+            metadata,
+            occurred_at_ms: unix_millis()?,
+        })
+        .map(|_| ())
+}
+
+fn record_tclone_failure(
+    operation_id: &str,
+    operation: &str,
+    source: Option<&TcloneRunRecord>,
+    target_run_id: Option<&str>,
+    summary: &str,
+    error: &io::Error,
+    metadata: Option<Value>,
+) {
+    if let Err(record_error) = record_tclone_transaction(
+        operation_id,
+        operation,
+        "failed",
+        source.map(|record| record.run_id.as_str()),
+        target_run_id,
+        source.and_then(|record| record.parent_run_id.as_deref()),
+        source.map(|record| record.workspace.as_str()),
+        summary,
+        Some(error),
+        metadata,
+    ) {
+        eprintln!("gensee: warning: could not record transactional failure: {record_error}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_tclone_transaction_best_effort(
+    operation_id: &str,
+    operation: &str,
+    phase: &str,
+    source_run_id: Option<&str>,
+    target_run_id: Option<&str>,
+    parent_run_id: Option<&str>,
+    workspace: Option<&str>,
+    summary: impl Into<String>,
+    metadata: Option<Value>,
+) {
+    if let Err(error) = record_tclone_transaction(
+        operation_id,
+        operation,
+        phase,
+        source_run_id,
+        target_run_id,
+        parent_run_id,
+        workspace,
+        summary,
+        None,
+        metadata,
+    ) {
+        eprintln!("gensee: warning: could not record transactional event: {error}");
+    }
+}
+
 pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
     if std::env::consts::OS != "linux" {
         return Err(io::Error::new(
@@ -3071,9 +3167,48 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
             ),
         ));
     }
-
     let started_at_ms = unix_millis()?;
     let run_id = format!("run_{}_{}", std::process::id(), started_at_ms);
+    let operation_id = tclone_operation_id("source");
+    let workspace = canonicalize_or_original(&config.workspace);
+    record_tclone_transaction_best_effort(
+        &operation_id,
+        "source",
+        "started",
+        Some(&run_id),
+        None,
+        None,
+        Some(&workspace.to_string_lossy()),
+        format!("Preparing transactional source {run_id}"),
+        None,
+    );
+    let result = run_tclone_agent_inner(config, started_at_ms, &run_id, &operation_id);
+    if let Err(error) = &result {
+        if let Err(record_error) = record_tclone_transaction(
+            &operation_id,
+            "source",
+            "failed",
+            Some(&run_id),
+            None,
+            None,
+            Some(&workspace.to_string_lossy()),
+            format!("Transactional source {run_id} failed"),
+            Some(error),
+            None,
+        ) {
+            eprintln!("gensee: warning: could not record transactional failure: {record_error}");
+        }
+    }
+    result
+}
+
+fn run_tclone_agent_inner(
+    config: RunConfig,
+    started_at_ms: u64,
+    run_id: &str,
+    operation_id: &str,
+) -> io::Result<()> {
+    let run_id = run_id.to_string();
     let safe_id = run_id.replace('_', "-");
     let source_container = format!("gensee-tclone-src-{safe_id}");
     let fork_prefix = format!("gensee-tclone-fork-{safe_id}");
@@ -3306,6 +3441,17 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         exit_code: None,
     })?;
     append_tclone_status(&run_id, "running", None)?;
+    record_tclone_transaction_best_effort(
+        operation_id,
+        "source",
+        "succeeded",
+        Some(&run_id),
+        None,
+        None,
+        Some(&original_workspace.to_string_lossy()),
+        format!("Transactional source {run_id} is ready"),
+        Some(json!({ "status": "running", "container_name": source_container })),
+    );
     cleanup_guard.disarm();
 
     eprintln!(
@@ -3339,6 +3485,21 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         exit_code,
     })?;
     append_tclone_status(&run_id, "agent-ended", exit_code)?;
+    record_tclone_transaction_best_effort(
+        &tclone_operation_id("source_end"),
+        "source_end",
+        if status.success() {
+            "succeeded"
+        } else {
+            "failed"
+        },
+        Some(&run_id),
+        None,
+        None,
+        Some(&original_workspace.to_string_lossy()),
+        format!("Agent session ended for transactional source {run_id}"),
+        Some(json!({ "exit_code": exit_code })),
+    );
 
     if status.success() {
         Ok(())
@@ -3384,149 +3545,199 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             source.run_id
         )));
     }
-    let podman = tclone_podman();
-    ensure_tclone_container_exists(&podman, &source)?;
-    let source_handoff = wait_for_tclone_source_fork_handoff(&source)?;
-    wait_for_tclone_source_quiet_if_requested(&podman, &source)?;
-    ensure_tclone_agent_ready_for_fork(&podman, &source)?;
-    let _detach_guard = TcloneForkDetachGuard::mark(&source.run_id)?;
-    detach_tclone_tmux_clients(&podman, &source.container_name);
-    let forked_at_ms = unix_millis()?;
-    let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
-    let name_hint = arg_value(&args, "--name");
-    let prefix = tclone_fork_name_prefix(&parent, name_hint.as_deref(), forked_at_ms);
-    let mut capability_guard = TcloneCapabilityRotationGuard::revoke(&podman, source.clone())?;
-    let output = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
-    capability_guard.restore()?;
-    let ids = output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if ids.len() != copies {
-        return Err(io::Error::other(format!(
-            "podman returned {} cloned container id(s), expected {copies}",
-            ids.len()
-        )));
-    }
-    let mut fork_run_ids = Vec::new();
-    let mut fork_records = Vec::new();
-    for index in 0..copies {
-        let run_id = format!("{}_fork_{}_{}", source.run_id, forked_at_ms, index);
-        let container_name = ids
-            .get(index)
-            .and_then(|id| inspect_container_name(&podman, id).ok())
-            .unwrap_or_else(|| {
-                if copies == 1 {
-                    prefix.clone()
-                } else {
-                    format!("{prefix}-{index}")
-                }
-            });
-        let root_pid = inspect_container_pid(&podman, &container_name).unwrap_or(0);
-        let overlay_layers = inspect_tclone_overlay_rootfs(&podman, &container_name).ok();
-        let observed_at = unix_millis()?;
-        EventStore::default_local()?.append_session(&AgentSession {
-            session_id: run_id.clone(),
-            agent_binary: source.agent_cmd.first().cloned().unwrap_or_default(),
-            root_pid,
-            cwd: source.container_workspace.clone(),
-            repo_path: None,
-            mode: Some(format!("managed-run:tclone:fork:{}", source.run_id)),
-            workspace_mode: Some("tclone-rootfs".to_string()),
-            original_workspace: Some(source.workspace.clone()),
-            staged_workspace: None,
-            sandbox_profile: Some("tclone-container".to_string()),
-            sandbox_profile_path: None,
-            started_at_ms: observed_at,
-            ended_at_ms: None,
-            exit_code: None,
-        })?;
-        let fork_record = TcloneRunRecord {
-            run_id: run_id.clone(),
-            parent_run_id: Some(source.run_id.clone()),
-            role: "fork".to_string(),
-            status: "running".to_string(),
-            container_name: container_name.clone(),
-            container_id: ids.get(index).cloned(),
-            source_container: Some(source.container_name.clone()),
-            host_control_owner_run_id: Some(tclone_host_control_owner_run_id(&source).to_string()),
-            fork_prefix: Some(prefix.clone()),
-            image: source.image.clone(),
-            workspace: source.workspace.clone(),
-            container_workspace: source.container_workspace.clone(),
-            container_home: source.container_home.clone(),
-            agent_cmd: source.agent_cmd.clone(),
-            fork_base_git_head: fork_base_git_head.clone(),
-            fork_base_overlay_lowerdir: overlay_layers
-                .as_ref()
-                .map(|layers| layers.lowerdir.to_string_lossy().to_string()),
-            fork_overlay_upperdir: overlay_layers
-                .as_ref()
-                .map(|layers| layers.upperdir.to_string_lossy().to_string()),
-            started_at_ms: observed_at,
-            updated_at_ms: observed_at,
-            exit_code: None,
-        };
-        append_tclone_record(&fork_record)?;
-        write_tclone_run_context_with_retry(
-            &podman,
-            &fork_record,
-            Duration::from_secs(TCLONE_ATTACH_RETRY_TIMEOUT_SECS),
-        )?;
-        if let Some(handoff) = source_handoff.as_ref() {
-            mark_tclone_fork_task_queued(&podman, &fork_record)?;
-            let prompt = tclone_prompt_with_fork_context(&fork_record, &handoff.prompt);
-            tclone_send_prompt_to_agent(&podman, &fork_record, &prompt, true)?;
+    let operation_id = tclone_operation_id("fork");
+    let requested_name = arg_value(&args, "--name");
+    let metadata = json!({
+        "copies": copies,
+        "requested_name": requested_name.clone(),
+    });
+    record_tclone_transaction_best_effort(
+        &operation_id,
+        "fork",
+        "started",
+        Some(&source.run_id),
+        None,
+        source.parent_run_id.as_deref(),
+        Some(&source.workspace),
+        format!("Creating {copies} fork(s) from {}", source.run_id),
+        Some(metadata.clone()),
+    );
+
+    let result: io::Result<()> = (|| {
+        let podman = tclone_podman();
+        ensure_tclone_container_exists(&podman, &source)?;
+        let source_handoff = wait_for_tclone_source_fork_handoff(&source)?;
+        wait_for_tclone_source_quiet_if_requested(&podman, &source)?;
+        ensure_tclone_agent_ready_for_fork(&podman, &source)?;
+        let _detach_guard = TcloneForkDetachGuard::mark(&source.run_id)?;
+        detach_tclone_tmux_clients(&podman, &source.container_name);
+        let forked_at_ms = unix_millis()?;
+        let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
+        let prefix = tclone_fork_name_prefix(&parent, requested_name.as_deref(), forked_at_ms);
+        let mut capability_guard = TcloneCapabilityRotationGuard::revoke(&podman, source.clone())?;
+        let output = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
+        capability_guard.restore()?;
+        let ids = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if ids.len() != copies {
+            return Err(io::Error::other(format!(
+                "podman returned {} cloned container id(s), expected {copies}",
+                ids.len()
+            )));
         }
-        if !fork_json {
-            println!("{run_id} | container={container_name}");
-        }
-        fork_records.push(json!({
-            "run_id": &run_id,
-            "container": &container_name,
-            "container_id": ids.get(index),
-            "role": "fork",
-            "source_run_id": &source.run_id,
-            "workspace": &source.container_workspace,
-        }));
-        fork_run_ids.push(run_id);
-    }
-    if source_handoff.is_some() {
-        let _ = fs::remove_file(tclone_source_fork_handoff_host_path(&source)?);
-        if let Err(error) = restart_tclone_source_codex_after_fork(&podman, &source) {
-            eprintln!(
-                "gensee: warning: fork succeeded, but source Codex could not be restarted: {error}"
-            );
-        }
-    }
-    if let Some(placement) = host_tmux_attach {
-        for (index, run_id) in fork_run_ids.iter().enumerate() {
-            let placement = if index == 0 {
-                placement
-            } else {
-                HostTmuxPlacement::Below
+        let mut fork_run_ids = Vec::new();
+        let mut fork_records = Vec::new();
+        for index in 0..copies {
+            let run_id = format!("{}_fork_{}_{}", source.run_id, forked_at_ms, index);
+            let container_name = ids
+                .get(index)
+                .and_then(|id| inspect_container_name(&podman, id).ok())
+                .unwrap_or_else(|| {
+                    if copies == 1 {
+                        prefix.clone()
+                    } else {
+                        format!("{prefix}-{index}")
+                    }
+                });
+            let root_pid = inspect_container_pid(&podman, &container_name).unwrap_or(0);
+            let overlay_layers = inspect_tclone_overlay_rootfs(&podman, &container_name).ok();
+            let observed_at = unix_millis()?;
+            EventStore::default_local()?.append_session(&AgentSession {
+                session_id: run_id.clone(),
+                agent_binary: source.agent_cmd.first().cloned().unwrap_or_default(),
+                root_pid,
+                cwd: source.container_workspace.clone(),
+                repo_path: None,
+                mode: Some(format!("managed-run:tclone:fork:{}", source.run_id)),
+                workspace_mode: Some("tclone-rootfs".to_string()),
+                original_workspace: Some(source.workspace.clone()),
+                staged_workspace: None,
+                sandbox_profile: Some("tclone-container".to_string()),
+                sandbox_profile_path: None,
+                started_at_ms: observed_at,
+                ended_at_ms: None,
+                exit_code: None,
+            })?;
+            let fork_record = TcloneRunRecord {
+                run_id: run_id.clone(),
+                parent_run_id: Some(source.run_id.clone()),
+                role: "fork".to_string(),
+                status: "running".to_string(),
+                container_name: container_name.clone(),
+                container_id: ids.get(index).cloned(),
+                source_container: Some(source.container_name.clone()),
+                host_control_owner_run_id: Some(
+                    tclone_host_control_owner_run_id(&source).to_string(),
+                ),
+                fork_prefix: Some(prefix.clone()),
+                image: source.image.clone(),
+                workspace: source.workspace.clone(),
+                container_workspace: source.container_workspace.clone(),
+                container_home: source.container_home.clone(),
+                agent_cmd: source.agent_cmd.clone(),
+                fork_base_git_head: fork_base_git_head.clone(),
+                fork_base_overlay_lowerdir: overlay_layers
+                    .as_ref()
+                    .map(|layers| layers.lowerdir.to_string_lossy().to_string()),
+                fork_overlay_upperdir: overlay_layers
+                    .as_ref()
+                    .map(|layers| layers.upperdir.to_string_lossy().to_string()),
+                started_at_ms: observed_at,
+                updated_at_ms: observed_at,
+                exit_code: None,
             };
-            if let Err(err) = open_tclone_attach_in_host_tmux_after_preflight(run_id, placement) {
+            append_tclone_record(&fork_record)?;
+            write_tclone_run_context_with_retry(
+                &podman,
+                &fork_record,
+                Duration::from_secs(TCLONE_ATTACH_RETRY_TIMEOUT_SECS),
+            )?;
+            if let Some(handoff) = source_handoff.as_ref() {
+                mark_tclone_fork_task_queued(&podman, &fork_record)?;
+                let prompt = tclone_prompt_with_fork_context(&fork_record, &handoff.prompt);
+                tclone_send_prompt_to_agent(&podman, &fork_record, &prompt, true)?;
+            }
+            record_tclone_transaction_best_effort(
+                &operation_id,
+                "fork",
+                "succeeded",
+                Some(&source.run_id),
+                Some(&run_id),
+                Some(&source.run_id),
+                Some(&source.workspace),
+                format!("Forked {} from {}", run_id, source.run_id),
+                Some(json!({
+                    "copies": copies,
+                    "copy_index": index,
+                    "container_name": container_name,
+                })),
+            );
+            if !fork_json {
+                println!("{run_id} | container={container_name}");
+            }
+            fork_records.push(json!({
+                "run_id": &run_id,
+                "container": &container_name,
+                "container_id": ids.get(index),
+                "role": "fork",
+                "source_run_id": &source.run_id,
+                "workspace": &source.container_workspace,
+            }));
+            fork_run_ids.push(run_id);
+        }
+        if source_handoff.is_some() {
+            let _ = fs::remove_file(tclone_source_fork_handoff_host_path(&source)?);
+            if let Err(error) = restart_tclone_source_codex_after_fork(&podman, &source) {
                 eprintln!(
-                    "gensee: warning: fork {run_id} was created, but tmux attach failed: {err}"
+                    "gensee: warning: fork succeeded, but source Codex could not be restarted: {error}"
                 );
             }
         }
-    }
-    if fork_json {
-        println!(
-            "{}",
-            json!({
-                "source_run_id": &source.run_id,
-                "forked_at_ms": forked_at_ms,
-                "attach": host_tmux_attach.is_some(),
-                "forks": fork_records,
-            })
+        if let Some(placement) = host_tmux_attach {
+            for (index, run_id) in fork_run_ids.iter().enumerate() {
+                let placement = if index == 0 {
+                    placement
+                } else {
+                    HostTmuxPlacement::Below
+                };
+                if let Err(err) = open_tclone_attach_in_host_tmux_after_preflight(run_id, placement)
+                {
+                    eprintln!(
+                        "gensee: warning: fork {run_id} was created, but tmux attach failed: {err}"
+                    );
+                }
+            }
+        }
+        if fork_json {
+            println!(
+                "{}",
+                json!({
+                    "source_run_id": &source.run_id,
+                    "forked_at_ms": forked_at_ms,
+                    "attach": host_tmux_attach.is_some(),
+                    "forks": fork_records,
+                })
+            );
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = &result {
+        record_tclone_failure(
+            &operation_id,
+            "fork",
+            Some(&source),
+            None,
+            &format!("Fork from {} failed", source.run_id),
+            error,
+            Some(metadata),
         );
     }
-    Ok(())
+    result
 }
 
 fn restart_tclone_source_codex_after_fork(
@@ -5633,19 +5844,79 @@ pub(crate) fn tclone_merge(args: Vec<OsString>) -> io::Result<()> {
     let scope = tclone_merge_scope(&args)?;
     let fork = find_tclone_record(&fork_target)?;
     let source = find_tclone_record(&source_target)?;
-    validate_tclone_merge_pair(&fork, &source, force)?;
+    let operation_id = tclone_operation_id("merge");
+    let (scope_name, selected_paths) = match &scope {
+        TcloneMergeScope::Git => ("git", Vec::new()),
+        TcloneMergeScope::Filesystem => ("filesystem", Vec::new()),
+        TcloneMergeScope::Paths(paths) => ("paths", paths.clone()),
+    };
+    let metadata = json!({
+        "scope": scope_name,
+        "paths": selected_paths,
+        "dry_run": dry_run,
+        "force": force,
+    });
+    record_tclone_transaction_best_effort(
+        &operation_id,
+        "merge",
+        "started",
+        Some(&fork.run_id),
+        Some(&source.run_id),
+        fork.parent_run_id.as_deref(),
+        Some(&fork.workspace),
+        format!("Merging {} into {}", fork.run_id, source.run_id),
+        Some(metadata.clone()),
+    );
 
-    let podman = tclone_podman();
-    ensure_tclone_container_exists(&podman, &fork)?;
-    ensure_tclone_container_exists(&podman, &source)?;
-
-    match scope {
-        TcloneMergeScope::Git => tclone_merge_git(&podman, &fork, &source, dry_run),
-        TcloneMergeScope::Filesystem => {
-            tclone_merge_filesystem(&podman, &fork, &source, None, dry_run)
+    let result = (|| {
+        validate_tclone_merge_pair(&fork, &source, force)?;
+        let podman = tclone_podman();
+        ensure_tclone_container_exists(&podman, &fork)?;
+        ensure_tclone_container_exists(&podman, &source)?;
+        match scope {
+            TcloneMergeScope::Git => tclone_merge_git(&podman, &fork, &source, dry_run),
+            TcloneMergeScope::Filesystem => {
+                tclone_merge_filesystem(&podman, &fork, &source, None, dry_run)
+            }
+            TcloneMergeScope::Paths(paths) => {
+                tclone_merge_filesystem(&podman, &fork, &source, Some(paths), dry_run)
+            }
         }
-        TcloneMergeScope::Paths(paths) => {
-            tclone_merge_filesystem(&podman, &fork, &source, Some(paths), dry_run)
+    })();
+
+    match result {
+        Ok(stats) => {
+            let verb = if dry_run { "Validated merge" } else { "Merged" };
+            let mut completed_metadata = metadata.clone();
+            if let Some(object) = completed_metadata.as_object_mut() {
+                object.insert("changed".to_string(), json!(stats.changed));
+                object.insert("upserted".to_string(), json!(stats.upserted));
+                object.insert("deleted".to_string(), json!(stats.deleted));
+            }
+            record_tclone_transaction_best_effort(
+                &operation_id,
+                "merge",
+                "succeeded",
+                Some(&fork.run_id),
+                Some(&source.run_id),
+                fork.parent_run_id.as_deref(),
+                Some(&fork.workspace),
+                format!("{verb} {} into {}", fork.run_id, source.run_id),
+                Some(completed_metadata),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            record_tclone_failure(
+                &operation_id,
+                "merge",
+                Some(&fork),
+                Some(&source.run_id),
+                &format!("Merge from {} into {} failed", fork.run_id, source.run_id),
+                &error,
+                Some(metadata),
+            );
+            Err(error)
         }
     }?;
 
@@ -5908,68 +6179,110 @@ pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
             format!("switch target must be a fork, got role={}", fork.role),
         ));
     }
-
-    let podman = tclone_podman();
-    ensure_tclone_container_exists(&podman, &fork)?;
-    let switched_at_ms = unix_millis()?;
-    let parent_run_id = fork.parent_run_id.as_deref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "switch target has no source run",
-        )
-    })?;
-    let previous_source = find_tclone_record(parent_run_id)?;
-    if previous_source.role != "source" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "switch source must have role=source, got role={}",
-                previous_source.role
-            ),
-        ));
-    }
-
-    let mut retired_source = previous_source.clone();
-    retired_source.status = "switched-away".to_string();
-    retired_source.updated_at_ms = switched_at_ms;
-    let switched = switched_tclone_source_record(fork.clone(), switched_at_ms)?;
-    append_tclone_records_atomically(&[retired_source, switched.clone()])?;
-
-    if let Err(error) = write_tclone_run_context(&podman, &switched) {
-        let failure = io::Error::new(
-            error.kind(),
-            format!("could not promote fork context to source: {error}"),
-        );
-        let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
-        return Err(tclone_switch_error_with_rollback(failure, rollback));
-    }
-    let completion_log =
-        match schedule_tclone_switch_completion(&switched.run_id, &previous_source.run_id) {
-            Ok(log_path) => log_path,
-            Err(error) => {
-                let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
-                return Err(tclone_switch_error_with_rollback(error, rollback));
-            }
-        };
-    if let Err(error) = tclone_exec(
-        &podman,
-        &switched.container_name,
-        &["rm", "-f", TCLONE_FORK_RESULT_PATH],
-    ) {
-        let failure = io::Error::new(
-            error.kind(),
-            format!("could not reset promoted source lifecycle state: {error}"),
-        );
-        let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
-        return Err(tclone_switch_error_with_rollback(failure, rollback));
-    }
-    println!(
-        "gensee: promoted {} ({}) to the main environment; the old source will be ended; completion log: {}",
-        switched.run_id,
-        switched.container_name,
-        completion_log.display()
+    let operation_id = tclone_operation_id("switch");
+    record_tclone_transaction_best_effort(
+        &operation_id,
+        "switch",
+        "started",
+        Some(&fork.run_id),
+        Some(&fork.run_id),
+        fork.parent_run_id.as_deref(),
+        Some(&fork.workspace),
+        format!("Switching active source to {}", fork.run_id),
+        None,
     );
-    Ok(())
+
+    let result = (|| {
+        let podman = tclone_podman();
+        ensure_tclone_container_exists(&podman, &fork)?;
+        let switched_at_ms = unix_millis()?;
+        let parent_run_id = fork.parent_run_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "switch target has no source run",
+            )
+        })?;
+        let previous_source = find_tclone_record(parent_run_id)?;
+        if previous_source.role != "source" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "switch source must have role=source, got role={}",
+                    previous_source.role
+                ),
+            ));
+        }
+
+        let mut retired_source = previous_source.clone();
+        retired_source.status = "switched-away".to_string();
+        retired_source.updated_at_ms = switched_at_ms;
+        let switched = switched_tclone_source_record(fork.clone(), switched_at_ms)?;
+        append_tclone_records_atomically(&[retired_source, switched.clone()])?;
+
+        if let Err(error) = write_tclone_run_context(&podman, &switched) {
+            let failure = io::Error::new(
+                error.kind(),
+                format!("could not promote fork context to source: {error}"),
+            );
+            let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
+            return Err(tclone_switch_error_with_rollback(failure, rollback));
+        }
+        let completion_log =
+            match schedule_tclone_switch_completion(&switched.run_id, &previous_source.run_id) {
+                Ok(log_path) => log_path,
+                Err(error) => {
+                    let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
+                    return Err(tclone_switch_error_with_rollback(error, rollback));
+                }
+            };
+        if let Err(error) = tclone_exec(
+            &podman,
+            &switched.container_name,
+            &["rm", "-f", TCLONE_FORK_RESULT_PATH],
+        ) {
+            let failure = io::Error::new(
+                error.kind(),
+                format!("could not reset promoted source lifecycle state: {error}"),
+            );
+            let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
+            return Err(tclone_switch_error_with_rollback(failure, rollback));
+        }
+        println!(
+            "gensee: promoted {} ({}) to the main environment; the old source will be ended; completion log: {}",
+            switched.run_id,
+            switched.container_name,
+            completion_log.display()
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            record_tclone_transaction_best_effort(
+                &operation_id,
+                "switch",
+                "succeeded",
+                Some(&fork.run_id),
+                Some(&fork.run_id),
+                fork.parent_run_id.as_deref(),
+                Some(&fork.workspace),
+                format!("{} became the active source", fork.run_id),
+                None,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            record_tclone_failure(
+                &operation_id,
+                "switch",
+                Some(&fork),
+                Some(&fork.run_id),
+                &format!("Switch to {} failed", fork.run_id),
+                &error,
+                None,
+            );
+            Err(error)
+        }
+    }
 }
 
 fn rollback_tclone_switch(
@@ -6218,26 +6531,69 @@ pub(crate) fn tclone_delete(args: Vec<OsString>) -> io::Result<()> {
         "usage: gensee run delete <tclone-run-or-container>|--all",
     )?;
     let record = find_tclone_record(&target)?;
-    let removed_container = remove_tclone_container(&record).map_err(|error| {
-        io::Error::other(format!(
-            "could not remove tclone container {} (record preserved): {error}",
-            record.container_name
-        ))
-    })?;
-    let removed_records = delete_tclone_records(|candidate| candidate.run_id == record.run_id)?;
-
-    println!(
-        "gensee: deleted tclone run {} ({}) container={} records_removed={removed_records}",
-        record.run_id,
-        record.container_name,
-        removed_container.as_str()
+    let operation_id = tclone_operation_id("delete");
+    record_tclone_transaction_best_effort(
+        &operation_id,
+        "delete",
+        "started",
+        Some(&record.run_id),
+        None,
+        record.parent_run_id.as_deref(),
+        Some(&record.workspace),
+        format!("Deleting {}", record.run_id),
+        None,
     );
-    Ok(())
+    let result = (|| {
+        let removed_container = remove_tclone_container(&record).map_err(|error| {
+            io::Error::other(format!(
+                "could not remove tclone container {} (record preserved): {error}",
+                record.container_name
+            ))
+        })?;
+        let removed_records = delete_tclone_records(|candidate| candidate.run_id == record.run_id)?;
+
+        println!(
+            "gensee: deleted tclone run {} ({}) container={} records_removed={removed_records}",
+            record.run_id,
+            record.container_name,
+            removed_container.as_str()
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            record_tclone_transaction_best_effort(
+                &operation_id,
+                "delete",
+                "succeeded",
+                Some(&record.run_id),
+                None,
+                record.parent_run_id.as_deref(),
+                Some(&record.workspace),
+                format!("Deleted {}", record.run_id),
+                None,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            record_tclone_failure(
+                &operation_id,
+                "delete",
+                Some(&record),
+                None,
+                &format!("Deleting {} failed", record.run_id),
+                &error,
+                None,
+            );
+            Err(error)
+        }
+    }
 }
 
 fn tclone_delete_all() -> io::Result<()> {
     let podman = tclone_podman();
     let records = list_tclone_runs()?;
+    let operation_id = tclone_operation_id("delete");
     let tracked_container_names = records
         .iter()
         .map(|record| record.container_name.clone())
@@ -6250,6 +6606,17 @@ fn tclone_delete_all() -> io::Result<()> {
         println!("gensee: no tclone runs to delete");
         return Ok(());
     }
+    record_tclone_transaction_best_effort(
+        &operation_id,
+        "delete",
+        "started",
+        None,
+        None,
+        None,
+        None,
+        format!("Deleting {} transactional run(s)", records.len()),
+        Some(json!({ "all": true, "run_count": records.len() })),
+    );
 
     let mut removed_containers = 0;
     let mut already_gone = 0;
@@ -6260,13 +6627,44 @@ fn tclone_delete_all() -> io::Result<()> {
             Ok(TcloneContainerRemoval::Removed) => {
                 removed_containers += 1;
                 deleted_run_ids.insert(record.run_id.clone());
+                record_tclone_transaction_best_effort(
+                    &operation_id,
+                    "delete",
+                    "succeeded",
+                    Some(&record.run_id),
+                    None,
+                    record.parent_run_id.as_deref(),
+                    Some(&record.workspace),
+                    format!("Deleted {}", record.run_id),
+                    Some(json!({ "all": true, "container": "removed" })),
+                );
             }
             Ok(TcloneContainerRemoval::AlreadyGone) => {
                 already_gone += 1;
                 deleted_run_ids.insert(record.run_id.clone());
+                record_tclone_transaction_best_effort(
+                    &operation_id,
+                    "delete",
+                    "succeeded",
+                    Some(&record.run_id),
+                    None,
+                    record.parent_run_id.as_deref(),
+                    Some(&record.workspace),
+                    format!("Pruned stale run {}", record.run_id),
+                    Some(json!({ "all": true, "container": "already_gone" })),
+                );
             }
             Err(error) => {
                 failed += 1;
+                record_tclone_failure(
+                    &operation_id,
+                    "delete",
+                    Some(record),
+                    None,
+                    &format!("Deleting {} failed", record.run_id),
+                    &error,
+                    Some(json!({ "all": true })),
+                );
                 eprintln!(
                     "gensee: warning: could not remove tclone container {} (record preserved): {error}",
                     record.container_name
@@ -6299,6 +6697,23 @@ fn tclone_delete_all() -> io::Result<()> {
             "{failed} tclone container(s) could not be removed; their records were preserved"
         )));
     }
+    record_tclone_transaction_best_effort(
+        &operation_id,
+        "delete",
+        "succeeded",
+        None,
+        None,
+        None,
+        None,
+        format!("Deleted {removed_records} transactional run record(s)"),
+        Some(json!({
+            "all": true,
+            "removed_records": removed_records,
+            "removed_containers": removed_containers,
+            "removed_orphans": removed_orphans,
+            "already_gone": already_gone,
+        })),
+    );
     Ok(())
 }
 
@@ -6410,7 +6825,7 @@ fn tclone_merge_git(
     fork: &TcloneRunRecord,
     source: &TcloneRunRecord,
     dry_run: bool,
-) -> io::Result<()> {
+) -> io::Result<TcloneMergeStats> {
     let source_files_id = format!("gensee-source-files-{}.txt", unix_millis()?);
     let host_source_files = gensee_tmp_root()?.join(&source_files_id);
     let fork_source_files = format!("/tmp/{source_files_id}");
@@ -6431,12 +6846,13 @@ fn tclone_merge_git(
         &["rm", "-f", &fork_source_files],
     );
     let patch = patch?;
+    let stats = tclone_git_patch_stats(&patch);
     if patch.trim().is_empty() {
         println!(
             "gensee: no changes to merge from {} into {}",
             fork.run_id, source.run_id
         );
-        return Ok(());
+        return Ok(stats);
     }
 
     let patch_id = format!("gensee-merge-{}.patch", unix_millis()?);
@@ -6471,7 +6887,23 @@ fn tclone_merge_git(
             fork.run_id, source.run_id
         );
     }
-    Ok(())
+    Ok(stats)
+}
+
+fn tclone_git_patch_stats(patch: &str) -> TcloneMergeStats {
+    let mut stats = TcloneMergeStats::default();
+    for block in patch
+        .split("\ndiff --git ")
+        .filter(|block| !block.trim().is_empty())
+    {
+        stats.changed += 1;
+        if block.contains("\ndeleted file mode ") {
+            stats.deleted += 1;
+        } else {
+            stats.upserted += 1;
+        }
+    }
+    stats
 }
 
 fn tclone_source_workspace_file_list(
@@ -6496,7 +6928,7 @@ fn tclone_merge_filesystem(
     source: &TcloneRunRecord,
     paths: Option<Vec<String>>,
     dry_run: bool,
-) -> io::Result<()> {
+) -> io::Result<TcloneMergeStats> {
     if paths.as_ref().is_some_and(Vec::is_empty) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -6530,6 +6962,19 @@ fn tclone_merge_filesystem(
         &source_rootfs,
         &filter,
     )?;
+    let stats = TcloneMergeStats {
+        changed: plan.changes.len(),
+        upserted: plan
+            .changes
+            .iter()
+            .filter(|change| change.op != TcloneOverlayMergeOp::Delete)
+            .count(),
+        deleted: plan
+            .changes
+            .iter()
+            .filter(|change| change.op == TcloneOverlayMergeOp::Delete)
+            .count(),
+    };
 
     if !plan.conflicts.is_empty() {
         let shown = plan
@@ -6552,14 +6997,14 @@ fn tclone_merge_filesystem(
             "gensee: no filesystem changes to merge from {} into {}",
             fork.run_id, source.run_id
         );
-        return Ok(());
+        return Ok(stats);
     }
     if dry_run {
         println!(
             "gensee: overlay filesystem merge dry-run found {} change(s) and no conflicts",
             plan.changes.len()
         );
-        return Ok(());
+        return Ok(stats);
     }
 
     apply_tclone_overlay_merge(podman, source, &plan)?;
@@ -6568,7 +7013,7 @@ fn tclone_merge_filesystem(
         "gensee: merged overlay filesystem changes from {} into {}",
         fork.run_id, source.run_id
     );
-    Ok(())
+    Ok(stats)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6941,54 +7386,97 @@ pub(crate) fn tclone_keep(args: Vec<OsString>) -> io::Result<()> {
         )
     })?;
     let record = find_tclone_record(&target)?;
-    if record.role != "fork" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "gensee run keep only accepts a fork",
-        ));
-    }
-    let destination = PathBuf::from(destination);
-    if !destination.is_absolute()
-        || destination
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        || destination.parent().is_none()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "keep destination must be a non-root absolute path without `..`",
-        ));
-    }
-    if destination.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "refusing to overwrite existing keep destination {}",
-                destination.display()
-            ),
-        ));
-    }
-    fs::create_dir(&destination)?;
-    let podman = tclone_podman();
-    let target = format!("{}:{}/.", record.container_name, record.container_workspace);
-    let copy_result = run_command_status(
-        &podman,
-        &[
-            OsString::from("cp"),
-            OsString::from(target),
-            destination.as_os_str().to_os_string(),
-        ],
+    let operation_id = tclone_operation_id("keep");
+    let metadata = json!({ "destination": &destination });
+    record_tclone_transaction_best_effort(
+        &operation_id,
+        "keep",
+        "started",
+        Some(&record.run_id),
+        None,
+        record.parent_run_id.as_deref(),
+        Some(&record.workspace),
+        format!("Copying {} workspace out", record.run_id),
+        Some(metadata.clone()),
     );
-    if let Err(error) = copy_result {
-        let _ = fs::remove_dir_all(&destination);
-        return Err(error);
+    let result = (|| {
+        if record.role != "fork" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "gensee run keep only accepts a fork",
+            ));
+        }
+        let destination = PathBuf::from(&destination);
+        if !destination.is_absolute()
+            || destination
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || destination.parent().is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "keep destination must be a non-root absolute path without `..`",
+            ));
+        }
+        if destination.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to overwrite existing keep destination {}",
+                    destination.display()
+                ),
+            ));
+        }
+        fs::create_dir(&destination)?;
+        let podman = tclone_podman();
+        let target = format!("{}:{}/.", record.container_name, record.container_workspace);
+        let copy_result = run_command_status(
+            &podman,
+            &[
+                OsString::from("cp"),
+                OsString::from(target),
+                destination.as_os_str().to_os_string(),
+            ],
+        );
+        if let Err(error) = copy_result {
+            let _ = fs::remove_dir_all(&destination);
+            return Err(error);
+        }
+        println!(
+            "gensee: copied tclone workspace {} -> {}",
+            record.run_id,
+            destination.display()
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            record_tclone_transaction_best_effort(
+                &operation_id,
+                "keep",
+                "succeeded",
+                Some(&record.run_id),
+                None,
+                record.parent_run_id.as_deref(),
+                Some(&record.workspace),
+                format!("Copied {} workspace out", record.run_id),
+                Some(metadata),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            record_tclone_failure(
+                &operation_id,
+                "keep",
+                Some(&record),
+                None,
+                &format!("Copying {} workspace failed", record.run_id),
+                &error,
+                Some(metadata),
+            );
+            Err(error)
+        }
     }
-    println!(
-        "gensee: copied tclone workspace {} -> {}",
-        record.run_id,
-        destination.display()
-    );
-    Ok(())
 }
 
 fn validate_tclone_merge_pair(
@@ -7376,29 +7864,71 @@ pub(crate) fn tclone_discard_if_exists(target: &str) -> io::Result<bool> {
     let Ok(record) = find_tclone_record(target) else {
         return Ok(false);
     };
-    if record.role != "fork" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("discard target must be a fork, got role={}", record.role),
-        ));
-    }
-    // Record the terminal resolution now, but delay destructive cleanup so
-    // the successful lifecycle response can reach the agent in this fork.
-    append_tclone_status(&record.run_id, "discarded", None)?;
-    let log_path = match schedule_tclone_resolution_cleanup(&record.run_id) {
-        Ok(log_path) => log_path,
-        Err(error) => {
-            append_tclone_record(&record)?;
-            return Err(error);
-        }
-    };
-    println!(
-        "gensee: marked tclone fork {} ({}) discarded; cleanup is scheduled; log: {}",
-        record.run_id,
-        record.container_name,
-        log_path.display()
+    let operation_id = tclone_operation_id("discard");
+    record_tclone_transaction_best_effort(
+        &operation_id,
+        "discard",
+        "started",
+        Some(&record.run_id),
+        None,
+        record.parent_run_id.as_deref(),
+        Some(&record.workspace),
+        format!("Discarding {}", record.run_id),
+        None,
     );
-    Ok(true)
+    let result = (|| {
+        if record.role != "fork" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("discard target must be a fork, got role={}", record.role),
+            ));
+        }
+        // Record the terminal resolution now, but delay destructive cleanup so
+        // the successful lifecycle response can reach the agent in this fork.
+        append_tclone_status(&record.run_id, "discarded", None)?;
+        let log_path = match schedule_tclone_resolution_cleanup(&record.run_id) {
+            Ok(log_path) => log_path,
+            Err(error) => {
+                append_tclone_record(&record)?;
+                return Err(error);
+            }
+        };
+        println!(
+            "gensee: marked tclone fork {} ({}) discarded; cleanup is scheduled; log: {}",
+            record.run_id,
+            record.container_name,
+            log_path.display()
+        );
+        Ok(true)
+    })();
+    match result {
+        Ok(discarded) => {
+            record_tclone_transaction_best_effort(
+                &operation_id,
+                "discard",
+                "succeeded",
+                Some(&record.run_id),
+                None,
+                record.parent_run_id.as_deref(),
+                Some(&record.workspace),
+                format!("Discarded {}", record.run_id),
+                None,
+            );
+            Ok(discarded)
+        }
+        Err(error) => {
+            record_tclone_failure(
+                &operation_id,
+                "discard",
+                Some(&record),
+                None,
+                &format!("Discarding {} failed", record.run_id),
+                &error,
+                None,
+            );
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn list_tclone_runs() -> io::Result<Vec<TcloneRunRecord>> {
@@ -8410,6 +8940,34 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn transaction_recording_best_effort_ignores_an_unavailable_store() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("transaction-store-unavailable");
+        let unavailable_root = root.join("not-a-directory");
+        fs::write(&unavailable_root, "file blocks store directory creation").unwrap();
+        let old_home = env::var_os("GENSEE_HOME");
+        env::set_var("GENSEE_HOME", &unavailable_root);
+
+        record_tclone_transaction_best_effort(
+            "fork_test",
+            "fork",
+            "started",
+            Some("source-run"),
+            None,
+            None,
+            Some("/workspace"),
+            "Starting fork",
+            None,
+        );
+
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn signed_host_control_request(
@@ -10797,6 +11355,19 @@ gensee async job job_1: exited status=0
         ];
 
         assert_eq!(tclone_merge_scope(&args).unwrap(), TcloneMergeScope::Git);
+    }
+
+    #[test]
+    fn tclone_git_patch_stats_count_upserts_and_deletions() {
+        let patch = "diff --git a/a.txt b/a.txt\nindex 1..2 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/b.txt b/b.txt\ndeleted file mode 100644\n--- a/b.txt\n+++ /dev/null\n";
+        assert_eq!(
+            tclone_git_patch_stats(patch),
+            TcloneMergeStats {
+                changed: 2,
+                upserted: 1,
+                deleted: 1,
+            }
+        );
     }
 
     #[test]

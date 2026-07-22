@@ -10,7 +10,7 @@ use gensee_crate_core::{
 use gensee_crate_db::sqlite::{
     open_store, AgentEventRecord, NewAgentEvent, NewAlert, NewArtifact, NewArtifactFact,
     NewArtifactObservation, NewArtifactRiskTag, NewHumanFeedback, NewRelation, NewRequest,
-    NewSession, NewSystemEvent, SqliteConfig, SqliteError, SqliteStore,
+    NewSession, NewSystemEvent, NewTransactionEvent, SqliteConfig, SqliteError, SqliteStore,
 };
 pub use gensee_crate_db::sqlite::{
     AlertRecord, ArtifactFactRecord, ArtifactObservationRecord, ArtifactRiskTagRecord,
@@ -41,6 +41,8 @@ const ARTIFACT_FACT_RECENT_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 // Tool inputs are operator-visible telemetry. Bound their at-rest size so a
 // single tool invocation cannot bloat the local store with arbitrary payloads.
 const MAX_STORED_TOOL_INPUT_BYTES: usize = 16 * 1024;
+const MAX_TRANSACTION_TEXT_CHARS: usize = 2 * 1024;
+const MAX_TRANSACTION_METADATA_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
@@ -99,6 +101,24 @@ pub struct ArtifactRiskTagInput {
     pub path: Option<String>,
     pub confidence: f64,
     pub evidence: Option<Value>,
+}
+
+/// A bounded, append-only lifecycle event for a transactional environment.
+#[derive(Debug, Clone)]
+pub struct TransactionEventInput {
+    pub operation_id: String,
+    pub environment_kind: String,
+    pub operation: String,
+    pub phase: String,
+    pub source_run_id: Option<String>,
+    pub target_run_id: Option<String>,
+    pub parent_run_id: Option<String>,
+    pub workspace: Option<String>,
+    pub summary: String,
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
+    pub metadata: Option<Value>,
+    pub occurred_at_ms: u64,
 }
 
 struct AlertInput<'a> {
@@ -224,6 +244,30 @@ impl EventStore {
             effect,
             self.encryption_key.as_ref(),
         )
+    }
+
+    pub fn append_transaction_event(&self, event: &TransactionEventInput) -> io::Result<i64> {
+        let db = self.sqlite_store()?;
+        db.insert_transaction_event(&NewTransactionEvent {
+            operation_id: event.operation_id.clone(),
+            environment_kind: event.environment_kind.clone(),
+            operation: event.operation.clone(),
+            phase: event.phase.clone(),
+            source_run_id: event.source_run_id.clone(),
+            target_run_id: event.target_run_id.clone(),
+            parent_run_id: event.parent_run_id.clone(),
+            workspace: event.workspace.clone(),
+            summary: bounded_transaction_text(&event.summary),
+            error_kind: event.error_kind.clone(),
+            error_message: event.error_message.as_deref().map(bounded_transaction_text),
+            metadata: event
+                .metadata
+                .as_ref()
+                .map(bounded_transaction_metadata)
+                .transpose()?,
+            occurred_at: to_i64(event.occurred_at_ms)?,
+        })
+        .map_err(sqlite_error)
     }
 
     pub fn list_sessions(&self) -> io::Result<Vec<AgentSession>> {
@@ -2194,6 +2238,36 @@ fn store_tool_input(value: Value) -> Option<String> {
     )
 }
 
+fn bounded_transaction_text(value: &str) -> String {
+    let mut bounded = value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .take(MAX_TRANSACTION_TEXT_CHARS + 1)
+        .collect::<String>();
+    if bounded.chars().count() > MAX_TRANSACTION_TEXT_CHARS {
+        bounded = bounded
+            .chars()
+            .take(MAX_TRANSACTION_TEXT_CHARS.saturating_sub(1))
+            .collect();
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn bounded_transaction_metadata(value: &Value) -> io::Result<String> {
+    let encoded = serde_json::to_string(value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if encoded.len() <= MAX_TRANSACTION_METADATA_BYTES {
+        return Ok(encoded);
+    }
+    Ok(json!({
+        "truncated": true,
+        "original_bytes": encoded.len(),
+        "max_bytes": MAX_TRANSACTION_METADATA_BYTES,
+    })
+    .to_string())
+}
+
 fn tool_response_json(event: &AgentHookEvent) -> Option<String> {
     if event.tool_response_stdout.is_none()
         && event.tool_response_stderr.is_none()
@@ -2451,6 +2525,24 @@ fn hex_value(byte: u8) -> io::Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transaction_text_is_bounded_and_strips_control_characters() {
+        let input = format!("safe\0{}", "x".repeat(MAX_TRANSACTION_TEXT_CHARS + 20));
+        let bounded = bounded_transaction_text(&input);
+        assert!(!bounded.contains('\0'));
+        assert_eq!(bounded.chars().count(), MAX_TRANSACTION_TEXT_CHARS);
+        assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn transaction_metadata_is_replaced_with_valid_truncation_metadata() {
+        let input = json!({ "paths": ["x".repeat(MAX_TRANSACTION_METADATA_BYTES)] });
+        let bounded = bounded_transaction_metadata(&input).unwrap();
+        let decoded: Value = serde_json::from_str(&bounded).unwrap();
+        assert_eq!(decoded["truncated"], true);
+        assert_eq!(decoded["max_bytes"], MAX_TRANSACTION_METADATA_BYTES);
+    }
 
     #[test]
     fn session_round_trips_through_jsonl() {

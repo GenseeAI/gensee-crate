@@ -8,7 +8,7 @@ pub(crate) use gensee_crate_core::{
 pub(crate) use gensee_crate_rules::policy::{self, Policy};
 pub(crate) use gensee_crate_store::{
     daemon_socket_path, default_root, AlertRecord, ArtifactObservationInput, ArtifactRiskTagInput,
-    ArtifactRiskTagRecord, EventStore, PolicyAlert,
+    ArtifactRiskTagRecord, EventStore, PolicyAlert, TransactionEventInput,
 };
 pub(crate) use serde_json::{json, Value};
 pub(crate) use sha2::{Digest, Sha256};

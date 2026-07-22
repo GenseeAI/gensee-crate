@@ -341,6 +341,23 @@ pub struct HumanFeedbackRecord {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct NewTransactionEvent {
+    pub operation_id: String,
+    pub environment_kind: String,
+    pub operation: String,
+    pub phase: String,
+    pub source_run_id: Option<String>,
+    pub target_run_id: Option<String>,
+    pub parent_run_id: Option<String>,
+    pub workspace: Option<String>,
+    pub summary: String,
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
+    pub metadata: Option<String>,
+    pub occurred_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArtifactObservationRecord {
     pub observation_id: i64,
     pub artifact_id: i64,
@@ -1546,6 +1563,38 @@ impl SqliteStore {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn insert_transaction_event(
+        &self,
+        event: &NewTransactionEvent,
+    ) -> Result<i64, SqliteError> {
+        self.conn
+            .execute(
+                "INSERT INTO transaction_events (
+                    operation_id, environment_kind, operation, phase,
+                    source_run_id, target_run_id, parent_run_id, workspace,
+                    summary, error_kind, error_message, metadata, occurred_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    event.operation_id,
+                    event.environment_kind,
+                    event.operation,
+                    event.phase,
+                    event.source_run_id,
+                    event.target_run_id,
+                    event.parent_run_id,
+                    event.workspace,
+                    event.summary,
+                    event.error_kind,
+                    event.error_message,
+                    event.metadata,
+                    event.occurred_at,
+                ],
+            )
+            .map_err(SqliteError::Database)?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// Most recent human feedback verdicts, newest first.
     pub fn recent_human_feedback(
         &self,
@@ -2032,6 +2081,7 @@ mod tests {
             "artifact_observations",
             "artifact_risk_tags",
             "artifact_facts",
+            "transaction_events",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -2050,6 +2100,63 @@ mod tests {
             std::fs::remove_file(path.with_file_name(format!("{}-wal", db_name.to_string_lossy())));
         let _ =
             std::fs::remove_file(path.with_file_name(format!("{}-shm", db_name.to_string_lossy())));
+    }
+
+    #[test]
+    fn transaction_events_are_append_only_and_keep_operation_phases() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-transaction-events-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).unwrap();
+        let base = NewTransactionEvent {
+            operation_id: "fork-op-1".to_string(),
+            environment_kind: "tclone".to_string(),
+            operation: "fork".to_string(),
+            phase: "started".to_string(),
+            source_run_id: Some("source-1".to_string()),
+            target_run_id: None,
+            parent_run_id: None,
+            workspace: Some("/workspace".to_string()),
+            summary: "Creating two forks".to_string(),
+            error_kind: None,
+            error_message: None,
+            metadata: Some(r#"{"copies":2}"#.to_string()),
+            occurred_at: 100,
+        };
+        store.insert_transaction_event(&base).unwrap();
+        store
+            .insert_transaction_event(&NewTransactionEvent {
+                phase: "succeeded".to_string(),
+                target_run_id: Some("fork-1".to_string()),
+                summary: "Created fork-1".to_string(),
+                occurred_at: 101,
+                ..base.clone()
+            })
+            .unwrap();
+        store
+            .insert_transaction_event(&NewTransactionEvent {
+                phase: "succeeded".to_string(),
+                target_run_id: Some("fork-2".to_string()),
+                summary: "Created fork-2".to_string(),
+                occurred_at: 102,
+                ..base
+            })
+            .unwrap();
+
+        let count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM transaction_events WHERE operation_id = 'fork-op-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

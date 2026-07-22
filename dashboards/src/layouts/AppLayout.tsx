@@ -14,6 +14,7 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
   AlertOutlined,
   ApartmentOutlined,
+  BranchesOutlined,
   BellOutlined,
   ClockCircleOutlined,
   DashboardOutlined,
@@ -56,6 +57,7 @@ const NAV_ITEMS: MenuItem[] = [
       { key: '/live-feed', icon: <ThunderboltOutlined />, label: "Live Feed"        },
       { key: '/today',     icon: <StarOutlined />,        label: "Today's Highlight" },
       { key: '/timeline',  icon: <ClockCircleOutlined />, label: 'Timeline'          },
+      { key: '/transactions', icon: <BranchesOutlined />, label: 'Transactions' },
     ],
   },
   { type: 'divider' },

@@ -16,7 +16,9 @@ import { ClearOutlined, PauseCircleOutlined, PlayCircleOutlined } from '@ant-des
 import { PageHeader }  from '@/components/PageHeader';
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder';
 import { useRealtime } from '@/hooks/useRealtime';
-import type { AgentEvent } from '@/api/types';
+import type { AgentEvent, TransactionEvent } from '@/api/types';
+import type { RealtimeEvent } from '@/hooks/useRealtime';
+import { useNavigate } from 'react-router-dom';
 
 const { Text } = Typography;
 
@@ -56,15 +58,51 @@ function EventRow({ event }: { event: AgentEvent }) {
   );
 }
 
+function TransactionEventRow({ event }: { event: TransactionEvent }) {
+  const navigate = useNavigate();
+  const color = event.phase === 'failed' ? 'red' : event.phase === 'started' ? 'blue' : 'green';
+  return (
+    <div
+      onClick={() => navigate(`/transactions?operation=${encodeURIComponent(event.operation_id)}`)}
+      style={{
+        display: 'flex',
+        gap: 12,
+        padding: '6px 0',
+        borderBottom: '1px solid rgba(128,128,128,0.12)',
+        alignItems: 'flex-start',
+        cursor: 'pointer',
+      }}
+      title="Open in Transactions"
+    >
+      <Text type="secondary" style={{ fontSize: 11, flexShrink: 0, width: 80 }}>
+        {new Date(event.occurred_at).toLocaleTimeString()}
+      </Text>
+      <Tag color="purple" style={{ flexShrink: 0 }}>Transactional environment</Tag>
+      <Tag color={color} style={{ flexShrink: 0 }}>{event.operation} · {event.phase}</Tag>
+      <Text style={{ fontSize: 12, flex: 1 }} ellipsis={{ tooltip: event.summary }}>
+        {event.summary}
+      </Text>
+    </div>
+  );
+}
+
+function LiveEventRow({ event }: { event: RealtimeEvent }) {
+  return event.category === 'agent'
+    ? <EventRow event={event.payload} />
+    : <TransactionEventRow event={event.payload} />;
+}
+
 export default function LiveFeed() {
   const [enabled, setEnabled]   = useState(true);
   const [typeFilter, setFilter] = useState<string | undefined>(undefined);
+  const [category, setCategory] = useState<'agent' | 'transactional_environment' | undefined>();
 
   const { events, connected, error, clear } = useRealtime('', enabled);
 
-  const filtered = typeFilter
-    ? events.filter(e => e.type === typeFilter)
-    : events;
+  const filtered = events.filter(event =>
+    (!category || event.category === category)
+      && (!typeFilter || event.category !== 'agent' || event.payload.type === typeFilter),
+  );
 
   const statusBadge = connected
     ? <Badge status="processing" color="green" text="Connected" />
@@ -79,8 +117,21 @@ export default function LiveFeed() {
           <Space>
             {statusBadge}
             <Select
+              placeholder="Category"
+              allowClear
+              style={{ width: 190 }}
+              size="small"
+              value={category}
+              onChange={setCategory}
+              options={[
+                { value: 'agent', label: 'Agent activity' },
+                { value: 'transactional_environment', label: 'Transactional environment' },
+              ]}
+            />
+            <Select
               placeholder="Filter by type"
               allowClear
+              disabled={category === 'transactional_environment'}
               style={{ width: 170 }}
               size="small"
               value={typeFilter}
@@ -132,7 +183,7 @@ export default function LiveFeed() {
                 }
               />
             ) : (
-              filtered.map(e => <EventRow key={e.event_id} event={e} />)
+              filtered.map(event => <LiveEventRow key={event.id} event={event} />)
             )}
           </Card>
         </Col>
