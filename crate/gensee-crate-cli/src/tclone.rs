@@ -4892,15 +4892,19 @@ fn tclone_run_context_payload(record: &TcloneRunRecord, capability: &str) -> Val
 }
 
 fn write_tclone_run_context_if_possible(podman: &OsString, record: &TcloneRunRecord) {
-    if record.role != "fork" {
+    if !tclone_record_should_receive_run_context(record) {
         return;
     }
     if let Err(error) = write_tclone_run_context(podman, record) {
         eprintln!(
-            "gensee: warning: could not write fork run context into {}: {error}",
+            "gensee: warning: could not write tclone run context into {}: {error}",
             record.run_id
         );
     }
+}
+
+fn tclone_record_should_receive_run_context(record: &TcloneRunRecord) -> bool {
+    record.role == "fork" || record.role == "source"
 }
 
 fn write_tclone_run_context_with_retry(
@@ -11813,6 +11817,19 @@ gensee async job job_1: exited status=0
         assert_eq!(payload["source_run_id"], "run_1");
         assert_eq!(payload["workspace"], "/workspace");
         assert_eq!(payload["host_control_capability"], "capability-1");
+    }
+
+    #[test]
+    fn tclone_source_records_receive_run_context() {
+        let mut source = test_record("run_1", "running");
+        source.role = "source".to_string();
+        let fork = test_fork_record("run_1_fork_2_0", "run_1");
+        let mut unrelated = test_record("run_other", "running");
+        unrelated.role = "observer".to_string();
+
+        assert!(tclone_record_should_receive_run_context(&source));
+        assert!(tclone_record_should_receive_run_context(&fork));
+        assert!(!tclone_record_should_receive_run_context(&unrelated));
     }
 
     #[test]
