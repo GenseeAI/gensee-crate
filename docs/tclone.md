@@ -242,6 +242,44 @@ can reap that stranded environment. Lifecycle logs and acknowledgement markers
 are retained for seven days and pruned opportunistically when another
 lifecycle action runs.
 
+### Host disk cleanup
+
+Run the repository cleanup script from a separate host shell when old tclone
+runs, `/tmp` state, or Cargo artifacts have filled the host disk. Do not run it
+inside a Gensee source or fork container.
+
+```bash
+cd ~/gensee-crate
+scripts/cleanup_tclone_host.sh --yes
+```
+
+The default cleanup deletes tracked tclone runs and `gensee-tclone-*` orphan
+containers, removes the private `gensee-agent-guard` directory under `TMPDIR`
+(normally `/tmp/gensee-agent-guard`), cleans Cargo artifacts, rebuilds `gensee`
+in release mode, and reinstalls it at the current `gensee` path (or
+`~/.cargo/bin/gensee`). It keeps unrelated containers and tagged images intact.
+Custom absolute `TMPDIR` locations are canonicalized before the script removes
+their exact `gensee-agent-guard` child.
+
+On a dedicated tclone host where every Podman container is disposable, use the
+stronger cleanup that also removes all containers and prunes unused volumes and
+dangling image layers:
+
+```bash
+scripts/cleanup_tclone_host.sh --all-podman-data --yes
+```
+
+This deliberately does not run `podman system prune --all`: the configured
+tagged tclone image is preserved, avoiding a subsequent short-name resolution
+failure. Use `--dry-run` to review every destructive and rebuild command first,
+or `--install-to /absolute/path/to/gensee` to select another install target.
+The script resolves the existing `gensee`, Podman wrapper, and privileged host
+utilities to absolute executable paths before invoking `sudo`; those binaries
+and any tools called internally by a configured wrapper must belong to the
+trusted host administrator. Failure to delete the selected private temporary
+directory stops the script before rebuilding so a partial cleanup is not
+reported as successful.
+
 ## Requirements
 
 - Linux tclone host.
