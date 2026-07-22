@@ -4315,11 +4315,11 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     result
 }
 
-fn tclone_parallel_pane_layout<'a>(
+fn tclone_parallel_pane_layout(
     index: usize,
     initial: HostTmuxPlacement,
-    previous_pane: Option<&'a str>,
-) -> (HostTmuxPlacement, Option<&'a str>) {
+    previous_pane: Option<&str>,
+) -> (HostTmuxPlacement, Option<&str>) {
     if index == 0 {
         (initial, None)
     } else {
