@@ -529,24 +529,32 @@ GENSEE_HOME="$HOME/.gensee" cargo tauri dev
 This opens a native desktop window backed by the Rust core. No TCP server
 is started; all data access goes through Tauri IPC.
 
-See [`dashboards/README.md`](dashboards/README.md) for requirements, demo data, and policy
-editing notes.
+See [`dashboards/README.md`](dashboards/README.md) for requirements, store setup,
+and policy editing notes.
 
-The activity view brings policy decisions, timeline filtering, event details,
-and command/tool context into one local desktop surface.
+The activity overview summarizes agent sessions, request and event volume,
+seven-day activity, recent high-risk findings, and the complete alert severity
+mix in one local surface.
 
-![Gensee Crate dashboard activity timeline](docs/images/dashboard-activity.png)
+![Gensee Crate activity and security overview](docs/images/dashboard-activity.png)
 
-The lineage view links derived artifacts and shows the facts behind each path,
-including current risk state and the policy/query context used to inspect it.
+Timeline expands each agent session into requests and tool calls. Parallel and
+sequential work, execution durations, affected files, and policy outcomes stay
+connected to the original task.
 
-![Gensee Crate artifact lineage dashboard](docs/images/dashboard-lineage.png)
+![Gensee Crate agent tool-call timeline](docs/images/dashboard-agent-timeline.png)
 
-The multi-turn view highlights long-horizon patterns across a session, including
-read-to-exfiltration chains, memory-poison signals, repeated artifact targeting,
-and policy decisions over time.
+Transactional environments retain their dependency structure as well as their
+chronology. The dependency view makes fork fan-out, validated merge origins,
+discarded experiments, and the active environment explicit.
 
-![Gensee Crate multi-turn provenance dashboard](docs/images/dashboard-multiturn.png)
+![Gensee Crate transactional environment dependency graph](docs/images/dashboard-transaction-dependencies.png)
+
+Artifact lineage connects operational guidance and reproduced evidence to code,
+tests, release workflows, and protected deployment targets, with risk state and
+authorship visible at each node.
+
+![Gensee Crate artifact lineage graph](docs/images/dashboard-lineage.png)
 
 ### 4. Manage policy
 
