@@ -132,6 +132,27 @@ CREATE TABLE IF NOT EXISTS human_feedback (
   created_at    INTEGER NOT NULL
 );
 
+-- Append-only history for state-changing transactional runtime operations.
+-- Multiple phase rows share an operation_id (for example started/succeeded),
+-- and multi-copy forks share one operation_id across their child runs.
+CREATE TABLE IF NOT EXISTS transaction_events (
+  transaction_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  operation_id          TEXT NOT NULL,
+  environment_kind      TEXT NOT NULL,
+  operation             TEXT NOT NULL,
+  phase                 TEXT NOT NULL CHECK (phase IN ('started', 'succeeded', 'failed')),
+  source_run_id         TEXT,
+  target_run_id         TEXT,
+  parent_run_id         TEXT,
+  workspace             TEXT,
+  summary               TEXT NOT NULL,
+  error_kind            TEXT,
+  error_message         TEXT,
+  metadata              TEXT,
+  occurred_at           INTEGER NOT NULL,
+  CHECK (metadata IS NULL OR json_valid(metadata))
+);
+
 CREATE TABLE IF NOT EXISTS artifact_observations (
   observation_id    INTEGER PRIMARY KEY AUTOINCREMENT,
   artifact_id       INTEGER NOT NULL,
@@ -263,3 +284,15 @@ CREATE INDEX IF NOT EXISTS idx_human_feedback_event
 
 CREATE INDEX IF NOT EXISTS idx_human_feedback_tool_use
     ON human_feedback(tool_use_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_transaction_events_time
+    ON transaction_events(occurred_at, transaction_event_id);
+
+CREATE INDEX IF NOT EXISTS idx_transaction_events_operation
+    ON transaction_events(operation_id, transaction_event_id);
+
+CREATE INDEX IF NOT EXISTS idx_transaction_events_source
+    ON transaction_events(source_run_id, occurred_at);
+
+CREATE INDEX IF NOT EXISTS idx_transaction_events_target
+    ON transaction_events(target_run_id, occurred_at);

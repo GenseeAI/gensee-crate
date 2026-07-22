@@ -1,16 +1,20 @@
 import { useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import type { AgentEvent } from '@/api/types';
+import type { AgentEvent, TransactionEvent } from '@/api/types';
 
 /** Maximum events kept in memory for the live feed. */
 const MAX_EVENTS = 500;
 
 export interface RealtimeState {
-  events:    AgentEvent[];
+  events:    RealtimeEvent[];
   connected: boolean;
   error:     string | null;
   clear:     () => void;
 }
+
+export type RealtimeEvent =
+  | { category: 'agent'; id: string; timestamp: number; payload: AgentEvent }
+  | { category: 'transactional_environment'; id: string; timestamp: number; payload: TransactionEvent };
 
 /**
  * Subscribe to Tauri 'agent-event' events emitted by the Rust backend's
@@ -19,22 +23,29 @@ export interface RealtimeState {
  * The `_url` parameter is kept for API compatibility but is ignored.
  */
 export function useRealtime(_url: string, enabled = true): RealtimeState {
-  const [events, setEvents]       = useState<AgentEvent[]>([]);
+  const [events, setEvents]       = useState<RealtimeEvent[]>([]);
   const [connected, setConnected] = useState(false);
   const [error, setError]         = useState<string | null>(null);
 
   useEffect(() => {
     if (!enabled) return;
 
-    let unlisten: (() => void) | undefined;
+    let unlisten: (() => void)[] = [];
     let cancelled = false;
 
     listen<AgentEvent>('agent-event', (tauri_event) => {
-      setEvents(prev => [tauri_event.payload, ...prev].slice(0, MAX_EVENTS));
+      const payload = tauri_event.payload;
+      const entry: RealtimeEvent = {
+        category: 'agent',
+        id: `agent-${payload.event_id}`,
+        timestamp: payload.ts,
+        payload,
+      };
+      setEvents(prev => [entry, ...prev].slice(0, MAX_EVENTS));
     })
       .then(fn => {
         if (cancelled) { fn(); return; }
-        unlisten = fn;
+        unlisten.push(fn);
         setConnected(true);
         setError(null);
       })
@@ -42,10 +53,27 @@ export function useRealtime(_url: string, enabled = true): RealtimeState {
         setConnected(false);
         setError(err instanceof Error ? err.message : String(err));
       });
+    listen<TransactionEvent>('transaction-event', (tauriEvent) => {
+      const payload = tauriEvent.payload;
+      const entry: RealtimeEvent = {
+        category: 'transactional_environment',
+        id: `transaction-${payload.transaction_event_id}`,
+        timestamp: payload.occurred_at,
+        payload,
+      };
+      setEvents(prev => [entry, ...prev].slice(0, MAX_EVENTS));
+    })
+      .then(fn => {
+        if (cancelled) { fn(); return; }
+        unlisten.push(fn);
+      })
+      .catch((err: unknown) => {
+        setError(err instanceof Error ? err.message : String(err));
+      });
 
     return () => {
       cancelled = true;
-      unlisten?.();
+      unlisten.forEach(stop => stop());
       setConnected(false);
     };
   }, [enabled]);
@@ -54,4 +82,3 @@ export function useRealtime(_url: string, enabled = true): RealtimeState {
 
   return { events, connected, error, clear };
 }
-

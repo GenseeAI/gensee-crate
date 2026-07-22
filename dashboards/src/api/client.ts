@@ -19,6 +19,7 @@ import type {
   SeverityCount,
   SystemEvent,
   TodayMetrics,
+  TransactionEvent,
 } from './types';
 
 export const api = {
@@ -80,4 +81,8 @@ export const api = {
   // Today metrics
   todayMetrics: (date?: string) =>
     invoke<TodayMetrics>('get_today_metrics', { date }),
+
+  // Transactional environments
+  transactionEvents: (limit = 500, offset = 0) =>
+    invoke<TransactionEvent[]>('get_transaction_events', { limit, offset }),
 };

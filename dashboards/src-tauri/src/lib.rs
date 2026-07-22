@@ -7,13 +7,13 @@
 
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde_json::{json, Value};
-use tauri::{Emitter, Manager};
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
     time::Duration,
 };
+use tauri::{Emitter, Manager};
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -34,9 +34,8 @@ fn open_dashboard_connection(
     db_path: &Path,
     flags: OpenFlags,
 ) -> Result<Connection, String> {
-    let conn = Connection::open_with_flags(db_path, flags).map_err(|e| {
-        format!("Unable to open Gensee database {}: {e}", db_path.display())
-    })?;
+    let conn = Connection::open_with_flags(db_path, flags)
+        .map_err(|e| format!("Unable to open Gensee database {}: {e}", db_path.display()))?;
 
     if !database_is_plaintext(db_path)? {
         let key_path = home.join("gensee.key");
@@ -51,15 +50,21 @@ fn open_dashboard_connection(
             return Err(format!("Invalid SQLCipher key in {}", key_path.display()));
         }
         conn.pragma_update(None, "key", key).map_err(|e| {
-            format!("Unable to apply SQLCipher key for {}: {e}", db_path.display())
+            format!(
+                "Unable to apply SQLCipher key for {}: {e}",
+                db_path.display()
+            )
         })?;
     }
 
     // Force page access now. Without this, SQLCipher reports SQLITE_NOTADB only
     // later on the first dashboard query, which obscures the real cause.
-    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
-        .map_err(|e| format!("Unable to read Gensee database {}: {e}", db_path.display()))?;
-    conn.busy_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map_err(|e| format!("Unable to read Gensee database {}: {e}", db_path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
@@ -99,7 +104,11 @@ fn get_store_security(state: tauri::State<AppState>) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 /// Execute `sql` with `params` and return every row as a JSON object.
-fn qjson(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<Value>, String> {
+fn qjson(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<Value>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let n = stmt.column_count();
     let names: Vec<String> = (0..n)
@@ -126,11 +135,39 @@ fn qjson(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Resul
         })
         .map_err(|e| e.to_string())?;
 
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
-fn qone(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Option<Value>, String> {
+fn qone(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<Option<Value>, String> {
     Ok(qjson(conn, sql, params)?.into_iter().next())
+}
+
+fn transaction_events_table_exists(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transaction_events')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .is_ok_and(|exists| exists == 1)
+}
+
+fn decode_transaction_metadata(rows: &mut [Value]) {
+    for row in rows {
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        let Some(encoded) = object.get("metadata").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Ok(metadata) = serde_json::from_str(encoded) {
+            object.insert("metadata".to_string(), metadata);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +178,8 @@ fn qone(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result
 fn get_state(state: tauri::State<AppState>) -> Result<Value, String> {
     let conn = state.ro.lock().map_err(|e| e.to_string())?;
     let now_24h = chrono_now_ms() - 86_400_000i64;
-    let sql = format!("
+    let sql = format!(
+        "
         SELECT
             (SELECT COUNT(*) FROM sessions)      AS sessions_count,
             (SELECT COUNT(*) FROM requests)      AS requests_count,
@@ -152,8 +190,39 @@ fn get_state(state: tauri::State<AppState>) -> Result<Value, String> {
               WHERE created_at >= {now_24h}
                 AND severity IN ('high','critical')) AS recent_high_alerts,
             (SELECT COUNT(*) FROM artifacts)     AS artifacts_count
-    ");
+    "
+    );
     qone(&conn, &sql, &[])?.ok_or_else(|| "No state row".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Commands — transactional environment history
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn get_transaction_events(
+    state: tauri::State<AppState>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Value>, String> {
+    let conn = state.ro.lock().map_err(|e| e.to_string())?;
+    if !transaction_events_table_exists(&conn) {
+        return Ok(Vec::new());
+    }
+    let limit = limit.clamp(1, 2_000);
+    let offset = offset.max(0);
+    let mut rows = qjson(
+        &conn,
+        "SELECT transaction_event_id, operation_id, environment_kind, operation,
+                phase, source_run_id, target_run_id, parent_run_id, workspace,
+                summary, error_kind, error_message, metadata, occurred_at
+         FROM transaction_events
+         ORDER BY occurred_at DESC, transaction_event_id DESC
+         LIMIT ?1 OFFSET ?2",
+        &[&limit, &offset],
+    )?;
+    decode_transaction_metadata(&mut rows);
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +247,8 @@ fn get_sessions(
     } else {
         ""
     };
-    let sql = format!("
+    let sql = format!(
+        "
         SELECT s.*,
             (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.session_id) AS req_count,
             (SELECT COUNT(*) FROM agent_events ae
@@ -187,14 +257,19 @@ fn get_sessions(
           FROM sessions s {where_clause}
          ORDER BY first_event_at DESC
          LIMIT {limit} OFFSET {offset}
-    ");
+    "
+    );
     qjson(&conn, &sql, &[])
 }
 
 #[tauri::command]
 fn get_session(state: tauri::State<AppState>, id: String) -> Result<Option<Value>, String> {
     let conn = state.ro.lock().map_err(|e| e.to_string())?;
-    qone(&conn, "SELECT * FROM sessions WHERE session_id = ?1 LIMIT 1", &[&id])
+    qone(
+        &conn,
+        "SELECT * FROM sessions WHERE session_id = ?1 LIMIT 1",
+        &[&id],
+    )
 }
 
 #[tauri::command]
@@ -207,7 +282,9 @@ fn get_session_requests(
     let limit = limit.unwrap_or(50).min(200);
     qjson(
         &conn,
-        &format!("SELECT * FROM requests WHERE session_id = ?1 ORDER BY request_id DESC LIMIT {limit}"),
+        &format!(
+            "SELECT * FROM requests WHERE session_id = ?1 ORDER BY request_id DESC LIMIT {limit}"
+        ),
         &[&id],
     )
 }
@@ -215,7 +292,9 @@ fn get_session_requests(
 #[tauri::command]
 fn get_session_events(state: tauri::State<AppState>, id: String) -> Result<Vec<Value>, String> {
     let conn = state.ro.lock().map_err(|e| e.to_string())?;
-    qjson(&conn, "
+    qjson(
+        &conn,
+        "
         SELECT se.*,
             COALESCE(
                 -- Workspace-effect/fsevents records store the changed file at
@@ -235,7 +314,9 @@ fn get_session_events(state: tauri::State<AppState>, id: String) -> Result<Vec<V
          WHERE r.session_id = ?1
          ORDER BY se.ts DESC
          LIMIT 200
-    ", &[&id])
+    ",
+        &[&id],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +337,9 @@ fn get_agent_events(
         Some(rid) => format!("WHERE request_id = {rid}"),
         None => String::new(),
     };
-    let sql = format!("SELECT * FROM agent_events {where_clause} ORDER BY ts DESC LIMIT {limit} OFFSET {offset}");
+    let sql = format!(
+        "SELECT * FROM agent_events {where_clause} ORDER BY ts DESC LIMIT {limit} OFFSET {offset}"
+    );
     qjson(&conn, &sql, &[])
 }
 
@@ -280,23 +363,39 @@ fn get_alerts(
 
     let mut conditions: Vec<String> = Vec::new();
     if let Some(ref s) = severity {
-        if VALID_SEV.contains(&s.as_str()) { conditions.push(format!("severity = '{s}'")); }
+        if VALID_SEV.contains(&s.as_str()) {
+            conditions.push(format!("severity = '{s}'"));
+        }
     }
     if let Some(ref a) = action {
-        if VALID_ACT.contains(&a.as_str()) { conditions.push(format!("action = '{a}'")); }
+        if VALID_ACT.contains(&a.as_str()) {
+            conditions.push(format!("action = '{a}'"));
+        }
     }
-    if let Some(rid) = request_id { conditions.push(format!("request_id = {rid}")); }
+    if let Some(rid) = request_id {
+        conditions.push(format!("request_id = {rid}"));
+    }
 
-    let where_clause = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
     let conn = state.ro.lock().map_err(|e| e.to_string())?;
-    qjson(&conn, &format!("
+    qjson(
+        &conn,
+        &format!(
+            "
         SELECT alert_id, request_id, entity_kind, entity_id, severity, action,
                rule_id, message, path, created_at,
                json_extract(evidence, '$.tool_use_id') AS tool_use_id
           FROM alerts {where_clause}
          ORDER BY created_at DESC
          LIMIT {limit} OFFSET {offset}
-    "), &[])
+    "
+        ),
+        &[],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +403,10 @@ fn get_alerts(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-fn get_activity_stats(state: tauri::State<AppState>, range: Option<String>) -> Result<Value, String> {
+fn get_activity_stats(
+    state: tauri::State<AppState>,
+    range: Option<String>,
+) -> Result<Value, String> {
     let is7d = range.as_deref() == Some("7d");
     let bucket_ms: i64 = if is7d { 86_400_000 } else { 3_600_000 };
     let range_ms: i64 = if is7d { 7 * 86_400_000 } else { 86_400_000 };
@@ -315,14 +417,22 @@ fn get_activity_stats(state: tauri::State<AppState>, range: Option<String>) -> R
         "SELECT (CAST(first_event_at/{bucket_ms} AS INTEGER))*{bucket_ms} AS bucket, COUNT(*) AS count
            FROM sessions WHERE first_event_at>={from_ms} GROUP BY bucket ORDER BY bucket"
     ), &[])?;
-    let agent_events = qjson(&conn, &format!(
-        "SELECT (CAST(ts/{bucket_ms} AS INTEGER))*{bucket_ms} AS bucket, COUNT(*) AS count
+    let agent_events = qjson(
+        &conn,
+        &format!(
+            "SELECT (CAST(ts/{bucket_ms} AS INTEGER))*{bucket_ms} AS bucket, COUNT(*) AS count
            FROM agent_events WHERE ts>={from_ms} GROUP BY bucket ORDER BY bucket"
-    ), &[])?;
-    let alerts = qjson(&conn, &format!(
+        ),
+        &[],
+    )?;
+    let alerts = qjson(
+        &conn,
+        &format!(
         "SELECT (CAST(created_at/{bucket_ms} AS INTEGER))*{bucket_ms} AS bucket, COUNT(*) AS count
            FROM alerts WHERE created_at>={from_ms} GROUP BY bucket ORDER BY bucket"
-    ), &[])?;
+    ),
+        &[],
+    )?;
 
     Ok(json!({
         "range": if is7d { "7d" } else { "24h" },
@@ -336,12 +446,16 @@ fn get_activity_stats(state: tauri::State<AppState>, range: Option<String>) -> R
 #[tauri::command]
 fn get_severity_stats(state: tauri::State<AppState>) -> Result<Vec<Value>, String> {
     let conn = state.ro.lock().map_err(|e| e.to_string())?;
-    qjson(&conn, "
+    qjson(
+        &conn,
+        "
         SELECT severity, COUNT(*) AS count FROM alerts GROUP BY severity
         ORDER BY CASE severity
             WHEN 'critical' THEN 5 WHEN 'high' THEN 4
             WHEN 'medium' THEN 3   WHEN 'low'  THEN 2 ELSE 1 END DESC
-    ", &[])
+    ",
+        &[],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -349,73 +463,123 @@ fn get_severity_stats(state: tauri::State<AppState>) -> Result<Vec<Value>, Strin
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-fn get_artifacts(state: tauri::State<AppState>, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Value>, String> {
+fn get_artifacts(
+    state: tauri::State<AppState>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<Value>, String> {
     let conn = state.ro.lock().map_err(|e| e.to_string())?;
     let limit = limit.unwrap_or(50).min(500);
     let offset = offset.unwrap_or(0);
-    qjson(&conn, &format!("SELECT * FROM artifacts ORDER BY artifact_id DESC LIMIT {limit} OFFSET {offset}"), &[])
+    qjson(
+        &conn,
+        &format!("SELECT * FROM artifacts ORDER BY artifact_id DESC LIMIT {limit} OFFSET {offset}"),
+        &[],
+    )
 }
 
 #[tauri::command]
 fn get_artifact_graph(state: tauri::State<AppState>) -> Result<Value, String> {
     let conn = state.ro.lock().map_err(|e| e.to_string())?;
-    let facts = qjson(&conn, "
+    let facts = qjson(
+        &conn,
+        "
         SELECT kind, uri, current_digest, last_seen_at, is_agent_authored,
                risk_level, is_memory_artifact, is_control_plane, is_persistent_target,
                last_modified_source
           FROM artifact_facts ORDER BY last_seen_at DESC LIMIT 80
-    ", &[])?;
-    let edges = qjson(&conn, "
+    ",
+        &[],
+    )?;
+    let edges = qjson(
+        &conn,
+        "
         SELECT r.relation_type AS type, r.confidence, sa.uri AS src_uri, da.uri AS dst_uri
           FROM relations r
           JOIN artifacts sa ON r.src_kind = 'artifact' AND r.src_id = sa.artifact_id
           JOIN artifacts da ON r.dst_kind = 'artifact' AND r.dst_id = da.artifact_id
          ORDER BY r.relation_id DESC LIMIT 200
-    ", &[])?;
+    ",
+        &[],
+    )?;
     Ok(json!({ "facts": facts, "edges": edges }))
 }
 
 #[tauri::command]
 fn get_artifact_lineage(state: tauri::State<AppState>, id: i64) -> Result<Value, String> {
     let conn = state.ro.lock().map_err(|e| e.to_string())?;
-    let artifacts = qjson(&conn, "SELECT artifact_id, kind, uri FROM artifacts WHERE artifact_id = ?1", &[&id])?;
-    if artifacts.is_empty() { return Ok(json!({ "nodes": [], "edges": [] })); }
+    let artifacts = qjson(
+        &conn,
+        "SELECT artifact_id, kind, uri FROM artifacts WHERE artifact_id = ?1",
+        &[&id],
+    )?;
+    if artifacts.is_empty() {
+        return Ok(json!({ "nodes": [], "edges": [] }));
+    }
 
-    let relations = qjson(&conn, "
+    let relations = qjson(
+        &conn,
+        "
         SELECT * FROM relations
          WHERE (src_kind = 'artifact' AND src_id = ?1)
             OR (dst_kind = 'artifact' AND dst_id = ?1)
-    ", &[&id])?;
+    ",
+        &[&id],
+    )?;
 
     let mut related_ids: Vec<i64> = vec![id];
     for r in &relations {
         if r.get("src_kind").and_then(Value::as_str) == Some("artifact") {
-            if let Some(n) = r.get("src_id").and_then(Value::as_i64) { related_ids.push(n); }
+            if let Some(n) = r.get("src_id").and_then(Value::as_i64) {
+                related_ids.push(n);
+            }
         }
         if r.get("dst_kind").and_then(Value::as_str) == Some("artifact") {
-            if let Some(n) = r.get("dst_id").and_then(Value::as_i64) { related_ids.push(n); }
+            if let Some(n) = r.get("dst_id").and_then(Value::as_i64) {
+                related_ids.push(n);
+            }
         }
     }
-    related_ids.sort(); related_ids.dedup();
-    let ids_str = related_ids.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
-    let all = qjson(&conn, &format!("SELECT artifact_id, kind, uri FROM artifacts WHERE artifact_id IN ({ids_str})"), &[])?;
+    related_ids.sort();
+    related_ids.dedup();
+    let ids_str = related_ids
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let all = qjson(
+        &conn,
+        &format!("SELECT artifact_id, kind, uri FROM artifacts WHERE artifact_id IN ({ids_str})"),
+        &[],
+    )?;
 
-    let nodes: Vec<Value> = all.iter().map(|a| json!({
-        "id":    a.get("artifact_id").unwrap_or(&Value::Null).to_string(),
-        "kind":  a.get("kind"),
-        "label": a.get("uri").and_then(Value::as_str).unwrap_or("").replace("file://", ""),
-        "uri":   a.get("uri"),
-    })).collect();
+    let nodes: Vec<Value> = all
+        .iter()
+        .map(|a| {
+            json!({
+                "id":    a.get("artifact_id").unwrap_or(&Value::Null).to_string(),
+                "kind":  a.get("kind"),
+                "label": a.get("uri").and_then(Value::as_str).unwrap_or("").replace("file://", ""),
+                "uri":   a.get("uri"),
+            })
+        })
+        .collect();
 
-    let edges: Vec<Value> = relations.iter()
-        .filter(|r| r.get("src_kind").and_then(Value::as_str) == Some("artifact")
-                 && r.get("dst_kind").and_then(Value::as_str) == Some("artifact"))
-        .map(|r| json!({
-            "source":        r.get("src_id").unwrap_or(&Value::Null).to_string(),
-            "target":        r.get("dst_id").unwrap_or(&Value::Null).to_string(),
-            "relation_type": r.get("relation_type"),
-            "confidence":    r.get("confidence"),
-        })).collect();
+    let edges: Vec<Value> = relations
+        .iter()
+        .filter(|r| {
+            r.get("src_kind").and_then(Value::as_str) == Some("artifact")
+                && r.get("dst_kind").and_then(Value::as_str) == Some("artifact")
+        })
+        .map(|r| {
+            json!({
+                "source":        r.get("src_id").unwrap_or(&Value::Null).to_string(),
+                "target":        r.get("dst_id").unwrap_or(&Value::Null).to_string(),
+                "relation_type": r.get("relation_type"),
+                "confidence":    r.get("confidence"),
+            })
+        })
+        .collect();
 
     Ok(json!({ "nodes": nodes, "edges": edges }))
 }
@@ -424,7 +588,8 @@ fn get_artifact_lineage(state: tauri::State<AppState>, id: i64) -> Result<Value,
 // Commands — policy
 // ---------------------------------------------------------------------------
 
-const DEFAULT_POLICY: &str = include_str!("../../../crate/gensee-crate-rules/policy/default-policy.json");
+const DEFAULT_POLICY: &str =
+    include_str!("../../../crate/gensee-crate-rules/policy/default-policy.json");
 
 #[tauri::command]
 fn get_policy(state: tauri::State<AppState>) -> Result<Value, String> {
@@ -463,7 +628,11 @@ fn validate_policy(home: &Path, text: &str) -> Result<(), String> {
 }
 
 fn try_validate(tmp: &Path, home: &Path) -> Result<(), String> {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
     let candidates = [
         std::env::var("GENSEE_BIN").ok().map(PathBuf::from),
         Some(repo_root.join("target/release/gensee")),
@@ -478,7 +647,10 @@ fn try_validate(tmp: &Path, home: &Path) -> Result<(), String> {
             .env("GENSEE_HOME", home)
             .output()
         {
-            Ok(out) if out.status.success() => { found = true; break; }
+            Ok(out) if out.status.success() => {
+                found = true;
+                break;
+            }
             Ok(out) => {
                 let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 return Err(format!("Policy validation failed: {detail}"));
@@ -489,20 +661,26 @@ fn try_validate(tmp: &Path, home: &Path) -> Result<(), String> {
     }
 
     if !found {
-        return Err(
-            "No gensee binary found for policy validation. \
+        return Err("No gensee binary found for policy validation. \
              Build the CLI first: cargo build --release -p gensee-crate-cli, \
-             or set GENSEE_BIN to the binary path.".to_string()
-        );
+             or set GENSEE_BIN to the binary path."
+            .to_string());
     }
     Ok(())
 }
 
 fn which_gensee() -> Option<PathBuf> {
-    std::process::Command::new("which").arg("gensee").output().ok()
-        .and_then(|o| if o.status.success() {
-            Some(PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
-        } else { None })
+    std::process::Command::new("which")
+        .arg("gensee")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+            } else {
+                None
+            }
+        })
 }
 
 /// Write sensitive configuration without ever truncating the active policy.
@@ -512,7 +690,8 @@ fn which_gensee() -> Option<PathBuf> {
 fn write_secret(path: PathBuf, data: &[u8]) -> Result<(), String> {
     use std::io::Write;
 
-    let filename = path.file_name()
+    let filename = path
+        .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("Invalid policy path: {}", path.display()))?;
     let temporary = path.with_file_name(format!(".{filename}.{}.tmp", uuid_hex()));
@@ -553,53 +732,88 @@ fn uuid_hex() -> String {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-fn get_feedback(state: tauri::State<AppState>, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Value>, String> {
+fn get_feedback(
+    state: tauri::State<AppState>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<Value>, String> {
     let conn = state.ro.lock().map_err(|e| e.to_string())?;
     let limit = limit.unwrap_or(50).min(500);
     let offset = offset.unwrap_or(0);
-    qjson(&conn, &format!("SELECT * FROM human_feedback ORDER BY created_at DESC LIMIT {limit} OFFSET {offset}"), &[])
+    qjson(
+        &conn,
+        &format!(
+            "SELECT * FROM human_feedback ORDER BY created_at DESC LIMIT {limit} OFFSET {offset}"
+        ),
+        &[],
+    )
 }
 
 #[tauri::command]
 fn record_feedback(state: tauri::State<AppState>, data: Value) -> Result<Value, String> {
     // Open a SQLCipher-aware read-write connection for this write operation.
     let db_path = state.home.join("gensee.db");
-    let conn = open_dashboard_connection(
-        &state.home,
-        &db_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )?;
+    let conn = open_dashboard_connection(&state.home, &db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
 
     let now = chrono_now_ms();
-    let event_key    = data.get("event_key").and_then(Value::as_str).unwrap_or("");
-    let tool_use_id  = data.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-    let session_id   = data.get("session_id").and_then(Value::as_str).unwrap_or("");
-    let gensee_action= data.get("gensee_action").and_then(Value::as_str).unwrap_or("");
-    let human_verdict= data.get("human_verdict").and_then(Value::as_str).unwrap_or("agree");
-    let rule_id      = data.get("rule_id").and_then(Value::as_str).unwrap_or("");
-    let path         = data.get("path").and_then(Value::as_str).unwrap_or("");
-    let note         = data.get("note").and_then(Value::as_str).unwrap_or("");
+    let event_key = data.get("event_key").and_then(Value::as_str).unwrap_or("");
+    let tool_use_id = data
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let session_id = data.get("session_id").and_then(Value::as_str).unwrap_or("");
+    let gensee_action = data
+        .get("gensee_action")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let human_verdict = data
+        .get("human_verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("agree");
+    let rule_id = data.get("rule_id").and_then(Value::as_str).unwrap_or("");
+    let path = data.get("path").and_then(Value::as_str).unwrap_or("");
+    let note = data.get("note").and_then(Value::as_str).unwrap_or("");
 
     let label = derive_label(gensee_action, human_verdict);
 
-    let rows = conn.query_row("
+    let rows = conn
+        .query_row(
+            "
         INSERT INTO human_feedback
             (event_key, tool_use_id, session_id, gensee_action, human_verdict, label,
              rule_id, path, note, created_at)
         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
         RETURNING feedback_id
-    ", rusqlite::params![
-        event_key, tool_use_id, session_id, gensee_action, human_verdict, label,
-        rule_id, path, note, now
-    ], |row| row.get::<_, i64>(0)).map_err(|e| e.to_string())?;
+    ",
+            rusqlite::params![
+                event_key,
+                tool_use_id,
+                session_id,
+                gensee_action,
+                human_verdict,
+                label,
+                rule_id,
+                path,
+                note,
+                now
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?;
 
     Ok(json!({ "feedback_id": rows }))
 }
 
 fn derive_label(gensee_action: &str, human_verdict: &str) -> &'static str {
-    if human_verdict == "agree" { return "confirmed"; }
-    if human_verdict == "allow" && matches!(gensee_action, "block" | "ask") { return "false_positive"; }
-    if human_verdict == "deny"  && matches!(gensee_action, "allow" | "warn") { return "false_negative"; }
+    if human_verdict == "agree" {
+        return "confirmed";
+    }
+    if human_verdict == "allow" && matches!(gensee_action, "block" | "ask") {
+        return "false_positive";
+    }
+    if human_verdict == "deny" && matches!(gensee_action, "allow" | "warn") {
+        return "false_negative";
+    }
     "override"
 }
 
@@ -614,15 +828,23 @@ fn get_today_metrics(state: tauri::State<AppState>, date: Option<String>) -> Res
         d.len() == 10
             && d.as_bytes().get(4) == Some(&b'-')
             && d.as_bytes().get(7) == Some(&b'-')
-            && d.as_bytes().iter().enumerate().all(|(i, c)| {
-                matches!(i, 4 | 7) || c.is_ascii_digit()
-            })
+            && d.as_bytes()
+                .iter()
+                .enumerate()
+                .all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit())
     });
     let date_expr = selected_date.as_deref().unwrap_or("now");
-    let date_modifier = if selected_date.is_some() { "" } else { ", 'localtime'" };
+    let date_modifier = if selected_date.is_some() {
+        ""
+    } else {
+        ", 'localtime'"
+    };
     let date_sql = format!("date(?1{date_modifier})");
 
-    let tool_counts = qjson(&conn, &format!("
+    let tool_counts = qjson(
+        &conn,
+        &format!(
+            "
         SELECT ae.tool_name, COUNT(*) AS count
           FROM agent_events ae
          WHERE ae.type = 'PreToolUse'
@@ -631,64 +853,119 @@ fn get_today_metrics(state: tauri::State<AppState>, date: Option<String>) -> Res
          GROUP BY ae.tool_name
          ORDER BY count DESC
          LIMIT 20
-    "), &[&date_expr])?;
+    "
+        ),
+        &[&date_expr],
+    )?;
 
-    let sessions = qone(&conn, &format!("
+    let sessions = qone(
+        &conn,
+        &format!(
+            "
         SELECT COUNT(*) AS count FROM sessions
          WHERE date(first_event_at / 1000, 'unixepoch', 'localtime') = {date_sql}
            AND agent_id != 'system-monitor'
-    "), &[&date_expr])?
-        .and_then(|r| r.get("count").and_then(Value::as_i64))
-        .unwrap_or(0);
-    let requests = qone(&conn, &format!("
+    "
+        ),
+        &[&date_expr],
+    )?
+    .and_then(|r| r.get("count").and_then(Value::as_i64))
+    .unwrap_or(0);
+    let requests = qone(
+        &conn,
+        &format!(
+            "
         SELECT COUNT(DISTINCT ae.request_id) AS count FROM agent_events ae
          WHERE date(ae.ts / 1000, 'unixepoch', 'localtime') = {date_sql}
-    "), &[&date_expr])?
-        .and_then(|r| r.get("count").and_then(Value::as_i64))
-        .unwrap_or(0);
-    let files_written = qone(&conn, &format!("
+    "
+        ),
+        &[&date_expr],
+    )?
+    .and_then(|r| r.get("count").and_then(Value::as_i64))
+    .unwrap_or(0);
+    let files_written = qone(
+        &conn,
+        &format!(
+            "
         SELECT COUNT(DISTINCT json_extract(ae.tool_input, '$.path')) AS count
           FROM agent_events ae
          WHERE ae.type = 'PreToolUse'
            AND ae.tool_name IN ('Write', 'Edit', 'MultiEdit', 'apply_patch')
            AND date(ae.ts / 1000, 'unixepoch', 'localtime') = {date_sql}
            AND json_extract(ae.tool_input, '$.path') IS NOT NULL
-    "), &[&date_expr])?
-        .and_then(|r| r.get("count").and_then(Value::as_i64))
-        .unwrap_or(0);
-    let files_read = qone(&conn, &format!("
+    "
+        ),
+        &[&date_expr],
+    )?
+    .and_then(|r| r.get("count").and_then(Value::as_i64))
+    .unwrap_or(0);
+    let files_read = qone(
+        &conn,
+        &format!(
+            "
         SELECT COUNT(DISTINCT json_extract(ae.tool_input, '$.path')) AS count
           FROM agent_events ae
          WHERE ae.type = 'PreToolUse' AND ae.tool_name = 'Read'
            AND date(ae.ts / 1000, 'unixepoch', 'localtime') = {date_sql}
            AND json_extract(ae.tool_input, '$.path') IS NOT NULL
-    "), &[&date_expr])?
-        .and_then(|r| r.get("count").and_then(Value::as_i64))
-        .unwrap_or(0);
-    let alerts_by_action = qjson(&conn, &format!("
+    "
+        ),
+        &[&date_expr],
+    )?
+    .and_then(|r| r.get("count").and_then(Value::as_i64))
+    .unwrap_or(0);
+    let alerts_by_action = qjson(
+        &conn,
+        &format!(
+            "
         SELECT action, COUNT(*) AS count FROM alerts
          WHERE date(created_at / 1000, 'unixepoch', 'localtime') = {date_sql}
          GROUP BY action
-    "), &[&date_expr])?;
-    let alerts_by_severity = qjson(&conn, &format!("
+    "
+        ),
+        &[&date_expr],
+    )?;
+    let alerts_by_severity = qjson(
+        &conn,
+        &format!(
+            "
         SELECT severity, COUNT(*) AS count FROM alerts
          WHERE date(created_at / 1000, 'unixepoch', 'localtime') = {date_sql}
          GROUP BY severity
-    "), &[&date_expr])?;
+    "
+        ),
+        &[&date_expr],
+    )?;
 
-    let by_action: serde_json::Map<String, Value> = alerts_by_action.into_iter()
-        .filter_map(|row| Some((row.get("action")?.as_str()?.to_owned(), row.get("count")?.clone())))
+    let by_action: serde_json::Map<String, Value> = alerts_by_action
+        .into_iter()
+        .filter_map(|row| {
+            Some((
+                row.get("action")?.as_str()?.to_owned(),
+                row.get("count")?.clone(),
+            ))
+        })
         .collect();
-    let by_severity: serde_json::Map<String, Value> = alerts_by_severity.into_iter()
-        .filter_map(|row| Some((row.get("severity")?.as_str()?.to_owned(), row.get("count")?.clone())))
+    let by_severity: serde_json::Map<String, Value> = alerts_by_severity
+        .into_iter()
+        .filter_map(|row| {
+            Some((
+                row.get("severity")?.as_str()?.to_owned(),
+                row.get("count")?.clone(),
+            ))
+        })
         .collect();
-    let tool_calls = tool_counts.iter()
+    let tool_calls = tool_counts
+        .iter()
         .filter_map(|row| row.get("count").and_then(Value::as_i64))
         .sum::<i64>();
-    let tool_count = |name: &str| tool_counts.iter()
-        .find(|row| row.get("tool_name").and_then(Value::as_str) == Some(name))
-        .and_then(|row| row.get("count").and_then(Value::as_i64))
-        .unwrap_or(0);
+    let tool_count = |name: &str| {
+        tool_counts
+            .iter()
+            .find(|row| row.get("tool_name").and_then(Value::as_str) == Some(name))
+            .and_then(|row| row.get("count").and_then(Value::as_i64))
+            .unwrap_or(0)
+    };
 
     Ok(json!({
         "sessions": sessions,
@@ -711,21 +988,40 @@ fn get_today_metrics(state: tauri::State<AppState>, date: Option<String>) -> Res
 
 fn start_event_stream(app: tauri::AppHandle, home: PathBuf, db_path: PathBuf) {
     std::thread::spawn(move || {
-        let conn = match open_dashboard_connection(&home, &db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-            Ok(c) => c,
-            Err(e) => { eprintln!("Event stream: cannot open DB: {e}"); return; }
-        };
+        let conn =
+            match open_dashboard_connection(&home, &db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Event stream: cannot open DB: {e}");
+                    return;
+                }
+            };
 
         let mut last_id: i64 = conn
-            .query_row("SELECT COALESCE(MAX(event_id),0) FROM agent_events", [], |r| r.get(0))
+            .query_row(
+                "SELECT COALESCE(MAX(event_id),0) FROM agent_events",
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
+        let mut last_transaction_id: i64 = if transaction_events_table_exists(&conn) {
+            conn.query_row(
+                "SELECT COALESCE(MAX(transaction_event_id),0) FROM transaction_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        };
 
         loop {
             std::thread::sleep(Duration::from_secs(1));
-            if let Ok(events) = qjson(&conn,
+            if let Ok(events) = qjson(
+                &conn,
                 "SELECT * FROM agent_events WHERE event_id > ?1 ORDER BY event_id ASC LIMIT 50",
-                &[&last_id])
-            {
+                &[&last_id],
+            ) {
                 if let Some(last) = events.last() {
                     if let Some(id) = last.get("event_id").and_then(Value::as_i64) {
                         last_id = id;
@@ -733,6 +1029,29 @@ fn start_event_stream(app: tauri::AppHandle, home: PathBuf, db_path: PathBuf) {
                 }
                 for event in events {
                     let _ = app.emit("agent-event", &event);
+                }
+            }
+            if transaction_events_table_exists(&conn) {
+                if let Ok(mut events) = qjson(
+                    &conn,
+                    "SELECT transaction_event_id, operation_id, environment_kind, operation,
+                            phase, source_run_id, target_run_id, parent_run_id, workspace,
+                            summary, error_kind, error_message, metadata, occurred_at
+                     FROM transaction_events
+                     WHERE transaction_event_id > ?1
+                     ORDER BY transaction_event_id ASC
+                     LIMIT 100",
+                    &[&last_transaction_id],
+                ) {
+                    decode_transaction_metadata(&mut events);
+                    if let Some(last) = events.last() {
+                        if let Some(id) = last.get("transaction_event_id").and_then(Value::as_i64) {
+                            last_transaction_id = id;
+                        }
+                    }
+                    for event in events {
+                        let _ = app.emit("transaction-event", &event);
+                    }
                 }
             }
         }
@@ -751,13 +1070,19 @@ fn chrono_now_ms() -> i64 {
 }
 
 fn resolve_db_path(home: &Path) -> PathBuf {
-    if let Ok(p) = std::env::var("GENSEE_DB_PATH") { return PathBuf::from(p); }
+    if let Ok(p) = std::env::var("GENSEE_DB_PATH") {
+        return PathBuf::from(p);
+    }
     home.join("gensee.db")
 }
 
 fn resolve_home() -> PathBuf {
-    if let Ok(p) = std::env::var("GENSEE_HOME") { return PathBuf::from(p); }
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".gensee")
+    if let Ok(p) = std::env::var("GENSEE_HOME") {
+        return PathBuf::from(p);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".gensee")
 }
 
 // ---------------------------------------------------------------------------
@@ -766,7 +1091,7 @@ fn resolve_home() -> PathBuf {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let home    = resolve_home();
+    let home = resolve_home();
     let db_path = resolve_db_path(&home);
 
     // Open the real store at startup. Do not fall back to an empty in-memory
@@ -774,7 +1099,10 @@ pub fn run() {
     let ro = open_dashboard_connection(&home, &db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .unwrap_or_else(|error| panic!("Failed to open Gensee store: {error}"));
 
-    let state = AppState { ro: Mutex::new(ro), home: home.clone() };
+    let state = AppState {
+        ro: Mutex::new(ro),
+        home: home.clone(),
+    };
 
     tauri::Builder::default()
         .manage(state)
@@ -797,6 +1125,7 @@ pub fn run() {
             get_feedback,
             record_feedback,
             get_today_metrics,
+            get_transaction_events,
         ])
         .setup(move |app| {
             // Devtools are opt-in even for debug builds so normal development

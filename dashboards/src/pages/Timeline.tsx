@@ -13,6 +13,7 @@ import {
   Typography,
 } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
+import { useSearchParams } from 'react-router-dom';
 import { PageHeader }       from '@/components/PageHeader';
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder';
 import { SeverityBadge }    from '@/components/SeverityBadge';
@@ -39,8 +40,10 @@ const SOURCE_OPTIONS = [
 ];
 
 export default function Timeline() {
+  const [searchParams] = useSearchParams();
+  const sessionFilter = searchParams.get('session');
   const [source,    setSource]    = useState<string | undefined>(undefined);
-  const [hideEmpty, setHideEmpty] = useState(true);
+  const [hideEmpty, setHideEmpty] = useState(!sessionFilter);
 
   const fetchSessions = useCallback(
     () => api.sessions(100, 0, hideEmpty),
@@ -48,15 +51,18 @@ export default function Timeline() {
   );
   const { data: sessions, loading, refetch } = useApi(fetchSessions);
 
-  const filtered = source
-    ? (sessions ?? []).filter(s => s.agent_id.includes(source))
-    : (sessions ?? []);
+  const filtered = (sessions ?? []).filter(session =>
+    (!source || session.agent_id.includes(source))
+      && (!sessionFilter || session.session_id === sessionFilter),
+  );
 
   return (
     <div>
       <PageHeader
         title="Timeline"
-        description="Chronological history of agent sessions and requests."
+        description={sessionFilter
+          ? `Chronological activity for selected session ${sessionFilter}.`
+          : 'Chronological history of agent sessions and requests.'}
         extra={
           <Space>
             <Select
@@ -93,6 +99,7 @@ export default function Timeline() {
             ) : (
               <Collapse
                 size="small"
+                defaultActiveKey={sessionFilter ? [sessionFilter] : undefined}
                 items={filtered.map(s => ({
                   key:   s.session_id,
                   label: <SessionLabel session={s} />,

@@ -91,6 +91,18 @@ agent prompts, file paths, tool names, policy findings, and bounded metadata for
 WebSearch, WebFetch, and ToolSearch calls. Treat the Gensee home directory as
 private user data and do not share the database without review.
 
+The **Transactions** page reads append-only transactional environment events
+from the same encrypted database. Its History view groups state-changing tclone
+operations chronologically, while Dependencies shows which runs were forked and
+which successful merges contributed changes to another run. Run identifiers
+link to a session-filtered Timeline. New operations update Transactions live and
+also appear under the **Transactional environment** category in Live Feed.
+
+Discarding or deleting a tclone container does not erase its transaction
+history. Stored failure details are bounded: Gensee records structured operation
+metadata and short diagnostic messages, but not full patches, environment
+variables, or unrestricted command output.
+
 The store does not generically copy arbitrary non-file tool-input objects. Each
 persisted tool-input JSON record is capped at 16 KiB; oversized inputs are
 replaced by truncation metadata rather than partial content.

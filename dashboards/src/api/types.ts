@@ -54,6 +54,35 @@ export interface SystemEvent {
   process: string | null;
 }
 
+export type TransactionOperation =
+  | 'source'
+  | 'source_end'
+  | 'fork'
+  | 'merge'
+  | 'switch'
+  | 'keep'
+  | 'discard'
+  | 'delete';
+
+export type TransactionPhase = 'started' | 'succeeded' | 'failed';
+
+export interface TransactionEvent {
+  transaction_event_id: number;
+  operation_id: string;
+  environment_kind: string;
+  operation: TransactionOperation;
+  phase: TransactionPhase;
+  source_run_id: string | null;
+  target_run_id: string | null;
+  parent_run_id: string | null;
+  workspace: string | null;
+  summary: string;
+  error_kind: string | null;
+  error_message: string | null;
+  metadata: Record<string, unknown> | null;
+  occurred_at: number;
+}
+
 export type AlertSeverity = 'info' | 'low' | 'medium' | 'high' | 'critical';
 export type AlertAction   = 'allow' | 'warn' | 'ask' | 'block';
 
