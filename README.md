@@ -445,15 +445,28 @@ alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX
 gensee-tclone run --runtime tclone -- codex
 gensee-tclone run list              # source id is under "Tclone containers"
 gensee-tclone run list --json       # agent-facing completion polling
-gensee-tclone run fork <source-run-id> --copies 2 --attach tmux:right --json
+gensee-tclone run fork <source-run-id> --copies 2 --name try-upgrade --approach 'minimal compatible upgrade' --approach 'aggressive latest-version upgrade' --attach tmux:right --json
 gensee-tclone run attach <fork-id> --tmux right
 gensee-tclone run send <fork-id> -- 'Run cargo test and fix failures'
 gensee-tclone run exec <fork-id> -- bash -lc 'cargo test'
 gensee-tclone run diff <fork-id> [--json]
 gensee-tclone run summary <fork-id> --json
+gensee-tclone run compare <parallel-fork-id> --json
+gensee-tclone run choose <parallel-fork-id> <--merge|--promote|--discard-all>
 gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
 gensee-tclone run switch <fork-id>                         # promote fork; end old source
 ```
+
+Named parallel groups use stable indexed container names when available
+(`try-upgrade-0`, `try-upgrade-1`). If an unresolved older run still owns those
+names, Gensee automatically falls back to a timestamped prefix for the new group
+instead of failing the fork request. Panes form a vertical stack to the right of
+the source.
+Codex assigns the repeated approaches in order, compares the completed diffs
+and tests, recommends a winner, and—only after approval—merges or promotes that
+winner while discarding the other group members. The recommendation is a
+smallest-passing-diff heuristic, not a correctness judgment, and should be
+presented as a suggestion rather than an automatic choice.
 
 Codex should mediate fork resolution: summarize the fork in chat, offer merge,
 promote-to-main-and-end-source, and discard choices, and run the selected

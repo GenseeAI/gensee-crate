@@ -31,8 +31,10 @@ Use a second terminal to fork the running source container:
 ```bash
 gensee-tclone run list
 gensee-tclone run list --json
-gensee-tclone run fork <source-run-id> --copies 2
-gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right --json
+gensee-tclone run fork <source-run-id> --copies 2 --name try-upgrade \
+  --approach 'minimal compatible upgrade' \
+  --approach 'aggressive latest-version upgrade' \
+  --attach tmux:right --json
 gensee-tclone run shell <run_id-or-container>
 gensee-tclone run attach <run_id-or-container>
 gensee-tclone run attach <run_id-or-container> --tmux right
@@ -40,6 +42,8 @@ gensee-tclone run send <run_id-or-container> -- 'Run npm test and fix failures'
 gensee-tclone run exec <run_id-or-container> -- bash -lc 'cargo test'
 gensee-tclone run diff <run_id-or-container> [--json]
 gensee-tclone run summary <fork-id> --json
+gensee-tclone run compare <parallel-fork-id> --json
+gensee-tclone run choose <parallel-fork-id> <--merge|--promote|--discard-all>
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
 gensee-tclone run merge <fork-id> --into <source-id> --filesystem
 gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace/src /workspace/Cargo.toml
@@ -64,6 +68,26 @@ same-user process inside the fork. Tclone currently trusts the fork agent and
 does not prevent it from tampering with its own hook state; the gate prevents an
 ordinary confused agent from skipping the user-choice turn.
 
+For parallel work, Codex proposes distinct approaches before asking for one
+approval. A named `--copies 2` group creates clean container names such as
+`try-upgrade-0` and `try-upgrade-1` when those names are free. If an unresolved
+older run still owns the clean names, Gensee automatically appends a timestamped
+suffix to the new group's prefix so repeated smoke tests can fork without manual
+cleanup. Repeated `--approach` values are assigned in index order and included
+in each fork's task context as validated, bounded labels rather than trusted
+instructions. The first fork no longer coordinates the
+user-facing decision; every fork reports only its own completion. When all forks
+finish, Gensee sends the source Codex a comparison prompt. The source runs
+`run compare --json`, which reports each approach's changed files, tests,
+readiness, and a smallest-passing-diff recommendation. That recommendation is
+only a size-and-test-status heuristic, not a correctness judgment; Codex must
+present it as a suggestion for the user's decision.
+After the user selects an approach and lifecycle action in the source pane,
+`run choose` merges or promotes that winner and schedules every other group
+member for discard. `--discard-all` retires the whole group. These remain
+agent-facing commands protected by the same later-user-approval gate as
+single-fork lifecycle commands.
+
 The source id is the row with role `source` under the `Tclone containers`
 section of `gensee run list`. The launcher also prints it directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
@@ -87,7 +111,8 @@ session as soon as the container is ready. If the host command runs inside tmux
 and the sudo wrapper preserves `TMUX`, `gensee run fork --attach tmux:right`
 opens the new fork in a right-side pane and reconnects to the cloned
 in-container `gensee-agent` session. With `--copies 2`, additional forks are
-opened below the first fork pane. `gensee run attach <id> --tmux right` can open
+opened below the previous fork pane, leaving the source on the left and one
+stacked fork column on the right. `gensee run attach <id> --tmux right` can open
 an existing run or fork in a new host pane.
 
 Use `gensee run send <id> -- <prompt>` to paste a prompt into the fork's
