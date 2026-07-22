@@ -6657,13 +6657,9 @@ fn record_tclone_parallel_choice_offer_for_source(
     target: &TcloneRunRecord,
     group: &[TcloneRunRecord],
 ) -> io::Result<()> {
-    let caller = env::var("GENSEE_TCLONE_HOST_CONTROL_CALLER").unwrap_or_default();
     let Some(source_run_id) = target.parent_run_id.as_deref() else {
         return Ok(());
     };
-    if caller != source_run_id {
-        return Ok(());
-    }
     let source = find_tclone_record(source_run_id)?;
     let offer = TcloneParallelChoiceOffer {
         source_run_id: source_run_id.to_string(),
@@ -9881,6 +9877,50 @@ mod tests {
         assert!(validate_tclone_parallel_choice_approval(&source, &target, "switch", 12).is_err());
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn tclone_parallel_choice_offer_records_without_host_control_caller() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("parallel-choice-offer-no-caller");
+        let old_home = env::var_os("GENSEE_HOME");
+        let old_caller = env::var_os("GENSEE_TCLONE_HOST_CONTROL_CALLER");
+        env::set_var("GENSEE_HOME", &root);
+        env::remove_var("GENSEE_TCLONE_HOST_CONTROL_CALLER");
+
+        let mut source = test_record("run_1", "running");
+        source.role = "source".to_string();
+        let mut target = test_fork_record("run_1_fork_2_0", "run_1");
+        target.fork_group_id = Some("group_1".to_string());
+        target.fork_index = Some(0);
+        target.fork_count = Some(2);
+        target.fork_approach = Some("minimal compatible upgrade".to_string());
+        let mut sibling = test_fork_record("run_1_fork_2_1", "run_1");
+        sibling.fork_group_id = Some("group_1".to_string());
+        sibling.fork_index = Some(1);
+        sibling.fork_count = Some(2);
+        sibling.fork_approach = Some("aggressive latest-version upgrade".to_string());
+        write_tclone_runs_to_path(&tclone_state_path().unwrap(), &[source.clone()]).unwrap();
+
+        record_tclone_parallel_choice_offer_for_source(&target, &[target.clone(), sibling])
+            .unwrap();
+        let offer = read_tclone_parallel_choice_offer_for_source(&source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(offer.source_run_id, "run_1");
+        assert_eq!(offer.group_id, "group_1");
+        assert_eq!(offer.options.len(), 2);
+        assert!(offer.approval.is_none());
+
+        match old_caller {
+            Some(value) => env::set_var("GENSEE_TCLONE_HOST_CONTROL_CALLER", value),
+            None => env::remove_var("GENSEE_TCLONE_HOST_CONTROL_CALLER"),
+        }
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
