@@ -37,7 +37,7 @@ that setting to enable egress-proxy governance; see
 
 ## Managed macOS sandbox mode
 
-The v0.1 managed Mac path adds `sandbox-exec` confinement and a staged
+The v0.2 managed Mac path adds `sandbox-exec` confinement and a staged
 workspace:
 
 ```bash

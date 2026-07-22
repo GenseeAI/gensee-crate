@@ -1,8 +1,8 @@
 # Endpoint Security spike
 
-The EndpointSecurity spike is isolated from the v0.1 critical path. The current
-watch path uses Apple's `/usr/bin/eslogger` as the default system-event source
-when available; a signed EndpointSecurity client remains future work.
+The EndpointSecurity spike is isolated from the current release path. The
+current watch path uses Apple's `/usr/bin/eslogger` as the default system-event
+source when available; a signed EndpointSecurity client remains future work.
 
 ```bash
 cargo run -p gensee-crate-macos --bin endpoint-spike -- list
