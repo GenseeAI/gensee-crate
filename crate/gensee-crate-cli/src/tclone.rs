@@ -934,10 +934,6 @@ fn try_record_tclone_source_parallel_choice_approval(
     let Some((target_run_id, choice)) = selected else {
         return Ok(());
     };
-    let target = find_tclone_record(&target_run_id)?;
-    if target.parent_run_id.as_deref() != Some(source_run_id) {
-        return Ok(());
-    }
     offer.approval = Some(TcloneParallelChoiceApproval {
         run_id: target_run_id.clone(),
         choice: choice.to_string(),
@@ -945,6 +941,29 @@ fn try_record_tclone_source_parallel_choice_approval(
         consumed_at_ms: None,
     });
     write_tclone_parallel_choice_offer(&offer)?;
+
+    // The source container's run registry is a clone-time snapshot. Parallel
+    // fork records are created on the host after that snapshot, so looking up
+    // the selected fork locally may legitimately fail. The signed comparison
+    // offer is authoritative for the allowed target; persist approval before
+    // attempting the optional fork-result mirror.
+    let target = match find_tclone_record(&target_run_id) {
+        Ok(target) => target,
+        Err(error) => {
+            eprintln!(
+                "gensee: warning: recorded parallel choice approval, but could not find target {} for mirroring: {error}",
+                target_run_id
+            );
+            return Ok(());
+        }
+    };
+    if target.parent_run_id.as_deref() != Some(source_run_id) {
+        eprintln!(
+            "gensee: warning: recorded parallel choice approval, but target {} is not a child of source {}",
+            target.run_id, source_run_id
+        );
+        return Ok(());
+    }
 
     let podman = tclone_podman();
     let Some(mut result) = (match read_tclone_fork_result(&podman, &target) {
@@ -9945,6 +9964,56 @@ mod tests {
         assert!(validate_tclone_parallel_choice_approval(&source, &target, "switch", 12).is_err());
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn tclone_source_records_parallel_approval_without_local_fork_record() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("parallel-source-approval-stale-registry");
+        let control_dir = root.join("host-control");
+        fs::create_dir_all(&control_dir).unwrap();
+        let old_home = env::var_os("GENSEE_HOME");
+        let old_control_dir = env::var_os(TCLONE_HOST_CONTROL_DIR_ENV);
+        env::set_var("GENSEE_HOME", &root);
+        env::set_var(TCLONE_HOST_CONTROL_DIR_ENV, &control_dir);
+
+        let offer = TcloneParallelChoiceOffer {
+            source_run_id: "run_1".to_string(),
+            group_id: "group_1".to_string(),
+            offered_at_ms: 10,
+            options: vec![TcloneParallelChoiceOption {
+                label: "Approach A".to_string(),
+                run_id: "run_1_fork_2_0".to_string(),
+                approach: "minimal compatible upgrade".to_string(),
+            }],
+            approval: None,
+        };
+        write_tclone_parallel_choice_offer(&offer).unwrap();
+        let context = json!({
+            "run_id": "run_1",
+            "role": "source",
+            "source_run_id": "run_1",
+        });
+        let mut event = test_hook_event("PreToolUse", 11);
+        event.tool_input_command = Some("gensee run choose run_1_fork_2_0 --merge".to_string());
+
+        try_record_tclone_source_parallel_choice_approval(&event, &context).unwrap();
+
+        let recorded = read_tclone_parallel_choice_offer().unwrap();
+        let approval = recorded.approval.unwrap();
+        assert_eq!(approval.run_id, "run_1_fork_2_0");
+        assert_eq!(approval.choice, "merge");
+        assert_eq!(approval.approved_at_ms, 11);
+
+        match old_control_dir {
+            Some(value) => env::set_var(TCLONE_HOST_CONTROL_DIR_ENV, value),
+            None => env::remove_var(TCLONE_HOST_CONTROL_DIR_ENV),
+        }
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
