@@ -464,7 +464,9 @@ instead of failing the fork request. Panes form a vertical stack to the right of
 the source.
 Codex assigns the repeated approaches in order, compares the completed diffs
 and tests, recommends a winner, and—only after approval—merges or promotes that
-winner while discarding the other group members.
+winner while discarding the other group members. The recommendation is a
+smallest-passing-diff heuristic, not a correctness judgment, and should be
+presented as a suggestion rather than an automatic choice.
 
 Codex should mediate fork resolution: summarize the fork in chat, offer merge,
 promote-to-main-and-end-source, and discard choices, and run the selected

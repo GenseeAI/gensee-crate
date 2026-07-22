@@ -74,11 +74,14 @@ approval. A named `--copies 2` group creates clean container names such as
 older run still owns the clean names, Gensee automatically appends a timestamped
 suffix to the new group's prefix so repeated smoke tests can fork without manual
 cleanup. Repeated `--approach` values are assigned in index order and included
-in each fork's trusted task context. The first fork no longer coordinates the
+in each fork's task context as validated, bounded labels rather than trusted
+instructions. The first fork no longer coordinates the
 user-facing decision; every fork reports only its own completion. When all forks
 finish, Gensee sends the source Codex a comparison prompt. The source runs
 `run compare --json`, which reports each approach's changed files, tests,
-readiness, and a smallest-passing-diff recommendation.
+readiness, and a smallest-passing-diff recommendation. That recommendation is
+only a size-and-test-status heuristic, not a correctness judgment; Codex must
+present it as a suggestion for the user's decision.
 After the user selects an approach and lifecycle action in the source pane,
 `run choose` merges or promotes that winner and schedules every other group
 member for discard. `--discard-all` retires the whole group. These remain
