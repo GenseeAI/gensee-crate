@@ -908,9 +908,6 @@ fn try_record_tclone_source_parallel_choice_approval(
     event: &AgentHookEvent,
     context: &Value,
 ) -> io::Result<()> {
-    if event.hook_event_name.as_deref() != Some("UserPromptSubmit") {
-        return Ok(());
-    }
     let Some(source_run_id) = context.get("run_id").and_then(Value::as_str) else {
         return Ok(());
     };
@@ -920,10 +917,21 @@ fn try_record_tclone_source_parallel_choice_approval(
     if offer.source_run_id != source_run_id {
         return Ok(());
     }
-    let Some(prompt) = user_prompt_from_hook(event) else {
-        return Ok(());
+
+    let selected = match event.hook_event_name.as_deref() {
+        Some("UserPromptSubmit") => {
+            let Some(prompt) = user_prompt_from_hook(event) else {
+                return Ok(());
+            };
+            tclone_parallel_choice_from_prompt(&prompt, &offer)
+        }
+        Some("PreToolUse") => event
+            .tool_input_command
+            .as_deref()
+            .and_then(|command| tclone_parallel_choice_from_tool_command(command, &offer)),
+        _ => return Ok(()),
     };
-    let Some((target_run_id, choice)) = tclone_parallel_choice_from_prompt(&prompt, &offer) else {
+    let Some((target_run_id, choice)) = selected else {
         return Ok(());
     };
     let target = find_tclone_record(&target_run_id)?;
@@ -939,8 +947,16 @@ fn try_record_tclone_source_parallel_choice_approval(
     write_tclone_parallel_choice_offer(&offer)?;
 
     let podman = tclone_podman();
-    let result = read_tclone_fork_result(&podman, &target);
-    let Some(mut result) = result? else {
+    let Some(mut result) = (match read_tclone_fork_result(&podman, &target) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!(
+                "gensee: warning: recorded parallel choice approval, but could not read target {} result for mirroring: {error}",
+                target.run_id
+            );
+            return Ok(());
+        }
+    }) else {
         eprintln!(
             "gensee: warning: recorded parallel choice approval, but target {} has no result",
             target.run_id
@@ -1048,10 +1064,10 @@ fn tclone_lifecycle_choice_from_prompt(prompt: &str) -> Option<&'static str> {
     {
         return None;
     }
-    let merge = words.contains(&"merge");
-    let discard = words.contains(&"discard");
-    let switch = words.contains(&"switch")
-        || words.contains(&"promote")
+    let merge = words.iter().any(|word| tclone_word_is_merge(word));
+    let discard = words.iter().any(|word| tclone_word_is_discard(word));
+    let switch = words.iter().any(|word| tclone_word_is_switch(word))
+        || words.iter().any(|word| tclone_word_is_promote(word))
         || (normalized.contains("keep working") && normalized.contains("fork"));
     let first_is_action = words
         .first()
@@ -1094,6 +1110,22 @@ fn normalize_tclone_choice_text(text: &str) -> String {
         .join(" ")
 }
 
+fn tclone_word_is_merge(word: &str) -> bool {
+    matches!(word, "merge" | "merging" | "merged")
+}
+
+fn tclone_word_is_discard(word: &str) -> bool {
+    matches!(word, "discard" | "discarding" | "discarded")
+}
+
+fn tclone_word_is_switch(word: &str) -> bool {
+    matches!(word, "switch" | "switching" | "switched")
+}
+
+fn tclone_word_is_promote(word: &str) -> bool {
+    matches!(word, "promote" | "promoting" | "promoted")
+}
+
 fn tclone_parallel_lifecycle_choice_from_prompt(prompt: &str) -> Option<&'static str> {
     if let Some(choice) = tclone_lifecycle_choice_from_prompt(prompt) {
         return Some(choice);
@@ -1119,11 +1151,13 @@ fn tclone_parallel_lifecycle_choice_from_prompt(prompt: &str) -> Option<&'static
     if !clearly_directive {
         return None;
     }
-    if words.contains(&"merge") {
+    if words.iter().any(|word| tclone_word_is_merge(word)) {
         Some("merge")
-    } else if words.contains(&"switch") || words.contains(&"promote") {
+    } else if words.iter().any(|word| tclone_word_is_switch(word))
+        || words.iter().any(|word| tclone_word_is_promote(word))
+    {
         Some("switch")
-    } else if words.contains(&"discard") {
+    } else if words.iter().any(|word| tclone_word_is_discard(word)) {
         Some("discard")
     } else {
         None
@@ -1148,9 +1182,9 @@ fn tclone_parallel_choice_from_prompt(
     }
 
     let action_words: &[&str] = match choice {
-        "merge" => &["merge"],
-        "switch" => &["promote", "switch"],
-        "discard" => &["discard"],
+        "merge" => &["merge", "merging"],
+        "switch" => &["promote", "promoting", "switch", "switching"],
+        "discard" => &["discard", "discarding"],
         _ => &[],
     };
     let action_matched = offer
@@ -1189,6 +1223,36 @@ fn tclone_parallel_choice_from_prompt(
         Some((matched[0].run_id.clone(), choice))
     } else {
         None
+    }
+}
+
+fn tclone_parallel_choice_from_tool_command(
+    command: &str,
+    offer: &TcloneParallelChoiceOffer,
+) -> Option<(String, &'static str)> {
+    let tokens = command
+        .split_whitespace()
+        .map(|token| token.trim_matches(|ch| matches!(ch, '\'' | '"' | ';')))
+        .collect::<Vec<_>>();
+    let mut selected = None;
+    for window in tokens.windows(3) {
+        if window[0] == "run" && window[1] == "choose" {
+            selected = Some(window[2].to_string());
+            break;
+        }
+    }
+    let selected = selected?;
+    if !offer.options.iter().any(|option| option.run_id == selected) {
+        return None;
+    }
+    let merge = tokens.iter().any(|token| *token == "--merge");
+    let promote = tokens.iter().any(|token| *token == "--promote");
+    let discard_all = tokens.iter().any(|token| *token == "--discard-all");
+    match (merge, promote, discard_all) {
+        (true, false, false) => Some((selected, "merge")),
+        (false, true, false) => Some((selected, "switch")),
+        (false, false, true) => Some((selected, "discard")),
+        _ => None,
     }
 }
 
@@ -11699,6 +11763,13 @@ gensee async job job_1: exited status=0
         );
         assert_eq!(
             tclone_parallel_choice_from_prompt(
+                "I approve merging Approach A and discarding Approach B.",
+                &offer
+            ),
+            Some(("run_1_fork_2_0".to_string(), "merge"))
+        );
+        assert_eq!(
+            tclone_parallel_choice_from_prompt(
                 "promote the aggressive latest-version upgrade",
                 &offer
             ),
@@ -11707,6 +11778,27 @@ gensee async job job_1: exited status=0
         assert_eq!(
             tclone_parallel_choice_from_prompt("discard the entire group", &offer),
             Some(("run_1_fork_2_0".to_string(), "discard"))
+        );
+        assert_eq!(
+            tclone_parallel_choice_from_tool_command(
+                "gensee run choose run_1_fork_2_0 --merge",
+                &offer
+            ),
+            Some(("run_1_fork_2_0".to_string(), "merge"))
+        );
+        assert_eq!(
+            tclone_parallel_choice_from_tool_command(
+                "/usr/local/bin/gensee run choose run_1_fork_2_1 --promote",
+                &offer
+            ),
+            Some(("run_1_fork_2_1".to_string(), "switch"))
+        );
+        assert_eq!(
+            tclone_parallel_choice_from_tool_command(
+                "gensee run choose run_1_fork_2_9 --merge",
+                &offer
+            ),
+            None
         );
     }
 
