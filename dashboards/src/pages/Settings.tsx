@@ -93,7 +93,7 @@ export default function Settings() {
         <Col xs={24} lg={12}>
           <Card size="small" title="About">
             <Text type="secondary" style={{ fontSize: 12 }}>
-              <strong>gensee-ui</strong> v0.1.0
+              <strong>gensee-ui</strong> v0.2.0
               <br />
               Built with Tauri v2, React 18, Ant Design 5.
               <br /><br />

@@ -179,7 +179,7 @@ stores.
 <details>
 <summary>Toolchain and prerequisites (if the installer reports a missing tool)</summary>
 
-- macOS and Linux for the stable v0.1 path. Linux host controls include `/proc`
+- macOS and Linux for the stable v0.2 path. Linux host controls include `/proc`
   process attribution, fanotify sensitive-path enforcement, seccomp launcher
   profiles, and cgroup/nftables network controls.
 - Claude Code, Codex, Antigravity, or VS Code / GitHub Copilot for hook-based
@@ -621,7 +621,7 @@ See [`docs/roadmap.md`](docs/roadmap.md) for more detail.
 
 Full docs live in [`docs/`](docs/README.md):
 
-- [Architecture](docs/architecture.md) — the v0.1 wedge, workspace crates, and roadmap.
+- [Architecture](docs/architecture.md) — the v0.2 runtime, workspace crates, and roadmap.
 - [Roadmap](docs/roadmap.md) — planned Linux enforcement, macOS Endpoint Security, sandbox, ML policy, and integration work.
 - [Linux host support](docs/linux.md) — `/proc` monitoring, fanotify
   sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress
