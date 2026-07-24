@@ -4,13 +4,17 @@
 </h1>
 
 <p align="center">
-  <strong>Full-stack, long-horizon runtime safety for AI coding agents.</strong>
+  <strong>Approve outcomes, not commands.</strong>
 </p>
 
 <p align="center">
-  Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, Antigravity, Cursor, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
-  It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS and Linux.
-  Real-time enforcement combines agent-interface decisions with Linux syscall, network, and sensitive-file controls. Offline event tracking, lineage, and provenance can be viewed in a native desktop dashboard and command line.
+  Gensee Crate lets Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a> do real work inside a disposable full-workspace fork.
+  With Gensee, you can let the agent install packages, edit files, run tests, and crash in isolation; then review the diff and test summary, merge the result, keep exploring, or throw the runtime away.
+</p>
+
+<p align="center">
+  Behind the scenes, Gensee ties prompts, tool calls, commands, files, packages, network activity, system events, and policy decisions into one transaction.
+  Runtime guards still protect secrets, sensitive files, syscalls, and risky network access, but the core promise is bigger: give agents room to move without letting untrusted work land in your main workspace unreviewed.
 </p>
 
 <p align="center">
@@ -29,7 +33,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/gensee-crate-defense-in-depth.png" alt="Gensee Crate defense-in-depth architecture" />
+  <img src="docs/gensee-crate-defense-in-depth.png" alt="Gensee Crate transactional runtime and defense-in-depth architecture" />
 </p>
 
 <p align="center">
@@ -44,17 +48,23 @@
 
 Gensee Crate helps you:
 
-- **Watch what your agent actually does.** Capture files read and written,
-  commands run, network targets reached, hook intent, alerts, and timeline
-  context in one local store.
-- **Enforce policy before risky tools run.** Enforces a deterministic, configurable [policy](docs/policy.md) that can allow, ask, or
+- **Run risky agent work transactionally.** Launch an agent in a disposable
+  runtime, fork the full workspace for speculative changes, then merge, keep
+  working, or discard the fork after review.
+- **Keep untrusted changes out of the main workspace.** Summaries and diffs show
+  what changed and what tests ran before a fork is allowed to merge back.
+- **Enforce policy before risky tools run.** A deterministic, configurable [policy](docs/policy.md) can allow, ask, or
   deny secret reads, destructive ops, out-of-workspace writes, cloud-metadata
   access, control-plane writes, dangerous executable content, and more.
+- **Watch what your agent actually does.** Capture prompts, tool calls, files
+  read and written, commands run, packages touched, network targets reached,
+  hook intent, alerts, and timeline context in one local store.
 - **Trace provenance across sessions.** Lineage graphs link prompts,
-  tool calls, filesystem effects, artifacts, alerts, and review verdicts so long-horizon safety issues such as memory poisoning and data exfiltration can be prevented in time and examined afterward.
+  tool calls, filesystem effects, artifacts, alerts, and review verdicts so long-horizon safety issues such as memory poisoning, policy bypass, and data exfiltration can be understood and contained.
 - **Seamless integration with your current workflow.** Run `gensee watch` beside an
-  agent or launch an agent in a sandbox with `gensee run` with additional safety.
-  Manage policy with `gensee policy` and inspect activity in the local dashboard.
+  agent, launch an agent with `gensee run`, or use the tclone runtime for
+  full-workspace fork, merge, and rollback flows. Manage policy with
+  `gensee policy` and inspect activity in the local dashboard.
 
 ## Preliminary Benchmark Results
 
