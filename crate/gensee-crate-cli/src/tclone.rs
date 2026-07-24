@@ -5819,6 +5819,9 @@ const TCLONE_HOST_TMUX_ENV_KEYS: &[&str] = &[
     "GENSEE_TCLONE_NODE_ROOT",
     "GENSEE_TCLONE_NODE_BIN",
     "GENSEE_TCLONE_READY_TIMEOUT_SECS",
+    "GENSEE_TMP_ROOT",
+    "TMPDIR",
+    "CONTAINERS_STORAGE_CONF",
     TCLONE_HOST_TMUX_SOCKET_ENV,
     TCLONE_HOST_TMUX_TARGET_ENV,
     "TERM",
@@ -12741,6 +12744,13 @@ gensee async job job_1: exited status=0
         assert!(!command.contains("; exec sudo env "));
         assert!(!command.contains("attach exited with status"));
         assert!(!command.contains("exec \"${SHELL:-/bin/sh}\""));
+    }
+
+    #[test]
+    fn tclone_host_tmux_attach_command_preserves_storage_env() {
+        assert!(TCLONE_HOST_TMUX_ENV_KEYS.contains(&"GENSEE_TMP_ROOT"));
+        assert!(TCLONE_HOST_TMUX_ENV_KEYS.contains(&"TMPDIR"));
+        assert!(TCLONE_HOST_TMUX_ENV_KEYS.contains(&"CONTAINERS_STORAGE_CONF"));
     }
 
     #[test]

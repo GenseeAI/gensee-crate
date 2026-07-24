@@ -450,7 +450,12 @@ Tclone provides low-latency full-workspace forking for AI agents:
 ```bash
 export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
-alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
+export GENSEE_TCLONE_IMAGE="${GENSEE_TCLONE_IMAGE:-localhost/gensee-tclone-webtop:tmux}"
+export GENSEE_TMP_ROOT="${GENSEE_TMP_ROOT:-/tmp}"
+export TMPDIR="$GENSEE_TMP_ROOT"
+# Optional: set this when os4agent uses a dedicated btrfs rootful Podman store.
+# export CONTAINERS_STORAGE_CONF="$GENSEE_HOME/tclone-btrfs-storage.conf"
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "TMPDIR=$TMPDIR" "GENSEE_TMP_ROOT=$GENSEE_TMP_ROOT" "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
 
 gensee-tclone run --runtime tclone -- codex
 gensee-tclone run list              # source id is under "Tclone containers"
@@ -466,6 +471,21 @@ gensee-tclone run choose <parallel-fork-id> <--merge|--promote|--discard-all>
 gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
 gensee-tclone run switch <fork-id>                         # promote fork; end old source
 ```
+
+Before launching the source, verify the host setup from the same shell:
+
+```bash
+sudo env "PATH=$PATH" "HOME=$HOME" "TMPDIR=$TMPDIR" \
+  "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  "$GENSEE_TCLONE_PODMAN" info --format '{{.Store.GraphRoot}} {{.Store.GraphDriverName}}'
+ls -l /dev/vma_cherrypick /dev/criu_capbypass /dev/reparent /dev/pkey_state
+```
+
+The Podman storage driver must be `btrfs`; an `overlay` driver on a btrfs disk
+is not enough for tclone snapshots. The tclone image must be loaded or pulled
+into the same Podman store selected by `CONTAINERS_STORAGE_CONF`. Keep
+`GENSEE_TMP_ROOT` outside the workspace, or a later launch can recursively copy
+Gensee's own staging tree and fail with `File name too long`.
 
 Named parallel groups use stable indexed container names when available
 (`try-upgrade-0`, `try-upgrade-1`). If an unresolved older run still owns those
@@ -512,10 +532,14 @@ input. Fork creation does not report success until the child has received its
 authoritative fork context.
 Use a tclone image with `tmux` for reliable `gensee run attach`. From inside a
 host tmux session, `--attach tmux:right` opens the forked live agent in a new
-pane. Without tmux, `gensee run shell` still opens a new shell but does not
-reconnect to the live agent UI. Use `gensee run exec <fork-id> -- <command>` for
-non-interactive, container-scoped commands in a fork, or `gensee run send
-<fork-id> -- <prompt>` to visibly send work into the forked agent pane.
+pane. The attach pane re-enters `gensee run attach`, so use the same wrapper for
+`run`, `list`, `fork`, `attach`, `send`, `exec`, `merge`, `switch`, and cleanup.
+If you rebuild or reinstall `gensee`, start a fresh source; already-running
+sources keep their old host-control process in memory. Without tmux,
+`gensee run shell` still opens a new shell but does not reconnect to the live
+agent UI. Use `gensee run exec <fork-id> -- <command>` for non-interactive,
+container-scoped commands in a fork, or `gensee run send <fork-id> -- <prompt>`
+to visibly send work into the forked agent pane.
 
 </details>
 
