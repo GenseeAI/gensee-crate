@@ -8,13 +8,8 @@
 </p>
 
 <p align="center">
-  Gensee Crate lets Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a> do real work inside a disposable full-workspace fork.
-  With Gensee, you can let the agent install packages, edit files, run tests, and crash in isolation; then review the diff and test summary, merge the result, keep exploring, or throw the runtime away.
-</p>
-
-<p align="center">
-  Behind the scenes, Gensee ties prompts, tool calls, commands, files, packages, network activity, system events, and policy decisions into one transaction.
-  Runtime guards still protect secrets, sensitive files, syscalls, and risky network access, but the core promise is bigger: give agents room to move without letting untrusted work land in your main workspace unreviewed.
+  Gensee Crate lets AI harness like Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a> do real work inside a disposable full-workspace fork.
+  With Gensee, you can let the harness install packages, edit files, run tests, and crash in isolation; then review the diff and test summary, merge the result, keep exploring, or throw the runtime away. Essentially, Gensee gives agents room to move without letting untrusted work land in your main workspace unreviewed. Behind the scenes, Gensee ties prompts, tool calls, commands, files, packages, network activity, system events, and policy decisions into a protected transaction runtime.
 </p>
 
 <p align="center">
