@@ -164,7 +164,12 @@ inside cloneable Podman container storage:
 ```bash
 export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
-alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" gensee'
+export GENSEE_TCLONE_IMAGE="${GENSEE_TCLONE_IMAGE:-localhost/gensee-tclone-webtop:tmux}"
+export GENSEE_TMP_ROOT="${GENSEE_TMP_ROOT:-/tmp}"
+export TMPDIR="$GENSEE_TMP_ROOT"
+# Optional: set when using a dedicated btrfs rootful Podman store.
+# export CONTAINERS_STORAGE_CONF="$GENSEE_HOME/tclone-btrfs-storage.conf"
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "TMPDIR=$TMPDIR" "GENSEE_TMP_ROOT=$GENSEE_TMP_ROOT" "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
 
 gensee-tclone run --runtime tclone -- codex
 ```
@@ -190,6 +195,13 @@ gensee-tclone run delete --all
 Use the row with role `source` under the `Tclone containers` section as
 `<source-run-id>`. The launcher also prints the source id as soon as the source
 container is created.
+
+Use the same `gensee-tclone` wrapper for source launch, fork, attach, list, and
+cleanup. Tclone host commands must all see the same `TMPDIR`,
+`GENSEE_TMP_ROOT`, and optional `CONTAINERS_STORAGE_CONF`; otherwise a fork may
+exist in one Podman store while `attach` or `list` looks in another. Keep the
+temporary root outside the workspace to avoid recursively copying Gensee's own
+staging directory.
 
 This initial mode is separate from `--sandbox linux`: Gensee owns source/fork
 container orchestration, while Linux seccomp, fanotify, and cgroup/nftables
