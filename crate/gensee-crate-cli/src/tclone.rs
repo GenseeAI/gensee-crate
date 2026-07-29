@@ -3695,8 +3695,20 @@ pub(crate) fn run_tclone_agent(config: RunConfig) -> io::Result<()> {
         ));
     }
     let started_at_ms = unix_millis()?;
-    let run_id = format!("run_{}_{}", std::process::id(), started_at_ms);
-    let operation_id = tclone_operation_id("source");
+    let run_id = match env::var("GENSEE_MANAGED_SOURCE_ID") {
+        Ok(run_id) => {
+            validate_managed_source_id("source ID", &run_id)?;
+            run_id
+        }
+        Err(_) => format!("run_{}_{}", std::process::id(), started_at_ms),
+    };
+    let operation_id = match env::var("GENSEE_MANAGED_OPERATION_ID") {
+        Ok(operation_id) => {
+            validate_managed_id("operation ID", &operation_id)?;
+            operation_id
+        }
+        Err(_) => tclone_operation_id("source"),
+    };
     let workspace = canonicalize_or_original(&config.workspace);
     record_tclone_transaction_best_effort(
         &operation_id,
@@ -4492,6 +4504,9 @@ fn tclone_fork_name_prefix(
     copies: usize,
 ) -> String {
     match name_hint {
+        Some(name) if env_flag("GENSEE_TCLONE_EXACT_FORK_NAME") => {
+            name.trim_end_matches('-').to_string()
+        }
         Some(name) if copies > 1 => name.trim_end_matches('-').to_string(),
         Some(name) => format!("{}-{forked_at_ms}", name.trim_end_matches('-')),
         None => format!(
