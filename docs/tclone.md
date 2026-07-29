@@ -9,7 +9,12 @@ full-workspace forking for AI agents.
 ```bash
 export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
-alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
+export GENSEE_TCLONE_IMAGE="${GENSEE_TCLONE_IMAGE:-localhost/gensee-tclone-webtop:tmux}"
+export GENSEE_TMP_ROOT="${GENSEE_TMP_ROOT:-/tmp}"
+export TMPDIR="$GENSEE_TMP_ROOT"
+# Optional: point at a dedicated rootful Podman store whose storage driver is btrfs.
+# export CONTAINERS_STORAGE_CONF="$GENSEE_HOME/tclone-btrfs-storage.conf"
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "TMPDIR=$TMPDIR" "GENSEE_TMP_ROOT=$GENSEE_TMP_ROOT" "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
 
 gensee-tclone run --runtime tclone -- codex
 ```
@@ -25,6 +30,48 @@ fallback and may not survive tclone restore.
 Add the exports and alias to `~/.bashrc`, `~/.zshrc`, or your shell profile if
 you use this host regularly. If testing from a source checkout, replace the
 alias target `gensee` with `./target/debug/gensee`.
+
+Keep `GENSEE_TMP_ROOT` outside the workspace you pass to `gensee run`. If the
+private `gensee-agent-guard` staging tree lands inside the workspace, a later
+source launch can recursively copy that tree into itself and fail with
+`File name too long`.
+
+Tclone requires rootful Podman to use the `btrfs` storage driver. It is not
+enough for an `overlay` Podman graphroot to live on a btrfs filesystem: the
+running container root then appears as an overlay `merged` mount, and tclone's
+btrfs snapshot step fails with `Not a Btrfs filesystem`. On hosts that already
+have an overlay rootful store, create a separate storage config and pass it
+through every Gensee wrapper command with `CONTAINERS_STORAGE_CONF`:
+
+```toml
+# $GENSEE_HOME/tclone-btrfs-storage.conf
+[storage]
+driver = "btrfs"
+runroot = "/mnt/btrfs/gensee-podman-run"
+graphroot = "/mnt/btrfs/gensee-podman-storage"
+```
+
+Images are scoped to the selected Podman store. After creating a btrfs store,
+load or pull `GENSEE_TCLONE_IMAGE` into that same store before launching a
+source:
+
+```bash
+sudo env "PATH=$PATH" "HOME=$HOME" "TMPDIR=$TMPDIR" \
+  "$GENSEE_TCLONE_PODMAN" save "$GENSEE_TCLONE_IMAGE" \
+  | sudo env "PATH=$PATH" "HOME=$HOME" "TMPDIR=$TMPDIR" \
+      "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+      "$GENSEE_TCLONE_PODMAN" load
+```
+
+Verify the store that Gensee will use:
+
+```bash
+sudo env "PATH=$PATH" "HOME=$HOME" "TMPDIR=$TMPDIR" \
+  "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  "$GENSEE_TCLONE_PODMAN" info --format '{{.Store.GraphRoot}} {{.Store.GraphDriverName}}'
+```
+
+The driver must print `btrfs`.
 
 Use a second terminal to fork the running source container:
 
@@ -114,6 +161,21 @@ in-container `gensee-agent` session. With `--copies 2`, additional forks are
 opened below the previous fork pane, leaving the source on the left and one
 stacked fork column on the right. `gensee run attach <id> --tmux right` can open
 an existing run or fork in a new host pane.
+
+When `--attach tmux:right` opens a pane, the pane re-enters
+`gensee run attach <fork-id>`. That re-entry must inherit the same Podman store
+and temporary-root environment as the source and fork commands, especially
+`CONTAINERS_STORAGE_CONF`, `GENSEE_TMP_ROOT`, and `TMPDIR`. If a pane appears
+and immediately disappears, check that the wrapper preserves those variables
+and start a fresh source with the rebuilt `gensee` binary; already-running
+sources keep the old host-control process in memory.
+
+The os4agent tfork kernel helper modules must be built for the running kernel.
+If `insmod` reports `Invalid module format`, compare `modinfo <module>.ko`
+`vermagic` with `uname -r`, rebuild the modules against
+`/lib/modules/$(uname -r)/build`, and load them again. Missing helpers surface
+later as absent `/dev/vma_cherrypick`, `/dev/criu_capbypass`, `/dev/reparent`,
+or `/dev/pkey_state` device nodes in CRIU/tfork logs.
 
 Use `gensee run send <id> -- <prompt>` to paste a prompt into the fork's
 in-container `gensee-agent` tmux session and press Enter. If that fork is

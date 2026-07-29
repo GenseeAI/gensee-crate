@@ -4845,9 +4845,18 @@ fn tclone_clone_args(
 }
 
 fn should_retry_tclone_without_overlay(error: &str) -> bool {
-    error.contains("spawn conmon for tfork")
-        || error.contains("conmon reported pid=-1")
-        || error.contains("clone setup failed")
+    [
+        "btrfs snapshot src→snap-ro",
+        "resolve parent overlay layers",
+        "resolve parent snap-ro",
+        "symlink snap-ro",
+        "parent-upper-frozen",
+        "freeze parent upper",
+        "setup overlay rootfs",
+        "mount overlay",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 fn should_retry_tclone_partial_multicopy(error: &str) -> bool {
@@ -5834,6 +5843,9 @@ const TCLONE_HOST_TMUX_ENV_KEYS: &[&str] = &[
     "GENSEE_TCLONE_NODE_ROOT",
     "GENSEE_TCLONE_NODE_BIN",
     "GENSEE_TCLONE_READY_TIMEOUT_SECS",
+    "GENSEE_TMP_ROOT",
+    "TMPDIR",
+    "CONTAINERS_STORAGE_CONF",
     TCLONE_HOST_TMUX_SOCKET_ENV,
     TCLONE_HOST_TMUX_TARGET_ENV,
     "TERM",
@@ -11868,13 +11880,34 @@ mod tests {
     }
 
     #[test]
-    fn tclone_overlay_retry_detects_conmon_setup_failure() {
-        assert!(should_retry_tclone_without_overlay(
-            "tfork: clone setup failed (spawn conmon for tfork: conmon reported pid=-1)"
-        ));
-        assert!(!should_retry_tclone_without_overlay(
-            "podman exited with status 125: container not found"
-        ));
+    fn tclone_overlay_retry_only_detects_overlay_setup_failures() {
+        for error in [
+            "tfork: clone setup failed (btrfs snapshot src→snap-ro failed)",
+            "tfork: clone setup failed (resolve parent overlay layers failed)",
+            "tfork: clone setup failed (resolve parent snap-ro failed)",
+            "tfork: clone setup failed (symlink snap-ro failed)",
+            "tfork: clone setup failed (mkdir parent-upper-frozen failed)",
+            "tfork: clone setup failed (freeze parent upper failed)",
+            "tfork: clone setup failed (setup overlay rootfs for copy 0 failed)",
+            "tfork: clone setup failed (mount overlay failed)",
+        ] {
+            assert!(
+                should_retry_tclone_without_overlay(error),
+                "expected overlay fallback for: {error}"
+            );
+        }
+
+        for error in [
+            "tfork: clone setup failed (spawn conmon for tfork: conmon reported pid=-1)",
+            "tfork: clone setup failed (criu_tfork failed: -52)",
+            "tfork: clone setup failed (iptables-restore: executable file not found)",
+            "podman exited with status 125: container not found",
+        ] {
+            assert!(
+                !should_retry_tclone_without_overlay(error),
+                "unexpected overlay fallback for: {error}"
+            );
+        }
     }
 
     #[test]
@@ -12756,6 +12789,13 @@ gensee async job job_1: exited status=0
         assert!(!command.contains("; exec sudo env "));
         assert!(!command.contains("attach exited with status"));
         assert!(!command.contains("exec \"${SHELL:-/bin/sh}\""));
+    }
+
+    #[test]
+    fn tclone_host_tmux_attach_command_preserves_storage_env() {
+        assert!(TCLONE_HOST_TMUX_ENV_KEYS.contains(&"GENSEE_TMP_ROOT"));
+        assert!(TCLONE_HOST_TMUX_ENV_KEYS.contains(&"TMPDIR"));
+        assert!(TCLONE_HOST_TMUX_ENV_KEYS.contains(&"CONTAINERS_STORAGE_CONF"));
     }
 
     #[test]

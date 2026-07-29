@@ -6,7 +6,7 @@ quick start, then dive into the topic guides below.
 
 ## Guides
 
-- [Architecture](architecture.md) — the v0.1 wedge, workspace crates, and roadmap.
+- [Architecture](architecture.md) — the v0.2 runtime, workspace crates, and roadmap.
 - [Roadmap](roadmap.md) — planned Linux enforcement, macOS Endpoint Security, sandbox, ML policy, and integration work.
 - [Linux host support](linux.md) — `/proc` process attribution, fanotify sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress controls, and Linux capability planning.
 - [Tclone runtime integration](tclone.md) — launch agents in cloneable Linux containers, fork live source containers, inspect diffs, keep workspaces, and discard forks.
