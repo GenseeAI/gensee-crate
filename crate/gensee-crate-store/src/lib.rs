@@ -18,7 +18,7 @@ pub use gensee_crate_db::sqlite::{
 };
 use gensee_crate_rules::policy::Policy;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::env;
@@ -104,7 +104,7 @@ pub struct ArtifactRiskTagInput {
 }
 
 /// A bounded, append-only lifecycle event for a transactional environment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionEventInput {
     pub operation_id: String,
     pub environment_kind: String,

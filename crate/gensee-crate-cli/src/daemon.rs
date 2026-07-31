@@ -27,6 +27,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 
 const NO_HOOK_OUTPUT: &str = "__gensee_no_hook_output__";
+pub(crate) const EVENT_STORE_APPEND_SESSION: &str = "event_store_append_session";
+pub(crate) const EVENT_STORE_APPEND_TRANSACTION: &str = "event_store_append_transaction";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonResponseMode {
@@ -78,6 +80,12 @@ pub(crate) fn run_daemon() -> io::Result<()> {
 pub(crate) fn serve_connection(mut stream: UnixStream, store: &EventStore) -> io::Result<()> {
     let mut request = String::new();
     stream.read_to_string(&mut request)?;
+    let value = serde_json::from_str::<Value>(&request).ok();
+    if let Some(value) =
+        value.filter(|value| value.get("operation").and_then(Value::as_str).is_some())
+    {
+        return serve_event_store_request(&mut stream, store, value);
+    }
     let (payload, provider) = match daemon_request_parts(&request) {
         Ok(parts) => parts,
         Err(_) => return Ok(()), // malformed request: nothing to do, nothing to answer
@@ -94,6 +102,101 @@ pub(crate) fn serve_connection(mut stream: UnixStream, store: &EventStore) -> io
         let _ = stream.write_all(NO_HOOK_OUTPUT.as_bytes());
     }
     Ok(())
+}
+
+fn serve_event_store_request(
+    stream: &mut impl Write,
+    store: &EventStore,
+    request: Value,
+) -> io::Result<()> {
+    let result = (|| {
+        if request
+            .get("gensee_daemon_protocol")
+            .and_then(Value::as_u64)
+            != Some(1)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event-store request missing gensee_daemon_protocol=1",
+            ));
+        }
+        let input = request.get("input").cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event-store request missing input",
+            )
+        })?;
+        match request.get("operation").and_then(Value::as_str) {
+            Some(EVENT_STORE_APPEND_SESSION) => {
+                let session = serde_json::from_value::<AgentSession>(input).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                })?;
+                store.append_session(&session)
+            }
+            Some(EVENT_STORE_APPEND_TRANSACTION) => {
+                let event =
+                    serde_json::from_value::<TransactionEventInput>(input).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                store.append_transaction_event(&event).map(|_| ())
+            }
+            Some(operation) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported daemon event-store operation `{operation}`"),
+            )),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event-store request missing operation",
+            )),
+        }
+    })();
+    let response = match result {
+        Ok(()) => json!({"gensee_daemon_protocol": 1, "ok": true}),
+        Err(error) => json!({
+            "gensee_daemon_protocol": 1,
+            "ok": false,
+            "error": error.to_string(),
+        }),
+    };
+    stream.write_all(response.to_string().as_bytes())
+}
+
+fn dispatch_event_store_request(operation: &str, input: &impl serde::Serialize) -> io::Result<()> {
+    let root = default_root()?;
+    let socket = daemon_socket_path(&root);
+    let mut stream = UnixStream::connect(&socket)?;
+    let request = json!({
+        "gensee_daemon_protocol": 1,
+        "operation": operation,
+        "input": input,
+    });
+    stream.write_all(request.to_string().as_bytes())?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let response = serde_json::from_str::<Value>(&response).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid daemon event-store response: {error}"),
+        )
+    })?;
+    if response.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    Err(io::Error::other(
+        response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("daemon event-store request failed"),
+    ))
+}
+
+pub(crate) fn daemon_append_session(session: &AgentSession) -> io::Result<()> {
+    dispatch_event_store_request(EVENT_STORE_APPEND_SESSION, session)
+}
+
+pub(crate) fn daemon_append_transaction_event(event: &TransactionEventInput) -> io::Result<()> {
+    dispatch_event_store_request(EVENT_STORE_APPEND_TRANSACTION, event)
 }
 
 pub(crate) fn daemon_request_parts(request: &str) -> io::Result<(String, String)> {
