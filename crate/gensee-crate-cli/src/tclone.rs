@@ -3086,7 +3086,37 @@ fn record_tclone_transaction(
     error: Option<&io::Error>,
     metadata: Option<Value>,
 ) -> io::Result<()> {
-    EventStore::default_local()?
+    let store = EventStore::default_local()?;
+    record_tclone_transaction_with_store(
+        &store,
+        operation_id,
+        operation,
+        phase,
+        source_run_id,
+        target_run_id,
+        parent_run_id,
+        workspace,
+        summary,
+        error,
+        metadata,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_tclone_transaction_with_store(
+    store: &EventStore,
+    operation_id: &str,
+    operation: &str,
+    phase: &str,
+    source_run_id: Option<&str>,
+    target_run_id: Option<&str>,
+    parent_run_id: Option<&str>,
+    workspace: Option<&str>,
+    summary: impl Into<String>,
+    error: Option<&io::Error>,
+    metadata: Option<Value>,
+) -> io::Result<()> {
+    store
         .append_transaction_event(&TransactionEventInput {
             operation_id: operation_id.to_string(),
             environment_kind: "tclone".to_string(),
@@ -3103,6 +3133,36 @@ fn record_tclone_transaction(
             occurred_at_ms: unix_millis()?,
         })
         .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_tclone_transaction_with_store_best_effort(
+    store: &EventStore,
+    operation_id: &str,
+    operation: &str,
+    phase: &str,
+    source_run_id: Option<&str>,
+    target_run_id: Option<&str>,
+    parent_run_id: Option<&str>,
+    workspace: Option<&str>,
+    summary: impl Into<String>,
+    metadata: Option<Value>,
+) {
+    if let Err(error) = record_tclone_transaction_with_store(
+        store,
+        operation_id,
+        operation,
+        phase,
+        source_run_id,
+        target_run_id,
+        parent_run_id,
+        workspace,
+        summary,
+        None,
+        metadata,
+    ) {
+        eprintln!("gensee: warning: could not record transactional event: {error}");
+    }
 }
 
 fn record_tclone_failure(
@@ -3553,17 +3613,27 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         "copies": copies,
         "requested_name": requested_name.clone(),
     });
-    record_tclone_transaction_best_effort(
-        &operation_id,
-        "fork",
-        "started",
-        Some(&source.run_id),
-        None,
-        source.parent_run_id.as_deref(),
-        Some(&source.workspace),
-        format!("Creating {copies} fork(s) from {}", source.run_id),
-        Some(metadata.clone()),
-    );
+    let event_store = match EventStore::default_local() {
+        Ok(store) => Some(store),
+        Err(error) => {
+            eprintln!("gensee: warning: could not record transactional event: {error}");
+            None
+        }
+    };
+    if let Some(store) = event_store.as_ref() {
+        record_tclone_transaction_with_store_best_effort(
+            store,
+            &operation_id,
+            "fork",
+            "started",
+            Some(&source.run_id),
+            None,
+            source.parent_run_id.as_deref(),
+            Some(&source.workspace),
+            format!("Creating {copies} fork(s) from {}", source.run_id),
+            Some(metadata.clone()),
+        );
+    }
     timing.mark("preflight_and_transaction_start");
 
     let result: io::Result<()> = (|| {
@@ -3590,6 +3660,13 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         timing.mark("podman_clone");
         capability_guard.restore()?;
         timing.mark("source_capability_restore");
+        let fallback_event_store;
+        let fork_event_store = if let Some(store) = event_store.as_ref() {
+            store
+        } else {
+            fallback_event_store = EventStore::default_local()?;
+            &fallback_event_store
+        };
         let ids = output
             .lines()
             .map(str::trim)
@@ -3622,7 +3699,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             let overlay_layers = inspect_tclone_overlay_rootfs(&podman, &container_name).ok();
             timing.mark("inspect_clone_overlay");
             let observed_at = unix_millis()?;
-            EventStore::default_local()?.append_session(&AgentSession {
+            fork_event_store.append_session(&AgentSession {
                 session_id: run_id.clone(),
                 agent_binary: source.agent_cmd.first().cloned().unwrap_or_default(),
                 root_pid,
@@ -3681,7 +3758,8 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 tclone_send_prompt_to_agent(&podman, &fork_record, &prompt, true)?;
             }
             timing.mark("handoff_prompt");
-            record_tclone_transaction_best_effort(
+            record_tclone_transaction_with_store_best_effort(
+                fork_event_store,
                 &operation_id,
                 "fork",
                 "succeeded",
