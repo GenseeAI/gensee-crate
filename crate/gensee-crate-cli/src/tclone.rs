@@ -3116,40 +3116,7 @@ fn record_tclone_transaction_with_store(
     error: Option<&io::Error>,
     metadata: Option<Value>,
 ) -> io::Result<()> {
-    store
-        .append_transaction_event(&TransactionEventInput {
-            operation_id: operation_id.to_string(),
-            environment_kind: "tclone".to_string(),
-            operation: operation.to_string(),
-            phase: phase.to_string(),
-            source_run_id: source_run_id.map(ToString::to_string),
-            target_run_id: target_run_id.map(ToString::to_string),
-            parent_run_id: parent_run_id.map(ToString::to_string),
-            workspace: workspace.map(ToString::to_string),
-            summary: summary.into(),
-            error_kind: error.map(|error| format!("{:?}", error.kind()).to_ascii_lowercase()),
-            error_message: error.map(ToString::to_string),
-            metadata,
-            occurred_at_ms: unix_millis()?,
-        })
-        .map(|_| ())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_tclone_transaction_with_store_best_effort(
-    store: &EventStore,
-    operation_id: &str,
-    operation: &str,
-    phase: &str,
-    source_run_id: Option<&str>,
-    target_run_id: Option<&str>,
-    parent_run_id: Option<&str>,
-    workspace: Option<&str>,
-    summary: impl Into<String>,
-    metadata: Option<Value>,
-) {
-    if let Err(error) = record_tclone_transaction_with_store(
-        store,
+    let event = tclone_transaction_event(
         operation_id,
         operation,
         phase,
@@ -3158,10 +3125,102 @@ fn record_tclone_transaction_with_store_best_effort(
         parent_run_id,
         workspace,
         summary,
-        None,
+        error,
         metadata,
-    ) {
-        eprintln!("gensee: warning: could not record transactional event: {error}");
+    )?;
+    store.append_transaction_event(&event).map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tclone_transaction_event(
+    operation_id: &str,
+    operation: &str,
+    phase: &str,
+    source_run_id: Option<&str>,
+    target_run_id: Option<&str>,
+    parent_run_id: Option<&str>,
+    workspace: Option<&str>,
+    summary: impl Into<String>,
+    error: Option<&io::Error>,
+    metadata: Option<Value>,
+) -> io::Result<TransactionEventInput> {
+    Ok(TransactionEventInput {
+        operation_id: operation_id.to_string(),
+        environment_kind: "tclone".to_string(),
+        operation: operation.to_string(),
+        phase: phase.to_string(),
+        source_run_id: source_run_id.map(ToString::to_string),
+        target_run_id: target_run_id.map(ToString::to_string),
+        parent_run_id: parent_run_id.map(ToString::to_string),
+        workspace: workspace.map(ToString::to_string),
+        summary: summary.into(),
+        error_kind: error.map(|error| format!("{:?}", error.kind()).to_ascii_lowercase()),
+        error_message: error.map(ToString::to_string),
+        metadata,
+        occurred_at_ms: unix_millis()?,
+    })
+}
+
+enum TcloneForkEventWriter {
+    Daemon,
+    Local(EventStore),
+    Unavailable,
+}
+
+impl TcloneForkEventWriter {
+    fn start_best_effort(event: &TransactionEventInput) -> Self {
+        if daemon_append_transaction_event(event).is_ok() {
+            return Self::Daemon;
+        }
+        match EventStore::default_local() {
+            Ok(store) => {
+                if let Err(error) = store.append_transaction_event(event) {
+                    eprintln!("gensee: warning: could not record transactional event: {error}");
+                }
+                Self::Local(store)
+            }
+            Err(error) => {
+                eprintln!("gensee: warning: could not record transactional event: {error}");
+                Self::Unavailable
+            }
+        }
+    }
+
+    fn append_session(&mut self, session: &AgentSession) -> io::Result<()> {
+        if matches!(self, Self::Daemon) && daemon_append_session(session).is_ok() {
+            return Ok(());
+        }
+        if let Self::Local(store) = self {
+            return store.append_session(session);
+        }
+        let store = EventStore::default_local()?;
+        store.append_session(session)?;
+        *self = Self::Local(store);
+        Ok(())
+    }
+
+    fn append_transaction_best_effort(&mut self, event: &TransactionEventInput) {
+        if matches!(self, Self::Daemon) && daemon_append_transaction_event(event).is_ok() {
+            return;
+        }
+        if let Self::Local(store) = self {
+            if let Err(error) = store.append_transaction_event(event) {
+                eprintln!("gensee: warning: could not record transactional event: {error}");
+            }
+            return;
+        }
+        match EventStore::default_local() {
+            Ok(store) => {
+                if let Err(error) = store.append_transaction_event(event) {
+                    eprintln!("gensee: warning: could not record transactional event: {error}");
+                }
+                *self = Self::Local(store);
+            }
+            Err(error) => {
+                eprintln!("gensee: warning: could not record transactional event: {error}");
+                *self = Self::Unavailable;
+            }
+        }
     }
 }
 
@@ -3613,27 +3672,19 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         "copies": copies,
         "requested_name": requested_name.clone(),
     });
-    let event_store = match EventStore::default_local() {
-        Ok(store) => Some(store),
-        Err(error) => {
-            eprintln!("gensee: warning: could not record transactional event: {error}");
-            None
-        }
-    };
-    if let Some(store) = event_store.as_ref() {
-        record_tclone_transaction_with_store_best_effort(
-            store,
-            &operation_id,
-            "fork",
-            "started",
-            Some(&source.run_id),
-            None,
-            source.parent_run_id.as_deref(),
-            Some(&source.workspace),
-            format!("Creating {copies} fork(s) from {}", source.run_id),
-            Some(metadata.clone()),
-        );
-    }
+    let started_event = tclone_transaction_event(
+        &operation_id,
+        "fork",
+        "started",
+        Some(&source.run_id),
+        None,
+        source.parent_run_id.as_deref(),
+        Some(&source.workspace),
+        format!("Creating {copies} fork(s) from {}", source.run_id),
+        None,
+        Some(metadata.clone()),
+    )?;
+    let mut event_writer = TcloneForkEventWriter::start_best_effort(&started_event);
     timing.mark("preflight_and_transaction_start");
 
     let result: io::Result<()> = (|| {
@@ -3660,13 +3711,6 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         timing.mark("podman_clone");
         capability_guard.restore()?;
         timing.mark("source_capability_restore");
-        let fallback_event_store;
-        let fork_event_store = if let Some(store) = event_store.as_ref() {
-            store
-        } else {
-            fallback_event_store = EventStore::default_local()?;
-            &fallback_event_store
-        };
         let ids = output
             .lines()
             .map(str::trim)
@@ -3706,7 +3750,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 .and_then(|rootfs| tclone_overlay_rootfs_from_path(rootfs).ok());
             timing.mark("inspect_clone");
             let observed_at = unix_millis()?;
-            fork_event_store.append_session(&AgentSession {
+            event_writer.append_session(&AgentSession {
                 session_id: run_id.clone(),
                 agent_binary: source.agent_cmd.first().cloned().unwrap_or_default(),
                 root_pid,
@@ -3765,8 +3809,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 tclone_send_prompt_to_agent(&podman, &fork_record, &prompt, true)?;
             }
             timing.mark("handoff_prompt");
-            record_tclone_transaction_with_store_best_effort(
-                fork_event_store,
+            let succeeded_event = tclone_transaction_event(
                 &operation_id,
                 "fork",
                 "succeeded",
@@ -3775,12 +3818,14 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 Some(&source.run_id),
                 Some(&source.workspace),
                 format!("Forked {} from {}", run_id, source.run_id),
+                None,
                 Some(json!({
                     "copies": copies,
                     "copy_index": index,
                     "container_name": container_name,
                 })),
-            );
+            )?;
+            event_writer.append_transaction_best_effort(&succeeded_event);
             timing.mark("record_fork_transaction");
             if !fork_json {
                 println!("{run_id} | container={container_name}");
