@@ -5550,7 +5550,6 @@ fn detach_tclone_tmux_clients(podman: &OsString, container_name: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    thread::sleep(Duration::from_millis(500));
 }
 
 fn tclone_tmux_detach_script() -> String {
