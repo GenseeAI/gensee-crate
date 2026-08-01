@@ -4280,23 +4280,29 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         let prefix = clone.prefix;
         let output = clone.output;
         timing.mark("podman_clone");
-        capability_guard.restore()?;
-        timing.mark("source_capability_restore");
-        let ids = output
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if ids.len() != copies {
-            return Err(io::Error::other(format!(
-                "podman returned {} cloned container id(s), expected {copies}",
-                ids.len()
-            )));
-        }
-        let mut fork_run_ids = Vec::new();
-        let mut fork_records = Vec::new();
-        for index in 0..copies {
+        capability_guard.start_restore();
+        timing.mark("source_capability_restore_start");
+        let child_result = (|| -> io::Result<(
+            Vec<String>,
+            Vec<Value>,
+            Vec<(TransactionEventInput, String)>,
+        )> {
+            let ids = output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if ids.len() != copies {
+                return Err(io::Error::other(format!(
+                    "podman returned {} cloned container id(s), expected {copies}",
+                    ids.len()
+                )));
+            }
+            let mut fork_run_ids = Vec::new();
+            let mut fork_records = Vec::new();
+            let mut pending_successes = Vec::new();
+            for index in 0..copies {
             let run_id = format!("{}_fork_{}_{}", source.run_id, forked_at_ms, index);
             let inspection = ids
                 .get(index)
@@ -4402,11 +4408,10 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                     "approach": fork_record.fork_approach.as_deref(),
                 })),
             )?;
-            event_writer.append_transaction_best_effort(&succeeded_event);
-            timing.mark("record_fork_transaction");
-            if !fork_json {
-                println!("{run_id} | container={container_name}");
-            }
+            pending_successes.push((
+                succeeded_event,
+                format!("{run_id} | container={container_name}"),
+            ));
             fork_records.push(json!({
                 "run_id": &run_id,
                 "container": &container_name,
@@ -4418,8 +4423,21 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 "index": index,
                 "approach": fork_record.fork_approach.as_deref(),
             }));
-            fork_run_ids.push(run_id);
+                fork_run_ids.push(run_id);
+            }
+            Ok((fork_run_ids, fork_records, pending_successes))
+        })();
+        let restore_result = capability_guard.finish_restore();
+        timing.mark("source_capability_restore_join");
+        let (fork_run_ids, fork_records, pending_successes) = child_result?;
+        restore_result?;
+        for (succeeded_event, status_line) in pending_successes {
+            event_writer.append_transaction_best_effort(&succeeded_event);
+            if !fork_json {
+                println!("{status_line}");
+            }
         }
+        timing.mark("record_fork_transaction");
         if source_handoff.is_some() {
             let _ = fs::remove_file(tclone_source_fork_handoff_host_path(&source)?);
             if let Err(error) = restart_tclone_source_codex_after_fork(&podman, &source) {
@@ -6651,6 +6669,7 @@ struct TcloneCapabilityRotationGuard {
     podman: OsString,
     source: TcloneRunRecord,
     restored: bool,
+    restore_thread: Option<thread::JoinHandle<io::Result<()>>>,
 }
 
 impl TcloneCapabilityRotationGuard {
@@ -6660,19 +6679,42 @@ impl TcloneCapabilityRotationGuard {
             podman: podman.clone(),
             source,
             restored: false,
+            restore_thread: None,
         })
     }
 
-    fn restore(&mut self) -> io::Result<()> {
-        rotate_tclone_host_control_capability(&self.source.run_id)?;
-        write_tclone_run_context(&self.podman, &self.source)?;
-        self.restored = true;
-        Ok(())
+    fn start_restore(&mut self) {
+        let podman = self.podman.clone();
+        let source = self.source.clone();
+        self.restore_thread = Some(thread::spawn(move || {
+            rotate_tclone_host_control_capability(&source.run_id)?;
+            write_tclone_run_context(&podman, &source)
+        }));
+    }
+
+    fn finish_restore(&mut self) -> io::Result<()> {
+        let Some(thread) = self.restore_thread.take() else {
+            return Err(io::Error::other(
+                "source capability restore was not started",
+            ));
+        };
+        let result = thread
+            .join()
+            .map_err(|_| io::Error::other("source capability restore thread panicked"))?;
+        if result.is_ok() {
+            self.restored = true;
+        }
+        result
     }
 }
 
 impl Drop for TcloneCapabilityRotationGuard {
     fn drop(&mut self) {
+        if let Some(thread) = self.restore_thread.take() {
+            if thread.join().is_ok_and(|result| result.is_ok()) {
+                self.restored = true;
+            }
+        }
         if !self.restored {
             let _ = rotate_tclone_host_control_capability(&self.source.run_id);
             let _ = write_tclone_run_context(&self.podman, &self.source);
