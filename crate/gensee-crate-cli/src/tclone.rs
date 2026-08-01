@@ -3702,6 +3702,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         let mut prepared_contexts = prepare_tclone_fork_contexts(&source, forked_at_ms, copies)?;
         timing.mark("prepare_clone_contexts");
         let mut capability_guard = TcloneCapabilityRotationGuard::revoke(&podman, source.clone())?;
+        let source_context_path = capability_guard.prepare_restore_payload()?;
         timing.mark("capability_revoke");
         let clones = run_tclone_clone_with_overlay_retry(
             &podman,
@@ -3709,10 +3710,11 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             &prefix,
             &source,
             &prepared_contexts,
+            &source_context_path,
         )?;
         timing.mark("podman_clone");
-        capability_guard.start_restore();
-        timing.mark("source_capability_restore_start");
+        capability_guard.mark_restore_preinstalled();
+        timing.mark("source_capability_preinstalled");
         let child_result = (|| -> io::Result<(Vec<String>, Vec<Value>)> {
             if clones.len() != copies {
                 return Err(io::Error::other(format!(
@@ -4120,6 +4122,7 @@ fn run_tclone_clone_with_overlay_retry(
     prefix: &str,
     source: &TcloneRunRecord,
     prepared_contexts: &TclonePreparedForkContexts,
+    source_context_path: &Path,
 ) -> io::Result<Vec<TcloneForkCloneMetadata>> {
     let use_overlay = env::var("GENSEE_TCLONE_OVERLAY_BTRFS")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
@@ -4132,6 +4135,7 @@ fn run_tclone_clone_with_overlay_retry(
         use_overlay,
         &[],
         &prepared_contexts.contexts,
+        source_context_path,
     )
 }
 
@@ -4154,6 +4158,7 @@ fn run_tclone_clone_attempts(
     use_overlay: bool,
     extra_env: &[(&str, &str)],
     prepared_contexts: &[TclonePreparedForkContext],
+    source_context_path: &Path,
 ) -> io::Result<Vec<TcloneForkCloneMetadata>> {
     let env = tclone_clone_env(extra_env);
     let clone_args = tclone_clone_args(
@@ -4162,6 +4167,7 @@ fn run_tclone_clone_attempts(
         &source.container_name,
         use_overlay,
         prepared_contexts,
+        source_context_path,
     );
     match run_command_capture_with_env(podman, &clone_args, &env) {
         Ok(output) => parse_tclone_fork_clone_metadata(&output),
@@ -4182,6 +4188,7 @@ fn run_tclone_clone_attempts(
                 &source.container_name,
                 false,
                 prepared_contexts,
+                source_context_path,
             );
             let output = run_command_capture_with_env(podman, &fallback_args, &env)?;
             parse_tclone_fork_clone_metadata(&output)
@@ -4216,6 +4223,7 @@ fn tclone_clone_args(
     source_container: &str,
     overlay_btrfs: bool,
     prepared_contexts: &[TclonePreparedForkContext],
+    source_context_path: &Path,
 ) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("container"),
@@ -4242,6 +4250,11 @@ fn tclone_clone_args(
             TCLONE_RUN_CONTEXT_PATH,
         )));
     }
+    args.push(OsString::from(format!(
+        "--tfork-inject-source-file={}:{}",
+        source_context_path.to_string_lossy(),
+        TCLONE_RUN_CONTEXT_PATH,
+    )));
     args.push(source);
     args
 }
@@ -5693,7 +5706,7 @@ struct TcloneCapabilityRotationGuard {
     podman: OsString,
     source: TcloneRunRecord,
     restored: bool,
-    restore_thread: Option<thread::JoinHandle<io::Result<()>>>,
+    restore_payload_path: Option<PathBuf>,
 }
 
 impl TcloneCapabilityRotationGuard {
@@ -5703,40 +5716,45 @@ impl TcloneCapabilityRotationGuard {
             podman: podman.clone(),
             source,
             restored: false,
-            restore_thread: None,
+            restore_payload_path: None,
         })
     }
 
-    fn start_restore(&mut self) {
-        let podman = self.podman.clone();
-        let source = self.source.clone();
-        self.restore_thread = Some(thread::spawn(move || {
-            rotate_tclone_host_control_capability(&source.run_id)?;
-            write_tclone_run_context(&podman, &source)
-        }));
+    fn prepare_restore_payload(&mut self) -> io::Result<PathBuf> {
+        let capability = rotate_tclone_host_control_capability(&self.source.run_id)?;
+        let payload = serde_json::to_vec(&tclone_run_context_payload(&self.source, &capability))?;
+        let context_dir = gensee_tmp_root()?
+            .join(&self.source.run_id)
+            .join("prepared-source-context");
+        create_restrictive_dir_all(&context_dir)?;
+        let payload_path =
+            context_dir.join(format!("{}-{}.json", std::process::id(), unix_millis()?));
+        write_atomic_nofollow(&payload_path, &payload, 0o600)?;
+        self.restore_payload_path = Some(payload_path.clone());
+        Ok(payload_path)
+    }
+
+    fn mark_restore_preinstalled(&mut self) {
+        self.restored = true;
     }
 
     fn finish_restore(&mut self) -> io::Result<()> {
-        let Some(thread) = self.restore_thread.take() else {
+        if !self.restored {
             return Err(io::Error::other(
-                "source capability restore was not started",
+                "source capability restore was not preinstalled",
             ));
-        };
-        let result = thread
-            .join()
-            .map_err(|_| io::Error::other("source capability restore thread panicked"))?;
-        if result.is_ok() {
-            self.restored = true;
         }
-        result
+        Ok(())
     }
 }
 
 impl Drop for TcloneCapabilityRotationGuard {
     fn drop(&mut self) {
-        if let Some(thread) = self.restore_thread.take() {
-            if thread.join().is_ok_and(|result| result.is_ok()) {
-                self.restored = true;
+        if let Some(path) = self.restore_payload_path.take() {
+            let parent = path.parent().map(Path::to_path_buf);
+            let _ = fs::remove_file(path);
+            if let Some(parent) = parent {
+                let _ = fs::remove_dir(parent);
             }
         }
         if !self.restored {
@@ -10596,12 +10614,13 @@ mod tests {
 
     #[test]
     fn tclone_clone_args_can_disable_overlay_btrfs() {
-        let overlay = tclone_clone_args(2, "fork-prefix", "source", true, &[]);
+        let source_context = Path::new("/tmp/source-context.json");
+        let overlay = tclone_clone_args(2, "fork-prefix", "source", true, &[], source_context);
         assert!(overlay.contains(&OsString::from("--tfork-overlay-btrfs")));
         assert!(overlay.contains(&OsString::from("--tfork-metadata")));
         assert!(overlay.contains(&OsString::from("--copies=2")));
 
-        let fallback = tclone_clone_args(2, "fork-prefix", "source", false, &[]);
+        let fallback = tclone_clone_args(2, "fork-prefix", "source", false, &[], source_context);
         assert!(!fallback.contains(&OsString::from("--tfork-overlay-btrfs")));
         assert!(fallback.contains(&OsString::from("--copies=2")));
     }
@@ -10618,12 +10637,22 @@ mod tests {
                 payload_path: PathBuf::from("/tmp/context-1.json"),
             },
         ];
-        let args = tclone_clone_args(2, "fork-prefix", "source", true, &contexts);
+        let args = tclone_clone_args(
+            2,
+            "fork-prefix",
+            "source",
+            true,
+            &contexts,
+            Path::new("/tmp/source-context.json"),
+        );
         assert!(args.contains(&OsString::from(format!(
             "--tfork-inject-file=0:/tmp/context-0.json:{TCLONE_RUN_CONTEXT_PATH}"
         ))));
         assert!(args.contains(&OsString::from(format!(
             "--tfork-inject-file=1:/tmp/context-1.json:{TCLONE_RUN_CONTEXT_PATH}"
+        ))));
+        assert!(args.contains(&OsString::from(format!(
+            "--tfork-inject-source-file=/tmp/source-context.json:{TCLONE_RUN_CONTEXT_PATH}"
         ))));
     }
 
