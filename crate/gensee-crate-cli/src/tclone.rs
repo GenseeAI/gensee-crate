@@ -3689,21 +3689,15 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
 
     let result: io::Result<()> = (|| {
         let podman = tclone_podman();
-        ensure_tclone_container_exists(&podman, &source)?;
-        timing.mark("ensure_source_exists");
         let source_handoff = wait_for_tclone_source_fork_handoff(&source)?;
         timing.mark("source_handoff");
         wait_for_tclone_source_quiet_if_requested(&podman, &source)?;
         timing.mark("source_quiet");
-        ensure_tclone_agent_ready_for_fork(&podman, &source)?;
-        timing.mark("agent_ready");
         let _detach_guard = TcloneForkDetachGuard::mark(&source.run_id)?;
         timing.mark("fork_marker");
-        detach_tclone_tmux_clients(&podman, &source.container_name);
-        timing.mark("tmux_detach");
+        let fork_base_git_head = prepare_tclone_source_for_fork(&podman, &source)?;
+        timing.mark("prepare_source");
         let forked_at_ms = unix_millis()?;
-        let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
-        timing.mark("capture_git_head");
         let prefix = tclone_fork_name_prefix(&parent, requested_name.as_deref(), forked_at_ms);
         let mut capability_guard = TcloneCapabilityRotationGuard::revoke(&podman, source.clone())?;
         timing.mark("capability_revoke");
@@ -5108,19 +5102,92 @@ fn wait_tclone_agent_ready(
     }
 }
 
-fn ensure_tclone_agent_ready_for_fork(
+fn prepare_tclone_source_for_fork(
     podman: &OsString,
     source: &TcloneRunRecord,
-) -> io::Result<()> {
-    match tclone_agent_readiness(podman, &source.container_name, &source.agent_cmd, true)? {
-        TcloneAgentReadiness::Ready | TcloneAgentReadiness::NoTmux => Ok(()),
-        TcloneAgentReadiness::Starting(message) | TcloneAgentReadiness::Exited(message) => {
-            Err(io::Error::other(format!(
-                "tclone source {} is not ready to fork: {message}",
-                source.run_id
-            )))
+) -> io::Result<Option<String>> {
+    let script = tclone_source_prepare_script(&source.agent_cmd);
+    let output = tclone_exec_capture_env(
+        podman,
+        &source.container_name,
+        &[("GENSEE_WORKSPACE", &source.container_workspace)],
+        &["sh", "-lc", &script],
+    )?;
+    let mut state = None;
+    let mut git_head = None;
+    let mut detail = Vec::new();
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("state=") {
+            state = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("git_head=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                git_head = Some(value.to_string());
+            }
+        } else {
+            detail.push(line);
         }
     }
+    match state.as_deref() {
+        Some("ready" | "no-tmux") => Ok(git_head),
+        Some("starting" | "exited") => Err(io::Error::other(format!(
+            "tclone source {} is not ready to fork: {}",
+            source.run_id,
+            detail.join("\n")
+        ))),
+        Some(other) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown tclone source preparation state {other:?}"),
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tclone source preparation returned no state",
+        )),
+    }
+}
+
+fn tclone_source_prepare_script(agent_cmd: &[String]) -> String {
+    let process_check = tclone_agent_process_check(agent_cmd).unwrap_or("true");
+    format!(
+        r#"state=no-tmux
+if command -v tmux >/dev/null 2>&1; then
+  if ! tmux has-session -t {session} 2>/dev/null; then
+    printf 'state=starting\n'
+    test -f /tmp/gensee-agent-start.log && tail -n 20 /tmp/gensee-agent-start.log
+    exit 0
+  fi
+  if tmux list-panes -t {session} -F '#{{pane_dead}}' 2>/dev/null | grep -q '^1$'; then
+    printf 'state=exited\n'
+    tmux capture-pane -pt {session} 2>/dev/null | tail -n 40 || true
+    exit 0
+  fi
+  if ! ({process_check}); then
+    printf 'state=starting\nagent process is not running yet\n'
+    exit 0
+  fi
+  state=ready
+  tmux display-message -t {session} 'Gensee is forking this run; reconnecting shortly.' 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    clients="$(tmux list-clients -t {session} -F '#{{client_pid}}' 2>/dev/null || true)"
+    [ -z "$clients" ] && break
+    tmux detach-client -a -s {session} 2>/dev/null || true
+    printf '%s\n' "$clients" |
+      while IFS= read -r client_pid; do
+        case "$client_pid" in
+          ''|*[!0-9]*) ;;
+          *) kill -HUP "$client_pid" 2>/dev/null || true ;;
+        esac
+      done
+    sleep 0.1
+  done
+fi
+printf 'state=%s\n' "$state"
+git_head="$(git -C "$GENSEE_WORKSPACE" rev-parse --verify HEAD 2>/dev/null || true)"
+printf 'git_head=%s\n' "$git_head"
+"#,
+        session = shell_quote(TCLONE_AGENT_TMUX_SESSION),
+        process_check = process_check,
+    )
 }
 
 fn wait_for_tclone_source_quiet_if_requested(
@@ -5667,42 +5734,6 @@ fn tclone_exec_ready(podman: &OsString, container_name: &str) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-
-fn detach_tclone_tmux_clients(podman: &OsString, container_name: &str) {
-    let script = tclone_tmux_detach_script();
-    let _ = Command::new(podman)
-        .arg("exec")
-        .arg(container_name)
-        .arg("sh")
-        .arg("-lc")
-        .arg(script)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-fn tclone_tmux_detach_script() -> String {
-    format!(
-        r#"if command -v tmux >/dev/null 2>&1 && tmux has-session -t {session} 2>/dev/null; then
-  tmux display-message -t {session} 'Gensee is forking this run; reconnecting shortly.' 2>/dev/null || true
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    clients="$(tmux list-clients -t {session} -F '#{{client_pid}}' 2>/dev/null || true)"
-    [ -z "$clients" ] && exit 0
-    tmux detach-client -a -s {session} 2>/dev/null || true
-    printf '%s\n' "$clients" |
-      while IFS= read -r client_pid; do
-        case "$client_pid" in
-          ''|*[!0-9]*) ;;
-          *) kill -HUP "$client_pid" 2>/dev/null || true ;;
-        esac
-      done
-    sleep 0.1
-  done
-fi
-"#,
-        session = shell_quote(TCLONE_AGENT_TMUX_SESSION),
-    )
 }
 
 pub(crate) fn tclone_diff(args: Vec<OsString>) -> io::Result<()> {
@@ -7775,28 +7806,6 @@ done < <(git ls-files --others --exclude-standard -z)
         &envs,
         &["bash", "-lc", script],
     )
-}
-
-fn capture_tclone_git_head(podman: &OsString, source: &TcloneRunRecord) -> io::Result<String> {
-    let script = r#"set -euo pipefail
-cd "$GENSEE_WORKSPACE"
-git rev-parse --verify HEAD
-"#;
-    let output = tclone_exec_capture_env(
-        podman,
-        &source.container_name,
-        &[("GENSEE_WORKSPACE", &source.container_workspace)],
-        &["bash", "-lc", script],
-    )?;
-    let head = output.trim().to_string();
-    if head.is_empty() {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "empty git HEAD from tclone source container",
-        ))
-    } else {
-        Ok(head)
-    }
 }
 
 fn ensure_tclone_container_exists(podman: &OsString, record: &TcloneRunRecord) -> io::Result<()> {
@@ -10653,13 +10662,16 @@ gensee async job job_1: exited status=0
     }
 
     #[test]
-    fn tclone_tmux_detach_script_drains_attached_clients() {
-        let script = tclone_tmux_detach_script();
+    fn tclone_source_prepare_script_validates_detaches_and_captures_git_head() {
+        let script = tclone_source_prepare_script(&["codex".to_string()]);
+        assert!(script.contains("agent process is not running yet"));
         assert!(script.contains("display-message"));
         assert!(script.contains("list-clients"));
         assert!(script.contains("client_pid"));
         assert!(script.contains("detach-client -a -s"));
         assert!(script.contains("kill -HUP"));
+        assert!(script.contains("git_head="));
+        assert!(script.contains("rev-parse --verify HEAD"));
     }
 
     #[test]
