@@ -4278,7 +4278,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         timing.mark("capability_revoke");
         let clone = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
         let prefix = clone.prefix;
-        let output = clone.output;
+        let clones = parse_tclone_fork_clone_metadata(&clone.output)?;
         timing.mark("podman_clone");
         capability_guard.start_restore();
         timing.mark("source_capability_restore_start");
@@ -4287,16 +4287,10 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             Vec<Value>,
             Vec<(TransactionEventInput, String)>,
         )> {
-            let ids = output
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            if ids.len() != copies {
+            if clones.len() != copies {
                 return Err(io::Error::other(format!(
-                    "podman returned {} cloned container id(s), expected {copies}",
-                    ids.len()
+                    "podman returned {} cloned container metadata record(s), expected {copies}",
+                    clones.len()
                 )));
             }
             let mut fork_run_ids = Vec::new();
@@ -4304,28 +4298,11 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             let mut pending_successes = Vec::new();
             for index in 0..copies {
             let run_id = format!("{}_fork_{}_{}", source.run_id, forked_at_ms, index);
-            let inspection = ids
-                .get(index)
-                .and_then(|id| inspect_tclone_container(&podman, id).ok());
-            let container_name = inspection
-                .as_ref()
-                .and_then(|value| value.name.clone())
-                .unwrap_or_else(|| {
-                    if copies == 1 {
-                        prefix.clone()
-                    } else {
-                        format!("{prefix}-{index}")
-                    }
-                });
-            let root_pid = inspection
-                .as_ref()
-                .and_then(|value| value.root_pid)
-                .unwrap_or(0);
-            let overlay_layers = inspection
-                .as_ref()
-                .and_then(|value| value.rootfs.as_deref())
-                .and_then(|rootfs| tclone_overlay_rootfs_from_path(rootfs).ok());
-            timing.mark("inspect_clone");
+            let clone = &clones[index];
+            let container_name = clone.name.clone();
+            let root_pid = clone.pid;
+            let overlay_layers = tclone_overlay_rootfs_from_path(&clone.rootfs).ok();
+            timing.mark("consume_clone_metadata");
             let observed_at = unix_millis()?;
             event_writer.append_session(&AgentSession {
                 session_id: run_id.clone(),
@@ -4350,7 +4327,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 role: "fork".to_string(),
                 status: "running".to_string(),
                 container_name: container_name.clone(),
-                container_id: ids.get(index).cloned(),
+                container_id: Some(clone.id.clone()),
                 source_container: Some(source.container_name.clone()),
                 host_control_owner_run_id: Some(
                     tclone_host_control_owner_run_id(&source).to_string(),
@@ -4415,7 +4392,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             fork_records.push(json!({
                 "run_id": &run_id,
                 "container": &container_name,
-                "container_id": ids.get(index),
+                "container_id": &clone.id,
                 "role": "fork",
                 "source_run_id": &source.run_id,
                 "workspace": &source.container_workspace,
@@ -4681,6 +4658,14 @@ pub(crate) fn tclone_fork_status(args: Vec<OsString>) -> io::Result<()> {
 struct TcloneCloneOutput {
     prefix: String,
     output: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TcloneForkCloneMetadata {
+    id: String,
+    name: String,
+    pid: u32,
+    rootfs: PathBuf,
 }
 
 fn run_tclone_clone_with_overlay_retry(
@@ -4985,14 +4970,11 @@ fn cleanup_tclone_partial_clone_names(podman: &OsString, copies: usize, prefix: 
 }
 
 fn validate_tclone_clone_output(output: &str, copies: usize) -> io::Result<()> {
-    let ids = output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .count();
-    if ids != copies {
+    let clones = parse_tclone_fork_clone_metadata(output)?;
+    if clones.len() != copies {
         return Err(io::Error::other(format!(
-            "podman returned {ids} cloned container id(s), expected {copies}"
+            "podman returned {} cloned container metadata record(s), expected {copies}",
+            clones.len()
         )));
     }
     Ok(())
@@ -5028,6 +5010,7 @@ fn tclone_clone_args(
         OsString::from("container"),
         OsString::from("clone"),
         OsString::from("--live"),
+        OsString::from("--tfork-metadata"),
         OsString::from(format!("--copies={copies}")),
         OsString::from("--persistent=async"),
         OsString::from("--tfork-tcp-close"),
@@ -5040,6 +5023,23 @@ fn tclone_clone_args(
         args.insert(5, OsString::from("--tfork-overlay-btrfs"));
     }
     args
+}
+
+fn parse_tclone_fork_clone_metadata(output: &str) -> io::Result<Vec<TcloneForkCloneMetadata>> {
+    let clones = serde_json::from_str::<Vec<TcloneForkCloneMetadata>>(output)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    if clones.iter().any(|clone| {
+        clone.id.is_empty()
+            || clone.name.is_empty()
+            || clone.pid == 0
+            || clone.rootfs.as_os_str().is_empty()
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "podman returned incomplete tfork clone metadata",
+        ));
+    }
+    Ok(clones)
 }
 
 fn should_retry_tclone_without_overlay(error: &str) -> bool {
@@ -12154,11 +12154,26 @@ mod tests {
     fn tclone_clone_args_can_disable_overlay_btrfs() {
         let overlay = tclone_clone_args(2, "fork-prefix", "source", true);
         assert!(overlay.contains(&OsString::from("--tfork-overlay-btrfs")));
+        assert!(overlay.contains(&OsString::from("--tfork-metadata")));
         assert!(overlay.contains(&OsString::from("--copies=2")));
 
         let fallback = tclone_clone_args(2, "fork-prefix", "source", false);
         assert!(!fallback.contains(&OsString::from("--tfork-overlay-btrfs")));
         assert!(fallback.contains(&OsString::from("--copies=2")));
+    }
+
+    #[test]
+    fn tclone_fork_metadata_parser_requires_complete_records() {
+        let parsed = parse_tclone_fork_clone_metadata(
+            r#"[{"id":"abc","name":"fork-0","pid":42,"rootfs":"/tmp/rootfs-0"}]"#,
+        )
+        .unwrap();
+        assert_eq!(parsed[0].id, "abc");
+        assert_eq!(parsed[0].pid, 42);
+        assert!(parse_tclone_fork_clone_metadata(
+            r#"[{"id":"abc","name":"fork-0","pid":0,"rootfs":"/tmp/rootfs-0"}]"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -12203,8 +12218,16 @@ mod tests {
         assert!(!should_retry_tclone_partial_multicopy(
             "podman exited with status 125: container not found"
         ));
-        assert!(validate_tclone_clone_output("clone-a\n", 2).is_err());
-        assert!(validate_tclone_clone_output("clone-a\nclone-b\n", 2).is_ok());
+        assert!(validate_tclone_clone_output(
+            r#"[{"id":"a","name":"fork-0","pid":1,"rootfs":"/tmp/0"}]"#,
+            2
+        )
+        .is_err());
+        assert!(validate_tclone_clone_output(
+            r#"[{"id":"a","name":"fork-0","pid":1,"rootfs":"/tmp/0"},{"id":"b","name":"fork-1","pid":2,"rootfs":"/tmp/1"}]"#,
+            2
+        )
+        .is_ok());
     }
 
     #[test]
