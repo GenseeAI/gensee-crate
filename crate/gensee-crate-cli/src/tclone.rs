@@ -4258,9 +4258,12 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         let mut fork_records = Vec::new();
         for index in 0..copies {
             let run_id = format!("{}_fork_{}_{}", source.run_id, forked_at_ms, index);
-            let container_name = ids
+            let inspection = ids
                 .get(index)
-                .and_then(|id| inspect_container_name(&podman, id).ok())
+                .and_then(|id| inspect_tclone_container(&podman, id).ok());
+            let container_name = inspection
+                .as_ref()
+                .and_then(|value| value.name.clone())
                 .unwrap_or_else(|| {
                     if copies == 1 {
                         prefix.clone()
@@ -4268,11 +4271,15 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                         format!("{prefix}-{index}")
                     }
                 });
-            timing.mark("inspect_clone_name");
-            let root_pid = inspect_container_pid(&podman, &container_name).unwrap_or(0);
-            timing.mark("inspect_clone_pid");
-            let overlay_layers = inspect_tclone_overlay_rootfs(&podman, &container_name).ok();
-            timing.mark("inspect_clone_overlay");
+            let root_pid = inspection
+                .as_ref()
+                .and_then(|value| value.root_pid)
+                .unwrap_or(0);
+            let overlay_layers = inspection
+                .as_ref()
+                .and_then(|value| value.rootfs.as_deref())
+                .and_then(|rootfs| tclone_overlay_rootfs_from_path(rootfs).ok());
+            timing.mark("inspect_clone");
             let observed_at = unix_millis()?;
             fork_event_store.append_session(&AgentSession {
                 session_id: run_id.clone(),
@@ -8463,6 +8470,13 @@ struct TcloneOverlayRootfs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TcloneContainerInspection {
+    name: Option<String>,
+    root_pid: Option<u32>,
+    rootfs: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TcloneOverlayMergeOp {
     UpsertFile,
     CreateDir,
@@ -9075,10 +9089,31 @@ fn ensure_tclone_container_exists(podman: &OsString, record: &TcloneRunRecord) -
 }
 
 fn inspect_tclone_rootfs(podman: &OsString, container: &str) -> io::Result<PathBuf> {
+    inspect_tclone_container(podman, container)?
+        .rootfs
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("podman inspect for {container} did not include a rootfs path"),
+            )
+        })
+}
+
+fn inspect_tclone_container(
+    podman: &OsString,
+    container: &str,
+) -> io::Result<TcloneContainerInspection> {
     let output = run_command_capture(
         podman,
         &[OsString::from("inspect"), OsString::from(container)],
     )?;
+    parse_tclone_container_inspection(&output, container)
+}
+
+fn parse_tclone_container_inspection(
+    output: &str,
+    container: &str,
+) -> io::Result<TcloneContainerInspection> {
     let values = serde_json::from_str::<Vec<serde_json::Value>>(&output)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
     let Some(value) = values.first() else {
@@ -9088,17 +9123,23 @@ fn inspect_tclone_rootfs(podman: &OsString, container: &str) -> io::Result<PathB
         ));
     };
     let data = &value["GraphDriver"]["Data"];
-    let path = data["Source"]
+    let rootfs = data["Source"]
         .as_str()
         .or_else(|| data["MergedDir"].as_str())
         .or_else(|| value["Rootfs"].as_str())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("podman inspect for {container} did not include a rootfs path"),
-            )
-        })?;
-    Ok(PathBuf::from(path))
+        .map(PathBuf::from);
+    let name = value["Name"]
+        .as_str()
+        .map(|name| name.trim_start_matches('/').to_string())
+        .filter(|name| !name.is_empty());
+    let root_pid = value["State"]["Pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok());
+    Ok(TcloneContainerInspection {
+        name,
+        root_pid,
+        rootfs,
+    })
 }
 
 fn inspect_tclone_overlay_rootfs(
@@ -9106,12 +9147,14 @@ fn inspect_tclone_overlay_rootfs(
     container: &str,
 ) -> io::Result<TcloneOverlayRootfs> {
     let rootfs = inspect_tclone_rootfs(podman, container)?;
-    let Some((lowerdir, upperdir)) = overlay_layers_for_mountpoint(&rootfs)? else {
+    tclone_overlay_rootfs_from_path(&rootfs)
+}
+
+fn tclone_overlay_rootfs_from_path(rootfs: &Path) -> io::Result<TcloneOverlayRootfs> {
+    let Some((lowerdir, upperdir)) = overlay_layers_for_mountpoint(rootfs)? else {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!(
-                "container {container} is not backed by a visible overlay rootfs; create a new fork with Gensee's tclone overlay mode"
-            ),
+            "container is not backed by a visible overlay rootfs; create a new fork with Gensee's tclone overlay mode",
         ));
     };
     Ok(TcloneOverlayRootfs { lowerdir, upperdir })
@@ -10098,27 +10141,6 @@ fn inspect_container_pid(podman: &OsString, container: &str) -> io::Result<u32> 
     })
 }
 
-fn inspect_container_name(podman: &OsString, container: &str) -> io::Result<String> {
-    let output = run_command_capture(
-        podman,
-        &[
-            OsString::from("inspect"),
-            OsString::from(container),
-            OsString::from("--format"),
-            OsString::from("{{.Name}}"),
-        ],
-    )?;
-    let name = output.trim().trim_start_matches('/').to_string();
-    if name.is_empty() {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "empty container name from podman inspect",
-        ))
-    } else {
-        Ok(name)
-    }
-}
-
 struct TcloneStateLock {
     path: PathBuf,
 }
@@ -10334,6 +10356,23 @@ fn find_command(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tclone_container_inspection_parses_one_podman_response() {
+        let inspection = parse_tclone_container_inspection(
+            r#"[{
+                "Name": "/fork-1",
+                "State": {"Pid": 4242},
+                "GraphDriver": {"Data": {"Source": "/bundle/rootfs"}}
+            }]"#,
+            "container-id",
+        )
+        .unwrap();
+
+        assert_eq!(inspection.name.as_deref(), Some("fork-1"));
+        assert_eq!(inspection.root_pid, Some(4242));
+        assert_eq!(inspection.rootfs, Some(PathBuf::from("/bundle/rootfs")));
+    }
 
     fn tclone_test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
