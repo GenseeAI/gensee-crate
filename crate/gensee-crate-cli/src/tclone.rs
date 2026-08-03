@@ -3707,7 +3707,11 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         timing.mark("podman_clone");
         capability_guard.start_restore();
         timing.mark("source_capability_restore_start");
-        let child_result = (|| -> io::Result<(Vec<String>, Vec<Value>)> {
+        let child_result = (|| -> io::Result<(
+            Vec<String>,
+            Vec<Value>,
+            Vec<(TransactionEventInput, String)>,
+        )> {
             if clones.len() != copies {
                 return Err(io::Error::other(format!(
                     "podman returned {} cloned container id(s), expected {copies}",
@@ -3716,6 +3720,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             }
             let mut fork_run_ids = Vec::new();
             let mut fork_records = Vec::new();
+            let mut pending_successes = Vec::new();
             for index in 0..copies {
                 let run_id = format!("{}_fork_{}_{}", source.run_id, forked_at_ms, index);
                 let clone = &clones[index];
@@ -3799,11 +3804,10 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                         "container_name": container_name,
                     })),
                 )?;
-                event_writer.append_transaction_best_effort(&succeeded_event);
-                timing.mark("record_fork_transaction");
-                if !fork_json {
-                    println!("{run_id} | container={container_name}");
-                }
+                pending_successes.push((
+                    succeeded_event,
+                    format!("{run_id} | container={container_name}"),
+                ));
                 fork_records.push(json!({
                     "run_id": &run_id,
                     "container": &container_name,
@@ -3814,12 +3818,19 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 }));
                 fork_run_ids.push(run_id);
             }
-            Ok((fork_run_ids, fork_records))
+            Ok((fork_run_ids, fork_records, pending_successes))
         })();
         let restore_result = capability_guard.finish_restore();
         timing.mark("source_capability_restore_join");
-        let (fork_run_ids, fork_records) = child_result?;
+        let (fork_run_ids, fork_records, pending_successes) = child_result?;
         restore_result?;
+        for (succeeded_event, status_line) in pending_successes {
+            event_writer.append_transaction_best_effort(&succeeded_event);
+            if !fork_json {
+                println!("{status_line}");
+            }
+        }
+        timing.mark("record_fork_transaction");
         if source_handoff.is_some() {
             let _ = fs::remove_file(tclone_source_fork_handoff_host_path(&source)?);
             if let Err(error) = restart_tclone_source_codex_after_fork(&podman, &source) {
