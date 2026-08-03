@@ -4288,7 +4288,12 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         let prefix = clone.prefix;
         let clones = parse_tclone_fork_clone_metadata(&clone.output)?;
         timing.mark("podman_clone");
-        capability_guard.start_restore();
+        // Security boundary: do not create or install the source's replacement
+        // capability until tfork has returned. Children can therefore snapshot
+        // only the old, already-revoked source credential. Source restoration
+        // uses podman exec and is joined before any success is published.
+        capability_guard.mark_clone_completed();
+        capability_guard.start_restore()?;
         timing.mark("source_capability_restore_start");
         let child_result = (|| -> io::Result<(
             Vec<String>,
@@ -6780,6 +6785,7 @@ struct TcloneForkDetachGuard {
 struct TcloneCapabilityRotationGuard {
     podman: OsString,
     source: TcloneRunRecord,
+    clone_completed: bool,
     restored: bool,
     restore_thread: Option<thread::JoinHandle<io::Result<()>>>,
 }
@@ -6790,18 +6796,33 @@ impl TcloneCapabilityRotationGuard {
         Ok(Self {
             podman: podman.clone(),
             source,
+            clone_completed: false,
             restored: false,
             restore_thread: None,
         })
     }
 
-    fn start_restore(&mut self) {
+    fn mark_clone_completed(&mut self) {
+        self.clone_completed = true;
+    }
+
+    fn start_restore(&mut self) -> io::Result<()> {
+        if !self.clone_completed {
+            return Err(io::Error::other(
+                "refusing to restore the source capability before clone completion",
+            ));
+        }
+        if self.restore_thread.is_some() {
+            return Err(io::Error::other(
+                "source capability restore was already started",
+            ));
+        }
         let podman = self.podman.clone();
         let source = self.source.clone();
         self.restore_thread = Some(thread::spawn(move || {
-            rotate_tclone_host_control_capability(&source.run_id)?;
-            write_tclone_run_context(&podman, &source)
+            restore_tclone_source_capability(&podman, &source)
         }));
+        Ok(())
     }
 
     fn finish_restore(&mut self) -> io::Result<()> {
@@ -6823,15 +6844,48 @@ impl TcloneCapabilityRotationGuard {
 impl Drop for TcloneCapabilityRotationGuard {
     fn drop(&mut self) {
         if let Some(thread) = self.restore_thread.take() {
-            if thread.join().is_ok_and(|result| result.is_ok()) {
-                self.restored = true;
+            match thread.join() {
+                Ok(Ok(())) => self.restored = true,
+                Ok(Err(error)) => eprintln!(
+                    "gensee: ERROR: source capability restore failed for {}: {error}; attempting rollback",
+                    self.source.run_id
+                ),
+                Err(_) => eprintln!(
+                    "gensee: ERROR: source capability restore thread panicked for {}; attempting rollback",
+                    self.source.run_id
+                ),
             }
         }
         if !self.restored {
-            let _ = rotate_tclone_host_control_capability(&self.source.run_id);
-            let _ = write_tclone_run_context(&self.podman, &self.source);
+            match restore_tclone_source_capability(&self.podman, &self.source) {
+                Ok(()) => eprintln!(
+                    "gensee: warning: restored source capability for {} during fork rollback",
+                    self.source.run_id
+                ),
+                Err(error) => eprintln!(
+                    "gensee: ERROR: could not restore source capability for {} during fork rollback after retries: {error}",
+                    self.source.run_id
+                ),
+            }
         }
     }
+}
+
+fn restore_tclone_source_capability(podman: &OsString, source: &TcloneRunRecord) -> io::Result<()> {
+    const ATTEMPTS: usize = 3;
+    let mut last_error = None;
+    for attempt in 0..ATTEMPTS {
+        let result = rotate_tclone_host_control_capability(&source.run_id)
+            .and_then(|_| write_tclone_run_context(podman, source));
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < ATTEMPTS {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("source capability restore failed")))
 }
 
 impl TcloneForkDetachGuard {
@@ -10612,6 +10666,27 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    #[cfg(unix)]
+    fn fake_podman_context_writer(test_name: &str) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
+        let root = env::temp_dir().join(format!(
+            "gensee-{test_name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root)?;
+        let capture_path = root.join("context.json");
+        let podman_path = root.join("podman");
+        fs::write(
+            &podman_path,
+            format!(
+                "#!/bin/sh\ncat > {}\n",
+                shell_quote(&capture_path.to_string_lossy())
+            ),
+        )?;
+        fs::set_permissions(&podman_path, fs::Permissions::from_mode(0o700))?;
+        Ok((root, podman_path, capture_path))
+    }
+
     fn test_record(run_id: &str, status: &str) -> TcloneRunRecord {
         TcloneRunRecord {
             run_id: run_id.to_string(),
@@ -12310,6 +12385,67 @@ mod tests {
             .unwrap();
         assert!(first_index < second_index);
         assert!(second_index < source_index);
+        assert!(!args.iter().any(|arg| {
+            arg.to_string_lossy()
+                .starts_with("--tfork-inject-source-file=")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_source_restore_is_rejected_before_clone_completion() -> io::Result<()> {
+        let _guard = tclone_test_env_lock();
+        let run_id = format!("restore-order-{}", Uuid::new_v4().simple());
+        let source = test_record(&run_id, "running");
+        let (fake_root, podman_path, capture_path) = fake_podman_context_writer("restore-order")?;
+        rotate_tclone_host_control_capability(&run_id)?;
+
+        let mut rotation =
+            TcloneCapabilityRotationGuard::revoke(&podman_path.into_os_string(), source)?;
+        let error = rotation.start_restore().unwrap_err();
+        assert!(error.to_string().contains("before clone completion"));
+        assert!(!capture_path.exists());
+
+        rotation.mark_clone_completed();
+        rotation.start_restore()?;
+        rotation.finish_restore()?;
+        let payload: Value = serde_json::from_slice(&fs::read(&capture_path)?)?;
+        let host_capability = read_tclone_host_control_capability(&run_id)?;
+        assert_eq!(
+            payload["host_control_capability"].as_str(),
+            Some(host_capability.as_str())
+        );
+        drop(rotation);
+
+        let _ = fs::remove_dir_all(gensee_tmp_root()?.join(&run_id));
+        let _ = fs::remove_dir_all(fake_root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_source_restore_drop_rolls_back_revocation() -> io::Result<()> {
+        let _guard = tclone_test_env_lock();
+        let run_id = format!("restore-drop-{}", Uuid::new_v4().simple());
+        let source = test_record(&run_id, "running");
+        let (fake_root, podman_path, capture_path) = fake_podman_context_writer("restore-drop")?;
+        rotate_tclone_host_control_capability(&run_id)?;
+
+        {
+            let _rotation =
+                TcloneCapabilityRotationGuard::revoke(&podman_path.into_os_string(), source)?;
+        }
+
+        let payload: Value = serde_json::from_slice(&fs::read(&capture_path)?)?;
+        let host_capability = read_tclone_host_control_capability(&run_id)?;
+        assert_eq!(
+            payload["host_control_capability"].as_str(),
+            Some(host_capability.as_str())
+        );
+
+        let _ = fs::remove_dir_all(gensee_tmp_root()?.join(&run_id));
+        let _ = fs::remove_dir_all(fake_root);
+        Ok(())
     }
 
     #[test]
