@@ -4120,7 +4120,14 @@ fn prepare_tclone_fork_contexts(
     };
     for index in 0..copies {
         let run_id = format!("{}_fork_{}_{}", source.run_id, forked_at_ms, index);
+        let payload_path = context_dir.join(format!("{forked_at_ms}-{index}.json"));
         let capability = ensure_tclone_host_control_capability(&run_id)?;
+        // Register cleanup as soon as capability allocation succeeds. Any
+        // serialization or payload-write failure below must revoke it.
+        prepared.contexts.push(TclonePreparedForkContext {
+            run_id: run_id.clone(),
+            payload_path: payload_path.clone(),
+        });
         let payload = json!({
             "run_id": &run_id,
             "role": "fork",
@@ -4128,12 +4135,7 @@ fn prepare_tclone_fork_contexts(
             "workspace": &source.container_workspace,
             "host_control_capability": capability,
         });
-        let payload_path = context_dir.join(format!("{forked_at_ms}-{index}.json"));
         write_atomic_nofollow(&payload_path, &serde_json::to_vec(&payload)?, 0o600)?;
-        prepared.contexts.push(TclonePreparedForkContext {
-            run_id,
-            payload_path,
-        });
     }
     Ok(prepared)
 }
@@ -4264,6 +4266,10 @@ fn tclone_clone_args(
         args.insert(5, OsString::from("--tfork-overlay-btrfs"));
     }
     let source = args.pop().expect("source container argument");
+    // Positional contract with Podman's tfork implementation: copy index i is
+    // used for the clone ID/rootfs/name arrays, fileInjections[i], and the
+    // metadata record appended for that clone. Keeping this loop in context
+    // order therefore binds each injected run ID to metadata entry i.
     for (index, context) in prepared_contexts.iter().enumerate() {
         args.push(OsString::from(format!(
             "--tfork-inject-file={}:{}:{}",
@@ -10730,15 +10736,83 @@ mod tests {
             &contexts,
             Path::new("/tmp/source-context.json"),
         );
-        assert!(args.contains(&OsString::from(format!(
+        let first = OsString::from(format!(
             "--tfork-inject-file=0:/tmp/context-0.json:{TCLONE_RUN_CONTEXT_PATH}"
-        ))));
-        assert!(args.contains(&OsString::from(format!(
+        ));
+        let second = OsString::from(format!(
             "--tfork-inject-file=1:/tmp/context-1.json:{TCLONE_RUN_CONTEXT_PATH}"
-        ))));
-        assert!(args.contains(&OsString::from(format!(
+        ));
+        let source_context = OsString::from(format!(
             "--tfork-inject-source-file=/tmp/source-context.json:{TCLONE_RUN_CONTEXT_PATH}"
-        ))));
+        ));
+        let first_index = args.iter().position(|arg| arg == &first).unwrap();
+        let second_index = args.iter().position(|arg| arg == &second).unwrap();
+        let source_context_index = args.iter().position(|arg| arg == &source_context).unwrap();
+        let source_index = args
+            .iter()
+            .position(|arg| arg == &OsString::from("source"))
+            .unwrap();
+        assert!(first_index < second_index);
+        assert!(second_index < source_context_index);
+        assert!(source_context_index < source_index);
+    }
+
+    #[test]
+    fn tclone_prepared_context_drop_revokes_uncommitted_capability() -> io::Result<()> {
+        let _guard = tclone_test_env_lock();
+        let run_id = format!("drop-uncommitted-{}", Uuid::new_v4().simple());
+        let run_root = gensee_tmp_root()?.join(&run_id);
+        let payload_dir = run_root.join("prepared-fork-contexts");
+        create_restrictive_dir_all(&payload_dir)?;
+        let payload_path = payload_dir.join("context.json");
+        fs::write(&payload_path, b"{}")?;
+        rotate_tclone_host_control_capability(&run_id)?;
+        let capability_path = tclone_host_control_capability_path(&run_id)?;
+
+        {
+            let _prepared = TclonePreparedForkContexts {
+                contexts: vec![TclonePreparedForkContext {
+                    run_id: run_id.clone(),
+                    payload_path: payload_path.clone(),
+                }],
+                committed: false,
+            };
+        }
+
+        assert!(!payload_path.exists());
+        assert!(!capability_path.exists());
+        let _ = fs::remove_dir_all(run_root);
+        Ok(())
+    }
+
+    #[test]
+    fn tclone_prepared_context_commit_preserves_capability() -> io::Result<()> {
+        let _guard = tclone_test_env_lock();
+        let run_id = format!("drop-committed-{}", Uuid::new_v4().simple());
+        let run_root = gensee_tmp_root()?.join(&run_id);
+        let payload_dir = run_root.join("prepared-fork-contexts");
+        create_restrictive_dir_all(&payload_dir)?;
+        let payload_path = payload_dir.join("context.json");
+        fs::write(&payload_path, b"{}")?;
+        rotate_tclone_host_control_capability(&run_id)?;
+        let capability_path = tclone_host_control_capability_path(&run_id)?;
+
+        {
+            let mut prepared = TclonePreparedForkContexts {
+                contexts: vec![TclonePreparedForkContext {
+                    run_id: run_id.clone(),
+                    payload_path: payload_path.clone(),
+                }],
+                committed: false,
+            };
+            prepared.commit();
+        }
+
+        assert!(!payload_path.exists());
+        assert!(capability_path.exists());
+        revoke_tclone_host_control_capability(&run_id)?;
+        let _ = fs::remove_dir_all(run_root);
+        Ok(())
     }
 
     #[test]
