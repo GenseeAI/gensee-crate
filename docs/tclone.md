@@ -9,7 +9,12 @@ full-workspace forking for AI agents.
 ```bash
 export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
-alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
+export GENSEE_TCLONE_IMAGE="${GENSEE_TCLONE_IMAGE:-localhost/gensee-tclone-webtop:tmux}"
+export GENSEE_TMP_ROOT="${GENSEE_TMP_ROOT:-/tmp}"
+export TMPDIR="$GENSEE_TMP_ROOT"
+# Optional: point at a dedicated rootful Podman store whose storage driver is btrfs.
+# export CONTAINERS_STORAGE_CONF="$GENSEE_HOME/tclone-btrfs-storage.conf"
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "TMPDIR=$TMPDIR" "GENSEE_TMP_ROOT=$GENSEE_TMP_ROOT" "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
 
 gensee-tclone run --runtime tclone -- codex
 ```
@@ -26,13 +31,57 @@ Add the exports and alias to `~/.bashrc`, `~/.zshrc`, or your shell profile if
 you use this host regularly. If testing from a source checkout, replace the
 alias target `gensee` with `./target/debug/gensee`.
 
+Keep `GENSEE_TMP_ROOT` outside the workspace you pass to `gensee run`. If the
+private `gensee-agent-guard` staging tree lands inside the workspace, a later
+source launch can recursively copy that tree into itself and fail with
+`File name too long`.
+
+Tclone requires rootful Podman to use the `btrfs` storage driver. It is not
+enough for an `overlay` Podman graphroot to live on a btrfs filesystem: the
+running container root then appears as an overlay `merged` mount, and tclone's
+btrfs snapshot step fails with `Not a Btrfs filesystem`. On hosts that already
+have an overlay rootful store, create a separate storage config and pass it
+through every Gensee wrapper command with `CONTAINERS_STORAGE_CONF`:
+
+```toml
+# $GENSEE_HOME/tclone-btrfs-storage.conf
+[storage]
+driver = "btrfs"
+runroot = "/mnt/btrfs/gensee-podman-run"
+graphroot = "/mnt/btrfs/gensee-podman-storage"
+```
+
+Images are scoped to the selected Podman store. After creating a btrfs store,
+load or pull `GENSEE_TCLONE_IMAGE` into that same store before launching a
+source:
+
+```bash
+sudo env "PATH=$PATH" "HOME=$HOME" "TMPDIR=$TMPDIR" \
+  "$GENSEE_TCLONE_PODMAN" save "$GENSEE_TCLONE_IMAGE" \
+  | sudo env "PATH=$PATH" "HOME=$HOME" "TMPDIR=$TMPDIR" \
+      "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+      "$GENSEE_TCLONE_PODMAN" load
+```
+
+Verify the store that Gensee will use:
+
+```bash
+sudo env "PATH=$PATH" "HOME=$HOME" "TMPDIR=$TMPDIR" \
+  "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  "$GENSEE_TCLONE_PODMAN" info --format '{{.Store.GraphRoot}} {{.Store.GraphDriverName}}'
+```
+
+The driver must print `btrfs`.
+
 Use a second terminal to fork the running source container:
 
 ```bash
 gensee-tclone run list
 gensee-tclone run list --json
-gensee-tclone run fork <source-run-id> --copies 2
-gensee-tclone run fork <source-run-id> --name try-upgrade --attach tmux:right --json
+gensee-tclone run fork <source-run-id> --copies 2 --name try-upgrade \
+  --approach 'minimal compatible upgrade' \
+  --approach 'aggressive latest-version upgrade' \
+  --attach tmux:right --json
 gensee-tclone run shell <run_id-or-container>
 gensee-tclone run attach <run_id-or-container>
 gensee-tclone run attach <run_id-or-container> --tmux right
@@ -40,6 +89,8 @@ gensee-tclone run send <run_id-or-container> -- 'Run npm test and fix failures'
 gensee-tclone run exec <run_id-or-container> -- bash -lc 'cargo test'
 gensee-tclone run diff <run_id-or-container> [--json]
 gensee-tclone run summary <fork-id> --json
+gensee-tclone run compare <parallel-fork-id> --json
+gensee-tclone run choose <parallel-fork-id> <--merge|--promote|--discard-all>
 gensee-tclone run merge <fork-id> --into <source-id>          # default: --git
 gensee-tclone run merge <fork-id> --into <source-id> --filesystem
 gensee-tclone run merge <fork-id> --into <source-id> --paths /workspace/src /workspace/Cargo.toml
@@ -64,6 +115,26 @@ same-user process inside the fork. Tclone currently trusts the fork agent and
 does not prevent it from tampering with its own hook state; the gate prevents an
 ordinary confused agent from skipping the user-choice turn.
 
+For parallel work, Codex proposes distinct approaches before asking for one
+approval. A named `--copies 2` group creates clean container names such as
+`try-upgrade-0` and `try-upgrade-1` when those names are free. If an unresolved
+older run still owns the clean names, Gensee automatically appends a timestamped
+suffix to the new group's prefix so repeated smoke tests can fork without manual
+cleanup. Repeated `--approach` values are assigned in index order and included
+in each fork's task context as validated, bounded labels rather than trusted
+instructions. The first fork no longer coordinates the
+user-facing decision; every fork reports only its own completion. When all forks
+finish, Gensee sends the source Codex a comparison prompt. The source runs
+`run compare --json`, which reports each approach's changed files, tests,
+readiness, and a smallest-passing-diff recommendation. That recommendation is
+only a size-and-test-status heuristic, not a correctness judgment; Codex must
+present it as a suggestion for the user's decision.
+After the user selects an approach and lifecycle action in the source pane,
+`run choose` merges or promotes that winner and schedules every other group
+member for discard. `--discard-all` retires the whole group. These remain
+agent-facing commands protected by the same later-user-approval gate as
+single-fork lifecycle commands.
+
 The source id is the row with role `source` under the `Tclone containers`
 section of `gensee run list`. The launcher also prints it directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
@@ -87,8 +158,24 @@ session as soon as the container is ready. If the host command runs inside tmux
 and the sudo wrapper preserves `TMUX`, `gensee run fork --attach tmux:right`
 opens the new fork in a right-side pane and reconnects to the cloned
 in-container `gensee-agent` session. With `--copies 2`, additional forks are
-opened below the first fork pane. `gensee run attach <id> --tmux right` can open
+opened below the previous fork pane, leaving the source on the left and one
+stacked fork column on the right. `gensee run attach <id> --tmux right` can open
 an existing run or fork in a new host pane.
+
+When `--attach tmux:right` opens a pane, the pane re-enters
+`gensee run attach <fork-id>`. That re-entry must inherit the same Podman store
+and temporary-root environment as the source and fork commands, especially
+`CONTAINERS_STORAGE_CONF`, `GENSEE_TMP_ROOT`, and `TMPDIR`. If a pane appears
+and immediately disappears, check that the wrapper preserves those variables
+and start a fresh source with the rebuilt `gensee` binary; already-running
+sources keep the old host-control process in memory.
+
+The os4agent tfork kernel helper modules must be built for the running kernel.
+If `insmod` reports `Invalid module format`, compare `modinfo <module>.ko`
+`vermagic` with `uname -r`, rebuild the modules against
+`/lib/modules/$(uname -r)/build`, and load them again. Missing helpers surface
+later as absent `/dev/vma_cherrypick`, `/dev/criu_capbypass`, `/dev/reparent`,
+or `/dev/pkey_state` device nodes in CRIU/tfork logs.
 
 Use `gensee run send <id> -- <prompt>` to paste a prompt into the fork's
 in-container `gensee-agent` tmux session and press Enter. If that fork is
@@ -216,6 +303,44 @@ cleanup fails safe and leaves the environment running; either delete command
 can reap that stranded environment. Lifecycle logs and acknowledgement markers
 are retained for seven days and pruned opportunistically when another
 lifecycle action runs.
+
+### Host disk cleanup
+
+Run the repository cleanup script from a separate host shell when old tclone
+runs, `/tmp` state, or Cargo artifacts have filled the host disk. Do not run it
+inside a Gensee source or fork container.
+
+```bash
+cd ~/gensee-crate
+scripts/cleanup_tclone_host.sh --yes
+```
+
+The default cleanup deletes tracked tclone runs and `gensee-tclone-*` orphan
+containers, removes the private `gensee-agent-guard` directory under `TMPDIR`
+(normally `/tmp/gensee-agent-guard`), cleans Cargo artifacts, rebuilds `gensee`
+in release mode, and reinstalls it at the current `gensee` path (or
+`~/.cargo/bin/gensee`). It keeps unrelated containers and tagged images intact.
+Custom absolute `TMPDIR` locations are canonicalized before the script removes
+their exact `gensee-agent-guard` child.
+
+On a dedicated tclone host where every Podman container is disposable, use the
+stronger cleanup that also removes all containers and prunes unused volumes and
+dangling image layers:
+
+```bash
+scripts/cleanup_tclone_host.sh --all-podman-data --yes
+```
+
+This deliberately does not run `podman system prune --all`: the configured
+tagged tclone image is preserved, avoiding a subsequent short-name resolution
+failure. Use `--dry-run` to review every destructive and rebuild command first,
+or `--install-to /absolute/path/to/gensee` to select another install target.
+The script resolves the existing `gensee`, Podman wrapper, and privileged host
+utilities to absolute executable paths before invoking `sudo`; those binaries
+and any tools called internally by a configured wrapper must belong to the
+trusted host administrator. Failure to delete the selected private temporary
+directory stops the script before rebuilding so a partial cleanup is not
+reported as successful.
 
 ## Requirements
 
