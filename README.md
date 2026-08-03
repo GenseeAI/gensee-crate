@@ -4,13 +4,12 @@
 </h1>
 
 <p align="center">
-  <strong>Full-stack, long-horizon runtime safety for AI coding agents.</strong>
+  <strong>Approve outcomes, not commands.</strong>
 </p>
 
 <p align="center">
-  Gensee Crate watches system events, user requests, agent tool calls, skills and memory behind unmodified coding agents such as Claude Code, Codex, Antigravity, Cursor, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>.
-  It follows long-horizon agent behavior across requests and sessions and runs as a low-latency sidecar beside the agents on native hosts like macOS and Linux.
-  Real-time enforcement combines agent-interface decisions with Linux syscall, network, and sensitive-file controls. Offline event tracking, lineage, and provenance can be viewed in a native desktop dashboard and command line.
+  Gensee Crate lets AI harness like Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a> do real work inside a disposable full-workspace fork.
+  With Gensee, you can let the harness install packages, edit files, run tests, and crash in isolation; then review the diff and test summary, merge the result, keep exploring, or throw the runtime away. Essentially, Gensee gives agents room to move without letting untrusted work land in your main workspace unreviewed. Behind the scenes, Gensee ties prompts, tool calls, commands, files, packages, network activity, system events, and policy decisions into a protected transaction runtime.
 </p>
 
 <p align="center">
@@ -29,7 +28,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/gensee-crate-defense-in-depth.png" alt="Gensee Crate defense-in-depth architecture" />
+  <img src="docs/gensee-crate-defense-in-depth.png" alt="Gensee Crate transactional runtime and defense-in-depth architecture" />
 </p>
 
 <p align="center">
@@ -44,17 +43,23 @@
 
 Gensee Crate helps you:
 
-- **Watch what your agent actually does.** Capture files read and written,
-  commands run, network targets reached, hook intent, alerts, and timeline
-  context in one local store.
-- **Enforce policy before risky tools run.** Enforces a deterministic, configurable [policy](docs/policy.md) that can allow, ask, or
+- **Run risky agent work transactionally.** Launch an agent in a disposable
+  runtime, fork the full workspace for speculative changes, then merge, keep
+  working, or discard the fork after review.
+- **Keep untrusted changes out of the main workspace.** Summaries and diffs show
+  what changed and what tests ran before a fork is allowed to merge back.
+- **Enforce policy before risky tools run.** A deterministic, configurable [policy](docs/policy.md) can allow, ask, or
   deny secret reads, destructive ops, out-of-workspace writes, cloud-metadata
   access, control-plane writes, dangerous executable content, and more.
+- **Watch what your agent actually does.** Capture prompts, tool calls, files
+  read and written, commands run, packages touched, network targets reached,
+  hook intent, alerts, and timeline context in one local store.
 - **Trace provenance across sessions.** Lineage graphs link prompts,
-  tool calls, filesystem effects, artifacts, alerts, and review verdicts so long-horizon safety issues such as memory poisoning and data exfiltration can be prevented in time and examined afterward.
+  tool calls, filesystem effects, artifacts, alerts, and review verdicts so long-horizon safety issues such as memory poisoning, policy bypass, and data exfiltration can be understood and contained.
 - **Seamless integration with your current workflow.** Run `gensee watch` beside an
-  agent or launch an agent in a sandbox with `gensee run` with additional safety.
-  Manage policy with `gensee policy` and inspect activity in the local dashboard.
+  agent, launch an agent with `gensee run`, or use the tclone runtime for
+  full-workspace fork, merge, and rollback flows. Manage policy with
+  `gensee policy` and inspect activity in the local dashboard.
 
 ## Preliminary Benchmark Results
 
@@ -179,7 +184,7 @@ stores.
 <details>
 <summary>Toolchain and prerequisites (if the installer reports a missing tool)</summary>
 
-- macOS and Linux for the stable v0.1 path. Linux host controls include `/proc`
+- macOS and Linux for the stable v0.2 path. Linux host controls include `/proc`
   process attribution, fanotify sensitive-path enforcement, seccomp launcher
   profiles, and cgroup/nftables network controls.
 - Claude Code, Codex, Antigravity, or VS Code / GitHub Copilot for hook-based
@@ -440,20 +445,53 @@ Tclone provides low-latency full-workspace forking for AI agents:
 ```bash
 export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
-alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
+export GENSEE_TCLONE_IMAGE="${GENSEE_TCLONE_IMAGE:-localhost/gensee-tclone-webtop:tmux}"
+export GENSEE_TMP_ROOT="${GENSEE_TMP_ROOT:-/tmp}"
+export TMPDIR="$GENSEE_TMP_ROOT"
+# Optional: set this when os4agent uses a dedicated btrfs rootful Podman store.
+# export CONTAINERS_STORAGE_CONF="$GENSEE_HOME/tclone-btrfs-storage.conf"
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "TMPDIR=$TMPDIR" "GENSEE_TMP_ROOT=$GENSEE_TMP_ROOT" "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
 
 gensee-tclone run --runtime tclone -- codex
 gensee-tclone run list              # source id is under "Tclone containers"
 gensee-tclone run list --json       # agent-facing completion polling
-gensee-tclone run fork <source-run-id> --copies 2 --attach tmux:right --json
+gensee-tclone run fork <source-run-id> --copies 2 --name try-upgrade --approach 'minimal compatible upgrade' --approach 'aggressive latest-version upgrade' --attach tmux:right --json
 gensee-tclone run attach <fork-id> --tmux right
 gensee-tclone run send <fork-id> -- 'Run cargo test and fix failures'
 gensee-tclone run exec <fork-id> -- bash -lc 'cargo test'
 gensee-tclone run diff <fork-id> [--json]
 gensee-tclone run summary <fork-id> --json
+gensee-tclone run compare <parallel-fork-id> --json
+gensee-tclone run choose <parallel-fork-id> <--merge|--promote|--discard-all>
 gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
 gensee-tclone run switch <fork-id>                         # promote fork; end old source
 ```
+
+Before launching the source, verify the host setup from the same shell:
+
+```bash
+sudo env "PATH=$PATH" "HOME=$HOME" "TMPDIR=$TMPDIR" \
+  "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  "$GENSEE_TCLONE_PODMAN" info --format '{{.Store.GraphRoot}} {{.Store.GraphDriverName}}'
+ls -l /dev/vma_cherrypick /dev/criu_capbypass /dev/reparent /dev/pkey_state
+```
+
+The Podman storage driver must be `btrfs`; an `overlay` driver on a btrfs disk
+is not enough for tclone snapshots. The tclone image must be loaded or pulled
+into the same Podman store selected by `CONTAINERS_STORAGE_CONF`. Keep
+`GENSEE_TMP_ROOT` outside the workspace, or a later launch can recursively copy
+Gensee's own staging tree and fail with `File name too long`.
+
+Named parallel groups use stable indexed container names when available
+(`try-upgrade-0`, `try-upgrade-1`). If an unresolved older run still owns those
+names, Gensee automatically falls back to a timestamped prefix for the new group
+instead of failing the fork request. Panes form a vertical stack to the right of
+the source.
+Codex assigns the repeated approaches in order, compares the completed diffs
+and tests, recommends a winner, and—only after approval—merges or promotes that
+winner while discarding the other group members. The recommendation is a
+smallest-passing-diff heuristic, not a correctness judgment, and should be
+presented as a suggestion rather than an automatic choice.
 
 Codex should mediate fork resolution: summarize the fork in chat, offer merge,
 promote-to-main-and-end-source, and discard choices, and run the selected
@@ -489,10 +527,14 @@ input. Fork creation does not report success until the child has received its
 authoritative fork context.
 Use a tclone image with `tmux` for reliable `gensee run attach`. From inside a
 host tmux session, `--attach tmux:right` opens the forked live agent in a new
-pane. Without tmux, `gensee run shell` still opens a new shell but does not
-reconnect to the live agent UI. Use `gensee run exec <fork-id> -- <command>` for
-non-interactive, container-scoped commands in a fork, or `gensee run send
-<fork-id> -- <prompt>` to visibly send work into the forked agent pane.
+pane. The attach pane re-enters `gensee run attach`, so use the same wrapper for
+`run`, `list`, `fork`, `attach`, `send`, `exec`, `merge`, `switch`, and cleanup.
+If you rebuild or reinstall `gensee`, start a fresh source; already-running
+sources keep their old host-control process in memory. Without tmux,
+`gensee run shell` still opens a new shell but does not reconnect to the live
+agent UI. Use `gensee run exec <fork-id> -- <command>` for non-interactive,
+container-scoped commands in a fork, or `gensee run send <fork-id> -- <prompt>`
+to visibly send work into the forked agent pane.
 
 </details>
 
@@ -529,24 +571,32 @@ GENSEE_HOME="$HOME/.gensee" cargo tauri dev
 This opens a native desktop window backed by the Rust core. No TCP server
 is started; all data access goes through Tauri IPC.
 
-See [`dashboards/README.md`](dashboards/README.md) for requirements, demo data, and policy
-editing notes.
+See [`dashboards/README.md`](dashboards/README.md) for requirements, store setup,
+and policy editing notes.
 
-The activity view brings policy decisions, timeline filtering, event details,
-and command/tool context into one local desktop surface.
+The activity overview summarizes agent sessions, request and event volume,
+seven-day activity, recent high-risk findings, and the complete alert severity
+mix in one local surface.
 
-![Gensee Crate dashboard activity timeline](docs/images/dashboard-activity.png)
+![Gensee Crate activity and security overview](docs/images/dashboard-activity.png)
 
-The lineage view links derived artifacts and shows the facts behind each path,
-including current risk state and the policy/query context used to inspect it.
+Timeline expands each agent session into requests and tool calls. Parallel and
+sequential work, execution durations, affected files, and policy outcomes stay
+connected to the original task.
 
-![Gensee Crate artifact lineage dashboard](docs/images/dashboard-lineage.png)
+![Gensee Crate agent tool-call timeline](docs/images/dashboard-agent-timeline.png)
 
-The multi-turn view highlights long-horizon patterns across a session, including
-read-to-exfiltration chains, memory-poison signals, repeated artifact targeting,
-and policy decisions over time.
+Transactional environments retain their dependency structure as well as their
+chronology. The dependency view makes fork fan-out, validated merge origins,
+discarded experiments, and the active environment explicit.
 
-![Gensee Crate multi-turn provenance dashboard](docs/images/dashboard-multiturn.png)
+![Gensee Crate transactional environment dependency graph](docs/images/dashboard-transaction-dependencies.png)
+
+Artifact lineage connects operational guidance and reproduced evidence to code,
+tests, release workflows, and protected deployment targets, with risk state and
+authorship visible at each node.
+
+![Gensee Crate artifact lineage graph](docs/images/dashboard-lineage.png)
 
 ### 4. Manage policy
 
@@ -600,7 +650,7 @@ See [`docs/roadmap.md`](docs/roadmap.md) for more detail.
 
 Full docs live in [`docs/`](docs/README.md):
 
-- [Architecture](docs/architecture.md) — the v0.1 wedge, workspace crates, and roadmap.
+- [Architecture](docs/architecture.md) — the v0.2 runtime, workspace crates, and roadmap.
 - [Roadmap](docs/roadmap.md) — planned Linux enforcement, macOS Endpoint Security, sandbox, ML policy, and integration work.
 - [Linux host support](docs/linux.md) — `/proc` monitoring, fanotify
   sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress
