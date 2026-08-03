@@ -4735,8 +4735,8 @@ fn prepare_tclone_fork_contexts(
         let run_id = format!("{}_fork_{}_{}", source.run_id, forked_at_ms, index);
         let payload_path = context_dir.join(format!("{forked_at_ms}-{index}.json"));
         let capability = ensure_tclone_host_control_capability(&run_id)?;
-        // Register cleanup as soon as capability allocation succeeds so a later
-        // serialization or write failure cannot leak an uncommitted credential.
+        // Register cleanup as soon as capability allocation succeeds. Any
+        // serialization or payload-write failure below must revoke it.
         prepared.contexts.push(TclonePreparedForkContext {
             run_id: run_id.clone(),
             payload_path: payload_path.clone(),
@@ -5147,8 +5147,10 @@ fn tclone_clone_args(
         args.insert(5, OsString::from("--tfork-overlay-btrfs"));
     }
     let source = args.pop().expect("source container argument");
-    // Podman's tfork implementation uses the same copy index for clone
-    // metadata and per-copy file injections.
+    // Positional contract with Podman's tfork implementation: copy index i is
+    // used for the clone ID/rootfs/name arrays, fileInjections[i], and the
+    // metadata record appended for that clone. Keeping this loop in context
+    // order therefore binds each injected run ID to metadata entry i.
     for (index, context) in prepared_contexts.iter().enumerate() {
         args.push(OsString::from(format!(
             "--tfork-inject-file={}:{}:{}",
