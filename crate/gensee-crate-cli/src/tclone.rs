@@ -4303,7 +4303,20 @@ fn parse_tclone_fork_clone_metadata_or_cleanup(
     copies: usize,
     prefix: &str,
 ) -> io::Result<Vec<TcloneForkCloneMetadata>> {
-    match parse_tclone_fork_clone_metadata(output) {
+    let parsed = parse_tclone_fork_clone_metadata(output).and_then(|clones| {
+        if clones.len() == copies {
+            Ok(clones)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "podman returned {} tfork metadata record(s), expected {copies}",
+                    clones.len()
+                ),
+            ))
+        }
+    });
+    match parsed {
         Ok(clones) => Ok(clones),
         Err(parse_error) => {
             // A successful podman invocation may have created every clone even
