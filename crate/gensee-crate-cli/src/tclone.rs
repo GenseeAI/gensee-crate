@@ -3736,7 +3736,16 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 let clone = &clones[index];
                 let container_name = clone.name.clone();
                 let root_pid = clone.pid;
-                let overlay_layers = tclone_overlay_rootfs_from_path(&clone.rootfs).ok();
+                let overlay_layers = match tclone_overlay_rootfs_from_path(&clone.rootfs) {
+                    Ok(layers) => Some(layers),
+                    Err(error) => {
+                        eprintln!(
+                            "gensee: warning: could not resolve overlay layers for cloned rootfs {}: {error}",
+                            clone.rootfs.display()
+                        );
+                        None
+                    }
+                };
                 timing.mark("consume_clone_metadata");
                 let observed_at = unix_millis()?;
                 event_writer.append_session(&AgentSession {
@@ -4183,7 +4192,7 @@ fn run_tclone_clone_attempts(
         source_context_path,
     );
     match run_command_capture_with_env(podman, &clone_args, &env) {
-        Ok(output) => parse_tclone_fork_clone_metadata(&output),
+        Ok(output) => parse_tclone_fork_clone_metadata_or_cleanup(podman, &output, copies, prefix),
         Err(error) if use_overlay && should_retry_tclone_without_overlay(&error.to_string()) => {
             eprintln!(
                 "gensee: tclone overlay-btrfs clone failed; retrying without --tfork-overlay-btrfs"
@@ -4204,7 +4213,7 @@ fn run_tclone_clone_attempts(
                 source_context_path,
             );
             let output = run_command_capture_with_env(podman, &fallback_args, &env)?;
-            parse_tclone_fork_clone_metadata(&output)
+            parse_tclone_fork_clone_metadata_or_cleanup(podman, &output, copies, &fallback_prefix)
         }
         Err(error) => Err(error),
     }
@@ -4273,8 +4282,11 @@ fn tclone_clone_args(
 }
 
 fn parse_tclone_fork_clone_metadata(output: &str) -> io::Result<Vec<TcloneForkCloneMetadata>> {
-    let clones = serde_json::from_str::<Vec<TcloneForkCloneMetadata>>(output)
+    let mut clones = serde_json::from_str::<Vec<TcloneForkCloneMetadata>>(output)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    for clone in &mut clones {
+        clone.name = clone.name.trim_start_matches('/').to_string();
+    }
     if clones.iter().any(|clone| {
         clone.id.is_empty()
             || clone.name.is_empty()
@@ -4287,6 +4299,43 @@ fn parse_tclone_fork_clone_metadata(output: &str) -> io::Result<Vec<TcloneForkCl
         ));
     }
     Ok(clones)
+}
+
+fn parse_tclone_fork_clone_metadata_or_cleanup(
+    podman: &OsString,
+    output: &str,
+    copies: usize,
+    prefix: &str,
+) -> io::Result<Vec<TcloneForkCloneMetadata>> {
+    match parse_tclone_fork_clone_metadata(output) {
+        Ok(clones) => Ok(clones),
+        Err(parse_error) => {
+            // A successful podman invocation may have created every clone even
+            // when its metadata was truncated or malformed. Remove the names
+            // deterministically assigned to this attempt before returning the
+            // parse error so no untracked containers survive.
+            for name in tclone_clone_names(copies, prefix) {
+                if let Err(cleanup_error) = remove_tclone_container_by_name(podman, &name) {
+                    eprintln!(
+                        "gensee: warning: could not remove clone {name} after malformed tfork metadata: {cleanup_error}"
+                    );
+                }
+            }
+            Err(parse_error)
+        }
+    }
+}
+
+fn tclone_clone_names(copies: usize, prefix: &str) -> Vec<String> {
+    (0..copies)
+        .map(|index| {
+            if copies == 1 {
+                prefix.to_string()
+            } else {
+                format!("{prefix}-{index}")
+            }
+        })
+        .collect()
 }
 
 fn should_retry_tclone_without_overlay(error: &str) -> bool {
@@ -8110,8 +8159,14 @@ fn recorded_tclone_overlay_rootfs(record: &TcloneRunRecord) -> io::Result<Tclone
 }
 
 fn overlay_layers_for_mountpoint(rootfs: &Path) -> io::Result<Option<(PathBuf, PathBuf)>> {
-    let rootfs = rootfs.to_string_lossy().to_string();
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    overlay_layers_from_mountinfo(rootfs, &mountinfo)
+}
+
+fn overlay_layers_from_mountinfo(
+    rootfs: &Path,
+    mountinfo: &str,
+) -> io::Result<Option<(PathBuf, PathBuf)>> {
     for line in mountinfo.lines() {
         let Some((left, right)) = line.split_once(" - ") else {
             continue;
@@ -8122,7 +8177,7 @@ fn overlay_layers_for_mountpoint(rootfs: &Path) -> io::Result<Option<(PathBuf, P
             continue;
         }
         let mountpoint = unescape_mountinfo_field(left_fields[4]);
-        if mountpoint != rootfs {
+        if Path::new(&mountpoint) != rootfs {
             continue;
         }
         if right_fields[0] != "overlay" {
@@ -8144,7 +8199,10 @@ fn overlay_layers_for_mountpoint(rootfs: &Path) -> io::Result<Option<(PathBuf, P
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("overlay mount for {rootfs} did not expose lowerdir and upperdir"),
+                format!(
+                    "overlay mount for {} did not expose lowerdir and upperdir",
+                    rootfs.display()
+                ),
             )),
         };
     }
@@ -10686,15 +10744,35 @@ mod tests {
     #[test]
     fn tclone_fork_metadata_parser_requires_complete_records() {
         let parsed = parse_tclone_fork_clone_metadata(
-            r#"[{"id":"abc","name":"fork-0","pid":42,"rootfs":"/tmp/rootfs-0"}]"#,
+            r#"[{"id":"abc","name":"/fork-0","pid":42,"rootfs":"/tmp/rootfs-0"}]"#,
         )
         .unwrap();
         assert_eq!(parsed[0].id, "abc");
+        assert_eq!(parsed[0].name, "fork-0");
         assert_eq!(parsed[0].pid, 42);
         assert!(parse_tclone_fork_clone_metadata(
             r#"[{"id":"abc","name":"fork-0","pid":0,"rootfs":"/tmp/rootfs-0"}]"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn tclone_clone_names_match_podman_copy_indices() {
+        assert_eq!(tclone_clone_names(1, "fork"), vec!["fork"]);
+        assert_eq!(
+            tclone_clone_names(3, "fork"),
+            vec!["fork-0", "fork-1", "fork-2"]
+        );
+    }
+
+    #[test]
+    fn tclone_overlay_metadata_accepts_trailing_slash_rootfs() {
+        let mountinfo = "36 25 0:32 / /tmp/rootfs rw,relatime - overlay overlay rw,lowerdir=/lower:/base,upperdir=/upper,workdir=/work\n";
+        let layers = overlay_layers_from_mountinfo(Path::new("/tmp/rootfs/"), mountinfo)
+            .unwrap()
+            .unwrap();
+        assert_eq!(layers.0, PathBuf::from("/lower"));
+        assert_eq!(layers.1, PathBuf::from("/upper"));
     }
 
     #[test]
