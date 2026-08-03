@@ -3689,6 +3689,8 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
 
     let result: io::Result<()> = (|| {
         let podman = tclone_podman();
+        ensure_tclone_container_exists(&podman, &source)?;
+        timing.mark("source_exists");
         let source_handoff = wait_for_tclone_source_fork_handoff(&source)?;
         timing.mark("source_handoff");
         wait_for_tclone_source_quiet_if_requested(&podman, &source)?;
@@ -5113,33 +5115,44 @@ fn prepare_tclone_source_for_fork(
     podman: &OsString,
     source: &TcloneRunRecord,
 ) -> io::Result<Option<String>> {
-    let script = tclone_source_prepare_script(&source.agent_cmd);
+    let marker = format!("gensee-source-prepare-{}:", Uuid::new_v4().simple());
+    let script = tclone_source_prepare_script(&source.agent_cmd, &marker);
     let output = tclone_exec_capture_env(
         podman,
         &source.container_name,
         &[("GENSEE_WORKSPACE", &source.container_workspace)],
         &["sh", "-lc", &script],
     )?;
+    parse_tclone_source_prepare_output(&output, &marker, &source.run_id)
+}
+
+fn parse_tclone_source_prepare_output(
+    output: &str,
+    marker: &str,
+    source_run_id: &str,
+) -> io::Result<Option<String>> {
     let mut state = None;
     let mut git_head = None;
     let mut detail = Vec::new();
     for line in output.lines() {
-        if let Some(value) = line.strip_prefix("state=") {
+        let Some(machine_line) = line.strip_prefix(marker) else {
+            detail.push(line);
+            continue;
+        };
+        if let Some(value) = machine_line.strip_prefix("state=") {
             state = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("git_head=") {
+        } else if let Some(value) = machine_line.strip_prefix("git_head=") {
             let value = value.trim();
             if !value.is_empty() {
                 git_head = Some(value.to_string());
             }
-        } else {
-            detail.push(line);
         }
     }
     match state.as_deref() {
         Some("ready" | "no-tmux") => Ok(git_head),
         Some("starting" | "exited") => Err(io::Error::other(format!(
             "tclone source {} is not ready to fork: {}",
-            source.run_id,
+            source_run_id,
             detail.join("\n")
         ))),
         Some(other) => Err(io::Error::new(
@@ -5153,23 +5166,25 @@ fn prepare_tclone_source_for_fork(
     }
 }
 
-fn tclone_source_prepare_script(agent_cmd: &[String]) -> String {
+fn tclone_source_prepare_script(agent_cmd: &[String], marker: &str) -> String {
     let process_check = tclone_agent_process_check(agent_cmd).unwrap_or("true");
     format!(
-        r#"state=no-tmux
+        r#"marker={marker}
+state=no-tmux
 if command -v tmux >/dev/null 2>&1; then
   if ! tmux has-session -t {session} 2>/dev/null; then
-    printf 'state=starting\n'
+    printf '%sstate=starting\n' "$marker"
     test -f /tmp/gensee-agent-start.log && tail -n 20 /tmp/gensee-agent-start.log
     exit 0
   fi
   if tmux list-panes -t {session} -F '#{{pane_dead}}' 2>/dev/null | grep -q '^1$'; then
-    printf 'state=exited\n'
+    printf '%sstate=exited\n' "$marker"
     tmux capture-pane -pt {session} 2>/dev/null | tail -n 40 || true
     exit 0
   fi
   if ! ({process_check}); then
-    printf 'state=starting\nagent process is not running yet\n'
+    printf '%sstate=starting\n' "$marker"
+    printf 'agent process is not running yet\n'
     exit 0
   fi
   state=ready
@@ -5188,10 +5203,11 @@ if command -v tmux >/dev/null 2>&1; then
     sleep 0.1
   done
 fi
-printf 'state=%s\n' "$state"
+printf '%sstate=%s\n' "$marker" "$state"
 git_head="$(git -C "$GENSEE_WORKSPACE" rev-parse --verify HEAD 2>/dev/null || true)"
-printf 'git_head=%s\n' "$git_head"
+printf '%sgit_head=%s\n' "$marker" "$git_head"
 "#,
+        marker = shell_quote(marker),
         session = shell_quote(TCLONE_AGENT_TMUX_SESSION),
         process_check = process_check,
     )
@@ -10694,7 +10710,7 @@ gensee async job job_1: exited status=0
 
     #[test]
     fn tclone_source_prepare_script_validates_detaches_and_captures_git_head() {
-        let script = tclone_source_prepare_script(&["codex".to_string()]);
+        let script = tclone_source_prepare_script(&["codex".to_string()], "source-prepare-marker:");
         assert!(script.contains("agent process is not running yet"));
         assert!(script.contains("display-message"));
         assert!(script.contains("list-clients"));
@@ -10703,6 +10719,28 @@ gensee async job job_1: exited status=0
         assert!(script.contains("kill -HUP"));
         assert!(script.contains("git_head="));
         assert!(script.contains("rev-parse --verify HEAD"));
+        assert!(script.contains("source-prepare-marker:"));
+    }
+
+    #[test]
+    fn tclone_source_prepare_parser_ignores_untrusted_state_lines() {
+        let marker = "source-prepare-marker:";
+        let error = parse_tclone_source_prepare_output(
+            "source-prepare-marker:state=starting\nstartup diagnostics\nstate=ready\n",
+            marker,
+            "run_source",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not ready to fork"));
+        assert!(error.to_string().contains("state=ready"));
+
+        let git_head = parse_tclone_source_prepare_output(
+            "state=exited\nsource-prepare-marker:state=ready\nsource-prepare-marker:git_head=abc123\n",
+            marker,
+            "run_source",
+        )
+        .unwrap();
+        assert_eq!(git_head.as_deref(), Some("abc123"));
     }
 
     #[test]
