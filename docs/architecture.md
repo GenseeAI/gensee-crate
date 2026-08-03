@@ -1,27 +1,33 @@
 # Architecture
 
 Gensee Crate is a local-first runtime security layer for AI coding agents. The
-current v0.1 release is a macOS-first runtime focused on four workflows:
+current v0.2 release supports native macOS and Linux controls, agent hooks, and
+transactional tclone environments across five workflows:
 
 - `gensee watch` — sidecar audit of workspace effects and macOS system events
   for users who do not want Gensee launching their agent. See [watch.md](watch.md).
 - `gensee run` — managed launch of an agent with optional macOS sandbox
   confinement and staged workspace review/discard. See
   [run-and-sandbox.md](run-and-sandbox.md).
+- `gensee run --runtime tclone` — launch, fork, compare, merge, promote, or
+  discard live agent environments on prepared Linux tclone hosts. See
+  [tclone.md](tclone.md).
 - `gensee policy` — inspect the active policy source, initialize
   `$GENSEE_HOME/policy.json`, validate policy files, walk through
   dashboard-style setup, and edit supported configuration keys with `get`/`set`.
   See [policy.md](policy.md).
-- `dashboards/` — local timeline, lineage, policy, and review UI (React + Node API)
-  backed by the same `GENSEE_HOME` store as the CLI. See [dashboard.md](dashboard.md).
+- `dashboards/` — native timeline, lineage, policy, transaction, and review UI
+  (React + Tauri) backed by the same `GENSEE_HOME` store as the CLI. See
+  [dashboard.md](dashboard.md).
 
-Container mode is future work. `eslogger` is the default `gensee watch`
-system-event backend on macOS when available and can be disabled by policy,
-while a signed EndpointSecurity client remains a future enrichment. Experimental
-Linux host support now includes `/proc` process attribution, capability
-planning, fanotify sensitive-path planning/debug probes, a seccomp launcher
-profile for dangerous syscalls, and cgroup/nftables network controls. See
-[endpoint-security.md](endpoint-security.md) and [linux.md](linux.md).
+The tclone container runtime is available on prepared Linux hosts. `eslogger`
+is the default `gensee watch` system-event backend on macOS when available and
+can be disabled by policy, while a signed EndpointSecurity client remains a
+future enrichment. Linux host support includes `/proc` process attribution,
+capability planning, fanotify sensitive-path enforcement, seccomp launcher
+profiles for dangerous syscalls, and cgroup/nftables network controls. See
+[endpoint-security.md](endpoint-security.md), [linux.md](linux.md), and
+[tclone.md](tclone.md).
 
 ## Workspace layout
 
@@ -34,7 +40,7 @@ profile for dangerous syscalls, and cgroup/nftables network controls. See
 | `crate/gensee-crate-macos` | macOS EndpointSecurity integration |
 | `crate/gensee-crate-linux` | Experimental Linux capability detection, `/proc` monitoring, policy decisions, fanotify planning/debug probes, seccomp launcher profiles, and cgroup/nftables egress controls |
 | `crate/gensee-crate-cli` | `gensee` CLI entry point, including run/watch/timeline/policy commands |
-| `crate/gensee-crate-ml` | Future v0.2 behavioral model experiments |
+| `crate/gensee-crate-ml` | Behavioral model experiments |
 | `integrations/claude-code` | Claude Code hook bridge |
 | `integrations/codex` | Codex hook bridge |
 | `integrations/omnigent` | Thin Omnigent sidecar/managed-launch integration |
@@ -43,7 +49,7 @@ profile for dangerous syscalls, and cgroup/nftables network controls. See
 | `integrations/mcp` | Optional MCP bridge |
 | `integrations/generic-launcher` | `gensee run -- <agent>` launcher integration |
 | `models` | Future model artifacts and notes |
-| `dashboards` | Local dashboard for timeline, lineage, policy, and review workflows (React + Vite + Node API) |
+| `dashboards` | Native dashboard for timeline, lineage, policy, transactions, and review workflows (React + Vite + Tauri) |
 | `scripts` | Local development and benchmark helpers |
 | `docs` | This documentation |
 
