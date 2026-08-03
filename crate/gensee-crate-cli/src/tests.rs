@@ -3419,6 +3419,75 @@ fn daemon_round_trip_returns_pretool_decision() {
 }
 
 #[test]
+fn daemon_appends_tclone_session_and_transaction_events() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let (store, workspace) = temp_store_and_workspace("daemon-tclone-events");
+    let session = AgentSession {
+        session_id: "fork-session".to_string(),
+        agent_binary: "codex".to_string(),
+        root_pid: 1234,
+        cwd: "/workspace".to_string(),
+        repo_path: None,
+        mode: Some("managed-run:tclone:fork:source".to_string()),
+        workspace_mode: Some("tclone-rootfs".to_string()),
+        original_workspace: Some(workspace.to_string_lossy().to_string()),
+        staged_workspace: None,
+        sandbox_profile: Some("tclone-container".to_string()),
+        sandbox_profile_path: None,
+        started_at_ms: 10,
+        ended_at_ms: None,
+        exit_code: None,
+    };
+    let transaction = TransactionEventInput {
+        operation_id: "fork-operation".to_string(),
+        environment_kind: "tclone".to_string(),
+        operation: "fork".to_string(),
+        phase: "started".to_string(),
+        source_run_id: Some("source".to_string()),
+        target_run_id: None,
+        parent_run_id: None,
+        workspace: Some(workspace.to_string_lossy().to_string()),
+        summary: "Creating a fork".to_string(),
+        error_kind: None,
+        error_message: None,
+        metadata: Some(json!({"copies": 1})),
+        occurred_at_ms: 11,
+    };
+
+    for request in [
+        json!({
+            "gensee_daemon_protocol": 1,
+            "operation": EVENT_STORE_APPEND_SESSION,
+            "input": session,
+        }),
+        json!({
+            "gensee_daemon_protocol": 1,
+            "operation": EVENT_STORE_APPEND_TRANSACTION,
+            "input": transaction,
+        }),
+    ] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let result = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| serve_connection(server, &store));
+            client.write_all(request.to_string().as_bytes()).unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            handle.join().unwrap().unwrap();
+            response
+        });
+        let response: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(response["ok"], json!(true));
+    }
+
+    let sessions = store.list_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "fork-session");
+}
+
+#[test]
 fn daemon_request_envelope_preserves_codex_provider() {
     let payload = pretool_bash_payload("s1", "/repo", "ls");
     let request = daemon_request(&payload, PROVIDER_CODEX);
