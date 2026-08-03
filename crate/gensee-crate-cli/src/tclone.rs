@@ -3713,6 +3713,10 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             &prepared_contexts,
         )?;
         timing.mark("podman_clone");
+        // Security boundary: do not create or install the source's replacement
+        // capability until tfork has returned. Children can therefore snapshot
+        // only the old, already-revoked source credential. Source restoration
+        // uses podman exec and is joined before any success is published.
         capability_guard.mark_clone_completed();
         capability_guard.start_restore()?;
         timing.mark("source_capability_restore_start");
