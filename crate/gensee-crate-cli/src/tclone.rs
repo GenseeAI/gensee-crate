@@ -4301,7 +4301,16 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             let clone = &clones[index];
             let container_name = clone.name.clone();
             let root_pid = clone.pid;
-            let overlay_layers = tclone_overlay_rootfs_from_path(&clone.rootfs).ok();
+            let overlay_layers = match tclone_overlay_rootfs_from_path(&clone.rootfs) {
+                Ok(layers) => Some(layers),
+                Err(error) => {
+                    eprintln!(
+                        "gensee: warning: could not resolve overlay layers for cloned rootfs {}: {error}",
+                        clone.rootfs.display()
+                    );
+                    None
+                }
+            };
             timing.mark("consume_clone_metadata");
             let observed_at = unix_millis()?;
             event_writer.append_session(&AgentSession {
@@ -4854,15 +4863,18 @@ fn run_tclone_clone_attempts(
                 prefix: prefix.to_string(),
                 output,
             }),
-            Err(error) => retry_tclone_partial_multicopy_clone(
-                podman,
-                copies,
-                prefix,
-                source,
-                use_overlay,
-                &env,
-                error,
-            ),
+            Err(error) => {
+                cleanup_tclone_partial_clone_names(podman, copies, prefix);
+                retry_tclone_partial_multicopy_clone(
+                    podman,
+                    copies,
+                    prefix,
+                    source,
+                    use_overlay,
+                    &env,
+                    error,
+                )
+            }
         },
         Err(error) if use_overlay && should_retry_tclone_without_overlay(&error.to_string()) => {
             eprintln!(
@@ -4885,15 +4897,18 @@ fn run_tclone_clone_attempts(
                         prefix: fallback_prefix,
                         output,
                     }),
-                    Err(error) => retry_tclone_partial_multicopy_clone(
-                        podman,
-                        copies,
-                        &fallback_prefix,
-                        source,
-                        false,
-                        &env,
-                        error,
-                    ),
+                    Err(error) => {
+                        cleanup_tclone_partial_clone_names(podman, copies, &fallback_prefix);
+                        retry_tclone_partial_multicopy_clone(
+                            podman,
+                            copies,
+                            &fallback_prefix,
+                            source,
+                            false,
+                            &env,
+                            error,
+                        )
+                    }
                 },
                 Err(error) => retry_tclone_partial_multicopy_clone(
                     podman,
@@ -5026,8 +5041,11 @@ fn tclone_clone_args(
 }
 
 fn parse_tclone_fork_clone_metadata(output: &str) -> io::Result<Vec<TcloneForkCloneMetadata>> {
-    let clones = serde_json::from_str::<Vec<TcloneForkCloneMetadata>>(output)
+    let mut clones = serde_json::from_str::<Vec<TcloneForkCloneMetadata>>(output)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    for clone in &mut clones {
+        clone.name = clone.name.trim_start_matches('/').to_string();
+    }
     if clones.iter().any(|clone| {
         clone.id.is_empty()
             || clone.name.is_empty()
@@ -9323,8 +9341,14 @@ fn recorded_tclone_overlay_rootfs(record: &TcloneRunRecord) -> io::Result<Tclone
 }
 
 fn overlay_layers_for_mountpoint(rootfs: &Path) -> io::Result<Option<(PathBuf, PathBuf)>> {
-    let rootfs = rootfs.to_string_lossy().to_string();
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    overlay_layers_from_mountinfo(rootfs, &mountinfo)
+}
+
+fn overlay_layers_from_mountinfo(
+    rootfs: &Path,
+    mountinfo: &str,
+) -> io::Result<Option<(PathBuf, PathBuf)>> {
     for line in mountinfo.lines() {
         let Some((left, right)) = line.split_once(" - ") else {
             continue;
@@ -9335,7 +9359,7 @@ fn overlay_layers_for_mountpoint(rootfs: &Path) -> io::Result<Option<(PathBuf, P
             continue;
         }
         let mountpoint = unescape_mountinfo_field(left_fields[4]);
-        if mountpoint != rootfs {
+        if Path::new(&mountpoint) != rootfs {
             continue;
         }
         if right_fields[0] != "overlay" {
@@ -9357,7 +9381,10 @@ fn overlay_layers_for_mountpoint(rootfs: &Path) -> io::Result<Option<(PathBuf, P
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("overlay mount for {rootfs} did not expose lowerdir and upperdir"),
+                format!(
+                    "overlay mount for {} did not expose lowerdir and upperdir",
+                    rootfs.display()
+                ),
             )),
         };
     }
@@ -12165,15 +12192,26 @@ mod tests {
     #[test]
     fn tclone_fork_metadata_parser_requires_complete_records() {
         let parsed = parse_tclone_fork_clone_metadata(
-            r#"[{"id":"abc","name":"fork-0","pid":42,"rootfs":"/tmp/rootfs-0"}]"#,
+            r#"[{"id":"abc","name":"/fork-0","pid":42,"rootfs":"/tmp/rootfs-0"}]"#,
         )
         .unwrap();
         assert_eq!(parsed[0].id, "abc");
+        assert_eq!(parsed[0].name, "fork-0");
         assert_eq!(parsed[0].pid, 42);
         assert!(parse_tclone_fork_clone_metadata(
             r#"[{"id":"abc","name":"fork-0","pid":0,"rootfs":"/tmp/rootfs-0"}]"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn tclone_overlay_metadata_accepts_trailing_slash_rootfs() {
+        let mountinfo = "36 25 0:32 / /tmp/rootfs rw,relatime - overlay overlay rw,lowerdir=/lower:/base,upperdir=/upper,workdir=/work\n";
+        let layers = overlay_layers_from_mountinfo(Path::new("/tmp/rootfs/"), mountinfo)
+            .unwrap()
+            .unwrap();
+        assert_eq!(layers.0, PathBuf::from("/lower"));
+        assert_eq!(layers.1, PathBuf::from("/upper"));
     }
 
     #[test]
