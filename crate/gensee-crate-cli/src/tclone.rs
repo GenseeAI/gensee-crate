@@ -50,6 +50,7 @@ const TCLONE_HOST_TMUX_TARGET_ENV: &str = "GENSEE_HOST_TMUX_TARGET";
 const TCLONE_HOST_TMUX_RUN_OPTION: &str = "@gensee_run_id";
 const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
 const TCLONE_WAIT_QUIET_FOR_FORK_ENV: &str = "GENSEE_TCLONE_WAIT_QUIET_FOR_FORK";
+const TCLONE_FORK_TIMING_ENV: &str = "GENSEE_TCLONE_FORK_TIMING";
 const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
@@ -3612,7 +3613,37 @@ fn record_tclone_transaction(
     error: Option<&io::Error>,
     metadata: Option<Value>,
 ) -> io::Result<()> {
-    EventStore::default_local()?
+    let store = EventStore::default_local()?;
+    record_tclone_transaction_with_store(
+        &store,
+        operation_id,
+        operation,
+        phase,
+        source_run_id,
+        target_run_id,
+        parent_run_id,
+        workspace,
+        summary,
+        error,
+        metadata,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_tclone_transaction_with_store(
+    store: &EventStore,
+    operation_id: &str,
+    operation: &str,
+    phase: &str,
+    source_run_id: Option<&str>,
+    target_run_id: Option<&str>,
+    parent_run_id: Option<&str>,
+    workspace: Option<&str>,
+    summary: impl Into<String>,
+    error: Option<&io::Error>,
+    metadata: Option<Value>,
+) -> io::Result<()> {
+    store
         .append_transaction_event(&TransactionEventInput {
             operation_id: operation_id.to_string(),
             environment_kind: "tclone".to_string(),
@@ -3629,6 +3660,36 @@ fn record_tclone_transaction(
             occurred_at_ms: unix_millis()?,
         })
         .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_tclone_transaction_with_store_best_effort(
+    store: &EventStore,
+    operation_id: &str,
+    operation: &str,
+    phase: &str,
+    source_run_id: Option<&str>,
+    target_run_id: Option<&str>,
+    parent_run_id: Option<&str>,
+    workspace: Option<&str>,
+    summary: impl Into<String>,
+    metadata: Option<Value>,
+) {
+    if let Err(error) = record_tclone_transaction_with_store(
+        store,
+        operation_id,
+        operation,
+        phase,
+        source_run_id,
+        target_run_id,
+        parent_run_id,
+        workspace,
+        summary,
+        None,
+        metadata,
+    ) {
+        eprintln!("gensee: warning: could not record transactional event: {error}");
+    }
 }
 
 fn record_tclone_failure(
@@ -4054,6 +4115,7 @@ fn run_tclone_agent_inner(
 }
 
 pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
+    let mut timing = TcloneForkTiming::start();
     let parent = tclone_target_arg(
         &args,
         "usage: gensee run fork <run_id> [--copies N] [--name <prefix>] [--approach <description>]... [--attach tmux:right|tmux:below] [--json]",
@@ -4118,21 +4180,33 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         "requested_name": requested_name.clone(),
         "approaches": approaches.clone(),
     });
-    record_tclone_transaction_best_effort(
-        &operation_id,
-        "fork",
-        "started",
-        Some(&source.run_id),
-        None,
-        source.parent_run_id.as_deref(),
-        Some(&source.workspace),
-        format!("Creating {copies} fork(s) from {}", source.run_id),
-        Some(metadata.clone()),
-    );
+    let event_store = match EventStore::default_local() {
+        Ok(store) => Some(store),
+        Err(error) => {
+            eprintln!("gensee: warning: could not record transactional event: {error}");
+            None
+        }
+    };
+    if let Some(store) = event_store.as_ref() {
+        record_tclone_transaction_with_store_best_effort(
+            store,
+            &operation_id,
+            "fork",
+            "started",
+            Some(&source.run_id),
+            None,
+            source.parent_run_id.as_deref(),
+            Some(&source.workspace),
+            format!("Creating {copies} fork(s) from {}", source.run_id),
+            Some(metadata.clone()),
+        );
+    }
+    timing.mark("preflight_and_transaction_start");
 
     let result: io::Result<()> = (|| {
         let podman = tclone_podman();
         ensure_tclone_container_exists(&podman, &source)?;
+        timing.mark("ensure_source_exists");
         let forked_at_ms = unix_millis()?;
         let prefix = choose_tclone_fork_name_prefix(
             &parent,
@@ -4142,16 +4216,32 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         )?;
         let group_id = format!("{}_parallel_{}", source.run_id, forked_at_ms);
         let source_handoff = wait_for_tclone_source_fork_handoff(&source)?;
+        timing.mark("source_handoff");
         wait_for_tclone_source_quiet_if_requested(&podman, &source)?;
+        timing.mark("source_quiet");
         ensure_tclone_agent_ready_for_fork(&podman, &source)?;
+        timing.mark("agent_ready");
         let _detach_guard = TcloneForkDetachGuard::mark(&source.run_id)?;
+        timing.mark("fork_marker");
         detach_tclone_tmux_clients(&podman, &source.container_name);
+        timing.mark("tmux_detach");
         let fork_base_git_head = capture_tclone_git_head(&podman, &source).ok();
+        timing.mark("capture_git_head");
         let mut capability_guard = TcloneCapabilityRotationGuard::revoke(&podman, source.clone())?;
+        timing.mark("capability_revoke");
         let clone = run_tclone_clone_with_overlay_retry(&podman, copies, &prefix, &source)?;
         let prefix = clone.prefix;
         let output = clone.output;
+        timing.mark("podman_clone");
         capability_guard.restore()?;
+        timing.mark("source_capability_restore");
+        let fallback_event_store;
+        let fork_event_store = if let Some(store) = event_store.as_ref() {
+            store
+        } else {
+            fallback_event_store = EventStore::default_local()?;
+            &fallback_event_store
+        };
         let ids = output
             .lines()
             .map(str::trim)
@@ -4178,10 +4268,13 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                         format!("{prefix}-{index}")
                     }
                 });
+            timing.mark("inspect_clone_name");
             let root_pid = inspect_container_pid(&podman, &container_name).unwrap_or(0);
+            timing.mark("inspect_clone_pid");
             let overlay_layers = inspect_tclone_overlay_rootfs(&podman, &container_name).ok();
+            timing.mark("inspect_clone_overlay");
             let observed_at = unix_millis()?;
-            EventStore::default_local()?.append_session(&AgentSession {
+            fork_event_store.append_session(&AgentSession {
                 session_id: run_id.clone(),
                 agent_binary: source.agent_cmd.first().cloned().unwrap_or_default(),
                 root_pid,
@@ -4197,6 +4290,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 ended_at_ms: None,
                 exit_code: None,
             })?;
+            timing.mark("append_session");
             let fork_record = TcloneRunRecord {
                 run_id: run_id.clone(),
                 parent_run_id: Some(source.run_id.clone()),
@@ -4230,17 +4324,21 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 exit_code: None,
             };
             append_tclone_record(&fork_record)?;
+            timing.mark("append_run_record");
             write_tclone_run_context_with_retry(
                 &podman,
                 &fork_record,
                 Duration::from_secs(TCLONE_ATTACH_RETRY_TIMEOUT_SECS),
             )?;
+            timing.mark("write_clone_context");
             if let Some(handoff) = source_handoff.as_ref() {
                 mark_tclone_fork_task_queued(&podman, &fork_record)?;
                 let prompt = tclone_prompt_with_fork_context(&fork_record, &handoff.prompt);
                 tclone_send_prompt_to_agent(&podman, &fork_record, &prompt, true)?;
             }
-            record_tclone_transaction_best_effort(
+            timing.mark("handoff_prompt");
+            record_tclone_transaction_with_store_best_effort(
+                fork_event_store,
                 &operation_id,
                 "fork",
                 "succeeded",
@@ -4257,6 +4355,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                     "approach": fork_record.fork_approach.as_deref(),
                 })),
             );
+            timing.mark("record_fork_transaction");
             if !fork_json {
                 println!("{run_id} | container={container_name}");
             }
@@ -4281,6 +4380,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 );
             }
         }
+        timing.mark("source_restart");
         if let Some(placement) = host_tmux_attach {
             let mut previous_pane = None;
             for (index, run_id) in fork_run_ids.iter().enumerate() {
@@ -4298,6 +4398,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 }
             }
         }
+        timing.mark("host_tmux_attach");
         if fork_json {
             println!(
                 "{}",
@@ -4310,6 +4411,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 })
             );
         }
+        timing.mark("output");
         Ok(())
     })();
 
@@ -4325,6 +4427,36 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         );
     }
     result
+}
+
+struct TcloneForkTiming {
+    enabled: bool,
+    started: Instant,
+    previous: Instant,
+}
+
+impl TcloneForkTiming {
+    fn start() -> Self {
+        let started = Instant::now();
+        Self {
+            enabled: env_flag(TCLONE_FORK_TIMING_ENV),
+            started,
+            previous: started,
+        }
+    }
+
+    fn mark(&mut self, phase: &str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        eprintln!(
+            "gensee: tclone fork timing phase={phase} delta_ms={:.3} elapsed_ms={:.3}",
+            now.duration_since(self.previous).as_secs_f64() * 1_000.0,
+            now.duration_since(self.started).as_secs_f64() * 1_000.0,
+        );
+        self.previous = now;
+    }
 }
 
 fn tclone_parallel_pane_layout(
@@ -6515,7 +6647,6 @@ fn detach_tclone_tmux_clients(podman: &OsString, container_name: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    thread::sleep(Duration::from_millis(500));
 }
 
 fn tclone_tmux_detach_script() -> String {
