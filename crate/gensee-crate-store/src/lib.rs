@@ -20,7 +20,7 @@ use gensee_crate_rules::policy::Policy;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -271,7 +271,22 @@ impl EventStore {
     }
 
     pub fn list_sessions(&self) -> io::Result<Vec<AgentSession>> {
-        read_jsonl(&self.sessions_path(), self.encryption_key.as_ref())
+        let sessions =
+            read_jsonl::<AgentSession>(&self.sessions_path(), self.encryption_key.as_ref())?;
+        let mut positions = HashMap::new();
+        let mut deduplicated = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            if let Some(index) = positions.get(&session.session_id).copied() {
+                // Session lifecycle updates and daemon retry fallbacks may append
+                // the same logical session more than once. Keep its original
+                // position while making the latest record authoritative.
+                deduplicated[index] = session;
+            } else {
+                positions.insert(session.session_id.clone(), deduplicated.len());
+                deduplicated.push(session);
+            }
+        }
+        Ok(deduplicated)
     }
 
     pub fn list_hook_events(&self) -> io::Result<Vec<AgentHookEvent>> {
@@ -2580,6 +2595,46 @@ mod tests {
         assert_eq!(stored.first_event_at, 100);
         assert_eq!(stored.last_event_at, None);
         assert!(!stored.flagged);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn repeated_session_appends_are_deduplicated_by_session_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-session-dedupe-test-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let mut session = AgentSession {
+            session_id: "run_deduplicated".to_string(),
+            agent_binary: "codex".to_string(),
+            root_pid: 1234,
+            cwd: "/repo".to_string(),
+            repo_path: Some("/repo".to_string()),
+            mode: Some("managed-run".to_string()),
+            workspace_mode: None,
+            original_workspace: None,
+            staged_workspace: None,
+            sandbox_profile: None,
+            sandbox_profile_path: None,
+            started_at_ms: 100,
+            ended_at_ms: None,
+            exit_code: None,
+        };
+        store.append_session(&session).unwrap();
+        // Model both a lost daemon acknowledgement retry and the eventual
+        // lifecycle update. Consumers must see one latest session record.
+        store.append_session(&session).unwrap();
+        session.ended_at_ms = Some(200);
+        session.exit_code = Some(0);
+        store.append_session(&session).unwrap();
+
+        let loaded = store.list_sessions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].session_id, "run_deduplicated");
+        assert_eq!(loaded[0].ended_at_ms, Some(200));
+        assert_eq!(loaded[0].exit_code, Some(0));
 
         fs::remove_dir_all(&dir).ok();
     }
