@@ -4301,6 +4301,9 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             let clone = &clones[index];
             let container_name = clone.name.clone();
             let root_pid = clone.pid;
+            // Podman's tfork metadata emits cloneRootfsList[i], the same
+            // absolute merged rootfs path installed in the clone config.
+            // It is therefore the mountpoint to match in mountinfo.
             let overlay_layers = match tclone_overlay_rootfs_from_path(&clone.rootfs) {
                 Ok(layers) => Some(layers),
                 Err(error) => {
