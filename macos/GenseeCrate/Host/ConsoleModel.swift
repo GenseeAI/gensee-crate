@@ -272,10 +272,7 @@ final class ConsoleModel: ObservableObject {
             names: ["Codex"],
             bundleIdentifiers: ["com.openai.codex"]
         ) || Self.executableInstalled(names: ["codex"])
-        let claudeInstalled = Self.executableInstalled(
-            names: ["claude"],
-            additionalPaths: [home.appendingPathComponent(".claude/local/claude").path]
-        )
+        let claudeInstalled = Self.claudeCodeInstalled(home: home)
         let cursorInstalled = Self.applicationInstalled(
             names: ["Cursor"],
             bundleIdentifiers: ["com.todesktop.230313mzl4w4u92"]
@@ -400,6 +397,39 @@ final class ConsoleModel: ObservableObject {
             $0.appendingPathComponent("Contents/Resources/app/extensions")
         }
         return extensionRoots.contains(where: copilotExtensionInstalled)
+    }
+
+    private static func claudeCodeInstalled(home: URL) -> Bool {
+        if executableInstalled(
+            names: ["claude"],
+            additionalPaths: [home.appendingPathComponent(".claude/local/claude").path]
+        ) {
+            return true
+        }
+        if applicationInstalled(
+            names: ["Claude Code"],
+            bundleIdentifiers: ["com.anthropic.claude-code"]
+        ) {
+            return true
+        }
+
+        let managedRoot = home.appendingPathComponent("Library/Application Support/Claude/claude-code")
+        let versions = (try? FileManager.default.contentsOfDirectory(
+            at: managedRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return versions.contains { versionURL in
+            let bundleURL = versionURL.appendingPathComponent("claude.app")
+            let infoURL = bundleURL.appendingPathComponent("Contents/Info.plist")
+            let executableURL = bundleURL.appendingPathComponent("Contents/MacOS/claude")
+            guard FileManager.default.isExecutableFile(atPath: executableURL.path),
+                  let data = try? Data(contentsOf: infoURL),
+                  let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+                  let bundleIdentifier = info["CFBundleIdentifier"] as? String
+            else { return false }
+            return bundleIdentifier == "com.anthropic.claude-code"
+        }
     }
 
     private static func copilotExtensionInstalled(in root: URL) -> Bool {
