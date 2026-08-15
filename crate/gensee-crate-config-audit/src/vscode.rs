@@ -14,6 +14,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use url::{Host, Url};
 
 const SETTINGS_REFERENCE: &str = "https://code.visualstudio.com/docs/configure/settings";
 const SECURITY_REFERENCE: &str = "https://code.visualstudio.com/docs/agents/security";
@@ -143,12 +144,13 @@ fn audit_vscode_scope(
     ];
 
     let mut effective = Value::Object(Map::new());
+    let mut settings_provenance = BTreeMap::new();
     let user_settings = user_data.join("settings.json");
-    let mut effective_source = user_settings.clone();
     load_settings_layer(
         &user_settings,
         "vscode_user_settings",
         &mut effective,
+        &mut settings_provenance,
         &mut sources,
         &mut findings,
     );
@@ -161,12 +163,10 @@ fn audit_vscode_scope(
             &profile_settings,
             "vscode_profile_settings",
             &mut effective,
+            &mut settings_provenance,
             &mut sources,
             &mut findings,
         );
-        if profile_settings.exists() {
-            effective_source = profile_settings.clone();
-        }
         if !profile_settings.exists() {
             findings.push(make_finding(
                 "VSC-CFG-002",
@@ -188,14 +188,18 @@ fn audit_vscode_scope(
         &workspace_settings,
         "vscode_workspace_settings",
         &mut effective,
+        &mut settings_provenance,
         &mut sources,
         &mut findings,
     );
-    if workspace_settings.exists() {
-        effective_source = workspace_settings;
-    }
 
-    evaluate_settings(&effective, &effective_source, &mut findings);
+    let effective_findings_start = findings.len();
+    evaluate_settings(&effective, &user_settings, &mut findings);
+    reattribute_settings_findings(
+        &mut findings[effective_findings_start..],
+        &settings_provenance,
+        "VS Code defaults",
+    );
     discover_mcp(
         &workspace,
         &user_data,
@@ -315,6 +319,7 @@ fn load_settings_layer(
     path: &Path,
     kind: &str,
     effective: &mut Value,
+    provenance: &mut BTreeMap<String, String>,
     sources: &mut Vec<AuditSource>,
     findings: &mut Vec<AuditFinding>,
 ) {
@@ -327,7 +332,14 @@ fn load_settings_layer(
         Ok(text) => {
             source.sha256 = Some(hash_bytes(text.as_bytes()));
             match parse_jsonc(&text) {
-                Ok(layer) if layer.is_object() => merge_json(effective, &layer),
+                Ok(layer) if layer.is_object() => {
+                    merge_json(effective, &layer);
+                    if let Some(settings) = layer.as_object() {
+                        for key in settings.keys() {
+                            provenance.insert(key.clone(), display_path(path));
+                        }
+                    }
+                }
                 Ok(_) => {
                     source
                         .errors
@@ -349,6 +361,40 @@ fn load_settings_layer(
         }
     }
     sources.push(source);
+}
+
+fn reattribute_settings_findings(
+    findings: &mut [AuditFinding],
+    provenance: &BTreeMap<String, String>,
+    default_source: &str,
+) {
+    for finding in findings {
+        for item in &mut finding.evidence {
+            item.source = item
+                .key
+                .as_deref()
+                .and_then(|key| settings_provenance_source(provenance, key))
+                .unwrap_or(default_source)
+                .to_string();
+        }
+        finding.fingerprint = finding_fingerprint(&finding.rule_id, &finding.evidence);
+    }
+}
+
+fn settings_provenance_source<'a>(
+    provenance: &'a BTreeMap<String, String>,
+    key: &str,
+) -> Option<&'a str> {
+    provenance
+        .iter()
+        .filter(|(candidate, _)| {
+            key == candidate.as_str()
+                || key
+                    .strip_prefix(candidate.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+        .max_by_key(|(candidate, _)| candidate.len())
+        .map(|(_, source)| source.as_str())
 }
 
 fn invalid_json_finding(path: &Path, detail: &str) -> AuditFinding {
@@ -1588,38 +1634,32 @@ fn mcp_sandbox_is_broad(value: Option<&Value>) -> bool {
 }
 
 fn insecure_remote_http(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.starts_with("http://")
-        && !lower.starts_with("http://localhost")
-        && !lower.starts_with("http://127.0.0.1")
-        && !lower.starts_with("http://[::1]")
+    Url::parse(url).map_or_else(
+        |_| url.to_ascii_lowercase().starts_with("http://"),
+        |parsed| parsed.scheme() == "http" && !url_host_is_loopback(&parsed),
+    )
 }
 
 fn url_has_credentials(url: &str) -> bool {
-    let user_info = url
-        .split_once("://")
-        .and_then(|(_, rest)| rest.split('/').next())
-        .is_some_and(|authority| authority.contains('@'));
-    let secret_query = url.split_once('?').is_some_and(|(_, query)| {
-        query.split('&').any(|parameter| {
-            let key = parameter
-                .split_once('=')
-                .map(|(key, _)| key)
-                .unwrap_or(parameter)
-                .to_ascii_lowercase();
-            [
-                "token",
-                "secret",
-                "password",
-                "api_key",
-                "apikey",
-                "authorization",
-            ]
-            .iter()
-            .any(|needle| key.contains(needle))
+    let Ok(url) = Url::parse(url) else {
+        return false;
+    };
+    !url.username().is_empty()
+        || url.password().is_some()
+        || url.query_pairs().any(|(key, _)| {
+            let key = normalize_secret_key(&key);
+            secret_key_name(&key)
         })
-    });
-    user_info || secret_query
+}
+
+fn url_host_is_loopback(url: &Url) -> bool {
+    url.host().is_some_and(|host| match host {
+        Host::Domain(domain) => domain
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    })
 }
 
 fn shell_command(command: &str) -> bool {
@@ -1665,22 +1705,36 @@ fn mutable_package_launcher(command: &str, args: &[Value]) -> bool {
 fn json_contains_secret(value: &Value) -> bool {
     match value {
         Value::Object(map) => map.iter().any(|(key, value)| {
-            let secret_key = [
-                "token",
-                "secret",
-                "password",
-                "api_key",
-                "apikey",
-                "authorization",
-            ]
-            .iter()
-            .any(|needle| key.to_ascii_lowercase().contains(needle));
+            let secret_key = secret_key_name(&normalize_secret_key(key));
             (secret_key && value.as_str().is_some_and(secret_literal))
                 || json_contains_secret(value)
         }),
         Value::Array(values) => values.iter().any(json_contains_secret),
         _ => false,
     }
+}
+
+fn normalize_secret_key(key: &str) -> String {
+    key.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn secret_key_name(key: &str) -> bool {
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "apikey",
+        "accesskey",
+        "authorization",
+        "privatekey",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
 }
 
 fn secret_literal(value: &str) -> bool {
@@ -1969,21 +2023,9 @@ fn make_finding(
     references: &[&str],
     mappings: &[&str],
 ) -> AuditFinding {
-    let mut hasher = Sha256::new();
-    hash_fingerprint_part(&mut hasher, rule_id.as_bytes());
-    for evidence in &evidence_items {
-        hash_fingerprint_part(&mut hasher, evidence.source.as_bytes());
-        hash_fingerprint_part(
-            &mut hasher,
-            evidence.key.as_deref().unwrap_or_default().as_bytes(),
-        );
-        hash_fingerprint_part(
-            &mut hasher,
-            evidence.value.as_deref().unwrap_or_default().as_bytes(),
-        );
-    }
+    let fingerprint = finding_fingerprint(rule_id, &evidence_items);
     AuditFinding {
-        fingerprint: format!("sha256:{:x}", hasher.finalize()),
+        fingerprint,
         rule_id: rule_id.to_string(),
         category: category.to_string(),
         severity,
@@ -2002,6 +2044,23 @@ fn make_finding(
             .collect(),
         mappings: mappings.iter().map(|value| (*value).to_string()).collect(),
     }
+}
+
+fn finding_fingerprint(rule_id: &str, evidence_items: &[Evidence]) -> String {
+    let mut hasher = Sha256::new();
+    hash_fingerprint_part(&mut hasher, rule_id.as_bytes());
+    for evidence in evidence_items {
+        hash_fingerprint_part(&mut hasher, evidence.source.as_bytes());
+        hash_fingerprint_part(
+            &mut hasher,
+            evidence.key.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_fingerprint_part(
+            &mut hasher,
+            evidence.value.as_deref().unwrap_or_default().as_bytes(),
+        );
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn hash_fingerprint_part(hasher: &mut Sha256, value: &[u8]) {
@@ -2193,6 +2252,78 @@ mod tests {
         assert!(!serialized.contains(endpoint_secret));
         assert!(serialized.contains("<redacted>"));
         assert!(serialized.contains("<redacted-credential-url>"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hyphenated_api_key_headers_are_detected() {
+        let root = temp_root("mcp-hyphenated-api-key");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let user_data = root.join("User");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &workspace.join(".vscode/mcp.json"),
+            r#"{"servers":{"demo":{"type":"http","url":"https://example.test/mcp","headers":{"X-API-Key":"opaque-review-secret-value"}}}}"#,
+        );
+
+        let report = audit_vscode_host(&VscodeAuditOptions {
+            workspace,
+            user_data,
+            profile: None,
+            extension_roots: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "VSC-MCP-009"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_http_requires_an_exact_loopback_host() {
+        assert!(!insecure_remote_http("http://localhost:3000/mcp"));
+        assert!(!insecure_remote_http("http://127.0.0.2:3000/mcp"));
+        assert!(!insecure_remote_http("http://[::1]:3000/mcp"));
+        assert!(insecure_remote_http("http://localhost.evil.example/mcp"));
+    }
+
+    #[test]
+    fn effective_findings_use_per_setting_provenance() {
+        let root = temp_root("settings-provenance");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let user_data = root.join("User");
+        fs::create_dir_all(&workspace).unwrap();
+        let user_settings = user_data.join("settings.json");
+        write(&user_settings, r#"{"chat.tools.global.autoApprove":true}"#);
+        write(
+            &workspace.join(".vscode/settings.json"),
+            r#"{"telemetry.telemetryLevel":"off"}"#,
+        );
+
+        let report = audit_vscode_host(&VscodeAuditOptions {
+            workspace,
+            user_data,
+            profile: None,
+            extension_roots: Vec::new(),
+        })
+        .unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == "VSC-AUT-001")
+            .unwrap();
+
+        assert_eq!(finding.evidence[0].source, display_path(&user_settings));
+        let compound = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == "VSC-AUT-003")
+            .unwrap();
+        assert_eq!(compound.evidence[2].source, "VS Code defaults");
         let _ = fs::remove_dir_all(root);
     }
 

@@ -33,6 +33,7 @@ Options:
   --json               Emit the versioned JSON report
   --fail-on <LEVEL>    Exit 1 when a finding is at or above LEVEL
                        (critical, high, medium, low, info, none)
+                       Audit input, parse, and I/O failures exit nonzero
   -h, --help           Show this help
 "#;
 
@@ -61,6 +62,8 @@ pub(crate) fn handle_config_audit(args: &[OsString]) -> io::Result<()> {
         }
     };
 
+    validate_input_paths(&options)?;
+
     let report = audit_target(
         options.target,
         &AuditOptions {
@@ -80,19 +83,74 @@ pub(crate) fn handle_config_audit(args: &[OsString]) -> io::Result<()> {
         print_human_bundle(&report);
     }
 
-    if options.fail_on.is_some_and(|threshold| {
-        report.reports.iter().any(|target| {
-            target.applicability != AuditApplicability::NotDetected
-                && target.report.findings.iter().any(|finding| {
-                    finding.assessment != Assessment::NotAssessable
-                        && finding.severity.at_least(threshold)
-                })
-        })
-    }) {
-        std::process::exit(1);
+    if let Some(exit_code) = audit_exit_code(&report, options.fail_on) {
+        std::process::exit(exit_code);
     }
 
     Ok(())
+}
+
+fn validate_input_paths(options: &AuditCliOptions) -> io::Result<()> {
+    validate_directory(&options.workspace, "workspace")?;
+    if matches!(
+        options.target,
+        AuditTargetName::Codex | AuditTargetName::CodexCli
+    ) {
+        if let Some(path) = &options.codex_home {
+            validate_directory(path, "Codex home")?;
+        }
+    }
+    if matches!(
+        options.target,
+        AuditTargetName::Vscode
+            | AuditTargetName::VscodeAgentHost
+            | AuditTargetName::GithubCopilotVscode
+    ) {
+        if let Some(path) = &options.vscode_user_data {
+            validate_directory(path, "VS Code user data")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_directory(path: &std::path::Path, label: &str) -> io::Result<()> {
+    if path.exists() && !path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} is not a directory: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn audit_exit_code(bundle: &AuditBundle, fail_on: Option<Severity>) -> Option<i32> {
+    let included = bundle
+        .reports
+        .iter()
+        .filter(|target| target.applicability != AuditApplicability::NotDetected);
+    if included.clone().any(|target| {
+        target
+            .report
+            .sources
+            .iter()
+            .any(|source| !source.errors.is_empty())
+            || target
+                .report
+                .findings
+                .iter()
+                .any(|finding| matches!(finding.rule_id.as_str(), "CAX-CFG-006" | "VSC-CFG-002"))
+    }) {
+        return Some(2);
+    }
+    fail_on.and_then(|threshold| {
+        included
+            .flat_map(|target| &target.report.findings)
+            .any(|finding| {
+                finding.assessment != Assessment::NotAssessable
+                    && finding.severity.at_least(threshold)
+            })
+            .then_some(1)
+    })
 }
 
 fn parse_options(args: &[OsString]) -> Result<Option<AuditCliOptions>, String> {
@@ -324,9 +382,25 @@ fn bundle_count(bundle: &AuditBundle, severity: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "gensee-cli-config-audit-{}-{name}",
+            std::process::id()
+        ))
+    }
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
     }
 
     #[test]
@@ -366,5 +440,78 @@ mod tests {
     #[test]
     fn audit_is_excluded_from_telemetry_bootstrap() {
         assert!(!crate::should_bootstrap_telemetry_for_command("audit"));
+    }
+
+    #[test]
+    fn rejects_a_file_as_codex_home() {
+        let root = temp_root("file-home");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let codex_home = root.join("not-a-directory");
+        fs::write(&codex_home, "not a directory").unwrap();
+        let options = parse_options(&arguments(&[
+            "codex",
+            "--workspace",
+            root.to_str().unwrap(),
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+        ]))
+        .unwrap()
+        .unwrap();
+
+        let error = validate_input_paths(&options).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_audits_take_precedence_over_policy_exit_status() {
+        let root = temp_root("operational-exit");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        write(&codex_home.join("config.toml"), "invalid = [toml\n");
+        let bundle = audit_target(
+            AuditTargetName::Codex,
+            &AuditOptions {
+                workspace,
+                codex_home: Some(codex_home),
+                codex_profile: None,
+                vscode_user_data: None,
+                vscode_profile: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(audit_exit_code(&bundle, Some(Severity::High)), Some(2));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn policy_findings_exit_one_when_the_audit_completed() {
+        let root = temp_root("policy-exit");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &codex_home.join("config.toml"),
+            "sandbox_mode = \"danger-full-access\"\n",
+        );
+        let bundle = audit_target(
+            AuditTargetName::Codex,
+            &AuditOptions {
+                workspace,
+                codex_home: Some(codex_home),
+                codex_profile: None,
+                vscode_user_data: None,
+                vscode_profile: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(audit_exit_code(&bundle, Some(Severity::High)), Some(1));
+        let _ = fs::remove_dir_all(root);
     }
 }

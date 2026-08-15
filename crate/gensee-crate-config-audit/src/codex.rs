@@ -11,6 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
+use url::{Host, Url};
 
 const CONFIG_REFERENCE: &str = "https://developers.openai.com/codex/config-reference/";
 const SECURITY_REFERENCE: &str = "https://learn.chatgpt.com/docs/agent-approvals-security";
@@ -70,6 +71,10 @@ pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
         &mut findings,
     );
     let mut config_complete = user_ok;
+    let mut config_provenance = BTreeMap::new();
+    if user_ok {
+        record_toml_provenance(&effective, "", &user_path, &mut config_provenance);
+    }
 
     if let Some(profile) = &options.profile {
         let profile_path = codex_home.join(format!("{profile}.config.toml"));
@@ -98,6 +103,7 @@ pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
             ));
         } else if ok {
             merge_toml(&mut effective, &layer);
+            record_toml_provenance(&layer, "", &profile_path, &mut config_provenance);
         }
         config_complete &= ok && profile_path.exists();
     }
@@ -121,6 +127,7 @@ pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
     if project_ok && trusted {
         ignored_project_keys = remove_ignored_project_keys(&mut project_layer);
         merge_toml(&mut effective, &project_layer);
+        record_toml_provenance(&project_layer, "", &project_path, &mut config_provenance);
     }
     if trusted && project_path.exists() {
         config_complete &= project_ok;
@@ -155,7 +162,13 @@ pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
     }
 
     let mut inventory = AuditInventory::default();
+    let effective_findings_start = findings.len();
     evaluate_effective_config(&effective, &user_path, &mut inventory, &mut findings);
+    reattribute_config_findings(
+        &mut findings[effective_findings_start..],
+        &config_provenance,
+        "codex defaults",
+    );
     inventory.skills = discover_skills(
         &workspace,
         &codex_home,
@@ -374,6 +387,58 @@ fn merge_toml(base: &mut TomlValue, overlay: &TomlValue) {
     }
 }
 
+fn record_toml_provenance(
+    value: &TomlValue,
+    prefix: &str,
+    source: &Path,
+    provenance: &mut BTreeMap<String, String>,
+) {
+    if !prefix.is_empty() {
+        provenance.insert(prefix.to_string(), display_path(source));
+    }
+    if let TomlValue::Table(table) = value {
+        for (key, child) in table {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            record_toml_provenance(child, &path, source, provenance);
+        }
+    }
+}
+
+fn reattribute_config_findings(
+    findings: &mut [AuditFinding],
+    provenance: &BTreeMap<String, String>,
+    default_source: &str,
+) {
+    for finding in findings {
+        for item in &mut finding.evidence {
+            item.source = item
+                .key
+                .as_deref()
+                .and_then(|key| provenance_source(provenance, key))
+                .unwrap_or(default_source)
+                .to_string();
+        }
+        finding.fingerprint = finding_fingerprint(&finding.rule_id, &finding.evidence);
+    }
+}
+
+fn provenance_source<'a>(provenance: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
+    provenance
+        .iter()
+        .filter(|(candidate, _)| {
+            key == candidate.as_str()
+                || key
+                    .strip_prefix(candidate.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        })
+        .max_by_key(|(candidate, _)| candidate.len())
+        .map(|(_, source)| source.as_str())
+}
+
 fn evaluate_effective_config(
     config: &TomlValue,
     source: &Path,
@@ -447,7 +512,7 @@ fn evaluate_effective_config(
             &["OWASP-ASI02", "OWASP-MCP10"],
         ));
     }
-    if has_global_domain_allow(config) {
+    if let Some(domain_key) = global_domain_allow_key(config) {
         findings.push(make_finding(
             "CAX-NET-002",
             "network_and_external_data",
@@ -456,7 +521,7 @@ fn evaluate_effective_config(
             Assessment::Confirmed,
             "Network policy allows every public host",
             "A global `*` domain rule removes most destination scoping and increases exfiltration reach.",
-            vec![evidence(source, Some("network.domains.*"), Some("allow"))],
+            vec![evidence(source, Some(domain_key), Some("allow"))],
             "Replace the global rule with the smallest set of exact or scoped wildcard domains required.",
             &[SECURITY_REFERENCE],
             &["OWASP-ASI02", "OWASP-MCP2"],
@@ -859,7 +924,7 @@ fn evaluate_mcp_servers(
             ));
         }
         if let Some(url) = endpoint.as_deref() {
-            if url.starts_with("http://") && !is_loopback_url(url) {
+            if insecure_remote_http(url) {
                 findings.push(make_finding(
                     "CAX-MCP-003",
                     "mcp_apps_connectors",
@@ -1795,21 +1860,9 @@ fn make_finding(
     references: &[&str],
     mappings: &[&str],
 ) -> AuditFinding {
-    let mut hasher = Sha256::new();
-    hash_fingerprint_part(&mut hasher, rule_id.as_bytes());
-    for evidence in &evidence_items {
-        hash_fingerprint_part(&mut hasher, evidence.source.as_bytes());
-        hash_fingerprint_part(
-            &mut hasher,
-            evidence.key.as_deref().unwrap_or_default().as_bytes(),
-        );
-        hash_fingerprint_part(
-            &mut hasher,
-            evidence.value.as_deref().unwrap_or_default().as_bytes(),
-        );
-    }
+    let fingerprint = finding_fingerprint(rule_id, &evidence_items);
     AuditFinding {
-        fingerprint: format!("sha256:{:x}", hasher.finalize()),
+        fingerprint,
         rule_id: rule_id.to_string(),
         category: category.to_string(),
         severity,
@@ -1828,6 +1881,23 @@ fn make_finding(
             .collect(),
         mappings: mappings.iter().map(|value| (*value).to_string()).collect(),
     }
+}
+
+fn finding_fingerprint(rule_id: &str, evidence_items: &[Evidence]) -> String {
+    let mut hasher = Sha256::new();
+    hash_fingerprint_part(&mut hasher, rule_id.as_bytes());
+    for evidence in evidence_items {
+        hash_fingerprint_part(&mut hasher, evidence.source.as_bytes());
+        hash_fingerprint_part(
+            &mut hasher,
+            evidence.key.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_fingerprint_part(
+            &mut hasher,
+            evidence.value.as_deref().unwrap_or_default().as_bytes(),
+        );
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn hash_fingerprint_part(hasher: &mut Sha256, value: &[u8]) {
@@ -1936,17 +2006,24 @@ fn network_policy_enabled(config: &TomlValue) -> bool {
     }
 }
 
-fn has_global_domain_allow(config: &TomlValue) -> bool {
+fn global_domain_allow_key(config: &TomlValue) -> Option<&'static str> {
     let candidates = [
-        get_value(config, &["features", "network_proxy", "domains"]),
-        get_value(config, &["experimental_network", "domains"]),
+        (
+            "features.network_proxy.domains.*",
+            get_value(config, &["features", "network_proxy", "domains"]),
+        ),
+        (
+            "experimental_network.domains.*",
+            get_value(config, &["experimental_network", "domains"]),
+        ),
     ];
-    candidates.into_iter().flatten().any(|value| {
-        value
-            .as_table()
+    candidates.into_iter().find_map(|(key, value)| {
+        (value
+            .and_then(TomlValue::as_table)
             .and_then(|domains| domains.get("*"))
             .and_then(TomlValue::as_str)
-            == Some("allow")
+            == Some("allow"))
+        .then_some(key)
     })
 }
 
@@ -2166,16 +2243,15 @@ fn risky_scope(scope: &str) -> bool {
 }
 
 fn secret_like(key: &str, value: &str) -> bool {
-    let key = key.to_ascii_lowercase();
+    let key = normalize_secret_key(key);
     let sensitive_key = [
         "token",
         "secret",
         "password",
         "passwd",
-        "api_key",
         "apikey",
         "authorization",
-        "private_key",
+        "privatekey",
         "credential",
     ]
     .iter()
@@ -2189,6 +2265,13 @@ fn secret_like(key: &str, value: &str) -> bool {
         || lower.starts_with("sk-")
         || lower.starts_with("ghp_")
         || lower.starts_with("github_pat_")
+}
+
+fn normalize_secret_key(key: &str) -> String {
+    key.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn sanitize_evidence_value(key: Option<&str>, value: &str) -> String {
@@ -2208,24 +2291,33 @@ fn sanitize_endpoint(value: &str) -> String {
 }
 
 fn endpoint_contains_secret(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    let authority_has_credentials = lower
-        .split_once("://")
-        .and_then(|(_, remainder)| remainder.split('/').next())
-        .is_some_and(|authority| authority.contains('@'));
-    authority_has_credentials
-        || [
-            "token=",
-            "secret=",
-            "password=",
-            "passwd=",
-            "api_key=",
-            "apikey=",
-            "access_key=",
-            "authorization=",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    let Ok(url) = Url::parse(value) else {
+        return value
+            .split_once("://")
+            .and_then(|(_, remainder)| remainder.split('/').next())
+            .is_some_and(|authority| authority.contains('@'));
+    };
+    !url.username().is_empty()
+        || url.password().is_some()
+        || url
+            .query_pairs()
+            .any(|(key, _)| secret_key_name(&normalize_secret_key(&key)))
+}
+
+fn secret_key_name(key: &str) -> bool {
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "apikey",
+        "accesskey",
+        "authorization",
+        "privatekey",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
 }
 
 fn is_broad_path(path: &str) -> bool {
@@ -2246,8 +2338,22 @@ fn looks_like_path(value: &str) -> bool {
 }
 
 fn is_loopback_url(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+    Url::parse(value).ok().is_some_and(|url| {
+        url.host().is_some_and(|host| match host {
+            Host::Domain(domain) => domain
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case("localhost"),
+            Host::Ipv4(address) => address.is_loopback(),
+            Host::Ipv6(address) => address.is_loopback(),
+        })
+    })
+}
+
+fn insecure_remote_http(value: &str) -> bool {
+    Url::parse(value).map_or_else(
+        |_| value.to_ascii_lowercase().starts_with("http://"),
+        |url| url.scheme() == "http" && !is_loopback_url(value),
+    )
 }
 
 fn contains_hidden_unicode(value: &str) -> bool {
@@ -2418,6 +2524,87 @@ mod tests {
         let encoded = serde_json::to_string(&report).unwrap();
         assert!(!encoded.contains("sk-super-secret"));
         assert!(encoded.contains("<redacted>"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hyphenated_api_key_headers_are_detected_and_redacted() {
+        let root = temp_root("hyphenated-api-key");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        let secret = "opaque-review-secret-value";
+        write(
+            &codex_home.join("config.toml"),
+            &format!(
+                "[mcp_servers.demo]\ncommand = \"demo\"\n[mcp_servers.demo.http_headers]\nX-API-Key = \"{secret}\"\n"
+            ),
+        );
+
+        let report = audit_codex(&CodexAuditOptions {
+            workspace,
+            codex_home,
+            profile: None,
+        })
+        .unwrap();
+        let serialized = serde_json::to_string(&report).unwrap();
+
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "CAX-MCP-006"));
+        assert!(!serialized.contains(secret));
+        assert!(serialized.contains("<redacted>"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loopback_urls_require_an_exact_loopback_host() {
+        assert!(is_loopback_url("http://localhost:3000/mcp"));
+        assert!(is_loopback_url("http://127.0.0.2:3000/mcp"));
+        assert!(is_loopback_url("http://[::1]:3000/mcp"));
+        assert!(!is_loopback_url("http://localhost.evil.example/mcp"));
+        assert!(insecure_remote_http("http://localhost.evil.example/mcp"));
+    }
+
+    #[test]
+    fn effective_findings_use_the_setting_layer_that_won() {
+        let root = temp_root("effective-provenance");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        let user_path = codex_home.join("config.toml");
+        let project_path = workspace.join(".codex/config.toml");
+        write(
+            &user_path,
+            &format!(
+                "sandbox_mode = \"read-only\"\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                workspace.display()
+            ),
+        );
+        write(&project_path, "sandbox_mode = \"danger-full-access\"\n");
+
+        let report = audit_codex(&CodexAuditOptions {
+            workspace,
+            codex_home,
+            profile: None,
+        })
+        .unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == "CAX-AUT-001")
+            .unwrap();
+
+        assert_eq!(finding.evidence[0].source, display_path(&project_path));
+        let default_finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == "CAX-ENV-001")
+            .unwrap();
+        assert_eq!(default_finding.evidence[0].source, "codex defaults");
         let _ = fs::remove_dir_all(root);
     }
 

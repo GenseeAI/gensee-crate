@@ -65,8 +65,9 @@ Options:
 | `--json` | Print JSON instead of the human review. |
 | `--fail-on LEVEL` | Exit 1 for actionable findings at or above `critical`, `high`, `medium`, `low`, or `info`. Use `none` to disable. |
 
-Without `--fail-on`, findings do not change the exit status. Parse and I/O
-failures still return an error.
+Without `--fail-on`, policy findings do not change the exit status. Invalid
+audit inputs return an error, and incomplete audits caused by parse or I/O
+failures exit 2. A `--fail-on` policy match exits 1.
 
 ## Dashboard view
 

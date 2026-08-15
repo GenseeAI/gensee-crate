@@ -82,6 +82,13 @@ function displayName(value: string) {
     .join(' ');
 }
 
+function formatSecurityConfigValue(value: unknown) {
+  if (value !== null && typeof value === 'object') {
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
 function AssessmentBadge({ assessment }: { assessment: AuditAssessment }) {
   const color = assessment === 'confirmed' ? 'red' : assessment === 'potential' ? 'orange' : 'default';
   return <Tag color={color}>{displayName(assessment).toUpperCase()}</Tag>;
@@ -337,7 +344,7 @@ function InventoryPanel({ report }: { report: ConfigAuditReport }) {
         <Descriptions size="small" bordered column={{ xs: 1, md: 2, xl: 3 }}>
           {securityConfig.map(([key, value]) => (
             <Descriptions.Item key={key} label={displayName(key)}>
-              <Text code>{String(value)}</Text>
+              <Text code>{formatSecurityConfigValue(value)}</Text>
             </Descriptions.Item>
           ))}
         </Descriptions>
@@ -520,9 +527,12 @@ function mergeReports(bundle: ConfigAuditBundle): ConfigAuditReport | undefined 
       ...source,
       kind: `${item.target}: ${source.kind}`,
     }))),
-    effective_security_config: Object.fromEntries(
-      selected.map(item => [item.target, item.report.effective_security_config]),
-    ),
+    effective_security_config: Object.fromEntries(selected.flatMap(item =>
+      Object.entries(item.report.effective_security_config).map(([key, value]) => [
+        `${item.target}.${key}`,
+        value,
+      ]),
+    )),
     inventory: {
       skills: inventories.flatMap(inventory => inventory.skills),
       mcp_servers: inventories.flatMap(inventory => inventory.mcp_servers),
