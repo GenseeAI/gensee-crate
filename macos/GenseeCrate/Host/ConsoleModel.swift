@@ -186,16 +186,39 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
-    func configureIntegration(_ provider: String) async {
-        runningCommand = "Configuring \(provider)"
+    func setIntegrationEnabled(_ provider: String, enabled: Bool) async {
+        guard let index = integrations.firstIndex(where: { $0.id == provider }) else { return }
+        let integration = integrations[index]
+        guard integration.canToggle else { return }
+        guard backendAvailable else {
+            errorMessage = GenseeCLIError.executableNotFound.localizedDescription
+            return
+        }
+
+        let previousValue = integration.configured
+        integrations[index].configured = enabled
+        runningCommand = "\(enabled ? "Enabling" : "Disabling") \(integration.name) protection"
         defer { runningCommand = nil }
         do {
-            let output = try await cli.run(["setup", provider, "--gensee-home", homeURL.path])
+            var arguments = ["setup", provider]
+            if enabled {
+                arguments += ["--gensee-home", homeURL.path]
+            } else {
+                arguments.append("--disable")
+            }
+            let output = try await cli.run(arguments)
             noticeMessage = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
             refreshIntegrations()
         } catch {
+            if let currentIndex = integrations.firstIndex(where: { $0.id == provider }) {
+                integrations[currentIndex].configured = previousValue
+            }
             errorMessage = error.localizedDescription
         }
+    }
+
+    func refreshHarnesses() {
+        refreshIntegrations()
     }
 
     func openFullDiskAccess() {
@@ -236,24 +259,133 @@ final class ConsoleModel: ObservableObject {
 
     private func refreshIntegrations() {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let definitions = [
-            ("codex", "Codex", "Policy decisions before tools run", ".codex/hooks.json"),
-            ("claude-code", "Claude Code", "Prompt, tool, and permission hooks", ".claude/settings.json"),
-            ("cursor", "Cursor", "Native agent hook coverage", ".cursor/hooks.json"),
-            ("vscode", "VS Code / Copilot", "Workspace and tool activity", ".copilot/hooks/gensee.json"),
-            ("antigravity", "Antigravity", "Global agent hook coverage", ".gemini/config/hooks.json"),
+        let codexInstalled = Self.applicationInstalled(
+            names: ["Codex"],
+            bundleIdentifiers: ["com.openai.codex"]
+        ) || Self.executableInstalled(names: ["codex"])
+        let claudeInstalled = Self.executableInstalled(
+            names: ["claude"],
+            additionalPaths: [home.appendingPathComponent(".claude/local/claude").path]
+        )
+        let cursorInstalled = Self.applicationInstalled(
+            names: ["Cursor"],
+            bundleIdentifiers: ["com.todesktop.230313mzl4w4u92"]
+        ) || Self.executableInstalled(names: ["cursor"])
+        let antigravityInstalled = Self.applicationInstalled(
+            names: ["Antigravity"],
+            bundleIdentifiers: []
+        ) || Self.executableInstalled(names: ["antigravity"])
+        let copilotInstalled = Self.githubCopilotInstalled(home: home)
+        let omnigentInstalled = Self.executableInstalled(names: ["omnigent"])
+
+        let definitions: [(String, String, String, String, String, Bool, Bool, String)] = [
+            (
+                "codex", "Codex", "Prompt, tool, permission, and lifecycle policy hooks",
+                ".codex/hooks.json", "chevron.left.forwardslash.chevron.right", codexInstalled, true,
+                codexInstalled ? "Codex is available on this Mac." : "Codex app or command was not found."
+            ),
+            (
+                "claude-code", "Claude Code", "Prompt, tool, permission, and lifecycle policy hooks",
+                ".claude/settings.json", "terminal", claudeInstalled, true,
+                claudeInstalled ? "Claude Code is available on this Mac." : "The claude command was not found."
+            ),
+            (
+                "antigravity", "Antigravity", "Global pre-invocation and tool policy hooks",
+                ".gemini/config/hooks.json", "sparkles", antigravityInstalled, true,
+                antigravityInstalled ? "Antigravity is available on this Mac." : "Antigravity app or command was not found."
+            ),
+            (
+                "cursor", "Cursor", "Prompt, shell, tool, and lifecycle policy hooks",
+                ".cursor/hooks.json", "cursorarrow.rays", cursorInstalled, true,
+                cursorInstalled ? "Cursor is available on this Mac." : "Cursor app or command was not found."
+            ),
+            (
+                "vscode", "GitHub Copilot", "VS Code prompt, tool, and lifecycle policy hooks",
+                ".copilot/hooks/gensee.json", "shippingbox", copilotInstalled, true,
+                copilotInstalled ? "GitHub Copilot for VS Code is available on this Mac." : "The GitHub Copilot VS Code extension was not found."
+            ),
+            (
+                "omnigent", "Omnigent", "Endpoint visibility through a Gensee-managed launch",
+                ".omnigent", "point.3.connected.trianglepath.dotted", omnigentInstalled, false,
+                omnigentInstalled ? "Run Omnigent with gensee run for managed-tree monitoring and enforcement." : "The omnigent command was not found."
+            ),
         ]
-        integrations = definitions.map { provider, name, detail, relativePath in
+        integrations = definitions.map { provider, name, detail, relativePath, symbol, installed, supportsDirectHooks, installationDetail in
             let path = home.appendingPathComponent(relativePath)
             let contents = (try? String(contentsOf: path, encoding: .utf8)) ?? ""
+            let configured = contents.localizedCaseInsensitiveContains("hook \(provider)")
+                && contents.localizedCaseInsensitiveContains("gensee")
+            let configurationIssue: String?
+            if provider == "claude-code", configured, Self.claudeHooksDisabled(contents) {
+                configurationIssue = "Claude Code has disableAllHooks enabled. Turn it off in settings before relying on protection."
+            } else {
+                configurationIssue = nil
+            }
             return IntegrationDescriptor(
                 id: provider,
                 name: name,
                 detail: detail,
                 configPath: path.path,
-                configured: contents.localizedCaseInsensitiveContains("gensee")
+                symbolName: symbol,
+                installed: installed,
+                supportsDirectHooks: supportsDirectHooks,
+                installationDetail: installationDetail,
+                configurationIssue: configurationIssue,
+                configured: configured
             )
         }
+    }
+
+    private static func applicationInstalled(names: [String], bundleIdentifiers: [String]) -> Bool {
+        if bundleIdentifiers.contains(where: { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil }) {
+            return true
+        }
+        let homeApplications = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications")
+        return names.contains { name in
+            FileManager.default.fileExists(atPath: "/Applications/\(name).app")
+                || FileManager.default.fileExists(atPath: homeApplications.appendingPathComponent("\(name).app").path)
+        }
+    }
+
+    private static func executableInstalled(names: [String], additionalPaths: [String] = []) -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let standardDirectories = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            home.appendingPathComponent(".local/bin").path,
+            home.appendingPathComponent(".cargo/bin").path,
+            home.appendingPathComponent("bin").path,
+        ]
+        let pathDirectories = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+        let candidates = additionalPaths + (standardDirectories + pathDirectories).flatMap { directory in
+            names.map { URL(fileURLWithPath: directory).appendingPathComponent($0).path }
+        }
+        return candidates.contains { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private static func githubCopilotInstalled(home: URL) -> Bool {
+        let vscodeInstalled = applicationInstalled(
+            names: ["Visual Studio Code", "Visual Studio Code - Insiders"],
+            bundleIdentifiers: ["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders"]
+        ) || executableInstalled(names: ["code", "code-insiders"])
+        guard vscodeInstalled else { return false }
+        let extensionRoots = [
+            home.appendingPathComponent(".vscode/extensions"),
+            home.appendingPathComponent(".vscode-insiders/extensions"),
+        ]
+        return extensionRoots.contains { root in
+            let entries = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
+            return entries.contains { $0.lowercased().hasPrefix("github.copilot-") }
+        }
+    }
+
+    private static func claudeHooksDisabled(_ contents: String) -> Bool {
+        guard let data = contents.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        return root["disableAllHooks"] as? Bool == true
     }
 
     private func configureEndpointSensor() {

@@ -1,0 +1,204 @@
+import SwiftUI
+
+struct DashboardHarnessesPage: View {
+    @ObservedObject var model: ConsoleModel
+
+    private var installedCount: Int {
+        model.integrations.filter(\.installed).count
+    }
+
+    private var protectedCount: Int {
+        model.integrations.filter { $0.installed && $0.configured && $0.supportsDirectHooks }.count
+    }
+
+    private var hookCapableInstalledCount: Int {
+        model.integrations.filter { $0.installed && $0.supportsDirectHooks }.count
+    }
+
+    var body: some View {
+        DashboardPage {
+            VStack(alignment: .leading, spacing: 16) {
+                DashboardPageHeader(
+                    "Harnesses",
+                    description: "Choose which installed AI harnesses receive Gensee monitoring and policy enforcement."
+                ) {
+                    Button { model.refreshHarnesses() } label: {
+                        Label("Scan again", systemImage: "arrow.clockwise")
+                    }
+                    .controlSize(.small)
+                }
+
+                coverageSummary
+
+                DashboardCard("Harness protection") {
+                    VStack(spacing: 0) {
+                        ForEach(Array(model.integrations.enumerated()), id: \.element.id) { index, integration in
+                            harnessRow(integration)
+                            if index < model.integrations.count - 1 {
+                                Divider().padding(.leading, 54)
+                            }
+                        }
+                    }
+                }
+
+                HStack(alignment: .top, spacing: 9) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.secondary)
+                    Text("Switches install or remove only Gensee-owned hooks; other harness settings and hooks are preserved. Protection behavior follows the active policy. Omnigent currently requires a managed `gensee run` launch because it does not yet expose a first-class policy bridge.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 4)
+            }
+        }
+    }
+
+    private var coverageSummary: some View {
+        HStack(spacing: 0) {
+            summaryMetric(
+                value: "\(protectedCount)",
+                label: "Protected",
+                detail: "of \(hookCapableInstalledCount) hook-capable",
+                color: protectedCount == hookCapableInstalledCount && hookCapableInstalledCount > 0 ? .dashboardGreen : .dashboardGold
+            )
+            Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 48)
+            summaryMetric(
+                value: "\(installedCount)",
+                label: "Detected",
+                detail: "of \(model.integrations.count) supported",
+                color: .dashboardBlue
+            )
+            Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 48)
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.shield")
+                    .font(.system(size: 19, weight: .medium))
+                    .foregroundStyle(Color.dashboardRed)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Policy-backed protection")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("Monitoring and pre-tool decisions use the same local Gensee policy.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 12)
+        .background(Color.dashboardPanel)
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.dashboardLine, lineWidth: 1))
+    }
+
+    private func summaryMetric(
+        value: String,
+        label: String,
+        detail: String,
+        color: Color
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 9) {
+            Text(value)
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label).font(.system(size: 11, weight: .semibold))
+                Text(detail).font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 18)
+        .frame(width: 180, alignment: .leading)
+    }
+
+    private func harnessRow(_ integration: IntegrationDescriptor) -> some View {
+        HStack(alignment: .center, spacing: 14) {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(rowAccent(integration).opacity(integration.installed ? 0.12 : 0.07))
+                .frame(width: 40, height: 40)
+                .overlay(
+                    Image(systemName: integration.symbolName)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(integration.installed ? rowAccent(integration) : Color.secondary)
+                )
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(integration.name)
+                        .font(.system(size: 13, weight: .semibold))
+                    DashboardTag(text: integration.statusLabel, color: statusColor(integration))
+                }
+                Text(integration.detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Text(integration.configurationIssue ?? integration.installationDetail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(integration.configurationIssue == nil ? Color.secondary : Color.dashboardGold)
+                    .lineLimit(2)
+                if integration.installed && integration.supportsDirectHooks {
+                    Text(abbreviatedPath(integration.configPath))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 6) {
+                coverageLabel("Observe", active: integration.canToggle && integration.configured)
+                coverageLabel("Enforce", active: integration.canToggle && integration.configured)
+            }
+            .frame(width: 150, alignment: .trailing)
+
+            Toggle(
+                "Protect \(integration.name)",
+                isOn: Binding(
+                    get: { integration.canToggle && integration.configured },
+                    set: { enabled in
+                        Task { await model.setIntegrationEnabled(integration.id, enabled: enabled) }
+                    }
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .tint(.dashboardRed)
+            .disabled(!integration.canToggle || !model.backendAvailable)
+            .help(toggleHelp(integration))
+            .frame(width: 48)
+        }
+        .padding(.vertical, 13)
+        .contentShape(Rectangle())
+        .opacity(integration.installed ? 1 : 0.42)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func coverageLabel(_ label: String, active: Bool) -> some View {
+        Label(label, systemImage: active ? "checkmark.circle.fill" : "circle")
+            .font(.system(size: 9, weight: .medium))
+            .foregroundStyle(active ? Color.dashboardGreen : Color.secondary)
+    }
+
+    private func rowAccent(_ integration: IntegrationDescriptor) -> Color {
+        if integration.configurationIssue != nil { return .dashboardGold }
+        if integration.configured { return .dashboardGreen }
+        return .dashboardBlue
+    }
+
+    private func statusColor(_ integration: IntegrationDescriptor) -> Color {
+        if !integration.installed { return .secondary }
+        if integration.configurationIssue != nil { return .dashboardGold }
+        if !integration.supportsDirectHooks { return .dashboardBlue }
+        return integration.configured ? .dashboardGreen : .secondary
+    }
+
+    private func toggleHelp(_ integration: IntegrationDescriptor) -> String {
+        if !integration.installed { return "Install \(integration.name) before enabling Gensee protection." }
+        if !integration.supportsDirectHooks {
+            return "Omnigent protection currently requires launching it with gensee run."
+        }
+        if !model.backendAvailable { return "The bundled Gensee backend is unavailable." }
+        return integration.configured
+            ? "Remove Gensee hooks while preserving unrelated harness settings."
+            : "Install Gensee monitoring and policy hooks."
+    }
+}

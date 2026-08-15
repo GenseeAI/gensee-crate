@@ -895,6 +895,128 @@ fn codex_hook_command_quotes_paths_with_spaces() {
 }
 
 #[test]
+fn hook_disable_removes_only_gensee_owned_entries() {
+    let mut nested = json!({
+        "PreToolUse": [
+            {
+                "matcher": "Read",
+                "hooks": [
+                    {"type": "command", "command": "./keep-before.sh"},
+                    {
+                        "type": "command",
+                        "command": "GENSEE_HOME=/old /old/gensee hook codex"
+                    },
+                    {"type": "command", "command": "./keep-after.sh"}
+                ]
+            },
+            {
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "GENSEE_HOME=/duplicate /duplicate/gensee hook codex"
+                }]
+            }
+        ],
+        "PermissionRequest": [{
+            "matcher": "*",
+            "hooks": [{
+                "type": "command",
+                "command": "GENSEE_HOME=/old /old/gensee hook codex"
+            }]
+        }],
+        "Unrelated": [{"matcher": "keep"}]
+    });
+    let hooks = nested.as_object_mut().unwrap();
+    assert!(remove_nested_hook_event(hooks, "PreToolUse", PROVIDER_CODEX, "Codex").unwrap());
+    assert!(remove_nested_hook_event(hooks, "PermissionRequest", PROVIDER_CODEX, "Codex").unwrap());
+
+    assert_eq!(hooks["Unrelated"][0]["matcher"], json!("keep"));
+    assert!(hooks.get("PermissionRequest").is_none());
+    let remaining = hooks["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .filter_map(|hook| hook["command"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(remaining, vec!["./keep-before.sh", "./keep-after.sh"]);
+
+    let mut flat = json!({
+        "preToolUse": [
+            {"command": "./keep.sh"},
+            {"command": "GENSEE_HOME=/old /old/gensee hook cursor"}
+        ],
+        "unrelated": [{"command": "./also-keep.sh"}]
+    });
+    let hooks = flat.as_object_mut().unwrap();
+    assert!(remove_flat_hook_event(hooks, "preToolUse", PROVIDER_CURSOR, "Cursor").unwrap());
+    assert_eq!(hooks["preToolUse"], json!([{"command": "./keep.sh"}]));
+    assert_eq!(hooks["unrelated"], json!([{"command": "./also-keep.sh"}]));
+}
+
+#[test]
+fn antigravity_disable_preserves_unrelated_policy_hooks() {
+    let root = env::temp_dir().join(format!(
+        "gensee-antigravity-disable-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let hooks_path = root.join("hooks.json");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        &hooks_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "other-setting": true,
+                "gensee-policy": {
+                    "PreToolUse": [{
+                        "matcher": "*",
+                        "hooks": [
+                            {"type": "command", "command": "./keep.sh"},
+                            {
+                                "type": "command",
+                                "command": "GENSEE_HOME=/old /old/gensee hook antigravity"
+                            }
+                        ]
+                    }],
+                    "PostToolUse": [{
+                        "matcher": "*",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook antigravity"
+                        }]
+                    }],
+                    "PreInvocation": [
+                        {"type": "command", "command": "./keep-invocation.sh"},
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook antigravity"
+                        }
+                    ]
+                }
+            }))
+            .unwrap()
+        ),
+    )
+    .unwrap();
+
+    assert!(remove_antigravity_hook_settings(&hooks_path).unwrap());
+    let updated: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    assert_eq!(updated["other-setting"], json!(true));
+    assert_eq!(
+        updated["gensee-policy"]["PreToolUse"][0]["hooks"][0]["command"],
+        json!("./keep.sh")
+    );
+    assert!(updated["gensee-policy"].get("PostToolUse").is_none());
+    assert_eq!(
+        updated["gensee-policy"]["PreInvocation"][0]["command"],
+        json!("./keep-invocation.sh")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn cursor_setup_adds_version_and_hooks_preserving_existing() {
     let mut settings = json!({
         "version": 1,

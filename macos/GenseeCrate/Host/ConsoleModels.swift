@@ -371,7 +371,21 @@ struct IntegrationDescriptor: Identifiable, Equatable {
     let name: String
     let detail: String
     let configPath: String
+    let symbolName: String
+    let installed: Bool
+    let supportsDirectHooks: Bool
+    let installationDetail: String
+    let configurationIssue: String?
     var configured: Bool
+
+    var canToggle: Bool { installed && supportsDirectHooks }
+
+    var statusLabel: String {
+        if !installed { return "Not installed" }
+        if !supportsDirectHooks { return "Managed launch only" }
+        if configurationIssue != nil { return "Needs attention" }
+        return configured ? "Protected" : "Ready to enable"
+    }
 }
 
 struct ActivityItem: Identifiable {

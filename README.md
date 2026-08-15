@@ -300,6 +300,17 @@ If you are running from a source checkout instead of an installed binary:
 ./target/debug/gensee setup cursor --gensee-home "$GENSEE_HOME"
 ```
 
+To disable a configured hook integration without disturbing any unrelated
+harness settings or hooks, pass `--disable`:
+
+```bash
+gensee setup codex --disable
+gensee setup claude-code --disable
+gensee setup antigravity --disable
+gensee setup vscode --disable
+gensee setup cursor --disable
+```
+
 The setup commands merge Gensee into the previous hook settings, update
 `~/.claude/settings.json`, `~/.codex/hooks.json`, or
 `~/.gemini/config/hooks.json` or `~/.cursor/hooks.json`, or write

@@ -22,9 +22,16 @@ The console includes:
 - Overview, activity, alerts, and run inventory backed by `gensee dashboard-state`
   and `gensee run list --json`.
 - Policy controls backed by `gensee policy get/set/path`.
-- Claude Code, Codex, Cursor, VS Code / Copilot, and Antigravity setup backed by
-  `gensee setup`.
+- A Harnesses page that detects Codex, Claude Code, Antigravity, Cursor,
+  GitHub Copilot, and Omnigent. Installed direct-hook integrations can be
+  enabled or disabled through `gensee setup`; unavailable harnesses remain
+  visible but disabled.
 - Endpoint Security installation, removal, and Full Disk Access navigation.
+
+Disabling a direct-hook integration removes only Gensee-owned hook entries and
+preserves unrelated harness settings and hooks. Omnigent remains a managed
+launch integration for now: run it with `gensee run` for process-tree
+monitoring and enforcement until the planned first-class policy bridge lands.
 
 ## Apple Developer configuration
 

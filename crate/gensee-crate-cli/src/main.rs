@@ -867,7 +867,7 @@ pub(crate) fn handle_setup(args: Vec<OsString>) -> io::Result<()> {
         Some("cursor") => setup_cursor(args[1..].to_vec()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee setup <claude-code|codex|antigravity|vscode|cursor> [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
+            "usage: gensee setup <claude-code|codex|antigravity|vscode|cursor> [--disable] [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
         )),
     }
 }
@@ -882,6 +882,7 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
     let mut gateway = ClaudeCodeGatewaySettings::default();
+    let mut disable = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -889,6 +890,10 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
         })?;
         match arg {
+            "--disable" => {
+                disable = true;
+                index += 1;
+            }
             "--yes" => {
                 index += 1;
             }
@@ -941,7 +946,7 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup claude-code [--gensee-home <path>] [--settings <path>] [--bin <path>] [--anthropic-base-url <url>] [--anthropic-auth-token <token>|--anthropic-api-key <key>|--api-key-helper <command>]"
+                    "usage: gensee setup claude-code [--disable] [--gensee-home <path>] [--settings <path>] [--bin <path>] [--anthropic-base-url <url>] [--anthropic-auth-token <token>|--anthropic-api-key <key>|--api-key-helper <command>]"
                 );
                 return Ok(());
             }
@@ -954,6 +959,22 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
         }
     }
     gateway.validate()?;
+
+    if disable {
+        remove_hook_settings(
+            &settings_path,
+            PROVIDER_CLAUDE_CODE,
+            HookLayout::Nested,
+            &["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"],
+            "settings",
+            Some(0o600),
+        )?;
+        println!(
+            "gensee setup: disabled Claude Code hooks in {}",
+            settings_path.display()
+        );
+        return Ok(());
+    }
 
     gensee_home = absolutize_for_hook(&gensee_home)?;
     bin_path = absolutize_for_hook(&bin_path)?;
@@ -990,6 +1011,7 @@ fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
+    let mut disable = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -997,6 +1019,10 @@ fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
         })?;
         match arg {
+            "--disable" => {
+                disable = true;
+                index += 1;
+            }
             "--yes" => {
                 index += 1;
             }
@@ -1029,7 +1055,7 @@ fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup codex [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                    "usage: gensee setup codex [--disable] [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
                 );
                 return Ok(());
             }
@@ -1040,6 +1066,28 @@ fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
                 ));
             }
         }
+    }
+
+    if disable {
+        remove_hook_settings(
+            &hooks_path,
+            PROVIDER_CODEX,
+            HookLayout::Nested,
+            &[
+                "UserPromptSubmit",
+                "PreToolUse",
+                "PermissionRequest",
+                "PostToolUse",
+                "Stop",
+            ],
+            "hooks",
+            None,
+        )?;
+        println!(
+            "gensee setup: disabled Codex hooks in {}",
+            hooks_path.display()
+        );
+        return Ok(());
     }
 
     gensee_home = absolutize_for_hook(&gensee_home)?;
@@ -1063,6 +1111,7 @@ fn setup_antigravity(args: Vec<OsString>) -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
+    let mut disable = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -1070,6 +1119,10 @@ fn setup_antigravity(args: Vec<OsString>) -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
         })?;
         match arg {
+            "--disable" => {
+                disable = true;
+                index += 1;
+            }
             "--yes" => {
                 index += 1;
             }
@@ -1102,7 +1155,7 @@ fn setup_antigravity(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup antigravity [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                    "usage: gensee setup antigravity [--disable] [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
                 );
                 return Ok(());
             }
@@ -1113,6 +1166,15 @@ fn setup_antigravity(args: Vec<OsString>) -> io::Result<()> {
                 ));
             }
         }
+    }
+
+    if disable {
+        remove_antigravity_hook_settings(&hooks_path)?;
+        println!(
+            "gensee setup: disabled Antigravity hooks in {}",
+            hooks_path.display()
+        );
+        return Ok(());
     }
 
     gensee_home = absolutize_for_hook(&gensee_home)?;
@@ -1158,6 +1220,7 @@ fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
+    let mut disable = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -1165,6 +1228,10 @@ fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
         })?;
         match arg {
+            "--disable" => {
+                disable = true;
+                index += 1;
+            }
             "--yes" => {
                 index += 1;
             }
@@ -1197,7 +1264,7 @@ fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup vscode [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                    "usage: gensee setup vscode [--disable] [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
                 );
                 return Ok(());
             }
@@ -1208,6 +1275,22 @@ fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
                 ));
             }
         }
+    }
+
+    if disable {
+        remove_hook_settings(
+            &hooks_path,
+            PROVIDER_VSCODE,
+            HookLayout::Flat,
+            &["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"],
+            "hooks",
+            None,
+        )?;
+        println!(
+            "gensee setup: disabled VS Code hooks in {}",
+            hooks_path.display()
+        );
+        return Ok(());
     }
 
     gensee_home = absolutize_for_hook(&gensee_home)?;
@@ -1283,6 +1366,7 @@ fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
+    let mut disable = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -1290,6 +1374,10 @@ fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
         })?;
         match arg {
+            "--disable" => {
+                disable = true;
+                index += 1;
+            }
             "--yes" => {
                 index += 1;
             }
@@ -1322,7 +1410,7 @@ fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup cursor [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                    "usage: gensee setup cursor [--disable] [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
                 );
                 return Ok(());
             }
@@ -1333,6 +1421,28 @@ fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
                 ));
             }
         }
+    }
+
+    if disable {
+        remove_hook_settings(
+            &hooks_path,
+            PROVIDER_CURSOR,
+            HookLayout::Flat,
+            &[
+                "preToolUse",
+                "postToolUse",
+                "beforeShellExecution",
+                "beforeSubmitPrompt",
+                "stop",
+            ],
+            "hooks",
+            None,
+        )?;
+        println!(
+            "gensee setup: disabled Cursor hooks in {}",
+            hooks_path.display()
+        );
+        return Ok(());
     }
 
     gensee_home = absolutize_for_hook(&gensee_home)?;
@@ -1614,6 +1724,175 @@ fn merge_nested_hook_event(
         .min(entries.len());
     entries.insert(insert_at, hook_entry);
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum HookLayout {
+    Flat,
+    Nested,
+}
+
+fn remove_flat_hook_event(
+    hooks: &mut serde_json::Map<String, Value>,
+    event_name: &str,
+    provider: &str,
+    integration: &str,
+) -> io::Result<bool> {
+    let Some(value) = hooks.get_mut(event_name) else {
+        return Ok(false);
+    };
+    let entries = value.as_array_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{integration} {event_name} hooks must be a JSON array"),
+        )
+    })?;
+    let context = format!("{integration} {event_name}");
+    let owned = entries
+        .iter()
+        .map(|entry| command_hook_owned_by(entry, provider, &context))
+        .collect::<io::Result<Vec<_>>>()?;
+    let removed = owned.iter().any(|is_owned| *is_owned);
+    let mut index = 0;
+    entries.retain(|_| {
+        let keep = !owned[index];
+        index += 1;
+        keep
+    });
+    if entries.is_empty() {
+        hooks.remove(event_name);
+    }
+    Ok(removed)
+}
+
+fn remove_nested_hook_event(
+    hooks: &mut serde_json::Map<String, Value>,
+    event_name: &str,
+    provider: &str,
+    integration: &str,
+) -> io::Result<bool> {
+    let Some(value) = hooks.get_mut(event_name) else {
+        return Ok(false);
+    };
+    let entries = value.as_array_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{integration} {event_name} hooks must be a JSON array"),
+        )
+    })?;
+    let context = format!("{integration} {event_name}");
+    let owned = validate_nested_hook_groups(entries, provider, &context)?;
+    let removed = owned
+        .iter()
+        .any(|group| group.iter().any(|is_owned| *is_owned));
+
+    for (entry, group_owned) in entries.iter_mut().zip(owned.iter()) {
+        let commands = entry
+            .get_mut("hooks")
+            .and_then(Value::as_array_mut)
+            .expect("nested hook groups were validated");
+        let mut index = 0;
+        commands.retain(|_| {
+            let keep = !group_owned[index];
+            index += 1;
+            keep
+        });
+    }
+    entries.retain(|entry| {
+        entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|commands| !commands.is_empty())
+    });
+    if entries.is_empty() {
+        hooks.remove(event_name);
+    }
+    Ok(removed)
+}
+
+fn remove_hook_settings(
+    path: &Path,
+    provider: &str,
+    layout: HookLayout,
+    event_names: &[&str],
+    backup_subject: &str,
+    new_file_mode: Option<u32>,
+) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let (existing_contents, mut root) = read_json_config(path)?;
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} must be a JSON object", path.display()),
+        )
+    })?;
+    let Some(hooks_value) = root_object.get_mut("hooks") else {
+        return Ok(false);
+    };
+    let hooks = hooks_value.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hooks field must be a JSON object",
+        )
+    })?;
+    let mut changed = false;
+    for event_name in event_names {
+        changed |= match layout {
+            HookLayout::Flat => remove_flat_hook_event(hooks, event_name, provider, "Agent")?,
+            HookLayout::Nested => remove_nested_hook_event(hooks, event_name, provider, "Agent")?,
+        };
+    }
+    if hooks.is_empty() {
+        root_object.remove("hooks");
+    }
+    if !changed {
+        return Ok(false);
+    }
+    write_json_config_if_changed_with_mode(
+        path,
+        existing_contents.as_deref(),
+        &root,
+        backup_subject,
+        new_file_mode,
+    )
+}
+
+fn remove_antigravity_hook_settings(path: &Path) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let (existing_contents, mut root) = read_json_config(path)?;
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Antigravity hooks must be a JSON object",
+        )
+    })?;
+    let Some(policy_value) = root_object.get_mut("gensee-policy") else {
+        return Ok(false);
+    };
+    let policy = policy_value.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Antigravity gensee-policy field must be a JSON object",
+        )
+    })?;
+    let mut changed = false;
+    for event_name in ["PreToolUse", "PostToolUse"] {
+        changed |=
+            remove_nested_hook_event(policy, event_name, PROVIDER_ANTIGRAVITY, "Antigravity")?;
+    }
+    changed |=
+        remove_flat_hook_event(policy, "PreInvocation", PROVIDER_ANTIGRAVITY, "Antigravity")?;
+    if policy.is_empty() {
+        root_object.remove("gensee-policy");
+    }
+    if !changed {
+        return Ok(false);
+    }
+    write_json_config_if_changed(path, existing_contents.as_deref(), &root, "hooks")
 }
 
 pub(crate) fn apply_cursor_hook_settings(root: &mut Value, command: &str) -> io::Result<()> {

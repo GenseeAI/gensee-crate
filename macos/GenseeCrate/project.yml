@@ -28,6 +28,7 @@ targets:
       - Host/DashboardOverviewPages.swift
       - Host/DashboardActivityPages.swift
       - Host/DashboardSecurityPages.swift
+      - Host/DashboardHarnessesPage.swift
       - Host/DashboardConfigPages.swift
       - Host/EndpointSecurityExtensionManager.swift
       - Host/EndpointSecuritySensor.swift

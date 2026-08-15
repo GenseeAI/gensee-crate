@@ -24,6 +24,7 @@
 		AF95DF2961EB5EB25758D917 /* DashboardComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3722B66B15A9D0C6A0542AB1 /* DashboardComponents.swift */; };
 		B3A01A811214C31B36C00F18 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C1B023EFF7B2DE9556556E9E /* Assets.xcassets */; };
 		B4EC3AFD2169905AA662360D /* ConsoleModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92AD1DC256F292439A6C70BA /* ConsoleModel.swift */; };
+		CEBB5434E3FFBD87829EB8C0 /* DashboardHarnessesPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */; };
 		D50CF93055DEC2DF49AD2240 /* libEndpointSecurity.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C7E850A448A571324F7CA4F /* libEndpointSecurity.tbd */; };
 		FC2ACB45E9ADD76BD8EBAFA1 /* GenseeCLI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B06211CB7A3B1543D9B7B5D /* GenseeCLI.swift */; };
 		FC7C99ABF3344039085F8FE9 /* SystemExtensions.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 646FCF1F1969644B69EFB35E /* SystemExtensions.framework */; };
@@ -56,6 +57,7 @@
 
 /* Begin PBXFileReference section */
 		23D1D4F2FC41CDD9893C88C2 /* DashboardSecurityPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardSecurityPages.swift; sourceTree = "<group>"; };
+		35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardHarnessesPage.swift; sourceTree = "<group>"; };
 		3722B66B15A9D0C6A0542AB1 /* DashboardComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardComponents.swift; sourceTree = "<group>"; };
 		393E28A9F1D61AA09BA25DC8 /* libbsm.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libbsm.tbd; path = usr/lib/libbsm.tbd; sourceTree = SDKROOT; };
 		5F1702DD7F563FB2B6DE975E /* GenseeEndpointSecurityBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = GenseeEndpointSecurityBridge.m; sourceTree = "<group>"; };
@@ -112,6 +114,7 @@
 				606554A9090B30CB60EEC12A /* DashboardActivityPages.swift */,
 				3722B66B15A9D0C6A0542AB1 /* DashboardComponents.swift */,
 				FF1B808391332D1FC13CD1D0 /* DashboardConfigPages.swift */,
+				35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */,
 				8E5F6044F8B4D45BBBC38D88 /* DashboardOverviewPages.swift */,
 				23D1D4F2FC41CDD9893C88C2 /* DashboardSecurityPages.swift */,
 				6F9083239FB55EA68146A81F /* DashboardShell.swift */,
@@ -297,6 +300,7 @@
 				3D884526B883F80941BD09BD /* DashboardActivityPages.swift in Sources */,
 				AF95DF2961EB5EB25758D917 /* DashboardComponents.swift in Sources */,
 				83F8664AFB2123015E35C5CA /* DashboardConfigPages.swift in Sources */,
+				CEBB5434E3FFBD87829EB8C0 /* DashboardHarnessesPage.swift in Sources */,
 				6F1EFE76386D67BDF9581E7B /* DashboardOverviewPages.swift in Sources */,
 				04161812076C359D9D1DA56D /* DashboardSecurityPages.swift in Sources */,
 				70FCB6B396339C7CE0DF1B79 /* DashboardShell.swift in Sources */,
