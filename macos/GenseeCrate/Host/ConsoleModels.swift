@@ -12,10 +12,11 @@ struct SecuritySnapshot: Decodable {
     var transactionEvents: [TransactionEvent] = []
     var workspaceEffects: [WorkspaceEffect] = []
     var jsonSessions: [AgentSessionRecord] = []
+    var dailyActivity: [DailyActivity] = []
 
     enum CodingKeys: String, CodingKey {
         case summary, alerts, agentEvents, systemEvents, sessions, artifacts
-        case relations, humanFeedback, transactionEvents, workspaceEffects, jsonSessions
+        case relations, humanFeedback, transactionEvents, workspaceEffects, jsonSessions, dailyActivity
     }
 
     init() {}
@@ -33,6 +34,22 @@ struct SecuritySnapshot: Decodable {
         transactionEvents = try values.decodeIfPresent([TransactionEvent].self, forKey: .transactionEvents) ?? []
         workspaceEffects = try values.decodeIfPresent([WorkspaceEffect].self, forKey: .workspaceEffects) ?? []
         jsonSessions = try values.decodeIfPresent([AgentSessionRecord].self, forKey: .jsonSessions) ?? []
+        dailyActivity = try values.decodeIfPresent([DailyActivity].self, forKey: .dailyActivity) ?? []
+    }
+}
+
+struct DailyActivity: Decodable, Identifiable {
+    let date: String
+    let requests: Int
+    let toolCalls: Int
+    let alerts: Int
+    let tokens: Int
+
+    var id: String { date }
+
+    enum CodingKeys: String, CodingKey {
+        case date, requests, alerts, tokens
+        case toolCalls = "tool_calls"
     }
 }
 

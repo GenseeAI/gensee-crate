@@ -3,7 +3,7 @@ import SwiftUI
 enum DashboardDestination: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
     case liveFeed = "Live Feed"
-    case today = "Today's Highlight"
+    case today = "Daily Highlight"
     case timeline = "Timeline"
     case transactions = "Transactions"
     case alerts = "Alerts"

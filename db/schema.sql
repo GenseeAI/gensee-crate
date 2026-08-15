@@ -14,9 +14,19 @@ CREATE TABLE IF NOT EXISTS requests (
     events TEXT,
     file_accessed_rate FLOAT DEFAULT 0.0,
     network_rate FLOAT DEFAULT 0.0,
+    created_at INTEGER,
+    completed_at INTEGER,
+    total_tokens INTEGER,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id),
     CHECK (events IS NULL OR json_valid(events))
 );
+
+CREATE TRIGGER IF NOT EXISTS requests_set_created_at
+AFTER INSERT ON requests
+WHEN NEW.created_at IS NULL
+BEGIN
+    UPDATE requests SET created_at = unixepoch() * 1000 WHERE request_id = NEW.request_id;
+END;
 
 CREATE TABLE IF NOT EXISTS agent_events (
   event_id        INTEGER PRIMARY KEY AUTOINCREMENT,

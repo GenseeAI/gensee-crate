@@ -546,6 +546,7 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
     migrate_legacy_relations(&conn).map_err(SqliteError::Schema)?;
     migrate_alert_hash_chain(&conn).map_err(SqliteError::Schema)?;
     migrate_agent_event_tool_use_id(&conn).map_err(SqliteError::Schema)?;
+    migrate_request_activity_fields(&conn).map_err(SqliteError::Schema)?;
 
     conn.execute_batch(include_str!("../schema.sql"))
         .map_err(SqliteError::Schema)?;
@@ -702,6 +703,57 @@ impl SqliteStore {
             .execute(
                 "UPDATE requests SET final_response = ?2 WHERE request_id = ?1",
                 params![request_id, final_response],
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn set_request_created_at(
+        &self,
+        request_id: i64,
+        created_at: i64,
+    ) -> Result<(), SqliteError> {
+        self.conn
+            .execute(
+                "UPDATE requests SET created_at = ?2 WHERE request_id = ?1",
+                params![request_id, created_at],
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn complete_request_with_token_total(
+        &self,
+        request_id: i64,
+        completed_at: i64,
+        cumulative_session_tokens: Option<i64>,
+    ) -> Result<(), SqliteError> {
+        let total_tokens = cumulative_session_tokens
+            .map(|cumulative| {
+                let earlier: i64 = self.conn.query_row(
+                    "SELECT COALESCE(SUM(total_tokens), 0)
+                     FROM requests
+                     WHERE session_id = (SELECT session_id FROM requests WHERE request_id = ?1)
+                       AND request_id < ?1",
+                    [request_id],
+                    |row| row.get(0),
+                )?;
+                Ok::<i64, rusqlite::Error>(if cumulative >= earlier {
+                    cumulative - earlier
+                } else {
+                    cumulative
+                })
+            })
+            .transpose()
+            .map_err(SqliteError::Database)?;
+
+        self.conn
+            .execute(
+                "UPDATE requests
+                 SET completed_at = ?2,
+                     total_tokens = COALESCE(?3, total_tokens)
+                 WHERE request_id = ?1",
+                params![request_id, completed_at, total_tokens],
             )
             .map(|_| ())
             .map_err(SqliteError::Database)
@@ -1503,11 +1555,11 @@ impl SqliteStore {
             .conn
             .prepare(
                 "SELECT alert_id, alerts.request_id, entity_kind, entity_id, severity,
-                    action, rule_id, message, path, evidence, created_at,
+                    action, rule_id, message, path, evidence, alerts.created_at,
                     requests.session_id
                  FROM alerts
                  LEFT JOIN requests ON requests.request_id = alerts.request_id
-                 ORDER BY created_at, alert_id",
+                 ORDER BY alerts.created_at, alert_id",
             )
             .map_err(SqliteError::Database)?;
         let rows = stmt
@@ -1522,12 +1574,12 @@ impl SqliteStore {
             .conn
             .prepare(
                 "SELECT alert_id, alerts.request_id, entity_kind, entity_id, severity,
-                    action, rule_id, message, path, evidence, created_at,
+                    action, rule_id, message, path, evidence, alerts.created_at,
                     requests.session_id
                  FROM alerts
                  LEFT JOIN requests ON requests.request_id = alerts.request_id
                  WHERE alerts.request_id = ?1
-                 ORDER BY created_at, alert_id",
+                 ORDER BY alerts.created_at, alert_id",
             )
             .map_err(SqliteError::Database)?;
         let rows = stmt
@@ -1839,6 +1891,35 @@ fn migrate_agent_event_tool_use_id(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute("ALTER TABLE agent_events ADD COLUMN tool_use_id TEXT", [])?;
     }
     Ok(())
+}
+
+/// Add activity timestamps and token totals to databases created before the
+/// Daily Highlight view. Existing requests are dated from their first agent
+/// event (or session start when no agent event exists).
+fn migrate_request_activity_fields(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = table_columns(conn, "requests")?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    if !columns.iter().any(|column| column == "created_at") {
+        conn.execute("ALTER TABLE requests ADD COLUMN created_at INTEGER", [])?;
+    }
+    if !columns.iter().any(|column| column == "completed_at") {
+        conn.execute("ALTER TABLE requests ADD COLUMN completed_at INTEGER", [])?;
+    }
+    if !columns.iter().any(|column| column == "total_tokens") {
+        conn.execute("ALTER TABLE requests ADD COLUMN total_tokens INTEGER", [])?;
+    }
+    conn.execute_batch(
+        "UPDATE requests
+         SET created_at = COALESCE(
+             created_at,
+             (SELECT MIN(ts) FROM agent_events WHERE agent_events.request_id = requests.request_id),
+             (SELECT first_event_at FROM sessions WHERE sessions.session_id = requests.session_id)
+         )
+         WHERE created_at IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);",
+    )
 }
 
 fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {

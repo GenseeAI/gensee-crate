@@ -385,7 +385,9 @@ direct-hook harnesses can be enabled or disabled; unavailable harnesses stay
 visible but muted. Enabled hooks are also checked for full event coverage and
 the app's active event-store/backend paths; stale or incomplete integrations
 show **Needs repair** with a one-click safe repair. See the
-[native macOS security console](docs/macos-app.md) guide.
+[native macOS security console](docs/macos-app.md) guide. Its **Daily
+Highlight** page combines today's summary with rolling-year heatmaps for agent
+turns, tool calls, alerts, and supported transcript token totals.
 
 **Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
 `sandbox-exec` and can stage workspace writes for review.

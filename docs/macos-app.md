@@ -14,6 +14,9 @@ console.
 
 - Dashboard, activity, alerts, transactions, and policy backed by the existing
   Rust CLI and local store.
+- A **Daily Highlight** view with today's summary and rolling 53-week heatmaps
+  for agent turns, tool calls, alerts, and captured token usage. Selecting a
+  day in any heatmap updates the summary above it.
 - Installation, status, and removal of the signed Endpoint Security system
   extension.
 - Navigation to Full Disk Access, which macOS requires for complete protected
@@ -56,6 +59,19 @@ settings file.
 Omnigent currently has no direct hook switch. Launch it with `gensee run` to
 place its process tree under Gensee monitoring and supported policy
 enforcement.
+
+## Daily activity and token totals
+
+The **Daily Highlight** page aggregates directly from the local SQLite event
+store. An agent turn is a stored request, a tool call is counted once at
+`PreToolUse`, and alert totals use the same filtering as the rest of the native
+dashboard.
+
+For supported Claude Code and Codex JSONL transcripts, Gensee reads numeric
+usage metadata when a turn completes and stores only that turn's total token
+count. It does not copy transcript content into the activity aggregate. Token
+history begins after this version is installed; prior turns remain at zero,
+and harnesses that do not expose compatible usage metadata also report zero.
 
 ## Endpoint Security modes
 

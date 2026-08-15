@@ -43,6 +43,7 @@ const ARTIFACT_FACT_RECENT_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_STORED_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_TRANSACTION_TEXT_CHARS: usize = 2 * 1024;
 const MAX_TRANSACTION_METADATA_BYTES: usize = 16 * 1024;
+const MAX_TOKEN_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
@@ -331,7 +332,7 @@ impl EventStore {
         let alerts = query_json_rows(
             conn,
             "SELECT alert_id, alerts.request_id, entity_kind, entity_id, severity,
-                action, rule_id, message, path, evidence, created_at,
+                action, rule_id, message, path, evidence, alerts.created_at,
                 requests.session_id
              FROM alerts
              LEFT JOIN requests ON requests.request_id = alerts.request_id
@@ -340,7 +341,7 @@ impl EventStore {
                  AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
                 OR rule_id = 'endpoint_security_event_gap'
              )
-             ORDER BY created_at DESC, alert_id DESC
+             ORDER BY alerts.created_at DESC, alert_id DESC
              LIMIT 200",
             |row| {
                 Ok(json!({
@@ -564,6 +565,72 @@ impl EventStore {
         .into_iter()
         .next()
         .unwrap_or_else(|| json!({}));
+        let daily_activity = query_json_rows(
+            conn,
+            "WITH
+             daily_requests AS (
+                SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
+                       COUNT(*) AS count,
+                       COALESCE(SUM(total_tokens), 0) AS tokens
+                FROM requests
+                WHERE created_at IS NOT NULL
+                  AND session_id != 'system'
+                  AND (
+                    original_user_prompt IS NOT NULL
+                    OR completed_at IS NOT NULL
+                    OR EXISTS (
+                        SELECT 1 FROM agent_events
+                        WHERE agent_events.request_id = requests.request_id
+                    )
+                  )
+                  AND date(created_at / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-371 days')
+                GROUP BY day
+             ),
+             daily_tools AS (
+                SELECT date(ts / 1000, 'unixepoch', 'localtime') AS day,
+                       COUNT(*) AS count
+                FROM agent_events
+                WHERE type = 'PreToolUse'
+                  AND date(ts / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-371 days')
+                GROUP BY day
+             ),
+             daily_alerts AS (
+                SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
+                       COUNT(*) AS count
+                FROM alerts
+                WHERE date(created_at / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-371 days')
+                  AND NOT (
+                    (rule_id = 'unmatched_system_effect'
+                     AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
+                    OR rule_id = 'endpoint_security_event_gap'
+                  )
+                GROUP BY day
+             ),
+             days AS (
+                SELECT day FROM daily_requests
+                UNION SELECT day FROM daily_tools
+                UNION SELECT day FROM daily_alerts
+             )
+             SELECT days.day,
+                    COALESCE(daily_requests.count, 0),
+                    COALESCE(daily_tools.count, 0),
+                    COALESCE(daily_alerts.count, 0),
+                    COALESCE(daily_requests.tokens, 0)
+             FROM days
+             LEFT JOIN daily_requests ON daily_requests.day = days.day
+             LEFT JOIN daily_tools ON daily_tools.day = days.day
+             LEFT JOIN daily_alerts ON daily_alerts.day = days.day
+             ORDER BY days.day",
+            |row| {
+                Ok(json!({
+                    "date": row.get::<_, String>(0)?,
+                    "requests": row.get::<_, i64>(1)?,
+                    "tool_calls": row.get::<_, i64>(2)?,
+                    "alerts": row.get::<_, i64>(3)?,
+                    "tokens": row.get::<_, i64>(4)?,
+                }))
+            },
+        )?;
         Ok(json!({
             "source": "gensee",
             "summary": dashboard_summary,
@@ -575,6 +642,7 @@ impl EventStore {
             "relations": relations,
             "humanFeedback": human_feedback,
             "transactionEvents": transaction_events,
+            "dailyActivity": daily_activity,
             "hookEvents": self.list_hook_events()?,
             "workspaceEffects": self.list_workspace_effects()?,
             "jsonSessions": self.list_sessions()?,
@@ -872,44 +940,66 @@ impl EventStore {
     }
 
     fn append_hook_event_database(&self, event: &AgentHookEvent) -> io::Result<()> {
+        let transcript_tokens = if event.hook_event_name.as_deref() == Some("Stop") {
+            event
+                .transcript_path
+                .as_deref()
+                .and_then(|path| transcript_total_tokens(Path::new(path)).ok().flatten())
+        } else {
+            None
+        };
         self.with_sqlite_transaction(|db| {
             let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, &event.provider, event.observed_at_ms)?;
 
             match event.hook_event_name.as_deref() {
                 Some("UserPromptSubmit") => {
-                    db.insert_request(&NewRequest {
-                        session_id: session_id.to_string(),
-                        original_user_prompt: text_from_raw_json(
-                            &event.raw_json,
-                            &["prompt", "user_prompt", "message"],
-                        ),
-                        final_response: None,
-                        events: Some(event.raw_json.clone()),
-                        file_accessed_rate: 0.0,
-                        network_rate: 0.0,
-                    })
-                    .map_err(sqlite_error)?;
-                }
-                Some("Stop") => {
-                    let response = text_from_raw_json(&event.raw_json, &["last_assistant_message"]);
-                    if let Some(request) = db
-                        .latest_request_for_session(session_id)
-                        .map_err(sqlite_error)?
-                    {
-                        db.set_request_response(request.request_id, response.as_deref())
-                            .map_err(sqlite_error)?;
-                    } else {
-                        db.insert_request(&NewRequest {
+                    let request_id = db
+                        .insert_request(&NewRequest {
                             session_id: session_id.to_string(),
-                            original_user_prompt: None,
-                            final_response: response,
+                            original_user_prompt: text_from_raw_json(
+                                &event.raw_json,
+                                &["prompt", "user_prompt", "message"],
+                            ),
+                            final_response: None,
                             events: Some(event.raw_json.clone()),
                             file_accessed_rate: 0.0,
                             network_rate: 0.0,
                         })
                         .map_err(sqlite_error)?;
-                    }
+                    db.set_request_created_at(request_id, to_i64(event.observed_at_ms)?)
+                        .map_err(sqlite_error)?;
+                }
+                Some("Stop") => {
+                    let response = text_from_raw_json(&event.raw_json, &["last_assistant_message"]);
+                    let request_id = if let Some(request) = db
+                        .latest_request_for_session(session_id)
+                        .map_err(sqlite_error)?
+                    {
+                        db.set_request_response(request.request_id, response.as_deref())
+                            .map_err(sqlite_error)?;
+                        request.request_id
+                    } else {
+                        let request_id = db
+                            .insert_request(&NewRequest {
+                                session_id: session_id.to_string(),
+                                original_user_prompt: None,
+                                final_response: response,
+                                events: Some(event.raw_json.clone()),
+                                file_accessed_rate: 0.0,
+                                network_rate: 0.0,
+                            })
+                            .map_err(sqlite_error)?;
+                        db.set_request_created_at(request_id, to_i64(event.observed_at_ms)?)
+                            .map_err(sqlite_error)?;
+                        request_id
+                    };
+                    db.complete_request_with_token_total(
+                        request_id,
+                        to_i64(event.observed_at_ms)?,
+                        transcript_tokens,
+                    )
+                    .map_err(sqlite_error)?;
                 }
                 _ if is_agent_event(event) => {
                     let request_id = latest_or_create_request(db, session_id)?;
@@ -1240,6 +1330,60 @@ fn ensure_session(
         flagged: false,
     })
     .map_err(sqlite_error)
+}
+
+/// Read only numeric usage metadata from a supported JSONL transcript. Claude
+/// emits usage per assistant message (sometimes repeating a message while it is
+/// streaming), while Codex emits a cumulative `total_token_usage` snapshot.
+/// Prompt and response content is never persisted by this path.
+fn transcript_total_tokens(path: &Path) -> io::Result<Option<i64>> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_TOKEN_TRANSCRIPT_BYTES {
+        return Ok(None);
+    }
+
+    let reader = BufReader::new(fs::File::open(path)?);
+    let mut claude_messages: HashMap<String, i64> = HashMap::new();
+    let mut codex_total = 0_i64;
+
+    for line in reader.lines() {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+
+        if let Some(total) = value
+            .pointer("/payload/info/total_token_usage/total_tokens")
+            .and_then(Value::as_i64)
+        {
+            codex_total = codex_total.max(total);
+        }
+
+        let Some(message_id) = value.pointer("/message/id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(usage) = value.pointer("/message/usage") else {
+            continue;
+        };
+        let total = [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .into_iter()
+        .filter_map(|key| usage.get(key).and_then(Value::as_i64))
+        .sum::<i64>();
+        if total > 0 {
+            claude_messages
+                .entry(message_id.to_string())
+                .and_modify(|stored| *stored = (*stored).max(total))
+                .or_insert(total);
+        }
+    }
+
+    let total = codex_total.max(claude_messages.values().sum());
+    Ok((total > 0).then_some(total))
 }
 
 fn latest_or_create_request(db: &SqliteStore, session_id: &str) -> io::Result<i64> {
@@ -2673,6 +2817,107 @@ fn hex_value(byte: u8) -> io::Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_token_usage_supports_claude_and_codex_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-token-transcript-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let claude_path = dir.join("claude.jsonl");
+        fs::write(
+            &claude_path,
+            concat!(
+                "{\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":4}}}\n",
+                "{\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":4}}}\n",
+                "{\"message\":{\"id\":\"m2\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(transcript_total_tokens(&claude_path).unwrap(), Some(25));
+
+        let codex_path = dir.join("codex.jsonl");
+        fs::write(
+            &codex_path,
+            concat!(
+                "{\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":21}}}}\n",
+                "{\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":42}}}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(transcript_total_tokens(&codex_path).unwrap(), Some(42));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_reports_daily_turn_tool_alert_and_token_totals() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-daily-activity-test-{}-{now}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"test"}"#,
+                now,
+            ))
+            .unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "PreToolUse",
+                r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Read"}"#,
+                now + 1,
+            ))
+            .unwrap();
+
+        let transcript = dir.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            "{\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":20,\"output_tokens\":5}}}\n",
+        )
+        .unwrap();
+        let mut stop = hook_event(
+            "Stop",
+            r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
+            now + 2,
+        );
+        stop.transcript_path = Some(transcript.display().to_string());
+        store.append_hook_event(&stop).unwrap();
+        store
+            .append_policy_alert(&PolicyAlert {
+                session_id: Some("s1".to_string()),
+                tool_use_id: None,
+                severity: "medium".to_string(),
+                action: "warn".to_string(),
+                rule_id: "test_alert".to_string(),
+                message: "test".to_string(),
+                path: None,
+                evidence: None,
+                observed_at_ms: now + 3,
+            })
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        let today = dashboard["dailyActivity"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(today["requests"], 1);
+        assert_eq!(today["tool_calls"], 1);
+        assert_eq!(today["alerts"], 1);
+        assert_eq!(today["tokens"], 25);
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn transaction_text_is_bounded_and_strips_control_characters() {

@@ -24,6 +24,9 @@ The console includes:
 
 - Overview, activity, alerts, and run inventory backed by `gensee dashboard-state`
   and `gensee run list --json`.
+- A Daily Highlight page with today's summary and four rolling-year activity
+  heatmaps for agent turns, tool calls, alerts, and token usage. Heatmap days
+  are selectable and update the detailed summary.
 - Policy controls backed by `gensee policy get/set/path`.
 - A Harnesses page that detects Codex, Claude Code, Antigravity, Cursor,
   GitHub Copilot, and Omnigent. Installed direct-hook integrations can be
@@ -32,6 +35,10 @@ The console includes:
   coverage, the active event-store path, the current backend executable, and
   harness-specific blockers, with a one-click Repair action when needed.
 - Endpoint Security installation, removal, and Full Disk Access navigation.
+
+Token totals are captured from compatible Claude Code and Codex transcript
+usage metadata when a turn completes. Only the numeric per-turn total is stored;
+historical turns and harnesses without compatible usage metadata remain zero.
 
 ## Use the security console
 
