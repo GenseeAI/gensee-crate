@@ -375,18 +375,49 @@ final class ConsoleModel: ObservableObject {
     }
 
     private static func githubCopilotInstalled(home: URL) -> Bool {
-        let vscodeInstalled = applicationInstalled(
-            names: ["Visual Studio Code", "Visual Studio Code - Insiders"],
-            bundleIdentifiers: ["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders"]
-        ) || executableInstalled(names: ["code", "code-insiders"])
+        let manager = FileManager.default
+        let applicationNames = ["Visual Studio Code", "Visual Studio Code - Insiders"]
+        let bundleIdentifiers = ["com.microsoft.VSCode", "com.microsoft.VSCodeInsiders"]
+        let applicationDirectories = [URL(fileURLWithPath: "/Applications"), home.appendingPathComponent("Applications")]
+        var applicationURLs = bundleIdentifiers.compactMap {
+            NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
+        }
+        applicationURLs += applicationDirectories.flatMap { directory in
+            applicationNames.map { directory.appendingPathComponent("\($0).app") }
+        }
+        applicationURLs = applicationURLs.reduce(into: []) { result, candidate in
+            guard manager.fileExists(atPath: candidate.path), !result.contains(candidate) else { return }
+            result.append(candidate)
+        }
+
+        let vscodeInstalled = !applicationURLs.isEmpty || executableInstalled(names: ["code", "code-insiders"])
         guard vscodeInstalled else { return false }
+
         let extensionRoots = [
             home.appendingPathComponent(".vscode/extensions"),
             home.appendingPathComponent(".vscode-insiders/extensions"),
-        ]
-        return extensionRoots.contains { root in
-            let entries = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
-            return entries.contains { $0.lowercased().hasPrefix("github.copilot-") }
+        ] + applicationURLs.map {
+            $0.appendingPathComponent("Contents/Resources/app/extensions")
+        }
+        return extensionRoots.contains(where: copilotExtensionInstalled)
+    }
+
+    private static func copilotExtensionInstalled(in root: URL) -> Bool {
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return entries.contains { extensionURL in
+            let manifestURL = extensionURL.appendingPathComponent("package.json")
+            guard let data = try? Data(contentsOf: manifestURL),
+                  let manifest = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let publisher = manifest["publisher"] as? String,
+                  let name = manifest["name"] as? String
+            else { return false }
+            let normalizedName = name.lowercased()
+            return publisher.caseInsensitiveCompare("github") == .orderedSame
+                && (normalizedName == "copilot" || normalizedName == "copilot-chat")
         }
     }
 
