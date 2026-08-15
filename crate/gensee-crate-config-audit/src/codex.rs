@@ -156,7 +156,13 @@ pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
 
     let mut inventory = AuditInventory::default();
     evaluate_effective_config(&effective, &user_path, &mut inventory, &mut findings);
-    inventory.skills = discover_skills(&workspace, &codex_home, &effective, &mut findings);
+    inventory.skills = discover_skills(
+        &workspace,
+        &codex_home,
+        &effective,
+        &mut sources,
+        &mut findings,
+    );
     evaluate_skill_review_surface(&inventory.skills, &mut findings);
     discover_rules(
         &workspace,
@@ -521,7 +527,7 @@ fn evaluate_shell_environment(
         config,
         &["shell_environment_policy", "ignore_default_excludes"],
     )
-    .unwrap_or(false);
+    .unwrap_or(true);
     let inherit_all = get_str(config, &["shell_environment_policy", "inherit"]) == Some("all");
     if ignore_excludes {
         findings.push(make_finding(
@@ -1014,6 +1020,7 @@ fn discover_skills(
     workspace: &Path,
     codex_home: &Path,
     config: &TomlValue,
+    sources: &mut Vec<AuditSource>,
     findings: &mut Vec<AuditFinding>,
 ) -> Vec<SkillInventory> {
     let disabled = disabled_skill_paths(config);
@@ -1045,8 +1052,21 @@ fn discover_skills(
             if !skill_file.exists() || !seen.insert(display_path(&skill_file)) {
                 continue;
             }
-            let text = read_limited_text(&skill_file).unwrap_or_default();
-            let name = skill_frontmatter_value(&text, "name")
+            let mut source = source_for(&skill_file, "codex_skill", true, true);
+            let text = match read_limited_text(&skill_file) {
+                Ok(text) => {
+                    source.sha256 = Some(hash_bytes(text.as_bytes()));
+                    Some(text)
+                }
+                Err(error) => {
+                    source.errors.push(error.to_string());
+                    None
+                }
+            };
+            let sha256 = source.sha256.clone();
+            sources.push(source);
+            let text = text.as_deref().unwrap_or_default();
+            let name = skill_frontmatter_value(text, "name")
                 .or_else(|| {
                     skill_dir
                         .file_name()
@@ -1054,16 +1074,23 @@ fn discover_skills(
                         .map(str::to_string)
                 })
                 .unwrap_or_else(|| "unknown".to_string());
-            let canonical = canonical_or_original(&skill_file);
-            let enabled = !disabled.contains(&display_path(&canonical))
-                && !disabled.contains(&display_path(&skill_file));
+            let canonical_dir = canonical_or_original(&skill_dir);
+            let canonical_file = canonical_or_original(&skill_file);
+            let enabled = ![
+                display_path(&canonical_dir),
+                display_path(&skill_dir),
+                display_path(&canonical_file),
+                display_path(&skill_file),
+            ]
+            .iter()
+            .any(|path| disabled.contains(path));
             let has_scripts = skill_dir.join("scripts").is_dir();
             names
                 .entry(name.clone())
                 .or_default()
                 .push(display_path(&skill_file));
             if enabled {
-                inspect_skill_content(&name, &skill_file, &skill_dir, &text, has_scripts, findings);
+                inspect_skill_content(&name, &skill_file, &skill_dir, text, has_scripts, findings);
             }
             skills.push(SkillInventory {
                 name,
@@ -1072,7 +1099,7 @@ fn discover_skills(
                 enabled,
                 has_scripts,
                 review_state: "unknown".to_string(),
-                sha256: Some(hash_bytes(text.as_bytes())),
+                sha256,
             });
         }
     }
@@ -1238,11 +1265,14 @@ fn discover_rules(
         for path in find_files_with_extension(&root, "rules", MAX_DISCOVERY_DEPTH) {
             inventory.rule_files += 1;
             let mut source = source_for(&path, kind, applied, applied);
-            if let Ok(text) = read_limited_text(&path) {
-                source.sha256 = Some(hash_bytes(text.as_bytes()));
-                if applied {
-                    inspect_rule_file(&path, &text, findings);
+            match read_limited_text(&path) {
+                Ok(text) => {
+                    source.sha256 = Some(hash_bytes(text.as_bytes()));
+                    if applied {
+                        inspect_rule_file(&path, &text, findings);
+                    }
                 }
+                Err(error) => source.errors.push(error.to_string()),
             }
             sources.push(source);
         }
@@ -1317,42 +1347,45 @@ fn discover_instruction_files(
     inventory.instruction_files = paths.len();
     for path in paths {
         let mut source = source_for(&path, "agent_instructions", true, true);
-        if let Ok(text) = read_limited_text(&path) {
-            source.sha256 = Some(hash_bytes(text.as_bytes()));
-            let lower = text.to_ascii_lowercase();
-            if contains_hidden_unicode(&text)
-                || lower.contains("ignore previous instructions")
-                || lower.contains("ignore all previous")
-            {
-                findings.push(make_finding(
-                    "CAX-INS-001",
-                    "instructions_trust_memory",
-                    Severity::High,
-                    "medium",
-                    Assessment::Potential,
-                    "Agent instruction file contains poisoning indicators",
-                    "The instruction chain contains invisible-control or instruction-override language that deserves human review.",
-                    vec![evidence(&path, None, Some("<redacted-content-match>"))],
-                    "Review the instruction file, remove hidden control characters, and express repository guidance without trying to override higher-priority instructions.",
-                    &["https://learn.chatgpt.com/docs/agent-configuration/agents-md"],
-                    &["OWASP-ASI01", "OWASP-ASI06"],
-                ));
+        match read_limited_text(&path) {
+            Ok(text) => {
+                source.sha256 = Some(hash_bytes(text.as_bytes()));
+                let lower = text.to_ascii_lowercase();
+                if contains_hidden_unicode(&text)
+                    || lower.contains("ignore previous instructions")
+                    || lower.contains("ignore all previous")
+                {
+                    findings.push(make_finding(
+                        "CAX-INS-001",
+                        "instructions_trust_memory",
+                        Severity::High,
+                        "medium",
+                        Assessment::Potential,
+                        "Agent instruction file contains poisoning indicators",
+                        "The instruction chain contains invisible-control or instruction-override language that deserves human review.",
+                        vec![evidence(&path, None, Some("<redacted-content-match>"))],
+                        "Review the instruction file, remove hidden control characters, and express repository guidance without trying to override higher-priority instructions.",
+                        &["https://learn.chatgpt.com/docs/agent-configuration/agents-md"],
+                        &["OWASP-ASI01", "OWASP-ASI06"],
+                    ));
+                }
+                if lower.contains("curl ") && (lower.contains("| sh") || lower.contains("| bash")) {
+                    findings.push(make_finding(
+                        "CAX-INS-002",
+                        "skills_plugins_hooks_supply_chain",
+                        Severity::High,
+                        "medium",
+                        Assessment::Potential,
+                        "Agent instruction file recommends remote code execution",
+                        "A download-to-shell instruction can turn mutable remote content into local execution.",
+                        vec![evidence(&path, None, Some("<redacted-content-match>"))],
+                        "Use a pinned, reviewed dependency or checked-in script instead of piping remote content to a shell.",
+                        &["https://learn.chatgpt.com/docs/agent-configuration/agents-md"],
+                        &["OWASP-ASI04", "OWASP-ASI05"],
+                    ));
+                }
             }
-            if lower.contains("curl ") && (lower.contains("| sh") || lower.contains("| bash")) {
-                findings.push(make_finding(
-                    "CAX-INS-002",
-                    "skills_plugins_hooks_supply_chain",
-                    Severity::High,
-                    "medium",
-                    Assessment::Potential,
-                    "Agent instruction file recommends remote code execution",
-                    "A download-to-shell instruction can turn mutable remote content into local execution.",
-                    vec![evidence(&path, None, Some("<redacted-content-match>"))],
-                    "Use a pinned, reviewed dependency or checked-in script instead of piping remote content to a shell.",
-                    &["https://learn.chatgpt.com/docs/agent-configuration/agents-md"],
-                    &["OWASP-ASI04", "OWASP-ASI05"],
-                ));
-            }
+            Err(error) => source.errors.push(error.to_string()),
         }
         sources.push(source);
     }
@@ -1530,16 +1563,18 @@ fn discover_plugins_and_marketplaces(
     let manifests = find_named_files(&plugin_root, "plugin.json", MAX_DISCOVERY_DEPTH);
     inventory.plugin_manifests = manifests.len();
     for path in manifests {
-        let source = source_for(&path, "plugin_manifest", true, true);
-        sources.push(source);
-        if let Ok(text) = read_limited_text(&path) {
-            if let Ok(value) = serde_json::from_str::<JsonValue>(&text) {
-                let bundled = ["skills", "mcpServers", "apps", "hooks"]
-                    .iter()
-                    .filter(|key| value.get(**key).is_some())
-                    .count();
-                if bundled >= 3 {
-                    findings.push(make_finding(
+        let mut source = source_for(&path, "plugin_manifest", true, true);
+        match read_limited_text(&path) {
+            Ok(text) => {
+                source.sha256 = Some(hash_bytes(text.as_bytes()));
+                match serde_json::from_str::<JsonValue>(&text) {
+                    Ok(value) => {
+                        let bundled = ["skills", "mcpServers", "apps", "hooks"]
+                            .iter()
+                            .filter(|key| value.get(**key).is_some())
+                            .count();
+                        if bundled >= 3 {
+                            findings.push(make_finding(
                         "CAX-PLG-001",
                         "skills_plugins_hooks_supply_chain",
                         Severity::Medium,
@@ -1552,9 +1587,14 @@ fn discover_plugins_and_marketplaces(
                         &["https://learn.chatgpt.com/docs/build-plugins"],
                         &["OWASP-ASI04", "OWASP-MCP4"],
                     ));
+                        }
+                    }
+                    Err(error) => source.errors.push(error.to_string()),
                 }
             }
+            Err(error) => source.errors.push(error.to_string()),
         }
+        sources.push(source);
     }
     let mut marketplace_paths = Vec::new();
     if let Some(home) = env::var_os("HOME") {
@@ -1571,14 +1611,17 @@ fn discover_plugins_and_marketplaces(
         let mut source = source_for(&path, "plugin_marketplace", applied, applied);
         if path.exists() {
             inventory.marketplace_files += 1;
-            if let Ok(text) = read_limited_text(&path) {
-                source.sha256 = Some(hash_bytes(text.as_bytes()));
-                let lower = text.to_ascii_lowercase();
-                if lower.contains("\"ref\": \"main\"")
-                    || lower.contains("\"ref\":\"main\"")
-                    || lower.contains("@latest")
-                {
-                    findings.push(make_finding(
+            match read_limited_text(&path) {
+                Ok(text) => {
+                    source.sha256 = Some(hash_bytes(text.as_bytes()));
+                    match serde_json::from_str::<JsonValue>(&text) {
+                        Ok(_) => {
+                            let lower = text.to_ascii_lowercase();
+                            if lower.contains("\"ref\": \"main\"")
+                                || lower.contains("\"ref\":\"main\"")
+                                || lower.contains("@latest")
+                            {
+                                findings.push(make_finding(
                         "CAX-PLG-002",
                         "skills_plugins_hooks_supply_chain",
                         Severity::Medium,
@@ -1591,7 +1634,12 @@ fn discover_plugins_and_marketplaces(
                         &["https://learn.chatgpt.com/docs/build-plugins"],
                         &["OWASP-ASI04", "OWASP-MCP4"],
                     ));
+                            }
+                        }
+                        Err(error) => source.errors.push(error.to_string()),
+                    }
                 }
+                Err(error) => source.errors.push(error.to_string()),
             }
         }
         sources.push(source);
@@ -1748,12 +1796,17 @@ fn make_finding(
     mappings: &[&str],
 ) -> AuditFinding {
     let mut hasher = Sha256::new();
-    hasher.update(rule_id.as_bytes());
+    hash_fingerprint_part(&mut hasher, rule_id.as_bytes());
     for evidence in &evidence_items {
-        hasher.update(evidence.source.as_bytes());
-        if let Some(key) = &evidence.key {
-            hasher.update(key.as_bytes());
-        }
+        hash_fingerprint_part(&mut hasher, evidence.source.as_bytes());
+        hash_fingerprint_part(
+            &mut hasher,
+            evidence.key.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_fingerprint_part(
+            &mut hasher,
+            evidence.value.as_deref().unwrap_or_default().as_bytes(),
+        );
     }
     AuditFinding {
         fingerprint: format!("sha256:{:x}", hasher.finalize()),
@@ -1775,6 +1828,11 @@ fn make_finding(
             .collect(),
         mappings: mappings.iter().map(|value| (*value).to_string()).collect(),
     }
+}
+
+fn hash_fingerprint_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 fn evidence(path: &Path, key: Option<&str>, value: Option<&str>) -> Evidence {
@@ -1873,7 +1931,7 @@ fn network_policy_enabled(config: &TomlValue) -> bool {
         Some(TomlValue::Table(table)) => table
             .get("enabled")
             .and_then(TomlValue::as_bool)
-            .unwrap_or(true),
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -2500,6 +2558,138 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.rule_id == "CAX-SKL-006"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn effective_defaults_flag_secret_environment_and_unproxied_network_access() {
+        let root = temp_root("effective-defaults");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &codex_home.join("config.toml"),
+            "[sandbox_workspace_write]\nnetwork_access = true\n[features.network_proxy]\ndomains = { example = \"allow\" }\n",
+        );
+
+        let report = audit_codex(&CodexAuditOptions {
+            workspace,
+            codex_home,
+            profile: None,
+        })
+        .unwrap();
+
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "CAX-NET-001"));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "CAX-ENV-001"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabled_skill_directory_is_not_reported_as_enabled() {
+        let root = temp_root("disabled-skill-directory");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        let skill_dir = codex_home.join("skills/reviewed");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &skill_dir.join("SKILL.md"),
+            "---\nname: reviewed\n---\nReview helper.\n",
+        );
+        fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        write(
+            &codex_home.join("config.toml"),
+            &format!(
+                "[[skills.config]]\npath = {:?}\nenabled = false\n",
+                skill_dir.to_string_lossy()
+            ),
+        );
+
+        let report = audit_codex(&CodexAuditOptions {
+            workspace,
+            codex_home,
+            profile: None,
+        })
+        .unwrap();
+
+        let skill = report
+            .inventory
+            .skills
+            .iter()
+            .find(|skill| skill.name == "reviewed")
+            .unwrap();
+        assert!(!skill.enabled);
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "CAX-SKL-005"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unreadable_discovered_source_makes_assessment_partial() {
+        let root = temp_root("oversized-rules");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        let rule_path = codex_home.join("rules/oversized.rules");
+        if let Some(parent) = rule_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&rule_path, vec![b'x'; MAX_TEXT_FILE_BYTES as usize + 1]).unwrap();
+
+        let report = audit_codex(&CodexAuditOptions {
+            workspace,
+            codex_home,
+            profile: None,
+        })
+        .unwrap();
+
+        let source = report
+            .sources
+            .iter()
+            .find(|source| source.path == display_path(&rule_path))
+            .unwrap();
+        assert_eq!(report.summary.assessment, "partial");
+        assert!(source.sha256.is_none());
+        assert!(!source.errors.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn evidence_values_disambiguate_fingerprints() {
+        let root = temp_root("fingerprints");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &codex_home.join("config.toml"),
+            "[sandbox_workspace_write]\nwritable_roots = [\"/\", \"/etc\"]\n",
+        );
+
+        let report = audit_codex(&CodexAuditOptions {
+            workspace,
+            codex_home,
+            profile: None,
+        })
+        .unwrap();
+        let findings = report
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id == "CAX-SBX-001")
+            .collect::<Vec<_>>();
+
+        assert_eq!(findings.len(), 2);
+        assert_ne!(findings[0].fingerprint, findings[1].fingerprint);
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -221,6 +221,7 @@ fn audit_vscode_scope(
     );
     discover_extensions(
         &options.extension_roots,
+        &mut sources,
         &mut inventory,
         &mut findings,
         &mut limitations,
@@ -909,8 +910,21 @@ fn discover_skills(
             if !seen.insert(canonical.clone()) {
                 continue;
             }
-            let text = read_limited_text(&skill_file).unwrap_or_default();
-            let name = frontmatter_value(&text, "name").unwrap_or_else(|| {
+            let mut source = source_for(&skill_file, "vscode_skill", true, true);
+            let text = match read_limited_text(&skill_file) {
+                Ok(text) => {
+                    source.sha256 = Some(hash_bytes(text.as_bytes()));
+                    Some(text)
+                }
+                Err(error) => {
+                    source.errors.push(error.to_string());
+                    None
+                }
+            };
+            let sha256 = source.sha256.clone();
+            sources.push(source);
+            let text = text.as_deref().unwrap_or_default();
+            let name = frontmatter_value(text, "name").unwrap_or_else(|| {
                 skill_file
                     .parent()
                     .and_then(Path::file_name)
@@ -919,7 +933,7 @@ fn discover_skills(
                     .to_string()
             });
             let manual_only =
-                frontmatter_value(&text, "disable-model-invocation").as_deref() == Some("true");
+                frontmatter_value(text, "disable-model-invocation").as_deref() == Some("true");
             let skill_dir = skill_file.parent().unwrap_or(&root);
             let has_scripts = skill_dir.join("scripts").is_dir();
             if has_scripts && !manual_only {
@@ -932,11 +946,8 @@ fn discover_skills(
                 enabled: true,
                 has_scripts,
                 review_state: "unknown".to_string(),
-                sha256: Some(hash_bytes(text.as_bytes())),
+                sha256,
             });
-            let mut source = source_for(&skill_file, "vscode_skill", true, true);
-            source.sha256 = Some(hash_bytes(text.as_bytes()));
-            sources.push(source);
 
             if has_scripts {
                 findings.push(make_finding(
@@ -953,7 +964,7 @@ fn discover_skills(
                     &["OWASP-ASI04"],
                 ));
             }
-            if poisoning_indicator(&text) || download_to_shell(&text) {
+            if poisoning_indicator(text) || download_to_shell(text) {
                 findings.push(make_finding(
                     "VSC-SKL-002",
                     "skills_instructions_hooks",
@@ -1026,7 +1037,6 @@ fn discover_instructions_and_agents(
     candidates.extend(agents);
 
     for path in candidates.into_iter().filter(|path| path.exists()) {
-        let text = read_limited_text(&path).unwrap_or_default();
         let kind = if path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1037,9 +1047,21 @@ fn discover_instructions_and_agents(
             "vscode_instruction"
         };
         let mut source = source_for(&path, kind, true, true);
-        source.sha256 = Some(hash_bytes(text.as_bytes()));
+        let text = match read_limited_text(&path) {
+            Ok(text) => {
+                source.sha256 = Some(hash_bytes(text.as_bytes()));
+                Some(text)
+            }
+            Err(error) => {
+                source.errors.push(error.to_string());
+                None
+            }
+        };
         sources.push(source);
         inventory.instruction_files += 1;
+        let Some(text) = text else {
+            continue;
+        };
         if poisoning_indicator(&text) || download_to_shell(&text) {
             findings.push(make_finding(
                 "VSC-INS-001",
@@ -1091,11 +1113,27 @@ fn discover_hooks(
     }
 
     for path in files.into_iter().filter(|path| path.exists()) {
-        let text = read_limited_text(&path).unwrap_or_default();
         let mut source = source_for(&path, "vscode_hook", true, true);
-        source.sha256 = Some(hash_bytes(text.as_bytes()));
+        let text = match read_limited_text(&path) {
+            Ok(text) => {
+                source.sha256 = Some(hash_bytes(text.as_bytes()));
+                Some(text)
+            }
+            Err(error) => {
+                source.errors.push(error.to_string());
+                None
+            }
+        };
+        let commands = text
+            .as_deref()
+            .map(hook_commands)
+            .transpose()
+            .unwrap_or_else(|error| {
+                source.errors.push(error);
+                None
+            })
+            .unwrap_or_default();
         sources.push(source);
-        let commands = hook_commands(&text);
         inventory.hook_commands += commands.len();
         for command in commands {
             if download_to_shell(&command) {
@@ -1119,6 +1157,7 @@ fn discover_hooks(
 
 fn discover_extensions(
     roots: &[PathBuf],
+    sources: &mut Vec<AuditSource>,
     inventory: &mut AuditInventory,
     findings: &mut Vec<AuditFinding>,
     limitations: &mut Vec<String>,
@@ -1127,12 +1166,30 @@ fn discover_extensions(
     for root in roots {
         for path in child_directories(root) {
             let package = path.join("package.json");
-            let Ok(text) = read_limited_text(&package) else {
+            if !package.exists() {
                 continue;
+            }
+            let mut source = source_for(&package, "vscode_extension_manifest", true, true);
+            let text = match read_limited_text(&package) {
+                Ok(text) => {
+                    source.sha256 = Some(hash_bytes(text.as_bytes()));
+                    text
+                }
+                Err(error) => {
+                    source.errors.push(error.to_string());
+                    sources.push(source);
+                    continue;
+                }
             };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                continue;
+            let value = match serde_json::from_str::<Value>(&text) {
+                Ok(value) => value,
+                Err(error) => {
+                    source.errors.push(error.to_string());
+                    sources.push(source);
+                    continue;
+                }
             };
+            sources.push(source);
             let publisher = value
                 .get("publisher")
                 .and_then(Value::as_str)
@@ -1666,13 +1723,11 @@ fn broad_agent_tools(text: &str) -> bool {
         || (lower.contains("terminal") && lower.contains("edit") && lower.contains("mcp"))
 }
 
-fn hook_commands(text: &str) -> Vec<String> {
-    let Ok(value) = parse_jsonc(text) else {
-        return Vec::new();
-    };
+fn hook_commands(text: &str) -> Result<Vec<String>, String> {
+    let value = parse_jsonc(text)?;
     let mut commands = Vec::new();
     collect_json_commands(&value, &mut commands);
-    commands
+    Ok(commands)
 }
 
 fn collect_json_commands(value: &Value, commands: &mut Vec<String>) {
@@ -1915,12 +1970,17 @@ fn make_finding(
     mappings: &[&str],
 ) -> AuditFinding {
     let mut hasher = Sha256::new();
-    hasher.update(rule_id.as_bytes());
+    hash_fingerprint_part(&mut hasher, rule_id.as_bytes());
     for evidence in &evidence_items {
-        hasher.update(evidence.source.as_bytes());
-        if let Some(key) = &evidence.key {
-            hasher.update(key.as_bytes());
-        }
+        hash_fingerprint_part(&mut hasher, evidence.source.as_bytes());
+        hash_fingerprint_part(
+            &mut hasher,
+            evidence.key.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_fingerprint_part(
+            &mut hasher,
+            evidence.value.as_deref().unwrap_or_default().as_bytes(),
+        );
     }
     AuditFinding {
         fingerprint: format!("sha256:{:x}", hasher.finalize()),
@@ -1944,11 +2004,22 @@ fn make_finding(
     }
 }
 
+fn hash_fingerprint_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
 fn evidence(path: &Path, key: Option<&str>, value: Option<&str>) -> Evidence {
     Evidence {
         source: display_path(path),
         key: key.map(str::to_string),
-        value: value.map(str::to_string),
+        value: value.map(|value| {
+            if key.is_some_and(|key| key.ends_with("otlpEndpoint")) && url_has_credentials(value) {
+                "<redacted-credential-url>".to_string()
+            } else {
+                value.to_string()
+            }
+        }),
     }
 }
 
@@ -2188,6 +2259,79 @@ mod tests {
             .iter()
             .all(|finding| is_copilot_privacy_rule(&finding.rule_id)));
         assert_eq!(copilot.target.provider, "github-copilot");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn redacts_copilot_telemetry_endpoint_credentials() {
+        let root = temp_root("copilot-otel-redaction");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let user_data = root.join("User");
+        fs::create_dir_all(&workspace).unwrap();
+        let secret = "review-secret-value-123456";
+        write(
+            &user_data.join("settings.json"),
+            &format!(
+                r#"{{"github.copilot.chat.otel.otlpEndpoint":"http://collector.example.test/v1/traces?token={secret}"}}"#
+            ),
+        );
+
+        let report = audit_github_copilot_vscode(&VscodeAuditOptions {
+            workspace,
+            user_data,
+            profile: None,
+            extension_roots: Vec::new(),
+        })
+        .unwrap();
+        let serialized = serde_json::to_string(&report).unwrap();
+
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "VSC-PRV-003"));
+        assert!(!serialized.contains(secret));
+        assert!(serialized.contains("<redacted-credential-url>"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovered_control_plane_read_and_parse_errors_are_reported() {
+        let root = temp_root("discovery-errors");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let user_data = root.join("User");
+        fs::create_dir_all(&workspace).unwrap();
+        let skill_path = workspace.join(".github/skills/oversized/SKILL.md");
+        if let Some(parent) = skill_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&skill_path, vec![b'x'; MAX_TEXT_FILE_BYTES as usize + 1]).unwrap();
+        let hook_path = workspace.join(".github/hooks/invalid.json");
+        write(&hook_path, "{ invalid json");
+
+        let report = audit_vscode_host(&VscodeAuditOptions {
+            workspace,
+            user_data,
+            profile: None,
+            extension_roots: Vec::new(),
+        })
+        .unwrap();
+
+        let skill_source = report
+            .sources
+            .iter()
+            .find(|source| source.path == display_path(&skill_path))
+            .unwrap();
+        assert!(skill_source.sha256.is_none());
+        assert!(!skill_source.errors.is_empty());
+        let hook_source = report
+            .sources
+            .iter()
+            .find(|source| source.path == display_path(&hook_path))
+            .unwrap();
+        assert!(hook_source.sha256.is_some());
+        assert!(!hook_source.errors.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 }
