@@ -1,7 +1,7 @@
 # macOS Endpoint Security sensor
 
 Gensee Crate ships a first-party Endpoint Security system extension in
-[`macos/GenseeCrate`](../macos/GenseeCrate):
+[`macos/GenseeCrate`](https://github.com/GenseeAI/gensee-crate/tree/main/macos/GenseeCrate):
 
 - host app: `ai.gensee.crate`
 - system extension: `ai.gensee.crate.endpoint-security`
