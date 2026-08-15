@@ -95,6 +95,8 @@ pub struct PolicyDocument {
     pub enforcement: EnforcementConfig,
     #[serde(default)]
     pub watch: WatchPolicyConfig,
+    #[serde(default)]
+    pub endpoint_security: EndpointSecurityConfig,
     /// Trusted path prefixes exempt from the FP-prone secret/persistence
     /// findings (the JSON form of `GENSEE_POLICY_ALLOW_PATH_PREFIXES`).
     #[serde(default)]
@@ -224,6 +226,53 @@ pub struct EnforcementConfig {
     pub noninteractive: bool,
 }
 
+/// macOS Endpoint Security sensor posture. `protect` and `strict` enable the
+/// same local authorization engine; strict additionally treats an unavailable
+/// or invalid policy as deny for managed process trees. The system extension
+/// still scopes fail-closed behavior to explicitly registered agent roots.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EndpointSecurityConfig {
+    pub mode: EndpointSecurityMode,
+    pub protected_paths: Vec<String>,
+    pub blocked_executables: Vec<String>,
+    pub fail_closed_managed_only: bool,
+    pub max_auth_latency_ms: u64,
+}
+
+impl Default for EndpointSecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: EndpointSecurityMode::Observe,
+            protected_paths: Vec::new(),
+            blocked_executables: Vec::new(),
+            fail_closed_managed_only: true,
+            max_auth_latency_ms: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointSecurityMode {
+    Off,
+    #[default]
+    Observe,
+    Protect,
+    Strict,
+}
+
+impl EndpointSecurityMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Observe => "observe",
+            Self::Protect => "protect",
+            Self::Strict => "strict",
+        }
+    }
+}
+
 /// Sidecar watch defaults.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -234,16 +283,17 @@ pub struct WatchPolicyConfig {
 impl Default for WatchPolicyConfig {
     fn default() -> Self {
         Self {
-            system_events: SystemEventMode::Eslogger,
+            system_events: SystemEventMode::EndpointSecurity,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum SystemEventMode {
     None,
     #[default]
+    EndpointSecurity,
     Eslogger,
 }
 
@@ -251,6 +301,7 @@ impl SystemEventMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::EndpointSecurity => "endpoint-security",
             Self::Eslogger => "eslogger",
         }
     }
@@ -1410,6 +1461,7 @@ mod tests {
             "linux",
             "enforcement",
             "watch",
+            "endpoint_security",
             "allow_path_prefixes",
         ] {
             doc.as_object_mut().unwrap().remove(key);
@@ -1424,7 +1476,8 @@ mod tests {
         assert_eq!(d.linux.network.mode, LinuxNetworkMode::Off);
         assert!(!d.enforcement.noninteractive);
         assert!(d.runtime.max_runtime_seconds.is_none());
-        assert_eq!(d.watch.system_events, SystemEventMode::Eslogger);
+        assert_eq!(d.watch.system_events, SystemEventMode::EndpointSecurity);
+        assert_eq!(d.endpoint_security.mode, EndpointSecurityMode::Observe);
         assert!(d.allow_path_prefixes.is_empty());
     }
 

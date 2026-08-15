@@ -1,60 +1,69 @@
-# Endpoint Security spike
+# macOS Endpoint Security sensor
 
-The EndpointSecurity spike is isolated from the current release path. The
-current watch path uses Apple's `/usr/bin/eslogger` as the default system-event
-source when available; a signed EndpointSecurity client remains future work.
+Gensee Crate ships a first-party Endpoint Security system extension in
+[`macos/GenseeCrate`](../macos/GenseeCrate):
 
-```bash
-cargo run -p gensee-crate-macos --bin endpoint-spike -- list
-cargo run -p gensee-crate-macos --bin endpoint-spike -- exec
-cargo run -p gensee-crate-macos --bin endpoint-spike -- file-mutation
-cargo run -p gensee-crate-macos --bin endpoint-spike -- file-open
-```
+- host app: `ai.gensee.crate`
+- system extension: `ai.gensee.crate.endpoint-security`
+- entitlement: `com.apple.developer.endpoint-security.client`
 
-The current implementation uses Apple's `/usr/bin/eslogger` as a temporary event
-source. Production should replace this with a signed EndpointSecurity client.
+The extension replaces `sudo /usr/bin/eslogger` for normal use. A signed XPC
+channel accepts only the signed Gensee host. The host pulls bounded batches and
+streams versioned JSONL into a long-lived `gensee ingest endpoint-security`
+process, which persists events in the active encrypted `GENSEE_HOME` store.
 
-## Ingesting `eslogger` events
+## Captured evidence
 
-For normal sidecar capture, use [`gensee watch`](watch.md). It starts
-`/usr/bin/eslogger` by default on macOS and writes normalized system events into
-the active `GENSEE_HOME` store. The manual ingester is still useful for focused
-experiments and saved event streams.
+The schema records the reboot ID, event ID, `(pid,pidversion)` process identity,
+parent and responsible audit tokens, signing/team identity, executable path,
+fork/exec targets, argv, script and cwd, file path plus device/inode, open flags,
+and per-type/global Endpoint Security sequence numbers. Subscriptions cover:
 
-Pipe `eslogger` JSON into Gensee to persist normalized Layer 1 system events:
+- process: exec, fork, exit
+- file access: open, readdir, mmap
+- mutation: create, write, close, rename, unlink, truncate
 
-```bash
-cargo build -p gensee-crate-cli
+The Rust ingester maintains an event-driven process graph and correlates exact
+descendants with active `gensee run` session roots. Extension-side root
+registration carries attribution to sessions started after the ingester.
+FSEvents remains a reconciliation signal, not the source of actor identity.
 
-sudo cargo run -p gensee-crate-macos --bin endpoint-spike -- exec \
-  | GENSEE_HOME=$PWD/.gensee-dev ./target/debug/gensee ingest eslogger
+An `open` event proves that a process obtained a descriptor with read intent;
+it does not prove that bytes were consumed.
 
-GENSEE_HOME=$PWD/.gensee-dev ./target/debug/gensee timeline
-```
+## Modes
 
-`exec` is system-wide and intentionally noisy. Use `--select` during local
-testing to keep the stream focused:
-
-```bash
-sudo cargo run -p gensee-crate-macos --bin endpoint-spike -- exec \
-  --select /bin/sleep --duration-seconds 10 \
-  | GENSEE_HOME=$PWD/.gensee-dev ./target/debug/gensee ingest eslogger
-```
-
-`endpoint-spike` writes status text to stderr and leaves stdout for JSON events.
-The ingester redacts common secret-bearing environment variables and JSON fields
-before storing raw event JSON.
-
-## File-open experiments
-
-For file-open experiments, capture a short bounded window and filter the Gensee
-timeline afterward. Apple's `eslogger --select` is best for process path
-filters, not target file path filters:
+Configure the sensor in the native Policy page or with:
 
 ```bash
-sudo ./target/debug/endpoint-spike file-open --duration-seconds 30 \
-  | GENSEE_HOME=$PWD/.gensee-pdf-test ./target/debug/gensee ingest eslogger
-
-GENSEE_HOME=$PWD/.gensee-pdf-test ./target/debug/gensee timeline \
-  --path "/path/to/target/dir"
+gensee policy set endpoint_security.mode observe
 ```
+
+- `off` — respond allow to authorization messages and omit telemetry.
+- `observe` — record auth/notify evidence; never deny (default).
+- `protect` — deny configured protected-path and blocked-executable operations
+  inside explicitly managed agent process trees.
+- `strict` — the managed-tree fail-closed posture. Unrelated host processes
+  remain outside the deny scope.
+
+Additional policy keys:
+
+```bash
+gensee policy set endpoint_security.protected_paths /absolute/path,/another/path
+gensee policy set endpoint_security.blocked_executables /usr/bin/osascript
+```
+
+Authorization decisions are deterministic and local to the extension. The ES
+callback never waits for the UI, XPC, SQLite, or human approval. Session-dependent
+decisions use no authorization cache. The dashboard reports decisions, denials,
+maximum observed authorization latency, and kernel/ring gaps.
+
+## Safety and rollback
+
+Start in `observe` and review evidence before using `protect`. Set mode back to
+`observe` for immediate policy rollback. The Settings page can deactivate the
+extension if necessary. Removal stops OS event coverage; it does not delete the
+Gensee database or other host files.
+
+`endpoint-spike` and `gensee ingest eslogger` remain available only as manual
+diagnostic compatibility tools.

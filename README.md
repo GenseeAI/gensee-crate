@@ -350,18 +350,17 @@ sidecar watching, and managed `gensee run` launches.
 **Hooks only.** Agent requests and tool calls are checked by Gensee policy after
 Step 1 setup. No extra command needs to keep running.
 
-**Watch.** Observe workspace file effects, and optionally ingest macOS
-EndpointSecurityLogger events:
+**Watch.** Observe workspace file effects. The native Gensee Crate app
+independently ingests signed Endpoint Security process and file events:
 
 ```bash
 gensee watch # optional flags: --workspace --watch-root --duration-seconds
-sudo gensee watch --system-events eslogger
+gensee policy set watch.system_events endpoint-security
 ```
 
-If you use `--system-events eslogger`, open Apple menu > System Settings >
-Privacy & Security > Full Disk Access, click `+`, add the app hosting `gensee`
-(for example Terminal, iTerm, or Visual Studio Code), then quit and reopen that
-app.
+Build and install [`macos/GenseeCrate`](macos/GenseeCrate), approve its bundled
+system extension, and grant Gensee Crate Full Disk Access. `eslogger` remains an
+optional manual diagnostic backend.
 
 **Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
 `sandbox-exec` and can stage workspace writes for review.
@@ -634,8 +633,9 @@ dashboard. Next directions include:
 - **Transactional Linux runtimes:** initial tclone launch/fork/shell/diff/keep
   support is available; next work is post-fork hook rebind, policy-controlled
   rollback, and multi-fork lifecycle management.
-- **Endpoint Security-based macOS defense:** deeper host-level file, process,
-  and network visibility once the Apple Endpoint Security path is available.
+- **Endpoint Security-based macOS defense:** process and file observation plus
+  managed-agent authorization are available; network visibility remains a
+  separate Network Extension or packet-sensor direction.
 - **Sandbox support:** stronger `gensee run` confinement, staged writes, and
   speculative or transactional execution for risky agent actions.
 - **ML-based policy and rules:** learning from controlled traces, blocked
@@ -668,4 +668,4 @@ Full docs live in [`docs/`](docs/README.md):
 - [Omnigent integration](integrations/omnigent/README.md) — thin sidecar/managed-run support and the deeper policy-bridge plan.
 - [Safety policy](docs/policy.md) — the data-driven allow/ask/deny engine and `gensee policy` workflow.
 - [SQLite lineage graph](docs/lineage-graph.md) — the provenance schema and example queries.
-- [Endpoint Security spike](docs/endpoint-security.md) — `eslogger` system events and the future signed EndpointSecurity path.
+- [Endpoint Security sensor](docs/endpoint-security.md) — signed macOS process/file observation and managed-tree authorization.

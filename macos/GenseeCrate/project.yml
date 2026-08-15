@@ -1,0 +1,115 @@
+name: GenseeCrate
+
+options:
+  minimumXcodeGenVersion: 2.46.0
+  xcodeVersion: "16.2"
+  projectFormat: xcode16_0
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    CODE_SIGN_STYLE: Automatic
+    CURRENT_PROJECT_VERSION: 6
+    DEVELOPMENT_TEAM: 3KWVB4M63F
+    ENABLE_HARDENED_RUNTIME: YES
+    MARKETING_VERSION: 0.2.4
+
+targets:
+  GenseeCrate:
+    type: application
+    platform: macOS
+    sources:
+      - Host/GenseeCrateApp.swift
+      - Host/ContentView.swift
+      - Host/DashboardShell.swift
+      - Host/DashboardComponents.swift
+      - Host/DashboardOverviewPages.swift
+      - Host/DashboardActivityPages.swift
+      - Host/DashboardSecurityPages.swift
+      - Host/DashboardConfigPages.swift
+      - Host/EndpointSecurityExtensionManager.swift
+      - Host/EndpointSecuritySensor.swift
+      - Host/GenseeEndpointSecurityBridge.h
+      - Host/GenseeEndpointSecurityBridge.m
+      - Host/GenseeCLI.swift
+      - Host/ConsoleModels.swift
+      - Host/ConsoleModel.swift
+      - Host/Brand.swift
+      - Host/Assets.xcassets
+    info:
+      path: Host/Info.plist
+      properties:
+        CFBundleDisplayName: Gensee Crate
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSApplicationCategoryType: public.app-category.utilities
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        NSHumanReadableCopyright: Copyright © 2026 GenseeAI. All rights reserved.
+        NSPrincipalClass: NSApplication
+    entitlements:
+      path: Host/GenseeCrate.entitlements
+      properties:
+        com.apple.developer.system-extension.install: true
+    settings:
+      base:
+        COMBINE_HIDPI_IMAGES: YES
+        GENERATE_INFOPLIST_FILE: NO
+        PRODUCT_BUNDLE_IDENTIFIER: ai.gensee.crate
+        PRODUCT_NAME: Gensee Crate
+        SWIFT_VERSION: 5.0
+        SWIFT_OBJC_BRIDGING_HEADER: Host/GenseeCrate-Bridging-Header.h
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    preBuildScripts:
+      - name: Build and Embed Gensee Backend
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          REPOSITORY_ROOT="$PROJECT_DIR/../.."
+          if [ "$CONFIGURATION" = "Release" ]; then
+            cargo build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" -p gensee-crate-cli --release
+            GENSEE_PROFILE="release"
+          else
+            cargo build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" -p gensee-crate-cli
+            GENSEE_PROFILE="debug"
+          fi
+          GENSEE_RESOURCES="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/bin"
+          mkdir -p "$GENSEE_RESOURCES"
+          cp "$REPOSITORY_ROOT/target/$GENSEE_PROFILE/gensee" "$GENSEE_RESOURCES/gensee"
+    dependencies:
+      - target: GenseeCrateEndpointSecurity
+      - sdk: SystemExtensions.framework
+    scheme:
+      gatherCoverageData: false
+
+  GenseeCrateEndpointSecurity:
+    type: system-extension
+    platform: macOS
+    sources:
+      - EndpointSecurityExtension/main.m
+    info:
+      path: EndpointSecurityExtension/Info.plist
+      properties:
+        CFBundleDisplayName: Gensee Crate Endpoint Security
+        CFBundlePackageType: SYSX
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        NSEndpointSecurityMachServiceName: "$(TeamIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER).xpc"
+        NSSystemExtensionUsageDescription: Gensee Crate monitors process and file activity to protect AI agent sessions.
+    entitlements:
+      path: EndpointSecurityExtension/GenseeCrateEndpointSecurity.entitlements
+      properties:
+        com.apple.developer.endpoint-security.client: true
+    settings:
+      base:
+        APPLICATION_EXTENSION_API_ONLY: YES
+        GENERATE_INFOPLIST_FILE: NO
+        PRODUCT_BUNDLE_IDENTIFIER: ai.gensee.crate.endpoint-security
+        PRODUCT_NAME: "$(PRODUCT_BUNDLE_IDENTIFIER)"
+        SKIP_INSTALL: YES
+    dependencies:
+      - sdk: libEndpointSecurity.tbd
+      - sdk: libbsm.tbd

@@ -23,7 +23,7 @@ quick start, then dive into the topic guides below.
 - [Safety policy](policy.md) — the data-driven allow/ask/deny policy engine and how to customize it.
 - [Dashboard](dashboard.md) — inspect live activity, lineage, policy decisions, alerts, and policy edits.
 - [SQLite lineage graph](lineage-graph.md) — the provenance schema, example queries, and what Gensee can flag today.
-- [Endpoint Security spike](endpoint-security.md) — `eslogger` system events and the future signed EndpointSecurity path.
+- [Endpoint Security sensor](endpoint-security.md) — signed macOS process/file observation and managed-tree authorization.
 
 ## Diagrams
 

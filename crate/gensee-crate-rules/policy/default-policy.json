@@ -504,8 +504,15 @@
   "enforcement": {
     "noninteractive": false
   },
+  "endpoint_security": {
+    "mode": "observe",
+    "protected_paths": [],
+    "blocked_executables": [],
+    "fail_closed_managed_only": true,
+    "max_auth_latency_ms": 10
+  },
   "watch": {
-    "system_events": "eslogger"
+    "system_events": "endpoint-security"
   },
   "allow_path_prefixes": []
 }

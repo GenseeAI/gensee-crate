@@ -2,8 +2,8 @@
 
 `watch` runs as an independent sidecar and does **not** launch the agent. It
 records filesystem effects in `$GENSEE_HOME/workspace-effects.jsonl` (default
-`~/.gensee/workspace-effects.jsonl`) and, on macOS, starts `eslogger` by
-default to record normalized system events in `$GENSEE_HOME/system-events.jsonl`.
+`~/.gensee/workspace-effects.jsonl`). On macOS, the signed Gensee system
+extension records normalized OS events independently of the sidecar.
 
 ```bash
 cargo run -p gensee-crate-cli -- watch \
@@ -34,18 +34,17 @@ receives file create/modify/delete/rename notifications without launching the
 agent or requiring EndpointSecurity. Use `--backend snapshot` to force the
 portable polling fallback.
 
-Both backends observe filesystem **effects**, not pure reads. For read intent,
-use agent hooks such as [Claude Code hooks](claude-code-hooks.md) or Codex
-hooks; for enforced denial, use [`gensee run --sandbox mac`](run-and-sandbox.md).
+Both backends observe filesystem **effects**, not pure reads. The installed
+[Endpoint Security sensor](endpoint-security.md) supplies read-open evidence and
+exact actors; agent hooks add prompt/tool context to those OS facts.
 
 ## System events
 
-On macOS, `gensee watch` starts `/usr/bin/eslogger` by default and ingests
-normalized exec/open/create/write/rename/unlink events into the same
-`GENSEE_HOME` store. The default comes from the policy document:
+On macOS, the default system-event backend is the signed extension. It is
+managed by Gensee Crate rather than spawned by each `watch` process:
 
 ```bash
-gensee policy set watch.system_events eslogger
+gensee policy set watch.system_events endpoint-security
 ```
 
 Turn it off persistently with policy, or for one watch command:
@@ -55,11 +54,8 @@ gensee policy set watch.system_events none
 gensee watch --workspace . --system-events none
 ```
 
-`eslogger` may require elevated permissions. If the selected system-event
-backend cannot start, the watch command reports that error instead of silently
-dropping system events. The lower-level `gensee ingest eslogger` command remains
-available for manual pipelines, but `gensee watch` is the default path for
-sidecar capture.
+The lower-level `gensee ingest eslogger` command remains available for manual
+diagnostics, but is not the production path and is no longer the default.
 
 EndpointSecurity/eslogger does not provide complete IP network
 egress/ingress visibility. System-level network capture on macOS needs a

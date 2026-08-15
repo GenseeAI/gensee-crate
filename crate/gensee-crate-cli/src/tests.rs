@@ -5905,6 +5905,14 @@ fn parses_watch_system_events_backend() {
         SystemEventBackend::None
     );
     assert_eq!(
+        SystemEventBackend::parse(
+            Some("endpoint-security".to_string()),
+            SystemEventBackend::None
+        )
+        .unwrap(),
+        SystemEventBackend::EndpointSecurity
+    );
+    assert_eq!(
         SystemEventBackend::parse(Some("eslogger".to_string()), SystemEventBackend::None).unwrap(),
         SystemEventBackend::Eslogger
     );
@@ -6559,6 +6567,9 @@ fn policy_setup_flow_updates_dashboard_settings() {
         "1.1.1.1, 10.0.0.0/8",             // linux.network.allow
         "169.254.169.254",                 // linux.network.deny
         "yes",                             // enforcement.noninteractive
+        "protect",                         // endpoint_security.mode
+        "/Users/me/.ssh,/Users/me/.aws",   // endpoint_security.protected_paths
+        "/usr/bin/osascript",              // endpoint_security.blocked_executables
         "none",                            // watch.system_events
         "/Users/me/templates,/opt/shared", // allow_path_prefixes
     ]
@@ -6616,6 +6627,18 @@ fn policy_setup_flow_updates_dashboard_settings() {
     assert_eq!(
         policy_value_get(&root, "enforcement.noninteractive"),
         Some(&json!(true))
+    );
+    assert_eq!(
+        policy_value_get(&root, "endpoint_security.mode"),
+        Some(&json!("protect"))
+    );
+    assert_eq!(
+        policy_value_get(&root, "endpoint_security.protected_paths"),
+        Some(&json!(["/Users/me/.ssh", "/Users/me/.aws"]))
+    );
+    assert_eq!(
+        policy_value_get(&root, "endpoint_security.blocked_executables"),
+        Some(&json!(["/usr/bin/osascript"]))
     );
     assert_eq!(
         policy_value_get(&root, "watch.system_events"),

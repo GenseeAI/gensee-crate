@@ -5,6 +5,7 @@ pub(crate) use gensee_crate_core::{
     parse_mcp_file_intents, parse_vscode_file_intents, redact_text, redact_value, AgentHookEvent,
     AgentSession, FileIntent, ProcessObservation, SystemEvent, WorkspaceEffect,
 };
+pub(crate) use gensee_crate_macos::{EndpointSecurityEvent, EndpointSecurityIngestor};
 pub(crate) use gensee_crate_rules::policy::{self, Policy};
 pub(crate) use gensee_crate_store::{
     daemon_socket_path, default_root, AlertRecord, ArtifactObservationInput, ArtifactRiskTagInput,
@@ -2818,11 +2819,35 @@ const ENFORCEMENT_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[PolicySetupItem {
     allow_null: false,
 }];
 
+const ENDPOINT_SECURITY_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[
+    PolicySetupItem {
+        key: "endpoint_security.mode",
+        value_type: PolicySetupValueType::String,
+        label: "Endpoint Security mode",
+        help: "off, observe, protect, or strict",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "endpoint_security.protected_paths",
+        value_type: PolicySetupValueType::List,
+        label: "Protected macOS paths",
+        help: "Additional absolute path prefixes denied to managed agent trees",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "endpoint_security.blocked_executables",
+        value_type: PolicySetupValueType::List,
+        label: "Blocked macOS executables",
+        help: "Absolute executable paths denied to managed agent trees",
+        allow_null: false,
+    },
+];
+
 const WATCH_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[PolicySetupItem {
     key: "watch.system_events",
     value_type: PolicySetupValueType::String,
     label: "System events",
-    help: "System-event backend for gensee watch: eslogger or none",
+    help: "System-event backend: endpoint-security, eslogger, or none",
     allow_null: false,
 }];
 
@@ -2859,6 +2884,11 @@ const POLICY_SETUP_GROUPS: &[PolicySetupGroup] = &[
         name: "Enforcement",
         hint: "How policy behaves when no human can approve an ask decision.",
         items: ENFORCEMENT_POLICY_SETUP_ITEMS,
+    },
+    PolicySetupGroup {
+        name: "Endpoint Security",
+        hint: "First-party macOS observation and authorization.",
+        items: ENDPOINT_SECURITY_POLICY_SETUP_ITEMS,
     },
     PolicySetupGroup {
         name: "Watch",
@@ -2951,6 +2981,9 @@ const SETTABLE_POLICY_KEYS: &[&str] = &[
     "linux.network.allow",
     "linux.network.deny",
     "enforcement.noninteractive",
+    "endpoint_security.mode",
+    "endpoint_security.protected_paths",
+    "endpoint_security.blocked_executables",
     "watch.system_events",
     "allow_path_prefixes",
 ];
@@ -2995,6 +3028,9 @@ pub(crate) fn telemetry_policy_key_bucket(key: &str) -> &'static str {
         "linux.network.allow" => "linux.network.allow",
         "linux.network.deny" => "linux.network.deny",
         "enforcement.noninteractive" => "enforcement.noninteractive",
+        "endpoint_security.mode" => "endpoint_security.mode",
+        "endpoint_security.protected_paths" => "endpoint_security.protected_paths",
+        "endpoint_security.blocked_executables" => "endpoint_security.blocked_executables",
         "watch.system_events" => "watch.system_events",
         "allow_path_prefixes" => "allow_path_prefixes",
         _ => "custom",
@@ -3064,9 +3100,10 @@ fn coerce_policy_value(key: &str, raw: &str) -> Value {
 pub(crate) fn handle_ingest(args: Vec<OsString>) -> io::Result<()> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("eslogger") => ingest_eslogger(),
+        Some("endpoint-security") => ingest_endpoint_security(),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee ingest eslogger",
+            "usage: gensee ingest eslogger|endpoint-security",
         )),
     }
 }
@@ -3363,6 +3400,123 @@ pub(crate) fn ingest_eslogger() -> io::Result<()> {
     Ok(())
 }
 
+/// Persist the versioned JSONL stream emitted by the signed Gensee Endpoint
+/// Security system extension. This process is intentionally long-lived: its
+/// in-memory graph carries exact `(pid,pidversion)` ancestry across fork/exec.
+pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
+    let store = EventStore::default_local()?;
+    let sessions = store.list_sessions()?;
+    let mut ingestor = EndpointSecurityIngestor::new(&sessions);
+    let mut count = 0_u64;
+    let mut rejected = 0_u64;
+    let stdin = io::stdin();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parsed = match EndpointSecurityEvent::parse(line) {
+            Ok(event) => event,
+            Err(error) => {
+                rejected += 1;
+                eprintln!("gensee: rejected Endpoint Security event: {error}");
+                continue;
+            }
+        };
+        let (event, findings) = ingestor.ingest(parsed);
+        let session_id = event.attribution.session_id.clone();
+        let observed_at_ms = event.observed_at_ms;
+        let evidence = serde_json::to_value(&event).map_err(io::Error::other)?;
+        for finding in findings {
+            store.append_policy_alert(&PolicyAlert {
+                session_id: session_id.clone(),
+                tool_use_id: None,
+                severity: finding.severity.to_string(),
+                action: "warn".to_string(),
+                rule_id: finding.rule_id.to_string(),
+                message: finding.message,
+                path: finding.path,
+                evidence: Some(evidence.clone()),
+                observed_at_ms,
+            })?;
+        }
+        if event.decision.result.as_deref() == Some("deny") {
+            store.append_policy_alert(&PolicyAlert {
+                session_id: session_id.clone(),
+                tool_use_id: None,
+                severity: "high".to_string(),
+                action: "block".to_string(),
+                rule_id: event
+                    .decision
+                    .rule_id
+                    .clone()
+                    .unwrap_or_else(|| "endpoint_security_enforced".to_string()),
+                message: event.decision.reason.clone().unwrap_or_else(|| {
+                    "Endpoint Security denied an operating-system action".to_string()
+                }),
+                path: event.primary_path().map(str::to_string),
+                evidence: Some(evidence.clone()),
+                observed_at_ms,
+            })?;
+        }
+        if event.action == "notify" {
+            if let (Some(session_id), Some(path)) = (session_id.as_ref(), event.primary_path()) {
+                let operation = match event.event_type.as_str() {
+                    "open" | "readdir" | "mmap" => Some("read"),
+                    "create" => Some("create"),
+                    "write" | "truncate" => Some("write"),
+                    "close" if event.modified == Some(true) => Some("write"),
+                    "rename" => Some("rename"),
+                    "unlink" => Some("delete"),
+                    _ => None,
+                };
+                if let Some(operation) = operation {
+                    for finding in Policy::global().evaluate_observation(operation, path) {
+                        store.append_policy_alert(&PolicyAlert {
+                            session_id: Some(session_id.clone()),
+                            tool_use_id: None,
+                            severity: finding.severity,
+                            action: "warn".to_string(),
+                            rule_id: if operation == "read" {
+                                "unreported_sensitive_open".to_string()
+                            } else {
+                                finding.rule_id
+                            },
+                            message: finding.message,
+                            path: Some(path.to_string()),
+                            evidence: Some(evidence.clone()),
+                            observed_at_ms,
+                        })?;
+                    }
+                    if matches!(operation, "create" | "write" | "rename" | "delete")
+                        && !store.has_recent_file_intent(path, observed_at_ms)?
+                    {
+                        store.append_policy_alert(&PolicyAlert {
+                            session_id: Some(session_id.clone()),
+                            tool_use_id: None,
+                            severity: "medium".to_string(),
+                            action: "warn".to_string(),
+                            rule_id: "hook_bypass_file_mutation".to_string(),
+                            message: "Agent process mutated a file without a matching hook-level file intent"
+                                .to_string(),
+                            path: Some(path.to_string()),
+                            evidence: Some(evidence.clone()),
+                            observed_at_ms,
+                        })?;
+                    }
+                }
+            }
+        }
+        store.append_system_event(&event.into_system_event()?)?;
+        count += 1;
+    }
+
+    eprintln!("gensee: ingested {count} Endpoint Security event(s), rejected {rejected}");
+    Ok(())
+}
+
 pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     let mut payload = String::new();
     io::stdin().read_to_string(&mut payload)?;
@@ -3406,21 +3560,96 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     };
 
     let event = build_hook_event(&payload, effective_provider)?;
+    let session_registration = hook_session_registration(&event);
 
     // Fast path: if the warm daemon is up, hand off over its socket — PreToolUse
     // waits for the decision (warm eval, no per-call store open), observational
     // events fire-and-forget off the critical path. Falls through to the
     // in-process path if the daemon is unreachable, so enforcement never
     // silently disappears.
-    if dispatch_via_daemon(&payload, &event) {
+    if dispatch_via_daemon(&payload, &event, session_registration.as_ref()) {
         return Ok(());
     }
 
     let store = EventStore::default_local()?;
+    if let Some(registration) = &session_registration {
+        store.append_session(registration)?;
+    }
     if let Some(decision_json) = process_hook_event(&payload, &event, &store)? {
         print!("{decision_json}");
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn hook_session_registration(event: &AgentHookEvent) -> Option<AgentSession> {
+    let session_id = event.session_id.as_ref()?.clone();
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,comm="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut processes = HashMap::<u32, (u32, String)>::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            continue;
+        };
+        let path = parts.collect::<Vec<_>>().join(" ");
+        processes.insert(pid, (ppid, path));
+    }
+    let mut pid = unsafe { libc::getppid() as u32 };
+    let mut selected = None;
+    let provider = event.provider.to_ascii_lowercase();
+    for _ in 0..24 {
+        let (ppid, path) = processes.get(&pid)?.clone();
+        let lower = path.to_ascii_lowercase();
+        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        let recognized = match provider.as_str() {
+            "codex" => name == "codex" || lower.contains("/codex.app/contents/macos/codex"),
+            "claude-code" => name == "claude" || name == "claude-code",
+            "antigravity" => name == "antigravity" || name == "gemini",
+            // Cursor/VS Code may multiplex several agent sessions in one app
+            // process. Do not turn that ambiguous ancestor into an enforcement
+            // root; their OS events remain observable without session binding.
+            _ => false,
+        };
+        if recognized {
+            selected = Some((pid, path));
+            break;
+        }
+        if ppid == 0 || ppid == pid {
+            break;
+        }
+        pid = ppid;
+    }
+    let (root_pid, agent_binary) = selected?;
+    Some(AgentSession {
+        session_id,
+        agent_binary,
+        root_pid,
+        cwd: event.cwd.clone().unwrap_or_default(),
+        repo_path: event.cwd.clone(),
+        mode: Some("hook".to_string()),
+        workspace_mode: None,
+        original_workspace: event.cwd.clone(),
+        staged_workspace: None,
+        sandbox_profile: None,
+        sandbox_profile_path: None,
+        started_at_ms: event.observed_at_ms,
+        ended_at_ms: None,
+        exit_code: None,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hook_session_registration(_event: &AgentHookEvent) -> Option<AgentSession> {
+    None
 }
 
 /// Core per-event processing shared by the in-process path and the daemon.

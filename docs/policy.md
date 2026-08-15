@@ -56,7 +56,9 @@ to parse, or whose `schema_version` differs from the binary's, **fails closed**.
   top of built-in credential-path defaults)
 - `linux.network` — `mode`, `allow`, `deny`
 - `enforcement` — `noninteractive` (escalate medium+ `ask` → `deny`)
-- `watch` — `system_events` (`eslogger` by default; set `none` to disable)
+- `endpoint_security` — `mode`, `protected_paths`, `blocked_executables`,
+  `fail_closed_managed_only`, `max_auth_latency_ms`
+- `watch` — `system_events` (`endpoint-security` by default; set `none` to disable)
 - `allow_path_prefixes` — list (JSON form of `GENSEE_POLICY_ALLOW_PATH_PREFIXES`)
 
 **Precedence: env var > JSON document > built-in default.** The matching

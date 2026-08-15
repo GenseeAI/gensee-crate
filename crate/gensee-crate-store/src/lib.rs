@@ -317,6 +317,14 @@ impl EventStore {
         db.list_alerts().map_err(sqlite_error)
     }
 
+    pub fn has_recent_file_intent(&self, path: &str, observed_at_ms: u64) -> io::Result<bool> {
+        let db = self.sqlite_store()?;
+        let ts = to_i64(observed_at_ms)?;
+        db.request_for_file_intent_path(path, ts, SYSTEM_EVENT_CORRELATION_WINDOW_MS)
+            .map(|event| event.is_some())
+            .map_err(sqlite_error)
+    }
+
     pub fn dashboard_state(&self) -> io::Result<Value> {
         let db = self.sqlite_store()?;
         let conn = db.connection();
@@ -327,6 +335,11 @@ impl EventStore {
                 requests.session_id
              FROM alerts
              LEFT JOIN requests ON requests.request_id = alerts.request_id
+             WHERE NOT (
+                (rule_id = 'unmatched_system_effect'
+                 AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
+                OR rule_id = 'endpoint_security_event_gap'
+             )
              ORDER BY created_at DESC, alert_id DESC
              LIMIT 200",
             |row| {
@@ -375,6 +388,10 @@ impl EventStore {
             conn,
             "SELECT event_id, pid, request_id, ts, source, type, cwd, args
              FROM system_events
+             WHERE NOT (
+                source = 'macos-endpoint-security'
+                AND args LIKE '%\"session_id\":null%'
+             )
              ORDER BY ts DESC, event_id DESC
              LIMIT 200",
             |row| {
@@ -392,10 +409,14 @@ impl EventStore {
         )?;
         let sessions = query_json_rows(
             conn,
-            "SELECT session_id, agent_id, first_event_at, last_event_at, flagged
-             FROM sessions
+            "SELECT s.session_id, s.agent_id, s.first_event_at, s.last_event_at, s.flagged,
+                (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.session_id),
+                (SELECT COUNT(*) FROM agent_events ae
+                   JOIN requests r ON ae.request_id = r.request_id
+                  WHERE r.session_id = s.session_id)
+             FROM sessions s
              ORDER BY COALESCE(last_event_at, first_event_at) DESC
-             LIMIT 20",
+             LIMIT 100",
             |row| {
                 Ok(json!({
                     "session_id": row.get::<_, String>(0)?,
@@ -403,6 +424,8 @@ impl EventStore {
                     "first_event_at": row.get::<_, i64>(2)?,
                     "last_event_at": row.get::<_, Option<i64>>(3)?,
                     "flagged": row.get::<_, i64>(4)?,
+                    "req_count": row.get::<_, i64>(5)?,
+                    "event_count": row.get::<_, i64>(6)?,
                 }))
             },
         )?;
@@ -474,8 +497,76 @@ impl EventStore {
                 }))
             },
         )?;
+        let transaction_events = query_json_rows(
+            conn,
+            "SELECT transaction_event_id, operation_id, environment_kind, operation,
+                phase, source_run_id, target_run_id, parent_run_id, workspace,
+                summary, error_kind, error_message, metadata, occurred_at
+             FROM transaction_events
+             ORDER BY occurred_at DESC, transaction_event_id DESC
+             LIMIT 1000",
+            |row| {
+                let metadata = row
+                    .get::<_, Option<String>>(12)?
+                    .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+                Ok(json!({
+                    "transaction_event_id": row.get::<_, i64>(0)?,
+                    "operation_id": row.get::<_, String>(1)?,
+                    "environment_kind": row.get::<_, String>(2)?,
+                    "operation": row.get::<_, String>(3)?,
+                    "phase": row.get::<_, String>(4)?,
+                    "source_run_id": row.get::<_, Option<String>>(5)?,
+                    "target_run_id": row.get::<_, Option<String>>(6)?,
+                    "parent_run_id": row.get::<_, Option<String>>(7)?,
+                    "workspace": row.get::<_, Option<String>>(8)?,
+                    "summary": row.get::<_, String>(9)?,
+                    "error_kind": row.get::<_, Option<String>>(10)?,
+                    "error_message": row.get::<_, Option<String>>(11)?,
+                    "metadata": metadata,
+                    "occurred_at": row.get::<_, i64>(13)?,
+                }))
+            },
+        )?;
+        let dashboard_summary = query_json_rows(
+            conn,
+            "SELECT
+                (SELECT COUNT(*) FROM sessions),
+                (SELECT COUNT(*) FROM requests),
+                (SELECT COUNT(*) FROM agent_events),
+                (SELECT COUNT(*) FROM system_events
+                  WHERE NOT (
+                    source = 'macos-endpoint-security'
+                    AND args LIKE '%\"session_id\":null%'
+                  )),
+                (SELECT COUNT(*) FROM alerts
+                  WHERE NOT (
+                    (rule_id = 'unmatched_system_effect'
+                     AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
+                    OR rule_id = 'endpoint_security_event_gap'
+                  )),
+                (SELECT COUNT(*) FROM alerts
+                  WHERE severity IN ('high', 'critical')
+                    AND created_at >= (unixepoch('now') - 86400) * 1000
+                    AND rule_id != 'endpoint_security_event_gap'),
+                (SELECT COUNT(*) FROM artifact_facts)",
+            |row| {
+                Ok(json!({
+                    "sessions_count": row.get::<_, i64>(0)?,
+                    "requests_count": row.get::<_, i64>(1)?,
+                    "agent_events_count": row.get::<_, i64>(2)?,
+                    "system_events_count": row.get::<_, i64>(3)?,
+                    "alerts_count": row.get::<_, i64>(4)?,
+                    "recent_high_alerts": row.get::<_, i64>(5)?,
+                    "artifacts_count": row.get::<_, i64>(6)?,
+                }))
+            },
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| json!({}));
         Ok(json!({
             "source": "gensee",
+            "summary": dashboard_summary,
             "alerts": alerts,
             "agentEvents": agent_events,
             "systemEvents": system_events,
@@ -483,6 +574,7 @@ impl EventStore {
             "artifacts": artifacts,
             "relations": relations,
             "humanFeedback": human_feedback,
+            "transactionEvents": transaction_events,
             "hookEvents": self.list_hook_events()?,
             "workspaceEffects": self.list_workspace_effects()?,
             "jsonSessions": self.list_sessions()?,
@@ -924,9 +1016,19 @@ impl EventStore {
         self.with_sqlite_transaction(|db| {
             let ts = to_i64(event.observed_at_ms)?;
             let matched_agent_event = agent_event_for_system_event(db, event, ts)?;
-            let request_id = match &matched_agent_event {
-                Some(agent_event) => agent_event.request_id,
-                None => system_request_id(db, event.observed_at_ms)?,
+            let endpoint_session_id = endpoint_security_session_id(event);
+            let request_id = if let Some(session_id) = endpoint_session_id.as_deref() {
+                ensure_session(
+                    db,
+                    session_id,
+                    "macos-endpoint-security",
+                    event.observed_at_ms,
+                )?;
+                latest_or_create_request(db, session_id)?
+            } else if let Some(agent_event) = &matched_agent_event {
+                agent_event.request_id
+            } else {
+                system_request_id(db, event.observed_at_ms)?
             };
 
             let event_id = db
@@ -940,7 +1042,8 @@ impl EventStore {
                     args: Some(event.raw_json.clone()),
                 })
                 .map_err(sqlite_error)?;
-            let matched = matched_agent_event.is_some();
+            let process_tree_matched = endpoint_session_id.is_some();
+            let matched = matched_agent_event.is_some() || process_tree_matched;
             if let Some(agent_event) = matched_agent_event {
                 insert_entity_relation(
                     db,
@@ -956,8 +1059,23 @@ impl EventStore {
                     ts,
                 )?;
             }
+            if process_tree_matched {
+                insert_entity_relation(
+                    db,
+                    EntityRef::request(request_id),
+                    EntityRef::system_event(event_id),
+                    "observed",
+                    1.0,
+                    Some(json!({
+                        "matched_by": "endpoint_security_process_tree",
+                        "session_id": endpoint_session_id,
+                        "system_event_type": event.event_type,
+                    })),
+                    ts,
+                )?;
+            }
             record_system_event_artifacts(db, request_id, event_id, event, ts, matched)?;
-            if !matched {
+            if !matched && event.source != "macos-endpoint-security" {
                 record_unmatched_system_event_alert(db, request_id, event_id, event, ts)?;
             }
 
@@ -1985,6 +2103,19 @@ fn text_from_raw_json(raw_json: &str, keys: &[&str]) -> Option<String> {
         .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
+fn endpoint_security_session_id(event: &SystemEvent) -> Option<String> {
+    if event.source != "macos-endpoint-security" {
+        return None;
+    }
+    serde_json::from_str::<Value>(&event.raw_json)
+        .ok()?
+        .get("attribution")?
+        .get("session_id")?
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
 fn system_event_paths(event: &SystemEvent) -> Vec<String> {
     let mut paths = BTreeSet::new();
     if let Some(path) = &event.file_path {
@@ -2065,6 +2196,7 @@ fn artifact_access(operation: &str) -> ArtifactAccess {
 
 fn system_artifact_relation_type(event_type: &str) -> &'static str {
     match event_type {
+        value if value.starts_with("auth_") => "attempted_access",
         "open" | "lookup" | "access" | "stat" | "getattrlist" | "readlink" | "readdir"
         | "getextattr" | "listextattr" | "fsgetpath" => "read_by",
         "unlink" => "deleted",
@@ -2077,6 +2209,7 @@ fn system_artifact_relation_type(event_type: &str) -> &'static str {
 
 fn request_artifact_relation_type(event_type: &str) -> &'static str {
     match event_type {
+        value if value.starts_with("auth_") => "attempted_access",
         "open" | "lookup" | "access" | "stat" | "getattrlist" | "readlink" | "readdir"
         | "getextattr" | "listextattr" | "fsgetpath" => "consumed_by",
         "unlink" => "deleted",
@@ -3063,6 +3196,78 @@ mod tests {
                 .len(),
             0
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unattributed_endpoint_security_events_do_not_create_legacy_unmatched_alerts() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-endpoint-global-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_system_event(&SystemEvent {
+                source: "macos-endpoint-security".to_string(),
+                event_type: "write".to_string(),
+                event_kind: "file_mutation".to_string(),
+                observed_at_ms: 130,
+                pid: Some(42),
+                ppid: Some(1),
+                process_name: Some("unmanaged".to_string()),
+                executable_path: Some("/usr/bin/unmanaged".to_string()),
+                file_path: Some("/private/tmp/unmanaged.txt".to_string()),
+                command_line: None,
+                raw_json: r#"{"attribution":{"session_id":null}}"#.to_string(),
+            })
+            .unwrap();
+
+        assert!(store
+            .list_alerts()
+            .unwrap()
+            .iter()
+            .all(|alert| alert.rule_id != "unmatched_system_effect"));
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["systemEvents"].as_array().unwrap().len(), 0);
+        assert_eq!(dashboard["summary"]["system_events_count"], 0);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_hides_legacy_endpoint_sequence_gap_alerts() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-endpoint-gap-dashboard-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let db = store.sqlite_store().unwrap();
+        insert_alert(
+            &db,
+            AlertInput {
+                request_id: None,
+                entity: None,
+                severity: "high",
+                action: "warn",
+                rule_id: "endpoint_security_event_gap",
+                message: "legacy prototype sequence gap",
+                path: None,
+                evidence: None,
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+            },
+        )
+        .unwrap();
+        drop(db);
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 0);
+        assert_eq!(dashboard["summary"]["alerts_count"], 0);
+        assert_eq!(dashboard["summary"]["recent_high_alerts"], 0);
 
         fs::remove_dir_all(&dir).ok();
     }
