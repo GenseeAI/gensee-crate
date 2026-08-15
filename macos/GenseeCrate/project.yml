@@ -70,18 +70,21 @@ targets:
         script: |
           set -euo pipefail
           REPOSITORY_ROOT="$PROJECT_DIR/../.."
-          if [ "$CONFIGURATION" = "Release" ]; then
-            cargo build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" -p gensee-crate-cli --release
-            GENSEE_PROFILE="release"
-          else
-            cargo build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" -p gensee-crate-cli
-            GENSEE_PROFILE="debug"
-          fi
           GENSEE_RESOURCES="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/bin"
           mkdir -p "$GENSEE_RESOURCES"
-          cp "$REPOSITORY_ROOT/target/$GENSEE_PROFILE/gensee" "$GENSEE_RESOURCES/gensee"
+          if [ "$CONFIGURATION" = "Release" ]; then
+            cargo build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" -p gensee-crate-cli --release --target aarch64-apple-darwin
+            cargo build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" -p gensee-crate-cli --release --target x86_64-apple-darwin
+            /usr/bin/lipo -create \
+              "$REPOSITORY_ROOT/target/aarch64-apple-darwin/release/gensee" \
+              "$REPOSITORY_ROOT/target/x86_64-apple-darwin/release/gensee" \
+              -output "$GENSEE_RESOURCES/gensee"
+          else
+            cargo build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" -p gensee-crate-cli
+            cp "$REPOSITORY_ROOT/target/debug/gensee" "$GENSEE_RESOURCES/gensee"
+          fi
           if [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ] && [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]; then
-            /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --identifier ai.gensee.crate.cli "$GENSEE_RESOURCES/gensee"
+            /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --identifier ai.gensee.crate.cli --options runtime --timestamp "$GENSEE_RESOURCES/gensee"
           fi
     dependencies:
       - target: GenseeCrateEndpointSecurity

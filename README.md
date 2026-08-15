@@ -25,6 +25,8 @@
   <a href="https://crate-docs.gensee.ai">Docs</a>
   ·
   <a href="https://www.gensee.ai/discord">Join Discord</a>
+  ·
+  <strong><a href="https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg">⬇️ Download the macOS app</a></strong>
 </p>
 
 <p align="center">

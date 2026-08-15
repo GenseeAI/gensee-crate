@@ -128,6 +128,36 @@ systemextensionsctl developer on
 That command requires administrator approval and should only be used on a
 development Mac.
 
+## Publish a macOS release
+
+Public builds must be universal, Developer ID signed, notarized by Apple, and
+stapled before upload. Store notarization credentials in the login keychain;
+never put them in the repository or a shell script:
+
+```bash
+xcrun notarytool store-credentials gensee-crate \
+  --apple-id "developer@example.com" \
+  --team-id "3KWVB4M63F"
+```
+
+The command securely prompts for an app-specific password. Then run the
+release script from the repository root with the version declared as
+`MARKETING_VERSION` in `project.yml`:
+
+```bash
+NOTARYTOOL_PROFILE=gensee-crate ./scripts/release_macos_app.sh 0.2.4
+```
+
+The script builds the host, system extension, and embedded Rust CLI for both
+Apple silicon and Intel; exports them with Developer ID signing; creates and
+notarizes `dist/Gensee-Crate.dmg`; and staples Apple's ticket. Create the
+GitHub release only after the script completes successfully. Keep the asset
+name `Gensee-Crate.dmg` so the stable public URL remains:
+
+```text
+https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg
+```
+
 ## Regenerating the Xcode project
 
 `project.yml` is the source of truth for target structure and signing

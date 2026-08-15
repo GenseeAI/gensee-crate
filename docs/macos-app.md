@@ -109,3 +109,17 @@ Certificates, private keys, `.p12` files, provisioning profiles, notarization
 credentials, archives, and built app/DMG artifacts must never be committed.
 Entitlement plist files, bundle identifiers, and Xcode build configuration are
 safe and intentionally versioned.
+
+## Download and release
+
+The latest notarized public build is available from the
+[GitHub Releases download](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg).
+Move **Gensee Crate.app** from the disk image to `/Applications` before
+activating the system extension.
+
+Maintainers publish with `scripts/release_macos_app.sh`. It creates a universal
+Developer ID build, verifies the host app, Endpoint Security extension, and
+embedded OSS CLI, submits the disk image to Apple's notarization service, and
+staples the result. The script requires a `notarytool` keychain profile through
+`NOTARYTOOL_PROFILE`; credentials and release artifacts stay outside version
+control. See `macos/GenseeCrate/README.md` for the exact release procedure.
