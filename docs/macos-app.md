@@ -43,6 +43,16 @@ unrelated user settings and hooks. Harnesses that are not installed remain
 visible but muted and unavailable. Use **Scan again** after installing or
 removing a harness outside Gensee Crate.
 
+For enabled integrations, the app verifies that every supported lifecycle
+event has a Gensee hook, every hook targets the app's active event store and
+backend executable, and harness-level settings do not disable execution. An
+unhealthy integration remains visibly enabled but changes to **Needs repair**;
+its Observe and Enforce indicators turn off so stale configuration is not
+presented as protection. **Repair** safely replaces stale or partial
+Gensee-owned entries. For Claude Code, an explicit repair also changes
+`disableAllHooks` from `true` to `false` while preserving the rest of the
+settings file.
+
 Omnigent currently has no direct hook switch. Launch it with `gensee run` to
 place its process tree under Gensee monitoring and supported policy
 enforcement.

@@ -379,11 +379,13 @@ struct IntegrationDescriptor: Identifiable, Equatable {
     var configured: Bool
 
     var canToggle: Bool { installed && supportsDirectHooks }
+    var isHealthy: Bool { configured && configurationIssue == nil }
+    var requiresRepair: Bool { canToggle && configured && configurationIssue != nil }
 
     var statusLabel: String {
         if !installed { return "Not installed" }
         if !supportsDirectHooks { return "Managed launch only" }
-        if configurationIssue != nil { return "Needs attention" }
+        if requiresRepair { return "Needs repair" }
         return configured ? "Protected" : "Ready to enable"
     }
 }

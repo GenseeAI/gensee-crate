@@ -12,6 +12,7 @@
 		084354B2A7A75325026F3D73 /* GenseeCrateEndpointSecurity.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = ADF9199FEAE114BBFADFEDDB /* GenseeCrateEndpointSecurity.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		0A89B2A6582326443FD14EEF /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 710E9EC4A241B8850EB0EB60 /* main.m */; };
 		2A060F6B2698D71FBAA89ADB /* GenseeCrateApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A3D55DA761A91C70B3F68CB /* GenseeCrateApp.swift */; };
+		30D03A7F9A136550F0A72DE7 /* HarnessConfigurationHealthTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDC43B9627D7C217071C5275 /* HarnessConfigurationHealthTests.swift */; };
 		342907D8F3EE64BED760F9F9 /* ConsoleModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8473EB5830E8F39EB110349 /* ConsoleModels.swift */; };
 		3D884526B883F80941BD09BD /* DashboardActivityPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 606554A9090B30CB60EEC12A /* DashboardActivityPages.swift */; };
 		3F9DAD52588ED94CD01C84AC /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FBE05DBB986CBCE7BE09ED0 /* ContentView.swift */; };
@@ -24,8 +25,10 @@
 		AF95DF2961EB5EB25758D917 /* DashboardComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3722B66B15A9D0C6A0542AB1 /* DashboardComponents.swift */; };
 		B3A01A811214C31B36C00F18 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C1B023EFF7B2DE9556556E9E /* Assets.xcassets */; };
 		B4EC3AFD2169905AA662360D /* ConsoleModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92AD1DC256F292439A6C70BA /* ConsoleModel.swift */; };
+		C1CFBA97FF43FD867550E37E /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
 		CEBB5434E3FFBD87829EB8C0 /* DashboardHarnessesPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */; };
 		D50CF93055DEC2DF49AD2240 /* libEndpointSecurity.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C7E850A448A571324F7CA4F /* libEndpointSecurity.tbd */; };
+		DF38FDB826769C79187233CA /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
 		FC2ACB45E9ADD76BD8EBAFA1 /* GenseeCLI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B06211CB7A3B1543D9B7B5D /* GenseeCLI.swift */; };
 		FC7C99ABF3344039085F8FE9 /* SystemExtensions.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 646FCF1F1969644B69EFB35E /* SystemExtensions.framework */; };
 		FF12BE5F512989900F05B603 /* libbsm.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 393E28A9F1D61AA09BA25DC8 /* libbsm.tbd */; };
@@ -57,6 +60,7 @@
 
 /* Begin PBXFileReference section */
 		23D1D4F2FC41CDD9893C88C2 /* DashboardSecurityPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardSecurityPages.swift; sourceTree = "<group>"; };
+		33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HarnessConfigurationHealth.swift; sourceTree = "<group>"; };
 		35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardHarnessesPage.swift; sourceTree = "<group>"; };
 		3722B66B15A9D0C6A0542AB1 /* DashboardComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardComponents.swift; sourceTree = "<group>"; };
 		393E28A9F1D61AA09BA25DC8 /* libbsm.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libbsm.tbd; path = usr/lib/libbsm.tbd; sourceTree = SDKROOT; };
@@ -78,6 +82,8 @@
 		C27E47B1FED91B645603F7B8 /* EndpointSecuritySensor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointSecuritySensor.swift; sourceTree = "<group>"; };
 		C8473EB5830E8F39EB110349 /* ConsoleModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsoleModels.swift; sourceTree = "<group>"; };
 		D5CBE9AE8A3819CA0AF3116D /* Brand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Brand.swift; sourceTree = "<group>"; };
+		EA24B5D008AE2C71CB3FC844 /* GenseeCrateHarnessTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GenseeCrateHarnessTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		EDC43B9627D7C217071C5275 /* HarnessConfigurationHealthTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HarnessConfigurationHealthTests.swift; sourceTree = "<group>"; };
 		FA20B771E8184937A5C2C57E /* EndpointSecurityExtensionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointSecurityExtensionManager.swift; sourceTree = "<group>"; };
 		FF1B808391332D1FC13CD1D0 /* DashboardConfigPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardConfigPages.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -124,8 +130,17 @@
 				8A3D55DA761A91C70B3F68CB /* GenseeCrateApp.swift */,
 				B25B76EA154890044AB13C42 /* GenseeEndpointSecurityBridge.h */,
 				5F1702DD7F563FB2B6DE975E /* GenseeEndpointSecurityBridge.m */,
+				33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */,
 			);
 			path = Host;
+			sourceTree = "<group>";
+		};
+		40E381BF48378ACA4DDA0CCF /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				EDC43B9627D7C217071C5275 /* HarnessConfigurationHealthTests.swift */,
+			);
+			path = Tests;
 			sourceTree = "<group>";
 		};
 		56385FD66570FC4349E724E3 /* Frameworks */ = {
@@ -151,6 +166,7 @@
 			children = (
 				7E4A8A78340952674B35776F /* GenseeCrate.app */,
 				ADF9199FEAE114BBFADFEDDB /* GenseeCrateEndpointSecurity.systemextension */,
+				EA24B5D008AE2C71CB3FC844 /* GenseeCrateHarnessTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -160,6 +176,7 @@
 			children = (
 				5ECC1E060C5D10191A581373 /* EndpointSecurityExtension */,
 				1856380B5FB50790F4546C93 /* Host */,
+				40E381BF48378ACA4DDA0CCF /* Tests */,
 				56385FD66570FC4349E724E3 /* Frameworks */,
 				AA79DDC9A1C3210D49161EE0 /* Products */,
 			);
@@ -168,6 +185,23 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		3EF66EB313E503EE013D6C3D /* GenseeCrateHarnessTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 39FBEF9177939BD4A910C6F9 /* Build configuration list for PBXNativeTarget "GenseeCrateHarnessTests" */;
+			buildPhases = (
+				E87884EA8F44707D48DE2D88 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = GenseeCrateHarnessTests;
+			packageProductDependencies = (
+			);
+			productName = GenseeCrateHarnessTests;
+			productReference = EA24B5D008AE2C71CB3FC844 /* GenseeCrateHarnessTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		C6621234195F53E9D3C6A708 /* GenseeCrateEndpointSecurity */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = AE64166EE2F793774BB3845A /* Build configuration list for PBXNativeTarget "GenseeCrateEndpointSecurity" */;
@@ -217,6 +251,10 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1620;
 				TargetAttributes = {
+					3EF66EB313E503EE013D6C3D = {
+						DevelopmentTeam = 3KWVB4M63F;
+						ProvisioningStyle = Automatic;
+					};
 					C6621234195F53E9D3C6A708 = {
 						DevelopmentTeam = 3KWVB4M63F;
 						ProvisioningStyle = Automatic;
@@ -243,6 +281,7 @@
 			targets = (
 				EE8F32919081C8457EAA3B80 /* GenseeCrate */,
 				C6621234195F53E9D3C6A708 /* GenseeCrateEndpointSecurity */,
+				3EF66EB313E503EE013D6C3D /* GenseeCrateHarnessTests */,
 			);
 		};
 /* End PBXProject section */
@@ -309,6 +348,16 @@
 				FC2ACB45E9ADD76BD8EBAFA1 /* GenseeCLI.swift in Sources */,
 				2A060F6B2698D71FBAA89ADB /* GenseeCrateApp.swift in Sources */,
 				051752191996C457E065E5B0 /* GenseeEndpointSecurityBridge.m in Sources */,
+				DF38FDB826769C79187233CA /* HarnessConfigurationHealth.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E87884EA8F44707D48DE2D88 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C1CFBA97FF43FD867550E37E /* HarnessConfigurationHealth.swift in Sources */,
+				30D03A7F9A136550F0A72DE7 /* HarnessConfigurationHealthTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -358,6 +407,24 @@
 				PRODUCT_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+		7C1D15DB97EC08114217E181 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "ai.gensee.crate.harness-tests";
+				SDKROOT = macosx;
+				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
 		};
@@ -532,9 +599,36 @@
 			};
 			name = Release;
 		};
+		F7E12DECCAD7E30502C968C0 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "ai.gensee.crate.harness-tests";
+				SDKROOT = macosx;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		39FBEF9177939BD4A910C6F9 /* Build configuration list for PBXNativeTarget "GenseeCrateHarnessTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F7E12DECCAD7E30502C968C0 /* Debug */,
+				7C1D15DB97EC08114217E181 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		4DBFAD267E4D558ACCF2FC7D /* Build configuration list for PBXNativeTarget "GenseeCrate" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

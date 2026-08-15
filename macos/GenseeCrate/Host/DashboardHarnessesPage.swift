@@ -8,7 +8,7 @@ struct DashboardHarnessesPage: View {
     }
 
     private var protectedCount: Int {
-        model.integrations.filter { $0.installed && $0.configured && $0.supportsDirectHooks }.count
+        model.integrations.filter { $0.installed && $0.isHealthy && $0.supportsDirectHooks }.count
     }
 
     private var hookCapableInstalledCount: Int {
@@ -44,7 +44,7 @@ struct DashboardHarnessesPage: View {
                 HStack(alignment: .top, spacing: 9) {
                     Image(systemName: "info.circle")
                         .foregroundStyle(.secondary)
-                    Text("Switches install or remove only Gensee-owned hooks; other harness settings and hooks are preserved. Protection behavior follows the active policy. Omnigent currently requires a managed `gensee run` launch because it does not yet expose a first-class policy bridge.")
+                    Text("Gensee verifies hook coverage, the active event-store path, the backend executable, and harness-specific blockers. Repair rewrites only Gensee-owned entries; unrelated settings and hooks are preserved. Omnigent currently requires a managed `gensee run` launch because it does not yet expose a first-class policy bridge.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -144,9 +144,22 @@ struct DashboardHarnessesPage: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
+            if integration.requiresRepair {
+                Button {
+                    Task { await model.repairIntegration(integration.id) }
+                } label: {
+                    Label("Repair", systemImage: "wrench.and.screwdriver")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!model.backendAvailable || model.runningCommand != nil)
+                .help("Reconnect \(integration.name) hooks to this app's event store and backend.")
+                .accessibilityLabel("Repair \(integration.name) protection")
+            }
+
             HStack(spacing: 6) {
-                coverageLabel("Observe", active: integration.canToggle && integration.configured)
-                coverageLabel("Enforce", active: integration.canToggle && integration.configured)
+                coverageLabel("Observe", active: integration.canToggle && integration.isHealthy)
+                coverageLabel("Enforce", active: integration.canToggle && integration.isHealthy)
             }
             .frame(width: 150, alignment: .trailing)
 
@@ -162,14 +175,14 @@ struct DashboardHarnessesPage: View {
             .labelsHidden()
             .toggleStyle(.switch)
             .tint(.dashboardRed)
-            .disabled(!integration.canToggle || !model.backendAvailable)
+            .disabled(!integration.canToggle || !model.backendAvailable || model.runningCommand != nil)
             .help(toggleHelp(integration))
             .frame(width: 48)
         }
         .padding(.vertical, 13)
         .contentShape(Rectangle())
         .opacity(integration.installed ? 1 : 0.42)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 
     private func coverageLabel(_ label: String, active: Bool) -> some View {
@@ -197,6 +210,9 @@ struct DashboardHarnessesPage: View {
             return "Omnigent protection currently requires launching it with gensee run."
         }
         if !model.backendAvailable { return "The bundled Gensee backend is unavailable." }
+        if integration.requiresRepair {
+            return "Gensee hooks are present but unhealthy. Turn this off to remove them, or use Repair."
+        }
         return integration.configured
             ? "Remove Gensee hooks while preserving unrelated harness settings."
             : "Install Gensee monitoring and policy hooks."

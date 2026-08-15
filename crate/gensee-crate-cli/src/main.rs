@@ -883,6 +883,7 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
     let mut bin_path = env::current_exe()?;
     let mut gateway = ClaudeCodeGatewaySettings::default();
     let mut disable = false;
+    let mut repair = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -892,6 +893,10 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
         match arg {
             "--disable" => {
                 disable = true;
+                index += 1;
+            }
+            "--repair" => {
+                repair = true;
                 index += 1;
             }
             "--yes" => {
@@ -946,7 +951,7 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup claude-code [--disable] [--gensee-home <path>] [--settings <path>] [--bin <path>] [--anthropic-base-url <url>] [--anthropic-auth-token <token>|--anthropic-api-key <key>|--api-key-helper <command>]"
+                    "usage: gensee setup claude-code [--disable|--repair] [--gensee-home <path>] [--settings <path>] [--bin <path>] [--anthropic-base-url <url>] [--anthropic-auth-token <token>|--anthropic-api-key <key>|--api-key-helper <command>]"
                 );
                 return Ok(());
             }
@@ -979,7 +984,7 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
     gensee_home = absolutize_for_hook(&gensee_home)?;
     bin_path = absolutize_for_hook(&bin_path)?;
     let command = claude_code_hook_command(&gensee_home, &bin_path);
-    let hooks_disabled = write_claude_code_settings(&settings_path, &command, &gateway)?;
+    let hooks_disabled = write_claude_code_settings(&settings_path, &command, &gateway, repair)?;
 
     println!(
         "gensee setup: configured Claude Code hooks in {}",
@@ -987,6 +992,9 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
     );
     if !gateway.is_empty() {
         println!("gensee setup: configured Claude Code gateway routing.");
+    }
+    if repair {
+        println!("gensee setup: repaired Claude Code hook activation and routing.");
     }
     if let Some(warning) = claude_code_disabled_hooks_warning(hooks_disabled) {
         eprintln!("{warning}");
@@ -2002,10 +2010,16 @@ fn write_claude_code_settings(
     settings_path: &Path,
     command: &str,
     gateway: &ClaudeCodeGatewaySettings,
+    repair_disabled_hooks: bool,
 ) -> io::Result<bool> {
     let (existing_contents, mut root) = read_json_config(settings_path)?;
     apply_claude_code_hook_settings(&mut root, command)?;
     apply_claude_code_gateway_settings(&mut root, gateway)?;
+    if repair_disabled_hooks && root.get("disableAllHooks").and_then(Value::as_bool) == Some(true) {
+        root.as_object_mut()
+            .expect("Claude Code settings are an object after hook configuration")
+            .insert("disableAllHooks".to_string(), json!(false));
+    }
     let hooks_disabled = root
         .get("disableAllHooks")
         .and_then(Value::as_bool)

@@ -35,6 +35,7 @@ targets:
       - Host/GenseeEndpointSecurityBridge.h
       - Host/GenseeEndpointSecurityBridge.m
       - Host/GenseeCLI.swift
+      - Host/HarnessConfigurationHealth.swift
       - Host/ConsoleModels.swift
       - Host/ConsoleModel.swift
       - Host/Brand.swift
@@ -114,3 +115,27 @@ targets:
     dependencies:
       - sdk: libEndpointSecurity.tbd
       - sdk: libbsm.tbd
+
+  GenseeCrateHarnessTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Host/HarnessConfigurationHealth.swift
+      - Tests/HarnessConfigurationHealthTests.swift
+    settings:
+      base:
+        CODE_SIGNING_ALLOWED: NO
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: ai.gensee.crate.harness-tests
+        SWIFT_VERSION: 5.0
+
+schemes:
+  GenseeCrateHarnessTests:
+    build:
+      targets:
+        GenseeCrateHarnessTests: all
+    test:
+      config: Debug
+      gatherCoverageData: true
+      targets:
+        - GenseeCrateHarnessTests

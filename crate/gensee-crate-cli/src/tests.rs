@@ -517,6 +517,7 @@ fn claude_code_setup_reports_disabled_hooks_without_changing_setting() {
         &settings_path,
         "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
         &ClaudeCodeGatewaySettings::default(),
+        false,
     )
     .unwrap();
 
@@ -529,6 +530,53 @@ fn claude_code_setup_reports_disabled_hooks_without_changing_setting() {
     let updated: Value =
         serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
     assert_eq!(updated["disableAllHooks"], json!(true));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn claude_code_repair_enables_hooks_without_losing_other_settings() {
+    let root = env::temp_dir().join(format!(
+        "gensee-claude-repair-hooks-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let settings_path = root.join("settings.json");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&json!({
+            "disableAllHooks": true,
+            "theme": "dark",
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Read",
+                    "hooks": [{"type": "command", "command": "./keep-me.sh"}]
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let hooks_disabled = write_claude_code_settings(
+        &settings_path,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
+        &ClaudeCodeGatewaySettings::default(),
+        true,
+    )
+    .unwrap();
+
+    assert!(!hooks_disabled);
+    let updated: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(updated["disableAllHooks"], json!(false));
+    assert_eq!(updated["theme"], json!("dark"));
+    assert!(updated["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .any(|hook| hook["command"] == json!("./keep-me.sh")));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -566,6 +614,7 @@ fn claude_code_setup_updates_symlink_target_without_replacing_link() {
         &settings_path,
         "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
         &ClaudeCodeGatewaySettings::default(),
+        false,
     )
     .unwrap();
 
@@ -626,6 +675,7 @@ fn claude_code_setup_rejects_dangling_settings_symlink() {
         &settings_path,
         "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
         &ClaudeCodeGatewaySettings::default(),
+        false,
     )
     .unwrap_err();
 
@@ -664,6 +714,7 @@ fn claude_code_setup_creates_new_settings_owner_only() {
         &settings_path,
         "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
         &gateway,
+        false,
     )
     .unwrap();
 

@@ -226,6 +226,41 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
+    func repairIntegration(_ provider: String) async {
+        guard let integration = integrations.first(where: { $0.id == provider }),
+              integration.canToggle,
+              integration.requiresRepair
+        else { return }
+        guard backendAvailable else {
+            errorMessage = GenseeCLIError.executableNotFound.localizedDescription
+            return
+        }
+
+        runningCommand = "Repairing \(integration.name) protection"
+        defer { runningCommand = nil }
+        do {
+            var arguments = ["setup", provider, "--gensee-home", homeURL.path]
+            if provider == "claude-code" {
+                arguments.append("--repair")
+            }
+            let output = try await cli.run(arguments)
+            refreshIntegrations()
+            if let updated = integrations.first(where: { $0.id == provider }),
+               let issue = updated.configurationIssue
+            {
+                errorMessage = "\(updated.name) still needs repair: \(issue)"
+            } else {
+                let detail = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                noticeMessage = detail.isEmpty
+                    ? "\(integration.name) protection was repaired."
+                    : detail
+            }
+        } catch {
+            refreshIntegrations()
+            errorMessage = error.localizedDescription
+        }
+    }
+
     func refreshHarnesses() {
         refreshIntegrations()
     }
@@ -319,14 +354,21 @@ final class ConsoleModel: ObservableObject {
         integrations = definitions.map { provider, name, detail, relativePath, symbol, installed, supportsDirectHooks, installationDetail in
             let path = home.appendingPathComponent(relativePath)
             let contents = (try? String(contentsOf: path, encoding: .utf8)) ?? ""
-            let configured = contents.localizedCaseInsensitiveContains("hook \(provider)")
-                && contents.localizedCaseInsensitiveContains("gensee")
-            let configurationIssue: String?
-            if provider == "claude-code", configured, Self.claudeHooksDisabled(contents) {
-                configurationIssue = "Claude Code has disableAllHooks enabled. Turn it off in settings before relying on protection."
-            } else {
-                configurationIssue = nil
+            let expectedCommand = cli.executableURL.map {
+                HarnessConfigurationHealth.expectedCommand(
+                    provider: provider,
+                    homeURL: homeURL,
+                    backendURL: $0
+                )
             }
+            let inspection = supportsDirectHooks
+                ? HarnessConfigurationHealth.inspect(
+                    provider: provider,
+                    contents: contents,
+                    expectedCommand: expectedCommand,
+                    eventStorePath: homeURL.path
+                )
+                : HarnessConfigurationInspection(configured: false, issue: nil)
             return IntegrationDescriptor(
                 id: provider,
                 name: name,
@@ -336,8 +378,8 @@ final class ConsoleModel: ObservableObject {
                 installed: installed,
                 supportsDirectHooks: supportsDirectHooks,
                 installationDetail: installationDetail,
-                configurationIssue: configurationIssue,
-                configured: configured
+                configurationIssue: inspection.issue,
+                configured: inspection.configured
             )
         }
     }
@@ -449,13 +491,6 @@ final class ConsoleModel: ObservableObject {
             return publisher.caseInsensitiveCompare("github") == .orderedSame
                 && (normalizedName == "copilot" || normalizedName == "copilot-chat")
         }
-    }
-
-    private static func claudeHooksDisabled(_ contents: String) -> Bool {
-        guard let data = contents.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return false }
-        return root["disableAllHooks"] as? Bool == true
     }
 
     private func configureEndpointSensor() {

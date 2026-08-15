@@ -311,6 +311,14 @@ gensee setup vscode --disable
 gensee setup cursor --disable
 ```
 
+The native app's **Repair** action reruns setup with its active event store and
+embedded backend. For Claude Code, the equivalent explicit CLI repair also
+reenables globally disabled hooks:
+
+```bash
+gensee setup claude-code --repair --gensee-home "$GENSEE_HOME"
+```
+
 The setup commands merge Gensee into the previous hook settings, update
 `~/.claude/settings.json`, `~/.codex/hooks.json`, or
 `~/.gemini/config/hooks.json` or `~/.cursor/hooks.json`, or write
@@ -374,8 +382,10 @@ system extension, and grant Gensee Crate Full Disk Access. `eslogger` remains an
 optional manual diagnostic backend. The app's Harnesses page detects Codex,
 Claude Code, Antigravity, Cursor, GitHub Copilot, and Omnigent. Installed
 direct-hook harnesses can be enabled or disabled; unavailable harnesses stay
-visible but muted. See the [native macOS security console](docs/macos-app.md)
-guide.
+visible but muted. Enabled hooks are also checked for full event coverage and
+the app's active event-store/backend paths; stale or incomplete integrations
+show **Needs repair** with a one-click safe repair. See the
+[native macOS security console](docs/macos-app.md) guide.
 
 **Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
 `sandbox-exec` and can stage workspace writes for review.

@@ -80,6 +80,15 @@ Then configure Claude Code to use the local gateway:
   --anthropic-auth-token local-gateway-token
 ```
 
+If Gensee hooks exist but point at an old event store or binary, rerun setup
+with the intended values. Use `--repair` when `disableAllHooks` is also `true`;
+this explicitly changes it to `false` while preserving unrelated Claude Code
+settings and hooks:
+
+```bash
+gensee setup claude-code --repair --gensee-home "$GENSEE_HOME"
+```
+
 The gateway screens JSON request bodies before forwarding to Anthropic. By
 default it blocks invisible/bidirectional/variation/tag Unicode markers anywhere
 in the request, and blocks variant punctuation in trusted prompt scaffolding such
