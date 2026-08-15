@@ -547,6 +547,7 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
     migrate_alert_hash_chain(&conn).map_err(SqliteError::Schema)?;
     migrate_agent_event_tool_use_id(&conn).map_err(SqliteError::Schema)?;
     migrate_request_activity_fields(&conn).map_err(SqliteError::Schema)?;
+    migrate_session_token_usage(&conn).map_err(SqliteError::Schema)?;
 
     conn.execute_batch(include_str!("../schema.sql"))
         .map_err(SqliteError::Schema)?;
@@ -730,19 +731,30 @@ impl SqliteStore {
     ) -> Result<(), SqliteError> {
         let total_tokens = cumulative_session_tokens
             .map(|cumulative| {
-                let earlier: i64 = self.conn.query_row(
-                    "SELECT COALESCE(SUM(total_tokens), 0)
-                     FROM requests
-                     WHERE session_id = (SELECT session_id FROM requests WHERE request_id = ?1)
-                       AND request_id < ?1",
+                let session_id: String = self.conn.query_row(
+                    "SELECT session_id FROM requests WHERE request_id = ?1",
                     [request_id],
                     |row| row.get(0),
                 )?;
-                Ok::<i64, rusqlite::Error>(if cumulative >= earlier {
-                    cumulative - earlier
-                } else {
-                    cumulative
-                })
+                let previous = self
+                    .conn
+                    .query_row(
+                        "SELECT last_cumulative_tokens FROM session_token_usage WHERE session_id = ?1",
+                        [&session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                self.conn.execute(
+                    "INSERT INTO session_token_usage (session_id, last_cumulative_tokens, updated_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                       last_cumulative_tokens = excluded.last_cumulative_tokens,
+                       updated_at = excluded.updated_at",
+                    params![session_id, cumulative, completed_at],
+                )?;
+                Ok::<i64, rusqlite::Error>(previous
+                    .map(|baseline| cumulative.saturating_sub(baseline).max(0))
+                    .unwrap_or(0))
             })
             .transpose()
             .map_err(SqliteError::Database)?;
@@ -751,7 +763,7 @@ impl SqliteStore {
             .execute(
                 "UPDATE requests
                  SET completed_at = ?2,
-                     total_tokens = COALESCE(?3, total_tokens)
+                     total_tokens = COALESCE(total_tokens, ?3)
                  WHERE request_id = ?1",
                 params![request_id, completed_at, total_tokens],
             )
@@ -1922,6 +1934,17 @@ fn migrate_request_activity_fields(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+fn migrate_session_token_usage(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_token_usage (
+            session_id TEXT PRIMARY KEY,
+            last_cumulative_tokens INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+         );",
+    )
+}
+
 fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -2154,6 +2177,7 @@ mod tests {
         for table in [
             "sessions",
             "requests",
+            "session_token_usage",
             "agent_events",
             "system_events",
             "artifacts",
@@ -2181,6 +2205,67 @@ mod tests {
             std::fs::remove_file(path.with_file_name(format!("{}-wal", db_name.to_string_lossy())));
         let _ =
             std::fs::remove_file(path.with_file_name(format!("{}-shm", db_name.to_string_lossy())));
+    }
+
+    #[test]
+    fn cumulative_token_usage_starts_with_a_baseline_and_records_deltas() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-token-delta-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .insert_session(&NewSession {
+                session_id: "legacy-session".to_string(),
+                agent_id: "claude-code".to_string(),
+                first_event_at: 1,
+                last_event_at: None,
+                flagged: false,
+            })
+            .unwrap();
+
+        let insert_request = || {
+            store
+                .insert_request(&NewRequest {
+                    session_id: "legacy-session".to_string(),
+                    original_user_prompt: Some("turn".to_string()),
+                    final_response: None,
+                    events: None,
+                    file_accessed_rate: 0.0,
+                    network_rate: 0.0,
+                })
+                .unwrap()
+        };
+        let first = insert_request();
+        store
+            .complete_request_with_token_total(first, 10, Some(100))
+            .unwrap();
+        let second = insert_request();
+        store
+            .complete_request_with_token_total(second, 20, Some(135))
+            .unwrap();
+        let reset = insert_request();
+        store
+            .complete_request_with_token_total(reset, 30, Some(12))
+            .unwrap();
+
+        let token_total = |request_id| {
+            store
+                .connection()
+                .query_row(
+                    "SELECT total_tokens FROM requests WHERE request_id = ?1",
+                    [request_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(token_total(first), Some(0));
+        assert_eq!(token_total(second), Some(35));
+        assert_eq!(token_total(reset), Some(0));
+
+        drop(store);
+        remove_sqlite_files(&path);
     }
 
     #[test]

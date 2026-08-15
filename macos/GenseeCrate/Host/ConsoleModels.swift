@@ -53,6 +53,38 @@ struct DailyActivity: Decodable, Identifiable {
     }
 }
 
+struct DailyDetail: Decodable {
+    let date: String
+    let sessions: Int
+    let requests: Int
+    let toolCalls: Int
+    let alerts: Int
+    let tokens: Int
+    let filesWritten: Int
+    let filesRead: Int
+    let webRequests: Int
+    let topTools: [DailyCount]
+    let alertsByAction: [DailyCount]
+    let alertsBySeverity: [DailyCount]
+
+    enum CodingKeys: String, CodingKey {
+        case date, sessions, requests, alerts, tokens
+        case toolCalls = "tool_calls"
+        case filesWritten = "files_written"
+        case filesRead = "files_read"
+        case webRequests = "web_requests"
+        case topTools = "top_tools"
+        case alertsByAction = "alerts_by_action"
+        case alertsBySeverity = "alerts_by_severity"
+    }
+}
+
+struct DailyCount: Decodable, Identifiable {
+    let name: String
+    let count: Int
+    var id: String { name }
+}
+
 struct AgentSessionRecord: Decodable, Identifiable {
     let sessionID: String
     let rootPID: UInt32
@@ -393,16 +425,19 @@ struct IntegrationDescriptor: Identifiable, Equatable {
     let supportsDirectHooks: Bool
     let installationDetail: String
     let configurationIssue: String?
+    let configurationNote: String?
+    let canRepair: Bool
+    let configuredBackendPath: String?
     var configured: Bool
 
     var canToggle: Bool { installed && supportsDirectHooks }
     var isHealthy: Bool { configured && configurationIssue == nil }
-    var requiresRepair: Bool { canToggle && configured && configurationIssue != nil }
+    var requiresRepair: Bool { canToggle && configured && configurationIssue != nil && canRepair }
 
     var statusLabel: String {
         if !installed { return "Not installed" }
         if !supportsDirectHooks { return "Managed launch only" }
-        if requiresRepair { return "Needs repair" }
+        if configurationIssue != nil { return canRepair ? "Needs repair" : "Manual fix needed" }
         return configured ? "Protected" : "Ready to enable"
     }
 }

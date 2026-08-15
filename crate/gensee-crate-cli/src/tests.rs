@@ -765,6 +765,19 @@ fn claude_code_gateway_settings_merge_into_env() {
     );
     assert!(settings["env"]["ANTHROPIC_API_KEY"].is_null());
     assert!(settings["apiKeyHelper"].is_null());
+    assert_eq!(
+        settings["genseeGatewayManagedKeys"],
+        json!([
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "ANTHROPIC_AUTH_TOKEN"
+        ])
+    );
+
+    remove_managed_claude_code_gateway_settings_from_root(settings.as_object_mut().unwrap());
+    assert_eq!(settings["env"]["EXISTING"], json!("keep"));
+    assert!(settings["env"]["ANTHROPIC_BASE_URL"].is_null());
+    assert!(settings.get("genseeGatewayManagedKeys").is_none());
 }
 
 #[test]
@@ -816,6 +829,11 @@ fn claude_code_gateway_settings_require_base_url_for_credential() {
         api_key_helper: None,
     };
     assert!(gateway.validate().is_err());
+}
+
+#[test]
+fn empty_hook_path_is_rejected_instead_of_becoming_the_working_directory() {
+    assert!(absolutize_for_hook(Path::new("")).is_err());
 }
 
 #[test]

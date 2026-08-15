@@ -24,9 +24,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -65,6 +65,18 @@ pub struct EventStore {
     root: PathBuf,
     sqlite: Arc<Mutex<SqliteStore>>,
     encryption_key: Option<[u8; 32]>,
+    transcript_tokens: Arc<Mutex<HashMap<PathBuf, TranscriptTokenState>>>,
+}
+
+#[derive(Debug, Default)]
+struct TranscriptTokenState {
+    offset: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    claude_messages: HashMap<String, i64>,
+    codex_total: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +170,7 @@ impl EventStore {
             root,
             sqlite: Arc::new(Mutex::new(sqlite)),
             encryption_key,
+            transcript_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -194,6 +207,16 @@ impl EventStore {
     }
 
     pub fn append_session(&self, session: &AgentSession) -> io::Result<()> {
+        if session.ended_at_ms.is_none()
+            && self.list_sessions()?.into_iter().any(|existing| {
+                existing.session_id == session.session_id
+                    && existing.ended_at_ms.is_none()
+                    && existing.root_pid == session.root_pid
+                    && existing.agent_binary == session.agent_binary
+            })
+        {
+            return Ok(());
+        }
         let db = self.sqlite_store()?;
         db.insert_session(&NewSession {
             session_id: session.session_id.clone(),
@@ -204,6 +227,25 @@ impl EventStore {
         })
         .map_err(sqlite_error)?;
         append_jsonl(&self.sessions_path(), session, self.encryption_key.as_ref())
+    }
+
+    pub fn end_session(
+        &self,
+        session_id: &str,
+        ended_at_ms: u64,
+        exit_code: Option<i32>,
+    ) -> io::Result<bool> {
+        let Some(mut session) = self
+            .list_sessions()?
+            .into_iter()
+            .find(|session| session.session_id == session_id && session.ended_at_ms.is_none())
+        else {
+            return Ok(false);
+        };
+        session.ended_at_ms = Some(ended_at_ms);
+        session.exit_code = exit_code;
+        self.append_session(&session)?;
+        Ok(true)
     }
 
     pub fn append_hook_event(&self, event: &AgentHookEvent) -> io::Result<()> {
@@ -339,7 +381,6 @@ impl EventStore {
              WHERE NOT (
                 (rule_id = 'unmatched_system_effect'
                  AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-                OR rule_id = 'endpoint_security_event_gap'
              )
              ORDER BY alerts.created_at DESC, alert_id DESC
              LIMIT 200",
@@ -543,12 +584,10 @@ impl EventStore {
                   WHERE NOT (
                     (rule_id = 'unmatched_system_effect'
                      AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-                    OR rule_id = 'endpoint_security_event_gap'
                   )),
                 (SELECT COUNT(*) FROM alerts
                   WHERE severity IN ('high', 'critical')
-                    AND created_at >= (unixepoch('now') - 86400) * 1000
-                    AND rule_id != 'endpoint_security_event_gap'),
+                    AND created_at >= (unixepoch('now') - 86400) * 1000),
                 (SELECT COUNT(*) FROM artifact_facts)",
             |row| {
                 Ok(json!({
@@ -602,7 +641,6 @@ impl EventStore {
                   AND NOT (
                     (rule_id = 'unmatched_system_effect'
                      AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-                    OR rule_id = 'endpoint_security_event_gap'
                   )
                 GROUP BY day
              ),
@@ -647,6 +685,123 @@ impl EventStore {
             "workspaceEffects": self.list_workspace_effects()?,
             "jsonSessions": self.list_sessions()?,
         }))
+    }
+
+    pub fn dashboard_day(&self, day: &str) -> io::Result<Value> {
+        if day.len() != 10
+            || day.as_bytes().get(4) != Some(&b'-')
+            || day.as_bytes().get(7) != Some(&b'-')
+            || !day
+                .chars()
+                .enumerate()
+                .all(|(index, character)| matches!(index, 4 | 7) || character.is_ascii_digit())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dashboard day must use YYYY-MM-DD",
+            ));
+        }
+
+        let db = self.sqlite_store()?;
+        let conn = db.connection();
+        let valid: i64 = conn
+            .query_row("SELECT date(?1) = ?1", [day], |row| row.get(0))
+            .map_err(sqlite_error_from_rusqlite)?;
+        if valid != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dashboard day is not a valid calendar date",
+            ));
+        }
+
+        let totals = conn
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(DISTINCT session_id) FROM requests
+                     WHERE session_id != 'system'
+                       AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
+                   (SELECT COUNT(*) FROM requests
+                     WHERE session_id != 'system'
+                       AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1
+                       AND (original_user_prompt IS NOT NULL OR completed_at IS NOT NULL
+                            OR EXISTS (SELECT 1 FROM agent_events ae WHERE ae.request_id = requests.request_id))),
+                   (SELECT COUNT(*) FROM agent_events
+                     WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1),
+                   (SELECT COUNT(*) FROM alerts
+                     WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
+                       AND NOT (rule_id = 'unmatched_system_effect'
+                                AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')),
+                   (SELECT COALESCE(SUM(total_tokens), 0) FROM requests
+                     WHERE session_id != 'system'
+                       AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
+                   (SELECT COUNT(*) FROM agent_events
+                     WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+                       AND (lower(COALESCE(tool_name, '')) LIKE '%write%'
+                            OR lower(COALESCE(tool_name, '')) LIKE '%edit%'
+                            OR lower(COALESCE(tool_name, '')) LIKE '%create%')),
+                   (SELECT COUNT(*) FROM agent_events
+                     WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+                       AND lower(COALESCE(tool_name, '')) LIKE '%read%'),
+                   (SELECT COUNT(*) FROM agent_events
+                     WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+                       AND (lower(COALESCE(tool_name, '')) LIKE '%search%'
+                            OR lower(COALESCE(tool_name, '')) LIKE '%fetch%'))",
+                [day],
+                |row| {
+                    Ok(json!({
+                        "sessions": row.get::<_, i64>(0)?,
+                        "requests": row.get::<_, i64>(1)?,
+                        "tool_calls": row.get::<_, i64>(2)?,
+                        "alerts": row.get::<_, i64>(3)?,
+                        "tokens": row.get::<_, i64>(4)?,
+                        "files_written": row.get::<_, i64>(5)?,
+                        "files_read": row.get::<_, i64>(6)?,
+                        "web_requests": row.get::<_, i64>(7)?,
+                    }))
+                },
+            )
+            .map_err(sqlite_error_from_rusqlite)?;
+
+        let grouped = |sql: &str| -> io::Result<Vec<Value>> {
+            let mut statement = conn.prepare(sql).map_err(sqlite_error_from_rusqlite)?;
+            let rows = statement
+                .query_map([day], |row| {
+                    Ok(json!({
+                        "name": row.get::<_, String>(0)?,
+                        "count": row.get::<_, i64>(1)?,
+                    }))
+                })
+                .map_err(sqlite_error_from_rusqlite)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sqlite_error_from_rusqlite)
+        };
+        let top_tools = grouped(
+            "SELECT tool_name, COUNT(*) FROM agent_events
+             WHERE type = 'PreToolUse' AND tool_name IS NOT NULL
+               AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+             GROUP BY tool_name ORDER BY COUNT(*) DESC, tool_name LIMIT 8",
+        )?;
+        let alerts_by_action = grouped(
+            "SELECT action, COUNT(*) FROM alerts
+             WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
+               AND NOT (rule_id = 'unmatched_system_effect'
+                        AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
+             GROUP BY action ORDER BY COUNT(*) DESC, action",
+        )?;
+        let alerts_by_severity = grouped(
+            "SELECT severity, COUNT(*) FROM alerts
+             WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
+               AND NOT (rule_id = 'unmatched_system_effect'
+                        AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
+             GROUP BY severity ORDER BY COUNT(*) DESC, severity",
+        )?;
+
+        let mut result = totals.as_object().cloned().unwrap_or_default();
+        result.insert("date".to_string(), json!(day));
+        result.insert("top_tools".to_string(), json!(top_tools));
+        result.insert("alerts_by_action".to_string(), json!(alerts_by_action));
+        result.insert("alerts_by_severity".to_string(), json!(alerts_by_severity));
+        Ok(Value::Object(result))
     }
 
     pub fn append_policy_alert(&self, alert: &PolicyAlert) -> io::Result<()> {
@@ -944,7 +1099,7 @@ impl EventStore {
             event
                 .transcript_path
                 .as_deref()
-                .and_then(|path| transcript_total_tokens(Path::new(path)).ok().flatten())
+                .and_then(|path| self.transcript_total_tokens(&event.provider, Path::new(path)))
         } else {
             None
         };
@@ -1028,6 +1183,17 @@ impl EventStore {
 
             Ok(())
         })
+    }
+
+    fn transcript_total_tokens(&self, provider: &str, path: &Path) -> Option<i64> {
+        let canonical = allowed_transcript_path(provider, path).ok().flatten()?;
+        let mut cache = self
+            .transcript_tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        transcript_total_tokens_cached(&canonical, &mut cache)
+            .ok()
+            .flatten()
     }
 
     fn append_process_observation_database(
@@ -1336,54 +1502,115 @@ fn ensure_session(
 /// emits usage per assistant message (sometimes repeating a message while it is
 /// streaming), while Codex emits a cumulative `total_token_usage` snapshot.
 /// Prompt and response content is never persisted by this path.
+#[cfg(test)]
 fn transcript_total_tokens(path: &Path) -> io::Result<Option<i64>> {
+    transcript_total_tokens_cached(path, &mut HashMap::new())
+}
+
+fn allowed_transcript_path(provider: &str, path: &Path) -> io::Result<Option<PathBuf>> {
+    let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let relative_root = match provider {
+        "claude-code" => Path::new(".claude/projects"),
+        "codex" => Path::new(".codex/sessions"),
+        _ => return Ok(None),
+    };
+    let allowed_root = PathBuf::from(home).join(relative_root);
+    let Ok(allowed_root) = allowed_root.canonicalize() else {
+        return Ok(None);
+    };
+    let Ok(canonical) = path.canonicalize() else {
+        return Ok(None);
+    };
+    Ok(canonical.starts_with(&allowed_root).then_some(canonical))
+}
+
+fn transcript_total_tokens_cached(
+    path: &Path,
+    cache: &mut HashMap<PathBuf, TranscriptTokenState>,
+) -> io::Result<Option<i64>> {
     let metadata = fs::metadata(path)?;
     if !metadata.is_file() || metadata.len() > MAX_TOKEN_TRANSCRIPT_BYTES {
         return Ok(None);
     }
 
-    let reader = BufReader::new(fs::File::open(path)?);
-    let mut claude_messages: HashMap<String, i64> = HashMap::new();
-    let mut codex_total = 0_i64;
-
-    for line in reader.lines() {
-        let line = line?;
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-
-        if let Some(total) = value
-            .pointer("/payload/info/total_token_usage/total_tokens")
-            .and_then(Value::as_i64)
-        {
-            codex_total = codex_total.max(total);
-        }
-
-        let Some(message_id) = value.pointer("/message/id").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(usage) = value.pointer("/message/usage") else {
-            continue;
-        };
-        let total = [
-            "input_tokens",
-            "output_tokens",
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-        ]
-        .into_iter()
-        .filter_map(|key| usage.get(key).and_then(Value::as_i64))
-        .sum::<i64>();
-        if total > 0 {
-            claude_messages
-                .entry(message_id.to_string())
-                .and_modify(|stored| *stored = (*stored).max(total))
-                .or_insert(total);
-        }
+    let state = cache.entry(path.to_path_buf()).or_default();
+    #[cfg(unix)]
+    let identity_changed =
+        state.offset > 0 && (state.device != metadata.dev() || state.inode != metadata.ino());
+    #[cfg(not(unix))]
+    let identity_changed = false;
+    if identity_changed || metadata.len() < state.offset {
+        *state = TranscriptTokenState::default();
+    }
+    #[cfg(unix)]
+    {
+        state.device = metadata.dev();
+        state.inode = metadata.ino();
     }
 
-    let total = codex_total.max(claude_messages.values().sum());
+    if metadata.len() > state.offset {
+        let mut file = fs::File::open(path)?;
+        file.seek(SeekFrom::Start(state.offset))?;
+        let mut appended = Vec::new();
+        file.read_to_end(&mut appended)?;
+
+        let complete_len = appended
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .or_else(|| {
+                serde_json::from_slice::<Value>(&appended)
+                    .ok()
+                    .map(|_| appended.len())
+            })
+            .unwrap_or(0);
+        for line in String::from_utf8_lossy(&appended[..complete_len]).lines() {
+            process_transcript_usage_line(line, state);
+        }
+        state.offset += complete_len as u64;
+    }
+
+    let total = state
+        .codex_total
+        .max(state.claude_messages.values().sum::<i64>());
     Ok((total > 0).then_some(total))
+}
+
+fn process_transcript_usage_line(line: &str, state: &mut TranscriptTokenState) {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    if let Some(total) = value
+        .pointer("/payload/info/total_token_usage/total_tokens")
+        .and_then(Value::as_i64)
+    {
+        state.codex_total = state.codex_total.max(total);
+    }
+
+    let Some(message_id) = value.pointer("/message/id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(usage) = value.pointer("/message/usage") else {
+        return;
+    };
+    let total = [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .into_iter()
+    .filter_map(|key| usage.get(key).and_then(Value::as_i64))
+    .sum::<i64>();
+    if total > 0 {
+        state
+            .claude_messages
+            .entry(message_id.to_string())
+            .and_modify(|stored| *stored = (*stored).max(total))
+            .or_insert(total);
+    }
 }
 
 fn latest_or_create_request(db: &SqliteStore, session_id: &str) -> io::Result<i64> {
@@ -2589,6 +2816,10 @@ fn sqlite_error(error: gensee_crate_db::sqlite::SqliteError) -> io::Error {
     io::Error::other(error)
 }
 
+fn sqlite_error_from_rusqlite(error: rusqlite::Error) -> io::Error {
+    io::Error::other(error)
+}
+
 fn query_json_rows<F>(
     conn: &rusqlite::Connection,
     sql: &str,
@@ -2837,6 +3068,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(transcript_total_tokens(&claude_path).unwrap(), Some(25));
+        let mut cache = HashMap::new();
+        assert_eq!(
+            transcript_total_tokens_cached(&claude_path, &mut cache).unwrap(),
+            Some(25)
+        );
+        writeln!(
+            OpenOptions::new().append(true).open(&claude_path).unwrap(),
+            "{{\"message\":{{\"id\":\"m3\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":2}}}}}}"
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_total_tokens_cached(&claude_path, &mut cache).unwrap(),
+            Some(30)
+        );
 
         let codex_path = dir.join("codex.jsonl");
         fs::write(
@@ -2870,13 +3115,13 @@ mod tests {
                 now,
             ))
             .unwrap();
-        store
-            .append_hook_event(&hook_event(
-                "PreToolUse",
-                r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Read"}"#,
-                now + 1,
-            ))
-            .unwrap();
+        let mut read = hook_event(
+            "PreToolUse",
+            r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Read"}"#,
+            now + 1,
+        );
+        read.tool_name = Some("Read".to_string());
+        store.append_hook_event(&read).unwrap();
 
         let transcript = dir.join("transcript.jsonl");
         fs::write(
@@ -2914,7 +3159,18 @@ mod tests {
         assert_eq!(today["requests"], 1);
         assert_eq!(today["tool_calls"], 1);
         assert_eq!(today["alerts"], 1);
-        assert_eq!(today["tokens"], 25);
+        // The first cumulative transcript observation establishes a baseline;
+        // it must not attribute earlier session usage to this request.
+        assert_eq!(today["tokens"], 0);
+        let day = today["date"].as_str().unwrap();
+        let detail = store.dashboard_day(day).unwrap();
+        assert_eq!(detail["sessions"], 1);
+        assert_eq!(detail["requests"], 1);
+        assert_eq!(detail["tool_calls"], 1);
+        assert_eq!(detail["alerts"], 1);
+        assert_eq!(detail["files_read"], 1);
+        assert_eq!(detail["top_tools"][0]["name"], "Read");
+        assert!(store.dashboard_day("2026-02-30").is_err());
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -2984,7 +3240,7 @@ mod tests {
             std::process::id()
         ));
         let store = EventStore::new(&dir).unwrap();
-        let mut session = AgentSession {
+        let session = AgentSession {
             session_id: "run_deduplicated".to_string(),
             agent_binary: "codex".to_string(),
             root_pid: 1234,
@@ -3004,15 +3260,23 @@ mod tests {
         // Model both a lost daemon acknowledgement retry and the eventual
         // lifecycle update. Consumers must see one latest session record.
         store.append_session(&session).unwrap();
-        session.ended_at_ms = Some(200);
-        session.exit_code = Some(0);
-        store.append_session(&session).unwrap();
+        assert!(store
+            .end_session(&session.session_id, 200, Some(0))
+            .unwrap());
 
         let loaded = store.list_sessions().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].session_id, "run_deduplicated");
         assert_eq!(loaded[0].ended_at_ms, Some(200));
         assert_eq!(loaded[0].exit_code, Some(0));
+        assert_eq!(
+            fs::read_to_string(store.sessions_path())
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "one start and one end record should be persisted"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -3482,7 +3746,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_hides_legacy_endpoint_sequence_gap_alerts() {
+    fn dashboard_surfaces_endpoint_sequence_gap_alerts() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-store-test-endpoint-gap-dashboard-{}",
             std::process::id()
@@ -3510,9 +3774,9 @@ mod tests {
         drop(db);
 
         let dashboard = store.dashboard_state().unwrap();
-        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 0);
-        assert_eq!(dashboard["summary"]["alerts_count"], 0);
-        assert_eq!(dashboard["summary"]["recent_high_alerts"], 0);
+        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(dashboard["summary"]["alerts_count"], 1);
+        assert_eq!(dashboard["summary"]["recent_high_alerts"], 1);
 
         fs::remove_dir_all(&dir).ok();
     }

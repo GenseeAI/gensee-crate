@@ -80,6 +80,9 @@ targets:
           GENSEE_RESOURCES="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/bin"
           mkdir -p "$GENSEE_RESOURCES"
           cp "$REPOSITORY_ROOT/target/$GENSEE_PROFILE/gensee" "$GENSEE_RESOURCES/gensee"
+          if [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ] && [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]; then
+            /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --identifier ai.gensee.crate.cli "$GENSEE_RESOURCES/gensee"
+          fi
     dependencies:
       - target: GenseeCrateEndpointSecurity
       - sdk: SystemExtensions.framework

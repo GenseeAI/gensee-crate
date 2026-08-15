@@ -28,6 +28,16 @@ BEGIN
     UPDATE requests SET created_at = unixepoch() * 1000 WHERE request_id = NEW.request_id;
 END;
 
+-- Last cumulative transcript counter observed for each agent session. Keeping
+-- this baseline separate prevents the first captured turn in an older session
+-- from absorbing all tokens used before Gensee token capture was enabled.
+CREATE TABLE IF NOT EXISTS session_token_usage (
+    session_id TEXT PRIMARY KEY,
+    last_cumulative_tokens INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
 CREATE TABLE IF NOT EXISTS agent_events (
   event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
   pid             INTEGER NOT NULL,
@@ -246,6 +256,9 @@ CREATE TABLE IF NOT EXISTS artifact_facts (
 -- Per-request event lookup: "show me everything that happened during request X".
 CREATE INDEX IF NOT EXISTS idx_agent_events_request_ts
     ON agent_events(request_id, ts);
+
+CREATE INDEX IF NOT EXISTS idx_requests_created_at
+    ON requests(created_at);
 
 CREATE INDEX IF NOT EXISTS idx_agent_events_tool_use
     ON agent_events(tool_use_id);

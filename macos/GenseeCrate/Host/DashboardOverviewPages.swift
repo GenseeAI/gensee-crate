@@ -171,23 +171,17 @@ struct TodayHighlightPage: View {
     @ObservedObject var model: ConsoleModel
     @State private var date = Date()
 
-    private var day: DateInterval { Calendar.current.dateInterval(of: .day, for: date)! }
-    private var agentEvents: [AgentEvent] { model.snapshot.agentEvents.filter { day.contains(Date(timeIntervalSince1970: Double($0.timestamp) / 1_000)) } }
-    private var toolEvents: [AgentEvent] { agentEvents.filter { $0.type == "PreToolUse" } }
-    private var alerts: [SecurityAlert] { model.snapshot.alerts.filter { day.contains(Date(timeIntervalSince1970: Double($0.createdAt) / 1_000)) } }
-    private var sessions: [RecordedSession] { model.snapshot.sessions.filter { day.contains(Date(timeIntervalSince1970: Double($0.firstEventAt) / 1_000)) } }
     private var selectedActivity: DailyActivity? { model.snapshot.dailyActivity.first { $0.date == dayKey(date) } }
-    private var requests: Int { selectedActivity?.requests ?? Set(agentEvents.map(\.requestID)).count }
-    private var toolCalls: Int { selectedActivity?.toolCalls ?? toolEvents.count }
-    private var alertCount: Int { selectedActivity?.alerts ?? alerts.count }
-    private var tokenCount: Int { selectedActivity?.tokens ?? 0 }
-    private var filesWritten: Int { toolEvents.filter { event in ["write", "edit", "create"].contains(where: { (event.toolName ?? "").localizedCaseInsensitiveContains($0) }) }.count }
-    private var filesRead: Int { toolEvents.filter { ($0.toolName ?? "").localizedCaseInsensitiveContains("read") }.count }
-    private var webRequests: Int { toolEvents.filter { event in ["search", "fetch"].contains(where: { (event.toolName ?? "").localizedCaseInsensitiveContains($0) }) }.count }
-    private var topTools: [(String, Int)] {
-        Dictionary(grouping: toolEvents.compactMap(\.toolName), by: { $0 })
-            .map { ($0.key, $0.value.count) }.sorted { $0.1 > $1.1 }.prefix(8).map { $0 }
-    }
+    private var selectedDetail: DailyDetail? { model.dailyDetail?.date == dayKey(date) ? model.dailyDetail : nil }
+    private var requests: Int { selectedDetail?.requests ?? selectedActivity?.requests ?? 0 }
+    private var toolCalls: Int { selectedDetail?.toolCalls ?? selectedActivity?.toolCalls ?? 0 }
+    private var alertCount: Int { selectedDetail?.alerts ?? selectedActivity?.alerts ?? 0 }
+    private var tokenCount: Int { selectedDetail?.tokens ?? selectedActivity?.tokens ?? 0 }
+    private var sessions: Int { selectedDetail?.sessions ?? 0 }
+    private var filesWritten: Int { selectedDetail?.filesWritten ?? 0 }
+    private var filesRead: Int { selectedDetail?.filesRead ?? 0 }
+    private var webRequests: Int { selectedDetail?.webRequests ?? 0 }
+    private var topTools: [DailyCount] { selectedDetail?.topTools ?? [] }
 
     var body: some View {
         DashboardPage {
@@ -210,14 +204,14 @@ struct TodayHighlightPage: View {
                             .font(.system(size: 17, weight: .semibold))
                     }
                     Spacer()
-                    if tokenCount == 0 {
-                        Label("Token capture starts with new completed turns", systemImage: "info.circle")
+                    if requests > 0 && tokenCount == 0 {
+                        Label("No compatible token usage was captured for this date", systemImage: "info.circle")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                     }
                 }
                 metricRow([
-                    ("Sessions", sessions.count, "person.2", Color.dashboardBlue),
+                    ("Sessions", sessions, "person.2", Color.dashboardBlue),
                     ("Agent Turns", requests, "bolt", Color.dashboardGold),
                     ("Tool Calls", toolCalls, "chevron.left.forwardslash.chevron.right", Color.dashboardGreen),
                     ("Alerts", alertCount, "exclamationmark.triangle", Color.dashboardRed),
@@ -231,20 +225,20 @@ struct TodayHighlightPage: View {
                 HStack(alignment: .top, spacing: 16) {
                     DashboardCard("Alert breakdown") {
                         HStack(alignment: .top, spacing: 40) {
-                            breakdown("By action", values: ["block", "ask", "warn", "allow"], field: { $0.action })
-                            breakdown("By severity", values: ["critical", "high", "medium", "low", "info"], field: { $0.severity })
+                            breakdown("By action", values: selectedDetail?.alertsByAction ?? [])
+                            breakdown("By severity", values: selectedDetail?.alertsBySeverity ?? [])
                         }.frame(minHeight: 150, alignment: .top)
                     }
                     DashboardCard("Tool usage") {
-                        if topTools.isEmpty { DashboardEmpty(text: "No tool calls recorded today.") }
+                        if topTools.isEmpty { DashboardEmpty(text: "No tool calls recorded for this date.") }
                         else {
                             VStack(spacing: 0) {
                                 ForEach(Array(topTools.enumerated()), id: \.offset) { _, tool in
                                     HStack {
-                                        Text(tool.0).font(.system(size: 11, design: .monospaced))
+                                        Text(tool.name).font(.system(size: 11, design: .monospaced))
                                         Spacer()
-                                        ProgressView(value: Double(tool.1), total: Double(max(1, toolEvents.count))).frame(width: 90)
-                                        Text(tool.1.formatted()).font(.system(size: 11, weight: .semibold)).frame(width: 34, alignment: .trailing)
+                                        ProgressView(value: Double(tool.count), total: Double(max(1, toolCalls))).frame(width: 90)
+                                        Text(tool.count.formatted()).font(.system(size: 11, weight: .semibold)).frame(width: 34, alignment: .trailing)
                                     }.padding(.vertical, 6)
                                     Divider()
                                 }
@@ -293,6 +287,9 @@ struct TodayHighlightPage: View {
                 }
             }
         }
+        .task(id: dayKey(date)) {
+            await model.refreshDailyDetail(day: dayKey(date))
+        }
     }
 
     private var friendlyDate: String {
@@ -305,14 +302,13 @@ struct TodayHighlightPage: View {
         HStack(spacing: 16) { ForEach(Array(items.enumerated()), id: \.offset) { _, item in DashboardStatCard(title: item.0, value: item.1, symbol: item.2, color: item.3) } }
     }
 
-    private func breakdown(_ title: String, values: [String], field: @escaping (SecurityAlert) -> String) -> some View {
+    private func breakdown(_ title: String, values: [DailyCount]) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
-            ForEach(values, id: \.self) { value in
-                let count = alerts.filter { field($0).lowercased() == value }.count
-                if count > 0 { HStack { DashboardTag(text: value, color: title.contains("action") ? actionColor(value) : severityColor(value)); Text(count.formatted()).font(.system(size: 12, weight: .semibold)) } }
+            ForEach(values) { value in
+                if value.count > 0 { HStack { DashboardTag(text: value.name, color: title.contains("action") ? actionColor(value.name) : severityColor(value.name)); Text(value.count.formatted()).font(.system(size: 12, weight: .semibold)) } }
             }
-            if alerts.isEmpty { Text("No alerts today").font(.system(size: 12)).foregroundStyle(.secondary) }
+            if values.isEmpty { Text("No alerts for this date").font(.system(size: 12)).foregroundStyle(.secondary) }
         }
     }
 }
@@ -354,7 +350,7 @@ private struct CalendarHeatmap: View {
         return calendar.date(byAdding: .weekOfYear, value: -(weeks - 1), to: currentWeek) ?? currentWeek
     }
     private var valuesByDay: [String: Int] {
-        Dictionary(uniqueKeysWithValues: activity.map { ($0.date, $0[keyPath: value]) })
+        Dictionary(activity.map { ($0.date, $0[keyPath: value]) }, uniquingKeysWith: +)
     }
     private var columns: [[HeatmapDay]] {
         (0..<weeks).map { week in

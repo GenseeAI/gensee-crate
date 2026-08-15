@@ -8,6 +8,7 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var policy = PolicySummary()
     @Published private(set) var policyDocument = ""
     @Published private(set) var integrations: [IntegrationDescriptor] = []
+    @Published private(set) var dailyDetail: DailyDetail?
     @Published private(set) var isRefreshing = false
     @Published private(set) var runningCommand: String?
     @Published private(set) var lastUpdated: Date?
@@ -139,6 +140,17 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
+    func refreshDailyDetail(day: String) async {
+        guard backendAvailable else { return }
+        do {
+            let detail = try await cli.decode(DailyDetail.self, arguments: ["dashboard-day", day])
+            guard detail.date == day else { return }
+            dailyDetail = detail
+        } catch {
+            dashboardRefreshIssue = error.localizedDescription
+        }
+    }
+
     func savePolicyDocument(_ text: String) async -> Bool {
         runningCommand = "Validating policy"
         defer { runningCommand = nil }
@@ -212,6 +224,11 @@ final class ConsoleModel: ObservableObject {
             var arguments = ["setup", provider]
             if enabled {
                 arguments += ["--gensee-home", homeURL.path]
+                let hookExecutable = try await cli.stableHookExecutableURL()
+                arguments += ["--bin", hookExecutable.path]
+                if provider == "claude-code" {
+                    arguments.append("--repair")
+                }
             } else {
                 arguments.append("--disable")
             }
@@ -240,6 +257,16 @@ final class ConsoleModel: ObservableObject {
         defer { runningCommand = nil }
         do {
             var arguments = ["setup", provider, "--gensee-home", homeURL.path]
+            let configuredBackend = integration.configuredBackendPath.map(URL.init(fileURLWithPath:))
+            let hookExecutable: URL
+            if let configuredBackend,
+               FileManager.default.isExecutableFile(atPath: configuredBackend.path)
+            {
+                hookExecutable = configuredBackend
+            } else {
+                hookExecutable = try await cli.stableHookExecutableURL()
+            }
+            arguments += ["--bin", hookExecutable.path]
             if provider == "claude-code" {
                 arguments.append("--repair")
             }
@@ -354,7 +381,7 @@ final class ConsoleModel: ObservableObject {
         integrations = definitions.map { provider, name, detail, relativePath, symbol, installed, supportsDirectHooks, installationDetail in
             let path = home.appendingPathComponent(relativePath)
             let contents = (try? String(contentsOf: path, encoding: .utf8)) ?? ""
-            let expectedCommand = cli.executableURL.map {
+            let expectedCommand = cli.preferredHookExecutableURL().map {
                 HarnessConfigurationHealth.expectedCommand(
                     provider: provider,
                     homeURL: homeURL,
@@ -379,6 +406,9 @@ final class ConsoleModel: ObservableObject {
                 supportsDirectHooks: supportsDirectHooks,
                 installationDetail: installationDetail,
                 configurationIssue: inspection.issue,
+                configurationNote: inspection.note,
+                canRepair: inspection.canRepair,
+                configuredBackendPath: inspection.backendPath,
                 configured: inspection.configured
             )
         }
@@ -499,12 +529,16 @@ final class ConsoleModel: ObservableObject {
         protectedPaths += [".ssh", ".aws", ".kube", ".config/gcloud"]
             .map { userHome.appendingPathComponent($0).path }
         var blockedExecutables: [String] = []
+        var failClosedManagedOnly = true
+        var maxAuthorizationLatencyMS: UInt64 = 10
         if let data = policyDocument.data(using: .utf8),
            let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let endpoint = document["endpoint_security"] as? [String: Any]
         {
             protectedPaths += endpoint["protected_paths"] as? [String] ?? []
             blockedExecutables = endpoint["blocked_executables"] as? [String] ?? []
+            failClosedManagedOnly = endpoint["fail_closed_managed_only"] as? Bool ?? true
+            maxAuthorizationLatencyMS = (endpoint["max_auth_latency_ms"] as? NSNumber)?.uint64Value ?? 10
         }
         let roots = snapshot.jsonSessions
             .filter { $0.isActive && $0.rootPID != 0 }
@@ -513,7 +547,9 @@ final class ConsoleModel: ObservableObject {
             mode: policy.endpointSecurityMode,
             protectedPaths: Array(Set(protectedPaths)).sorted(),
             blockedExecutables: blockedExecutables,
-            managedRoots: roots
+            managedRoots: roots,
+            failClosedManagedOnly: failClosedManagedOnly,
+            maxAuthorizationLatencyMS: maxAuthorizationLatencyMS
         )
     }
 

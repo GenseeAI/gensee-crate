@@ -59,11 +59,45 @@ struct GenseeCLI: Sendable {
             URL(fileURLWithPath: "/opt/homebrew/bin/gensee"),
             URL(fileURLWithPath: "/usr/local/bin/gensee"),
             home.appendingPathComponent(".cargo/bin/gensee"),
-            home.appendingPathComponent("Projects/Gensee-Prod/gensee-crate/target/debug/gensee"),
-            home.appendingPathComponent("Projects/Gensee-Prod/gensee-crate/target/release/gensee"),
         ])
 
         return candidates.first { manager.isExecutableFile(atPath: $0.path) }
+    }
+
+    func preferredHookExecutableURL() -> URL? {
+        guard let executableURL else { return nil }
+        guard executableURL.path.contains(".app/Contents/") else { return executableURL }
+        let stableURL = homeURL.appendingPathComponent("bin/gensee")
+        return FileManager.default.isExecutableFile(atPath: stableURL.path) ? stableURL : executableURL
+    }
+
+    /// Hook files outlive individual app builds, so never point them into an
+    /// application bundle that may be replaced during an update.
+    func stableHookExecutableURL() async throws -> URL {
+        guard let executableURL else { throw GenseeCLIError.executableNotFound }
+        guard executableURL.path.contains(".app/Contents/") else { return executableURL }
+        let homeURL = homeURL
+        return try await Task.detached(priority: .utility) {
+            let manager = FileManager.default
+            let binDirectory = homeURL.appendingPathComponent("bin", isDirectory: true)
+            let destination = binDirectory.appendingPathComponent("gensee")
+            try manager.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+
+            let staging = binDirectory.appendingPathComponent(".gensee-\(UUID().uuidString).tmp")
+            try manager.copyItem(at: executableURL, to: staging)
+            do {
+                try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: staging.path)
+                if manager.fileExists(atPath: destination.path) {
+                    _ = try manager.replaceItemAt(destination, withItemAt: staging)
+                } else {
+                    try manager.moveItem(at: staging, to: destination)
+                }
+            } catch {
+                try? manager.removeItem(at: staging)
+                throw error
+            }
+            return destination
+        }.value
     }
 
     func run(_ arguments: [String]) async throws -> GenseeCommandOutput {
@@ -90,8 +124,14 @@ struct GenseeCLI: Sendable {
             process.environment = environment
 
             try process.run()
-            let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            let stderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            let stdoutTask = Task.detached {
+                stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            }
+            let stderrTask = Task.detached {
+                stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            }
+            let stdout = await stdoutTask.value
+            let stderr = await stderrTask.value
             process.waitUntilExit()
 
             let result = GenseeCommandOutput(

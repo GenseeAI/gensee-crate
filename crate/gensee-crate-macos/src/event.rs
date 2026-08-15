@@ -194,6 +194,7 @@ impl EndpointSecurityEvent {
         } else {
             match self.event_type.as_str() {
                 "exec" | "fork" | "exit" => "process",
+                "open" if self.is_write_open() => "file_mutation",
                 "open" | "readdir" | "mmap" if self.is_read_open() || self.event_type != "open" => {
                     "file_read"
                 }
@@ -622,6 +623,19 @@ mod tests {
         assert_eq!(system.source, "macos-endpoint-security");
         assert_eq!(system.event_kind, "file_read");
         assert_eq!(system.file_path.as_deref(), Some("/tmp/example"));
+    }
+
+    #[test]
+    fn maps_write_only_open_to_file_mutation() {
+        let mut raw = event("open", process(50, 1, None, None));
+        raw.open_flags = Some(2);
+        raw.file = Some(EndpointSecurityFile {
+            path: "/tmp/output".to_string(),
+            ..EndpointSecurityFile::default()
+        });
+        let system = raw.into_system_event().unwrap();
+        assert_eq!(system.event_kind, "file_mutation");
+        assert_eq!(system.file_path.as_deref(), Some("/tmp/output"));
     }
 
     #[test]

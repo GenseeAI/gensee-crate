@@ -315,7 +315,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\nREPOSITORY_ROOT=\"$PROJECT_DIR/../..\"\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n  cargo build --manifest-path \"$REPOSITORY_ROOT/Cargo.toml\" -p gensee-crate-cli --release\n  GENSEE_PROFILE=\"release\"\nelse\n  cargo build --manifest-path \"$REPOSITORY_ROOT/Cargo.toml\" -p gensee-crate-cli\n  GENSEE_PROFILE=\"debug\"\nfi\nGENSEE_RESOURCES=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/bin\"\nmkdir -p \"$GENSEE_RESOURCES\"\ncp \"$REPOSITORY_ROOT/target/$GENSEE_PROFILE/gensee\" \"$GENSEE_RESOURCES/gensee\"\n";
+			shellScript = "set -euo pipefail\nREPOSITORY_ROOT=\"$PROJECT_DIR/../..\"\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n  cargo build --manifest-path \"$REPOSITORY_ROOT/Cargo.toml\" -p gensee-crate-cli --release\n  GENSEE_PROFILE=\"release\"\nelse\n  cargo build --manifest-path \"$REPOSITORY_ROOT/Cargo.toml\" -p gensee-crate-cli\n  GENSEE_PROFILE=\"debug\"\nfi\nGENSEE_RESOURCES=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/bin\"\nmkdir -p \"$GENSEE_RESOURCES\"\ncp \"$REPOSITORY_ROOT/target/$GENSEE_PROFILE/gensee\" \"$GENSEE_RESOURCES/gensee\"\nif [ \"${CODE_SIGNING_ALLOWED:-YES}\" != \"NO\" ] && [ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]; then\n  /usr/bin/codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" --identifier ai.gensee.crate.cli \"$GENSEE_RESOURCES/gensee\"\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

@@ -274,7 +274,15 @@ struct DashboardSettingsPage: View {
                 Text("\(sensor.health.authorizationCount.formatted()) (\(sensor.health.deniedCount.formatted()) denied)")
                     .font(.system(size: 11, design: .monospaced))
             }
-            settingsLine("Max authorization latency", "\(sensor.health.maxAuthorizationLatencyUS) µs")
+            settingsLine(
+                "Max authorization latency",
+                "\(sensor.health.maxAuthorizationLatencyUS) µs / \(sensor.health.configuredMaxAuthorizationLatencyUS) µs budget"
+            )
+            if sensor.health.exceedsAuthorizationLatencyBudget {
+                Label("Authorization latency exceeded the configured budget", systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.dashboardGold)
+            }
             settingsLine("Managed processes", sensor.health.managedProcesses.formatted())
             if let error = sensor.health.error {
                 Text(error).font(.system(size: 10)).foregroundStyle(.red)

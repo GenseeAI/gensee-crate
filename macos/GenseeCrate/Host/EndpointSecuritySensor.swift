@@ -13,11 +13,15 @@ struct EndpointSensorHealth: Equatable {
     var authorizationCount: UInt64 = 0
     var deniedCount: UInt64 = 0
     var maxAuthorizationLatencyUS: UInt64 = 0
+    var configuredMaxAuthorizationLatencyUS: UInt64 = 10_000
     var managedProcesses: UInt64 = 0
     var lastEventAt: Date?
     var error: String?
 
     var hasDataLoss: Bool { kernelDrops > 0 || ringDrops > 0 }
+    var exceedsAuthorizationLatencyBudget: Bool {
+        maxAuthorizationLatencyUS > configuredMaxAuthorizationLatencyUS
+    }
 }
 
 /// Pulls bounded event batches from the root system extension and streams them
@@ -37,7 +41,9 @@ final class EndpointSecuritySensor: ObservableObject {
     private var bootID = ""
     private var started = false
     private var pendingConfiguration: [String: Any] = ["mode": "observe"]
+    private var pendingConfigurationData: Data?
     private var configurationNeedsPush = true
+    private var ingestErrorBuffer = Data()
 
     init(homeURL: URL, executableURL: URL?) {
         self.homeURL = homeURL
@@ -90,15 +96,23 @@ final class EndpointSecuritySensor: ObservableObject {
         mode: String,
         protectedPaths: [String],
         blockedExecutables: [String],
-        managedRoots: [[String: Any]]
+        managedRoots: [[String: Any]],
+        failClosedManagedOnly: Bool,
+        maxAuthorizationLatencyMS: UInt64
     ) {
-        pendingConfiguration = [
+        let configuration: [String: Any] = [
             "schema_version": 1,
             "mode": mode,
             "protected_paths": protectedPaths,
             "blocked_executables": blockedExecutables,
             "managed_roots": managedRoots,
+            "fail_closed_managed_only": failClosedManagedOnly,
+            "max_auth_latency_ms": maxAuthorizationLatencyMS,
         ]
+        let encoded = try? JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
+        guard encoded != pendingConfigurationData else { return }
+        pendingConfiguration = configuration
+        pendingConfigurationData = encoded
         configurationNeedsPush = true
     }
 
@@ -147,11 +161,19 @@ final class EndpointSecuritySensor: ObservableObject {
         var environment = ProcessInfo.processInfo.environment
         environment["GENSEE_HOME"] = homeURL.path
         process.environment = environment
+        ingestErrorBuffer.removeAll(keepingCapacity: true)
+        errors.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            Task { @MainActor in self?.appendIngesterError(data) }
+        }
         process.terminationHandler = { [weak self] process in
-            let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-            let detail = String(decoding: errorData, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            errors.fileHandleForReading.readabilityHandler = nil
+            let trailing = errors.fileHandleForReading.readDataToEndOfFile()
             Task { @MainActor in
+                self?.appendIngesterError(trailing)
+                let detail = String(decoding: self?.ingestErrorBuffer ?? Data(), as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 self?.ingestProcess = nil
                 self?.ingestInput = nil
                 if process.terminationStatus != 0 {
@@ -197,12 +219,14 @@ final class EndpointSecuritySensor: ObservableObject {
                     failure: { error in continuation.resume(throwing: error) }
                 )
             }
+            // Record the extension's returned cursor before applying health.
+            // applyHealth may intentionally rewind it after an extension reboot.
+            cursor = response.1
             applyHealth(response.2)
             if configurationNeedsPush {
                 try await pushConfiguration(using: connection)
             }
-            try write(events: response.0)
-            cursor = response.1
+            try await write(events: response.0)
             health.connected = true
             health.error = nil
         } catch {
@@ -252,10 +276,14 @@ final class EndpointSecuritySensor: ObservableObject {
         health.authorizationCount = number(dictionary["authorization_count"])
         health.deniedCount = number(dictionary["denied_count"])
         health.maxAuthorizationLatencyUS = number(dictionary["max_authorization_latency_us"])
+        health.configuredMaxAuthorizationLatencyUS = max(
+            1,
+            number(dictionary["configured_max_authorization_latency_us"])
+        )
         health.managedProcesses = number(dictionary["managed_processes"])
     }
 
-    private func write(events: [[String: Any]]) throws {
+    private func write(events: [[String: Any]]) async throws {
         guard !events.isEmpty else { return }
         guard let ingestInput else {
             throw NSError(
@@ -270,9 +298,20 @@ final class EndpointSecuritySensor: ObservableObject {
             batch.append(data)
             batch.append(0x0A)
         }
-        try ingestInput.write(contentsOf: batch)
+        try await Task.detached(priority: .utility) {
+            try ingestInput.write(contentsOf: batch)
+        }.value
         health.ingestedEvents += UInt64(events.count)
         health.lastEventAt = Date()
+    }
+
+    private func appendIngesterError(_ data: Data) {
+        guard !data.isEmpty else { return }
+        ingestErrorBuffer.append(data)
+        let maximumBytes = 64 * 1024
+        if ingestErrorBuffer.count > maximumBytes {
+            ingestErrorBuffer.removeFirst(ingestErrorBuffer.count - maximumBytes)
+        }
     }
 
     private func number(_ value: Any?) -> UInt64 {

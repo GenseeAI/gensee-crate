@@ -131,7 +131,8 @@ static BOOL GenseeIsOwnProcess(const es_process_t *process)
     NSString *teamID = GenseeStringFromToken(process->team_id);
     if ([teamID isEqualToString:@"3KWVB4M63F"] &&
         ([signingID isEqualToString:@"ai.gensee.crate"] ||
-         [signingID isEqualToString:@"ai.gensee.crate.endpoint-security"])) {
+         [signingID isEqualToString:@"ai.gensee.crate.endpoint-security"] ||
+         [signingID isEqualToString:@"ai.gensee.crate.cli"])) {
         return YES;
     }
     return [path containsString:@"/Gensee Crate.app/Contents/"];
@@ -352,11 +353,14 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 @property(nonatomic) uint64_t ringDrops;
 @property(nonatomic) uint64_t lastGlobalSequence;
 @property(nonatomic) uint64_t kernelDrops;
+@property(nonatomic) uint64_t reportedDrops;
 @property(nonatomic) NSString *mode;
 @property(nonatomic) NSArray<NSString *> *protectedPaths;
 @property(nonatomic) NSSet<NSString *> *blockedExecutables;
 @property(nonatomic) NSDictionary<NSNumber *, NSString *> *managedRoots;
 @property(nonatomic) NSMutableDictionary<NSString *, NSString *> *managedProcesses;
+@property(nonatomic) BOOL failClosedManagedOnly;
+@property(nonatomic) uint64_t maxAuthorizationLatencyUS;
 @property(nonatomic) uint64_t authorizationCount;
 @property(nonatomic) uint64_t deniedCount;
 @property(nonatomic) uint64_t maximumAuthorizationLatency;
@@ -378,6 +382,8 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         _blockedExecutables = [NSSet set];
         _managedRoots = @{};
         _managedProcesses = [NSMutableDictionary dictionary];
+        _failClosedManagedOnly = YES;
+        _maxAuthorizationLatencyUS = 10000;
     }
     return self;
 }
@@ -443,6 +449,19 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     return NO;
 }
 
+- (NSNumber *_Nullable)rootPIDForSessionLocked:(NSString *)session
+{
+    for (NSNumber *pid in self.managedRoots) {
+        if ([self.managedRoots[pid] isEqualToString:session]) return pid;
+    }
+    return nil;
+}
+
+- (BOOL)isOwnProcessLocked:(const es_process_t *)process
+{
+    return GenseeIsOwnProcess(process);
+}
+
 - (void)authorizeMessage:(const es_message_t *)message
                    result:(NSString **)result
                    ruleID:(NSString **)ruleID
@@ -453,10 +472,13 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     __block BOOL deny = NO;
     __block NSString *decisionRule = nil;
     __block NSString *decisionReason = nil;
+    __block uint64_t authorizationBudgetUS = 10000;
     @synchronized (self) {
+        authorizationBudgetUS = self.maxAuthorizationLatencyUS;
         NSString *session = [self sessionForProcessLocked:message->process messageVersion:message->version];
         BOOL enforcing = [self.mode isEqualToString:@"protect"] || [self.mode isEqualToString:@"strict"];
-        if (enforcing && session != nil) {
+        BOOL inScope = !self.failClosedManagedOnly || session != nil;
+        if (enforcing && inScope && ![self isOwnProcessLocked:message->process]) {
             NSString *path = GenseeAuthorizationPath(message);
             NSString *secondaryPath = GenseeSecondaryAuthorizationPath(message);
             if (message->event_type == ES_EVENT_TYPE_AUTH_EXEC && [self.blockedExecutables containsObject:path]) {
@@ -470,6 +492,16 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
                 decisionReason = @"Managed agent access to this protected path is denied.";
             }
         }
+    }
+
+    // Never miss Endpoint Security's response deadline in order to enforce a
+    // local rule. The configured budget is intentionally fail-open: the event
+    // is still recorded with a reason so the console can surface the overrun.
+    uint64_t decisionElapsed = GenseeElapsedMicroseconds(started);
+    if (deny && decisionElapsed > authorizationBudgetUS) {
+        deny = NO;
+        decisionRule = @"endpoint_security_latency_budget_fail_open";
+        decisionReason = @"The authorization decision exceeded its configured latency budget.";
     }
 
     es_respond_result_t response;
@@ -508,12 +540,23 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
              latencyUS:(uint64_t)latencyUS
 {
     __block NSString *actorSession = nil;
+    __block NSNumber *actorRootPID = nil;
+    __block BOOL actorIsOwn = NO;
     @synchronized (self) {
+        actorIsOwn = [self isOwnProcessLocked:message->process];
         actorSession = [self sessionForProcessLocked:message->process messageVersion:message->version];
+        if (actorSession != nil) actorRootPID = [self rootPIDForSessionLocked:actorSession];
         if (message->event_type == ES_EVENT_TYPE_NOTIFY_FORK) {
             if (actorSession != nil) self.managedProcesses[[self keyForProcess:message->event.fork.child]] = actorSession;
         } else if (message->event_type == ES_EVENT_TYPE_NOTIFY_EXEC) {
-            if (actorSession != nil) self.managedProcesses[[self keyForProcess:message->event.exec.target]] = actorSession;
+            if (actorSession != nil) {
+                NSString *actorKey = [self keyForProcess:message->process];
+                NSString *targetKey = [self keyForProcess:message->event.exec.target];
+                self.managedProcesses[targetKey] = actorSession;
+                if (![actorKey isEqualToString:targetKey]) {
+                    [self.managedProcesses removeObjectForKey:actorKey];
+                }
+            }
         } else if (message->event_type == ES_EVENT_TYPE_NOTIFY_EXIT) {
             [self.managedProcesses removeObjectForKey:[self keyForProcess:message->process]];
             NSNumber *pid = @(audit_token_to_pid(message->process->audit_token));
@@ -528,16 +571,22 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     // descendants exactly, but the host only needs durable evidence for a
     // managed agent tree. This keeps unrelated host activity out of Crate's
     // database and prevents legacy unmatched-event heuristics from firing.
-    if (actorSession == nil) return;
+    if (actorSession == nil || actorIsOwn) return;
     NSMutableDictionary *serialized = [GenseeSerializeMessage(message, mode, result, ruleID, reason, latencyUS) mutableCopy];
     serialized[@"attribution"] = @{
         @"session_id": actorSession,
+        @"root_pid": actorRootPID ?: @0,
         @"confidence": @1.0,
         @"matched_by": @"endpoint_security_process_tree",
     };
     dispatch_async(self.queue, ^{
         NSMutableDictionary *withCursor = [serialized mutableCopy];
         withCursor[@"sensor_cursor"] = @(self.nextCursor++);
+        uint64_t cumulativeDrops = self.kernelDrops + self.ringDrops;
+        withCursor[@"dropped_events"] = @(cumulativeDrops >= self.reportedDrops
+            ? cumulativeDrops - self.reportedDrops
+            : cumulativeDrops);
+        self.reportedDrops = cumulativeDrops;
         [self.events addObject:withCursor];
         self.totalEvents += 1;
         if (self.events.count > GenseeRingCapacity) {
@@ -583,6 +632,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         @"authorization_count": @(self.authorizationCount),
         @"denied_count": @(self.deniedCount),
         @"max_authorization_latency_us": @(self.maximumAuthorizationLatency),
+        @"configured_max_authorization_latency_us": @(self.maxAuthorizationLatencyUS),
         @"managed_processes": @(managedProcessCount),
     };
 }
@@ -622,10 +672,21 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     NSArray *protectedPaths = configuration[@"protected_paths"];
     NSArray *blockedExecutables = configuration[@"blocked_executables"];
     NSArray *managedRoots = configuration[@"managed_roots"];
+    NSNumber *failClosedManagedOnly = configuration[@"fail_closed_managed_only"];
+    NSNumber *maxAuthorizationLatencyMS = configuration[@"max_auth_latency_ms"];
     if (!GenseeIsAbsoluteStringArray(protectedPaths) ||
         !GenseeIsAbsoluteStringArray(blockedExecutables) ||
         (managedRoots != nil && ![managedRoots isKindOfClass:NSArray.class])) {
         reply(NO, @"Protected paths and blocked executables must be arrays of absolute paths; managed roots must be an array.");
+        return;
+    }
+    if (failClosedManagedOnly != nil && ![failClosedManagedOnly isKindOfClass:NSNumber.class]) {
+        reply(NO, @"fail_closed_managed_only must be a boolean.");
+        return;
+    }
+    if (maxAuthorizationLatencyMS != nil &&
+        (![maxAuthorizationLatencyMS isKindOfClass:NSNumber.class] || maxAuthorizationLatencyMS.unsignedLongLongValue == 0)) {
+        reply(NO, @"max_auth_latency_ms must be a positive integer.");
         return;
     }
     NSMutableDictionary<NSNumber *, NSString *> *roots = [NSMutableDictionary dictionary];
@@ -647,6 +708,8 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         self.blockedExecutables = [NSSet setWithArray:[(blockedExecutables ?: @[]) valueForKey:@"stringByStandardizingPath"]];
         self.managedRoots = roots;
         self.managedProcesses = activeProcesses;
+        self.failClosedManagedOnly = failClosedManagedOnly == nil ? YES : failClosedManagedOnly.boolValue;
+        self.maxAuthorizationLatencyUS = (maxAuthorizationLatencyMS ?: @10).unsignedLongLongValue * 1000ULL;
     }
     if (self.client != NULL) es_clear_cache(self.client);
     reply(YES, nil);
@@ -678,10 +741,10 @@ int main(int argc, const char *argv[])
                                     ruleID:&ruleID
                                     reason:&reason
                                  latencyUS:&latency];
-                if (![mode isEqualToString:@"off"] && !GenseeIsOwnProcess(message->process)) {
+                if (![mode isEqualToString:@"off"]) {
                     [service recordMessage:message mode:mode result:decision ruleID:ruleID reason:reason latencyUS:latency];
                 }
-            } else if (![mode isEqualToString:@"off"] && !GenseeIsOwnProcess(message->process)) {
+            } else if (![mode isEqualToString:@"off"]) {
                 [service recordMessage:message mode:mode result:@"observed" ruleID:nil reason:nil latencyUS:0];
             }
         });

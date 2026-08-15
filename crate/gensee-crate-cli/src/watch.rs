@@ -586,7 +586,11 @@ fn start_system_event_watcher(
     match backend {
         SystemEventBackend::None => Ok(None),
         SystemEventBackend::EndpointSecurity => {
-            eprintln!("gensee: using the signed Gensee Endpoint Security system extension");
+            eprintln!(
+                "gensee: Endpoint Security events are ingested by the signed Gensee Crate app; \
+                 this watch process does not start or verify that sensor. Keep the app running, \
+                 or use --system-events eslogger for a manual diagnostic watcher"
+            );
             Ok(None)
         }
         SystemEventBackend::Eslogger => start_eslogger_watcher(store).map(Some),

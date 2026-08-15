@@ -130,7 +130,7 @@ struct DashboardHarnessesPage: View {
                 Text(integration.detail)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                Text(integration.configurationIssue ?? integration.installationDetail)
+                Text(integration.configurationIssue ?? integration.configurationNote ?? integration.installationDetail)
                     .font(.system(size: 10))
                     .foregroundStyle(integration.configurationIssue == nil ? Color.secondary : Color.dashboardGold)
                     .lineLimit(2)
@@ -212,6 +212,9 @@ struct DashboardHarnessesPage: View {
         if !model.backendAvailable { return "The bundled Gensee backend is unavailable." }
         if integration.requiresRepair {
             return "Gensee hooks are present but unhealthy. Turn this off to remove them, or use Repair."
+        }
+        if integration.configurationIssue != nil {
+            return "This configuration must be fixed manually before Gensee can safely manage it."
         }
         return integration.configured
             ? "Remove Gensee hooks while preserving unrelated harness settings."

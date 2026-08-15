@@ -3,9 +3,26 @@ import Foundation
 struct HarnessConfigurationInspection: Equatable {
     let configured: Bool
     let issue: String?
+    let note: String?
+    let canRepair: Bool
+    let backendPath: String?
 
     var isHealthy: Bool { configured && issue == nil }
-    var requiresRepair: Bool { configured && issue != nil }
+    var requiresRepair: Bool { configured && issue != nil && canRepair }
+
+    init(
+        configured: Bool,
+        issue: String?,
+        note: String? = nil,
+        canRepair: Bool = true,
+        backendPath: String? = nil
+    ) {
+        self.configured = configured
+        self.issue = issue
+        self.note = note
+        self.canRepair = canRepair
+        self.backendPath = backendPath
+    }
 }
 
 enum HarnessConfigurationHealth {
@@ -31,8 +48,9 @@ enum HarnessConfigurationHealth {
             return HarnessConfigurationInspection(
                 configured: appearsConfigured,
                 issue: appearsConfigured
-                    ? "The harness configuration is invalid JSON. Fix its syntax, then run Repair again."
-                    : nil
+                    ? "The harness configuration is invalid JSON. Fix its syntax before Gensee can manage these hooks."
+                    : nil,
+                canRepair: false
             )
         }
 
@@ -47,12 +65,20 @@ enum HarnessConfigurationHealth {
             issues.append("Claude Code has all hooks disabled. Repair will enable them while preserving its other settings.")
         }
 
-        let eventContainer: [String: Any]?
+        let containerKey: String
         if provider == "antigravity" {
-            eventContainer = root["gensee-policy"] as? [String: Any]
+            containerKey = "gensee-policy"
         } else {
-            eventContainer = root["hooks"] as? [String: Any]
+            containerKey = "hooks"
         }
+        guard root[containerKey] == nil || root[containerKey] is [String: Any] else {
+            return HarnessConfigurationInspection(
+                configured: true,
+                issue: "The \(containerKey) setting has an unsupported shape. Fix it manually before Gensee can repair these hooks.",
+                canRepair: false
+            )
+        }
+        let eventContainer = root[containerKey] as? [String: Any]
 
         let missingEvents = expectedEvents(for: provider).filter { eventName in
             guard let event = eventContainer?[eventName] else { return true }
@@ -62,23 +88,52 @@ enum HarnessConfigurationHealth {
             issues.append("Gensee hooks are incomplete (missing \(missingEvents.joined(separator: ", "))). Repair will restore full coverage.")
         }
 
-        if let expectedCommand {
-            let eventCommands = expectedEvents(for: provider).flatMap { eventName in
-                guard let event = eventContainer?[eventName] else { return [String]() }
-                return commands(in: event).filter { isGenseeCommand($0, provider: provider) }
-            }
-            if eventCommands.contains(where: {
-                !hookCommandsAreEquivalent($0, expectedCommand, provider: provider)
-            }) {
-                issues.append("Hooks point to a different event store or Gensee backend. Repair will route events to \(eventStorePath).")
-            }
-        } else {
+        guard let expectedCommand,
+              let expected = parsedHookCommand(expectedCommand),
+              !expected.home.isEmpty
+        else {
             issues.append("The Gensee backend is unavailable. Rebuild or reinstall the app before repairing this harness.")
+            return HarnessConfigurationInspection(
+                configured: true,
+                issue: issues.joined(separator: " "),
+                canRepair: false
+            )
         }
+
+        let eventCommands = expectedEvents(for: provider).flatMap { eventName in
+            guard let event = eventContainer?[eventName] else { return [String]() }
+            return commands(in: event).filter { isGenseeCommand($0, provider: provider) }
+        }
+        let parsedCommands = eventCommands.compactMap(parsedHookCommand)
+        guard parsedCommands.count == eventCommands.count,
+              parsedCommands.allSatisfy({ !$0.home.isEmpty && !$0.backend.isEmpty })
+        else {
+            return HarnessConfigurationInspection(
+                configured: true,
+                issue: "Gensee found a custom or malformed hook command that it cannot safely rewrite. Update that command manually or remove it before enabling protection again.",
+                canRepair: false
+            )
+        }
+
+        if parsedCommands.contains(where: { normalizedPath($0.home) != normalizedPath(expected.home) }) {
+            issues.append("Hooks point to a different event store. Repair will route events to \(eventStorePath).")
+        }
+
+        let backendPaths = Set(parsedCommands.map { normalizedPath($0.backend) })
+        let missingBackend = backendPaths.first { !FileManager.default.isExecutableFile(atPath: $0) }
+        if let missingBackend {
+            issues.append("The configured Gensee backend is unavailable at \(missingBackend). Repair will install a stable backend command.")
+        }
+        let alternateBackends = backendPaths.filter { $0 != normalizedPath(expected.backend) }
+        let note = issues.isEmpty && !alternateBackends.isEmpty
+            ? "Hooks use another valid Gensee installation at \(alternateBackends.sorted().joined(separator: ", "))."
+            : nil
 
         return HarnessConfigurationInspection(
             configured: true,
-            issue: issues.isEmpty ? nil : issues.joined(separator: " ")
+            issue: issues.isEmpty ? nil : issues.joined(separator: " "),
+            note: note,
+            backendPath: backendPaths.count == 1 ? backendPaths.first : nil
         )
     }
 
@@ -115,24 +170,9 @@ enum HarnessConfigurationHealth {
     }
 
     private static func isGenseeCommand(_ command: String, provider: String) -> Bool {
-        let suffix = "hook \(provider)"
+        let suffix = " hook \(provider)"
         return command.contains("GENSEE_HOME=")
             && command.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(suffix)
-    }
-
-    private static func hookCommandsAreEquivalent(
-        _ command: String,
-        _ expectedCommand: String,
-        provider: String
-    ) -> Bool {
-        guard let actual = parsedHookCommand(command),
-              let expected = parsedHookCommand(expectedCommand),
-              actual.provider == provider,
-              expected.provider == provider
-        else { return false }
-
-        return normalizedPath(actual.home) == normalizedPath(expected.home)
-            && normalizedPath(actual.backend) == normalizedPath(expected.backend)
     }
 
     private static func parsedHookCommand(_ command: String) -> (home: String, backend: String, provider: String)? {

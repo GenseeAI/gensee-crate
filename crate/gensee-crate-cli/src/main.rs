@@ -256,6 +256,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             args.remove(0);
             dashboard_state()
         }
+        Some("dashboard-day") => {
+            args.remove(0);
+            dashboard_day(args)
+        }
         Some("telemetry") => {
             args.remove(0);
             handle_telemetry(args)
@@ -974,6 +978,7 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
             "settings",
             Some(0o600),
         )?;
+        remove_managed_claude_code_gateway_settings(&settings_path)?;
         println!(
             "gensee setup: disabled Claude Code hooks in {}",
             settings_path.display()
@@ -2047,6 +2052,8 @@ fn apply_claude_code_gateway_settings(
             "Claude Code settings must be a JSON object",
         )
     })?;
+    remove_managed_claude_code_gateway_settings_from_root(root_object);
+    let mut managed_keys = Vec::new();
     {
         let env_value = root_object
             .entry("env".to_string())
@@ -2058,20 +2065,24 @@ fn apply_claude_code_gateway_settings(
 
         if let Some(base_url) = gateway.base_url.as_deref() {
             env_object.insert("ANTHROPIC_BASE_URL".to_string(), json!(base_url));
+            managed_keys.push("ANTHROPIC_BASE_URL");
         }
         if let Some(custom_headers) = gateway.custom_headers.as_deref() {
             env_object.insert(
                 "ANTHROPIC_CUSTOM_HEADERS".to_string(),
                 json!(custom_headers),
             );
+            managed_keys.push("ANTHROPIC_CUSTOM_HEADERS");
         }
         if let Some(auth_token) = gateway.auth_token.as_deref() {
             env_object.insert("ANTHROPIC_AUTH_TOKEN".to_string(), json!(auth_token));
             env_object.remove("ANTHROPIC_API_KEY");
+            managed_keys.push("ANTHROPIC_AUTH_TOKEN");
         }
         if let Some(api_key) = gateway.api_key.as_deref() {
             env_object.insert("ANTHROPIC_API_KEY".to_string(), json!(api_key));
             env_object.remove("ANTHROPIC_AUTH_TOKEN");
+            managed_keys.push("ANTHROPIC_API_KEY");
         }
         if gateway.api_key_helper.is_some() {
             env_object.remove("ANTHROPIC_AUTH_TOKEN");
@@ -2084,8 +2095,54 @@ fn apply_claude_code_gateway_settings(
     }
     if let Some(helper) = gateway.api_key_helper.as_deref() {
         root_object.insert("apiKeyHelper".to_string(), json!(helper));
+        managed_keys.push("apiKeyHelper");
     }
+    root_object.insert("genseeGatewayManagedKeys".to_string(), json!(managed_keys));
     Ok(())
+}
+
+fn remove_managed_claude_code_gateway_settings(settings_path: &Path) -> io::Result<()> {
+    let (existing_contents, mut root) = read_json_config(settings_path)?;
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Claude Code settings must be a JSON object",
+        )
+    })?;
+    remove_managed_claude_code_gateway_settings_from_root(root_object);
+    write_json_config_if_changed_with_mode(
+        settings_path,
+        existing_contents.as_deref(),
+        &root,
+        "settings",
+        Some(0o600),
+    )
+    .map(|_| ())
+}
+
+fn remove_managed_claude_code_gateway_settings_from_root(
+    root_object: &mut serde_json::Map<String, Value>,
+) {
+    let managed_keys = root_object
+        .remove("genseeGatewayManagedKeys")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    if let Some(env_object) = root_object.get_mut("env").and_then(Value::as_object_mut) {
+        for key in &managed_keys {
+            if let Some(key) = key.as_str().filter(|key| *key != "apiKeyHelper") {
+                env_object.remove(key);
+            }
+        }
+        if env_object.is_empty() {
+            root_object.remove("env");
+        }
+    }
+    if managed_keys
+        .iter()
+        .any(|key| key.as_str() == Some("apiKeyHelper"))
+    {
+        root_object.remove("apiKeyHelper");
+    }
 }
 
 fn write_codex_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()> {
@@ -2271,6 +2328,12 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn absolutize_for_hook(path: &Path) -> io::Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hook paths must not be empty",
+        ));
+    }
     if path.is_absolute() {
         Ok(path.to_path_buf())
     } else {
@@ -3277,6 +3340,8 @@ const SETTABLE_POLICY_KEYS: &[&str] = &[
     "endpoint_security.mode",
     "endpoint_security.protected_paths",
     "endpoint_security.blocked_executables",
+    "endpoint_security.fail_closed_managed_only",
+    "endpoint_security.max_auth_latency_ms",
     "watch.system_events",
     "allow_path_prefixes",
 ];
@@ -3669,6 +3734,21 @@ fn dashboard_state() -> io::Result<()> {
     Ok(())
 }
 
+fn dashboard_day(args: Vec<OsString>) -> io::Result<()> {
+    let [day] = args.as_slice() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee dashboard-day <YYYY-MM-DD>",
+        ));
+    };
+    let day = day.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "dashboard day must be UTF-8")
+    })?;
+    let store = EventStore::default_local()?;
+    println!("{}", serde_json::to_string(&store.dashboard_day(day)?)?);
+    Ok(())
+}
+
 pub(crate) fn ingest_eslogger() -> io::Result<()> {
     let store = EventStore::default_local()?;
     let mut count = 0_u64;
@@ -3757,6 +3837,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
         if event.action == "notify" {
             if let (Some(session_id), Some(path)) = (session_id.as_ref(), event.primary_path()) {
                 let operation = match event.event_type.as_str() {
+                    "open" if event.is_write_open() => Some("write"),
                     "open" | "readdir" | "mmap" => Some("read"),
                     "create" => Some("create"),
                     "write" | "truncate" => Some("write"),
@@ -3802,7 +3883,17 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 }
             }
         }
+        let ended_root_session =
+            if event.event_type == "exit" && event.attribution.root_pid == Some(event.actor.pid) {
+                event.attribution.session_id.clone()
+            } else {
+                None
+            };
+        let exit_code = event.exit_status;
         store.append_system_event(&event.into_system_event()?)?;
+        if let Some(session_id) = ended_root_session {
+            store.end_session(&session_id, observed_at_ms, exit_code)?;
+        }
         count += 1;
     }
 
@@ -3876,6 +3967,9 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn hook_session_registration(event: &AgentHookEvent) -> Option<AgentSession> {
+    if event.hook_event_name.as_deref() != Some("UserPromptSubmit") {
+        return None;
+    }
     let session_id = event.session_id.as_ref()?.clone();
     let output = Command::new("ps")
         .args(["-axo", "pid=,ppid=,comm="])
