@@ -25,9 +25,8 @@ struct LiveFeedPage: View {
         DashboardPage {
             VStack(alignment: .leading, spacing: 16) {
                 DashboardPageHeader("Live Feed", description: "Real-time stream of agent hook events.") {
-                    HStack(spacing: 8) {
-                        Label(model.backendAvailable ? "Connected" : "Disconnected", systemImage: "circle.fill")
-                            .font(.system(size: 11)).foregroundStyle(model.backendAvailable ? Color.green : Color.red)
+                    HStack(spacing: 12) {
+                        LiveFeedConnectionBadge(connected: model.backendAvailable)
                         Picker("Category", selection: $category) {
                             ForEach(["All", "Agent activity", "Transactional environment"], id: \.self, content: Text.init)
                         }.frame(width: 190)
@@ -74,6 +73,29 @@ struct LiveFeedPage: View {
                 if enabled { await model.refreshDashboard(reportErrors: false) }
             }
         }
+    }
+}
+
+private struct LiveFeedConnectionBadge: View {
+    let connected: Bool
+
+    private var color: Color { connected ? .green : .red }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "circle.fill")
+                .font(.system(size: 8, weight: .semibold))
+            Text(connected ? "Connected" : "Disconnected")
+                .font(.system(size: 11, weight: .semibold))
+                .lineLimit(1)
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 9)
+        .frame(height: 24)
+        .background(color.opacity(0.10), in: Capsule())
+        .fixedSize(horizontal: true, vertical: false)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(connected ? "Gensee backend connected" : "Gensee backend disconnected")
     }
 }
 
