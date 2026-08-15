@@ -52,6 +52,32 @@ final class HarnessConfigurationHealthTests: XCTestCase {
         XCTAssertTrue(inspection.issue?.contains(homeURL.path) == true)
     }
 
+    func testTmpAndPrivateTmpCommandsAreEquivalent() throws {
+        let privateTmpHome = URL(fileURLWithPath: "/private/tmp/gensee-home")
+        let privateTmpBackend = URL(
+            fileURLWithPath: "/private/tmp/build/Gensee Crate.app/Contents/Resources/bin/gensee"
+        )
+        let expectedCommand = HarnessConfigurationHealth.expectedCommand(
+            provider: "claude-code",
+            homeURL: privateTmpHome,
+            backendURL: privateTmpBackend
+        )
+        let installedCommand = "GENSEE_HOME=/tmp/gensee-home '/tmp/build/Gensee Crate.app/Contents/Resources/bin/gensee' hook claude-code"
+        let contents = try nestedConfiguration(
+            events: HarnessConfigurationHealth.expectedEvents(for: "claude-code"),
+            command: installedCommand
+        )
+
+        let inspection = HarnessConfigurationHealth.inspect(
+            provider: "claude-code",
+            contents: contents,
+            expectedCommand: expectedCommand,
+            eventStorePath: privateTmpHome.path
+        )
+
+        XCTAssertTrue(inspection.isHealthy, inspection.issue ?? "Expected equivalent commands")
+    }
+
     func testMissingHookEventNeedsRepair() throws {
         let command = HarnessConfigurationHealth.expectedCommand(
             provider: "codex",

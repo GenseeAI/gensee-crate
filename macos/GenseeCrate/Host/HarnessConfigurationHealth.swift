@@ -67,7 +67,9 @@ enum HarnessConfigurationHealth {
                 guard let event = eventContainer?[eventName] else { return [String]() }
                 return commands(in: event).filter { isGenseeCommand($0, provider: provider) }
             }
-            if eventCommands.contains(where: { $0 != expectedCommand }) {
+            if eventCommands.contains(where: {
+                !hookCommandsAreEquivalent($0, expectedCommand, provider: provider)
+            }) {
                 issues.append("Hooks point to a different event store or Gensee backend. Repair will route events to \(eventStorePath).")
             }
         } else {
@@ -116,6 +118,93 @@ enum HarnessConfigurationHealth {
         let suffix = "hook \(provider)"
         return command.contains("GENSEE_HOME=")
             && command.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(suffix)
+    }
+
+    private static func hookCommandsAreEquivalent(
+        _ command: String,
+        _ expectedCommand: String,
+        provider: String
+    ) -> Bool {
+        guard let actual = parsedHookCommand(command),
+              let expected = parsedHookCommand(expectedCommand),
+              actual.provider == provider,
+              expected.provider == provider
+        else { return false }
+
+        return normalizedPath(actual.home) == normalizedPath(expected.home)
+            && normalizedPath(actual.backend) == normalizedPath(expected.backend)
+    }
+
+    private static func parsedHookCommand(_ command: String) -> (home: String, backend: String, provider: String)? {
+        let words = shellWords(command)
+        guard words.count == 4,
+              words[0].hasPrefix("GENSEE_HOME="),
+              words[2] == "hook"
+        else { return nil }
+
+        return (
+            home: String(words[0].dropFirst("GENSEE_HOME=".count)),
+            backend: words[1],
+            provider: words[3]
+        )
+    }
+
+    /// Parses the small, shell-quoted command shape emitted by the Rust setup command.
+    /// This deliberately does not execute or expand shell syntax.
+    private static func shellWords(_ command: String) -> [String] {
+        var result: [String] = []
+        var word = ""
+        var wordStarted = false
+        var inSingleQuote = false
+        var escaping = false
+
+        for character in command {
+            if escaping {
+                word.append(character)
+                wordStarted = true
+                escaping = false
+            } else if character == "\\" && !inSingleQuote {
+                escaping = true
+                wordStarted = true
+            } else if character == "'" {
+                inSingleQuote.toggle()
+                wordStarted = true
+            } else if character.isWhitespace && !inSingleQuote {
+                if wordStarted {
+                    result.append(word)
+                    word = ""
+                    wordStarted = false
+                }
+            } else {
+                word.append(character)
+                wordStarted = true
+            }
+        }
+
+        guard !inSingleQuote, !escaping else { return [] }
+        if wordStarted { result.append(word) }
+        return result
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        var normalized = URL(fileURLWithPath: path).standardizedFileURL.path
+        // macOS exposes these directories through root-level symlinks. A child
+        // process may report either spelling for the same executable or store.
+        for (alias, canonical) in [
+            ("/tmp", "/private/tmp"),
+            ("/var", "/private/var"),
+            ("/etc", "/private/etc"),
+        ] {
+            if normalized == alias {
+                normalized = canonical
+                break
+            }
+            if normalized.hasPrefix(alias + "/") {
+                normalized = canonical + normalized.dropFirst(alias.count)
+                break
+            }
+        }
+        return URL(fileURLWithPath: normalized).resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     private static func shellQuote(_ value: String) -> String {
