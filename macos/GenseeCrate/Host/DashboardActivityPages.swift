@@ -71,7 +71,7 @@ struct LiveFeedPage: View {
         .task(id: enabled) {
             while enabled && !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                if enabled { await model.refreshDashboard() }
+                if enabled { await model.refreshDashboard(reportErrors: false) }
             }
         }
     }

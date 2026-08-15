@@ -9,6 +9,7 @@ struct GenseeCommandOutput: Sendable {
 enum GenseeCLIError: LocalizedError {
     case executableNotFound
     case commandFailed(arguments: [String], output: String, exitCode: Int32)
+    case commandTerminated(arguments: [String], signal: Int32)
     case invalidOutput(String)
 
     var errorDescription: String? {
@@ -17,7 +18,13 @@ enum GenseeCLIError: LocalizedError {
             return "The Gensee backend could not be found. Rebuild the app or choose an installed gensee binary."
         case let .commandFailed(arguments, output, exitCode):
             let command = (["gensee"] + arguments).joined(separator: " ")
-            return "\(command) failed (exit \(exitCode)): \(output.trimmingCharacters(in: .whitespacesAndNewlines))"
+            let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return detail.isEmpty
+                ? "\(command) failed (exit \(exitCode)) without diagnostic output."
+                : "\(command) failed (exit \(exitCode)): \(detail)"
+        case let .commandTerminated(arguments, signal):
+            let command = (["gensee"] + arguments).joined(separator: " ")
+            return "\(command) was terminated by signal \(signal)."
         case let .invalidOutput(message):
             return message
         }
@@ -93,6 +100,12 @@ struct GenseeCLI: Sendable {
                 exitCode: process.terminationStatus
             )
             guard result.exitCode == 0 else {
+                if process.terminationReason == .uncaughtSignal {
+                    throw GenseeCLIError.commandTerminated(
+                        arguments: arguments,
+                        signal: process.terminationStatus
+                    )
+                }
                 let output = result.stderr.isEmpty ? result.stdout : result.stderr
                 throw GenseeCLIError.commandFailed(
                     arguments: arguments,

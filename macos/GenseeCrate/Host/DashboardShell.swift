@@ -68,7 +68,7 @@ struct DashboardShell: View {
             await model.refreshAll()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
-                await model.refreshDashboard()
+                await model.refreshDashboard(reportErrors: false)
             }
         }
         .alert("Gensee needs attention", isPresented: errorPresented) {
@@ -112,6 +112,12 @@ struct DashboardShell: View {
             .background(Color.dashboardMutedFill, in: RoundedRectangle(cornerRadius: 5))
 
             Spacer()
+            if let issue = model.dashboardRefreshIssue {
+                Label("Refresh delayed", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.dashboardGold)
+                    .help(issue)
+            }
             Button { selection = .alerts } label: { Image(systemName: "bell") }
                 .buttonStyle(.plain).help("Alerts")
             Button { selection = .settings } label: { Image(systemName: "questionmark.circle") }

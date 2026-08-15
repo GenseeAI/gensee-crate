@@ -11,12 +11,14 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var isRefreshing = false
     @Published private(set) var runningCommand: String?
     @Published private(set) var lastUpdated: Date?
+    @Published private(set) var dashboardRefreshIssue: String?
     @Published var errorMessage: String?
     @Published var noticeMessage: String?
 
     let homeURL: URL
     let endpointSensor: EndpointSecuritySensor
     private var cli: GenseeCLI
+    private var dashboardRefreshInProgress = false
 
     init() {
         let environmentHome = ProcessInfo.processInfo.environment["GENSEE_HOME"]
@@ -119,14 +121,21 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
-    func refreshDashboard() async {
+    func refreshDashboard(reportErrors: Bool = true) async {
         guard backendAvailable else { return }
+        guard !dashboardRefreshInProgress else { return }
+        dashboardRefreshInProgress = true
+        defer { dashboardRefreshInProgress = false }
         do {
             snapshot = try await cli.decode(SecuritySnapshot.self, arguments: ["dashboard-state"])
             configureEndpointSensor()
             lastUpdated = Date()
+            dashboardRefreshIssue = nil
         } catch {
-            errorMessage = error.localizedDescription
+            dashboardRefreshIssue = error.localizedDescription
+            if reportErrors, errorMessage == nil {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -166,7 +175,7 @@ final class ConsoleModel: ObservableObject {
         do {
             let output = try await cli.run(arguments)
             noticeMessage = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            await refreshDashboard()
+            await refreshDashboard(reportErrors: false)
             return true
         } catch {
             errorMessage = error.localizedDescription
