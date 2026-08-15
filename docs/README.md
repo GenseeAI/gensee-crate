@@ -7,7 +7,7 @@ quick start, then dive into the topic guides below.
 ## Guides
 
 - [Architecture](architecture.md) — the v0.2 runtime, workspace crates, and roadmap.
-- [Roadmap](roadmap.md) — planned Linux enforcement, macOS Endpoint Security, sandbox, ML policy, and integration work.
+- [Roadmap](roadmap.md) — current host controls and planned sandbox, sensor, ML policy, and integration work.
 - [Linux host support](linux.md) — `/proc` process attribution, fanotify sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress controls, and Linux capability planning.
 - [Tclone runtime integration](tclone.md) — launch agents in cloneable Linux containers, fork live source containers, inspect diffs, keep workspaces, and discard forks.
 - [`gensee watch` (sidecar)](watch.md) — observe filesystem effects and macOS system events without launching the agent.
@@ -21,7 +21,8 @@ quick start, then dive into the topic guides below.
 - [Cursor hooks](cursor-support.md) — native hook setup, enforcement behavior, and runtime verification.
 - [Omnigent integration](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/omnigent) — thin `watch`/`run` support and the deeper policy-bridge plan.
 - [Safety policy](policy.md) — the data-driven allow/ask/deny policy engine and how to customize it.
-- [Dashboard](dashboard.md) — inspect live activity, lineage, policy decisions, alerts, and policy edits.
+- [Dashboard](dashboard.md) — run the cross-platform React/Tauri inspector for activity, lineage, policy, and transactions.
+- [Native macOS security console](macos-app.md) — manage the Endpoint Security extension, policy modes, and harness protection.
 - [SQLite lineage graph](lineage-graph.md) — the provenance schema, example queries, and what Gensee can flag today.
 - [Endpoint Security sensor](endpoint-security.md) — signed macOS process/file observation and managed-tree authorization.
 

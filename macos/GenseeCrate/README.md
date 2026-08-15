@@ -6,9 +6,12 @@ Crate. It uses these explicit App IDs:
 - Host app: `ai.gensee.crate`
 - Endpoint Security extension: `ai.gensee.crate.endpoint-security`
 
-The extension is intentionally notification-only. It subscribes to process
-execution/lifecycle and common file events, but it does not subscribe to
-Endpoint Security `AUTH` events until the Crate policy response path is ready.
+The extension supports `off`, `observe`, `protect`, and `strict` policy modes.
+It subscribes to process lifecycle, file access and mutation notifications, and
+the corresponding Endpoint Security `AUTH` events. `observe` is the default and
+never denies. `protect` and `strict` can deny configured operations only inside
+explicitly managed agent process trees; unrelated host processes remain outside
+the deny scope.
 
 The host app embeds the `gensee` CLI built from this repository and uses it as
 the product backend. The native console reads the local dashboard snapshot,
@@ -28,10 +31,27 @@ The console includes:
   visible but disabled.
 - Endpoint Security installation, removal, and Full Disk Access navigation.
 
+## Use the security console
+
+The **Harnesses** page always lists the six supported harnesses. When Codex,
+Claude Code, Antigravity, Cursor, or GitHub Copilot is detected, its switch
+enables or disables the existing Gensee hook integration through the embedded
+OSS CLI. A harness that is not installed remains visible with a disabled,
+muted switch so users can see what is supported without implying that it is
+active. **Scan again** refreshes installation and protection state.
+
+Omnigent is shown in the same inventory, but it currently uses managed-launch
+protection instead of a direct hook toggle. Launch it through `gensee run` to
+associate its process tree with Gensee policy and Endpoint Security decisions.
+
+Use **Policy** to choose the Endpoint Security mode and configure protected
+paths or blocked executables. Use **Settings** to install, inspect, or remove
+the system extension and to open the Full Disk Access pane. Start with
+`observe`, confirm event delivery, and review the local evidence before moving
+to an enforcement mode.
+
 Disabling a direct-hook integration removes only Gensee-owned hook entries and
-preserves unrelated harness settings and hooks. Omnigent remains a managed
-launch integration for now: run it with `gensee run` for process-tree
-monitoring and enforcement until the planned first-class policy bridge lands.
+preserves unrelated harness settings and hooks.
 
 ## Apple Developer configuration
 

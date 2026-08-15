@@ -371,7 +371,11 @@ gensee policy set watch.system_events endpoint-security
 
 Build and install [`macos/GenseeCrate`](macos/GenseeCrate), approve its bundled
 system extension, and grant Gensee Crate Full Disk Access. `eslogger` remains an
-optional manual diagnostic backend.
+optional manual diagnostic backend. The app's Harnesses page detects Codex,
+Claude Code, Antigravity, Cursor, GitHub Copilot, and Omnigent. Installed
+direct-hook harnesses can be enabled or disabled; unavailable harnesses stay
+visible but muted. See the [native macOS security console](docs/macos-app.md)
+guide.
 
 **Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
 `sandbox-exec` and can stage workspace writes for review.
@@ -662,7 +666,7 @@ See [`docs/roadmap.md`](docs/roadmap.md) for more detail.
 Full docs live in [`docs/`](docs/README.md):
 
 - [Architecture](docs/architecture.md) — the v0.2 runtime, workspace crates, and roadmap.
-- [Roadmap](docs/roadmap.md) — planned Linux enforcement, macOS Endpoint Security, sandbox, ML policy, and integration work.
+- [Roadmap](docs/roadmap.md) — current host controls and planned sandbox, sensor, ML policy, and integration work.
 - [Linux host support](docs/linux.md) — `/proc` monitoring, fanotify
   sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress
   controls, and the Linux enforcement plan.
@@ -676,7 +680,9 @@ Full docs live in [`docs/`](docs/README.md):
 - [Codex hooks](docs/codex-support.md) — wiring Codex prompts and tool intent into Gensee.
 - [Antigravity support](docs/antigravity-support.md) — wiring Antigravity hooks and `.agents` customizations into Gensee.
 - [VS Code / GitHub Copilot hooks](docs/vscode-support.md) — wiring VS Code agent hooks and native tool intent into Gensee.
+- [Cursor hooks](docs/cursor-support.md) — wiring Cursor prompts, tools, shell commands, and lifecycle events into Gensee.
 - [Omnigent integration](integrations/omnigent/README.md) — thin sidecar/managed-run support and the deeper policy-bridge plan.
 - [Safety policy](docs/policy.md) — the data-driven allow/ask/deny engine and `gensee policy` workflow.
+- [Native macOS security console](docs/macos-app.md) — manage the Endpoint Security extension, policy modes, and harness protection.
 - [SQLite lineage graph](docs/lineage-graph.md) — the provenance schema and example queries.
 - [Endpoint Security sensor](docs/endpoint-security.md) — signed macOS process/file observation and managed-tree authorization.

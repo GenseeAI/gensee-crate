@@ -1,8 +1,9 @@
 # Roadmap
 
 Gensee Crate supports macOS and Linux today, with Claude Code, Codex,
-Antigravity, and VS Code / GitHub Copilot hook support, local policy
-enforcement, staged workspace runs, local telemetry, and a browser dashboard.
+Antigravity, Cursor, and VS Code / GitHub Copilot hook support, local policy
+enforcement, staged workspace runs, local telemetry, a React/Tauri dashboard,
+and a native SwiftUI macOS security console.
 Linux host support includes `/proc` process attribution, capability planning,
 fanotify sensitive-path enforcement, seccomp launcher profiles, and
 cgroup-scoped nftables egress controls. This roadmap is directional and may
@@ -46,16 +47,33 @@ Planned work includes:
 
 ## Endpoint Security-Based Defense
 
-On macOS, deeper system-level enforcement requires Apple's Endpoint Security
-entitlement. GenseeAI is pursuing this path so Gensee Crate can move beyond
-sidecar observation and sandboxed launches toward stronger host-level defense.
+On macOS, Gensee Crate now ships a first-party, signed Endpoint Security system
+extension and native security console. The extension replaces `eslogger` in the
+normal product path and connects kernel-owned evidence to the same Rust policy,
+attribution, and local-store backend used by the OSS CLI.
+
+Available now:
+
+- Exact process identity and process-tree evidence for exec, fork, and exit.
+- File open, directory read, mmap, create, write, close, rename, unlink, and
+  truncate evidence attributed to the responsible process.
+- Local authorization for configured protected paths and blocked executables in
+  explicitly managed agent process trees.
+- `off`, `observe`, `protect`, and `strict` modes with an observe-first default
+  and a bounded, local authorization path that never waits for the UI.
+- A SwiftUI console for extension lifecycle, health, policy mode, Full Disk
+  Access guidance, and installed-harness protection toggles.
 
 Planned work includes:
 
-- Endpoint Security-based file, process, and network visibility on macOS.
-- Stronger correlation between agent tool calls and OS-level events.
-- Detection of bypass attempts that happen outside the agent's normal hook path.
-- Policy enforcement that can complement agent hooks and sandboxed runs.
+- Broader authorization coverage and policy controls for supported Endpoint
+  Security operations.
+- Stronger correlation between agent prompts/tool calls and OS-level events.
+- Detection and explanation of bypass attempts outside the normal hook path,
+  including alternative shells, background jobs, and indirect interpreters.
+- Richer descendant and cross-session attribution for concurrent harnesses.
+- System-level network visibility through a separate Network Extension, packet
+  filter, or equivalent sensor; Endpoint Security is not a packet monitor.
 
 ## Sandbox Support
 

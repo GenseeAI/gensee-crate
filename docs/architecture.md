@@ -2,7 +2,7 @@
 
 Gensee Crate is a local-first runtime security layer for AI coding agents. The
 current v0.2 release supports native macOS and Linux controls, agent hooks, and
-transactional tclone environments across five workflows:
+transactional tclone environments across six workflows:
 
 - `gensee watch` — sidecar audit of workspace effects and macOS system events
   for users who do not want Gensee launching their agent. See [watch.md](watch.md).
@@ -19,6 +19,10 @@ transactional tclone environments across five workflows:
 - `dashboards/` — native timeline, lineage, policy, transaction, and review UI
   (React + Tauri) backed by the same `GENSEE_HOME` store as the CLI. See
   [dashboard.md](dashboard.md).
+- `macos/GenseeCrate` — SwiftUI security console for the signed Endpoint
+  Security extension, sensor policy, and installed harness protection. It
+  embeds the monorepo's `gensee` CLI rather than implementing a separate
+  backend. See [macos-app.md](macos-app.md).
 
 The tclone container runtime is available on prepared Linux hosts. The signed
 Gensee Endpoint Security system extension is the default macOS system-event

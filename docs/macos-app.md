@@ -1,0 +1,85 @@
+# Native macOS security console
+
+Gensee Crate for macOS is a SwiftUI security console and the host for Gensee's
+first-party Endpoint Security system extension. Its source lives in
+[`macos/GenseeCrate`](https://github.com/GenseeAI/gensee-crate/tree/main/macos/GenseeCrate).
+
+The app does not implement a second Gensee backend. It embeds the `gensee` CLI
+built from this monorepo and uses the existing Rust crates, policy engine, setup
+commands, and `GENSEE_HOME` store. Activity recorded by hooks, `gensee watch`,
+`gensee run`, and the system extension therefore appears in the same local
+console.
+
+## What the app manages
+
+- Dashboard, activity, alerts, transactions, and policy backed by the existing
+  Rust CLI and local store.
+- Installation, status, and removal of the signed Endpoint Security system
+  extension.
+- Navigation to Full Disk Access, which macOS requires for complete protected
+  file visibility.
+- Endpoint Security `off`, `observe`, `protect`, and `strict` policy modes.
+- Harness protection for Codex, Claude Code, Antigravity, Cursor, GitHub
+  Copilot, and Omnigent.
+
+## Harness controls
+
+The **Harnesses** page scans the Mac and always displays all six supported
+harnesses:
+
+| Harness | Protection path |
+| --- | --- |
+| Codex | Direct Gensee hooks |
+| Claude Code | Direct Gensee hooks |
+| Antigravity | Direct Gensee hooks |
+| Cursor | Direct Gensee hooks |
+| GitHub Copilot | VS Code agent hooks |
+| Omnigent | Managed launch with `gensee run` |
+
+Installed direct-hook harnesses have an enable/disable switch. Enabling calls
+the matching `gensee setup <provider>` command; disabling calls its
+`--disable` form. Disable removes only Gensee-owned hook entries and preserves
+unrelated user settings and hooks. Harnesses that are not installed remain
+visible but muted and unavailable. Use **Scan again** after installing or
+removing a harness outside Gensee Crate.
+
+Omnigent currently has no direct hook switch. Launch it with `gensee run` to
+place its process tree under Gensee monitoring and supported policy
+enforcement.
+
+## Endpoint Security modes
+
+The bundled system extension records exact process identity and supported
+process/file events. Configure its mode on the **Policy** page or with:
+
+```bash
+gensee policy set endpoint_security.mode observe
+```
+
+- `off` — allow authorization messages and omit telemetry.
+- `observe` — record evidence without denying operations; this is the default.
+- `protect` — enforce configured protected paths and blocked executables for
+  explicitly managed agent process trees.
+- `strict` — use the managed-tree fail-closed posture while leaving unrelated
+  host processes outside the deny scope.
+
+See the [Endpoint Security sensor](endpoint-security.md) guide for captured
+events, policy keys, safety boundaries, and rollback.
+
+## Signing and installation
+
+The host App ID is `ai.gensee.crate`; the extension App ID is
+`ai.gensee.crate.endpoint-security`. Building the source does not grant the
+managed entitlement. The signing team must have Apple's Endpoint Security
+approval and matching provisioning for the intended Development or Developer
+ID distribution method.
+
+Activation only works from a correctly signed app installed in `/Applications`.
+After opening it, use **Install & Enable**, approve the system extension in
+System Settings if prompted, grant Gensee Crate Full Disk Access, and confirm
+the Settings page reports event delivery.
+
+Certificates, private keys, `.p12` files, provisioning profiles, notarization
+credentials, archives, and built app/DMG artifacts must never be committed.
+Entitlement plist files, bundle identifiers, and Xcode build configuration are
+safe and intentionally versioned.

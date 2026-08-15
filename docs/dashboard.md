@@ -1,12 +1,18 @@
-# Dashboard
+# Cross-platform dashboard
 
-The Gensee Crate dashboard is a local native desktop application for inspecting the same
-`GENSEE_HOME` store used by `gensee watch`, agent hooks, `gensee run`, and
-`gensee timeline`.
+The React/Tauri Gensee Crate dashboard is a local desktop application for
+inspecting the same `GENSEE_HOME` store used by `gensee watch`, agent hooks,
+`gensee run`, and `gensee timeline`.
 
 Use it when you want to see live agent activity, policy decisions, alerts, file
 and request lineage, review verdicts, and the active policy document in one
 place.
+
+On macOS, Gensee also provides a dedicated SwiftUI
+[security console](macos-app.md). It uses the same Rust backend and local store,
+and adds system-extension lifecycle, Endpoint Security mode, Full Disk Access,
+and per-harness protection controls. The React/Tauri dashboard remains the
+cross-platform development surface for detailed lineage and transaction views.
 
 ## Launch
 

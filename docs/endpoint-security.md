@@ -12,6 +12,11 @@ channel accepts only the signed Gensee host. The host pulls bounded batches and
 streams versioned JSONL into a long-lived `gensee ingest endpoint-security`
 process, which persists events in the active encrypted `GENSEE_HOME` store.
 
+The native [macOS security console](macos-app.md) manages extension activation,
+Full Disk Access navigation, sensor policy mode, health, and protection toggles
+for installed agent harnesses. It delegates policy and hook configuration to
+the embedded OSS `gensee` CLI rather than duplicating the Rust implementation.
+
 ## Captured evidence
 
 The schema records the reboot ID, event ID, `(pid,pidversion)` process identity,
