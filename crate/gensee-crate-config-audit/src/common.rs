@@ -1,6 +1,7 @@
 use crate::model::{
     Assessment, AuditFinding, AuditSource, AuditSummary, Evidence, Remediation, Severity,
 };
+use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -169,6 +170,11 @@ pub(crate) fn secret_key_name(key: &str) -> bool {
     .any(|needle| key.contains(needle))
 }
 
+pub(crate) fn secret_literal(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && !runtime_secret_reference(trimmed) && trimmed.len() >= 8
+}
+
 pub(crate) fn insecure_remote_http(value: &str) -> bool {
     Url::parse(value).map_or_else(
         |_| value.to_ascii_lowercase().starts_with("http://"),
@@ -189,11 +195,13 @@ pub(crate) fn endpoint_has_credentials(value: &str) -> bool {
 /// only: redaction fails closed, while findings use `endpoint_has_credentials`
 /// so malformed input is not reported as confirmed credential exposure.
 pub(crate) fn endpoint_must_be_redacted(value: &str) -> bool {
-    Url::parse(value).map_or(true, |url| parsed_url_has_credentials(&url))
+    endpoint_has_credentials(value) || !endpoint_is_parseable(value)
 }
 
 pub(crate) fn endpoint_is_parseable(value: &str) -> bool {
-    Url::parse(value).is_ok()
+    Url::parse(value)
+        .ok()
+        .is_some_and(|url| url.host().is_some())
 }
 
 /// Returns a report-safe endpoint value. Confirmed credentials receive a
@@ -213,20 +221,32 @@ pub(crate) fn endpoint_display_value(value: &str) -> String {
 }
 
 fn parsed_url_has_credentials(url: &Url) -> bool {
-    !url.username().is_empty()
-        || url.password().is_some()
-        || url
-            .query_pairs()
-            .any(|(key, _)| secret_key_name(&normalize_secret_key(&key)))
+    url_userinfo_has_literal_credentials(url)
+        || url.query_pairs().any(|(key, value)| {
+            secret_key_name(&normalize_secret_key(&key)) && secret_value_is_literal(&value)
+        })
+}
+
+fn url_userinfo_has_literal_credentials(url: &Url) -> bool {
+    if url.username().is_empty() && url.password().is_none() {
+        return false;
+    }
+
+    let encoded = url.password().map_or_else(
+        || url.username().to_string(),
+        |password| format!("{}:{password}", url.username()),
+    );
+    secret_value_is_literal(&percent_decode_str(&encoded).decode_utf8_lossy())
 }
 
 fn parse_endpoint_for_credential_detection(value: &str) -> Option<Url> {
-    if let Ok(url) = Url::parse(value) {
-        return Some(url);
+    let parsed = Url::parse(value).ok();
+    if parsed.as_ref().is_some_and(|url| url.host().is_some()) {
+        return parsed;
     }
 
     let value = value.trim();
-    if value.is_empty() || has_explicit_url_scheme(value) {
+    if value.is_empty() || (parsed.is_none() && has_explicit_url_scheme(value)) {
         return None;
     }
 
@@ -234,7 +254,25 @@ fn parse_endpoint_for_credential_detection(value: &str) -> Option<Url> {
     if authority.is_empty() {
         return None;
     }
-    Url::parse(&format!("https://{authority}")).ok()
+    Url::parse(&format!("https://{authority}"))
+        .ok()
+        .filter(|url| url.host().is_some())
+}
+
+fn secret_value_is_literal(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && !runtime_secret_reference(trimmed)
+}
+
+fn runtime_secret_reference(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.contains("${")
+        || trimmed
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("env:"))
+        || trimmed
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("input:"))
 }
 
 fn has_explicit_url_scheme(value: &str) -> bool {
@@ -396,6 +434,7 @@ mod tests {
     fn endpoint_redaction_recovers_scheme_less_credentials_and_fails_closed() {
         for endpoint in [
             "//admin:do-not-leak@example.com/mcp",
+            "admin:do-not-leak@internal.example/mcp",
             "example.com/mcp?token=do-not-leak",
         ] {
             assert!(endpoint_must_be_redacted(endpoint), "{endpoint}");
@@ -435,6 +474,20 @@ mod tests {
             endpoint_display_value("https://example.com/mcp"),
             "https://example.com/mcp"
         );
+    }
+
+    #[test]
+    fn endpoint_credentials_ignore_runtime_secret_references() {
+        for endpoint in [
+            "https://example.com/mcp?token=${input:api-key}",
+            "https://${input:user}@example.com/mcp",
+            "https://example.com/mcp?api_key=env:MCP_API_KEY",
+        ] {
+            assert!(endpoint_is_parseable(endpoint), "{endpoint}");
+            assert!(!endpoint_has_credentials(endpoint), "{endpoint}");
+            assert!(!endpoint_must_be_redacted(endpoint), "{endpoint}");
+            assert_eq!(endpoint_display_value(endpoint), endpoint);
+        }
     }
 
     #[test]

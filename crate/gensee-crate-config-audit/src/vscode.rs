@@ -4,8 +4,8 @@ use crate::common::{
     canonical_or_original, collect_json_commands, display_path, endpoint_display_value,
     endpoint_has_credentials, endpoint_is_parseable, endpoint_must_be_redacted,
     executable_dependency_is_unpinned, finding_fingerprint, hash_bytes, insecure_remote_http,
-    make_finding, normalize_secret_key, read_limited_text, secret_key_name, sort_findings,
-    source_for, summarize,
+    make_finding, normalize_secret_key, read_limited_text, secret_key_name, secret_literal,
+    sort_findings, source_for, summarize,
 };
 use crate::model::{
     Assessment, AuditApplicability, AuditFinding, AuditInventory, AuditReport, AuditSource,
@@ -1705,15 +1705,6 @@ fn json_contains_secret(value: &Value) -> bool {
     }
 }
 
-fn secret_literal(value: &str) -> bool {
-    let trimmed = value.trim();
-    !trimmed.is_empty()
-        && !trimmed.contains("${")
-        && !trimmed.starts_with("env:")
-        && !trimmed.starts_with("input:")
-        && trimmed.len() >= 8
-}
-
 fn poisoning_indicator(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     [
@@ -2110,6 +2101,7 @@ mod tests {
     fn redacts_unparseable_mcp_endpoints_and_recovers_scheme_less_credentials() {
         for (index, (endpoint, has_credentials)) in [
             ("//admin:do-not-leak@example.com/mcp", true),
+            ("admin:do-not-leak@internal.example/mcp", true),
             ("example.com/mcp?token=do-not-leak", true),
             (":://admin:do-not-leak@example.com", false),
         ]
@@ -2166,6 +2158,45 @@ mod tests {
                     "<redacted-url>"
                 })
             );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn mcp_endpoint_input_variables_are_not_reported_as_credentials() {
+        for (index, endpoint) in [
+            "https://example.com/mcp?token=${input:api-key}",
+            "https://${input:user}@example.com/mcp",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = temp_root(&format!("mcp-input-variable-{index}"));
+            let _ = fs::remove_dir_all(&root);
+            let workspace = root.join("repo");
+            let user_data = root.join("User");
+            fs::create_dir_all(&workspace).unwrap();
+            write(
+                &workspace.join(".vscode/mcp.json"),
+                &format!(r#"{{"servers":{{"demo":{{"type":"http","url":"{endpoint}"}}}}}}"#),
+            );
+
+            let report = audit_vscode_host(&VscodeAuditOptions {
+                workspace,
+                user_data,
+                profile: None,
+                extension_roots: Vec::new(),
+            })
+            .unwrap();
+
+            assert_eq!(
+                report.inventory.mcp_servers[0].endpoint.as_deref(),
+                Some(endpoint)
+            );
+            assert!(!report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "VSC-MCP-005"));
             let _ = fs::remove_dir_all(root);
         }
     }

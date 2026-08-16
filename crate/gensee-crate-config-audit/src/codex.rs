@@ -2532,6 +2532,7 @@ mod tests {
     fn redacts_unparseable_mcp_endpoints_from_the_report() {
         for (index, (endpoint, has_credentials)) in [
             ("//admin:do-not-leak@example.com/mcp", true),
+            ("admin:do-not-leak@internal.example/mcp", true),
             ("example.com/mcp?token=do-not-leak", true),
             (":://admin:do-not-leak@example.com", false),
         ]
@@ -2591,6 +2592,37 @@ mod tests {
             );
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn mcp_endpoint_runtime_references_are_not_reported_as_credentials() {
+        let root = temp_root("mcp-runtime-reference");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        let endpoint = "https://example.com/mcp?token=${env:MCP_API_KEY}";
+        write(
+            &codex_home.join("config.toml"),
+            &format!("[mcp_servers.demo]\nurl = \"{endpoint}\"\n"),
+        );
+
+        let report = audit_codex(&CodexAuditOptions {
+            workspace,
+            codex_home,
+            profile: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.inventory.mcp_servers[0].endpoint.as_deref(),
+            Some(endpoint)
+        );
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "CAX-MCP-006"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
