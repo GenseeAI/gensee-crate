@@ -1,3 +1,6 @@
+#[cfg(test)]
+use crate::common::MAX_TEXT_FILE_BYTES;
+use crate::common::{canonical_or_original, display_path, hash_bytes, read_limited_text};
 use crate::model::{
     Assessment, AuditApplicability, AuditFinding, AuditInventory, AuditReport, AuditSource,
     AuditSummary, AuditTarget, Evidence, ExtensionInventory, ManualCheck, McpInventory,
@@ -26,7 +29,6 @@ const HOOKS_REFERENCE: &str = "https://code.visualstudio.com/docs/agent-customiz
 const COPILOT_DATA_REFERENCE: &str =
     "https://docs.github.com/en/copilot/how-tos/manage-your-account/manage-policies#model-training-and-improvements";
 
-const MAX_TEXT_FILE_BYTES: u64 = 256 * 1024;
 const MAX_DISCOVERY_DEPTH: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -132,8 +134,8 @@ fn audit_vscode_scope(
     options: &VscodeAuditOptions,
     scope: VscodeReportScope,
 ) -> io::Result<AuditReport> {
-    let workspace = canonical_or_original(&options.workspace);
-    let user_data = canonical_or_original(&options.user_data);
+    let workspace = options.workspace.clone();
+    let user_data = options.user_data.clone();
     let mut sources = Vec::new();
     let mut findings = Vec::new();
     let mut inventory = AuditInventory::default();
@@ -1693,13 +1695,43 @@ fn mutable_package_launcher(command: &str, args: &[Value]) -> bool {
     ) {
         return false;
     }
-    args.iter().filter_map(Value::as_str).any(|argument| {
-        if argument.starts_with('-') {
+    let positional = args
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|argument| !argument.starts_with('-'))
+        .collect::<Vec<_>>();
+    let package = match launcher.as_str() {
+        "npx" | "pnpx" | "uvx" | "pipx" => positional.first().copied(),
+        "npm" | "pnpm" | "yarn" => positional
+            .first()
+            .copied()
+            .filter(|subcommand| matches!(*subcommand, "exec" | "dlx" | "x"))
+            .and_then(|_| positional.get(1))
+            .copied(),
+        _ => None,
+    };
+    package.is_some_and(|package| {
+        if looks_like_path(package) {
             return false;
         }
-        let package = argument.rsplit('/').next().unwrap_or(argument);
-        !package.contains('@') || package.ends_with("@latest") || package.contains("@next")
+        let versioned_name = package
+            .strip_prefix('@')
+            .and_then(|scoped| scoped.split_once('/'))
+            .map(|(_, name)| name)
+            .unwrap_or(package);
+        !versioned_name.contains('@')
+            || versioned_name.ends_with("@latest")
+            || versioned_name.contains("@next")
     })
+}
+
+fn looks_like_path(value: &str) -> bool {
+    value.starts_with('.')
+        || value.starts_with('/')
+        || value.starts_with('~')
+        || value.contains("/../")
+        || value.contains("/./")
+        || value.chars().nth(1) == Some(':')
 }
 
 fn json_contains_secret(value: &Value) -> bool {
@@ -2114,29 +2146,6 @@ fn sort_findings(findings: &mut [AuditFinding]) {
     });
 }
 
-fn canonical_or_original(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn display_path(path: &Path) -> String {
-    path.to_string_lossy().to_string()
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn read_limited_text(path: &Path) -> io::Result<String> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > MAX_TEXT_FILE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} exceeds the audit size limit", path.display()),
-        ));
-    }
-    fs::read_to_string(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2159,6 +2168,35 @@ mod tests {
     fn parses_jsonc_comments_and_trailing_commas() {
         let value = parse_jsonc("{ // comment\n \"enabled\": true, }").unwrap();
         assert_eq!(value["enabled"], true);
+    }
+
+    #[test]
+    fn package_launcher_checks_only_the_package_position() {
+        let values = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| Value::String((*item).into()))
+                .collect::<Vec<_>>()
+        };
+
+        assert!(!mutable_package_launcher(
+            "npx",
+            &values(&["-y", "@scope/server@1.2.3", "/Users/me/projects"]),
+        ));
+        assert!(mutable_package_launcher(
+            "npx",
+            &values(&["-y", "@scope/server"])
+        ));
+        assert!(!mutable_package_launcher("npm", &values(&["run", "build"])));
+        assert!(!mutable_package_launcher("yarn", &values(&["run", "test"])));
+        assert!(mutable_package_launcher(
+            "npm",
+            &values(&["exec", "demo-server"])
+        ));
+        assert!(!mutable_package_launcher(
+            "pnpm",
+            &values(&["dlx", "demo-server@1.2.3", "/tmp/workspace"]),
+        ));
     }
 
     #[test]

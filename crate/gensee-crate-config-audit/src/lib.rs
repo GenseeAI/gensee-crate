@@ -5,6 +5,7 @@
 //! auditing them.
 
 mod codex;
+mod common;
 mod model;
 mod targets;
 mod vscode;

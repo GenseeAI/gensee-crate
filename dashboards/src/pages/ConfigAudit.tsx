@@ -263,16 +263,19 @@ function FindingsPanel({ report }: { report: ConfigAuditReport }) {
 
 function InventoryPanel({ report }: { report: ConfigAuditReport }) {
   const inventory = report.inventory;
+  const modelsInventoryState = report.target.provider === 'codex';
   const mcpColumns: ColumnsType<AuditMcpServer> = [
     { title: 'Server', dataIndex: 'id', render: value => <Text strong>{value}</Text> },
     { title: 'Transport', dataIndex: 'transport', width: 110, render: value => <Tag>{value.toUpperCase()}</Tag> },
-    { title: 'Enabled', dataIndex: 'enabled', width: 100, render: value => <BooleanBadge value={value} /> },
-    {
-      title: 'Tool allowlist',
-      dataIndex: 'has_tool_allowlist',
-      width: 130,
-      render: value => <BooleanBadge value={value} yes="SCOPED" no="UNSCOPED" />,
-    },
+    ...(modelsInventoryState ? [
+      { title: 'Enabled', dataIndex: 'enabled', width: 100, render: (value: boolean) => <BooleanBadge value={value} /> },
+      {
+        title: 'Tool allowlist',
+        dataIndex: 'has_tool_allowlist',
+        width: 130,
+        render: (value: boolean) => <BooleanBadge value={value} yes="SCOPED" no="UNSCOPED" />,
+      },
+    ] : []),
     {
       title: 'Endpoint',
       dataIndex: 'endpoint',
@@ -283,9 +286,13 @@ function InventoryPanel({ report }: { report: ConfigAuditReport }) {
   const skillColumns: ColumnsType<AuditSkill> = [
     { title: 'Skill', dataIndex: 'name', render: value => <Text strong>{value}</Text> },
     { title: 'Scope', dataIndex: 'scope', width: 130, render: value => <Tag>{displayName(value)}</Tag> },
-    { title: 'Enabled', dataIndex: 'enabled', width: 100, render: value => <BooleanBadge value={value} /> },
+    ...(modelsInventoryState ? [
+      { title: 'Enabled', dataIndex: 'enabled', width: 100, render: (value: boolean) => <BooleanBadge value={value} /> },
+    ] : []),
     { title: 'Scripts', dataIndex: 'has_scripts', width: 100, render: value => <BooleanBadge value={value} /> },
-    { title: 'Review', dataIndex: 'review_state', width: 120, render: value => <Tag color={value === 'unknown' ? 'orange' : 'green'}>{value.toUpperCase()}</Tag> },
+    ...(modelsInventoryState ? [
+      { title: 'Review', dataIndex: 'review_state', width: 120, render: (value: string) => <Tag color={value === 'unknown' ? 'orange' : 'green'}>{value.toUpperCase()}</Tag> },
+    ] : []),
     {
       title: 'Path',
       dataIndex: 'path',
@@ -349,6 +356,15 @@ function InventoryPanel({ report }: { report: ConfigAuditReport }) {
           ))}
         </Descriptions>
       </Card>
+
+      {!modelsInventoryState && (
+        <Alert
+          type="info"
+          showIcon
+          message="VS Code inventory state is not modeled"
+          description="The audit discovered these resources, but VS Code enabled state, MCP tool allowlists, and skill review state cannot be determined statically. Those columns are omitted instead of presenting assumptions as facts."
+        />
+      )}
 
       <Card size="small" title={`MCP servers (${inventory.mcp_servers.length})`}>
         <Table<AuditMcpServer>
@@ -498,6 +514,8 @@ function mergeReports(bundle: ConfigAuditBundle): ConfigAuditReport | undefined 
   const first = selected[0].report;
   const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
   const inventories = selected.map(item => item.report.inventory);
+  const uniqueBy = <T,>(items: T[], key: (item: T) => string) =>
+    Array.from(new Map(items.map(item => [key(item), item])).values());
   selected.forEach(item => {
     (Object.keys(counts) as AuditSeverity[]).forEach(severity => {
       counts[severity] += item.report.summary.counts[severity] ?? 0;
@@ -534,16 +552,22 @@ function mergeReports(bundle: ConfigAuditBundle): ConfigAuditReport | undefined 
       ]),
     )),
     inventory: {
-      skills: inventories.flatMap(inventory => inventory.skills),
-      mcp_servers: inventories.flatMap(inventory => inventory.mcp_servers),
-      hook_commands: inventories.reduce((sum, inventory) => sum + inventory.hook_commands, 0),
-      plugin_manifests: inventories.reduce((sum, inventory) => sum + inventory.plugin_manifests, 0),
-      marketplace_files: inventories.reduce((sum, inventory) => sum + inventory.marketplace_files, 0),
-      rule_files: inventories.reduce((sum, inventory) => sum + inventory.rule_files, 0),
-      instruction_files: inventories.reduce((sum, inventory) => sum + inventory.instruction_files, 0),
-      managed_requirement_files: inventories.reduce((sum, inventory) => sum + inventory.managed_requirement_files, 0),
-      extensions: inventories.flatMap(inventory => inventory.extensions ?? []),
-      custom_agents: inventories.reduce((sum, inventory) => sum + (inventory.custom_agents ?? 0), 0),
+      skills: uniqueBy(inventories.flatMap(inventory => inventory.skills), skill => skill.path),
+      mcp_servers: uniqueBy(
+        inventories.flatMap(inventory => inventory.mcp_servers),
+        server => `${server.id}:${server.transport}:${server.endpoint ?? ''}`,
+      ),
+      hook_commands: Math.max(...inventories.map(inventory => inventory.hook_commands)),
+      plugin_manifests: Math.max(...inventories.map(inventory => inventory.plugin_manifests)),
+      marketplace_files: Math.max(...inventories.map(inventory => inventory.marketplace_files)),
+      rule_files: Math.max(...inventories.map(inventory => inventory.rule_files)),
+      instruction_files: Math.max(...inventories.map(inventory => inventory.instruction_files)),
+      managed_requirement_files: Math.max(...inventories.map(inventory => inventory.managed_requirement_files)),
+      extensions: uniqueBy(
+        inventories.flatMap(inventory => inventory.extensions ?? []),
+        extension => extension.path,
+      ),
+      custom_agents: Math.max(...inventories.map(inventory => inventory.custom_agents ?? 0)),
     },
     findings: selected.flatMap(item => item.report.findings.map(finding => ({
       ...finding,

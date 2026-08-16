@@ -100,8 +100,7 @@ The auditor reconstructs the local Codex view as far as static files permit:
 - MCP servers, Apps defaults, plugin manifests, and marketplace sources;
 - `AGENTS.md` and `AGENTS.override.md` files under the audited workspace;
 - file ownership-boundary signals such as group/world writable files and
-  symlinks; and
-- on Windows, the workspace VS Code setting that selects WSL execution.
+  symlinks.
 
 Discovery is bounded to eight directory levels and text files of at most 256
 KiB. Symlinked directories are not traversed.

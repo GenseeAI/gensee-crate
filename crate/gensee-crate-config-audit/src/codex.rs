@@ -1,3 +1,6 @@
+#[cfg(test)]
+use crate::common::MAX_TEXT_FILE_BYTES;
+use crate::common::{canonical_or_original, display_path, hash_bytes, read_limited_text};
 use crate::model::{
     Assessment, AuditFinding, AuditInventory, AuditReport, AuditSource, AuditSummary, AuditTarget,
     Evidence, ManualCheck, McpInventory, Remediation, Ruleset, Severity, SkillInventory,
@@ -13,7 +16,7 @@ use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
 use url::{Host, Url};
 
-const CONFIG_REFERENCE: &str = "https://developers.openai.com/codex/config-reference/";
+const CONFIG_REFERENCE: &str = "https://learn.chatgpt.com/docs/config-file/config-reference";
 const SECURITY_REFERENCE: &str = "https://learn.chatgpt.com/docs/agent-approvals-security";
 const MCP_REFERENCE: &str = "https://learn.chatgpt.com/docs/extend/mcp";
 const SKILLS_REFERENCE: &str = "https://learn.chatgpt.com/docs/build-skills";
@@ -22,7 +25,6 @@ const MANAGED_CONFIG_REFERENCE: &str =
     "https://learn.chatgpt.com/docs/enterprise/managed-configuration";
 const DATA_REFERENCE: &str = "https://help.openai.com/en/articles/5722486-api-data-usage-policies";
 
-const MAX_TEXT_FILE_BYTES: u64 = 256 * 1024;
 const MAX_DISCOVERY_DEPTH: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -51,8 +53,9 @@ impl CodexAuditOptions {
 }
 
 pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
-    let workspace = canonical_or_original(&options.workspace);
-    let codex_home = canonical_or_original(&options.codex_home);
+    let workspace = options.workspace.clone();
+    let canonical_workspace = canonical_or_original(&workspace);
+    let codex_home = options.codex_home.clone();
     let mut sources = Vec::new();
     let mut findings = Vec::new();
     let mut limitations = vec![
@@ -108,7 +111,7 @@ pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
         config_complete &= ok && profile_path.exists();
     }
 
-    let trusted = project_is_trusted(&effective, &workspace);
+    let trusted = project_is_trusted(&effective, &workspace, &canonical_workspace);
     let project_path = workspace.join(".codex").join("config.toml");
     let mut ignored_project_keys = Vec::new();
     let (mut project_layer, project_ok) = if trusted {
@@ -329,14 +332,11 @@ fn config_read_finding(path: &Path, error: &str) -> AuditFinding {
     )
 }
 
-fn project_is_trusted(config: &TomlValue, workspace: &Path) -> bool {
+fn project_is_trusted(config: &TomlValue, workspace: &Path, canonical_workspace: &Path) -> bool {
     let Some(projects) = config.get("projects").and_then(TomlValue::as_table) else {
         return false;
     };
-    let candidates = [
-        display_path(workspace),
-        workspace.to_string_lossy().to_string(),
-    ];
+    let candidates = [display_path(workspace), display_path(canonical_workspace)];
     candidates.iter().any(|candidate| {
         projects
             .get(candidate)
@@ -617,7 +617,10 @@ fn evaluate_shell_environment(
             &["OWASP-MCP1", "OWASP-ASI03"],
         ));
     }
-    if inherit_all && get_value(config, &["shell_environment_policy", "include_only"]).is_none() {
+    let has_environment_filter = get_value(config, &["shell_environment_policy", "filters"])
+        .or_else(|| get_value(config, &["shell_environment_policy", "include_only"]))
+        .is_some();
+    if inherit_all && !has_environment_filter {
         findings.push(make_finding(
             "CAX-ENV-002",
             "sandbox_filesystem_environment",
@@ -627,7 +630,7 @@ fn evaluate_shell_environment(
             "Subprocesses inherit the full user environment",
             "Broad environment inheritance can expose credentials and internal configuration to tools and child processes.",
             vec![evidence(source, Some("shell_environment_policy.inherit"), Some("all"))],
-            "Use `core` or `none`, or define an explicit `include_only` allowlist.",
+            "Use `core` or `none`, or define an explicit `filters` allowlist.",
             &[CONFIG_REFERENCE],
             &["OWASP-MCP1", "OWASP-ASI03"],
         ));
@@ -2393,33 +2396,6 @@ fn get_integer(value: &TomlValue, path: &[&str]) -> Option<i64> {
     get_value(value, path).and_then(TomlValue::as_integer)
 }
 
-fn canonical_or_original(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn read_limited_text(path: &Path) -> io::Result<String> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > MAX_TEXT_FILE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} exceeds the {} byte audit limit",
-                path.display(),
-                MAX_TEXT_FILE_BYTES
-            ),
-        ));
-    }
-    fs::read_to_string(path)
-}
-
-fn display_path(path: &Path) -> String {
-    path.to_string_lossy().to_string()
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 fn sort_findings(findings: &mut [AuditFinding]) {
     findings.sort_by(|left, right| {
         right
@@ -2502,6 +2478,21 @@ mod tests {
             json!("read-only")
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_trust_accepts_the_original_or_canonical_workspace_key() {
+        let original = Path::new("/tmp/audit-workspace");
+        let canonical = Path::new("/private/tmp/audit-workspace");
+        for trusted_path in [original, canonical] {
+            let config = format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                trusted_path.display()
+            )
+            .parse::<TomlValue>()
+            .unwrap();
+            assert!(project_is_trusted(&config, original, canonical));
+        }
     }
 
     #[test]
@@ -2776,6 +2767,24 @@ mod tests {
             .iter()
             .any(|finding| finding.rule_id == "CAX-ENV-001"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_environment_filters_prevent_full_inheritance_warning() {
+        let config = r#"
+            [shell_environment_policy]
+            inherit = "all"
+            filters = ["PATH", "HOME"]
+        "#
+        .parse::<TomlValue>()
+        .unwrap();
+        let mut findings = Vec::new();
+
+        evaluate_shell_environment(&config, Path::new("config.toml"), false, &mut findings);
+
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule_id == "CAX-ENV-002"));
     }
 
     #[test]

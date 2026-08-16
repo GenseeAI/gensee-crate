@@ -133,6 +133,14 @@ fn get_config_audit(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let vscode_user_data = nonempty_path(vscode_user_data);
+    if let Some(path) = &vscode_user_data {
+        if path.exists() && !path.is_dir() {
+            return Err(format!(
+                "VS Code user data is not a directory: {}",
+                path.display()
+            ));
+        }
+    }
     let vscode_profile = vscode_profile
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
@@ -158,7 +166,6 @@ fn resolve_audit_workspace(workspace: Option<String>) -> Result<PathBuf, String>
         None => std::env::current_dir()
             .map_err(|error| format!("Unable to resolve the audit workspace: {error}"))?,
     };
-    let path = fs::canonicalize(&path).unwrap_or(path);
     if !path.is_dir() {
         return Err(format!("Audit workspace is not a directory: {}", path.display()));
     }

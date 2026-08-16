@@ -9,7 +9,7 @@ use gensee_crate_config_audit::{
 };
 
 const AUDIT_USAGE: &str = r#"Usage:
-  gensee audit config [OPTIONS]
+  gensee audit config [OPTIONS]  (defaults to the Codex CLI target)
   gensee audit codex [OPTIONS]
   gensee audit vscode [OPTIONS]
   gensee audit codex-cli [OPTIONS]
@@ -133,7 +133,7 @@ fn audit_exit_code(bundle: &AuditBundle, fail_on: Option<Severity>) -> Option<i3
             .report
             .sources
             .iter()
-            .any(|source| !source.errors.is_empty())
+            .any(source_error_prevents_effective_config)
             || target
                 .report
                 .findings
@@ -151,6 +151,20 @@ fn audit_exit_code(bundle: &AuditBundle, fail_on: Option<Severity>) -> Option<i3
             })
             .then_some(1)
     })
+}
+
+fn source_error_prevents_effective_config(source: &gensee_crate_config_audit::AuditSource) -> bool {
+    !source.errors.is_empty()
+        && matches!(
+            source.kind.as_str(),
+            "user_config"
+                | "profile_config"
+                | "project_config"
+                | "managed_requirements"
+                | "vscode_user_settings"
+                | "vscode_profile_settings"
+                | "vscode_workspace_settings"
+        )
 }
 
 fn parse_options(args: &[OsString]) -> Result<Option<AuditCliOptions>, String> {
@@ -512,6 +526,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(audit_exit_code(&bundle, Some(Severity::High)), Some(1));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skipped_discovery_artifact_does_not_become_an_operational_failure() {
+        let root = temp_root("discovery-limit-exit");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &codex_home.join("config.toml"),
+            "sandbox_mode = \"read-only\"\n",
+        );
+        fs::write(workspace.join("AGENTS.md"), vec![b'x'; 256 * 1024 + 1]).unwrap();
+        let bundle = audit_target(
+            AuditTargetName::Codex,
+            &AuditOptions {
+                workspace,
+                codex_home: Some(codex_home),
+                codex_profile: None,
+                vscode_user_data: None,
+                vscode_profile: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(audit_exit_code(&bundle, None), None);
         let _ = fs::remove_dir_all(root);
     }
 }
