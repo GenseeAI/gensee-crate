@@ -80,6 +80,11 @@ struct TranscriptTokenState {
     codex_total: i64,
 }
 
+struct TranscriptTokenUpdate {
+    total: Option<i64>,
+    record: TranscriptTokenStateRecord,
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyAlert {
     pub session_id: Option<String>,
@@ -1180,8 +1185,28 @@ impl EventStore {
     }
 
     fn append_hook_event_database(&self, event: &AgentHookEvent) -> io::Result<()> {
+        let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
+        // Transcript reads can be tens of megabytes. Prepare their incremental
+        // state before BEGIN IMMEDIATE so dashboard readers and other hook
+        // writers are never blocked on filesystem I/O. Token accounting is
+        // best-effort: the Stop event remains durable if the transcript cannot
+        // be read.
+        let transcript_update: Option<TranscriptTokenUpdate> =
+            if event.hook_event_name.as_deref() == Some("Stop") {
+                event.transcript_path.as_deref().and_then(|path| {
+                    self.prepare_transcript_token_update(
+                        session_id,
+                        &event.provider,
+                        Path::new(path),
+                        event.observed_at_ms,
+                    )
+                    .ok()
+                    .flatten()
+                })
+            } else {
+                None
+            };
         self.with_sqlite_transaction(|db| {
-            let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, &event.provider, event.observed_at_ms)?;
 
             match event.hook_event_name.as_deref() {
@@ -1203,20 +1228,11 @@ impl EventStore {
                         .map_err(sqlite_error)?;
                 }
                 Some("Stop") => {
-                    let transcript_tokens = event
-                        .transcript_path
-                        .as_deref()
-                        .map(|path| {
-                            self.transcript_total_tokens(
-                                db,
-                                session_id,
-                                &event.provider,
-                                Path::new(path),
-                                event.observed_at_ms,
-                            )
-                        })
-                        .transpose()?
-                        .flatten();
+                    let transcript_tokens = transcript_update.as_ref().and_then(|update| {
+                        db.upsert_transcript_token_state(&update.record)
+                            .ok()
+                            .and(update.total)
+                    });
                     let response = text_from_raw_json(&event.raw_json, &["last_assistant_message"]);
                     let request_id = if let Some(request) = db
                         .latest_request_for_session(session_id)
@@ -1276,20 +1292,38 @@ impl EventStore {
         })
     }
 
-    fn transcript_total_tokens(
+    fn prepare_transcript_token_update(
         &self,
-        db: &SqliteStore,
         session_id: &str,
         provider: &str,
         path: &Path,
         observed_at_ms: u64,
-    ) -> io::Result<Option<i64>> {
+    ) -> io::Result<Option<TranscriptTokenUpdate>> {
         let Some(canonical) = allowed_transcript_path(provider, path)? else {
             return Ok(None);
         };
-        self.transcript_total_tokens_at_path(db, session_id, &canonical, observed_at_ms)
+        let canonical_text = canonical.to_string_lossy().into_owned();
+        let persisted = self
+            .sqlite_store()?
+            .transcript_token_state(session_id, &canonical_text)
+            .map_err(sqlite_error)?;
+        let mut state = persisted
+            .as_ref()
+            .and_then(|record| serde_json::from_str(&record.state_json).ok())
+            .unwrap_or_default();
+        let total = transcript_total_tokens_with_state(&canonical, &mut state)?;
+        Ok(Some(TranscriptTokenUpdate {
+            total,
+            record: TranscriptTokenStateRecord {
+                session_id: session_id.to_string(),
+                transcript_path: canonical_text,
+                state_json: serde_json::to_string(&state).map_err(io::Error::other)?,
+                updated_at: to_i64(observed_at_ms)?,
+            },
+        }))
     }
 
+    #[cfg(test)]
     fn transcript_total_tokens_at_path(
         &self,
         db: &SqliteStore,

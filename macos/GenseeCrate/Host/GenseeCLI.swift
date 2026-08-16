@@ -69,8 +69,11 @@ struct GenseeCLI: Sendable {
         guard executableURL.path.contains(".app/Contents/") else { return executableURL }
         let stableURL = homeURL.appendingPathComponent("bin/gensee")
         let manager = FileManager.default
-        let stableIsCurrent = manager.isExecutableFile(atPath: stableURL.path)
-            && manager.contentsEqual(atPath: executableURL.path, andPath: stableURL.path)
+        let stableIsCurrent = Self.installedCopyMatches(
+            source: executableURL,
+            destination: stableURL,
+            manager: manager
+        )
         return stableIsCurrent ? stableURL : executableURL
     }
 
@@ -86,9 +89,11 @@ struct GenseeCLI: Sendable {
             let destination = binDirectory.appendingPathComponent("gensee")
             try manager.createDirectory(at: binDirectory, withIntermediateDirectories: true)
 
-            if manager.isExecutableFile(atPath: destination.path),
-               manager.contentsEqual(atPath: executableURL.path, andPath: destination.path)
-            {
+            if Self.installedCopyMatches(
+                source: executableURL,
+                destination: destination,
+                manager: manager
+            ) {
                 return destination
             }
 
@@ -107,6 +112,25 @@ struct GenseeCLI: Sendable {
             }
             return destination
         }.value
+    }
+
+    private static func installedCopyMatches(
+        source: URL,
+        destination: URL,
+        manager: FileManager
+    ) -> Bool {
+        guard manager.isExecutableFile(atPath: destination.path) else { return false }
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey]
+        guard let sourceValues = try? source.resourceValues(forKeys: keys),
+              let destinationValues = try? destination.resourceValues(forKeys: keys)
+        else {
+            return manager.contentsEqual(atPath: source.path, andPath: destination.path)
+        }
+        guard sourceValues.fileSize == destinationValues.fileSize else { return false }
+        if sourceValues.contentModificationDate == destinationValues.contentModificationDate {
+            return true
+        }
+        return manager.contentsEqual(atPath: source.path, andPath: destination.path)
     }
 
     func run(_ arguments: [String]) async throws -> GenseeCommandOutput {

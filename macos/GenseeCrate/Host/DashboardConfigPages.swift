@@ -6,9 +6,9 @@ struct DashboardPolicyPage: View {
     @State private var editorText = ""
     @State private var dirty = false
 
-    private var document: [String: Any] {
+    private var document: [String: Any]? {
         guard let data = editorText.data(using: .utf8),
-              let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+              let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return value
     }
 
@@ -19,7 +19,7 @@ struct DashboardPolicyPage: View {
                     HStack(spacing: 8) {
                         Button { Task { await model.refreshPolicy(); editorText = model.policyDocument; dirty = false } } label: { Label("Reload", systemImage: "arrow.clockwise") }
                         Button { Task { if await model.savePolicyDocument(editorText) { dirty = false } } } label: { Label("Save & Validate", systemImage: "square.and.arrow.down") }
-                            .buttonStyle(.borderedProminent).tint(.dashboardRed).disabled(!dirty)
+                            .buttonStyle(.borderedProminent).tint(.dashboardRed).disabled(!dirty || document == nil)
                     }.controlSize(.small)
                 }
                 DashboardCard {
@@ -30,18 +30,32 @@ struct DashboardPolicyPage: View {
                         Divider()
                         Group {
                             switch tab {
-                            case "Decision Rules": PolicyRulesView(document: document)
-                            case "Artifact Definitions": ArtifactDefinitionsView(document: document)
+                            case "Decision Rules": PolicyRulesView(document: document ?? [:])
+                            case "Artifact Definitions": ArtifactDefinitionsView(document: document ?? [:])
                             case "Advanced (JSON)":
                                 TextEditor(text: $editorText)
                                     .font(.system(size: 11, design: .monospaced))
                                     .frame(minHeight: 470)
                                     .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.dashboardLine))
                             default:
-                                PolicySettingsView(
-                                    document: document,
-                                    editorText: $editorText
-                                )
+                                if let document {
+                                    PolicySettingsView(
+                                        document: document,
+                                        editorText: $editorText
+                                    )
+                                } else {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Label("Policy JSON needs attention", systemImage: "exclamationmark.triangle.fill")
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .foregroundStyle(Color.dashboardRed)
+                                        Text("Settings controls are disabled because the policy buffer is empty or is not a valid JSON object. Fix it in Advanced (JSON), then return here.")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(14)
+                                    .background(Color.dashboardRed.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
+                                }
                             }
                         }
                     }
@@ -355,17 +369,14 @@ private struct PolicySettingRow: View {
             }
             guard let number = Int(trimmed) else {
                 validationMessage = nullable ? "Enter a whole number or leave blank." : "Enter a whole number."
-                onChange(raw)
                 return
             }
             if let minimum, number < minimum {
                 validationMessage = "Minimum: \(minimum)."
-                onChange(raw)
                 return
             }
             if let maximum, number > maximum {
                 validationMessage = "Maximum: \(maximum)."
-                onChange(raw)
                 return
             }
             validationMessage = nil
@@ -374,17 +385,14 @@ private struct PolicySettingRow: View {
         case let .decimal(minimum, maximum):
             guard let number = Double(trimmed), number.isFinite else {
                 validationMessage = "Enter a valid number."
-                onChange(raw)
                 return
             }
             if let minimum, number < minimum {
                 validationMessage = "Minimum: \(minimum.formatted())."
-                onChange(raw)
                 return
             }
             if let maximum, number > maximum {
                 validationMessage = "Maximum: \(maximum.formatted())."
-                onChange(raw)
                 return
             }
             validationMessage = nil
@@ -415,7 +423,7 @@ private struct PolicySettingRow: View {
         case .integer:
             return (value as? NSNumber)?.int64Value.description ?? String(describing: value!)
         case .decimal:
-            return (value as? NSNumber)?.doubleValue.formatted(.number.precision(.fractionLength(1...3)))
+            return (value as? NSNumber).map { String($0.doubleValue) }
                 ?? String(describing: value!)
         case .text:
             return value as? String ?? String(describing: value!)

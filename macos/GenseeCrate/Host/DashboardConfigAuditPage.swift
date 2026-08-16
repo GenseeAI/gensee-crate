@@ -9,13 +9,25 @@ struct HarnessConfigAuditPanel: View {
     @State private var section = AuditSection.findings
 
     private static var defaultWorkspace: String {
-        ProcessInfo.processInfo.environment["GENSEE_WORKSPACE"]
-            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        ProcessInfo.processInfo.environment["GENSEE_WORKSPACE"] ?? ""
     }
 
     private var bundle: ConfigAuditBundle? {
-        guard model.configAudit?.requestedTarget == target else { return nil }
-        return model.configAudit
+        guard !workspacePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let bundle = model.configAudit,
+              bundle.requestedTarget == target,
+              let auditedWorkspace = bundle.includedReports.first?.report.target.workspace,
+              auditedWorkspace == normalizedWorkspacePath
+        else { return nil }
+        return bundle
+    }
+
+    private var normalizedWorkspacePath: String {
+        let expanded = (workspacePath as NSString).expandingTildeInPath
+        return URL(fileURLWithPath: expanded)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
     }
 
     var body: some View {
@@ -104,7 +116,7 @@ struct HarnessConfigAuditPanel: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.dashboardRed)
-                    .disabled(model.runningCommand != nil)
+                    .disabled(model.runningCommand != nil || workspacePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
                 Text("The shared OSS Rust auditor reads bounded local configuration files. It does not launch agents, extensions, hooks, skills, MCP servers, or package runners.")
                     .font(.system(size: 10))
@@ -275,7 +287,7 @@ struct HarnessConfigAuditPanel: View {
             ForEach(bundle.includedReports) { item in
                 DashboardCard(pretty(item.target)) {
                     VStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(item.report.sources.enumerated()), id: \.element.id) { index, source in
+                        ForEach(Array(item.report.sources.enumerated()), id: \.offset) { index, source in
                             HStack(alignment: .top, spacing: 10) {
                                 Image(systemName: source.errors.isEmpty ? "doc.text" : "exclamationmark.triangle.fill")
                                     .foregroundStyle(source.errors.isEmpty ? Color.secondary : Color.dashboardGold)

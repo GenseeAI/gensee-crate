@@ -442,6 +442,8 @@ private struct CalendarHeatmap: View {
                     } else {
                         Text("Hover a cell for its exact count")
                             .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
                     }
                     Text("\(total.formatted()) total · \(activeDays) active days")
                         .foregroundStyle(.secondary)

@@ -358,6 +358,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 @property(nonatomic) NSString *mode;
 @property(nonatomic) NSArray<NSString *> *protectedPaths;
 @property(nonatomic) NSSet<NSString *> *blockedExecutables;
+@property(nonatomic) NSSet<NSString *> *ownExecutables;
 @property(nonatomic) NSDictionary<NSNumber *, NSString *> *managedRoots;
 @property(nonatomic) NSMutableDictionary<NSString *, NSString *> *managedProcesses;
 @property(nonatomic) uint64_t maxAuthorizationLatencyUS;
@@ -380,6 +381,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         _mode = @"observe";
         _protectedPaths = @[];
         _blockedExecutables = [NSSet set];
+        _ownExecutables = [NSSet set];
         _managedRoots = @{};
         _managedProcesses = [NSMutableDictionary dictionary];
         _maxAuthorizationLatencyUS = 10000;
@@ -458,7 +460,10 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 
 - (BOOL)isOwnProcessLocked:(const es_process_t *)process
 {
-    return GenseeIsOwnProcess(process);
+    if (GenseeIsOwnProcess(process)) return YES;
+    if (process == NULL || process->executable == NULL) return NO;
+    NSString *path = [GenseeStringFromToken(process->executable->path) stringByStandardizingPath];
+    return [self.ownExecutables containsObject:path];
 }
 
 - (void)authorizeMessage:(const es_message_t *)message
@@ -477,7 +482,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         NSString *session = [self sessionForProcessLocked:message->process messageVersion:message->version];
         BOOL enforcing = [self.mode isEqualToString:@"protect"] || [self.mode isEqualToString:@"strict"];
         BOOL ownExecTarget = message->event_type == ES_EVENT_TYPE_AUTH_EXEC &&
-            GenseeIsOwnProcess(message->event.exec.target);
+            [self isOwnProcessLocked:message->event.exec.target];
         if (enforcing && session != nil && ![self isOwnProcessLocked:message->process] && !ownExecTarget) {
             NSString *path = GenseeAuthorizationPath(message);
             NSString *secondaryPath = GenseeSecondaryAuthorizationPath(message);
@@ -672,13 +677,15 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     }
     NSArray *protectedPaths = configuration[@"protected_paths"];
     NSArray *blockedExecutables = configuration[@"blocked_executables"];
+    NSArray *ownExecutables = configuration[@"own_executables"];
     NSArray *managedRoots = configuration[@"managed_roots"];
     NSNumber *failClosedManagedOnly = configuration[@"fail_closed_managed_only"];
     NSNumber *maxAuthorizationLatencyMS = configuration[@"max_auth_latency_ms"];
     if (!GenseeIsAbsoluteStringArray(protectedPaths) ||
         !GenseeIsAbsoluteStringArray(blockedExecutables) ||
+        !GenseeIsAbsoluteStringArray(ownExecutables) ||
         (managedRoots != nil && ![managedRoots isKindOfClass:NSArray.class])) {
-        reply(NO, @"Protected paths and blocked executables must be arrays of absolute paths; managed roots must be an array.");
+        reply(NO, @"Protected paths, blocked executables, and own executables must be arrays of absolute paths; managed roots must be an array.");
         return;
     }
     if (failClosedManagedOnly != nil &&
@@ -711,6 +718,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         self.mode = requestedMode;
         self.protectedPaths = [(protectedPaths ?: @[]) valueForKey:@"stringByStandardizingPath"];
         self.blockedExecutables = [NSSet setWithArray:[(blockedExecutables ?: @[]) valueForKey:@"stringByStandardizingPath"]];
+        self.ownExecutables = [NSSet setWithArray:[(ownExecutables ?: @[]) valueForKey:@"stringByStandardizingPath"]];
         self.managedRoots = roots;
         self.managedProcesses = activeProcesses;
         self.maxAuthorizationLatencyUS = (maxAuthorizationLatencyMS ?: @10).unsignedLongLongValue * 1000ULL;

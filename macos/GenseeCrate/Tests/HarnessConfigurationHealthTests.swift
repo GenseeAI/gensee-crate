@@ -211,6 +211,45 @@ final class HarnessConfigurationHealthTests: XCTestCase {
         XCTAssertNotEqual(inspection.backendPath, versionedBackend.path)
     }
 
+    func testEquivalentBackendSpellingsPreferStableSymlinkForRepair() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gensee-harness-mixed-symlink-\(UUID().uuidString)")
+        let cellar = directory.appendingPathComponent("Cellar/gensee/0.2.1/bin", isDirectory: true)
+        let stableBin = directory.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: cellar, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stableBin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let versionedBackend = cellar.appendingPathComponent("gensee")
+        let stableBackend = stableBin.appendingPathComponent("gensee")
+        try Data("#!/bin/sh\n".utf8).write(to: versionedBackend)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: versionedBackend.path)
+        try FileManager.default.createSymbolicLink(at: stableBackend, withDestinationURL: versionedBackend)
+
+        let events = HarnessConfigurationHealth.expectedEvents(for: "claude-code")
+        var hooks: [String: Any] = [:]
+        for (index, event) in events.enumerated() {
+            let backend = index.isMultiple(of: 2) ? stableBackend : versionedBackend
+            let command = HarnessConfigurationHealth.expectedCommand(
+                provider: "claude-code", homeURL: homeURL, backendURL: backend
+            )
+            hooks[event] = [["matcher": "*", "hooks": [["type": "command", "command": command]]]]
+        }
+        let data = try JSONSerialization.data(withJSONObject: ["hooks": hooks], options: [.sortedKeys])
+        let expected = HarnessConfigurationHealth.expectedCommand(
+            provider: "claude-code", homeURL: homeURL, backendURL: backendURL
+        )
+        let inspection = HarnessConfigurationHealth.inspect(
+            provider: "claude-code",
+            contents: String(decoding: data, as: UTF8.self),
+            expectedCommand: expected,
+            eventStorePath: homeURL.path
+        )
+
+        XCTAssertTrue(inspection.isHealthy, inspection.issue ?? "Expected equivalent backend spellings")
+        XCTAssertEqual(inspection.backendPath, stableBackend.path)
+    }
+
     func testMalformedHooksContainerRequiresManualFix() throws {
         let command = HarnessConfigurationHealth.expectedCommand(
             provider: "claude-code", homeURL: homeURL, backendURL: backendURL

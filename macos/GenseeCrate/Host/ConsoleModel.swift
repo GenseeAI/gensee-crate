@@ -24,6 +24,8 @@ final class ConsoleModel: ObservableObject {
     let endpointSensor: EndpointSecuritySensor
     private var cli: GenseeCLI
     private var dashboardRefreshInProgress = false
+    private var readAlertBaselineCount = 0
+    private var readThroughAlertID: Int64 = 0
 
     init() {
         let environmentHome = ProcessInfo.processInfo.environment["GENSEE_HOME"]
@@ -33,6 +35,12 @@ final class ConsoleModel: ObservableObject {
         cli = GenseeCLI(homeURL: resolvedHome)
         endpointSensor = EndpointSecuritySensor(homeURL: resolvedHome, executableURL: cli.executableURL)
         readAlertIDs = Self.loadReadAlertIDs(homeURL: resolvedHome)
+        readAlertBaselineCount = UserDefaults.standard.integer(
+            forKey: Self.readAlertsBaselineKey(homeURL: resolvedHome)
+        )
+        readThroughAlertID = Int64(UserDefaults.standard.integer(
+            forKey: Self.readAlertsWatermarkKey(homeURL: resolvedHome)
+        ))
         refreshIntegrations()
         Task { [weak self] in await self?.refreshIntegrationsWithCurrentBackend() }
     }
@@ -62,23 +70,29 @@ final class ConsoleModel: ObservableObject {
     }
 
     var unreadAlertCount: Int {
-        snapshot.alerts.filter { !readAlertIDs.contains($0.alertID) }.count
+        let baseline = min(readAlertBaselineCount, snapshot.summary.alertsCount)
+        let individuallyRead = readAlertIDs.lazy.filter { $0 > self.readThroughAlertID }.count
+        return max(0, snapshot.summary.alertsCount - baseline - individuallyRead)
     }
 
     func isAlertRead(_ alertID: Int64) -> Bool {
-        readAlertIDs.contains(alertID)
+        alertID <= readThroughAlertID || readAlertIDs.contains(alertID)
     }
 
     func markAlertRead(_ alertID: Int64) {
+        guard !isAlertRead(alertID) else { return }
         var updated = readAlertIDs
         guard updated.insert(alertID).inserted else { return }
-        persistReadAlertIDs(updated)
+        readAlertIDs = updated
+        persistReadAlertState()
     }
 
     func markAllAlertsRead() {
-        let currentAlertIDs = Set(snapshot.alerts.map(\.alertID))
-        guard !currentAlertIDs.isSubset(of: readAlertIDs) else { return }
-        persistReadAlertIDs(readAlertIDs.union(currentAlertIDs))
+        guard unreadAlertCount > 0 else { return }
+        readAlertBaselineCount = snapshot.summary.alertsCount
+        readThroughAlertID = max(readThroughAlertID, snapshot.alerts.map(\.alertID).max() ?? 0)
+        readAlertIDs.removeAll()
+        persistReadAlertState()
     }
 
     var recentActivity: [ActivityItem] {
@@ -177,6 +191,7 @@ final class ConsoleModel: ObservableObject {
         dailyDetailLoadState = .loading(day)
         do {
             let detail = try await cli.decode(DailyDetail.self, arguments: ["dashboard-day", day])
+            guard !Task.isCancelled else { return }
             guard detail.date == day else {
                 dailyDetailLoadState = .unavailable(
                     day: day,
@@ -187,6 +202,7 @@ final class ConsoleModel: ObservableObject {
             dailyDetail = detail
             dailyDetailLoadState = .loaded(day)
         } catch {
+            guard !Task.isCancelled else { return }
             dashboardRefreshIssue = error.localizedDescription
             dailyDetailLoadState = .unavailable(day: day, message: error.localizedDescription)
         }
@@ -197,7 +213,10 @@ final class ConsoleModel: ObservableObject {
             errorMessage = GenseeCLIError.executableNotFound.localizedDescription
             return
         }
-        let workspaceURL = URL(fileURLWithPath: workspace).standardizedFileURL
+        let expandedWorkspace = (workspace as NSString).expandingTildeInPath
+        let workspaceURL = URL(fileURLWithPath: expandedWorkspace)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: workspaceURL.path, isDirectory: &isDirectory),
               isDirectory.boolValue
@@ -396,17 +415,33 @@ final class ConsoleModel: ObservableObject {
         "gensee.alerts.read.\(homeURL.path)"
     }
 
+    private static func readAlertsBaselineKey(homeURL: URL) -> String {
+        "gensee.alerts.read-baseline.\(homeURL.path)"
+    }
+
+    private static func readAlertsWatermarkKey(homeURL: URL) -> String {
+        "gensee.alerts.read-through.\(homeURL.path)"
+    }
+
     private static func loadReadAlertIDs(homeURL: URL) -> Set<Int64> {
         let values = UserDefaults.standard.array(forKey: readAlertsKey(homeURL: homeURL)) as? [NSNumber] ?? []
         return Set(values.map(\.int64Value))
     }
 
-    private func persistReadAlertIDs(_ alertIDs: Set<Int64>) {
-        let retained = Array(alertIDs.sorted(by: >).prefix(5_000))
+    private func persistReadAlertState() {
+        let retained = Array(readAlertIDs.sorted(by: >).prefix(5_000))
         readAlertIDs = Set(retained)
         UserDefaults.standard.set(
             retained.map(NSNumber.init(value:)),
             forKey: Self.readAlertsKey(homeURL: homeURL)
+        )
+        UserDefaults.standard.set(
+            readAlertBaselineCount,
+            forKey: Self.readAlertsBaselineKey(homeURL: homeURL)
+        )
+        UserDefaults.standard.set(
+            readThroughAlertID,
+            forKey: Self.readAlertsWatermarkKey(homeURL: homeURL)
         )
     }
 
@@ -444,6 +479,7 @@ final class ConsoleModel: ObservableObject {
 
     private func refreshIntegrations() {
         let home = FileManager.default.homeDirectoryForCurrentUser
+        let preferredHookExecutable = cli.preferredHookExecutableURL()
         let codexInstalled = Self.applicationInstalled(
             names: ["Codex"],
             bundleIdentifiers: ["com.openai.codex"]
@@ -495,7 +531,7 @@ final class ConsoleModel: ObservableObject {
         integrations = definitions.map { provider, name, detail, relativePath, symbol, installed, supportsDirectHooks, installationDetail in
             let path = home.appendingPathComponent(relativePath)
             let contents = (try? String(contentsOf: path, encoding: .utf8)) ?? ""
-            let expectedCommand = cli.preferredHookExecutableURL().map {
+            let expectedCommand = preferredHookExecutable.map {
                 HarnessConfigurationHealth.expectedCommand(
                     provider: provider,
                     homeURL: homeURL,
@@ -655,10 +691,19 @@ final class ConsoleModel: ObservableObject {
         let roots = snapshot.jsonSessions
             .filter { $0.isActive && $0.rootPID != 0 }
             .map { ["pid": $0.rootPID, "session_id": $0.sessionID] as [String: Any] }
+        var ownExecutables = integrations.compactMap(\.configuredBackendPath)
+        if let executablePath = cli.executableURL?.path {
+            ownExecutables.append(executablePath)
+        }
+        let stableHook = homeURL.appendingPathComponent("bin/gensee")
+        if FileManager.default.isExecutableFile(atPath: stableHook.path) {
+            ownExecutables.append(stableHook.path)
+        }
         endpointSensor.updateConfiguration(
             mode: policy.endpointSecurityMode,
             protectedPaths: Array(Set(protectedPaths)).sorted(),
             blockedExecutables: blockedExecutables,
+            ownExecutables: Array(Set(ownExecutables)).sorted(),
             managedRoots: roots,
             failClosedManagedOnly: true,
             maxAuthorizationLatencyMS: min(100, max(1, maxAuthorizationLatencyMS))

@@ -96,6 +96,7 @@ final class EndpointSecuritySensor: ObservableObject {
         mode: String,
         protectedPaths: [String],
         blockedExecutables: [String],
+        ownExecutables: [String],
         managedRoots: [[String: Any]],
         failClosedManagedOnly: Bool,
         maxAuthorizationLatencyMS: UInt64
@@ -105,6 +106,7 @@ final class EndpointSecuritySensor: ObservableObject {
             "mode": mode,
             "protected_paths": protectedPaths,
             "blocked_executables": blockedExecutables,
+            "own_executables": ownExecutables,
             "managed_roots": managedRoots,
             "fail_closed_managed_only": failClosedManagedOnly,
             "max_auth_latency_ms": maxAuthorizationLatencyMS,
@@ -224,10 +226,13 @@ final class EndpointSecuritySensor: ObservableObject {
             if configurationNeedsPush {
                 try await pushConfiguration(using: connection)
             }
-            try await write(events: response.0)
-            // Commit delivery only after the ingester accepted the batch. A
-            // boot/ring rewind from applyHealth remains authoritative.
-            if !didRewind { cursor = pendingCursor }
+            // A boot/ring rewind means this batch was fetched from a stale
+            // cursor. Refetch from the recovered cursor before ingesting it so
+            // the first post-launch batch is never delivered twice.
+            if !didRewind {
+                try await write(events: response.0)
+                cursor = pendingCursor
+            }
             health.connected = true
             health.error = nil
         } catch {

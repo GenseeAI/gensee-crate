@@ -129,6 +129,9 @@ enum HarnessConfigurationHealth {
         let note = issues.isEmpty && !alternateBackends.isEmpty
             ? "Hooks use another valid Gensee installation at \(alternateBackends.sorted().joined(separator: ", "))."
             : nil
+        let repairBackend = backendPaths.count == 1
+            ? preferredBackendSpelling(configuredBackendPaths, expected: expected.backend)
+            : nil
 
         return HarnessConfigurationInspection(
             configured: true,
@@ -137,8 +140,25 @@ enum HarnessConfigurationHealth {
             // Preserve the hook's stable spelling (for example
             // /opt/homebrew/bin/gensee). Symlink resolution is comparison-only;
             // repairing to a versioned Cellar target would break on upgrade.
-            backendPath: backendPaths.count == 1 ? configuredBackendPaths.sorted().first : nil
+            backendPath: repairBackend
         )
+    }
+
+    private static func preferredBackendSpelling(_ paths: Set<String>, expected: String) -> String? {
+        if paths.contains(expected) { return expected }
+        return paths.sorted { left, right in
+            let leftIsSymlink = (try? FileManager.default.destinationOfSymbolicLink(atPath: left)) != nil
+            let rightIsSymlink = (try? FileManager.default.destinationOfSymbolicLink(atPath: right)) != nil
+            if leftIsSymlink != rightIsSymlink { return leftIsSymlink }
+            let leftIsCellar = left.contains("/Cellar/")
+            let rightIsCellar = right.contains("/Cellar/")
+            if leftIsCellar != rightIsCellar { return !leftIsCellar }
+            let leftComponents = URL(fileURLWithPath: left).pathComponents.count
+            let rightComponents = URL(fileURLWithPath: right).pathComponents.count
+            if leftComponents != rightComponents { return leftComponents < rightComponents }
+            if left.count != right.count { return left.count < right.count }
+            return left < right
+        }.first
     }
 
     static func expectedEvents(for provider: String) -> [String] {
