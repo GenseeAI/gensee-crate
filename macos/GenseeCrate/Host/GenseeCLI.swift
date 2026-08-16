@@ -68,7 +68,10 @@ struct GenseeCLI: Sendable {
         guard let executableURL else { return nil }
         guard executableURL.path.contains(".app/Contents/") else { return executableURL }
         let stableURL = homeURL.appendingPathComponent("bin/gensee")
-        return FileManager.default.isExecutableFile(atPath: stableURL.path) ? stableURL : executableURL
+        let manager = FileManager.default
+        let stableIsCurrent = manager.isExecutableFile(atPath: stableURL.path)
+            && manager.contentsEqual(atPath: executableURL.path, andPath: stableURL.path)
+        return stableIsCurrent ? stableURL : executableURL
     }
 
     /// Hook files outlive individual app builds, so never point them into an
@@ -82,6 +85,12 @@ struct GenseeCLI: Sendable {
             let binDirectory = homeURL.appendingPathComponent("bin", isDirectory: true)
             let destination = binDirectory.appendingPathComponent("gensee")
             try manager.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+
+            if manager.isExecutableFile(atPath: destination.path),
+               manager.contentsEqual(atPath: executableURL.path, andPath: destination.path)
+            {
+                return destination
+            }
 
             let staging = binDirectory.appendingPathComponent(".gensee-\(UUID().uuidString).tmp")
             try manager.copyItem(at: executableURL, to: staging)

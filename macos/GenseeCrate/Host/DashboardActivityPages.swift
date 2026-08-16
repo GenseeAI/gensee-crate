@@ -26,7 +26,7 @@ struct LiveFeedPage: View {
             VStack(alignment: .leading, spacing: 16) {
                 DashboardPageHeader("Live Feed", description: "Real-time stream of agent hook events.") {
                     HStack(spacing: 12) {
-                        LiveFeedConnectionBadge(connected: model.backendAvailable)
+                        LiveFeedConnectionBadge(connected: model.endpointSensor.health.connected)
                         Picker("Category", selection: $category) {
                             ForEach(["All", "Agent activity", "Transactional environment"], id: \.self, content: Text.init)
                         }.frame(width: 190)
@@ -38,7 +38,12 @@ struct LiveFeedPage: View {
                 }
                 DashboardCard("Events (\(agentEvents.count + transactionEvents.count) / \(model.snapshot.agentEvents.count + model.snapshot.transactionEvents.count) total)") {
                     if agentEvents.isEmpty && transactionEvents.isEmpty {
-                        DashboardEmpty(text: model.backendAvailable ? "Waiting for agent events…" : "Not connected — check the Gensee backend.", symbol: "bolt")
+                        DashboardEmpty(
+                            text: model.endpointSensor.health.connected
+                                ? "Waiting for agent events…"
+                                : "Endpoint Security is not connected — check Settings for sensor status.",
+                            symbol: "bolt"
+                        )
                     } else {
                         VStack(spacing: 0) {
                             ForEach(agentEvents.prefix(150)) { event in
@@ -95,7 +100,7 @@ private struct LiveFeedConnectionBadge: View {
         .background(color.opacity(0.10), in: Capsule())
         .fixedSize(horizontal: true, vertical: false)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(connected ? "Gensee backend connected" : "Gensee backend disconnected")
+        .accessibilityLabel(connected ? "Endpoint Security connected" : "Endpoint Security disconnected")
     }
 }
 

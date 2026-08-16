@@ -3340,7 +3340,6 @@ const SETTABLE_POLICY_KEYS: &[&str] = &[
     "endpoint_security.mode",
     "endpoint_security.protected_paths",
     "endpoint_security.blocked_executables",
-    "endpoint_security.fail_closed_managed_only",
     "endpoint_security.max_auth_latency_ms",
     "watch.system_events",
     "allow_path_prefixes",

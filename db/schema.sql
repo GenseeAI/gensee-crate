@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL,
+    root_pid INTEGER NOT NULL DEFAULT 0,
     first_event_at INTEGER NOT NULL,
     last_event_at INTEGER,
     flagged INTEGER DEFAULT 0
@@ -36,6 +37,18 @@ CREATE TABLE IF NOT EXISTS session_token_usage (
     last_cumulative_tokens INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
+-- Incremental transcript parsing state. This survives one-shot hook processes
+-- and is removed when its agent session ends.
+CREATE TABLE IF NOT EXISTS transcript_token_state (
+    session_id TEXT NOT NULL,
+    transcript_path TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, transcript_path),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+    CHECK (json_valid(state_json))
 );
 
 CREATE TABLE IF NOT EXISTS agent_events (

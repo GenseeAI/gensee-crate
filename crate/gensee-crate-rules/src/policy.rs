@@ -566,6 +566,17 @@ impl Policy {
                 doc.schema_version
             ));
         }
+        if !doc.endpoint_security.fail_closed_managed_only {
+            return Err(
+                "endpoint_security.fail_closed_managed_only is reserved and must remain true"
+                    .to_string(),
+            );
+        }
+        if !(1..=100).contains(&doc.endpoint_security.max_auth_latency_ms) {
+            return Err(
+                "endpoint_security.max_auth_latency_ms must be between 1 and 100".to_string(),
+            );
+        }
         Ok(Self {
             doc,
             override_error: None,
@@ -1446,6 +1457,33 @@ mod tests {
     #[test]
     fn default_policy_json_round_trips() {
         assert!(Policy::from_json(default_policy_json()).is_ok());
+    }
+
+    #[test]
+    fn endpoint_security_scope_cannot_be_widened_beyond_managed_sessions() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(default_policy_json()).expect("default parses");
+        doc["endpoint_security"]["fail_closed_managed_only"] = serde_json::json!(false);
+        let err = Policy::from_json(&doc.to_string()).expect_err("unsafe scope must be rejected");
+        assert!(err.contains("must remain true"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn endpoint_security_authorization_latency_is_bounded() {
+        for invalid in [0, 101] {
+            let mut doc: serde_json::Value =
+                serde_json::from_str(default_policy_json()).expect("default parses");
+            doc["endpoint_security"]["max_auth_latency_ms"] = serde_json::json!(invalid);
+            let err =
+                Policy::from_json(&doc.to_string()).expect_err("out-of-range latency must fail");
+            assert!(err.contains("between 1 and 100"), "unexpected error: {err}");
+        }
+        for valid in [1, 100] {
+            let mut doc: serde_json::Value =
+                serde_json::from_str(default_policy_json()).expect("default parses");
+            doc["endpoint_security"]["max_auth_latency_ms"] = serde_json::json!(valid);
+            Policy::from_json(&doc.to_string()).expect("boundary latency should parse");
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@
 #import <bsm/libbsm.h>
 #import <fcntl.h>
 #import <mach/mach_time.h>
+#import <math.h>
 #import <os/log.h>
 #import <sys/sysctl.h>
 
@@ -359,7 +360,6 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 @property(nonatomic) NSSet<NSString *> *blockedExecutables;
 @property(nonatomic) NSDictionary<NSNumber *, NSString *> *managedRoots;
 @property(nonatomic) NSMutableDictionary<NSString *, NSString *> *managedProcesses;
-@property(nonatomic) BOOL failClosedManagedOnly;
 @property(nonatomic) uint64_t maxAuthorizationLatencyUS;
 @property(nonatomic) uint64_t authorizationCount;
 @property(nonatomic) uint64_t deniedCount;
@@ -382,7 +382,6 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         _blockedExecutables = [NSSet set];
         _managedRoots = @{};
         _managedProcesses = [NSMutableDictionary dictionary];
-        _failClosedManagedOnly = YES;
         _maxAuthorizationLatencyUS = 10000;
     }
     return self;
@@ -477,8 +476,9 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         authorizationBudgetUS = self.maxAuthorizationLatencyUS;
         NSString *session = [self sessionForProcessLocked:message->process messageVersion:message->version];
         BOOL enforcing = [self.mode isEqualToString:@"protect"] || [self.mode isEqualToString:@"strict"];
-        BOOL inScope = !self.failClosedManagedOnly || session != nil;
-        if (enforcing && inScope && ![self isOwnProcessLocked:message->process]) {
+        BOOL ownExecTarget = message->event_type == ES_EVENT_TYPE_AUTH_EXEC &&
+            GenseeIsOwnProcess(message->event.exec.target);
+        if (enforcing && session != nil && ![self isOwnProcessLocked:message->process] && !ownExecTarget) {
             NSString *path = GenseeAuthorizationPath(message);
             NSString *secondaryPath = GenseeSecondaryAuthorizationPath(message);
             if (message->event_type == ES_EVENT_TYPE_AUTH_EXEC && [self.blockedExecutables containsObject:path]) {
@@ -495,8 +495,9 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     }
 
     // Never miss Endpoint Security's response deadline in order to enforce a
-    // local rule. The configured budget is intentionally fail-open: the event
-    // is still recorded with a reason so the console can surface the overrun.
+    // local rule. The configured budget is intentionally fail-open. Every
+    // authorization eligible for a deny belongs to a managed session, so the
+    // resulting allow decision is recorded for the console below.
     uint64_t decisionElapsed = GenseeElapsedMicroseconds(started);
     if (deny && decisionElapsed > authorizationBudgetUS) {
         deny = NO;
@@ -680,13 +681,17 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         reply(NO, @"Protected paths and blocked executables must be arrays of absolute paths; managed roots must be an array.");
         return;
     }
-    if (failClosedManagedOnly != nil && ![failClosedManagedOnly isKindOfClass:NSNumber.class]) {
-        reply(NO, @"fail_closed_managed_only must be a boolean.");
+    if (failClosedManagedOnly != nil &&
+        (![failClosedManagedOnly isKindOfClass:NSNumber.class] || !failClosedManagedOnly.boolValue)) {
+        reply(NO, @"fail_closed_managed_only is reserved and must remain true.");
         return;
     }
     if (maxAuthorizationLatencyMS != nil &&
-        (![maxAuthorizationLatencyMS isKindOfClass:NSNumber.class] || maxAuthorizationLatencyMS.unsignedLongLongValue == 0)) {
-        reply(NO, @"max_auth_latency_ms must be a positive integer.");
+        (![maxAuthorizationLatencyMS isKindOfClass:NSNumber.class] ||
+         maxAuthorizationLatencyMS.doubleValue != floor(maxAuthorizationLatencyMS.doubleValue) ||
+         maxAuthorizationLatencyMS.unsignedLongLongValue < 1 ||
+         maxAuthorizationLatencyMS.unsignedLongLongValue > 100)) {
+        reply(NO, @"max_auth_latency_ms must be an integer from 1 through 100.");
         return;
     }
     NSMutableDictionary<NSNumber *, NSString *> *roots = [NSMutableDictionary dictionary];
@@ -708,7 +713,6 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         self.blockedExecutables = [NSSet setWithArray:[(blockedExecutables ?: @[]) valueForKey:@"stringByStandardizingPath"]];
         self.managedRoots = roots;
         self.managedProcesses = activeProcesses;
-        self.failClosedManagedOnly = failClosedManagedOnly == nil ? YES : failClosedManagedOnly.boolValue;
         self.maxAuthorizationLatencyUS = (maxAuthorizationLatencyMS ?: @10).unsignedLongLongValue * 1000ULL;
     }
     if (self.client != NULL) es_clear_cache(self.client);

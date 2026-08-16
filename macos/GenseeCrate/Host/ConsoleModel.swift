@@ -9,6 +9,7 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var policyDocument = ""
     @Published private(set) var integrations: [IntegrationDescriptor] = []
     @Published private(set) var dailyDetail: DailyDetail?
+    @Published private(set) var dailyDetailLoadState = DailyDetailLoadState.idle
     @Published private(set) var isRefreshing = false
     @Published private(set) var runningCommand: String?
     @Published private(set) var lastUpdated: Date?
@@ -29,6 +30,7 @@ final class ConsoleModel: ObservableObject {
         cli = GenseeCLI(homeURL: resolvedHome)
         endpointSensor = EndpointSecuritySensor(homeURL: resolvedHome, executableURL: cli.executableURL)
         refreshIntegrations()
+        Task { [weak self] in await self?.refreshIntegrationsWithCurrentBackend() }
     }
 
     var backendPath: String? { cli.executableURL?.path }
@@ -84,7 +86,7 @@ final class ConsoleModel: ObservableObject {
         isRefreshing = true
         defer { isRefreshing = false }
         cli = GenseeCLI(homeURL: homeURL)
-        refreshIntegrations()
+        await refreshIntegrationsWithCurrentBackend()
 
         guard backendAvailable else {
             errorMessage = GenseeCLIError.executableNotFound.localizedDescription
@@ -141,13 +143,28 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshDailyDetail(day: String) async {
-        guard backendAvailable else { return }
+        guard backendAvailable else {
+            dailyDetailLoadState = .unavailable(
+                day: day,
+                message: "The Gensee backend is unavailable. Repair the app backend, then try again."
+            )
+            return
+        }
+        dailyDetailLoadState = .loading(day)
         do {
             let detail = try await cli.decode(DailyDetail.self, arguments: ["dashboard-day", day])
-            guard detail.date == day else { return }
+            guard detail.date == day else {
+                dailyDetailLoadState = .unavailable(
+                    day: day,
+                    message: "The backend returned daily details for \(detail.date) instead of \(day)."
+                )
+                return
+            }
             dailyDetail = detail
+            dailyDetailLoadState = .loaded(day)
         } catch {
             dashboardRefreshIssue = error.localizedDescription
+            dailyDetailLoadState = .unavailable(day: day, message: error.localizedDescription)
         }
     }
 
@@ -234,7 +251,7 @@ final class ConsoleModel: ObservableObject {
             }
             let output = try await cli.run(arguments)
             noticeMessage = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            refreshIntegrations()
+            await refreshIntegrationsWithCurrentBackend()
         } catch {
             if let currentIndex = integrations.firstIndex(where: { $0.id == provider }) {
                 integrations[currentIndex].configured = previousValue
@@ -271,7 +288,7 @@ final class ConsoleModel: ObservableObject {
                 arguments.append("--repair")
             }
             let output = try await cli.run(arguments)
-            refreshIntegrations()
+            await refreshIntegrationsWithCurrentBackend()
             if let updated = integrations.first(where: { $0.id == provider }),
                let issue = updated.configurationIssue
             {
@@ -283,13 +300,13 @@ final class ConsoleModel: ObservableObject {
                     : detail
             }
         } catch {
-            refreshIntegrations()
+            await refreshIntegrationsWithCurrentBackend()
             errorMessage = error.localizedDescription
         }
     }
 
-    func refreshHarnesses() {
-        refreshIntegrations()
+    func refreshHarnesses() async {
+        await refreshIntegrationsWithCurrentBackend()
     }
 
     func openFullDiskAccess() {
@@ -326,6 +343,17 @@ final class ConsoleModel: ObservableObject {
             return try String(contentsOf: userPolicy, encoding: .utf8)
         }
         return try await cli.run(["policy", "print-default"]).stdout
+    }
+
+    private func refreshIntegrationsWithCurrentBackend() async {
+        if cli.executableURL?.path.contains(".app/Contents/") == true {
+            do {
+                _ = try await cli.stableHookExecutableURL()
+            } catch {
+                errorMessage = "Could not refresh the stable Gensee hook backend: \(error.localizedDescription)"
+            }
+        }
+        refreshIntegrations()
     }
 
     private func refreshIntegrations() {
@@ -529,7 +557,6 @@ final class ConsoleModel: ObservableObject {
         protectedPaths += [".ssh", ".aws", ".kube", ".config/gcloud"]
             .map { userHome.appendingPathComponent($0).path }
         var blockedExecutables: [String] = []
-        var failClosedManagedOnly = true
         var maxAuthorizationLatencyMS: UInt64 = 10
         if let data = policyDocument.data(using: .utf8),
            let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -537,7 +564,6 @@ final class ConsoleModel: ObservableObject {
         {
             protectedPaths += endpoint["protected_paths"] as? [String] ?? []
             blockedExecutables = endpoint["blocked_executables"] as? [String] ?? []
-            failClosedManagedOnly = endpoint["fail_closed_managed_only"] as? Bool ?? true
             maxAuthorizationLatencyMS = (endpoint["max_auth_latency_ms"] as? NSNumber)?.uint64Value ?? 10
         }
         let roots = snapshot.jsonSessions
@@ -548,8 +574,8 @@ final class ConsoleModel: ObservableObject {
             protectedPaths: Array(Set(protectedPaths)).sorted(),
             blockedExecutables: blockedExecutables,
             managedRoots: roots,
-            failClosedManagedOnly: failClosedManagedOnly,
-            maxAuthorizationLatencyMS: maxAuthorizationLatencyMS
+            failClosedManagedOnly: true,
+            maxAuthorizationLatencyMS: min(100, max(1, maxAuthorizationLatencyMS))
         )
     }
 

@@ -219,14 +219,15 @@ final class EndpointSecuritySensor: ObservableObject {
                     failure: { error in continuation.resume(throwing: error) }
                 )
             }
-            // Record the extension's returned cursor before applying health.
-            // applyHealth may intentionally rewind it after an extension reboot.
-            cursor = response.1
-            applyHealth(response.2)
+            let pendingCursor = response.1
+            let didRewind = applyHealth(response.2)
             if configurationNeedsPush {
                 try await pushConfiguration(using: connection)
             }
             try await write(events: response.0)
+            // Commit delivery only after the ingester accepted the batch. A
+            // boot/ring rewind from applyHealth remains authoritative.
+            if !didRewind { cursor = pendingCursor }
             health.connected = true
             health.error = nil
         } catch {
@@ -258,11 +259,13 @@ final class EndpointSecuritySensor: ObservableObject {
         if accepted { configurationNeedsPush = false }
     }
 
-    private func applyHealth(_ dictionary: [String: Any]) {
+    @discardableResult
+    private func applyHealth(_ dictionary: [String: Any]) -> Bool {
         let nextBootID = dictionary["boot_id"] as? String ?? ""
         let nextCursor = number(dictionary["next_cursor"])
         let oldestCursor = number(dictionary["oldest_cursor"])
-        if bootID != nextBootID || cursor >= nextCursor {
+        let didRewind = bootID != nextBootID || cursor >= nextCursor
+        if didRewind {
             bootID = nextBootID
             cursor = oldestCursor > 0 ? oldestCursor - 1 : 0
         }
@@ -281,6 +284,7 @@ final class EndpointSecuritySensor: ObservableObject {
             number(dictionary["configured_max_authorization_latency_us"])
         )
         health.managedProcesses = number(dictionary["managed_processes"])
+        return didRewind
     }
 
     private func write(events: [[String: Any]]) async throws {

@@ -75,7 +75,6 @@ private struct PolicySettingsView: View {
             ("endpoint_security.mode", "Sensor mode", "Off, observe, protect, or strict."),
             ("endpoint_security.protected_paths", "Protected paths", "Extra absolute path prefixes denied to managed agent trees."),
             ("endpoint_security.blocked_executables", "Blocked executables", "Executable paths denied before launch."),
-            ("endpoint_security.fail_closed_managed_only", "Managed trees only", "Never fail closed for unrelated host processes."),
             ("endpoint_security.max_auth_latency_ms", "Authorization latency budget", "Target maximum local decision latency."),
         ]),
         ("Allowlisted paths", "Path prefixes that are always trusted.", [("allow_path_prefixes", "Allowed path prefixes", "Absolute path prefixes exempt from sensitive checks.")]),

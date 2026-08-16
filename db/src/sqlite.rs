@@ -147,6 +147,7 @@ pub enum SqliteError {
 pub struct SessionRecord {
     pub session_id: String,
     pub agent_id: String,
+    pub root_pid: i64,
     pub first_event_at: i64,
     pub last_event_at: Option<i64>,
     pub flagged: bool,
@@ -156,9 +157,18 @@ pub struct SessionRecord {
 pub struct NewSession {
     pub session_id: String,
     pub agent_id: String,
+    pub root_pid: i64,
     pub first_event_at: i64,
     pub last_event_at: Option<i64>,
     pub flagged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptTokenStateRecord {
+    pub session_id: String,
+    pub transcript_path: String,
+    pub state_json: String,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -547,7 +557,9 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
     migrate_alert_hash_chain(&conn).map_err(SqliteError::Schema)?;
     migrate_agent_event_tool_use_id(&conn).map_err(SqliteError::Schema)?;
     migrate_request_activity_fields(&conn).map_err(SqliteError::Schema)?;
+    migrate_session_root_pid(&conn).map_err(SqliteError::Schema)?;
     migrate_session_token_usage(&conn).map_err(SqliteError::Schema)?;
+    migrate_transcript_token_state(&conn).map_err(SqliteError::Schema)?;
 
     conn.execute_batch(include_str!("../schema.sql"))
         .map_err(SqliteError::Schema)?;
@@ -584,16 +596,18 @@ impl SqliteStore {
     pub fn insert_session(&self, session: &NewSession) -> Result<(), SqliteError> {
         self.conn
             .execute(
-                "INSERT INTO sessions (session_id, agent_id, first_event_at, last_event_at, flagged)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO sessions (session_id, agent_id, root_pid, first_event_at, last_event_at, flagged)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(session_id) DO UPDATE SET
                     agent_id = excluded.agent_id,
+                    root_pid = CASE WHEN excluded.root_pid > 0 THEN excluded.root_pid ELSE sessions.root_pid END,
                     first_event_at = MIN(sessions.first_event_at, excluded.first_event_at),
                     last_event_at = COALESCE(excluded.last_event_at, sessions.last_event_at),
                     flagged = excluded.flagged",
                 params![
                     session.session_id,
                     session.agent_id,
+                    session.root_pid,
                     session.first_event_at,
                     session.last_event_at,
                     bool_to_i64(session.flagged),
@@ -606,7 +620,7 @@ impl SqliteStore {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>, SqliteError> {
         self.conn
             .query_row(
-                "SELECT session_id, agent_id, first_event_at, last_event_at, flagged
+                "SELECT session_id, agent_id, root_pid, first_event_at, last_event_at, flagged
                  FROM sessions
                  WHERE session_id = ?1",
                 [session_id],
@@ -621,6 +635,66 @@ impl SqliteStore {
             .execute(
                 "UPDATE sessions SET flagged = ?2 WHERE session_id = ?1",
                 params![session_id, bool_to_i64(flagged)],
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn transcript_token_state(
+        &self,
+        session_id: &str,
+        transcript_path: &str,
+    ) -> Result<Option<TranscriptTokenStateRecord>, SqliteError> {
+        self.conn
+            .query_row(
+                "SELECT session_id, transcript_path, state_json, updated_at
+                 FROM transcript_token_state
+                 WHERE session_id = ?1 AND transcript_path = ?2",
+                params![session_id, transcript_path],
+                |row| {
+                    Ok(TranscriptTokenStateRecord {
+                        session_id: row.get(0)?,
+                        transcript_path: row.get(1)?,
+                        state_json: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn upsert_transcript_token_state(
+        &self,
+        state: &TranscriptTokenStateRecord,
+    ) -> Result<(), SqliteError> {
+        self.conn
+            .execute(
+                "INSERT INTO transcript_token_state (
+                    session_id, transcript_path, state_json, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id, transcript_path) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at",
+                params![
+                    state.session_id,
+                    state.transcript_path,
+                    state.state_json,
+                    state.updated_at,
+                ],
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn delete_transcript_token_state_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), SqliteError> {
+        self.conn
+            .execute(
+                "DELETE FROM transcript_token_state WHERE session_id = ?1",
+                [session_id],
             )
             .map(|_| ())
             .map_err(SqliteError::Database)
@@ -763,7 +837,10 @@ impl SqliteStore {
             .execute(
                 "UPDATE requests
                  SET completed_at = ?2,
-                     total_tokens = COALESCE(total_tokens, ?3)
+                     total_tokens = CASE
+                       WHEN ?3 IS NULL THEN total_tokens
+                       ELSE COALESCE(total_tokens, 0) + ?3
+                     END
                  WHERE request_id = ?1",
                 params![request_id, completed_at, total_tokens],
             )
@@ -1934,6 +2011,17 @@ fn migrate_request_activity_fields(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+fn migrate_session_root_pid(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = table_columns(conn, "sessions")?;
+    if !columns.is_empty() && !columns.iter().any(|column| column == "root_pid") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN root_pid INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_session_token_usage(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS session_token_usage (
@@ -1941,6 +2029,20 @@ fn migrate_session_token_usage(conn: &Connection) -> rusqlite::Result<()> {
             last_cumulative_tokens INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+         );",
+    )
+}
+
+fn migrate_transcript_token_state(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS transcript_token_state (
+            session_id TEXT NOT NULL,
+            transcript_path TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (session_id, transcript_path),
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+            CHECK (json_valid(state_json))
          );",
     )
 }
@@ -1962,9 +2064,10 @@ fn map_session(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
         session_id: row.get(0)?,
         agent_id: row.get(1)?,
-        first_event_at: row.get(2)?,
-        last_event_at: row.get(3)?,
-        flagged: row.get::<_, i64>(4)? != 0,
+        root_pid: row.get(2)?,
+        first_event_at: row.get(3)?,
+        last_event_at: row.get(4)?,
+        flagged: row.get::<_, i64>(5)? != 0,
     })
 }
 
@@ -2178,6 +2281,7 @@ mod tests {
             "sessions",
             "requests",
             "session_token_usage",
+            "transcript_token_state",
             "agent_events",
             "system_events",
             "artifacts",
@@ -2219,6 +2323,7 @@ mod tests {
             .insert_session(&NewSession {
                 session_id: "legacy-session".to_string(),
                 agent_id: "claude-code".to_string(),
+                root_pid: 0,
                 first_event_at: 1,
                 last_event_at: None,
                 flagged: false,
@@ -2263,6 +2368,99 @@ mod tests {
         assert_eq!(token_total(first), Some(0));
         assert_eq!(token_total(second), Some(35));
         assert_eq!(token_total(reset), Some(0));
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn repeated_completion_accumulates_new_token_delta_on_the_same_request() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-repeated-stop-token-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .insert_session(&NewSession {
+                session_id: "repeat-session".to_string(),
+                agent_id: "claude-code".to_string(),
+                root_pid: 0,
+                first_event_at: 1,
+                last_event_at: None,
+                flagged: false,
+            })
+            .unwrap();
+        let request_id = store
+            .insert_request(&NewRequest {
+                session_id: "repeat-session".to_string(),
+                original_user_prompt: Some("turn".to_string()),
+                final_response: None,
+                events: None,
+                file_accessed_rate: 0.0,
+                network_rate: 0.0,
+            })
+            .unwrap();
+
+        store
+            .complete_request_with_token_total(request_id, 10, Some(100))
+            .unwrap();
+        store
+            .complete_request_with_token_total(request_id, 20, Some(135))
+            .unwrap();
+
+        let total: Option<i64> = store
+            .connection()
+            .query_row(
+                "SELECT total_tokens FROM requests WHERE request_id = ?1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, Some(35));
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn transcript_token_state_round_trips_and_is_deleted_by_session() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-transcript-state-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .insert_session(&NewSession {
+                session_id: "state-session".to_string(),
+                agent_id: "claude-code".to_string(),
+                root_pid: 0,
+                first_event_at: 1,
+                last_event_at: None,
+                flagged: false,
+            })
+            .unwrap();
+        let state = TranscriptTokenStateRecord {
+            session_id: "state-session".to_string(),
+            transcript_path: "/tmp/transcript.jsonl".to_string(),
+            state_json: r#"{"offset":42}"#.to_string(),
+            updated_at: 10,
+        };
+        store.upsert_transcript_token_state(&state).unwrap();
+        assert_eq!(
+            store
+                .transcript_token_state("state-session", "/tmp/transcript.jsonl")
+                .unwrap(),
+            Some(state)
+        );
+        store
+            .delete_transcript_token_state_for_session("state-session")
+            .unwrap();
+        assert!(store
+            .transcript_token_state("state-session", "/tmp/transcript.jsonl")
+            .unwrap()
+            .is_none());
 
         drop(store);
         remove_sqlite_files(&path);
@@ -2339,6 +2537,7 @@ mod tests {
             .insert_session(&NewSession {
                 session_id: "sess_1".to_string(),
                 agent_id: "agent_a".to_string(),
+                root_pid: 0,
                 first_event_at: 100,
                 last_event_at: None,
                 flagged: false,
@@ -2350,6 +2549,7 @@ mod tests {
             SessionRecord {
                 session_id: "sess_1".to_string(),
                 agent_id: "agent_a".to_string(),
+                root_pid: 0,
                 first_event_at: 100,
                 last_event_at: None,
                 flagged: true,
@@ -2546,6 +2746,7 @@ mod tests {
             .insert_session(&NewSession {
                 session_id: "sess_1".to_string(),
                 agent_id: "agent_a".to_string(),
+                root_pid: 0,
                 first_event_at: 1,
                 last_event_at: None,
                 flagged: false,
@@ -2602,6 +2803,7 @@ mod tests {
             .insert_session(&NewSession {
                 session_id: "sess_1".to_string(),
                 agent_id: "claude-code".to_string(),
+                root_pid: 0,
                 first_event_at: 1,
                 last_event_at: None,
                 flagged: false,

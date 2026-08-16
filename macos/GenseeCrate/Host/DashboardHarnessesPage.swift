@@ -22,7 +22,7 @@ struct DashboardHarnessesPage: View {
                     "Harnesses",
                     description: "Choose which installed AI harnesses receive Gensee monitoring and policy enforcement."
                 ) {
-                    Button { model.refreshHarnesses() } label: {
+                    Button { Task { await model.refreshHarnesses() } } label: {
                         Label("Scan again", systemImage: "arrow.clockwise")
                     }
                     .controlSize(.small)

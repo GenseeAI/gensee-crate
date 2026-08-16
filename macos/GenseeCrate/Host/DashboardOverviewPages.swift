@@ -177,11 +177,16 @@ struct TodayHighlightPage: View {
     private var toolCalls: Int { selectedDetail?.toolCalls ?? selectedActivity?.toolCalls ?? 0 }
     private var alertCount: Int { selectedDetail?.alerts ?? selectedActivity?.alerts ?? 0 }
     private var tokenCount: Int { selectedDetail?.tokens ?? selectedActivity?.tokens ?? 0 }
-    private var sessions: Int { selectedDetail?.sessions ?? 0 }
-    private var filesWritten: Int { selectedDetail?.filesWritten ?? 0 }
-    private var filesRead: Int { selectedDetail?.filesRead ?? 0 }
-    private var webRequests: Int { selectedDetail?.webRequests ?? 0 }
-    private var topTools: [DailyCount] { selectedDetail?.topTools ?? [] }
+    private var detailUnavailableMessage: String? {
+        guard case let .unavailable(day, message) = model.dailyDetailLoadState,
+              day == dayKey(date)
+        else { return nil }
+        return message
+    }
+    private var detailIsLoading: Bool {
+        guard case let .loading(day) = model.dailyDetailLoadState else { return false }
+        return day == dayKey(date)
+    }
 
     var body: some View {
         DashboardPage {
@@ -211,39 +216,65 @@ struct TodayHighlightPage: View {
                     }
                 }
                 metricRow([
-                    ("Sessions", sessions, "person.2", Color.dashboardBlue),
                     ("Agent Turns", requests, "bolt", Color.dashboardGold),
                     ("Tool Calls", toolCalls, "chevron.left.forwardslash.chevron.right", Color.dashboardGreen),
                     ("Alerts", alertCount, "exclamationmark.triangle", Color.dashboardRed),
-                ])
-                metricRow([
                     ("Tokens", tokenCount, "text.word.spacing", Color.purple),
-                    ("Files Written / Edited", filesWritten, "square.and.pencil", Color.dashboardBlue),
-                    ("Files Read", filesRead, "book", Color.dashboardGreen),
-                    ("Web Requests", webRequests, "globe", Color.dashboardGold),
                 ])
-                HStack(alignment: .top, spacing: 16) {
-                    DashboardCard("Alert breakdown") {
-                        HStack(alignment: .top, spacing: 40) {
-                            breakdown("By action", values: selectedDetail?.alertsByAction ?? [])
-                            breakdown("By severity", values: selectedDetail?.alertsBySeverity ?? [])
-                        }.frame(minHeight: 150, alignment: .top)
-                    }
-                    DashboardCard("Tool usage") {
-                        if topTools.isEmpty { DashboardEmpty(text: "No tool calls recorded for this date.") }
-                        else {
-                            VStack(spacing: 0) {
-                                ForEach(Array(topTools.enumerated()), id: \.offset) { _, tool in
-                                    HStack {
-                                        Text(tool.name).font(.system(size: 11, design: .monospaced))
-                                        Spacer()
-                                        ProgressView(value: Double(tool.count), total: Double(max(1, toolCalls))).frame(width: 90)
-                                        Text(tool.count.formatted()).font(.system(size: 11, weight: .semibold)).frame(width: 34, alignment: .trailing)
-                                    }.padding(.vertical, 6)
-                                    Divider()
+                if let detail = selectedDetail {
+                    metricRow([
+                        ("Sessions", detail.sessions, "person.2", Color.dashboardBlue),
+                        ("Files Written / Edited", detail.filesWritten, "square.and.pencil", Color.dashboardBlue),
+                        ("Files Read", detail.filesRead, "book", Color.dashboardGreen),
+                        ("Web Requests", detail.webRequests, "globe", Color.dashboardGold),
+                    ])
+                    HStack(alignment: .top, spacing: 16) {
+                        DashboardCard("Alert breakdown") {
+                            HStack(alignment: .top, spacing: 40) {
+                                breakdown("By action", values: detail.alertsByAction)
+                                breakdown("By severity", values: detail.alertsBySeverity)
+                            }.frame(minHeight: 150, alignment: .top)
+                        }
+                        DashboardCard("Tool usage") {
+                            if detail.topTools.isEmpty { DashboardEmpty(text: "No tool calls recorded for this date.") }
+                            else {
+                                VStack(spacing: 0) {
+                                    ForEach(Array(detail.topTools.enumerated()), id: \.offset) { _, tool in
+                                        HStack {
+                                            Text(tool.name).font(.system(size: 11, design: .monospaced))
+                                            Spacer()
+                                            ProgressView(value: Double(tool.count), total: Double(max(1, toolCalls))).frame(width: 90)
+                                            Text(tool.count.formatted()).font(.system(size: 11, weight: .semibold)).frame(width: 34, alignment: .trailing)
+                                        }.padding(.vertical, 6)
+                                        Divider()
+                                    }
                                 }
                             }
                         }
+                    }
+                } else {
+                    DashboardCard("Daily details") {
+                        HStack(spacing: 10) {
+                            if detailIsLoading {
+                                ProgressView().controlSize(.small)
+                                Text("Loading session, file, web, alert, and tool details…")
+                            } else if let detailUnavailableMessage {
+                                Image(systemName: "exclamationmark.triangle")
+                                    .foregroundStyle(Color.dashboardGold)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Detailed activity is unavailable for this date.")
+                                        .font(.system(size: 12, weight: .semibold))
+                                    Text(detailUnavailableMessage)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
+                            } else {
+                                ProgressView().controlSize(.small)
+                                Text("Preparing daily details…")
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 90, alignment: .leading)
                     }
                 }
                 DashboardCard("Rolling 53-week activity") {

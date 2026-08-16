@@ -79,6 +79,13 @@ struct DailyDetail: Decodable {
     }
 }
 
+enum DailyDetailLoadState: Equatable {
+    case idle
+    case loading(String)
+    case loaded(String)
+    case unavailable(day: String, message: String)
+}
+
 struct DailyCount: Decodable, Identifiable {
     let name: String
     let count: Int

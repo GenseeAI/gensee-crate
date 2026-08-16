@@ -174,6 +174,43 @@ final class HarnessConfigurationHealthTests: XCTestCase {
         XCTAssertTrue(inspection.note?.contains(alternateBackend.path) == true)
     }
 
+    func testAlternateBackendPreservesUnresolvedSymlinkForRepair() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gensee-harness-symlink-\(UUID().uuidString)")
+        let cellar = directory.appendingPathComponent("Cellar/gensee/0.2.1/bin", isDirectory: true)
+        let stableBin = directory.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: cellar, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stableBin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let versionedBackend = cellar.appendingPathComponent("gensee")
+        let stableBackend = stableBin.appendingPathComponent("gensee")
+        try Data("#!/bin/sh\n".utf8).write(to: versionedBackend)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: versionedBackend.path)
+        try FileManager.default.createSymbolicLink(at: stableBackend, withDestinationURL: versionedBackend)
+
+        let expected = HarnessConfigurationHealth.expectedCommand(
+            provider: "claude-code", homeURL: homeURL, backendURL: backendURL
+        )
+        let alternate = HarnessConfigurationHealth.expectedCommand(
+            provider: "claude-code", homeURL: homeURL, backendURL: stableBackend
+        )
+        let contents = try nestedConfiguration(
+            events: HarnessConfigurationHealth.expectedEvents(for: "claude-code"),
+            command: alternate
+        )
+        let inspection = HarnessConfigurationHealth.inspect(
+            provider: "claude-code",
+            contents: contents,
+            expectedCommand: expected,
+            eventStorePath: homeURL.path
+        )
+
+        XCTAssertTrue(inspection.isHealthy, inspection.issue ?? "Expected healthy symlink backend")
+        XCTAssertEqual(inspection.backendPath, stableBackend.path)
+        XCTAssertNotEqual(inspection.backendPath, versionedBackend.path)
+    }
+
     func testMalformedHooksContainerRequiresManualFix() throws {
         let command = HarnessConfigurationHealth.expectedCommand(
             provider: "claude-code", homeURL: homeURL, backendURL: backendURL

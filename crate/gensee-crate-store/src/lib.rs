@@ -11,6 +11,7 @@ use gensee_crate_db::sqlite::{
     open_store, AgentEventRecord, NewAgentEvent, NewAlert, NewArtifact, NewArtifactFact,
     NewArtifactObservation, NewArtifactRiskTag, NewHumanFeedback, NewRelation, NewRequest,
     NewSession, NewSystemEvent, NewTransactionEvent, SqliteConfig, SqliteError, SqliteStore,
+    TranscriptTokenStateRecord,
 };
 pub use gensee_crate_db::sqlite::{
     AlertRecord, ArtifactFactRecord, ArtifactObservationRecord, ArtifactRiskTagRecord,
@@ -65,10 +66,10 @@ pub struct EventStore {
     root: PathBuf,
     sqlite: Arc<Mutex<SqliteStore>>,
     encryption_key: Option<[u8; 32]>,
-    transcript_tokens: Arc<Mutex<HashMap<PathBuf, TranscriptTokenState>>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct TranscriptTokenState {
     offset: u64,
     #[cfg(unix)]
@@ -170,7 +171,6 @@ impl EventStore {
             root,
             sqlite: Arc::new(Mutex::new(sqlite)),
             encryption_key,
-            transcript_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -207,20 +207,25 @@ impl EventStore {
     }
 
     pub fn append_session(&self, session: &AgentSession) -> io::Result<()> {
-        if session.ended_at_ms.is_none()
-            && self.list_sessions()?.into_iter().any(|existing| {
-                existing.session_id == session.session_id
-                    && existing.ended_at_ms.is_none()
-                    && existing.root_pid == session.root_pid
-                    && existing.agent_binary == session.agent_binary
-            })
-        {
-            return Ok(());
+        if session.ended_at_ms.is_none() {
+            let duplicate = self
+                .sqlite_store()?
+                .get_session(&session.session_id)
+                .map_err(sqlite_error)?
+                .is_some_and(|existing| {
+                    existing.last_event_at.is_none()
+                        && existing.root_pid == i64::from(session.root_pid)
+                        && existing.agent_id == session.agent_binary
+                });
+            if duplicate {
+                return Ok(());
+            }
         }
         let db = self.sqlite_store()?;
         db.insert_session(&NewSession {
             session_id: session.session_id.clone(),
             agent_id: session.agent_binary.clone(),
+            root_pid: i64::from(session.root_pid),
             first_event_at: to_i64(session.started_at_ms)?,
             last_event_at: session.ended_at_ms.map(to_i64).transpose()?,
             flagged: false,
@@ -235,16 +240,20 @@ impl EventStore {
         ended_at_ms: u64,
         exit_code: Option<i32>,
     ) -> io::Result<bool> {
-        let Some(mut session) = self
-            .list_sessions()?
-            .into_iter()
-            .find(|session| session.session_id == session_id && session.ended_at_ms.is_none())
-        else {
+        let Some(mut session) = latest_session_by_id(
+            &self.sessions_path(),
+            self.encryption_key.as_ref(),
+            session_id,
+        )?
+        .filter(|session| session.ended_at_ms.is_none()) else {
             return Ok(false);
         };
         session.ended_at_ms = Some(ended_at_ms);
         session.exit_code = exit_code;
         self.append_session(&session)?;
+        self.sqlite_store()?
+            .delete_transcript_token_state_for_session(session_id)
+            .map_err(sqlite_error)?;
         Ok(true)
     }
 
@@ -1095,14 +1104,6 @@ impl EventStore {
     }
 
     fn append_hook_event_database(&self, event: &AgentHookEvent) -> io::Result<()> {
-        let transcript_tokens = if event.hook_event_name.as_deref() == Some("Stop") {
-            event
-                .transcript_path
-                .as_deref()
-                .and_then(|path| self.transcript_total_tokens(&event.provider, Path::new(path)))
-        } else {
-            None
-        };
         self.with_sqlite_transaction(|db| {
             let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, &event.provider, event.observed_at_ms)?;
@@ -1126,6 +1127,20 @@ impl EventStore {
                         .map_err(sqlite_error)?;
                 }
                 Some("Stop") => {
+                    let transcript_tokens = event
+                        .transcript_path
+                        .as_deref()
+                        .map(|path| {
+                            self.transcript_total_tokens(
+                                db,
+                                session_id,
+                                &event.provider,
+                                Path::new(path),
+                                event.observed_at_ms,
+                            )
+                        })
+                        .transpose()?
+                        .flatten();
                     let response = text_from_raw_json(&event.raw_json, &["last_assistant_message"]);
                     let request_id = if let Some(request) = db
                         .latest_request_for_session(session_id)
@@ -1185,15 +1200,44 @@ impl EventStore {
         })
     }
 
-    fn transcript_total_tokens(&self, provider: &str, path: &Path) -> Option<i64> {
-        let canonical = allowed_transcript_path(provider, path).ok().flatten()?;
-        let mut cache = self
-            .transcript_tokens
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        transcript_total_tokens_cached(&canonical, &mut cache)
-            .ok()
-            .flatten()
+    fn transcript_total_tokens(
+        &self,
+        db: &SqliteStore,
+        session_id: &str,
+        provider: &str,
+        path: &Path,
+        observed_at_ms: u64,
+    ) -> io::Result<Option<i64>> {
+        let Some(canonical) = allowed_transcript_path(provider, path)? else {
+            return Ok(None);
+        };
+        self.transcript_total_tokens_at_path(db, session_id, &canonical, observed_at_ms)
+    }
+
+    fn transcript_total_tokens_at_path(
+        &self,
+        db: &SqliteStore,
+        session_id: &str,
+        canonical: &Path,
+        observed_at_ms: u64,
+    ) -> io::Result<Option<i64>> {
+        let canonical_text = canonical.to_string_lossy().into_owned();
+        let persisted = db
+            .transcript_token_state(session_id, &canonical_text)
+            .map_err(sqlite_error)?;
+        let mut state = persisted
+            .as_ref()
+            .and_then(|record| serde_json::from_str(&record.state_json).ok())
+            .unwrap_or_default();
+        let total = transcript_total_tokens_with_state(canonical, &mut state)?;
+        db.upsert_transcript_token_state(&TranscriptTokenStateRecord {
+            session_id: session_id.to_string(),
+            transcript_path: canonical_text,
+            state_json: serde_json::to_string(&state).map_err(io::Error::other)?,
+            updated_at: to_i64(observed_at_ms)?,
+        })
+        .map_err(sqlite_error)?;
+        Ok(total)
     }
 
     fn append_process_observation_database(
@@ -1491,6 +1535,7 @@ fn ensure_session(
     db.insert_session(&NewSession {
         session_id: session_id.to_string(),
         agent_id: agent_id.to_string(),
+        root_pid: 0,
         first_event_at: to_i64(observed_at_ms)?,
         last_event_at: None,
         flagged: false,
@@ -1508,15 +1553,18 @@ fn transcript_total_tokens(path: &Path) -> io::Result<Option<i64>> {
 }
 
 fn allowed_transcript_path(provider: &str, path: &Path) -> io::Result<Option<PathBuf>> {
-    let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) else {
+    let home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let claude_config = env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let codex_home = env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let Some(allowed_root) = transcript_root(provider, home, claude_config, codex_home) else {
         return Ok(None);
     };
-    let relative_root = match provider {
-        "claude-code" => Path::new(".claude/projects"),
-        "codex" => Path::new(".codex/sessions"),
-        _ => return Ok(None),
-    };
-    let allowed_root = PathBuf::from(home).join(relative_root);
     let Ok(allowed_root) = allowed_root.canonicalize() else {
         return Ok(None);
     };
@@ -1526,16 +1574,41 @@ fn allowed_transcript_path(provider: &str, path: &Path) -> io::Result<Option<Pat
     Ok(canonical.starts_with(&allowed_root).then_some(canonical))
 }
 
+fn transcript_root(
+    provider: &str,
+    home: Option<PathBuf>,
+    claude_config: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match provider {
+        "claude-code" => claude_config
+            .or_else(|| home.map(|home| home.join(".claude")))
+            .map(|root| root.join("projects")),
+        "codex" => codex_home
+            .or_else(|| home.map(|home| home.join(".codex")))
+            .map(|root| root.join("sessions")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 fn transcript_total_tokens_cached(
     path: &Path,
     cache: &mut HashMap<PathBuf, TranscriptTokenState>,
+) -> io::Result<Option<i64>> {
+    let state = cache.entry(path.to_path_buf()).or_default();
+    transcript_total_tokens_with_state(path, state)
+}
+
+fn transcript_total_tokens_with_state(
+    path: &Path,
+    state: &mut TranscriptTokenState,
 ) -> io::Result<Option<i64>> {
     let metadata = fs::metadata(path)?;
     if !metadata.is_file() || metadata.len() > MAX_TOKEN_TRANSCRIPT_BYTES {
         return Ok(None);
     }
 
-    let state = cache.entry(path.to_path_buf()).or_default();
     #[cfg(unix)]
     let identity_changed =
         state.offset > 0 && (state.device != metadata.dev() || state.inode != metadata.ino());
@@ -2899,6 +2972,44 @@ fn read_jsonl<T: DeserializeOwned>(
     Ok(records)
 }
 
+/// Scan lifecycle records for one session without materializing and
+/// decrypting every session into a collection. The latest matching record is
+/// authoritative, matching `list_sessions` semantics.
+fn latest_session_by_id(
+    path: &Path,
+    encryption_key: Option<&[u8; 32]>,
+    session_id: &str,
+) -> io::Result<Option<AgentSession>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let file = OpenOptions::new().read(true).open(path)?;
+    let mut latest = None;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let decoded = if line.starts_with(JSONL_ENCRYPTED_PREFIX) {
+            let Some(key) = encryption_key else { continue };
+            let Ok(decoded) = decrypt_jsonl_line(key, &line) else {
+                continue;
+            };
+            decoded
+        } else {
+            line
+        };
+        let Ok(session) = serde_json::from_str::<AgentSession>(&decoded) else {
+            continue;
+        };
+        if session.session_id == session_id {
+            latest = Some(session);
+        }
+    }
+    Ok(latest)
+}
+
 fn store_encryption_enabled() -> bool {
     !matches!(
         env::var("GENSEE_STORE_ENCRYPTION").ok().as_deref(),
@@ -3098,6 +3209,83 @@ mod tests {
     }
 
     #[test]
+    fn transcript_roots_honor_harness_configuration_directories() {
+        let home = PathBuf::from("/Users/tester");
+        assert_eq!(
+            transcript_root(
+                "claude-code",
+                Some(home.clone()),
+                Some(PathBuf::from("/Volumes/config/claude")),
+                None,
+            ),
+            Some(PathBuf::from("/Volumes/config/claude/projects"))
+        );
+        assert_eq!(
+            transcript_root(
+                "codex",
+                Some(home.clone()),
+                None,
+                Some(PathBuf::from("/Volumes/config/codex")),
+            ),
+            Some(PathBuf::from("/Volumes/config/codex/sessions"))
+        );
+        assert_eq!(
+            transcript_root("claude-code", Some(home.clone()), None, None),
+            Some(home.join(".claude/projects"))
+        );
+        assert_eq!(transcript_root("cursor", None, None, None), None);
+    }
+
+    #[test]
+    fn transcript_offset_survives_event_store_restarts() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-transcript-state-test-{}-{now}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("claude.jsonl");
+        fs::write(
+            &transcript,
+            "{\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+        )
+        .unwrap();
+
+        {
+            let store = EventStore::new(&dir).unwrap();
+            let db = store.sqlite_store().unwrap();
+            ensure_session(&db, "persisted-session", "claude-code", 1).unwrap();
+            assert_eq!(
+                store
+                    .transcript_total_tokens_at_path(&db, "persisted-session", &transcript, 1,)
+                    .unwrap(),
+                Some(15)
+            );
+        }
+
+        writeln!(
+            OpenOptions::new().append(true).open(&transcript).unwrap(),
+            "{{\"message\":{{\"id\":\"m2\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":2}}}}}}"
+        )
+        .unwrap();
+        {
+            let store = EventStore::new(&dir).unwrap();
+            let db = store.sqlite_store().unwrap();
+            assert_eq!(
+                store
+                    .transcript_total_tokens_at_path(&db, "persisted-session", &transcript, 2,)
+                    .unwrap(),
+                Some(20)
+            );
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn dashboard_reports_daily_turn_tool_alert_and_token_totals() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3260,6 +3448,16 @@ mod tests {
         // Model both a lost daemon acknowledgement retry and the eventual
         // lifecycle update. Consumers must see one latest session record.
         store.append_session(&session).unwrap();
+        {
+            let db = store.sqlite_store().unwrap();
+            db.upsert_transcript_token_state(&TranscriptTokenStateRecord {
+                session_id: session.session_id.clone(),
+                transcript_path: "/tmp/test-transcript.jsonl".to_string(),
+                state_json: "{}".to_string(),
+                updated_at: 150,
+            })
+            .unwrap();
+        }
         assert!(store
             .end_session(&session.session_id, 200, Some(0))
             .unwrap());
@@ -3277,6 +3475,12 @@ mod tests {
             2,
             "one start and one end record should be persisted"
         );
+        assert!(store
+            .sqlite_store()
+            .unwrap()
+            .transcript_token_state(&session.session_id, "/tmp/test-transcript.jsonl")
+            .unwrap()
+            .is_none());
 
         fs::remove_dir_all(&dir).ok();
     }

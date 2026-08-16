@@ -119,8 +119,9 @@ enum HarnessConfigurationHealth {
             issues.append("Hooks point to a different event store. Repair will route events to \(eventStorePath).")
         }
 
+        let configuredBackendPaths = Set(parsedCommands.map(\.backend))
         let backendPaths = Set(parsedCommands.map { normalizedPath($0.backend) })
-        let missingBackend = backendPaths.first { !FileManager.default.isExecutableFile(atPath: $0) }
+        let missingBackend = configuredBackendPaths.first { !FileManager.default.isExecutableFile(atPath: $0) }
         if let missingBackend {
             issues.append("The configured Gensee backend is unavailable at \(missingBackend). Repair will install a stable backend command.")
         }
@@ -133,7 +134,10 @@ enum HarnessConfigurationHealth {
             configured: true,
             issue: issues.isEmpty ? nil : issues.joined(separator: " "),
             note: note,
-            backendPath: backendPaths.count == 1 ? backendPaths.first : nil
+            // Preserve the hook's stable spelling (for example
+            // /opt/homebrew/bin/gensee). Symlink resolution is comparison-only;
+            // repairing to a versioned Cellar target would break on upgrade.
+            backendPath: backendPaths.count == 1 ? configuredBackendPaths.sorted().first : nil
         )
     }
 
@@ -226,7 +230,7 @@ enum HarnessConfigurationHealth {
         return result
     }
 
-    private static func normalizedPath(_ path: String) -> String {
+    private static func standardizedPath(_ path: String) -> String {
         var normalized = URL(fileURLWithPath: path).standardizedFileURL.path
         // macOS exposes these directories through root-level symlinks. A child
         // process may report either spelling for the same executable or store.
@@ -244,7 +248,13 @@ enum HarnessConfigurationHealth {
                 break
             }
         }
-        return URL(fileURLWithPath: normalized).resolvingSymlinksInPath().standardizedFileURL.path
+        return normalized
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: standardizedPath(path))
+            .resolvingSymlinksInPath()
+            .standardizedFileURL.path
     }
 
     private static func shellQuote(_ value: String) -> String {

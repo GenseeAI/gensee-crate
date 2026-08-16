@@ -57,7 +57,9 @@ to parse, or whose `schema_version` differs from the binary's, **fails closed**.
 - `linux.network` — `mode`, `allow`, `deny`
 - `enforcement` — `noninteractive` (escalate medium+ `ask` → `deny`)
 - `endpoint_security` — `mode`, `protected_paths`, `blocked_executables`,
-  `fail_closed_managed_only`, `max_auth_latency_ms`
+  `max_auth_latency_ms` (1–100). The compatibility field
+  `fail_closed_managed_only` is reserved at `true`; Endpoint Security denies
+  never apply outside explicitly managed agent process trees.
 - `watch` — `system_events` (`endpoint-security` by default; set `none` to disable)
 - `allow_path_prefixes` — list (JSON form of `GENSEE_POLICY_ALLOW_PATH_PREFIXES`)
 
