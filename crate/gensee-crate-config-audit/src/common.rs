@@ -176,14 +176,23 @@ pub(crate) fn insecure_remote_http(value: &str) -> bool {
     )
 }
 
+/// Returns `true` only when a parsed endpoint proves that it embeds
+/// credentials. An unparseable endpoint is not evidence of credentials.
+pub(crate) fn endpoint_has_credentials(value: &str) -> bool {
+    Url::parse(value)
+        .ok()
+        .is_some_and(|url| parsed_url_has_credentials(&url))
+}
+
 /// Returns `true` when an endpoint contains URL credentials or cannot be
-/// parsed safely enough to prove that it does not. Callers use this only for
-/// values already known to be endpoint fields so malformed input fails closed
-/// without redacting unrelated evidence strings.
-pub(crate) fn endpoint_contains_secret(value: &str) -> bool {
-    let Ok(url) = Url::parse(value) else {
-        return true;
-    };
+/// parsed safely enough to prove that it does not. Use this for serialization
+/// only: redaction fails closed, while findings use `endpoint_has_credentials`
+/// so malformed input is not reported as confirmed credential exposure.
+pub(crate) fn endpoint_must_be_redacted(value: &str) -> bool {
+    Url::parse(value).map_or(true, |url| parsed_url_has_credentials(&url))
+}
+
+fn parsed_url_has_credentials(url: &Url) -> bool {
     !url.username().is_empty()
         || url.password().is_some()
         || url
@@ -333,21 +342,24 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_redaction_fails_closed_for_unparseable_values() {
+    fn endpoint_redaction_fails_closed_without_claiming_unparseable_values_have_credentials() {
         for endpoint in [
             "//admin:do-not-leak@example.com/mcp",
             "example.com/mcp?token=do-not-leak",
             ":://admin:do-not-leak@example.com",
         ] {
-            assert!(endpoint_contains_secret(endpoint), "{endpoint}");
+            assert!(endpoint_must_be_redacted(endpoint), "{endpoint}");
+            assert!(!endpoint_has_credentials(endpoint), "{endpoint}");
         }
-        assert!(endpoint_contains_secret(
-            "https://admin:do-not-leak@example.com/mcp"
-        ));
-        assert!(endpoint_contains_secret(
-            "https://example.com/mcp?access_token=do-not-leak"
-        ));
-        assert!(!endpoint_contains_secret("https://example.com/mcp"));
+        for endpoint in [
+            "https://admin:do-not-leak@example.com/mcp",
+            "https://example.com/mcp?access_token=do-not-leak",
+        ] {
+            assert!(endpoint_must_be_redacted(endpoint), "{endpoint}");
+            assert!(endpoint_has_credentials(endpoint), "{endpoint}");
+        }
+        assert!(!endpoint_must_be_redacted("https://example.com/mcp"));
+        assert!(!endpoint_has_credentials("https://example.com/mcp"));
     }
 
     #[test]

@@ -1,10 +1,10 @@
 #[cfg(test)]
 use crate::common::MAX_TEXT_FILE_BYTES;
 use crate::common::{
-    canonical_or_original, collect_json_commands, display_path, endpoint_contains_secret,
-    executable_dependency_is_unpinned, finding_fingerprint, hash_bytes, insecure_remote_http,
-    make_finding, normalize_secret_key, read_limited_text, secret_key_name, sort_findings,
-    source_for, summarize,
+    canonical_or_original, collect_json_commands, display_path, endpoint_has_credentials,
+    endpoint_must_be_redacted, executable_dependency_is_unpinned, finding_fingerprint, hash_bytes,
+    insecure_remote_http, make_finding, normalize_secret_key, read_limited_text, secret_key_name,
+    sort_findings, source_for, summarize,
 };
 use crate::model::{
     Assessment, AuditApplicability, AuditFinding, AuditInventory, AuditReport, AuditSource,
@@ -821,11 +821,14 @@ fn inspect_mcp_server(
         .get("url")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let endpoint_must_be_redacted = raw_endpoint
+        .as_deref()
+        .is_some_and(endpoint_must_be_redacted);
     let endpoint_has_credentials = raw_endpoint
         .as_deref()
-        .is_some_and(endpoint_contains_secret);
+        .is_some_and(endpoint_has_credentials);
     let inventory_endpoint = raw_endpoint.as_ref().map(|endpoint| {
-        if endpoint_has_credentials {
+        if endpoint_must_be_redacted {
             "<redacted-credential-url>".to_string()
         } else {
             endpoint.clone()
@@ -849,7 +852,7 @@ fn inspect_mcp_server(
                 "Remote MCP endpoint uses plaintext HTTP",
                 "Tool requests, results, and authorization material can be intercepted in transit.",
                 "url",
-                if endpoint_has_credentials {
+                if endpoint_must_be_redacted {
                     "<redacted-credential-url>"
                 } else {
                     url
@@ -1920,7 +1923,7 @@ fn evidence(path: &Path, key: Option<&str>, value: Option<&str>) -> Evidence {
         key: key.map(str::to_string),
         value: value.map(|value| {
             if key.is_some_and(|key| key.ends_with("otlpEndpoint"))
-                && endpoint_contains_secret(value)
+                && endpoint_must_be_redacted(value)
             {
                 "<redacted-credential-url>".to_string()
             } else {
@@ -2078,7 +2081,7 @@ mod tests {
     }
 
     #[test]
-    fn redacts_unparseable_mcp_endpoints_from_the_report() {
+    fn redacts_unparseable_mcp_endpoints_without_confirmed_credential_findings() {
         for (index, endpoint) in [
             "//admin:do-not-leak@example.com/mcp",
             "example.com/mcp?token=do-not-leak",
@@ -2111,12 +2114,43 @@ mod tests {
                 report.inventory.mcp_servers[0].endpoint.as_deref(),
                 Some("<redacted-credential-url>")
             );
-            assert!(report
+            assert!(!report
                 .findings
                 .iter()
                 .any(|finding| finding.rule_id == "VSC-MCP-005"));
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn scheme_less_endpoint_typo_is_redacted_without_a_credential_finding() {
+        let root = temp_root("mcp-scheme-less-no-credentials");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let user_data = root.join("User");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &workspace.join(".vscode/mcp.json"),
+            r#"{"servers":{"demo":{"type":"http","url":"example.com/mcp"}}}"#,
+        );
+
+        let report = audit_vscode_host(&VscodeAuditOptions {
+            workspace,
+            user_data,
+            profile: None,
+            extension_roots: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.inventory.mcp_servers[0].endpoint.as_deref(),
+            Some("<redacted-credential-url>")
+        );
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "VSC-MCP-005"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

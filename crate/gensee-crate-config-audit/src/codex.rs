@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::common::MAX_TEXT_FILE_BYTES;
 use crate::common::{
-    canonical_or_original, collect_json_commands, display_path, endpoint_contains_secret,
+    canonical_or_original, collect_json_commands, display_path, endpoint_must_be_redacted,
     executable_dependency_is_unpinned, finding_fingerprint, hash_bytes, insecure_remote_http,
     is_loopback_url, make_finding, normalize_secret_key, read_limited_text, sort_findings,
     source_for, summarize,
@@ -2145,7 +2145,7 @@ fn secret_like(key: &str, value: &str) -> bool {
 
 fn sanitize_evidence_value(key: Option<&str>, value: &str) -> String {
     if key.is_some_and(|key| secret_like(key, value))
-        || key.is_some_and(endpoint_key) && endpoint_contains_secret(value)
+        || key.is_some_and(endpoint_key) && endpoint_must_be_redacted(value)
     {
         "<redacted>".to_string()
     } else {
@@ -2154,12 +2154,13 @@ fn sanitize_evidence_value(key: Option<&str>, value: &str) -> String {
 }
 
 fn endpoint_key(key: &str) -> bool {
-    let key = normalize_secret_key(key);
-    key.contains("url") || key.contains("endpoint")
+    let final_segment = key.rsplit('.').next().unwrap_or(key);
+    let final_segment = normalize_secret_key(final_segment);
+    final_segment.contains("url") || final_segment.contains("endpoint")
 }
 
 fn sanitize_endpoint(value: &str) -> String {
-    if endpoint_contains_secret(value) {
+    if endpoint_must_be_redacted(value) {
         "<redacted-url>".to_string()
     } else {
         value.to_string()
@@ -2324,6 +2325,40 @@ mod tests {
         let encoded = serde_json::to_string(&report).unwrap();
         assert!(!encoded.contains("sk-super-secret"));
         assert!(encoded.contains("<redacted>"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn endpoint_key_ignores_url_text_in_mcp_server_ids() {
+        let root = temp_root("endpoint-key-final-segment");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &codex_home.join("config.toml"),
+            "[mcp_servers.url-fetcher]\ncommand = \"bash\"\n",
+        );
+
+        let report = audit_codex(&CodexAuditOptions {
+            workspace,
+            codex_home,
+            profile: None,
+        })
+        .unwrap();
+        let command = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == "CAX-MCP-004")
+            .unwrap();
+        let allowlist = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == "CAX-MCP-001")
+            .unwrap();
+
+        assert_eq!(command.evidence[0].value.as_deref(), Some("bash"));
+        assert_eq!(allowlist.evidence[0].value.as_deref(), Some("<unset>"));
         let _ = fs::remove_dir_all(root);
     }
 
