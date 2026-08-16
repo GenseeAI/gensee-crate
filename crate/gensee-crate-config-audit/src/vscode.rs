@@ -1,23 +1,26 @@
 #[cfg(test)]
 use crate::common::MAX_TEXT_FILE_BYTES;
-use crate::common::{canonical_or_original, display_path, hash_bytes, read_limited_text};
+use crate::common::{
+    canonical_or_original, collect_json_commands, display_path, executable_dependency_is_unpinned,
+    finding_fingerprint, hash_bytes, insecure_remote_http, make_finding, normalize_secret_key,
+    read_limited_text, secret_key_name, sort_findings, source_for, summarize,
+};
 use crate::model::{
     Assessment, AuditApplicability, AuditFinding, AuditInventory, AuditReport, AuditSource,
-    AuditSummary, AuditTarget, Evidence, ExtensionInventory, ManualCheck, McpInventory,
-    Remediation, Ruleset, Severity, SkillInventory,
+    AuditTarget, Evidence, ExtensionInventory, ManualCheck, McpInventory, Ruleset, Severity,
+    SkillInventory,
 };
 use crate::{
     GITHUB_COPILOT_VSCODE_RULESET_ID, GITHUB_COPILOT_VSCODE_RULESET_VERSION, VSCODE_RULESET_ID,
     VSCODE_RULESET_VERSION,
 };
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use url::{Host, Url};
+use url::Url;
 
 const SETTINGS_REFERENCE: &str = "https://code.visualstudio.com/docs/configure/settings";
 const SECURITY_REFERENCE: &str = "https://code.visualstudio.com/docs/agents/security";
@@ -134,8 +137,8 @@ fn audit_vscode_scope(
     options: &VscodeAuditOptions,
     scope: VscodeReportScope,
 ) -> io::Result<AuditReport> {
-    let workspace = options.workspace.clone();
-    let user_data = options.user_data.clone();
+    let workspace = canonical_or_original(&options.workspace);
+    let user_data = canonical_or_original(&options.user_data);
     let mut sources = Vec::new();
     let mut findings = Vec::new();
     let mut inventory = AuditInventory::default();
@@ -1635,13 +1638,6 @@ fn mcp_sandbox_is_broad(value: Option<&Value>) -> bool {
             .is_some_and(|domains| domains.iter().any(|domain| domain.as_str() == Some("*")))
 }
 
-fn insecure_remote_http(url: &str) -> bool {
-    Url::parse(url).map_or_else(
-        |_| url.to_ascii_lowercase().starts_with("http://"),
-        |parsed| parsed.scheme() == "http" && !url_host_is_loopback(&parsed),
-    )
-}
-
 fn url_has_credentials(url: &str) -> bool {
     let Ok(url) = Url::parse(url) else {
         return false;
@@ -1652,16 +1648,6 @@ fn url_has_credentials(url: &str) -> bool {
             let key = normalize_secret_key(&key);
             secret_key_name(&key)
         })
-}
-
-fn url_host_is_loopback(url: &Url) -> bool {
-    url.host().is_some_and(|host| match host {
-        Host::Domain(domain) => domain
-            .trim_end_matches('.')
-            .eq_ignore_ascii_case("localhost"),
-        Host::Ipv4(address) => address.is_loopback(),
-        Host::Ipv6(address) => address.is_loopback(),
-    })
 }
 
 fn shell_command(command: &str) -> bool {
@@ -1684,54 +1670,8 @@ fn shell_command(command: &str) -> bool {
 }
 
 fn mutable_package_launcher(command: &str, args: &[Value]) -> bool {
-    let launcher = Path::new(command)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(command)
-        .to_ascii_lowercase();
-    if !matches!(
-        launcher.as_str(),
-        "npx" | "npm" | "pnpm" | "pnpx" | "yarn" | "uvx" | "pipx"
-    ) {
-        return false;
-    }
-    let positional = args
-        .iter()
-        .filter_map(Value::as_str)
-        .filter(|argument| !argument.starts_with('-'))
-        .collect::<Vec<_>>();
-    let package = match launcher.as_str() {
-        "npx" | "pnpx" | "uvx" | "pipx" => positional.first().copied(),
-        "npm" | "pnpm" | "yarn" => positional
-            .first()
-            .copied()
-            .filter(|subcommand| matches!(*subcommand, "exec" | "dlx" | "x"))
-            .and_then(|_| positional.get(1))
-            .copied(),
-        _ => None,
-    };
-    package.is_some_and(|package| {
-        if looks_like_path(package) {
-            return false;
-        }
-        let versioned_name = package
-            .strip_prefix('@')
-            .and_then(|scoped| scoped.split_once('/'))
-            .map(|(_, name)| name)
-            .unwrap_or(package);
-        !versioned_name.contains('@')
-            || versioned_name.ends_with("@latest")
-            || versioned_name.contains("@next")
-    })
-}
-
-fn looks_like_path(value: &str) -> bool {
-    value.starts_with('.')
-        || value.starts_with('/')
-        || value.starts_with('~')
-        || value.contains("/../")
-        || value.contains("/./")
-        || value.chars().nth(1) == Some(':')
+    let arguments = args.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+    executable_dependency_is_unpinned(command, &arguments)
 }
 
 fn json_contains_secret(value: &Value) -> bool {
@@ -1744,29 +1684,6 @@ fn json_contains_secret(value: &Value) -> bool {
         Value::Array(values) => values.iter().any(json_contains_secret),
         _ => false,
     }
-}
-
-fn normalize_secret_key(key: &str) -> String {
-    key.chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn secret_key_name(key: &str) -> bool {
-    [
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "apikey",
-        "accesskey",
-        "authorization",
-        "privatekey",
-        "credential",
-    ]
-    .iter()
-    .any(|needle| key.contains(needle))
 }
 
 fn secret_literal(value: &str) -> bool {
@@ -1814,27 +1731,6 @@ fn hook_commands(text: &str) -> Result<Vec<String>, String> {
     let mut commands = Vec::new();
     collect_json_commands(&value, &mut commands);
     Ok(commands)
-}
-
-fn collect_json_commands(value: &Value, commands: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if key == "command" {
-                    if let Some(command) = value.as_str() {
-                        commands.push(command.to_string());
-                    }
-                }
-                collect_json_commands(value, commands);
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                collect_json_commands(value, commands);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn frontmatter_value(text: &str, key: &str) -> Option<String> {
@@ -1928,19 +1824,6 @@ fn find_files(root: &Path, predicate: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
     }
     files.sort();
     files
-}
-
-fn source_for(path: &Path, kind: &str, applied: bool, trusted: bool) -> AuditSource {
-    AuditSource {
-        kind: kind.to_string(),
-        path: display_path(path),
-        exists: path.exists(),
-        applied,
-        trusted,
-        sha256: None,
-        ignored_keys: Vec::new(),
-        errors: Vec::new(),
-    }
 }
 
 fn scan_source_integrity(sources: &[AuditSource], findings: &mut Vec<AuditFinding>) {
@@ -2041,65 +1924,6 @@ fn mcp_finding(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn make_finding(
-    rule_id: &str,
-    category: &str,
-    severity: Severity,
-    confidence: &str,
-    assessment: Assessment,
-    title: &str,
-    description: &str,
-    evidence_items: Vec<Evidence>,
-    remediation: &str,
-    references: &[&str],
-    mappings: &[&str],
-) -> AuditFinding {
-    let fingerprint = finding_fingerprint(rule_id, &evidence_items);
-    AuditFinding {
-        fingerprint,
-        rule_id: rule_id.to_string(),
-        category: category.to_string(),
-        severity,
-        confidence: confidence.to_string(),
-        assessment,
-        title: title.to_string(),
-        description: description.to_string(),
-        evidence: evidence_items,
-        remediation: Remediation {
-            summary: remediation.to_string(),
-            suggested_values: BTreeMap::new(),
-        },
-        references: references
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
-        mappings: mappings.iter().map(|value| (*value).to_string()).collect(),
-    }
-}
-
-fn finding_fingerprint(rule_id: &str, evidence_items: &[Evidence]) -> String {
-    let mut hasher = Sha256::new();
-    hash_fingerprint_part(&mut hasher, rule_id.as_bytes());
-    for evidence in evidence_items {
-        hash_fingerprint_part(&mut hasher, evidence.source.as_bytes());
-        hash_fingerprint_part(
-            &mut hasher,
-            evidence.key.as_deref().unwrap_or_default().as_bytes(),
-        );
-        hash_fingerprint_part(
-            &mut hasher,
-            evidence.value.as_deref().unwrap_or_default().as_bytes(),
-        );
-    }
-    format!("sha256:{:x}", hasher.finalize())
-}
-
-fn hash_fingerprint_part(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update((value.len() as u64).to_le_bytes());
-    hasher.update(value);
-}
-
 fn evidence(path: &Path, key: Option<&str>, value: Option<&str>) -> Evidence {
     Evidence {
         source: display_path(path),
@@ -2112,38 +1936,6 @@ fn evidence(path: &Path, key: Option<&str>, value: Option<&str>) -> Evidence {
             }
         }),
     }
-}
-
-fn summarize(assessment: &str, findings: &[AuditFinding], manual: usize) -> AuditSummary {
-    let mut counts: BTreeMap<String, usize> = ["critical", "high", "medium", "low", "info"]
-        .into_iter()
-        .map(|severity| (severity.to_string(), 0))
-        .collect();
-    for finding in findings {
-        *counts
-            .entry(finding.severity.as_str().to_string())
-            .or_default() += 1;
-    }
-    AuditSummary {
-        assessment: assessment.to_string(),
-        max_severity: findings
-            .iter()
-            .map(|finding| finding.severity)
-            .max_by_key(|severity| severity.rank()),
-        counts,
-        manual_checks: manual,
-    }
-}
-
-fn sort_findings(findings: &mut [AuditFinding]) {
-    findings.sort_by(|left, right| {
-        right
-            .severity
-            .rank()
-            .cmp(&left.severity.rank())
-            .then_with(|| left.rule_id.cmp(&right.rule_id))
-            .then_with(|| left.fingerprint.cmp(&right.fingerprint))
-    });
 }
 
 #[cfg(test)]
@@ -2181,7 +1973,7 @@ mod tests {
 
         assert!(!mutable_package_launcher(
             "npx",
-            &values(&["-y", "@scope/server@1.2.3", "/Users/me/projects"]),
+            &values(&["-y", "@scope/server@1.2.3", "--root", "data"]),
         ));
         assert!(mutable_package_launcher(
             "npx",
@@ -2355,13 +2147,73 @@ mod tests {
             .find(|finding| finding.rule_id == "VSC-AUT-001")
             .unwrap();
 
-        assert_eq!(finding.evidence[0].source, display_path(&user_settings));
+        assert_eq!(
+            finding.evidence[0].source,
+            display_path(&canonical_or_original(&user_settings))
+        );
         let compound = report
             .findings
             .iter()
             .find(|finding| finding.rule_id == "VSC-AUT-003")
             .unwrap();
         assert_eq!(compound.evidence[2].source, "VS Code defaults");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_paths_stabilize_report_identity_and_fingerprints() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("canonical-report-identity");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let user_data = root.join("User");
+        let workspace_alias = root.join("repo-alias");
+        let user_data_alias = root.join("User-alias");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &user_data.join("settings.json"),
+            r#"{"chat.tools.global.autoApprove":true}"#,
+        );
+        symlink(&workspace, &workspace_alias).unwrap();
+        symlink(&user_data, &user_data_alias).unwrap();
+
+        let canonical = audit_vscode_host(&VscodeAuditOptions {
+            workspace: workspace.clone(),
+            user_data: user_data.clone(),
+            profile: None,
+            extension_roots: Vec::new(),
+        })
+        .unwrap();
+        let aliased = audit_vscode_host(&VscodeAuditOptions {
+            workspace: workspace_alias,
+            user_data: user_data_alias,
+            profile: None,
+            extension_roots: Vec::new(),
+        })
+        .unwrap();
+        let canonical_finding = canonical
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == "VSC-AUT-001")
+            .unwrap();
+        let aliased_finding = aliased
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == "VSC-AUT-001")
+            .unwrap();
+
+        assert_eq!(canonical.target.workspace, aliased.target.workspace);
+        assert_eq!(
+            canonical.target.vscode_user_data,
+            aliased.target.vscode_user_data
+        );
+        assert_eq!(
+            canonical_finding.evidence[0].source,
+            aliased_finding.evidence[0].source
+        );
+        assert_eq!(canonical_finding.fingerprint, aliased_finding.fingerprint);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2490,14 +2342,14 @@ mod tests {
         let skill_source = report
             .sources
             .iter()
-            .find(|source| source.path == display_path(&skill_path))
+            .find(|source| source.path == display_path(&canonical_or_original(&skill_path)))
             .unwrap();
         assert!(skill_source.sha256.is_none());
         assert!(!skill_source.errors.is_empty());
         let hook_source = report
             .sources
             .iter()
-            .find(|source| source.path == display_path(&hook_path))
+            .find(|source| source.path == display_path(&canonical_or_original(&hook_path)))
             .unwrap();
         assert!(hook_source.sha256.is_some());
         assert!(!hook_source.errors.is_empty());

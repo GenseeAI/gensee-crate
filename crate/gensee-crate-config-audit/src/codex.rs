@@ -1,13 +1,16 @@
 #[cfg(test)]
 use crate::common::MAX_TEXT_FILE_BYTES;
-use crate::common::{canonical_or_original, display_path, hash_bytes, read_limited_text};
+use crate::common::{
+    canonical_or_original, collect_json_commands, display_path, executable_dependency_is_unpinned,
+    finding_fingerprint, hash_bytes, insecure_remote_http, make_finding, normalize_secret_key,
+    read_limited_text, secret_key_name, sort_findings, source_for, summarize,
+};
 use crate::model::{
-    Assessment, AuditFinding, AuditInventory, AuditReport, AuditSource, AuditSummary, AuditTarget,
-    Evidence, ManualCheck, McpInventory, Remediation, Ruleset, Severity, SkillInventory,
+    Assessment, AuditFinding, AuditInventory, AuditReport, AuditSource, AuditTarget, Evidence,
+    ManualCheck, McpInventory, Ruleset, Severity, SkillInventory,
 };
 use crate::{CODEX_RULESET_ID, CODEX_RULESET_VERSION};
 use serde_json::{json, Value as JsonValue};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -53,9 +56,9 @@ impl CodexAuditOptions {
 }
 
 pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
-    let workspace = options.workspace.clone();
-    let canonical_workspace = canonical_or_original(&workspace);
-    let codex_home = options.codex_home.clone();
+    let original_workspace = options.workspace.clone();
+    let workspace = canonical_or_original(&original_workspace);
+    let codex_home = canonical_or_original(&options.codex_home);
     let mut sources = Vec::new();
     let mut findings = Vec::new();
     let mut limitations = vec![
@@ -111,7 +114,7 @@ pub fn audit_codex(options: &CodexAuditOptions) -> io::Result<AuditReport> {
         config_complete &= ok && profile_path.exists();
     }
 
-    let trusted = project_is_trusted(&effective, &workspace, &canonical_workspace);
+    let trusted = project_is_trusted(&effective, &original_workspace, &workspace);
     let project_path = workspace.join(".codex").join("config.toml");
     let mut ignored_project_keys = Vec::new();
     let (mut project_layer, project_ok) = if trusted {
@@ -300,19 +303,6 @@ fn load_toml_layer(
             sources.push(source);
             (TomlValue::Table(Default::default()), false)
         }
-    }
-}
-
-fn source_for(path: &Path, kind: &str, applied: bool, trusted: bool) -> AuditSource {
-    AuditSource {
-        kind: kind.to_string(),
-        path: display_path(path),
-        exists: path.exists(),
-        applied,
-        trusted,
-        sha256: None,
-        ignored_keys: Vec::new(),
-        errors: Vec::new(),
     }
 }
 
@@ -617,10 +607,7 @@ fn evaluate_shell_environment(
             &["OWASP-MCP1", "OWASP-ASI03"],
         ));
     }
-    let has_environment_filter = get_value(config, &["shell_environment_policy", "filters"])
-        .or_else(|| get_value(config, &["shell_environment_policy", "include_only"]))
-        .is_some();
-    if inherit_all && !has_environment_filter {
+    if inherit_all && !has_environment_allowlist(config) {
         findings.push(make_finding(
             "CAX-ENV-002",
             "sandbox_filesystem_environment",
@@ -650,6 +637,22 @@ fn evaluate_shell_environment(
             }
         }
     }
+}
+
+fn has_environment_allowlist(config: &TomlValue) -> bool {
+    let canonical_filter_includes = get_value(config, &["shell_environment_policy", "filters"])
+        .and_then(TomlValue::as_table)
+        .is_some_and(|filters| {
+            filters.values().any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|decision| decision.eq_ignore_ascii_case("include"))
+            })
+        });
+    let legacy_include_only = get_value(config, &["shell_environment_policy", "include_only"])
+        .and_then(TomlValue::as_array)
+        .is_some_and(|values| !values.is_empty());
+    canonical_filter_includes || legacy_include_only
 }
 
 fn evaluate_privacy_config(config: &TomlValue, source: &Path, findings: &mut Vec<AuditFinding>) {
@@ -1820,94 +1823,6 @@ fn effective_security_summary(
     summary
 }
 
-fn summarize(assessment: &str, findings: &[AuditFinding], manual: usize) -> AuditSummary {
-    let mut counts = BTreeMap::new();
-    for severity in [
-        Severity::Critical,
-        Severity::High,
-        Severity::Medium,
-        Severity::Low,
-        Severity::Info,
-    ] {
-        counts.insert(
-            severity.as_str().to_string(),
-            findings
-                .iter()
-                .filter(|finding| finding.severity == severity)
-                .count(),
-        );
-    }
-    let max_severity = findings
-        .iter()
-        .map(|finding| finding.severity)
-        .max_by_key(|severity| severity.rank());
-    AuditSummary {
-        assessment: assessment.to_string(),
-        max_severity,
-        counts,
-        manual_checks: manual,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn make_finding(
-    rule_id: &str,
-    category: &str,
-    severity: Severity,
-    confidence: &str,
-    assessment: Assessment,
-    title: &str,
-    description: &str,
-    evidence_items: Vec<Evidence>,
-    remediation: &str,
-    references: &[&str],
-    mappings: &[&str],
-) -> AuditFinding {
-    let fingerprint = finding_fingerprint(rule_id, &evidence_items);
-    AuditFinding {
-        fingerprint,
-        rule_id: rule_id.to_string(),
-        category: category.to_string(),
-        severity,
-        confidence: confidence.to_string(),
-        assessment,
-        title: title.to_string(),
-        description: description.to_string(),
-        evidence: evidence_items,
-        remediation: Remediation {
-            summary: remediation.to_string(),
-            suggested_values: BTreeMap::new(),
-        },
-        references: references
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
-        mappings: mappings.iter().map(|value| (*value).to_string()).collect(),
-    }
-}
-
-fn finding_fingerprint(rule_id: &str, evidence_items: &[Evidence]) -> String {
-    let mut hasher = Sha256::new();
-    hash_fingerprint_part(&mut hasher, rule_id.as_bytes());
-    for evidence in evidence_items {
-        hash_fingerprint_part(&mut hasher, evidence.source.as_bytes());
-        hash_fingerprint_part(
-            &mut hasher,
-            evidence.key.as_deref().unwrap_or_default().as_bytes(),
-        );
-        hash_fingerprint_part(
-            &mut hasher,
-            evidence.value.as_deref().unwrap_or_default().as_bytes(),
-        );
-    }
-    format!("sha256:{:x}", hasher.finalize())
-}
-
-fn hash_fingerprint_part(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update((value.len() as u64).to_le_bytes());
-    hasher.update(value);
-}
-
 fn evidence(path: &Path, key: Option<&str>, value: Option<&str>) -> Evidence {
     Evidence {
         source: display_path(path),
@@ -2083,30 +1998,6 @@ fn collect_hook_commands_from_toml(value: &TomlValue) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn collect_json_commands(value: &JsonValue, commands: &mut Vec<String>) {
-    match value {
-        JsonValue::Object(map) => {
-            for (key, value) in map {
-                if matches!(
-                    key.as_str(),
-                    "command" | "commandWindows" | "command_windows"
-                ) {
-                    if let Some(command) = value.as_str() {
-                        commands.push(command.to_string());
-                    }
-                }
-                collect_json_commands(value, commands);
-            }
-        }
-        JsonValue::Array(values) => {
-            for value in values {
-                collect_json_commands(value, commands);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn find_named_files(root: &Path, name: &str, max_depth: usize) -> Vec<PathBuf> {
     fn visit(path: &Path, name: &str, depth: usize, max_depth: usize, found: &mut Vec<PathBuf>) {
         if depth > max_depth {
@@ -2207,24 +2098,6 @@ fn skip_discovery_directory(path: &Path) -> bool {
     )
 }
 
-fn executable_dependency_is_unpinned(command: &str, args: &[&str]) -> bool {
-    let launcher = Path::new(command)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(command);
-    if !matches!(launcher, "npx" | "uvx" | "pipx" | "bunx" | "pnpx") {
-        return false;
-    }
-    args.iter().any(|arg| {
-        if arg.starts_with('-') || matches!(*arg, "y" | "yes") {
-            return false;
-        }
-        *arg == "latest"
-            || arg.ends_with("@latest")
-            || (!arg.contains('@') && !looks_like_path(arg))
-    })
-}
-
 fn is_shell_indirection(command: &str) -> bool {
     let name = Path::new(command)
         .file_name()
@@ -2270,13 +2143,6 @@ fn secret_like(key: &str, value: &str) -> bool {
         || lower.starts_with("github_pat_")
 }
 
-fn normalize_secret_key(key: &str) -> String {
-    key.chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
 fn sanitize_evidence_value(key: Option<&str>, value: &str) -> String {
     if key.is_some_and(|key| secret_like(key, value)) || endpoint_contains_secret(value) {
         "<redacted>".to_string()
@@ -2307,22 +2173,6 @@ fn endpoint_contains_secret(value: &str) -> bool {
             .any(|(key, _)| secret_key_name(&normalize_secret_key(&key)))
 }
 
-fn secret_key_name(key: &str) -> bool {
-    [
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "apikey",
-        "accesskey",
-        "authorization",
-        "privatekey",
-        "credential",
-    ]
-    .iter()
-    .any(|needle| key.contains(needle))
-}
-
 fn is_broad_path(path: &str) -> bool {
     let normalized = path.trim_end_matches('/');
     normalized.is_empty()
@@ -2336,10 +2186,6 @@ fn is_broad_path(path: &str) -> bool {
         || normalized.ends_with("/.config")
 }
 
-fn looks_like_path(value: &str) -> bool {
-    value.starts_with('.') || value.starts_with('/') || value.contains(std::path::MAIN_SEPARATOR)
-}
-
 fn is_loopback_url(value: &str) -> bool {
     Url::parse(value).ok().is_some_and(|url| {
         url.host().is_some_and(|host| match host {
@@ -2350,13 +2196,6 @@ fn is_loopback_url(value: &str) -> bool {
             Host::Ipv6(address) => address.is_loopback(),
         })
     })
-}
-
-fn insecure_remote_http(value: &str) -> bool {
-    Url::parse(value).map_or_else(
-        |_| value.to_ascii_lowercase().starts_with("http://"),
-        |url| url.scheme() == "http" && !is_loopback_url(value),
-    )
 }
 
 fn contains_hidden_unicode(value: &str) -> bool {
@@ -2394,17 +2233,6 @@ fn get_str<'a>(value: &'a TomlValue, path: &[&str]) -> Option<&'a str> {
 
 fn get_integer(value: &TomlValue, path: &[&str]) -> Option<i64> {
     get_value(value, path).and_then(TomlValue::as_integer)
-}
-
-fn sort_findings(findings: &mut [AuditFinding]) {
-    findings.sort_by(|left, right| {
-        right
-            .severity
-            .rank()
-            .cmp(&left.severity.rank())
-            .then_with(|| left.rule_id.cmp(&right.rule_id))
-            .then_with(|| left.fingerprint.cmp(&right.fingerprint))
-    });
 }
 
 #[cfg(test)]
@@ -2589,7 +2417,10 @@ mod tests {
             .find(|finding| finding.rule_id == "CAX-AUT-001")
             .unwrap();
 
-        assert_eq!(finding.evidence[0].source, display_path(&project_path));
+        assert_eq!(
+            finding.evidence[0].source,
+            display_path(&canonical_or_original(&project_path))
+        );
         let default_finding = report
             .findings
             .iter()
@@ -2770,11 +2601,11 @@ mod tests {
     }
 
     #[test]
-    fn canonical_environment_filters_prevent_full_inheritance_warning() {
+    fn inclusive_environment_filters_prevent_full_inheritance_warning() {
         let config = r#"
             [shell_environment_policy]
             inherit = "all"
-            filters = ["PATH", "HOME"]
+            filters = { PATH = "include", HOME = "include" }
         "#
         .parse::<TomlValue>()
         .unwrap();
@@ -2785,6 +2616,76 @@ mod tests {
         assert!(!findings
             .iter()
             .any(|finding| finding.rule_id == "CAX-ENV-002"));
+    }
+
+    #[test]
+    fn exclude_only_environment_filters_do_not_hide_full_inheritance() {
+        let config = r#"
+            [shell_environment_policy]
+            inherit = "all"
+            filters = { AWS_SECRET_ACCESS_KEY = "exclude" }
+        "#
+        .parse::<TomlValue>()
+        .unwrap();
+        let mut findings = Vec::new();
+
+        evaluate_shell_environment(&config, Path::new("config.toml"), false, &mut findings);
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == "CAX-ENV-002"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_paths_stabilize_report_identity_and_fingerprints() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("canonical-report-identity");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        let workspace_alias = root.join("repo-alias");
+        let codex_home_alias = root.join("codex-alias");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &codex_home.join("config.toml"),
+            "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
+        );
+        symlink(&workspace, &workspace_alias).unwrap();
+        symlink(&codex_home, &codex_home_alias).unwrap();
+
+        let canonical = audit_codex(&CodexAuditOptions {
+            workspace: workspace.clone(),
+            codex_home: codex_home.clone(),
+            profile: None,
+        })
+        .unwrap();
+        let aliased = audit_codex(&CodexAuditOptions {
+            workspace: workspace_alias,
+            codex_home: codex_home_alias,
+            profile: None,
+        })
+        .unwrap();
+        let canonical_finding = canonical
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == "CAX-AUT-002")
+            .unwrap();
+        let aliased_finding = aliased
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == "CAX-AUT-002")
+            .unwrap();
+
+        assert_eq!(canonical.target.workspace, aliased.target.workspace);
+        assert_eq!(canonical.target.codex_home, aliased.target.codex_home);
+        assert_eq!(
+            canonical_finding.evidence[0].source,
+            aliased_finding.evidence[0].source
+        );
+        assert_eq!(canonical_finding.fingerprint, aliased_finding.fingerprint);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2852,7 +2753,7 @@ mod tests {
         let source = report
             .sources
             .iter()
-            .find(|source| source.path == display_path(&rule_path))
+            .find(|source| source.path == display_path(&canonical_or_original(&rule_path)))
             .unwrap();
         assert_eq!(report.summary.assessment, "partial");
         assert!(source.sha256.is_none());

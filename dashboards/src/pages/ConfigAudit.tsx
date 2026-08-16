@@ -44,6 +44,7 @@ import type {
   AuditAssessment,
   AuditExtension,
   AuditFinding,
+  AuditInventory,
   AuditManualCheck,
   AuditMcpServer,
   AuditSeverity,
@@ -516,6 +517,8 @@ function mergeReports(bundle: ConfigAuditBundle): ConfigAuditReport | undefined 
   const inventories = selected.map(item => item.report.inventory);
   const uniqueBy = <T,>(items: T[], key: (item: T) => string) =>
     Array.from(new Map(items.map(item => [key(item), item])).values());
+  const sumInventoryCount = (count: (inventory: AuditInventory) => number) =>
+    inventories.reduce((total, inventory) => total + count(inventory), 0);
   selected.forEach(item => {
     (Object.keys(counts) as AuditSeverity[]).forEach(severity => {
       counts[severity] += item.report.summary.counts[severity] ?? 0;
@@ -557,17 +560,17 @@ function mergeReports(bundle: ConfigAuditBundle): ConfigAuditReport | undefined 
         inventories.flatMap(inventory => inventory.mcp_servers),
         server => `${server.id}:${server.transport}:${server.endpoint ?? ''}`,
       ),
-      hook_commands: Math.max(...inventories.map(inventory => inventory.hook_commands)),
-      plugin_manifests: Math.max(...inventories.map(inventory => inventory.plugin_manifests)),
-      marketplace_files: Math.max(...inventories.map(inventory => inventory.marketplace_files)),
-      rule_files: Math.max(...inventories.map(inventory => inventory.rule_files)),
-      instruction_files: Math.max(...inventories.map(inventory => inventory.instruction_files)),
-      managed_requirement_files: Math.max(...inventories.map(inventory => inventory.managed_requirement_files)),
+      hook_commands: sumInventoryCount(inventory => inventory.hook_commands),
+      plugin_manifests: sumInventoryCount(inventory => inventory.plugin_manifests),
+      marketplace_files: sumInventoryCount(inventory => inventory.marketplace_files),
+      rule_files: sumInventoryCount(inventory => inventory.rule_files),
+      instruction_files: sumInventoryCount(inventory => inventory.instruction_files),
+      managed_requirement_files: sumInventoryCount(inventory => inventory.managed_requirement_files),
       extensions: uniqueBy(
         inventories.flatMap(inventory => inventory.extensions ?? []),
         extension => extension.path,
       ),
-      custom_agents: Math.max(...inventories.map(inventory => inventory.custom_agents ?? 0)),
+      custom_agents: sumInventoryCount(inventory => inventory.custom_agents ?? 0),
     },
     findings: selected.flatMap(item => item.report.findings.map(finding => ({
       ...finding,
