@@ -50,4 +50,36 @@ final class HarnessActivationGuidanceTests: XCTestCase {
             working
         )
     }
+
+    func testCodexHookReviewClosesOnlyItsOriginatingTerminalAfterTrustChanges() {
+        let script = CodexHookReviewScript.render(
+            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
+            hooksURL: URL(fileURLWithPath: "/Users/example/.codex/hooks.json")
+        )
+
+        XCTAssertTrue(script.contains("current_checksum\" != \"$initial_checksum"))
+        XCTAssertTrue(script.contains("hooks_are_trusted"))
+        XCTAssertTrue(script.contains("gensee hook codex"))
+        XCTAssertTrue(script.contains("if tty of terminalTab is targetTTY"))
+        XCTAssertFalse(script.contains("close front window"))
+    }
+
+    func testCodexHookReviewScriptHasValidZshSyntax() throws {
+        let script = CodexHookReviewScript.render(
+            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
+            hooksURL: URL(fileURLWithPath: "/Users/example/.codex/hooks.json")
+        )
+        let scriptURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gensee-codex-review-\(UUID().uuidString).command")
+        defer { try? FileManager.default.removeItem(at: scriptURL) }
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-n", scriptURL.path]
+        try process.run()
+        process.waitUntilExit()
+
+        XCTAssertEqual(process.terminationStatus, 0)
+    }
 }

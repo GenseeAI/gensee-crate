@@ -68,7 +68,9 @@ it changes only Gensee-owned hook entries.
 
 After setup, follow the provider-specific restart or reload instruction and
 start a new agent turn. Codex additionally requires trust review for
-non-managed hooks: use **Open Codex Hook Review**, enter the copied `/hooks`
+non-managed hooks: use **Open Codex Hook Review**, enter the copied `/hooks`,
+and trust the Gensee commands. The one-time Terminal review closes automatically
+after Codex records approval.
 command in the opened CLI, and trust Gensee. The assistant can use the Codex
 binary bundled with the ChatGPT app, so the user does not need a separately
 installed command on `PATH`. Until the first real event arrives, the harness is

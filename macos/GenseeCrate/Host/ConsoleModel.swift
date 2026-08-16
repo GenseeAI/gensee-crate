@@ -519,21 +519,15 @@ final class ConsoleModel: ObservableObject {
         }
         do {
             let scriptURL = homeURL.appendingPathComponent("bin/review-codex-hooks.command")
-            let quotedCodex = Self.shellSingleQuote(codexURL.path)
-            let script = """
-            #!/bin/zsh
-            clear
-            echo 'Gensee configured Codex hooks.'
-            echo 'When Codex opens, enter /hooks and trust the Gensee hook command.'
-            echo
-            exec \(quotedCodex)
-            """
+            let hooksURL = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".codex/hooks.json")
+            let script = CodexHookReviewScript.render(codexURL: codexURL, hooksURL: hooksURL)
             try script.write(to: scriptURL, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString("/hooks", forType: .string)
             NSWorkspace.shared.open(scriptURL)
-            noticeMessage = "Opened Codex CLI and copied /hooks. Paste it there to review and trust Gensee."
+            noticeMessage = "Opened Codex CLI and copied /hooks. The review window closes automatically after Gensee hooks are trusted."
         } catch {
             errorMessage = "Could not open Codex hook review: \(error.localizedDescription)"
         }
@@ -875,10 +869,6 @@ final class ConsoleModel: ObservableObject {
         } catch {
             return false
         }
-    }
-
-    private static func shellSingleQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     private static func applicationInstalled(names: [String], bundleIdentifiers: [String]) -> Bool {

@@ -12,7 +12,7 @@ enum HarnessActivationGuidance {
         case "codex":
             HarnessActivationInstruction(
                 title: "Review the hook, then start a new task",
-                detail: "Codex requires you to trust non-managed hooks before they run. Open the Codex CLI, enter /hooks, and trust the Gensee command. The ChatGPT app does not expose /hooks, so Gensee can open its bundled Codex CLI for this one-time review.",
+                detail: "Codex requires you to trust non-managed hooks before they run. Open the Codex CLI, enter /hooks, and trust the Gensee commands. The ChatGPT app does not expose /hooks, so Gensee opens its bundled Codex CLI for this one-time review and closes the review window after approval.",
                 actionTitle: "Open Codex Hook Review"
             )
         case "claude-code":
@@ -106,5 +106,103 @@ enum CodexExecutableResolver {
         isRunnable: (URL) -> Bool
     ) -> URL? {
         candidates.first(where: isRunnable)
+    }
+}
+
+enum CodexHookReviewScript {
+    static func render(codexURL: URL, hooksURL: URL) -> String {
+        let quotedCodex = shellSingleQuote(codexURL.path)
+        let quotedHooks = shellSingleQuote(hooksURL.path)
+        return """
+        #!/bin/zsh
+        clear
+        echo 'Gensee configured Codex hooks.'
+        echo 'Open /hooks and trust all Gensee hook commands.'
+        echo 'This review window will close automatically after approval.'
+        echo
+
+        config_path="${CODEX_HOME:-$HOME/.codex}/config.toml"
+        hooks_path=\(quotedHooks)
+        review_tty=$(/usr/bin/tty)
+        approval_marker=$(/usr/bin/mktemp -t gensee-codex-hook-review)
+        /bin/rm -f "$approval_marker"
+        initial_checksum=$(/usr/bin/cksum "$config_path" 2>/dev/null || true)
+
+        close_review_window() {
+          /usr/bin/osascript - "$review_tty" <<'APPLESCRIPT'
+        on run argv
+          set targetTTY to item 1 of argv
+          tell application "Terminal"
+            repeat with terminalWindow in windows
+              repeat with terminalTab in tabs of terminalWindow
+                if tty of terminalTab is targetTTY then
+                  close terminalWindow
+                  return
+                end if
+              end repeat
+            end repeat
+          end tell
+        end run
+        APPLESCRIPT
+        }
+
+        hooks_are_trusted() {
+          local expected trusted
+          expected=$(/usr/bin/grep -c 'gensee hook codex' "$hooks_path" 2>/dev/null || true)
+          [[ "$expected" -gt 0 ]] || return 1
+          trusted=$(/usr/bin/awk -v hook_path="$hooks_path" '
+            /^\\[hooks\\.state\\."/ {
+              in_gensee_section = index($0, hook_path ":") > 0
+              next
+            }
+            in_gensee_section && /^[[:space:]]*trusted_hash[[:space:]]*=/ {
+              count++
+              in_gensee_section = 0
+            }
+            END { print count + 0 }
+          ' "$config_path" 2>/dev/null)
+          [[ "$trusted" -ge "$expected" ]]
+        }
+
+        if [[ "$config_path" -nt "$hooks_path" ]] && hooks_are_trusted; then
+          echo 'Gensee hooks are already approved. Closing this review window…'
+          /bin/sleep 0.4
+          close_review_window
+          exit 0
+        fi
+
+        setopt MONITOR
+        \(quotedCodex) &
+        codex_pid=$!
+        (
+          while /bin/kill -0 "$codex_pid" 2>/dev/null; do
+            current_checksum=$(/usr/bin/cksum "$config_path" 2>/dev/null || true)
+            if [[ "$current_checksum" != "$initial_checksum" ]] && hooks_are_trusted; then
+              : > "$approval_marker"
+              /bin/kill -TERM "$codex_pid" 2>/dev/null || true
+              exit 0
+            fi
+            /bin/sleep 0.25
+          done
+        ) &
+        watcher_pid=$!
+
+        fg %1 >/dev/null 2>&1 || true
+        if [[ -f "$approval_marker" ]]; then
+          wait "$watcher_pid" 2>/dev/null || true
+          /bin/rm -f "$approval_marker"
+          echo
+          echo 'Gensee hooks approved. Closing this review window…'
+          /bin/sleep 0.4
+          close_review_window
+        else
+          /bin/kill -TERM "$watcher_pid" 2>/dev/null || true
+          /bin/rm -f "$approval_marker"
+        fi
+        """
+    }
+
+    private static func shellSingleQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
