@@ -514,7 +514,7 @@ final class ConsoleModel: ObservableObject {
 
     func openCodexHookReview() {
         guard let codexURL = Self.codexExecutableURL() else {
-            errorMessage = "Gensee could not find a Codex CLI. Install the Codex CLI, then run it and enter /hooks to review the Gensee hook."
+            errorMessage = "Gensee could not find a working Codex CLI. Install or update Codex, then run it and enter /hooks to review the Gensee hook."
             return
         }
         do {
@@ -849,23 +849,32 @@ final class ConsoleModel: ObservableObject {
     private static func codexExecutableURL() -> URL? {
         let manager = FileManager.default
         let home = manager.homeDirectoryForCurrentUser
-        var candidates = [
-            URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
-            URL(fileURLWithPath: "/usr/local/bin/codex"),
-            home.appendingPathComponent(".local/bin/codex"),
-            home.appendingPathComponent(".cargo/bin/codex"),
-            URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
-            URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex"),
-            home.appendingPathComponent("Applications/ChatGPT.app/Contents/Resources/codex"),
-            home.appendingPathComponent("Applications/Codex.app/Contents/Resources/codex"),
-        ]
-        if let application = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") {
-            candidates += [
-                application.appendingPathComponent("Contents/Resources/codex"),
-                application.appendingPathComponent("Contents/MacOS/codex"),
-            ]
+        let applicationURLs = ["com.openai.codex"].compactMap {
+            NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
         }
-        return candidates.first { manager.isExecutableFile(atPath: $0.path) }
+        let candidates = CodexExecutableResolver.orderedCandidates(
+            home: home,
+            applicationURLs: applicationURLs
+        )
+        return CodexExecutableResolver.firstRunnable(candidates: candidates) { candidate in
+            manager.isExecutableFile(atPath: candidate.path)
+                && codexExecutableResponds(candidate)
+        }
+    }
+
+    private static func codexExecutableResponds(_ executable: URL) -> Bool {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["--version"]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationReason == .exit && process.terminationStatus == 0
+        } catch {
+            return false
+        }
     }
 
     private static func shellSingleQuote(_ value: String) -> String {

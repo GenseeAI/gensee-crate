@@ -73,3 +73,38 @@ enum HarnessActivationGuidance {
         return Int64((modified ?? now).timeIntervalSince1970 * 1_000)
     }
 }
+
+enum CodexExecutableResolver {
+    static func orderedCandidates(home: URL, applicationURLs: [URL]) -> [URL] {
+        let applicationCandidates = applicationURLs.flatMap { application in
+            [
+                application.appendingPathComponent("Contents/Resources/codex"),
+                application.appendingPathComponent("Contents/MacOS/codex"),
+            ]
+        }
+        let installedApplications = [
+            URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
+            URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex"),
+            home.appendingPathComponent("Applications/ChatGPT.app/Contents/Resources/codex"),
+            home.appendingPathComponent("Applications/Codex.app/Contents/Resources/codex"),
+        ]
+        let commandLineInstalls = [
+            home.appendingPathComponent(".local/bin/codex"),
+            URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
+            URL(fileURLWithPath: "/usr/local/bin/codex"),
+            home.appendingPathComponent(".cargo/bin/codex"),
+        ]
+
+        var seen = Set<String>()
+        return (applicationCandidates + installedApplications + commandLineInstalls).filter { url in
+            seen.insert(url.standardizedFileURL.path).inserted
+        }
+    }
+
+    static func firstRunnable(
+        candidates: [URL],
+        isRunnable: (URL) -> Bool
+    ) -> URL? {
+        candidates.first(where: isRunnable)
+    }
+}
