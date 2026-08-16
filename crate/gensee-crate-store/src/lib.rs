@@ -561,50 +561,65 @@ impl EventStore {
                 }))
             },
         )?;
-        let artifact_rows = query_json_rows(
-            conn,
-            "SELECT facts.kind, facts.uri, facts.current_digest, facts.last_seen_at,
-                facts.last_modified_at, facts.last_modified_source,
-                facts.last_modified_session_id, facts.risk_level,
-                facts.risk_rule_id, facts.is_agent_authored,
-                facts.is_unmatched_modified, facts.is_memory_artifact,
-                facts.is_persistent_target, facts.is_control_plane,
-                COALESCE(json_extract(facts.metadata, '$.source'),
-                         facts.last_modified_source, last_event.source),
-                json_extract(last_event.args, '$.file.mode')
-             FROM artifact_facts AS facts
-             LEFT JOIN system_events AS last_event
-               ON last_event.event_id = facts.last_system_event_id
-             ORDER BY facts.last_seen_at DESC",
-            |row| {
-                Ok(json!({
-                    "kind": row.get::<_, String>(0)?,
-                    "uri": row.get::<_, String>(1)?,
-                    "current_digest": row.get::<_, Option<String>>(2)?,
-                    "last_seen_at": row.get::<_, i64>(3)?,
-                    "last_modified_at": row.get::<_, Option<i64>>(4)?,
-                    "last_modified_source": row.get::<_, Option<String>>(5)?,
-                    "last_modified_session_id": row.get::<_, Option<String>>(6)?,
-                    "risk_level": row.get::<_, Option<String>>(7)?,
-                    "risk_rule_id": row.get::<_, Option<String>>(8)?,
-                    "is_agent_authored": row.get::<_, i64>(9)?,
-                    "is_unmatched_modified": row.get::<_, i64>(10)?,
-                    "is_memory_artifact": row.get::<_, i64>(11)?,
-                    "is_persistent_target": row.get::<_, i64>(12)?,
-                    "is_control_plane": row.get::<_, i64>(13)?,
-                    "_observation_source": row.get::<_, Option<String>>(14)?,
-                    "_observation_mode": row.get::<_, Option<i64>>(15)?,
-                }))
-            },
-        )?;
-        let visible_artifact_count = artifact_rows
-            .iter()
-            .filter(|artifact| dashboard_artifact_is_visible(artifact))
-            .count();
+        let artifact_visibility = dashboard_artifact_visibility_sql(
+            "observation_source",
+            "observation_mode",
+            "observation_path",
+        );
+        let artifact_query = format!(
+            "WITH candidates AS (
+                SELECT facts.kind, facts.uri, facts.current_digest, facts.last_seen_at,
+                    facts.last_modified_at, facts.last_modified_source,
+                    facts.last_modified_session_id, facts.risk_level,
+                    facts.risk_rule_id, facts.is_agent_authored,
+                    facts.is_unmatched_modified, facts.is_memory_artifact,
+                    facts.is_persistent_target, facts.is_control_plane,
+                    COALESCE(json_extract(facts.metadata, '$.source'),
+                             facts.last_modified_source, last_event.source) AS observation_source,
+                    json_extract(last_event.args, '$.file.mode') AS observation_mode,
+                    CASE WHEN facts.uri LIKE 'file://%'
+                         THEN substr(facts.uri, 8)
+                         ELSE facts.uri
+                    END AS observation_path
+                 FROM artifact_facts AS facts
+                 LEFT JOIN system_events AS last_event
+                   ON last_event.event_id = facts.last_system_event_id
+             )
+             SELECT kind, uri, current_digest, last_seen_at,
+                    last_modified_at, last_modified_source,
+                    last_modified_session_id, risk_level, risk_rule_id,
+                    is_agent_authored, is_unmatched_modified, is_memory_artifact,
+                    is_persistent_target, is_control_plane,
+                    observation_source, observation_mode
+             FROM candidates
+             WHERE {artifact_visibility}
+             ORDER BY last_seen_at DESC
+             LIMIT 80"
+        );
+        let artifact_rows = query_json_rows(conn, &artifact_query, |row| {
+            Ok(json!({
+                "kind": row.get::<_, String>(0)?,
+                "uri": row.get::<_, String>(1)?,
+                "current_digest": row.get::<_, Option<String>>(2)?,
+                "last_seen_at": row.get::<_, i64>(3)?,
+                "last_modified_at": row.get::<_, Option<i64>>(4)?,
+                "last_modified_source": row.get::<_, Option<String>>(5)?,
+                "last_modified_session_id": row.get::<_, Option<String>>(6)?,
+                "risk_level": row.get::<_, Option<String>>(7)?,
+                "risk_rule_id": row.get::<_, Option<String>>(8)?,
+                "is_agent_authored": row.get::<_, i64>(9)?,
+                "is_unmatched_modified": row.get::<_, i64>(10)?,
+                "is_memory_artifact": row.get::<_, i64>(11)?,
+                "is_persistent_target": row.get::<_, i64>(12)?,
+                "is_control_plane": row.get::<_, i64>(13)?,
+                "_observation_source": row.get::<_, Option<String>>(14)?,
+                "_observation_mode": row.get::<_, Option<i64>>(15)?,
+            }))
+        })?;
+        debug_assert!(artifact_rows.iter().all(dashboard_artifact_is_visible));
+        let visible_artifact_count = artifact_rows.len();
         let artifacts = artifact_rows
             .into_iter()
-            .filter(dashboard_artifact_is_visible)
-            .take(80)
             .map(|mut artifact| {
                 if let Some(object) = artifact.as_object_mut() {
                     object.remove("_observation_source");
@@ -613,28 +628,33 @@ impl EventStore {
                 artifact
             })
             .collect::<Vec<_>>();
-        let relations = query_json_rows(
-            conn,
-            "SELECT r.relation_type AS type, r.confidence AS confidence,
-                sa.uri AS src_uri, da.uri AS dst_uri
-             FROM relations r
-             JOIN artifacts sa ON r.src_kind = 'artifact' AND r.src_id = sa.artifact_id
-             JOIN artifacts da ON r.dst_kind = 'artifact' AND r.dst_id = da.artifact_id
-             ORDER BY r.relation_id DESC
-             LIMIT 5000",
-            |row| {
-                Ok(json!({
-                    "type": row.get::<_, String>(0)?,
-                    "confidence": row.get::<_, f64>(1)?,
-                    "src_uri": row.get::<_, String>(2)?,
-                    "dst_uri": row.get::<_, String>(3)?,
-                }))
-            },
-        )?
-        .into_iter()
-        .filter(dashboard_relation_is_visible)
-        .take(200)
-        .collect::<Vec<_>>();
+        let source_visibility = dashboard_path_visibility_sql("src_path");
+        let destination_visibility = dashboard_path_visibility_sql("dst_path");
+        let relation_query = format!(
+            "WITH candidates AS (
+                SELECT r.relation_id, r.relation_type AS type, r.confidence AS confidence,
+                    sa.uri AS src_uri, da.uri AS dst_uri,
+                    CASE WHEN sa.uri LIKE 'file://%' THEN substr(sa.uri, 8) ELSE sa.uri END AS src_path,
+                    CASE WHEN da.uri LIKE 'file://%' THEN substr(da.uri, 8) ELSE da.uri END AS dst_path
+                 FROM relations r
+                 JOIN artifacts sa ON r.src_kind = 'artifact' AND r.src_id = sa.artifact_id
+                 JOIN artifacts da ON r.dst_kind = 'artifact' AND r.dst_id = da.artifact_id
+             )
+             SELECT type, confidence, src_uri, dst_uri
+             FROM candidates
+             WHERE {source_visibility} AND {destination_visibility}
+             ORDER BY relation_id DESC
+             LIMIT 200"
+        );
+        let relations = query_json_rows(conn, &relation_query, |row| {
+            Ok(json!({
+                "type": row.get::<_, String>(0)?,
+                "confidence": row.get::<_, f64>(1)?,
+                "src_uri": row.get::<_, String>(2)?,
+                "dst_uri": row.get::<_, String>(3)?,
+            }))
+        })?;
+        debug_assert!(relations.iter().all(dashboard_relation_is_visible));
         let human_feedback = query_json_rows(
             conn,
             "SELECT event_key, tool_use_id, session_id, gensee_action, human_verdict,
@@ -2864,6 +2884,54 @@ fn file_path_from_uri(uri: &str) -> &str {
     uri.strip_prefix("file://").unwrap_or(uri)
 }
 
+fn dashboard_path_visibility_sql(path: &str) -> String {
+    format!(
+        "NOT (
+            {path} GLOB '/dev/*'
+            OR {path} GLOB '/private/tmp/cc-socks/*'
+            OR {path} GLOB '/tmp/cc-socks/*'
+            OR {path} GLOB '/private/tmp/claude-*'
+            OR {path} GLOB '/tmp/claude-*'
+            OR {path} GLOB '/private/var/tmp/sh-thd-*'
+            OR {path} GLOB '*/.claude/sessions/*'
+            OR {path} GLOB '*/.claude/projects/*'
+            OR {path} GLOB '*/.claude/shell-snapshots/*'
+            OR (
+                {path} GLOB '*/.claude/plugins/cache/*'
+                AND ({path} GLOB '*/.in_use' OR {path} GLOB '*/.in_use/*')
+            )
+            OR {path} = '/bin'
+            OR {path} GLOB '/bin/*'
+            OR {path} = '/sbin'
+            OR {path} GLOB '/sbin/*'
+            OR {path} = '/usr/bin'
+            OR {path} GLOB '/usr/bin/*'
+            OR {path} GLOB '/usr/local/bin*'
+            OR {path} GLOB '/usr/lib/*'
+            OR {path} GLOB '/usr/share/*'
+            OR {path} GLOB '/System/*'
+            OR {path} GLOB '/Library/Developer/*'
+            OR {path} GLOB '/Applications/Xcode.app/Contents/Developer/*'
+            OR {path} GLOB '/Library/Preferences/Logging/*'
+            OR {path} GLOB '/Library/Preferences/*'
+            OR {path} GLOB '/private/var/db/*'
+            OR {path} GLOB '/private/var/folders/*'
+            OR {path} GLOB '/opt/homebrew/Cellar/*'
+        )"
+    )
+}
+
+fn dashboard_artifact_visibility_sql(source: &str, mode: &str, path: &str) -> String {
+    let path_visibility = dashboard_path_visibility_sql(path);
+    format!(
+        "COALESCE({source}, '') != 'macos-endpoint-security'
+         OR (
+            ({mode} IS NULL OR ({mode} & 61440) NOT IN (4096, 8192, 16384, 24576, 49152))
+            AND {path_visibility}
+         )"
+    )
+}
+
 fn dashboard_artifact_is_visible(artifact: &Value) -> bool {
     let observed_by_endpoint_security = artifact.get("_observation_source").and_then(Value::as_str)
         == Some("macos-endpoint-security");
@@ -4713,6 +4781,118 @@ mod tests {
         assert!(!dashboard_artifact_is_visible(&legacy_system_read));
         assert!(!dashboard_artifact_is_visible(&real_system_mutation));
         assert!(dashboard_artifact_is_visible(&project_artifact));
+    }
+
+    #[test]
+    fn dashboard_sql_filters_noise_before_applying_lineage_limits() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-dashboard-filter-limits-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let db = store.sqlite_store().unwrap();
+        let conn = db.connection();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        conn.execute(
+            "INSERT INTO artifacts (kind, uri, digest) VALUES ('file', 'file:///repo/source', '')",
+            [],
+        )
+        .unwrap();
+        let clean_source = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO artifacts (kind, uri, digest) VALUES ('file', 'file:///repo/destination', '')",
+            [],
+        )
+        .unwrap();
+        let clean_destination = conn.last_insert_rowid();
+        for index in 0..300 {
+            conn.execute(
+                "INSERT INTO relations (
+                    src_kind, src_id, dst_kind, dst_id, relation_type, confidence, created_at
+                 ) VALUES ('artifact', ?1, 'artifact', ?2, ?3, 1.0, ?4)",
+                rusqlite::params![
+                    clean_source,
+                    clean_destination,
+                    format!("clean-{index}"),
+                    index
+                ],
+            )
+            .unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO artifacts (kind, uri, digest) VALUES ('file', 'file:///usr/lib/noise-a', '')",
+            [],
+        )
+        .unwrap();
+        let noise_source = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO artifacts (kind, uri, digest) VALUES ('file', 'file:///usr/lib/noise-b', '')",
+            [],
+        )
+        .unwrap();
+        let noise_destination = conn.last_insert_rowid();
+        for index in 0..5_199 {
+            conn.execute(
+                "INSERT INTO relations (
+                    src_kind, src_id, dst_kind, dst_id, relation_type, confidence, created_at
+                 ) VALUES ('artifact', ?1, 'artifact', ?2, ?3, 1.0, ?4)",
+                rusqlite::params![
+                    noise_source,
+                    noise_destination,
+                    format!("noise-{index}"),
+                    1_000 + index
+                ],
+            )
+            .unwrap();
+        }
+
+        for index in 0..100 {
+            conn.execute(
+                "INSERT INTO artifact_facts (
+                    kind, uri, last_seen_at, last_modified_source, metadata
+                 ) VALUES ('file', ?1, ?2, 'macos-endpoint-security', ?3)",
+                rusqlite::params![
+                    format!("file:///repo/artifact-{index}"),
+                    index,
+                    r#"{"source":"macos-endpoint-security"}"#
+                ],
+            )
+            .unwrap();
+        }
+        for index in 0..500 {
+            conn.execute(
+                "INSERT INTO artifact_facts (
+                    kind, uri, last_seen_at, last_modified_source, metadata
+                 ) VALUES ('file', ?1, ?2, 'macos-endpoint-security', ?3)",
+                rusqlite::params![
+                    format!("file:///System/Library/noise-{index}"),
+                    1_000 + index,
+                    r#"{"source":"macos-endpoint-security"}"#
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        drop(db);
+
+        let dashboard = store.dashboard_state().unwrap();
+        let artifacts = dashboard["artifacts"].as_array().unwrap();
+        let relations = dashboard["relations"].as_array().unwrap();
+        assert_eq!(artifacts.len(), 80);
+        assert_eq!(dashboard["summary"]["artifacts_count"], 80);
+        assert!(artifacts.iter().all(|artifact| artifact["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("file:///repo/")));
+        assert_eq!(relations.len(), 200);
+        assert!(relations.iter().all(|relation| {
+            relation["src_uri"] == "file:///repo/source"
+                && relation["dst_uri"] == "file:///repo/destination"
+        }));
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

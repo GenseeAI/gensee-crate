@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct EndpointSensorHealth: Equatable {
@@ -44,6 +45,13 @@ final class EndpointSecuritySensor: ObservableObject {
     private var pendingConfigurationData: Data?
     private var configurationNeedsPush = true
     private var ingestErrorBuffer = Data()
+    private var executableDigestCache: [String: ExecutableDigestCacheEntry] = [:]
+
+    private struct ExecutableDigestCacheEntry {
+        let size: UInt64
+        let modificationDate: Date
+        let sha256: String
+    }
 
     init(homeURL: URL, executableURL: URL?) {
         self.homeURL = homeURL
@@ -96,15 +104,18 @@ final class EndpointSecuritySensor: ObservableObject {
         mode: String,
         protectedPaths: [String],
         blockedExecutables: [String],
+        trustedExecutablePaths: [String],
         managedRoots: [[String: Any]],
         failClosedManagedOnly: Bool,
         maxAuthorizationLatencyMS: UInt64
     ) {
+        let trustedExecutableHashes = trustedExecutableSHA256(paths: trustedExecutablePaths)
         let configuration: [String: Any] = [
             "schema_version": 1,
             "mode": mode,
             "protected_paths": protectedPaths,
             "blocked_executables": blockedExecutables,
+            "trusted_executable_sha256": trustedExecutableHashes,
             "managed_roots": managedRoots,
             "fail_closed_managed_only": failClosedManagedOnly,
             "max_auth_latency_ms": maxAuthorizationLatencyMS,
@@ -114,6 +125,37 @@ final class EndpointSecuritySensor: ObservableObject {
         pendingConfiguration = configuration
         pendingConfigurationData = encoded
         configurationNeedsPush = true
+    }
+
+    private func trustedExecutableSHA256(paths: [String]) -> [String] {
+        let manager = FileManager.default
+        let normalizedPaths = Set(paths.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
+        })
+        executableDigestCache = executableDigestCache.filter { normalizedPaths.contains($0.key) }
+
+        return normalizedPaths.compactMap { path in
+            guard manager.isExecutableFile(atPath: path),
+                  let attributes = try? manager.attributesOfItem(atPath: path),
+                  let size = (attributes[.size] as? NSNumber)?.uint64Value,
+                  let modificationDate = attributes[.modificationDate] as? Date
+            else { return nil }
+            if let cached = executableDigestCache[path],
+               cached.size == size,
+               cached.modificationDate == modificationDate
+            {
+                return cached.sha256
+            }
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe)
+            else { return nil }
+            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            executableDigestCache[path] = ExecutableDigestCacheEntry(
+                size: size,
+                modificationDate: modificationDate,
+                sha256: digest
+            )
+            return digest
+        }.sorted()
     }
 
     private func machServiceName() throws -> String {
