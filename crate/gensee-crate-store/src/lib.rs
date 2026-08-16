@@ -677,36 +677,6 @@ impl EventStore {
                 }))
             },
         )?;
-        let transaction_events = query_json_rows(
-            conn,
-            "SELECT transaction_event_id, operation_id, environment_kind, operation,
-                phase, source_run_id, target_run_id, parent_run_id, workspace,
-                summary, error_kind, error_message, metadata, occurred_at
-             FROM transaction_events
-             ORDER BY occurred_at DESC, transaction_event_id DESC
-             LIMIT 1000",
-            |row| {
-                let metadata = row
-                    .get::<_, Option<String>>(12)?
-                    .and_then(|value| serde_json::from_str::<Value>(&value).ok());
-                Ok(json!({
-                    "transaction_event_id": row.get::<_, i64>(0)?,
-                    "operation_id": row.get::<_, String>(1)?,
-                    "environment_kind": row.get::<_, String>(2)?,
-                    "operation": row.get::<_, String>(3)?,
-                    "phase": row.get::<_, String>(4)?,
-                    "source_run_id": row.get::<_, Option<String>>(5)?,
-                    "target_run_id": row.get::<_, Option<String>>(6)?,
-                    "parent_run_id": row.get::<_, Option<String>>(7)?,
-                    "workspace": row.get::<_, Option<String>>(8)?,
-                    "summary": row.get::<_, String>(9)?,
-                    "error_kind": row.get::<_, Option<String>>(10)?,
-                    "error_message": row.get::<_, Option<String>>(11)?,
-                    "metadata": metadata,
-                    "occurred_at": row.get::<_, i64>(13)?,
-                }))
-            },
-        )?;
         let mut dashboard_summary = query_json_rows(
             conn,
             "SELECT
@@ -819,7 +789,6 @@ impl EventStore {
             "artifacts": artifacts,
             "relations": relations,
             "humanFeedback": human_feedback,
-            "transactionEvents": transaction_events,
             "dailyActivity": daily_activity,
             "jsonSessions": self.list_sessions()?,
         }))
@@ -2861,6 +2830,7 @@ fn lineage_path_is_system_dependency(path: &str) -> bool {
         || path == "/usr/bin"
         || path.starts_with("/usr/bin/")
         || path == "/usr/local/bin"
+        || path.starts_with("/usr/local/bin/")
         || path.starts_with("/usr/lib/")
         || path.starts_with("/usr/share/")
         || path.starts_with("/System/")
@@ -2906,7 +2876,8 @@ fn dashboard_path_visibility_sql(path: &str) -> String {
             OR {path} GLOB '/sbin/*'
             OR {path} = '/usr/bin'
             OR {path} GLOB '/usr/bin/*'
-            OR {path} GLOB '/usr/local/bin*'
+            OR {path} = '/usr/local/bin'
+            OR {path} GLOB '/usr/local/bin/*'
             OR {path} GLOB '/usr/lib/*'
             OR {path} GLOB '/usr/share/*'
             OR {path} GLOB '/System/*'
@@ -4401,6 +4372,37 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_snapshot_omits_transaction_events() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-dashboard-transaction-projection-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_transaction_event(&TransactionEventInput {
+                operation_id: "op-1".to_string(),
+                environment_kind: "container".to_string(),
+                operation: "create".to_string(),
+                phase: "succeeded".to_string(),
+                source_run_id: None,
+                target_run_id: Some("run-1".to_string()),
+                parent_run_id: None,
+                workspace: Some("/repo".to_string()),
+                summary: "transaction payload must stay off the dashboard refresh path".to_string(),
+                error_kind: None,
+                error_message: None,
+                metadata: Some(json!({"large": "metadata"})),
+                occurred_at_ms: 100,
+            })
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert!(dashboard.get("transactionEvents").is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn failed_database_append_rolls_back_partial_graph_rows() {
         let dir =
             std::env::temp_dir().join(format!("gensee-store-test-rollback-{}", std::process::id()));
@@ -4781,6 +4783,25 @@ mod tests {
         assert!(!dashboard_artifact_is_visible(&legacy_system_read));
         assert!(!dashboard_artifact_is_visible(&real_system_mutation));
         assert!(dashboard_artifact_is_visible(&project_artifact));
+    }
+
+    #[test]
+    fn dashboard_usr_local_bin_filter_matches_rust_predicate() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        for (path, expected_visible) in [
+            ("/usr/local/bin", false),
+            ("/usr/local/bin/gensee", false),
+            ("/usr/local/binaries/tool", true),
+            ("/usr/local/bin-old/x", true),
+        ] {
+            let rust_visible = !lineage_path_is_system_dependency(path);
+            let sql = format!("SELECT {}", dashboard_path_visibility_sql("?1"));
+            let sql_visible: bool = connection
+                .query_row(&sql, [path], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rust_visible, expected_visible, "Rust visibility for {path}");
+            assert_eq!(sql_visible, expected_visible, "SQL visibility for {path}");
+        }
     }
 
     #[test]

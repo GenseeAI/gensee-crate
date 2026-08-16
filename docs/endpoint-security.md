@@ -58,6 +58,11 @@ gensee policy set endpoint_security.protected_paths /absolute/path,/another/path
 gensee policy set endpoint_security.blocked_executables /usr/bin/osascript
 ```
 
+`GENSEE_HOME` is not protected implicitly because hook binaries must update the
+encrypted store. The extension recognizes its own processes only by the Gensee
+Team ID and signing identifiers; executable paths and file-content hashes do
+not grant an authorization bypass.
+
 Authorization decisions are deterministic and local to the extension. The ES
 callback never waits for the UI, XPC, SQLite, or human approval. Session-dependent
 decisions use no authorization cache. The dashboard reports decisions, denials,

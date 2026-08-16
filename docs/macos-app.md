@@ -108,6 +108,13 @@ gensee policy set endpoint_security.mode observe
 - `strict` — use the managed-tree fail-closed posture while leaving unrelated
   host processes outside the deny scope.
 
+The app does not implicitly add `GENSEE_HOME` to the Endpoint Security protected
+path list. Hook binaries—including unsigned development and package-manager
+builds—must be able to read and update their own encrypted event store. The
+extension grants process-level bypass only to Gensee binaries carrying the
+approved Gensee Team ID and signing identifiers; it does not trust executable
+paths or file-content hashes.
+
 See the [Endpoint Security sensor](endpoint-security.md) guide for captured
 events, policy keys, safety boundaries, and rollback.
 

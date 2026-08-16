@@ -1,4 +1,3 @@
-#import <CommonCrypto/CommonDigest.h>
 #import <EndpointSecurity/EndpointSecurity.h>
 #import <Foundation/Foundation.h>
 #import <bsm/libbsm.h>
@@ -209,39 +208,6 @@ static BOOL GenseeIsAbsoluteStringArray(id value)
     return YES;
 }
 
-static BOOL GenseeIsSHA256Array(id value)
-{
-    if (value == nil) return YES;
-    if (![value isKindOfClass:NSArray.class]) return NO;
-    NSCharacterSet *nonHex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"] invertedSet];
-    for (id item in (NSArray *)value) {
-        if (![item isKindOfClass:NSString.class] ||
-            [(NSString *)item length] != CC_SHA256_DIGEST_LENGTH * 2 ||
-            [(NSString *)item rangeOfCharacterFromSet:nonHex].location != NSNotFound) {
-            return NO;
-        }
-    }
-    return YES;
-}
-
-static NSString *_Nullable GenseeExecutableSHA256(const es_process_t *process)
-{
-    if (process == NULL || process->executable == NULL) return nil;
-    NSString *path = GenseeStringFromToken(process->executable->path);
-    // Only a configured Gensee CLI can qualify for content-based trust. This
-    // name check is a hashing optimization, not a trust decision.
-    if (![[path lastPathComponent] isEqualToString:@"gensee"]) return nil;
-    NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
-    if (data == nil || data.length > UINT32_MAX) return nil;
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH] = {0};
-    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
-    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
-    for (NSUInteger index = 0; index < CC_SHA256_DIGEST_LENGTH; index++) {
-        [hex appendFormat:@"%02x", digest[index]];
-    }
-    return hex;
-}
-
 static uint64_t GenseeElapsedMicroseconds(uint64_t start)
 {
     static mach_timebase_info_data_t timebase;
@@ -386,9 +352,6 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 @property(nonatomic) NSString *mode;
 @property(nonatomic) NSArray<NSString *> *protectedPaths;
 @property(nonatomic) NSSet<NSString *> *blockedExecutables;
-@property(nonatomic) NSSet<NSString *> *trustedExecutableSHA256;
-@property(nonatomic) NSMutableSet<NSString *> *contentTrustedProcesses;
-@property(nonatomic) NSMutableDictionary<NSString *, NSNumber *> *contentTrustByExecutable;
 @property(nonatomic) NSDictionary<NSNumber *, NSString *> *managedRoots;
 @property(nonatomic) NSMutableDictionary<NSString *, NSString *> *managedProcesses;
 @property(nonatomic) uint64_t maxAuthorizationLatencyUS;
@@ -411,9 +374,6 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         _mode = @"observe";
         _protectedPaths = @[];
         _blockedExecutables = [NSSet set];
-        _trustedExecutableSHA256 = [NSSet set];
-        _contentTrustedProcesses = [NSMutableSet set];
-        _contentTrustByExecutable = [NSMutableDictionary dictionary];
         _managedRoots = @{};
         _managedProcesses = [NSMutableDictionary dictionary];
         _maxAuthorizationLatencyUS = 10000;
@@ -492,28 +452,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 
 - (BOOL)isOwnProcessLocked:(const es_process_t *)process
 {
-    if (GenseeIsOwnProcess(process)) return YES;
-    if (process == NULL || process->executable == NULL) return NO;
-    NSString *key = [self keyForProcess:process];
-    if ([self.contentTrustedProcesses containsObject:key]) return YES;
-    if (self.trustedExecutableSHA256.count == 0) return NO;
-    const struct stat executableStat = process->executable->stat;
-    NSString *executableKey = [NSString stringWithFormat:@"%llu:%llu:%lld:%lld:%lld",
-                               (uint64_t)executableStat.st_dev,
-                               (uint64_t)executableStat.st_ino,
-                               (int64_t)executableStat.st_size,
-                               (int64_t)executableStat.st_mtimespec.tv_sec,
-                               (int64_t)executableStat.st_mtimespec.tv_nsec];
-    NSNumber *cachedTrust = self.contentTrustByExecutable[executableKey];
-    BOOL trusted = cachedTrust != nil ? cachedTrust.boolValue : NO;
-    if (cachedTrust == nil) {
-        NSString *digest = GenseeExecutableSHA256(process);
-        trusted = digest != nil && [self.trustedExecutableSHA256 containsObject:digest];
-        self.contentTrustByExecutable[executableKey] = @(trusted);
-    }
-    if (!trusted) return NO;
-    [self.contentTrustedProcesses addObject:key];
-    return YES;
+    return GenseeIsOwnProcess(process);
 }
 
 - (void)authorizeMessage:(const es_message_t *)message
@@ -609,16 +548,13 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
                 NSString *actorKey = [self keyForProcess:message->process];
                 NSString *targetKey = [self keyForProcess:message->event.exec.target];
                 self.managedProcesses[targetKey] = actorSession;
-                [self isOwnProcessLocked:message->event.exec.target];
                 if (![actorKey isEqualToString:targetKey]) {
                     [self.managedProcesses removeObjectForKey:actorKey];
-                    [self.contentTrustedProcesses removeObject:actorKey];
                 }
             }
         } else if (message->event_type == ES_EVENT_TYPE_NOTIFY_EXIT) {
             NSString *processKey = [self keyForProcess:message->process];
             [self.managedProcesses removeObjectForKey:processKey];
-            [self.contentTrustedProcesses removeObject:processKey];
             NSNumber *pid = @(audit_token_to_pid(message->process->audit_token));
             if (self.managedRoots[pid] != nil) {
                 NSMutableDictionary<NSNumber *, NSString *> *remainingRoots = [self.managedRoots mutableCopy];
@@ -731,15 +667,13 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     }
     NSArray *protectedPaths = configuration[@"protected_paths"];
     NSArray *blockedExecutables = configuration[@"blocked_executables"];
-    NSArray *trustedExecutableSHA256 = configuration[@"trusted_executable_sha256"];
     NSArray *managedRoots = configuration[@"managed_roots"];
     NSNumber *failClosedManagedOnly = configuration[@"fail_closed_managed_only"];
     NSNumber *maxAuthorizationLatencyMS = configuration[@"max_auth_latency_ms"];
     if (!GenseeIsAbsoluteStringArray(protectedPaths) ||
         !GenseeIsAbsoluteStringArray(blockedExecutables) ||
-        !GenseeIsSHA256Array(trustedExecutableSHA256) ||
         (managedRoots != nil && ![managedRoots isKindOfClass:NSArray.class])) {
-        reply(NO, @"Protected paths and blocked executables must be arrays of absolute paths; trusted executable hashes must be SHA-256 strings; managed roots must be an array.");
+        reply(NO, @"Protected paths and blocked executables must be arrays of absolute paths; managed roots must be an array.");
         return;
     }
     if (failClosedManagedOnly != nil &&
@@ -772,9 +706,6 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         self.mode = requestedMode;
         self.protectedPaths = [(protectedPaths ?: @[]) valueForKey:@"stringByStandardizingPath"];
         self.blockedExecutables = [NSSet setWithArray:[(blockedExecutables ?: @[]) valueForKey:@"stringByStandardizingPath"]];
-        self.trustedExecutableSHA256 = [NSSet setWithArray:[(trustedExecutableSHA256 ?: @[]) valueForKey:@"lowercaseString"]];
-        [self.contentTrustedProcesses removeAllObjects];
-        [self.contentTrustByExecutable removeAllObjects];
         self.managedRoots = roots;
         self.managedProcesses = activeProcesses;
         self.maxAuthorizationLatencyUS = (maxAuthorizationLatencyMS ?: @10).unsignedLongLongValue * 1000ULL;

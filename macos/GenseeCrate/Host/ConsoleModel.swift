@@ -716,8 +716,7 @@ final class ConsoleModel: ObservableObject {
 
     private func configureEndpointSensor() {
         let userHome = FileManager.default.homeDirectoryForCurrentUser
-        var protectedPaths = [homeURL.path]
-        protectedPaths += [".ssh", ".aws", ".kube", ".config/gcloud"]
+        var protectedPaths = [".ssh", ".aws", ".kube", ".config/gcloud"]
             .map { userHome.appendingPathComponent($0).path }
         var blockedExecutables: [String] = []
         var maxAuthorizationLatencyMS: UInt64 = 10
@@ -732,15 +731,10 @@ final class ConsoleModel: ObservableObject {
         let roots = snapshot.jsonSessions
             .filter { $0.isActive && $0.rootPID != 0 }
             .map { ["pid": $0.rootPID, "session_id": $0.sessionID] as [String: Any] }
-        let trustedExecutablePaths = Set(
-            [cli.executableURL?.path, cli.preferredHookExecutableURL()?.path]
-                .compactMap { $0 }
-        )
         endpointSensor.updateConfiguration(
             mode: policy.endpointSecurityMode,
             protectedPaths: Array(Set(protectedPaths)).sorted(),
             blockedExecutables: blockedExecutables,
-            trustedExecutablePaths: Array(trustedExecutablePaths).sorted(),
             managedRoots: roots,
             failClosedManagedOnly: true,
             maxAuthorizationLatencyMS: min(100, max(1, maxAuthorizationLatencyMS))
