@@ -263,31 +263,42 @@ private struct TimelineToolCallGraph: View {
     }
 
     var body: some View {
-        ScrollView(.horizontal) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 6) {
-                    Label("Branch lines show call order", systemImage: "arrow.triangle.branch")
-                    Text("·")
-                    Text("Overlapping calls are grouped as parallel")
-                }
-                .font(.system(size: 9))
-                .foregroundStyle(.tertiary)
-                .padding(.bottom, 6)
-
-                TimelineAxis(minimumTimestamp: minimumTimestamp, span: span)
-                ForEach(groups) { group in
-                    TimelineToolGroupView(
-                        group: group,
-                        groupCount: groups.count,
-                        minimumTimestamp: minimumTimestamp,
-                        span: span,
-                        outcomes: outcomes
-                    )
-                }
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Label("Branch lines show call order", systemImage: "arrow.triangle.branch")
+                Text("·")
+                Text("Overlapping calls are grouped as parallel")
             }
-            .frame(minWidth: 930, alignment: .leading)
+            .font(.system(size: 9))
+            .foregroundStyle(.tertiary)
+            .padding(.bottom, 6)
+
+            TimelineAxis(minimumTimestamp: minimumTimestamp, span: span)
+            ForEach(groups) { group in
+                TimelineToolGroupView(
+                    group: group,
+                    groupCount: groups.count,
+                    minimumTimestamp: minimumTimestamp,
+                    span: span,
+                    outcomes: outcomes
+                )
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
+}
+
+private enum TimelineColumns {
+    static let branch: CGFloat = 28
+    static let marker: CGFloat = 14
+    static let time: CGFloat = 76
+    static let tool: CGFloat = 88
+    static let severity: CGFloat = 62
+    static let action: CGFloat = 62
+    static let command: CGFloat = 220
+    static let durationLabel: CGFloat = 64
+    static let minimumDurationTrack: CGFloat = 140
+    static let spacing: CGFloat = 6
 }
 
 private struct TimelineAxis: View {
@@ -295,24 +306,35 @@ private struct TimelineAxis: View {
     let span: Int64
 
     var body: some View {
-        HStack(spacing: 6) {
-            Color.clear.frame(width: 28)
-            Color.clear.frame(width: 76)
-            Color.clear.frame(width: 88)
-            Color.clear.frame(width: 62)
-            Color.clear.frame(width: 62)
-            Color.clear.frame(minWidth: 150, maxWidth: .infinity)
-            Color.clear.frame(width: 72)
-            GeometryReader { geometry in
-                ZStack(alignment: .leading) {
-                    Rectangle().fill(Color.dashboardLine).frame(height: 1).offset(y: 13)
-                    timelineTick(dashboardTime(minimumTimestamp), x: 0, textOffset: 0, alignment: .leading)
-                    timelineTick(dashboardTime(minimumTimestamp + span / 2), x: geometry.size.width / 2, textOffset: 38, alignment: .center)
-                    timelineTick(dashboardTime(minimumTimestamp + span), x: geometry.size.width, textOffset: 76, alignment: .trailing)
+        HStack(spacing: 0) {
+            Color.clear.frame(width: TimelineColumns.branch)
+            HStack(spacing: TimelineColumns.spacing) {
+                Color.clear.frame(width: TimelineColumns.marker)
+                Color.clear.frame(width: TimelineColumns.time)
+                Color.clear.frame(width: TimelineColumns.tool)
+                Color.clear.frame(width: TimelineColumns.severity)
+                Color.clear.frame(width: TimelineColumns.action)
+                Text("COMMAND")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: TimelineColumns.command, alignment: .leading)
+                Text("DURATION")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: TimelineColumns.durationLabel, alignment: .trailing)
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Rectangle().fill(Color.dashboardLine).frame(height: 1).offset(y: 13)
+                        timelineTick(dashboardTime(minimumTimestamp), x: 0, textOffset: 0, alignment: .leading)
+                        timelineTick(dashboardTime(minimumTimestamp + span / 2), x: geometry.size.width / 2, textOffset: 38, alignment: .center)
+                        timelineTick(dashboardTime(minimumTimestamp + span), x: geometry.size.width, textOffset: 76, alignment: .trailing)
+                    }
                 }
+                .frame(minWidth: TimelineColumns.minimumDurationTrack, maxWidth: .infinity, minHeight: 18, maxHeight: 18)
+                .layoutPriority(1)
             }
-            .frame(width: 190, height: 18)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, 2)
     }
 
@@ -351,7 +373,7 @@ private struct TimelineToolGroupView: View {
                     connectsFromPrevious: group.index > 0,
                     connectsToNext: group.index < groupCount - 1
                 )
-                .frame(width: 28, height: CGFloat(group.calls.count) * 34)
+                .frame(width: TimelineColumns.branch, height: CGFloat(group.calls.count) * 34)
 
                 VStack(spacing: 0) {
                     ForEach(group.calls) { call in
@@ -364,8 +386,11 @@ private struct TimelineToolGroupView: View {
                         )
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -407,31 +432,38 @@ private struct TimelineToolCallRow: View {
     var body: some View {
         VStack(spacing: 0) {
             Button { expanded.toggle() } label: {
-                HStack(spacing: 6) {
+                HStack(spacing: TimelineColumns.spacing) {
                     Circle()
                         .fill(toolColor(call.toolName))
                         .frame(width: 7, height: 7)
                         .padding(.leading, parallel ? 6 : 0)
-                        .frame(width: 14)
+                        .frame(width: TimelineColumns.marker)
                     Text(dashboardTime(call.startTimestamp))
                         .foregroundStyle(.secondary)
-                        .frame(width: 76, alignment: .leading)
+                        .frame(width: TimelineColumns.time, alignment: .leading)
                     DashboardTag(text: call.toolName, color: toolColor(call.toolName))
-                        .frame(width: 88, alignment: .leading)
+                        .frame(width: TimelineColumns.tool, alignment: .leading)
                     DashboardTag(text: outcome.severity, color: severityColor(outcome.severity))
-                        .frame(width: 62, alignment: .leading)
+                        .frame(width: TimelineColumns.severity, alignment: .leading)
                     DashboardTag(text: outcome.action, color: actionColor(outcome.action))
-                        .frame(width: 62, alignment: .leading)
-                    Text(call.detail ?? "—")
-                        .font(.system(size: 10, design: call.detail == nil ? .default : .monospaced))
-                        .foregroundStyle(call.detail == nil ? Color.secondary.opacity(0.6) : Color.primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(call.detailFull ?? call.detail ?? "No tool detail captured")
-                        .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
+                        .frame(width: TimelineColumns.action, alignment: .leading)
+                    HStack(spacing: 4) {
+                        Text(call.detail ?? "—")
+                            .font(.system(size: 10, design: call.detail == nil ? .default : .monospaced))
+                            .foregroundStyle(call.detail == nil ? Color.secondary.opacity(0.6) : Color.primary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 10)
+                    }
+                    .help(expanded ? "Collapse full tool details" : "Expand full command and tool details")
+                    .frame(width: TimelineColumns.command, alignment: .leading)
+                    .clipped()
                     Text(durationLabel(call))
                         .foregroundStyle(.secondary)
-                        .frame(width: 72, alignment: .trailing)
+                        .frame(width: TimelineColumns.durationLabel, alignment: .trailing)
                         .help(call.durationSource == .elapsed ? "Approximate elapsed time from PreToolUse to PostToolUse; may include approval wait." : "Provider-reported execution duration.")
                     TimelineDurationBar(
                         startOffset: call.startTimestamp - minimumTimestamp,
@@ -439,11 +471,13 @@ private struct TimelineToolCallRow: View {
                         span: span,
                         color: toolColor(call.toolName)
                     )
-                    .frame(width: 190, height: 22)
+                    .frame(minWidth: TimelineColumns.minimumDurationTrack, maxWidth: .infinity, minHeight: 22, maxHeight: 22)
+                    .layoutPriority(1)
                 }
                 .font(.system(size: 10))
                 .padding(.vertical, 5)
                 .contentShape(Rectangle())
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.plain)
 
@@ -495,6 +529,9 @@ private struct TimelineToolCallDetails: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
+            if let detail = call.detailFull ?? call.detail, !detail.isEmpty {
+                detailRow(commandDetailLabel, detail)
+            }
             if !call.affectedFiles.isEmpty {
                 detailRow("AFFECTED FILES", call.affectedFiles.joined(separator: "\n"))
             }
@@ -509,6 +546,13 @@ private struct TimelineToolCallDetails: View {
         .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.dashboardMutedFill.opacity(0.55))
+    }
+
+    private var commandDetailLabel: String {
+        switch call.toolName.lowercased() {
+        case "bash", "shell", "runterminalcommand", "runinterminal": "FULL COMMAND"
+        default: "FULL DETAIL"
+        }
     }
 
     private func detailRow(_ label: String, _ value: String) -> some View {

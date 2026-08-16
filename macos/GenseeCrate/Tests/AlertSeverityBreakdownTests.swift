@@ -26,4 +26,19 @@ final class AlertSeverityBreakdownTests: XCTestCase {
         XCTAssertEqual(counts["info"], 1)
         XCTAssertEqual(counts.values.reduce(0, +), 2)
     }
+
+    func testAlertReadStateResetsWhenStoreCountRollsBack() {
+        XCTAssertTrue(AlertReadState.storeWasReset(
+            alertCount: 20,
+            readAlertBaselineCount: 5_000
+        ))
+        XCTAssertFalse(AlertReadState.storeWasReset(
+            alertCount: 5_000,
+            readAlertBaselineCount: 5_000
+        ))
+        XCTAssertFalse(AlertReadState.storeWasReset(
+            alertCount: 5_001,
+            readAlertBaselineCount: 5_000
+        ))
+    }
 }

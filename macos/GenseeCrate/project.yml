@@ -139,6 +139,7 @@ targets:
       - Tests/AlertSeverityBreakdownTests.swift
       - Tests/TimelineModelsTests.swift
       - Tests/ConfigAuditModelsTests.swift
+      - Tests/ArtifactFactTests.swift
     settings:
       base:
         CODE_SIGNING_ALLOWED: NO

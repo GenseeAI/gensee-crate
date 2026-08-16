@@ -42,6 +42,7 @@ const ARTIFACT_FACT_RECENT_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 // Tool inputs are operator-visible telemetry. Bound their at-rest size so a
 // single tool invocation cannot bloat the local store with arbitrary payloads.
 const MAX_STORED_TOOL_INPUT_BYTES: usize = 16 * 1024;
+const MAX_STORED_TOOL_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_TRANSACTION_TEXT_CHARS: usize = 2 * 1024;
 const MAX_TRANSACTION_METADATA_BYTES: usize = 16 * 1024;
 const MAX_TOKEN_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
@@ -390,7 +391,8 @@ impl EventStore {
             "SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
                 alerts.severity, alerts.action, alerts.rule_id, alerts.message,
                 alerts.path, alerts.evidence, alerts.created_at,
-                requests.session_id, requests.original_user_prompt,
+                requests.session_id,
+                substr(requests.original_user_prompt, 1, 1024),
                 trigger_event.source, trigger_event.type, trigger_event.tool_name,
                 trigger_event.tool_input, trigger_event.tool_use_id,
                 feedback.human_verdict, feedback.label, feedback.created_at
@@ -474,7 +476,7 @@ impl EventStore {
             conn,
             "SELECT event_id, pid, agent_events.request_id, requests.session_id, ts,
                 source, type, cwd, permission_mode, tool_name, tool_input,
-                tool_response, tool_use_id
+                json_extract(tool_response, '$.duration_ms'), tool_use_id
              FROM agent_events
              LEFT JOIN requests ON requests.request_id = agent_events.request_id
              ORDER BY ts DESC, event_id DESC
@@ -492,7 +494,7 @@ impl EventStore {
                     "permission_mode": row.get::<_, Option<String>>(8)?,
                     "tool_name": row.get::<_, Option<String>>(9)?,
                     "tool_input": row.get::<_, Option<String>>(10)?,
-                    "tool_response": row.get::<_, Option<String>>(11)?,
+                    "duration_ms": row.get::<_, Option<i64>>(11)?,
                     "tool_use_id": row.get::<_, Option<String>>(12)?,
                 }))
             },
@@ -544,8 +546,8 @@ impl EventStore {
         )?;
         let requests = query_json_rows(
             conn,
-            "SELECT request_id, session_id, original_user_prompt, final_response,
-                created_at, completed_at
+            "SELECT request_id, session_id,
+                substr(original_user_prompt, 1, 1024), created_at, completed_at
              FROM requests
              ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
              LIMIT 500",
@@ -554,21 +556,26 @@ impl EventStore {
                     "request_id": row.get::<_, i64>(0)?,
                     "session_id": row.get::<_, String>(1)?,
                     "original_user_prompt": row.get::<_, Option<String>>(2)?,
-                    "final_response": row.get::<_, Option<String>>(3)?,
-                    "created_at": row.get::<_, Option<i64>>(4)?,
-                    "completed_at": row.get::<_, Option<i64>>(5)?,
+                    "created_at": row.get::<_, Option<i64>>(3)?,
+                    "completed_at": row.get::<_, Option<i64>>(4)?,
                 }))
             },
         )?;
-        let artifacts = query_json_rows(
+        let artifact_rows = query_json_rows(
             conn,
-            "SELECT kind, uri, current_digest, last_seen_at, last_modified_at,
-                last_modified_source, last_modified_session_id, risk_level,
-                risk_rule_id, is_agent_authored, is_unmatched_modified,
-                is_memory_artifact, is_persistent_target, is_control_plane
-             FROM artifact_facts
-             ORDER BY last_seen_at DESC
-             LIMIT 80",
+            "SELECT facts.kind, facts.uri, facts.current_digest, facts.last_seen_at,
+                facts.last_modified_at, facts.last_modified_source,
+                facts.last_modified_session_id, facts.risk_level,
+                facts.risk_rule_id, facts.is_agent_authored,
+                facts.is_unmatched_modified, facts.is_memory_artifact,
+                facts.is_persistent_target, facts.is_control_plane,
+                COALESCE(json_extract(facts.metadata, '$.source'),
+                         facts.last_modified_source, last_event.source),
+                json_extract(last_event.args, '$.file.mode')
+             FROM artifact_facts AS facts
+             LEFT JOIN system_events AS last_event
+               ON last_event.event_id = facts.last_system_event_id
+             ORDER BY facts.last_seen_at DESC",
             |row| {
                 Ok(json!({
                     "kind": row.get::<_, String>(0)?,
@@ -585,9 +592,27 @@ impl EventStore {
                     "is_memory_artifact": row.get::<_, i64>(11)?,
                     "is_persistent_target": row.get::<_, i64>(12)?,
                     "is_control_plane": row.get::<_, i64>(13)?,
+                    "_observation_source": row.get::<_, Option<String>>(14)?,
+                    "_observation_mode": row.get::<_, Option<i64>>(15)?,
                 }))
             },
         )?;
+        let visible_artifact_count = artifact_rows
+            .iter()
+            .filter(|artifact| dashboard_artifact_is_visible(artifact))
+            .count();
+        let artifacts = artifact_rows
+            .into_iter()
+            .filter(dashboard_artifact_is_visible)
+            .take(80)
+            .map(|mut artifact| {
+                if let Some(object) = artifact.as_object_mut() {
+                    object.remove("_observation_source");
+                    object.remove("_observation_mode");
+                }
+                artifact
+            })
+            .collect::<Vec<_>>();
         let relations = query_json_rows(
             conn,
             "SELECT r.relation_type AS type, r.confidence AS confidence,
@@ -596,7 +621,7 @@ impl EventStore {
              JOIN artifacts sa ON r.src_kind = 'artifact' AND r.src_id = sa.artifact_id
              JOIN artifacts da ON r.dst_kind = 'artifact' AND r.dst_id = da.artifact_id
              ORDER BY r.relation_id DESC
-             LIMIT 200",
+             LIMIT 5000",
             |row| {
                 Ok(json!({
                     "type": row.get::<_, String>(0)?,
@@ -605,7 +630,11 @@ impl EventStore {
                     "dst_uri": row.get::<_, String>(3)?,
                 }))
             },
-        )?;
+        )?
+        .into_iter()
+        .filter(dashboard_relation_is_visible)
+        .take(200)
+        .collect::<Vec<_>>();
         let human_feedback = query_json_rows(
             conn,
             "SELECT event_key, tool_use_id, session_id, gensee_action, human_verdict,
@@ -658,7 +687,7 @@ impl EventStore {
                 }))
             },
         )?;
-        let dashboard_summary = query_json_rows(
+        let mut dashboard_summary = query_json_rows(
             conn,
             "SELECT
                 (SELECT COUNT(*) FROM sessions),
@@ -693,6 +722,7 @@ impl EventStore {
         .into_iter()
         .next()
         .unwrap_or_else(|| json!({}));
+        dashboard_summary["artifacts_count"] = json!(visible_artifact_count);
         let daily_activity = query_json_rows(
             conn,
             "WITH
@@ -771,8 +801,6 @@ impl EventStore {
             "humanFeedback": human_feedback,
             "transactionEvents": transaction_events,
             "dailyActivity": daily_activity,
-            "hookEvents": self.list_hook_events()?,
-            "workspaceEffects": self.list_workspace_effects()?,
             "jsonSessions": self.list_sessions()?,
         }))
     }
@@ -2478,9 +2506,17 @@ fn record_system_event_artifacts(
     ts: i64,
     matched_agent_intent: bool,
 ) -> io::Result<()> {
-    let relation_type = system_artifact_relation_type(&event.event_type);
-    let request_relation_type = request_artifact_relation_type(&event.event_type);
+    let raw_event = serde_json::from_str::<Value>(&event.raw_json).ok();
+    let modified = raw_event
+        .as_ref()
+        .and_then(|value| value.get("modified"))
+        .and_then(Value::as_bool);
+    let relation_type = system_artifact_relation_type_for_event(event);
+    let request_relation_type = request_artifact_relation_type_for_event(event);
     for path in system_event_paths(event) {
+        if !should_materialize_system_artifact(event, &path, raw_event.as_ref()) {
+            continue;
+        }
         let artifact_id = upsert_file_artifact(
             db,
             &path,
@@ -2488,6 +2524,8 @@ fn record_system_event_artifacts(
             Some(json!({
                 "source": event.source,
                 "system_event_type": event.event_type,
+                "system_event_kind": event.event_kind,
+                "modified": modified,
             })),
         )?;
         match relation_type {
@@ -2539,6 +2577,8 @@ fn record_system_event_artifacts(
                 metadata: Some(json!({
                     "source": event.source,
                     "system_event_type": event.event_type,
+                    "system_event_kind": event.event_kind,
+                    "modified": modified,
                     "matched_agent_intent": matched_agent_intent,
                 })),
             },
@@ -2730,6 +2770,140 @@ fn add_path_variants(path: &str, paths: &mut BTreeSet<String>) {
     }
 }
 
+fn should_materialize_system_artifact(
+    event: &SystemEvent,
+    path: &str,
+    raw_event: Option<&Value>,
+) -> bool {
+    if event.source != "macos-endpoint-security" {
+        return true;
+    }
+
+    // Authorization records describe an attempted operation. The matching
+    // notify record represents the operation that actually happened; a denied
+    // authorization should remain audit evidence without becoming lineage.
+    if event.event_type.starts_with("auth_")
+        || raw_event
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
+            == Some("auth")
+    {
+        return false;
+    }
+
+    // Endpoint Security emits close notifications for ordinary reads too. A
+    // close is a mutation only when ES explicitly reports modified=true.
+    if event.event_type == "close"
+        && raw_event
+            .and_then(|value| value.get("modified"))
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return false;
+    }
+
+    // Directories, devices, FIFOs, and sockets are useful in the raw event
+    // stream but are not file artifacts. Preserve regular files and symlinks.
+    if raw_event
+        .and_then(|value| value.get("file"))
+        .and_then(|value| value.get("mode"))
+        .and_then(Value::as_u64)
+        .is_some_and(lineage_mode_is_non_file)
+    {
+        return false;
+    }
+
+    if lineage_path_is_harness_runtime_noise(path) || lineage_path_is_system_dependency(path) {
+        return false;
+    }
+    true
+}
+
+fn lineage_path_is_harness_runtime_noise(path: &str) -> bool {
+    path.starts_with("/dev/")
+        || path.starts_with("/private/tmp/cc-socks/")
+        || path.starts_with("/tmp/cc-socks/")
+        || path.starts_with("/private/tmp/claude-")
+        || path.starts_with("/tmp/claude-")
+        || path.starts_with("/private/var/tmp/sh-thd-")
+        || path.contains("/.claude/sessions/")
+        || path.contains("/.claude/projects/")
+        || path.contains("/.claude/shell-snapshots/")
+        || (path.contains("/.claude/plugins/cache/")
+            && (path.ends_with("/.in_use") || path.contains("/.in_use/")))
+}
+
+fn lineage_path_is_system_dependency(path: &str) -> bool {
+    path == "/bin"
+        || path.starts_with("/bin/")
+        || path == "/sbin"
+        || path.starts_with("/sbin/")
+        || path == "/usr/bin"
+        || path.starts_with("/usr/bin/")
+        || path == "/usr/local/bin"
+        || path.starts_with("/usr/lib/")
+        || path.starts_with("/usr/share/")
+        || path.starts_with("/System/")
+        || path.starts_with("/Library/Developer/")
+        || path.starts_with("/Applications/Xcode.app/Contents/Developer/")
+        || path.starts_with("/Library/Preferences/Logging/")
+        || path.starts_with("/Library/Preferences/")
+        || path.starts_with("/private/var/db/")
+        || path.starts_with("/private/var/folders/")
+        || path.starts_with("/opt/homebrew/Cellar/")
+}
+
+fn lineage_mode_is_non_file(mode: u64) -> bool {
+    matches!(
+        mode & 0o170000,
+        0o010000 | 0o020000 | 0o040000 | 0o060000 | 0o140000
+    )
+}
+
+fn file_path_from_uri(uri: &str) -> &str {
+    uri.strip_prefix("file://").unwrap_or(uri)
+}
+
+fn dashboard_artifact_is_visible(artifact: &Value) -> bool {
+    let observed_by_endpoint_security = artifact.get("_observation_source").and_then(Value::as_str)
+        == Some("macos-endpoint-security");
+    if !observed_by_endpoint_security {
+        return true;
+    }
+
+    let Some(path) = artifact
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(file_path_from_uri)
+    else {
+        return true;
+    };
+    if lineage_path_is_harness_runtime_noise(path) {
+        return false;
+    }
+    if artifact
+        .get("_observation_mode")
+        .and_then(Value::as_u64)
+        .is_some_and(lineage_mode_is_non_file)
+    {
+        return false;
+    }
+    !lineage_path_is_system_dependency(path)
+}
+
+fn dashboard_relation_is_visible(relation: &Value) -> bool {
+    ["src_uri", "dst_uri"].into_iter().all(|key| {
+        relation
+            .get(key)
+            .and_then(Value::as_str)
+            .map(file_path_from_uri)
+            .is_none_or(|path| {
+                !lineage_path_is_harness_runtime_noise(path)
+                    && !lineage_path_is_system_dependency(path)
+            })
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArtifactAccess {
     Consumed,
@@ -2748,28 +2922,46 @@ fn artifact_access(operation: &str) -> ArtifactAccess {
     }
 }
 
+fn system_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str {
+    if event.event_kind == "file_read" {
+        return "read_by";
+    }
+    if event.event_type == "open" && event.event_kind == "file_mutation" {
+        return "modified";
+    }
+    system_artifact_relation_type(&event.event_type)
+}
+
 fn system_artifact_relation_type(event_type: &str) -> &'static str {
     match event_type {
         value if value.starts_with("auth_") => "attempted_access",
         "open" | "lookup" | "access" | "stat" | "getattrlist" | "readlink" | "readdir"
-        | "getextattr" | "listextattr" | "fsgetpath" => "read_by",
+        | "getextattr" | "listextattr" | "fsgetpath" | "mmap" => "read_by",
         "unlink" => "deleted",
-        "setmode" | "setowner" | "setflags" | "setacl" | "setextattr" | "deleteextattr" => {
-            "modified"
-        }
+        "close" | "truncate" | "rename" | "setmode" | "setowner" | "setflags" | "setacl"
+        | "setextattr" | "deleteextattr" => "modified",
         _ => "wrote",
     }
+}
+
+fn request_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str {
+    if event.event_kind == "file_read" {
+        return "consumed_by";
+    }
+    if event.event_type == "open" && event.event_kind == "file_mutation" {
+        return "modified";
+    }
+    request_artifact_relation_type(&event.event_type)
 }
 
 fn request_artifact_relation_type(event_type: &str) -> &'static str {
     match event_type {
         value if value.starts_with("auth_") => "attempted_access",
         "open" | "lookup" | "access" | "stat" | "getattrlist" | "readlink" | "readdir"
-        | "getextattr" | "listextattr" | "fsgetpath" => "consumed_by",
+        | "getextattr" | "listextattr" | "fsgetpath" | "mmap" => "consumed_by",
         "unlink" => "deleted",
-        "setmode" | "setowner" | "setflags" | "setacl" | "setextattr" | "deleteextattr" => {
-            "modified"
-        }
+        "close" | "truncate" | "rename" | "setmode" | "setowner" | "setflags" | "setacl"
+        | "setextattr" | "deleteextattr" => "modified",
         _ => "produced",
     }
 }
@@ -2979,10 +3171,22 @@ fn tool_response_json(event: &AgentHookEvent) -> Option<String> {
         return None;
     }
 
+    let response = json!({
+        "stdout": event.tool_response_stdout.as_deref(),
+        "stderr": event.tool_response_stderr.as_deref(),
+        "interrupted": event.tool_response_interrupted,
+        "duration_ms": event.duration_ms,
+    });
+    let encoded = response.to_string();
+    if encoded.len() <= MAX_STORED_TOOL_RESPONSE_BYTES {
+        return Some(encoded);
+    }
+
     Some(
         json!({
-            "stdout": event.tool_response_stdout.as_deref(),
-            "stderr": event.tool_response_stderr.as_deref(),
+            "truncated": true,
+            "original_bytes": encoded.len(),
+            "max_bytes": MAX_STORED_TOOL_RESPONSE_BYTES,
             "interrupted": event.tool_response_interrupted,
             "duration_ms": event.duration_ms,
         })
@@ -3489,6 +3693,25 @@ mod tests {
         let decoded: Value = serde_json::from_str(&bounded).unwrap();
         assert_eq!(decoded["truncated"], true);
         assert_eq!(decoded["max_bytes"], MAX_TRANSACTION_METADATA_BYTES);
+    }
+
+    #[test]
+    fn oversized_tool_response_is_replaced_with_truncation_metadata() {
+        let mut event = hook_event("PostToolUse", "{}", 100);
+        event.tool_response_stdout = Some("x".repeat(MAX_STORED_TOOL_RESPONSE_BYTES + 1));
+        event.tool_response_stderr = Some("sensitive stderr".to_string());
+        event.tool_response_interrupted = Some(false);
+        event.duration_ms = Some(42);
+
+        let encoded = tool_response_json(&event).unwrap();
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+
+        assert!(encoded.len() < MAX_STORED_TOOL_RESPONSE_BYTES);
+        assert_eq!(decoded["truncated"], true);
+        assert_eq!(decoded["max_bytes"], MAX_STORED_TOOL_RESPONSE_BYTES);
+        assert_eq!(decoded["duration_ms"], 42);
+        assert!(decoded.get("stdout").is_none());
+        assert!(decoded.get("stderr").is_none());
     }
 
     #[test]
@@ -4013,9 +4236,9 @@ mod tests {
             .iter()
             .find(|event| event["type"] == "PostToolUse")
             .unwrap();
-        let response =
-            serde_json::from_str::<Value>(post_event["tool_response"].as_str().unwrap()).unwrap();
-        assert_eq!(response["duration_ms"], 8);
+        assert_eq!(post_event["duration_ms"], 8);
+        assert!(post_event.get("tool_response").is_none());
+        assert!(dashboard["requests"][0].get("final_response").is_none());
         let alert = &dashboard["alerts"][0];
         assert_eq!(
             alert["original_user_prompt"],
@@ -4051,6 +4274,60 @@ mod tests {
         assert_eq!(alert["human_verdict"], "agree");
         assert_eq!(alert["feedback_label"], "confirmed");
         assert_eq!(alert["feedback_created_at"], 130);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_snapshot_bounds_request_text_and_omits_final_response() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-dashboard-request-projection-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let prompt = "p".repeat(2_048);
+        let response_marker = "response-that-must-not-enter-dashboard-state";
+        let response = format!("{response_marker}{}", "r".repeat(32 * 1_024));
+
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                &json!({
+                    "session_id": "s1",
+                    "hook_event_name": "UserPromptSubmit",
+                    "cwd": "/repo",
+                    "prompt": prompt,
+                })
+                .to_string(),
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "Stop",
+                &json!({
+                    "session_id": "s1",
+                    "hook_event_name": "Stop",
+                    "cwd": "/repo",
+                    "last_assistant_message": response,
+                })
+                .to_string(),
+                110,
+            ))
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        let request = &dashboard["requests"][0];
+        assert_eq!(
+            request["original_user_prompt"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            1_024
+        );
+        assert!(request.get("final_response").is_none());
+        assert!(!dashboard.to_string().contains(response_marker));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -4297,6 +4574,145 @@ mod tests {
         ));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_runtime_noise_stays_in_audit_stream_but_out_of_lineage() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-endpoint-lineage-filter-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let endpoint_event = |event_type: &str,
+                              event_kind: &str,
+                              path: &str,
+                              mode: u64,
+                              modified: Option<bool>,
+                              observed_at_ms: u64| {
+            let mut raw = json!({
+                "action": "notify",
+                "file": { "path": path, "mode": mode },
+                "attribution": { "session_id": "claude-session" }
+            });
+            if let Some(modified) = modified {
+                raw["modified"] = json!(modified);
+            }
+            SystemEvent {
+                source: "macos-endpoint-security".to_string(),
+                event_type: event_type.to_string(),
+                event_kind: event_kind.to_string(),
+                observed_at_ms,
+                pid: Some(5311),
+                ppid: Some(5310),
+                process_name: Some("claude".to_string()),
+                executable_path: Some("/Applications/Claude.app/Contents/MacOS/Claude".to_string()),
+                file_path: Some(path.to_string()),
+                command_line: None,
+                raw_json: raw.to_string(),
+            }
+        };
+
+        let ignored = [
+            endpoint_event(
+                "open",
+                "file_read",
+                "/Library/Preferences/Logging/com.apple.diagnosticd.filter.plist",
+                0o100644,
+                None,
+                100,
+            ),
+            endpoint_event(
+                "unlink",
+                "file_mutation",
+                "/Users/test/.claude/sessions/5311.json",
+                0o100600,
+                None,
+                101,
+            ),
+            endpoint_event(
+                "unlink",
+                "file_mutation",
+                "/private/tmp/cc-socks/5311.sock",
+                0o140600,
+                None,
+                102,
+            ),
+            endpoint_event(
+                "close",
+                "system",
+                "/repo/merely-read.txt",
+                0o100644,
+                Some(false),
+                103,
+            ),
+            endpoint_event(
+                "readdir",
+                "file_read",
+                "/Users/test/.claude/skills",
+                0o040755,
+                None,
+                104,
+            ),
+        ];
+        for event in &ignored {
+            store.append_system_event(event).unwrap();
+            assert!(store
+                .artifact_fact_for_file(event.file_path.as_deref().unwrap())
+                .unwrap()
+                .is_none());
+        }
+
+        store
+            .append_system_event(&endpoint_event(
+                "write",
+                "file_mutation",
+                "/repo/src/lib.rs",
+                0o100644,
+                None,
+                105,
+            ))
+            .unwrap();
+        assert!(store
+            .artifact_fact_for_file("/repo/src/lib.rs")
+            .unwrap()
+            .is_some());
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["systemEvents"].as_array().unwrap().len(), 6);
+        assert_eq!(dashboard["summary"]["artifacts_count"], 1);
+        assert_eq!(dashboard["artifacts"].as_array().unwrap().len(), 1);
+        assert_eq!(dashboard["artifacts"][0]["uri"], "file:///repo/src/lib.rs");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_hides_legacy_endpoint_runtime_artifacts() {
+        let legacy_system_read = json!({
+            "uri": "file:///System/Library/dyld/dyld_shared_cache_arm64e",
+            "_observation_source": "macos-endpoint-security",
+            "_observation_event_type": "open",
+            "_observation_event_kind": null,
+            "_observation_modified": null,
+        });
+        let real_system_mutation = json!({
+            "uri": "file:///System/Library/example.conf",
+            "_observation_source": "macos-endpoint-security",
+            "_observation_event_type": "write",
+            "_observation_event_kind": "file_mutation",
+            "_observation_modified": null,
+        });
+        let project_artifact = json!({
+            "uri": "file:///repo/src/lib.rs",
+            "_observation_source": "macos-endpoint-security",
+            "_observation_event_type": "write",
+            "_observation_event_kind": "file_mutation",
+            "_observation_modified": null,
+        });
+
+        assert!(!dashboard_artifact_is_visible(&legacy_system_read));
+        assert!(!dashboard_artifact_is_visible(&real_system_mutation));
+        assert!(dashboard_artifact_is_visible(&project_artifact));
     }
 
     #[test]

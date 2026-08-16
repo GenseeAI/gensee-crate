@@ -30,13 +30,29 @@ struct DashboardPolicyPage: View {
                         Divider()
                         Group {
                             switch tab {
-                            case "Decision Rules": PolicyRulesView(document: document ?? [:])
-                            case "Artifact Definitions": ArtifactDefinitionsView(document: document ?? [:])
+                            case "Decision Rules":
+                                PolicyRulesView(document: document ?? [:], editorText: $editorText)
+                            case "Artifact Definitions":
+                                ArtifactDefinitionsView(document: document ?? [:], editorText: $editorText)
                             case "Advanced (JSON)":
-                                TextEditor(text: $editorText)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .frame(minHeight: 470)
-                                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.dashboardLine))
+                                VStack(alignment: .leading, spacing: 9) {
+                                    HStack {
+                                        Text("Edit the complete policy document. Save & Validate checks it with the Gensee policy engine before replacing the active policy.")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.secondary)
+                                        Spacer()
+                                        Label(
+                                            document == nil ? "Invalid JSON" : "Valid JSON",
+                                            systemImage: document == nil ? "xmark.circle.fill" : "checkmark.circle.fill"
+                                        )
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .foregroundStyle(document == nil ? Color.dashboardRed : Color.dashboardGreen)
+                                    }
+                                    TextEditor(text: $editorText)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .frame(minHeight: 470)
+                                        .overlay(RoundedRectangle(cornerRadius: 5).stroke(document == nil ? Color.dashboardRed : Color.dashboardLine))
+                                }
                             default:
                                 if let document {
                                     PolicySettingsView(
@@ -114,21 +130,6 @@ private struct PolicySettingsView: View {
             ]
         ),
         PolicySettingGroup(
-            title: "Linux controls",
-            detail: "Seccomp, fanotify, and network policy for Linux sandboxes.",
-            settings: [
-                .boolean("linux.seccomp.enabled", "Enable seccomp", "Apply the configured syscall restrictions."),
-                .boolean("linux.seccomp.deny_ptrace", "Deny ptrace", "Block process inspection and tracing syscalls."),
-                .boolean("linux.seccomp.deny_bpf", "Deny BPF", "Block loading BPF programs."),
-                .boolean("linux.seccomp.deny_kernel_modules", "Deny kernel modules", "Block kernel module loading and unloading."),
-                .boolean("linux.seccomp.deny_mount_namespace_changes", "Deny mount namespace changes", "Block mount and namespace mutation syscalls."),
-                .list("linux.fanotify.paths", "Fanotify paths", "Additional Linux path prefixes monitored by fanotify."),
-                .choice("linux.network.mode", "Linux network mode", "Select observation or network enforcement.", options: ["off", "monitor", "allowlist", "deny-all"]),
-                .list("linux.network.allow", "Allowed destinations", "Allowed IP addresses or CIDR ranges."),
-                .list("linux.network.deny", "Denied destinations", "Denied IP addresses or CIDR ranges."),
-            ]
-        ),
-        PolicySettingGroup(
             title: "Observation & trust",
             detail: "System-event source and explicitly trusted paths.",
             settings: [
@@ -172,10 +173,7 @@ private struct PolicySettingsView: View {
     private func updatePolicyValue(_ key: String, to value: Any) {
         var root = document
         setDottedValue(&root, key, value)
-        guard JSONSerialization.isValidJSONObject(root),
-              let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-        else { return }
-        editorText = String(decoding: data, as: UTF8.self)
+        editorText = formattedPolicyDocument(root) ?? editorText
     }
 }
 
@@ -444,73 +442,238 @@ private struct PolicySettingRow: View {
 
 private struct PolicyRulesView: View {
     let document: [String: Any]
+    @Binding var editorText: String
 
-    private var groups: [(String, [[String: Any]])] {
-        var fileRules: [[String: Any]] = []
-        if let secret = document["secret_paths"] as? [String: Any], let protected = secret["protected"] as? [String: Any] { fileRules.append(protected.merging(["_name": "Protected secrets"]) { current, _ in current }) }
-        if let persistence = document["persistence_writes"] as? [String: Any] { fileRules.append(persistence.merging(["_name": "Persistence / startup writes"]) { current, _ in current }) }
+    private var groups: [(String, [PolicyRuleRow])] {
+        var fileRules: [PolicyRuleRow] = []
+        if let secret = document["secret_paths"] as? [String: Any] {
+            if let protected = secret["protected"] as? [String: Any] {
+                fileRules.append(PolicyRuleRow(
+                    name: "Protected secrets",
+                    ruleID: secret["rule_id"] as? String,
+                    rule: protected,
+                    target: .dotted("secret_paths.protected.action")
+                ))
+            }
+            if let credentialHint = secret["credential_hint"] as? [String: Any] {
+                fileRules.append(PolicyRuleRow(
+                    name: "Credential-like paths",
+                    ruleID: secret["rule_id"] as? String,
+                    rule: credentialHint,
+                    target: .dotted("secret_paths.credential_hint.action")
+                ))
+            }
+        }
+        if let persistence = document["persistence_writes"] as? [String: Any] {
+            fileRules.append(PolicyRuleRow(
+                name: "Persistence / startup writes",
+                ruleID: persistence["rule_id"] as? String,
+                rule: persistence,
+                target: .dotted("persistence_writes.action")
+            ))
+        }
         if let categories = document["categories"] as? [String: Any] {
-            for (name, value) in categories { if let rule = value as? [String: Any] { fileRules.append(rule.merging(["_name": name.replacingOccurrences(of: "_", with: " ")]) { current, _ in current }) } }
+            for name in categories.keys.sorted() {
+                guard let rule = categories[name] as? [String: Any] else { continue }
+                fileRules.append(PolicyRuleRow(
+                    name: name.replacingOccurrences(of: "_", with: " ").capitalized,
+                    ruleID: rule["rule_id"] as? String,
+                    rule: rule,
+                    target: .dotted("categories.\(name).action")
+                ))
+            }
         }
         return [
             ("File access rules", fileRules),
-            ("Command rules", document["command_rules"] as? [[String: Any]] ?? []),
-            ("Executable-content rules", document["content_rules"] as? [[String: Any]] ?? []),
-            ("Network / URL rules", document["url_rules"] as? [[String: Any]] ?? []),
+            ("Command rules", rows(in: "command_rules")),
+            ("Executable-content rules", rows(in: "content_rules")),
+            ("Network / URL rules", rows(in: "url_rules")),
         ].filter { !$0.1.isEmpty }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Each rule's action — Deny blocks, Ask prompts the user, Allow/Warn lets it through.").font(.system(size: 11)).foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline) {
+                Text("Choose what Gensee does when each rule matches. Deny blocks, Ask prompts, and Warn or Allow lets the operation continue.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("ACTION")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
             if groups.isEmpty { DashboardEmpty(text: "No decision rules found in this policy.") }
             ForEach(groups, id: \.0) { group in
                 VStack(alignment: .leading, spacing: 0) {
                     Text("\(group.0) (\(group.1.count))").font(.system(size: 13, weight: .semibold)).padding(.bottom, 6)
-                    ForEach(Array(group.1.enumerated()), id: \.offset) { _, rule in
-                        HStack {
+                    ForEach(group.1) { rule in
+                        HStack(spacing: 16) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text((rule["_name"] ?? rule["id"] ?? rule["rule_id"] ?? "Rule") as? String ?? "Rule").font(.system(size: 12, weight: .semibold))
-                                Text(rule["rule_id"] as? String ?? matcherSummary(rule)).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
+                                Text(rule.name).font(.system(size: 12, weight: .semibold))
+                                if let ruleID = rule.ruleID, !ruleID.isEmpty {
+                                    Text(ruleID).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                                if !rule.matcherSummary.isEmpty {
+                                    Text(rule.matcherSummary)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundStyle(.tertiary)
+                                        .lineLimit(1)
+                                }
                             }
                             Spacer()
-                            DashboardTag(text: rule["action"] as? String ?? "allow", color: actionColor(rule["action"] as? String ?? "allow"))
+                            Picker("Action", selection: Binding(
+                                get: { rule.action },
+                                set: { updateAction(for: rule.target, action: $0) }
+                            )) {
+                                Text("Deny").tag("block")
+                                Text("Ask").tag("ask")
+                                Text("Warn").tag("warn")
+                                Text("Allow").tag("allow")
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .frame(width: 112)
+                            .accessibilityLabel("Action for \(rule.name)")
                         }.padding(.vertical, 7)
                         Divider()
                     }
                 }.padding(14).background(Color.dashboardMutedFill, in: RoundedRectangle(cornerRadius: 5))
             }
+            PolicyUnsavedEditsNote()
         }
     }
 
-    private func matcherSummary(_ rule: [String: Any]) -> String {
-        ["patterns", "commands", "bare_commands", "hosts", "url_substrings", "segments", "filenames", "filename_suffixes", "path_contains", "exact_paths"]
-            .flatMap { rule[$0] as? [String] ?? [] }.prefix(4).joined(separator: ", ")
+    private func rows(in collection: String) -> [PolicyRuleRow] {
+        (document[collection] as? [[String: Any]] ?? []).enumerated().map { index, rule in
+            PolicyRuleRow(
+                name: (rule["id"] ?? rule["rule_id"] ?? "Rule \(index + 1)") as? String ?? "Rule \(index + 1)",
+                ruleID: rule["rule_id"] as? String,
+                rule: rule,
+                target: .indexed(collection, index)
+            )
+        }
+    }
+
+    private func updateAction(for target: PolicyRuleActionTarget, action: String) {
+        var root = document
+        switch target {
+        case let .dotted(path):
+            setDottedValue(&root, path, action)
+        case let .indexed(collection, index):
+            guard var rules = root[collection] as? [[String: Any]], rules.indices.contains(index) else { return }
+            rules[index]["action"] = action
+            root[collection] = rules
+        }
+        editorText = formattedPolicyDocument(root) ?? editorText
     }
 }
 
 private struct ArtifactDefinitionsView: View {
     let document: [String: Any]
-    private let definitions = [("executable", "Executable artifacts"), ("memory", "Memory files"), ("skill", "Skill / plugin locations"), ("control_plane", "Control-plane files")]
+    @Binding var editorText: String
+
+    private let definitions = [
+        ("executable", "Executable artifacts", "Runnable scripts, skills, plugins, and hooks."),
+        ("memory", "Memory files", "Agent memory tracked for poisoning across turns and sessions."),
+        ("skill", "Skill / plugin locations", "Paths containing skill, rule, and plugin definitions."),
+        ("control_plane", "Control-plane files", "Gensee-owned and harness-control files that require protection."),
+    ]
+    private let matcherFields = [
+        ("segments", "Path segments", "Exact directory names."),
+        ("filenames", "Exact filenames", "Case-insensitive filename matches."),
+        ("filename_prefixes", "Filename prefixes", "Prefixes matched against the filename."),
+        ("filename_suffixes", "Filename suffixes", "Suffixes or extensions matched against the filename."),
+        ("filename_contains", "Filename contains", "Fragments matched anywhere in the filename."),
+        ("path_suffixes", "Path ends with", "Suffixes matched against the complete path."),
+        ("path_contains", "Path contains", "Fragments matched anywhere in the complete path."),
+    ]
 
     var body: some View {
         let registries = document["artifact_registries"] as? [String: Any] ?? [:]
         VStack(alignment: .leading, spacing: 10) {
-            Text("What the shield treats as executable, memory, skill, or control-plane files.").font(.system(size: 11)).foregroundStyle(.secondary)
+            Text("Define which paths Gensee treats as executable, memory, skill, or control-plane artifacts. Separate multiple matchers with commas.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
             ForEach(definitions, id: \.0) { definition in
                 DisclosureGroup {
-                    let values = registries[definition.0] as? [String: Any] ?? [:]
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(values.keys.sorted(), id: \.self) { key in
-                            HStack(alignment: .top) {
-                                Text(key.replacingOccurrences(of: "_", with: " ").capitalized).frame(width: 190, alignment: .leading)
-                                Text(displayValue(values[key])).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
-                            }.font(.system(size: 11))
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(matcherFields, id: \.0) { field in
+                            let path = "artifact_registries.\(definition.0).\(field.0)"
+                            PolicySettingRow(
+                                setting: .list(path, field.1, field.2),
+                                value: dottedValue(document, path),
+                                onChange: { updatePolicyValue(path, to: $0) }
+                            )
+                            Divider()
                         }
-                    }.padding(10)
-                } label: { Text(definition.1).font(.system(size: 12, weight: .semibold)) }
+                    }
+                    .padding(.top, 8)
+                } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(definition.1).font(.system(size: 12, weight: .semibold))
+                        Text("\(definition.2) · \(matcherCount(in: registries[definition.0])) matchers")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
                     .padding(10).background(Color.dashboardMutedFill, in: RoundedRectangle(cornerRadius: 5))
             }
+            PolicyUnsavedEditsNote()
+        }
+    }
+
+    private func matcherCount(in value: Any?) -> Int {
+        guard let registry = value as? [String: Any] else { return 0 }
+        return matcherFields.reduce(0) { count, field in
+            count + (registry[field.0] as? [Any] ?? []).count
+        }
+    }
+
+    private func updatePolicyValue(_ key: String, to value: Any) {
+        var root = document
+        setDottedValue(&root, key, value)
+        editorText = formattedPolicyDocument(root) ?? editorText
+    }
+}
+
+private enum PolicyRuleActionTarget: Hashable {
+    case dotted(String)
+    case indexed(String, Int)
+}
+
+private struct PolicyRuleRow: Identifiable {
+    let name: String
+    let ruleID: String?
+    let action: String
+    let matcherSummary: String
+    let target: PolicyRuleActionTarget
+
+    var id: PolicyRuleActionTarget { target }
+
+    init(name: String, ruleID: String?, rule: [String: Any], target: PolicyRuleActionTarget) {
+        self.name = name
+        self.ruleID = ruleID
+        action = rule["action"] as? String ?? "allow"
+        matcherSummary = [
+            "patterns", "all_of", "commands", "bare_commands", "arg_all", "arg_any", "raw_contains", "raw_all",
+            "host_substrings", "segments", "filenames", "filename_suffixes", "path_contains", "exact_paths",
+        ]
+        .flatMap { rule[$0] as? [String] ?? [] }
+        .prefix(4)
+        .joined(separator: ", ")
+        self.target = target
+    }
+}
+
+private struct PolicyUnsavedEditsNote: View {
+    var body: some View {
+        HStack {
+            Image(systemName: "checkmark.shield")
+                .foregroundStyle(Color.dashboardGreen)
+            Text("Edits remain local until Save & Validate confirms the complete policy.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Spacer()
         }
     }
 }
@@ -667,9 +830,9 @@ private func setDottedValue(
     object[key] = child
 }
 
-private func displayValue(_ value: Any?) -> String {
-    guard let value else { return "—" }
-    if let array = value as? [Any] { return array.map { String(describing: $0) }.joined(separator: ", ") }
-    if let dictionary = value as? [String: Any], let data = try? JSONSerialization.data(withJSONObject: dictionary), let string = String(data: data, encoding: .utf8) { return string }
-    return String(describing: value)
+private func formattedPolicyDocument(_ document: [String: Any]) -> String? {
+    guard JSONSerialization.isValidJSONObject(document),
+          let data = try? JSONSerialization.data(withJSONObject: document, options: [.prettyPrinted, .sortedKeys])
+    else { return nil }
+    return String(decoding: data, as: UTF8.self)
 }

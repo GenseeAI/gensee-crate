@@ -57,7 +57,7 @@ enum TimelineDerivation {
             guard let pre = pair.pre else { return nil }
             let inputObject = jsonObject(pre.toolInput)
             let responseObject = jsonObject(pair.post?.toolResponse)
-            let reportedDuration = integer(responseObject?["duration_ms"])
+            let reportedDuration = pair.post?.durationMS ?? integer(responseObject?["duration_ms"])
             let elapsedDuration = pair.post.flatMap { post in
                 post.timestamp >= pre.timestamp ? post.timestamp - pre.timestamp : nil
             }

@@ -124,19 +124,13 @@ static NSDictionary *GenseeProcessDictionary(const es_process_t *process, uint32
 
 static BOOL GenseeIsOwnProcess(const es_process_t *process)
 {
-    if (process == NULL || process->is_es_client) return YES;
-    NSString *path = process->executable != NULL
-        ? GenseeStringFromToken(process->executable->path)
-        : @"";
+    if (process == NULL) return NO;
     NSString *signingID = GenseeStringFromToken(process->signing_id);
     NSString *teamID = GenseeStringFromToken(process->team_id);
-    if ([teamID isEqualToString:@"3KWVB4M63F"] &&
+    return [teamID isEqualToString:@"3KWVB4M63F"] &&
         ([signingID isEqualToString:@"ai.gensee.crate"] ||
          [signingID isEqualToString:@"ai.gensee.crate.endpoint-security"] ||
-         [signingID isEqualToString:@"ai.gensee.crate.cli"])) {
-        return YES;
-    }
-    return [path containsString:@"/Gensee Crate.app/Contents/"];
+         [signingID isEqualToString:@"ai.gensee.crate.cli"]);
 }
 
 static NSString *GenseeDestinationPath(const es_file_t *directory, es_string_token_t filename)
@@ -358,7 +352,6 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 @property(nonatomic) NSString *mode;
 @property(nonatomic) NSArray<NSString *> *protectedPaths;
 @property(nonatomic) NSSet<NSString *> *blockedExecutables;
-@property(nonatomic) NSSet<NSString *> *ownExecutables;
 @property(nonatomic) NSDictionary<NSNumber *, NSString *> *managedRoots;
 @property(nonatomic) NSMutableDictionary<NSString *, NSString *> *managedProcesses;
 @property(nonatomic) uint64_t maxAuthorizationLatencyUS;
@@ -381,7 +374,6 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         _mode = @"observe";
         _protectedPaths = @[];
         _blockedExecutables = [NSSet set];
-        _ownExecutables = [NSSet set];
         _managedRoots = @{};
         _managedProcesses = [NSMutableDictionary dictionary];
         _maxAuthorizationLatencyUS = 10000;
@@ -460,10 +452,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 
 - (BOOL)isOwnProcessLocked:(const es_process_t *)process
 {
-    if (GenseeIsOwnProcess(process)) return YES;
-    if (process == NULL || process->executable == NULL) return NO;
-    NSString *path = [GenseeStringFromToken(process->executable->path) stringByStandardizingPath];
-    return [self.ownExecutables containsObject:path];
+    return GenseeIsOwnProcess(process);
 }
 
 - (void)authorizeMessage:(const es_message_t *)message
@@ -677,15 +666,13 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     }
     NSArray *protectedPaths = configuration[@"protected_paths"];
     NSArray *blockedExecutables = configuration[@"blocked_executables"];
-    NSArray *ownExecutables = configuration[@"own_executables"];
     NSArray *managedRoots = configuration[@"managed_roots"];
     NSNumber *failClosedManagedOnly = configuration[@"fail_closed_managed_only"];
     NSNumber *maxAuthorizationLatencyMS = configuration[@"max_auth_latency_ms"];
     if (!GenseeIsAbsoluteStringArray(protectedPaths) ||
         !GenseeIsAbsoluteStringArray(blockedExecutables) ||
-        !GenseeIsAbsoluteStringArray(ownExecutables) ||
         (managedRoots != nil && ![managedRoots isKindOfClass:NSArray.class])) {
-        reply(NO, @"Protected paths, blocked executables, and own executables must be arrays of absolute paths; managed roots must be an array.");
+        reply(NO, @"Protected paths and blocked executables must be arrays of absolute paths; managed roots must be an array.");
         return;
     }
     if (failClosedManagedOnly != nil &&
@@ -718,7 +705,6 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         self.mode = requestedMode;
         self.protectedPaths = [(protectedPaths ?: @[]) valueForKey:@"stringByStandardizingPath"];
         self.blockedExecutables = [NSSet setWithArray:[(blockedExecutables ?: @[]) valueForKey:@"stringByStandardizingPath"]];
-        self.ownExecutables = [NSSet setWithArray:[(ownExecutables ?: @[]) valueForKey:@"stringByStandardizingPath"]];
         self.managedRoots = roots;
         self.managedProcesses = activeProcesses;
         self.maxAuthorizationLatencyUS = (maxAuthorizationLatencyMS ?: @10).unsignedLongLongValue * 1000ULL;

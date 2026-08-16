@@ -273,6 +273,11 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_request_ts
 CREATE INDEX IF NOT EXISTS idx_requests_created_at
     ON requests(created_at);
 
+-- Supports the macOS console's bounded recent-request projection without a
+-- full table scan and temporary sort on every two-second refresh.
+CREATE INDEX IF NOT EXISTS idx_requests_dashboard_activity
+    ON requests(COALESCE(completed_at, created_at, request_id) DESC, request_id DESC);
+
 CREATE INDEX IF NOT EXISTS idx_agent_events_tool_use
     ON agent_events(tool_use_id);
 

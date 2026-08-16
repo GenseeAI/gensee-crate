@@ -11,6 +11,7 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var dailyDetail: DailyDetail?
     @Published private(set) var dailyDetailLoadState = DailyDetailLoadState.idle
     @Published private(set) var configAudit: ConfigAuditBundle?
+    @Published private(set) var auditedIntegrationIDs: Set<String> = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var runningCommand: String?
     @Published private(set) var feedbackAlertID: Int64?
@@ -34,6 +35,7 @@ final class ConsoleModel: ObservableObject {
         homeURL = resolvedHome
         cli = GenseeCLI(homeURL: resolvedHome)
         endpointSensor = EndpointSecuritySensor(homeURL: resolvedHome, executableURL: cli.executableURL)
+        auditedIntegrationIDs = Self.loadAuditedIntegrationIDs(homeURL: resolvedHome)
         readAlertIDs = Self.loadReadAlertIDs(homeURL: resolvedHome)
         readAlertBaselineCount = UserDefaults.standard.integer(
             forKey: Self.readAlertsBaselineKey(homeURL: resolvedHome)
@@ -168,7 +170,12 @@ final class ConsoleModel: ObservableObject {
         dashboardRefreshInProgress = true
         defer { dashboardRefreshInProgress = false }
         do {
-            snapshot = try await cli.decode(SecuritySnapshot.self, arguments: ["dashboard-state"])
+            let refreshedSnapshot = try await cli.decode(
+                SecuritySnapshot.self,
+                arguments: ["dashboard-state"]
+            )
+            reconcileReadAlertState(alertCount: refreshedSnapshot.summary.alertsCount)
+            snapshot = refreshedSnapshot
             configureEndpointSensor()
             lastUpdated = Date()
             dashboardRefreshIssue = nil
@@ -229,11 +236,16 @@ final class ConsoleModel: ObservableObject {
         runningCommand = "Auditing \(target == "vscode" ? "VS Code" : "Codex") configuration"
         defer { runningCommand = nil }
         do {
-            configAudit = try await cli.decode(
+            let audit = try await cli.decode(
                 ConfigAuditBundle.self,
                 arguments: ["audit", target, "--workspace", workspaceURL.path, "--json"],
                 acceptingExitCodes: [0, 2]
             )
+            configAudit = audit
+            if let harnessID = audit.auditedHarnessID {
+                auditedIntegrationIDs.insert(harnessID)
+                persistAuditedIntegrationIDs()
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -415,6 +427,24 @@ final class ConsoleModel: ObservableObject {
         "gensee.alerts.read.\(homeURL.path)"
     }
 
+    private static func auditedIntegrationsKey(homeURL: URL) -> String {
+        "gensee.harnesses.audited.\(homeURL.path)"
+    }
+
+    private static func loadAuditedIntegrationIDs(homeURL: URL) -> Set<String> {
+        let values = UserDefaults.standard.stringArray(
+            forKey: auditedIntegrationsKey(homeURL: homeURL)
+        ) ?? []
+        return Set(values)
+    }
+
+    private func persistAuditedIntegrationIDs() {
+        UserDefaults.standard.set(
+            auditedIntegrationIDs.sorted(),
+            forKey: Self.auditedIntegrationsKey(homeURL: homeURL)
+        )
+    }
+
     private static func readAlertsBaselineKey(homeURL: URL) -> String {
         "gensee.alerts.read-baseline.\(homeURL.path)"
     }
@@ -426,6 +456,17 @@ final class ConsoleModel: ObservableObject {
     private static func loadReadAlertIDs(homeURL: URL) -> Set<Int64> {
         let values = UserDefaults.standard.array(forKey: readAlertsKey(homeURL: homeURL)) as? [NSNumber] ?? []
         return Set(values.map(\.int64Value))
+    }
+
+    private func reconcileReadAlertState(alertCount: Int) {
+        guard AlertReadState.storeWasReset(
+            alertCount: alertCount,
+            readAlertBaselineCount: readAlertBaselineCount
+        ) else { return }
+        readAlertBaselineCount = 0
+        readThroughAlertID = 0
+        readAlertIDs.removeAll()
+        persistReadAlertState()
     }
 
     private func persistReadAlertState() {
@@ -691,19 +732,10 @@ final class ConsoleModel: ObservableObject {
         let roots = snapshot.jsonSessions
             .filter { $0.isActive && $0.rootPID != 0 }
             .map { ["pid": $0.rootPID, "session_id": $0.sessionID] as [String: Any] }
-        var ownExecutables = integrations.compactMap(\.configuredBackendPath)
-        if let executablePath = cli.executableURL?.path {
-            ownExecutables.append(executablePath)
-        }
-        let stableHook = homeURL.appendingPathComponent("bin/gensee")
-        if FileManager.default.isExecutableFile(atPath: stableHook.path) {
-            ownExecutables.append(stableHook.path)
-        }
         endpointSensor.updateConfiguration(
             mode: policy.endpointSecurityMode,
             protectedPaths: Array(Set(protectedPaths)).sorted(),
             blockedExecutables: blockedExecutables,
-            ownExecutables: Array(Set(ownExecutables)).sorted(),
             managedRoots: roots,
             failClosedManagedOnly: true,
             maxAuthorizationLatencyMS: min(100, max(1, maxAuthorizationLatencyMS))

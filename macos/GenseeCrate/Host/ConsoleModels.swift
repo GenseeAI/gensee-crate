@@ -1,5 +1,11 @@
 import Foundation
 
+enum AlertReadState {
+    static func storeWasReset(alertCount: Int, readAlertBaselineCount: Int) -> Bool {
+        alertCount < readAlertBaselineCount
+    }
+}
+
 struct SecuritySnapshot: Decodable {
     var summary = DashboardSummary()
     var alerts: [SecurityAlert] = []
@@ -187,6 +193,7 @@ struct AgentEvent: Decodable, Identifiable {
     let permissionMode: String?
     let toolInput: String?
     let toolResponse: String?
+    let durationMS: Int64?
     let toolUseID: String?
 
     var id: String { "agent-\(eventID)" }
@@ -202,6 +209,7 @@ struct AgentEvent: Decodable, Identifiable {
         case permissionMode = "permission_mode"
         case toolInput = "tool_input"
         case toolResponse = "tool_response"
+        case durationMS = "duration_ms"
         case toolUseID = "tool_use_id"
     }
 }
@@ -286,6 +294,34 @@ struct ArtifactFact: Decodable, Identifiable {
     let isControlPlane: Int
 
     var id: String { "\(kind):\(uri)" }
+
+    var filePath: String {
+        guard let url = URL(string: uri), url.isFileURL else { return uri }
+        return url.path
+    }
+
+    var displayName: String {
+        let name = URL(fileURLWithPath: filePath).lastPathComponent
+        return name.isEmpty ? filePath : name
+    }
+
+    var isSensitive: Bool {
+        if riskLevel != nil || isMemoryArtifact != 0 || isControlPlane != 0 || isPersistentTarget != 0 {
+            return true
+        }
+
+        let normalized = filePath.lowercased()
+        let protectedDirectories = [
+            "/.ssh/", "/.aws/", "/.gnupg/", "/.kube/", "/.docker/",
+            "/.config/gcloud/", "/.config/gh/", "/library/keychains/",
+        ]
+        if protectedDirectories.contains(where: normalized.contains) {
+            return true
+        }
+
+        let protectedFiles = [".netrc", ".npmrc", ".pypirc"]
+        return protectedFiles.contains(URL(fileURLWithPath: normalized).lastPathComponent)
+    }
 
     enum CodingKeys: String, CodingKey {
         case kind, uri

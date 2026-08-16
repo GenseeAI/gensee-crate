@@ -55,6 +55,7 @@ final class ConfigAuditModelsTests: XCTestCase {
         let bundle = try JSONDecoder().decode(ConfigAuditBundle.self, from: Data(json.utf8))
 
         XCTAssertEqual(bundle.requestedTarget, "codex")
+        XCTAssertEqual(bundle.auditedHarnessID, "codex")
         XCTAssertEqual(bundle.summary.findingCount, 1)
         XCTAssertEqual(bundle.reports[0].report.findings[0].evidence.count, 0)
         XCTAssertEqual(bundle.reports[0].report.sources[0].errors.count, 0)

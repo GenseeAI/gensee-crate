@@ -75,6 +75,7 @@ final class TimelineModelsTests: XCTestCase {
             permissionMode: nil,
             toolInput: input,
             toolResponse: response,
+            durationMS: nil,
             toolUseID: useID
         )
     }

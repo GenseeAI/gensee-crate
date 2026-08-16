@@ -15,6 +15,15 @@ struct ConfigAuditBundle: Decodable {
     var includedReports: [ConfigAuditTargetReport] {
         reports.filter { $0.applicability != "not_detected" }
     }
+
+    var auditedHarnessID: String? {
+        guard !includedReports.isEmpty else { return nil }
+        switch requestedTarget {
+        case "codex", "codex-cli": return "codex"
+        case "vscode", "github-copilot-vscode", "vscode-agent-host": return "vscode"
+        default: return nil
+        }
+    }
 }
 
 struct ConfigAuditTargetReport: Decodable, Identifiable {

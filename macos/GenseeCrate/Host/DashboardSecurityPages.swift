@@ -344,6 +344,11 @@ struct LineagePage: View {
         model.snapshot.artifacts.filter { containsSearch(searchText, fields: $0.uri, $0.kind, $0.lastModifiedSource, $0.riskLevel) }
     }
 
+    private var selectedArtifact: ArtifactFact? {
+        guard let selectedURI else { return nil }
+        return artifacts.first { $0.uri == selectedURI }
+    }
+
     var body: some View {
         DashboardPage {
             VStack(alignment: .leading, spacing: 16) {
@@ -359,8 +364,13 @@ struct LineagePage: View {
                                             HStack(spacing: 8) {
                                                 Rectangle().fill(selectedURI == artifact.uri ? Color.dashboardRed : .clear).frame(width: 3)
                                                 VStack(alignment: .leading, spacing: 2) {
-                                                    Text(URL(fileURLWithPath: artifact.uri.replacingOccurrences(of: "file://", with: "")).lastPathComponent)
+                                                    Text(artifact.displayName)
                                                         .font(.system(size: 12, weight: selectedURI == artifact.uri ? .semibold : .regular)).lineLimit(1)
+                                                    Text(abbreviatedPath(artifact.filePath))
+                                                        .font(.system(size: 9, design: .monospaced))
+                                                        .foregroundStyle(.secondary)
+                                                        .lineLimit(1)
+                                                        .truncationMode(.middle)
                                                     Text([artifact.kind, artifact.lastModifiedSource, artifact.riskLevel].compactMap { $0 }.joined(separator: " · "))
                                                         .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
                                                 }
@@ -369,16 +379,36 @@ struct LineagePage: View {
                                             .padding(.vertical, 6).padding(.horizontal, 4)
                                             .background(selectedURI == artifact.uri ? Color.dashboardBlue.opacity(0.09) : .clear, in: RoundedRectangle(cornerRadius: 4))
                                             .contentShape(Rectangle())
-                                        }.buttonStyle(.plain)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help(artifact.filePath)
                                     }
                                 }
                             }.frame(maxHeight: 520)
                         }
-                    }.frame(width: 330)
+                    }.frame(width: 370)
 
                     DashboardCard("Lineage Graph (\(artifacts.count))") {
-                        ArtifactGraphView(facts: artifacts, edges: model.snapshot.relations, selectedURI: $selectedURI)
-                            .frame(minHeight: 420)
+                        VStack(alignment: .leading, spacing: 10) {
+                            if let selectedArtifact {
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text("Selected path")
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                    Text(abbreviatedPath(selectedArtifact.filePath))
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .textSelection(.enabled)
+                                        .lineLimit(2)
+                                        .truncationMode(.middle)
+                                        .help(selectedArtifact.filePath)
+                                    Spacer(minLength: 0)
+                                }
+                                .padding(.horizontal, 4)
+                                Divider()
+                            }
+                            ArtifactGraphView(facts: artifacts, edges: model.snapshot.relations, selectedURI: $selectedURI)
+                                .frame(minHeight: 420)
+                        }
                     }.frame(maxWidth: .infinity)
                 }
             }
@@ -387,7 +417,7 @@ struct LineagePage: View {
 }
 
 private struct ArtifactGraphView: View {
-    private let nodeSize = CGSize(width: 150, height: 88)
+    private let nodeSize = CGSize(width: 184, height: 106)
     private let horizontalInset: CGFloat = 16
     private let verticalInset: CGFloat = 24
     private let minimumColumnSpacing: CGFloat = 24
@@ -425,8 +455,13 @@ private struct ArtifactGraphView: View {
                                 if let position = layout.positions[fact.id] {
                                     Button { selectedURI = selectedURI == fact.uri ? nil : fact.uri } label: {
                                         VStack(alignment: .leading, spacing: 5) {
-                                            Text(URL(fileURLWithPath: fact.uri.replacingOccurrences(of: "file://", with: "")).lastPathComponent)
+                                            Text(fact.displayName)
                                                 .font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                                            Text(abbreviatedPath(fact.filePath))
+                                                .font(.system(size: 9, design: .monospaced))
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
                                             Text(fact.lastModifiedSource ?? fact.kind).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
                                             DashboardTag(text: artifactClass(fact), color: artifactClass(fact) == "sensitive" ? .orange : .dashboardBlue)
                                         }
@@ -435,6 +470,7 @@ private struct ArtifactGraphView: View {
                                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(selectedURI == fact.uri ? Color.dashboardRed : Color.dashboardLine, lineWidth: selectedURI == fact.uri ? 2.5 : 1))
                                     }
                                     .buttonStyle(.plain)
+                                    .help(fact.filePath)
                                     .position(position)
                                     .id(fact.id)
                                 }
@@ -504,6 +540,6 @@ private struct ArtifactGraphView: View {
     }
 
     private func artifactClass(_ fact: ArtifactFact) -> String {
-        fact.riskLevel != nil || fact.isMemoryArtifact != 0 || fact.isControlPlane != 0 || fact.isPersistentTarget != 0 ? "sensitive" : "benign"
+        fact.isSensitive ? "sensitive" : "benign"
     }
 }

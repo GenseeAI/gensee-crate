@@ -37,6 +37,7 @@
 		B3A01A811214C31B36C00F18 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C1B023EFF7B2DE9556556E9E /* Assets.xcassets */; };
 		B4EC3AFD2169905AA662360D /* ConsoleModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92AD1DC256F292439A6C70BA /* ConsoleModel.swift */; };
 		C1CFBA97FF43FD867550E37E /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
+		CABD267D92A105B162179646 /* ArtifactFactTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D50189280D53EE5D350B921A /* ArtifactFactTests.swift */; };
 		CEBB5434E3FFBD87829EB8C0 /* DashboardHarnessesPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */; };
 		D50CF93055DEC2DF49AD2240 /* libEndpointSecurity.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C7E850A448A571324F7CA4F /* libEndpointSecurity.tbd */; };
 		DF38FDB826769C79187233CA /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
@@ -99,6 +100,7 @@
 		C1B023EFF7B2DE9556556E9E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C27E47B1FED91B645603F7B8 /* EndpointSecuritySensor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointSecuritySensor.swift; sourceTree = "<group>"; };
 		C8473EB5830E8F39EB110349 /* ConsoleModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsoleModels.swift; sourceTree = "<group>"; };
+		D50189280D53EE5D350B921A /* ArtifactFactTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArtifactFactTests.swift; sourceTree = "<group>"; };
 		D5CBE9AE8A3819CA0AF3116D /* Brand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Brand.swift; sourceTree = "<group>"; };
 		EA24B5D008AE2C71CB3FC844 /* GenseeCrateHarnessTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GenseeCrateHarnessTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		EDC43B9627D7C217071C5275 /* HarnessConfigurationHealthTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HarnessConfigurationHealthTests.swift; sourceTree = "<group>"; };
@@ -161,6 +163,7 @@
 			isa = PBXGroup;
 			children = (
 				0EABB784CC4CC45204E63CA1 /* AlertSeverityBreakdownTests.swift */,
+				D50189280D53EE5D350B921A /* ArtifactFactTests.swift */,
 				7294E1EB1AB2BC3775FC1E9D /* ConfigAuditModelsTests.swift */,
 				EDC43B9627D7C217071C5275 /* HarnessConfigurationHealthTests.swift */,
 				39CFE24CFF06C20FEC203C0B /* TimelineModelsTests.swift */,
@@ -387,6 +390,7 @@
 			files = (
 				0783AAA9D10980D16D10D045 /* AlertSeverityBreakdown.swift in Sources */,
 				55F95CB261F2C459B47E86FC /* AlertSeverityBreakdownTests.swift in Sources */,
+				CABD267D92A105B162179646 /* ArtifactFactTests.swift in Sources */,
 				3C8D8EFE80616515AA2B1929 /* ConfigAuditModels.swift in Sources */,
 				076516A9E8D79FF29811936D /* ConfigAuditModelsTests.swift in Sources */,
 				953ADF0AC9D10BB7EDA306B6 /* ConsoleModels.swift in Sources */,

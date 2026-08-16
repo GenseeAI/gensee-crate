@@ -18,6 +18,18 @@ struct DashboardHarnessesPage: View {
         model.integrations.filter { $0.installed && $0.supportsDirectHooks }.count
     }
 
+    private var auditCapableInstalledCount: Int {
+        model.integrations.filter { $0.installed && configAuditTarget($0) != nil }.count
+    }
+
+    private var auditedCount: Int {
+        model.integrations.filter {
+            $0.installed
+                && configAuditTarget($0) != nil
+                && model.auditedIntegrationIDs.contains($0.id)
+        }.count
+    }
+
     var body: some View {
         ScrollViewReader { scrollProxy in
             DashboardPage {
@@ -88,9 +100,18 @@ struct DashboardHarnessesPage: View {
             Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 48)
             summaryMetric(
                 value: "\(installedCount)",
-                label: "Detected",
+                label: "Installed",
                 detail: "of \(model.integrations.count) supported",
                 color: .dashboardBlue
+            )
+            Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 48)
+            summaryMetric(
+                value: "\(auditedCount)",
+                label: "Audited",
+                detail: "of \(auditCapableInstalledCount) audit-capable",
+                color: auditedCount == auditCapableInstalledCount && auditCapableInstalledCount > 0
+                    ? .dashboardGreen
+                    : .secondary
             )
             Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 48)
             HStack(spacing: 10) {

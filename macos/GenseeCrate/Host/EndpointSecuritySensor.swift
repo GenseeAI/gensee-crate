@@ -96,7 +96,6 @@ final class EndpointSecuritySensor: ObservableObject {
         mode: String,
         protectedPaths: [String],
         blockedExecutables: [String],
-        ownExecutables: [String],
         managedRoots: [[String: Any]],
         failClosedManagedOnly: Bool,
         maxAuthorizationLatencyMS: UInt64
@@ -106,7 +105,6 @@ final class EndpointSecuritySensor: ObservableObject {
             "mode": mode,
             "protected_paths": protectedPaths,
             "blocked_executables": blockedExecutables,
-            "own_executables": ownExecutables,
             "managed_roots": managedRoots,
             "fail_closed_managed_only": failClosedManagedOnly,
             "max_auth_latency_ms": maxAuthorizationLatencyMS,
