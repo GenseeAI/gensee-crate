@@ -28,6 +28,9 @@ The console includes:
   heatmaps for agent turns, tool calls, alerts, and token usage. Heatmap days
   are selectable and update the detailed summary.
 - Policy controls backed by `gensee policy get/set/path`.
+- A Config Audit tab backed by `gensee audit --json`, with native findings,
+  evidence, remediation, inventory, source provenance, and manual checks for
+  Codex CLI and VS Code/Copilot configuration.
 - A Harnesses page that detects Codex, Claude Code, Antigravity, Cursor,
   GitHub Copilot, and Omnigent. Installed direct-hook integrations can be
   enabled or disabled through `gensee setup`; unavailable harnesses remain

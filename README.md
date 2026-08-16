@@ -393,7 +393,9 @@ the app's active event-store/backend paths; stale or incomplete integrations
 show **Needs repair** with a one-click safe repair. See the
 [native macOS security console](docs/macos-app.md) guide. Its **Daily
 Highlight** page combines today's summary with rolling-year heatmaps for agent
-turns, tool calls, alerts, and supported transcript token totals.
+turns, tool calls, alerts, and supported transcript token totals. Its **Config
+Audit** tab runs the shared OSS auditor and presents Codex or VS Code/Copilot
+findings, evidence, inventory, source provenance, and manual checks natively.
 
 **Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
 `sandbox-exec` and can stage workspace writes for review.

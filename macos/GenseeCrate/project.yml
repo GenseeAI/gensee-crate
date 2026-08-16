@@ -29,6 +29,7 @@ targets:
       - Host/DashboardActivityPages.swift
       - Host/DashboardSecurityPages.swift
       - Host/DashboardHarnessesPage.swift
+      - Host/DashboardConfigAuditPage.swift
       - Host/DashboardConfigPages.swift
       - Host/EndpointSecurityExtensionManager.swift
       - Host/EndpointSecuritySensor.swift
@@ -37,6 +38,7 @@ targets:
       - Host/GenseeCLI.swift
       - Host/HarnessConfigurationHealth.swift
       - Host/ConsoleModels.swift
+      - Host/ConfigAuditModels.swift
       - Host/ConsoleModel.swift
       - Host/Brand.swift
       - Host/Assets.xcassets
@@ -127,7 +129,9 @@ targets:
     platform: macOS
     sources:
       - Host/HarnessConfigurationHealth.swift
+      - Host/ConfigAuditModels.swift
       - Tests/HarnessConfigurationHealthTests.swift
+      - Tests/ConfigAuditModelsTests.swift
     settings:
       base:
         CODE_SIGNING_ALLOWED: NO

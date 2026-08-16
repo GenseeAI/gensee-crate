@@ -10,6 +10,7 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var integrations: [IntegrationDescriptor] = []
     @Published private(set) var dailyDetail: DailyDetail?
     @Published private(set) var dailyDetailLoadState = DailyDetailLoadState.idle
+    @Published private(set) var configAudit: ConfigAuditBundle?
     @Published private(set) var isRefreshing = false
     @Published private(set) var runningCommand: String?
     @Published private(set) var feedbackAlertID: Int64?
@@ -188,6 +189,34 @@ final class ConsoleModel: ObservableObject {
         } catch {
             dashboardRefreshIssue = error.localizedDescription
             dailyDetailLoadState = .unavailable(day: day, message: error.localizedDescription)
+        }
+    }
+
+    func runConfigAudit(target: String, workspace: String) async {
+        guard backendAvailable else {
+            errorMessage = GenseeCLIError.executableNotFound.localizedDescription
+            return
+        }
+        let workspaceURL = URL(fileURLWithPath: workspace).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: workspaceURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            errorMessage = "Choose an existing workspace directory before running Config Audit."
+            return
+        }
+
+        configAudit = nil
+        runningCommand = "Auditing \(target == "vscode" ? "VS Code" : "Codex") configuration"
+        defer { runningCommand = nil }
+        do {
+            configAudit = try await cli.decode(
+                ConfigAuditBundle.self,
+                arguments: ["audit", target, "--workspace", workspaceURL.path, "--json"],
+                acceptingExitCodes: [0, 2]
+            )
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 

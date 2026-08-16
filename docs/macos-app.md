@@ -12,7 +12,7 @@ console.
 
 ## What the app manages
 
-- Dashboard, activity, alerts, transactions, and policy backed by the existing
+- Dashboard, activity, alerts, lineage, and policy backed by the existing
   Rust CLI and local store.
 - A **Daily Highlight** view with today's summary and rolling 53-week heatmaps
   for agent turns, tool calls, alerts, and captured token usage. Selecting a
@@ -24,6 +24,20 @@ console.
 - Endpoint Security `off`, `observe`, `protect`, and `strict` policy modes.
 - Harness protection for Codex, Claude Code, Antigravity, Cursor, GitHub
   Copilot, and Omnigent.
+- A **Config Audit** tab backed by the shared OSS Rust audit library for static,
+  read-only review of Codex CLI and VS Code/Copilot configuration.
+
+## Config Audit
+
+Choose **Codex CLI** or **VS Code + Copilot**, select a workspace, and run the
+audit from the native **Config Audit** tab. Findings are expandable with
+file-level evidence and remediation; Inventory, Sources, and Manual Checks
+retain the same versioned report content as `gensee audit --json`.
+
+The app invokes its embedded `gensee` backend. The audit bounds file size and
+directory depth and never launches agents, extensions, hooks, skills, MCP
+servers, or package runners. A partial report remains viewable when a specific
+configuration layer cannot be reconstructed.
 
 ## Harness controls
 

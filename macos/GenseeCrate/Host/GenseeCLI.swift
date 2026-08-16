@@ -110,6 +110,13 @@ struct GenseeCLI: Sendable {
     }
 
     func run(_ arguments: [String]) async throws -> GenseeCommandOutput {
+        try await run(arguments, acceptingExitCodes: [0])
+    }
+
+    func run(
+        _ arguments: [String],
+        acceptingExitCodes: Set<Int32>
+    ) async throws -> GenseeCommandOutput {
         guard let executableURL else { throw GenseeCLIError.executableNotFound }
         let homeURL = homeURL
 
@@ -148,7 +155,7 @@ struct GenseeCLI: Sendable {
                 stderr: String(decoding: stderr, as: UTF8.self),
                 exitCode: process.terminationStatus
             )
-            guard result.exitCode == 0 else {
+            guard acceptingExitCodes.contains(result.exitCode) else {
                 if process.terminationReason == .uncaughtSignal {
                     throw GenseeCLIError.commandTerminated(
                         arguments: arguments,
@@ -167,7 +174,15 @@ struct GenseeCLI: Sendable {
     }
 
     func decode<T: Decodable>(_ type: T.Type, arguments: [String]) async throws -> T {
-        let output = try await run(arguments)
+        try await decode(type, arguments: arguments, acceptingExitCodes: [0])
+    }
+
+    func decode<T: Decodable>(
+        _ type: T.Type,
+        arguments: [String],
+        acceptingExitCodes: Set<Int32>
+    ) async throws -> T {
+        let output = try await run(arguments, acceptingExitCodes: acceptingExitCodes)
         guard let data = output.stdout.data(using: .utf8) else {
             throw GenseeCLIError.invalidOutput("The Gensee backend returned non-UTF-8 output.")
         }
