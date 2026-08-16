@@ -162,6 +162,21 @@ struct DashboardSummary: Decodable {
     var alertsCount: Int = 0
     var recentHighAlerts: Int = 0
     var artifactsCount: Int = 0
+    var criticalAlertsCount: Int = 0
+    var highAlertsCount: Int = 0
+    var mediumAlertsCount: Int = 0
+    var lowAlertsCount: Int = 0
+    var infoAlertsCount: Int = 0
+
+    var alertsBySeverity: [String: Int] {
+        [
+            "critical": criticalAlertsCount,
+            "high": highAlertsCount,
+            "medium": mediumAlertsCount,
+            "low": lowAlertsCount,
+            "info": infoAlertsCount,
+        ]
+    }
 
     enum CodingKeys: String, CodingKey {
         case sessionsCount = "sessions_count"
@@ -171,6 +186,29 @@ struct DashboardSummary: Decodable {
         case alertsCount = "alerts_count"
         case recentHighAlerts = "recent_high_alerts"
         case artifactsCount = "artifacts_count"
+        case criticalAlertsCount = "critical_alerts_count"
+        case highAlertsCount = "high_alerts_count"
+        case mediumAlertsCount = "medium_alerts_count"
+        case lowAlertsCount = "low_alerts_count"
+        case infoAlertsCount = "info_alerts_count"
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        sessionsCount = try values.decodeIfPresent(Int.self, forKey: .sessionsCount) ?? 0
+        requestsCount = try values.decodeIfPresent(Int.self, forKey: .requestsCount) ?? 0
+        agentEventsCount = try values.decodeIfPresent(Int.self, forKey: .agentEventsCount) ?? 0
+        systemEventsCount = try values.decodeIfPresent(Int.self, forKey: .systemEventsCount) ?? 0
+        alertsCount = try values.decodeIfPresent(Int.self, forKey: .alertsCount) ?? 0
+        recentHighAlerts = try values.decodeIfPresent(Int.self, forKey: .recentHighAlerts) ?? 0
+        artifactsCount = try values.decodeIfPresent(Int.self, forKey: .artifactsCount) ?? 0
+        criticalAlertsCount = try values.decodeIfPresent(Int.self, forKey: .criticalAlertsCount) ?? 0
+        highAlertsCount = try values.decodeIfPresent(Int.self, forKey: .highAlertsCount) ?? 0
+        mediumAlertsCount = try values.decodeIfPresent(Int.self, forKey: .mediumAlertsCount) ?? 0
+        lowAlertsCount = try values.decodeIfPresent(Int.self, forKey: .lowAlertsCount) ?? 0
+        infoAlertsCount = try values.decodeIfPresent(Int.self, forKey: .infoAlertsCount) ?? 0
     }
 }
 

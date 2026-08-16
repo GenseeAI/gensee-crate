@@ -276,6 +276,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_request_ts
 CREATE INDEX IF NOT EXISTS idx_requests_created_at
     ON requests(created_at);
 
+CREATE INDEX IF NOT EXISTS idx_requests_session_id
+    ON requests(session_id, request_id);
+
 -- Supports the macOS console's bounded recent-request projection without a
 -- full table scan and temporary sort on every two-second refresh.
 CREATE INDEX IF NOT EXISTS idx_requests_dashboard_activity
@@ -286,6 +289,11 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_tool_use
 
 CREATE INDEX IF NOT EXISTS idx_system_events_request_ts
     ON system_events(request_id, ts);
+
+-- Keeps dashboard visibility checks index-only even when a large historical
+-- Endpoint Security stream remains in the audit database.
+CREATE INDEX IF NOT EXISTS idx_system_events_dashboard_visibility
+    ON system_events(source, request_id, ts DESC, event_id DESC);
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind_uri
     ON artifacts(kind, uri);

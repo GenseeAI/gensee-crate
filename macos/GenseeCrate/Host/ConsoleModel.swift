@@ -719,6 +719,10 @@ final class ConsoleModel: ObservableObject {
         let userHome = FileManager.default.homeDirectoryForCurrentUser
         var protectedPaths = [".ssh", ".aws", ".kube", ".config/gcloud"]
             .map { userHome.appendingPathComponent($0).path }
+        protectedPaths += [
+            homeURL.appendingPathComponent("policy.json").standardizedFileURL.path,
+            homeURL.appendingPathComponent("bin", isDirectory: true).standardizedFileURL.path,
+        ]
         var blockedExecutables: [String] = []
         var maxAuthorizationLatencyMS: UInt64 = 10
         if let data = policyDocument.data(using: .utf8),

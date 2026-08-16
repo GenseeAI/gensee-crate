@@ -3810,7 +3810,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 continue;
             }
         };
-        let (mut event, findings) = ingestor.ingest(parsed);
+        let (event, findings) = ingestor.ingest(parsed);
         let attributed_session_id = event.attribution.session_id.clone();
         let observed_at_ms = event.observed_at_ms;
         let active_tool = attributed_session_id
@@ -3827,7 +3827,8 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
         let tool_use_id = active_tool
             .as_ref()
             .and_then(|tool| tool.tool_use_id.clone());
-        let bookkeeping = endpoint_security_event_is_bookkeeping(&event);
+        let workspace_root = active_tool.as_ref().map(|tool| tool.cwd.as_str());
+        let bookkeeping = endpoint_security_event_is_bookkeeping(&event, workspace_root);
         let evidence = serde_json::to_value(&event).map_err(io::Error::other)?;
         for finding in findings {
             if finding.rule_id != "endpoint_security_event_gap"
@@ -3889,7 +3890,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
         if event.action == "notify" {
             if let Some(session_id) = active_session_id.as_deref() {
                 if let Some((logical_operation, path)) =
-                    alert_pipeline.logical_operation(&event, session_id)
+                    alert_pipeline.logical_operation(&event, session_id, workspace_root)
                 {
                     let policy_operation = endpoint_policy_operation(&event, logical_operation);
                     let key =
@@ -3946,17 +3947,14 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 None
             };
         let exit_code = event.exit_status;
-        // The ingestor retains ancestry internally, but idle or stale trees are
-        // persisted without request attribution. A later PreToolUse can make
-        // the same process tree eligible again inside its bounded window.
-        if active_session_id.is_none() {
-            event.attribution.session_id = None;
-            event.attribution.root_pid = None;
-            event.attribution.depth = None;
-            event.attribution.confidence = None;
-            event.attribution.matched_by = None;
+        // Global events still flow through the in-memory ancestry graph, but
+        // only activity correlated to a live tool window belongs in the
+        // product event store. Persisting the idle global stream makes the
+        // dashboard scan host bookkeeping while providing no user-facing
+        // attribution value.
+        if active_session_id.is_some() && !bookkeeping {
+            store.append_system_event(&event.into_system_event()?)?;
         }
-        store.append_system_event(&event.into_system_event()?)?;
         if let Some(session_id) = ended_root_session {
             store.end_session(&session_id, observed_at_ms, exit_code)?;
         }

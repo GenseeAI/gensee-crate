@@ -108,19 +108,21 @@ gensee policy set endpoint_security.mode observe
 - `strict` — use the managed-tree fail-closed posture while leaving unrelated
   host processes outside the deny scope.
 
-The app does not implicitly add `GENSEE_HOME` to the Endpoint Security protected
-path list. Hook binaries—including unsigned development and package-manager
-builds—must be able to read and update their own encrypted event store. The
-extension grants process-level bypass only to Gensee binaries carrying the
-approved Gensee Team ID and signing identifiers; it does not trust executable
-paths or file-content hashes.
+The app does not protect the mutable event-store files in `GENSEE_HOME`; hook
+binaries must be able to update that encrypted store. It always protects
+`$GENSEE_HOME/policy.json` and `$GENSEE_HOME/bin/`, so a managed agent cannot
+replace its active policy or stable hook backend. The extension grants
+process-level bypass only to Gensee binaries carrying the approved Gensee Team
+ID and signing identifiers; it does not trust executable paths or file-content
+hashes.
 
 Harness protection toggles also scope Endpoint Security attribution. Disabled
 hook harnesses are removed from the extension's managed roots immediately;
 managed `gensee run` sessions remain eligible independently. User-facing bypass
 findings require a bounded active tool-call window and pass through bookkeeping
 filters, logical-operation coalescing, and durable deduplication. Raw OS events
-may still be observed to maintain ancestry without becoming alerts.
+are still observed in memory to maintain ancestry, but events outside an active
+tool window are not persisted or surfaced as alerts.
 
 See the [Endpoint Security sensor](endpoint-security.md) guide for captured
 events, policy keys, safety boundaries, and rollback.

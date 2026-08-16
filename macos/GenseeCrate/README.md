@@ -80,7 +80,12 @@ preserves unrelated harness settings and hooks. It also removes that harness's
 active roots from Endpoint Security before the next event batch is fetched.
 Only events inside a bounded active tool-call window can become findings;
 runtime bookkeeping is filtered and related file events are coalesced and
-durably deduplicated.
+durably deduplicated. Build-output filtering requires both a fixed top-level
+root beneath the active workspace and a known build process. The app leaves
+the mutable event store writable while always protecting
+`$GENSEE_HOME/policy.json` and `$GENSEE_HOME/bin/`. Idle global OS events remain
+available to the in-memory ancestry tracker but are not written to the
+dashboard event store.
 
 ## Apple Developer configuration
 

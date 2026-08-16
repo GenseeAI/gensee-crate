@@ -105,6 +105,7 @@ pub struct ActiveToolCall {
     pub provider: String,
     pub tool_use_id: Option<String>,
     pub started_at_ms: u64,
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone)]
@@ -405,7 +406,7 @@ impl EventStore {
         let window = to_i64(window_ms)?;
         db.connection()
             .query_row(
-                "SELECT candidate.source, candidate.tool_use_id, candidate.ts
+                "SELECT candidate.source, candidate.tool_use_id, candidate.ts, candidate.cwd
                  FROM agent_events AS candidate
                  JOIN requests ON requests.request_id = candidate.request_id
                  WHERE requests.session_id = ?1
@@ -446,6 +447,7 @@ impl EventStore {
                         provider: row.get(0)?,
                         tool_use_id: row.get(1)?,
                         started_at_ms: u64::try_from(row.get::<_, i64>(2)?).unwrap_or_default(),
+                        cwd: row.get(3)?,
                     })
                 },
             )
@@ -457,9 +459,10 @@ impl EventStore {
     pub fn dashboard_state(&self) -> io::Result<Value> {
         let db = self.sqlite_store()?;
         let conn = db.connection();
-        let alert_visibility = dashboard_alert_visibility_sql("alerts");
+        let visible_alerts_cte = dashboard_visible_alerts_cte();
         let alerts_sql = format!(
-            "SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
+            "WITH {visible_alerts_cte}
+             SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
                 alerts.severity, alerts.action, alerts.rule_id, alerts.message,
                 alerts.path, alerts.evidence, alerts.created_at,
                 requests.session_id,
@@ -467,7 +470,7 @@ impl EventStore {
                 trigger_event.source, trigger_event.type, trigger_event.tool_name,
                 trigger_event.tool_input, trigger_event.tool_use_id,
                 feedback.human_verdict, feedback.label, feedback.created_at
-             FROM alerts
+             FROM visible_alerts AS alerts
              LEFT JOIN requests ON requests.request_id = alerts.request_id
              LEFT JOIN agent_events AS trigger_event
                ON trigger_event.event_id = COALESCE(
@@ -511,9 +514,8 @@ impl EventStore {
                           candidate_feedback.feedback_id DESC
                  LIMIT 1
                )
-             WHERE {alert_visibility}
              ORDER BY alerts.created_at DESC, alerts.alert_id DESC
-             LIMIT 200"
+             LIMIT 200",
         );
         let alerts = query_json_rows(conn, &alerts_sql, |row| {
             Ok(json!({
@@ -573,7 +575,9 @@ impl EventStore {
              FROM system_events
              WHERE NOT (
                 source = 'macos-endpoint-security'
-                AND args LIKE '%\"session_id\":null%'
+                AND request_id IN (
+                    SELECT request_id FROM requests WHERE session_id = 'system'
+                )
              )
              ORDER BY ts DESC, event_id DESC
              LIMIT 200",
@@ -684,10 +688,9 @@ impl EventStore {
                 "_observation_mode": row.get::<_, Option<i64>>(15)?,
             }))
         })?;
-        debug_assert!(artifact_rows.iter().all(dashboard_artifact_is_visible));
-        let visible_artifact_count = artifact_rows.len();
         let artifacts = artifact_rows
             .into_iter()
+            .filter(dashboard_artifact_is_visible)
             .map(|mut artifact| {
                 if let Some(object) = artifact.as_object_mut() {
                     object.remove("_observation_source");
@@ -696,22 +699,38 @@ impl EventStore {
                 artifact
             })
             .collect::<Vec<_>>();
-        let source_visibility = dashboard_path_visibility_sql("src_path");
-        let destination_visibility = dashboard_path_visibility_sql("dst_path");
+        let visible_artifact_count = artifacts.len();
         let relation_query = format!(
-            "WITH candidates AS (
-                SELECT r.relation_id, r.relation_type AS type, r.confidence AS confidence,
-                    sa.uri AS src_uri, da.uri AS dst_uri,
-                    CASE WHEN sa.uri LIKE 'file://%' THEN substr(sa.uri, 8) ELSE sa.uri END AS src_path,
-                    CASE WHEN da.uri LIKE 'file://%' THEN substr(da.uri, 8) ELSE da.uri END AS dst_path
-                 FROM relations r
-                 JOIN artifacts sa ON r.src_kind = 'artifact' AND r.src_id = sa.artifact_id
-                 JOIN artifacts da ON r.dst_kind = 'artifact' AND r.dst_id = da.artifact_id
+            "WITH artifact_candidates AS (
+                SELECT facts.kind, facts.uri, facts.current_artifact_id, facts.last_seen_at,
+                    COALESCE(json_extract(facts.metadata, '$.source'),
+                             facts.last_modified_source, last_event.source) AS observation_source,
+                    json_extract(last_event.args, '$.file.mode') AS observation_mode,
+                    CASE WHEN facts.uri LIKE 'file://%'
+                         THEN substr(facts.uri, 8)
+                         ELSE facts.uri
+                    END AS observation_path
+                FROM artifact_facts AS facts
+                LEFT JOIN system_events AS last_event
+                  ON last_event.event_id = facts.last_system_event_id
+             ),
+             visible_artifacts AS MATERIALIZED (
+                SELECT kind, uri, current_artifact_id AS artifact_id
+                FROM artifact_candidates
+                WHERE {artifact_visibility}
+                  AND current_artifact_id IS NOT NULL
+                ORDER BY last_seen_at DESC
+                LIMIT 80
              )
-             SELECT type, confidence, src_uri, dst_uri
-             FROM candidates
-             WHERE {source_visibility} AND {destination_visibility}
-             ORDER BY relation_id DESC
+             SELECT r.relation_type, r.confidence,
+                    visible_source.uri, visible_destination.uri
+             FROM visible_artifacts AS visible_source
+             CROSS JOIN relations AS r INDEXED BY idx_relations_src
+               ON r.src_kind = 'artifact' AND r.src_id = visible_source.artifact_id
+             JOIN visible_artifacts AS visible_destination
+               ON r.dst_kind = 'artifact'
+              AND r.dst_id = visible_destination.artifact_id
+             ORDER BY r.relation_id DESC
              LIMIT 200"
         );
         let relations = query_json_rows(conn, &relation_query, |row| {
@@ -722,7 +741,10 @@ impl EventStore {
                 "dst_uri": row.get::<_, String>(3)?,
             }))
         })?;
-        debug_assert!(relations.iter().all(dashboard_relation_is_visible));
+        let relations = relations
+            .into_iter()
+            .filter(dashboard_relation_is_visible)
+            .collect::<Vec<_>>();
         let human_feedback = query_json_rows(
             conn,
             "SELECT event_key, tool_use_id, session_id, gensee_action, human_verdict,
@@ -746,21 +768,28 @@ impl EventStore {
             },
         )?;
         let dashboard_summary_sql = format!(
-            "SELECT
+            "WITH {visible_alerts_cte}
+             SELECT
                 (SELECT COUNT(*) FROM sessions),
                 (SELECT COUNT(*) FROM requests),
                 (SELECT COUNT(*) FROM agent_events),
                 (SELECT COUNT(*) FROM system_events
                   WHERE NOT (
                     source = 'macos-endpoint-security'
-                    AND args LIKE '%\"session_id\":null%'
+                    AND request_id IN (
+                        SELECT request_id FROM requests WHERE session_id = 'system'
+                    )
                   )),
-                (SELECT COUNT(*) FROM alerts WHERE {alert_visibility}),
-                (SELECT COUNT(*) FROM alerts
-                  WHERE {alert_visibility}
-                    AND severity IN ('high', 'critical')
+                (SELECT COUNT(*) FROM visible_alerts),
+                (SELECT COUNT(*) FROM visible_alerts
+                  WHERE severity IN ('high', 'critical')
                     AND created_at >= (unixepoch('now') - 86400) * 1000),
-                (SELECT COUNT(*) FROM artifact_facts)"
+                (SELECT COUNT(*) FROM artifact_facts),
+                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'critical'),
+                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'high'),
+                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'medium'),
+                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'low'),
+                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'info')"
         );
         let mut dashboard_summary = query_json_rows(conn, &dashboard_summary_sql, |row| {
             Ok(json!({
@@ -771,6 +800,11 @@ impl EventStore {
                 "alerts_count": row.get::<_, i64>(4)?,
                 "recent_high_alerts": row.get::<_, i64>(5)?,
                 "artifacts_count": row.get::<_, i64>(6)?,
+                "critical_alerts_count": row.get::<_, i64>(7)?,
+                "high_alerts_count": row.get::<_, i64>(8)?,
+                "medium_alerts_count": row.get::<_, i64>(9)?,
+                "low_alerts_count": row.get::<_, i64>(10)?,
+                "info_alerts_count": row.get::<_, i64>(11)?,
             }))
         })?
         .into_iter()
@@ -778,7 +812,7 @@ impl EventStore {
         .unwrap_or_else(|| json!({}));
         dashboard_summary["artifacts_count"] = json!(visible_artifact_count);
         let daily_activity_sql = format!(
-            "WITH
+            "WITH {visible_alerts_cte},
              daily_requests AS (
                 SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
                        COUNT(*) AS count,
@@ -808,9 +842,8 @@ impl EventStore {
              daily_alerts AS (
                 SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
                        COUNT(*) AS count
-                FROM alerts
+                FROM visible_alerts
                 WHERE date(created_at / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-371 days')
-                  AND {alert_visibility}
                 GROUP BY day
              ),
              days AS (
@@ -871,7 +904,7 @@ impl EventStore {
 
         let db = self.sqlite_store()?;
         let conn = db.connection();
-        let alert_visibility = dashboard_alert_visibility_sql("alerts");
+        let visible_alerts_cte = dashboard_visible_alerts_cte();
         let valid: i64 = conn
             .query_row("SELECT date(?1) = ?1", [day], |row| row.get(0))
             .map_err(sqlite_error_from_rusqlite)?;
@@ -883,7 +916,8 @@ impl EventStore {
         }
 
         let totals_sql = format!(
-            "SELECT
+            "WITH {visible_alerts_cte}
+             SELECT
                (SELECT COUNT(DISTINCT session_id) FROM requests
                  WHERE session_id != 'system'
                    AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
@@ -894,9 +928,8 @@ impl EventStore {
                         OR EXISTS (SELECT 1 FROM agent_events ae WHERE ae.request_id = requests.request_id))),
                (SELECT COUNT(*) FROM agent_events
                  WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1),
-               (SELECT COUNT(*) FROM alerts
-                 WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
-                   AND {alert_visibility}),
+               (SELECT COUNT(*) FROM visible_alerts
+                 WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
                (SELECT COALESCE(SUM(total_tokens), 0) FROM requests
                  WHERE session_id != 'system'
                    AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
@@ -948,16 +981,16 @@ impl EventStore {
              GROUP BY tool_name ORDER BY COUNT(*) DESC, tool_name LIMIT 8",
         )?;
         let alerts_by_action_sql = format!(
-            "SELECT action, COUNT(*) FROM alerts
+            "WITH {visible_alerts_cte}
+             SELECT action, COUNT(*) FROM visible_alerts
              WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
-               AND {alert_visibility}
              GROUP BY action ORDER BY COUNT(*) DESC, action"
         );
         let alerts_by_action = grouped(&alerts_by_action_sql)?;
         let alerts_by_severity_sql = format!(
-            "SELECT severity, COUNT(*) FROM alerts
+            "WITH {visible_alerts_cte}
+             SELECT severity, COUNT(*) FROM visible_alerts
              WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
-               AND {alert_visibility}
              GROUP BY severity ORDER BY COUNT(*) DESC, severity"
         );
         let alerts_by_severity = grouped(&alerts_by_severity_sql)?;
@@ -3050,7 +3083,7 @@ fn dashboard_path_visibility_sql(path: &str) -> String {
     )
 }
 
-fn dashboard_alert_visibility_sql(alias: &str) -> String {
+fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
     let path = format!("COALESCE({alias}.path, '')");
     let lower_path = format!("lower({path})");
     format!(
@@ -3071,19 +3104,33 @@ fn dashboard_alert_visibility_sql(alias: &str) -> String {
               OR {lower_path} LIKE '%/node_modules/.cache/%'
               OR {lower_path} LIKE '%/test-results/%'
               OR {lower_path} LIKE '%/testresults/%'
-         ))
-         AND NOT ({alias}.rule_id = 'hook_bypass_file_mutation' AND EXISTS (
-              SELECT 1 FROM alerts AS earlier
-              WHERE earlier.alert_id < {alias}.alert_id
-                AND earlier.rule_id = {alias}.rule_id
-                AND earlier.request_id IS {alias}.request_id
-                AND COALESCE(earlier.path, '') = COALESCE({alias}.path, '')
-                AND ABS(earlier.created_at - {alias}.created_at) <= 10000
-                AND COALESCE(json_extract(earlier.evidence, '$.actor.pid'), -1) =
-                    COALESCE(json_extract({alias}.evidence, '$.actor.pid'), -1)
-                AND COALESCE(json_extract(earlier.evidence, '$.actor.pidversion'), -1) =
-                    COALESCE(json_extract({alias}.evidence, '$.actor.pidversion'), -1)
          ))"
+    )
+}
+
+fn dashboard_visible_alerts_cte() -> String {
+    let base_visibility = dashboard_alert_base_visibility_sql("alerts");
+    format!(
+        "ranked_dashboard_alerts AS MATERIALIZED (
+            SELECT alerts.*,
+                   LAG(alerts.created_at) OVER (
+                       PARTITION BY alerts.rule_id,
+                                    alerts.request_id,
+                                    COALESCE(alerts.path, ''),
+                                    COALESCE(json_extract(alerts.evidence, '$.actor.pid'), -1),
+                                    COALESCE(json_extract(alerts.evidence, '$.actor.pidversion'), -1)
+                       ORDER BY alerts.created_at, alerts.alert_id
+                   ) AS previous_related_alert_at
+            FROM alerts
+            WHERE {base_visibility}
+         ),
+         visible_alerts AS MATERIALIZED (
+            SELECT *
+            FROM ranked_dashboard_alerts
+            WHERE rule_id != 'hook_bypass_file_mutation'
+               OR previous_related_alert_at IS NULL
+               OR created_at - previous_related_alert_at > 10000
+         )"
     )
 }
 
@@ -4641,6 +4688,16 @@ mod tests {
         assert_eq!(store.list_alerts().unwrap().len(), 4);
         let dashboard = store.dashboard_state().unwrap();
         assert_eq!(dashboard["summary"]["alerts_count"], 1);
+        assert_eq!(dashboard["summary"]["medium_alerts_count"], 1);
+        let severity_total = ["critical", "high", "medium", "low", "info"]
+            .into_iter()
+            .map(|severity| {
+                dashboard["summary"][format!("{severity}_alerts_count")]
+                    .as_i64()
+                    .unwrap()
+            })
+            .sum::<i64>();
+        assert_eq!(severity_total, dashboard["summary"]["alerts_count"]);
         assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 1);
         assert_eq!(dashboard["alerts"][0]["path"], "/repo/out.txt");
 
@@ -4807,6 +4864,7 @@ mod tests {
         assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 1);
         assert_eq!(dashboard["summary"]["alerts_count"], 1);
         assert_eq!(dashboard["summary"]["recent_high_alerts"], 1);
+        assert_eq!(dashboard["summary"]["high_alerts_count"], 1);
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -5072,6 +5130,20 @@ mod tests {
         )
         .unwrap();
         let clean_destination = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO artifact_facts (
+                kind, uri, current_artifact_id, last_seen_at, last_modified_source, metadata
+             ) VALUES ('file', 'file:///repo/source', ?1, 10000, 'agent', '{}')",
+            [clean_source],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artifact_facts (
+                kind, uri, current_artifact_id, last_seen_at, last_modified_source, metadata
+             ) VALUES ('file', 'file:///repo/destination', ?1, 9999, 'agent', '{}')",
+            [clean_destination],
+        )
+        .unwrap();
         for index in 0..300 {
             conn.execute(
                 "INSERT INTO relations (
@@ -5805,6 +5877,7 @@ mod tests {
         let active = store.active_tool_call("s1", 250, 1_000).unwrap().unwrap();
         assert_eq!(active.provider, "claude-code");
         assert_eq!(active.tool_use_id.as_deref(), Some("tool-active"));
+        assert_eq!(active.cwd, "/repo");
         assert!(store
             .active_tool_call("s1", 1_201, 1_000)
             .unwrap()

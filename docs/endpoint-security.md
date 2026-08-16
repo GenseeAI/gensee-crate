@@ -58,10 +58,13 @@ gensee policy set endpoint_security.protected_paths /absolute/path,/another/path
 gensee policy set endpoint_security.blocked_executables /usr/bin/osascript
 ```
 
-`GENSEE_HOME` is not protected implicitly because hook binaries must update the
-encrypted store. The extension recognizes its own processes only by the Gensee
-Team ID and signing identifiers; executable paths and file-content hashes do
-not grant an authorization bypass.
+The mutable event-store files in `GENSEE_HOME` are not protected implicitly
+because hook binaries must update them. The app always protects
+`$GENSEE_HOME/policy.json` and `$GENSEE_HOME/bin/`, preventing a managed agent
+from replacing the policy or stable hook backend that governs its next action.
+The extension recognizes its own processes only by the Gensee Team ID and
+signing identifiers; executable paths and file-content hashes do not grant an
+authorization bypass.
 
 Authorization decisions are deterministic and local to the extension. The ES
 callback never waits for the UI, XPC, SQLite, or human approval. Session-dependent
@@ -79,15 +82,20 @@ attribution from the extension.
 The Rust ingester attaches an event to a request only while that session has an
 unfinished `PreToolUse` or `PermissionRequest` event no more than 60 seconds old.
 `PostToolUse`, `PostToolUseFailure`, a blocking decision, or expiry closes that
-window. Outside it, the OS event remains audit telemetry without request
-attribution and cannot produce a hook-bypass finding.
+window. Outside it, the OS event still updates the ingester's in-memory ancestry
+graph, but it is not written to the product event store and cannot produce a
+hook-bypass finding. This prevents idle host telemetry from growing the local
+database or delaying the dashboard.
 
 Before findings are stored, known harness bookkeeping (including Crashpad,
 transcripts, compiler/build output, test results, and harness SQLite sidecars)
-is excluded. Related `open`, `write`, and modified `close` notifications are
-coalesced into one mutation. Alerts are then deduplicated for 10 seconds by
-session, exact `(pid,pidversion)` identity, path, logical operation, and rule;
-the database repeats this check so app restarts cannot replay the same alert.
+is excluded. Build and test paths qualify only when they are fixed top-level
+roots directly beneath the active tool's workspace and the actor is a known
+build process; an agent-created directory with a build-like name is not enough.
+Related `open`, `write`, and modified `close` notifications are coalesced into
+one mutation. Alerts are then deduplicated for 10 seconds by session, exact
+`(pid,pidversion)` identity, path, logical operation, and rule; the database
+repeats this check so app restarts cannot replay the same alert.
 
 ## Safety and rollback
 

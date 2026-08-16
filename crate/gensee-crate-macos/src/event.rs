@@ -275,8 +275,9 @@ impl EndpointSecurityAlertPipeline {
         &mut self,
         event: &EndpointSecurityEvent,
         session_id: &str,
+        workspace_root: Option<&str>,
     ) -> Option<(&'static str, String)> {
-        if endpoint_security_event_is_bookkeeping(event) {
+        if endpoint_security_event_is_bookkeeping(event, workspace_root) {
             return None;
         }
         let operation = endpoint_security_logical_operation(event)?;
@@ -326,9 +327,13 @@ pub fn endpoint_security_reporting_path(event: &EndpointSecurityEvent) -> Option
 }
 
 /// Known harness/runtime bookkeeping is useful as raw telemetry but is not a
-/// security finding. Keep this list narrow and based on dedicated state/build
-/// locations rather than filename extensions alone.
-pub fn endpoint_security_event_is_bookkeeping(event: &EndpointSecurityEvent) -> bool {
+/// security finding. Build-output suppression requires both a fixed top-level
+/// root under the active workspace and a known build process; directory names
+/// or filename extensions alone are never enough.
+pub fn endpoint_security_event_is_bookkeeping(
+    event: &EndpointSecurityEvent,
+    workspace_root: Option<&str>,
+) -> bool {
     let executable = event
         .actor
         .executable_path
@@ -363,13 +368,7 @@ pub fn endpoint_security_event_is_bookkeeping(event: &EndpointSecurityEvent) -> 
     {
         return true;
     }
-    if lower.contains("/target/")
-        || lower.contains("/deriveddata/")
-        || lower.contains("/.build/")
-        || lower.contains("/node_modules/.cache/")
-        || lower.contains("/test-results/")
-        || lower.contains("/testresults/")
-    {
+    if endpoint_security_event_is_known_build_output(event, &lower, workspace_root) {
         return true;
     }
     let sqlite_sidecar =
@@ -379,6 +378,69 @@ pub fn endpoint_security_event_is_bookkeeping(event: &EndpointSecurityEvent) -> 
             || lower.contains("/.claude/")
             || lower.contains("/library/application support/cursor/")
             || lower.contains("/library/application support/code/"))
+}
+
+fn endpoint_security_event_is_known_build_output(
+    event: &EndpointSecurityEvent,
+    normalized_lower_path: &str,
+    workspace_root: Option<&str>,
+) -> bool {
+    let executable = event
+        .actor
+        .executable_path
+        .as_deref()
+        .unwrap_or_default()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let executable_name = executable.rsplit('/').next().unwrap_or_default();
+    let known_build_process = matches!(
+        executable_name,
+        "cargo"
+            | "rustc"
+            | "cc"
+            | "c++"
+            | "clang"
+            | "clang++"
+            | "ld"
+            | "swift"
+            | "swiftc"
+            | "swift-frontend"
+            | "xcodebuild"
+            | "xctest"
+            | "npm"
+            | "npx"
+            | "yarn"
+            | "pnpm"
+            | "bun"
+    );
+    if !known_build_process {
+        return false;
+    }
+
+    let Some(workspace_root) = workspace_root.filter(|root| !root.trim().is_empty()) else {
+        return false;
+    };
+    let workspace_root = workspace_root
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if workspace_root.is_empty() {
+        return false;
+    }
+    [
+        "target",
+        "deriveddata",
+        ".build",
+        "node_modules/.cache",
+        "test-results",
+        "testresults",
+    ]
+    .iter()
+    .any(|relative| {
+        let build_root = format!("{workspace_root}/{relative}");
+        normalized_lower_path == build_root
+            || normalized_lower_path.starts_with(&format!("{build_root}/"))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -539,7 +601,7 @@ impl EndpointSecurityIngestor {
                 let key = event.actor.key();
                 self.exited.insert(key);
                 if let Some(node) = self.nodes.remove(&key) {
-                    if node.depth == Some(0) {
+                    if node.depth == Some(0) || node.root_pid == Some(event.actor.pid) {
                         self.active_roots.remove(&event.actor.pid);
                         if let Some(session_id) = node.session_id {
                             for descendant in self.nodes.values_mut() {
@@ -825,6 +887,29 @@ mod tests {
     }
 
     #[test]
+    fn sensor_attributed_root_exit_revokes_helpers_without_depth() {
+        let mut ingestor = EndpointSecurityIngestor::new(&[]);
+        let mut root = event("open", process(10, 1, Some(1), Some(1)));
+        root.attribution.session_id = Some("session-1".to_string());
+        root.attribution.root_pid = Some(10);
+        ingestor.ingest(root);
+
+        let mut helper = event("open", process(11, 1, Some(10), Some(1)));
+        helper.attribution.session_id = Some("session-1".to_string());
+        helper.attribution.root_pid = Some(10);
+        ingestor.ingest(helper);
+
+        let mut exit = event("exit", process(10, 1, Some(1), Some(1)));
+        exit.attribution.session_id = Some("session-1".to_string());
+        exit.attribution.root_pid = Some(10);
+        ingestor.ingest(exit);
+
+        let (helper_event, _) = ingestor.ingest(event("open", process(11, 1, Some(10), Some(1))));
+        assert_eq!(helper_event.attribution.session_id, None);
+        assert_eq!(ingestor.health()["active_session_roots"], 0);
+    }
+
+    #[test]
     fn coalesces_open_write_and_close_into_one_mutation() {
         let mut pipeline = EndpointSecurityAlertPipeline::new(10_000);
         let mut open = event("open", process(20, 2, Some(10), Some(1)));
@@ -834,20 +919,26 @@ mod tests {
             ..EndpointSecurityFile::default()
         });
         assert_eq!(
-            pipeline.logical_operation(&open, "session-1"),
+            pipeline.logical_operation(&open, "session-1", Some("/repo")),
             Some(("mutation", "/repo/output.txt".to_string()))
         );
 
         let mut write = event("write", process(20, 2, Some(10), Some(1)));
         write.observed_at_ms = 2;
         write.file = open.file.clone();
-        assert_eq!(pipeline.logical_operation(&write, "session-1"), None);
+        assert_eq!(
+            pipeline.logical_operation(&write, "session-1", Some("/repo")),
+            None
+        );
 
         let mut close = event("close", process(20, 2, Some(10), Some(1)));
         close.observed_at_ms = 3;
         close.modified = Some(true);
         close.file = open.file;
-        assert_eq!(pipeline.logical_operation(&close, "session-1"), None);
+        assert_eq!(
+            pipeline.logical_operation(&close, "session-1", Some("/repo")),
+            None
+        );
     }
 
     #[test]
@@ -861,8 +952,12 @@ mod tests {
         let mut second = first.clone();
         second.actor = process(21, 1, Some(10), Some(1));
         second.observed_at_ms = 2;
-        assert!(pipeline.logical_operation(&first, "session-1").is_some());
-        assert!(pipeline.logical_operation(&second, "session-1").is_some());
+        assert!(pipeline
+            .logical_operation(&first, "session-1", Some("/repo"))
+            .is_some());
+        assert!(pipeline
+            .logical_operation(&second, "session-1", Some("/repo"))
+            .is_some());
     }
 
     #[test]
@@ -874,6 +969,13 @@ mod tests {
             ),
             ("/bin/codex", "/Users/me/.codex/sessions/2026/session.jsonl"),
             ("/bin/rustc", "/repo/target/debug/deps/output.o"),
+            ("/usr/bin/swiftc", "/repo/.build/debug/output.o"),
+            ("/usr/bin/xcodebuild", "/repo/deriveddata/Build/output.o"),
+            (
+                "/opt/homebrew/bin/npm",
+                "/repo/node_modules/.cache/cache.bin",
+            ),
+            ("/usr/bin/xctest", "/repo/test-results/result.xml"),
             ("/bin/codex", "/Users/me/.codex/state.sqlite-wal"),
             ("/bin/codex", "/dev/null"),
         ] {
@@ -883,8 +985,43 @@ mod tests {
                 path: path.to_string(),
                 ..EndpointSecurityFile::default()
             });
-            assert!(endpoint_security_event_is_bookkeeping(&raw), "{path}");
+            assert!(
+                endpoint_security_event_is_bookkeeping(&raw, Some("/repo")),
+                "{path}"
+            );
         }
+    }
+
+    #[test]
+    fn does_not_hide_agent_files_in_build_named_directories() {
+        for path in [
+            "/repo/target/exfil.env",
+            "/repo/src/test-results/id_rsa",
+            "/other/target/exfil.env",
+        ] {
+            let mut raw = event("write", process(20, 2, Some(10), Some(1)));
+            raw.actor.executable_path =
+                Some("/Applications/Codex.app/Contents/MacOS/Codex".to_string());
+            raw.file = Some(EndpointSecurityFile {
+                path: path.to_string(),
+                ..EndpointSecurityFile::default()
+            });
+            assert!(
+                !endpoint_security_event_is_bookkeeping(&raw, Some("/repo")),
+                "{path}"
+            );
+        }
+
+        let mut nested_build = event("write", process(20, 2, Some(10), Some(1)));
+        nested_build.actor.executable_path = Some("/bin/rustc".to_string());
+        nested_build.file = Some(EndpointSecurityFile {
+            path: "/repo/src/target/output.o".to_string(),
+            ..EndpointSecurityFile::default()
+        });
+        assert!(!endpoint_security_event_is_bookkeeping(
+            &nested_build,
+            Some("/repo")
+        ));
     }
 
     #[test]
@@ -894,6 +1031,6 @@ mod tests {
             path: "/repo/security-events.log".to_string(),
             ..EndpointSecurityFile::default()
         });
-        assert!(!endpoint_security_event_is_bookkeeping(&raw));
+        assert!(!endpoint_security_event_is_bookkeeping(&raw, Some("/repo")));
     }
 }

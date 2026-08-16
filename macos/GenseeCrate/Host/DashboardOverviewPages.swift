@@ -33,12 +33,13 @@ struct DashboardOverviewPage: View {
                     DashboardStatCard(title: "Sessions", value: model.snapshot.summary.sessionsCount, symbol: "person.2", color: .dashboardBlue)
                     DashboardStatCard(title: "Requests", value: model.snapshot.summary.requestsCount, symbol: "doc.text", color: .dashboardGreen)
                     DashboardStatCard(title: "Agent Events", value: model.snapshot.summary.agentEventsCount, symbol: "bolt", color: .dashboardGold)
-                    DashboardStatCard(title: "High Alerts (24 h)", value: model.snapshot.summary.recentHighAlerts, symbol: "exclamationmark.triangle", color: .dashboardRed)
+                    DashboardStatCard(title: "High + Critical (24 h)", value: model.snapshot.summary.recentHighAlerts, symbol: "exclamationmark.triangle", color: .dashboardRed)
+                        .help("High and critical describe potential impact. The alert action separately shows whether Gensee warned, asked, or blocked.")
                 }
 
                 HStack(alignment: .top, spacing: 16) {
                     ActivityChartCard(model: model).frame(maxWidth: .infinity)
-                    SeverityBreakdownCard(alerts: model.snapshot.alerts).frame(width: 360)
+                    SeverityBreakdownCard(summary: model.snapshot.summary).frame(width: 360)
                 }
 
                 DashboardCard("Recent Alerts") {
@@ -129,10 +130,9 @@ private struct ActivityChartCard: View {
 }
 
 private struct SeverityBreakdownCard: View {
-    let alerts: [SecurityAlert]
-    private var severityValues: [String] { alerts.map(\.severity) }
-    private var severityCounts: [String: Int] { AlertSeverityBreakdown.counts(for: severityValues) }
-    private var slices: [AlertSeveritySlice] { AlertSeverityBreakdown.slices(for: severityValues) }
+    let summary: DashboardSummary
+    private var severityCounts: [String: Int] { summary.alertsBySeverity }
+    private var slices: [AlertSeveritySlice] { AlertSeverityBreakdown.slices(for: severityCounts) }
 
     var body: some View {
         DashboardCard("Alert severity breakdown") {
@@ -146,7 +146,7 @@ private struct SeverityBreakdownCard: View {
                             .rotationEffect(.degrees(-90))
                     }
                     VStack(spacing: 0) {
-                        Text(alerts.count.formatted()).font(.system(size: 23, weight: .semibold))
+                        Text(summary.alertsCount.formatted()).font(.system(size: 23, weight: .semibold))
                         Text("alerts").font(.caption).foregroundStyle(.secondary)
                     }
                 }

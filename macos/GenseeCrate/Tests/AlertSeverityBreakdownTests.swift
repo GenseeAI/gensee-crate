@@ -27,6 +27,14 @@ final class AlertSeverityBreakdownTests: XCTestCase {
         XCTAssertEqual(counts.values.reduce(0, +), 2)
     }
 
+    func testSlicesAcceptFullStoreAggregateCounts() throws {
+        let counts = ["critical": 3, "high": 107, "medium": 36, "low": 9, "info": 48]
+        let slices = AlertSeverityBreakdown.slices(for: counts)
+
+        XCTAssertEqual(slices.map(\.count).reduce(0, +), 203)
+        XCTAssertEqual(try XCTUnwrap(slices.last).endFraction, 1, accuracy: 0.000_001)
+    }
+
     func testAlertReadStateResetsWhenStoreCountRollsBack() {
         XCTAssertTrue(AlertReadState.storeWasReset(
             alertCount: 20,

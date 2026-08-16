@@ -21,7 +21,10 @@ enum AlertSeverityBreakdown {
     }
 
     static func slices(for severities: [String]) -> [AlertSeveritySlice] {
-        let severityCounts = counts(for: severities)
+        slices(for: counts(for: severities))
+    }
+
+    static func slices(for severityCounts: [String: Int]) -> [AlertSeveritySlice] {
         let total = severityCounts.values.reduce(0, +)
         guard total > 0 else { return [] }
 
