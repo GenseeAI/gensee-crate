@@ -5,10 +5,8 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
     case liveFeed = "Live Feed"
     case today = "Daily Highlight"
     case timeline = "Timeline"
-    case transactions = "Transactions"
     case alerts = "Alerts"
     case lineage = "Lineage Graph"
-    case feedback = "Feedback"
     case harnesses = "Harnesses"
     case policy = "Policy"
     case settings = "Settings"
@@ -21,10 +19,8 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
         case .liveFeed: "bolt"
         case .today: "star"
         case .timeline: "clock"
-        case .transactions: "arrow.triangle.branch"
         case .alerts: "exclamationmark.triangle"
         case .lineage: "point.3.connected.trianglepath.dotted"
-        case .feedback: "hand.thumbsup"
         case .harnesses: "switch.2"
         case .policy: "checkmark.shield"
         case .settings: "gearshape"
@@ -43,7 +39,7 @@ struct DashboardShell: View {
         VStack(spacing: 0) {
             topBar
             HStack(spacing: 0) {
-                DashboardSidebar(selection: $selection, alertCount: model.snapshot.summary.alertsCount)
+                DashboardSidebar(selection: $selection, alertCount: model.unreadAlertCount)
                     .frame(width: 220)
                 Rectangle().fill(Color.dashboardLine).frame(width: 1)
                 ZStack {
@@ -124,11 +120,6 @@ struct DashboardShell: View {
                 .buttonStyle(.plain).help("Help and settings")
             Button { darkMode.toggle() } label: { Image(systemName: darkMode ? "sun.max" : "moon") }
                 .buttonStyle(.plain).help(darkMode ? "Switch to light mode" : "Switch to dark mode")
-            Circle()
-                .fill(Color.dashboardRed)
-                .frame(width: 28, height: 28)
-                .overlay(Image(systemName: "person.fill").font(.system(size: 12)).foregroundStyle(.white))
-            Text("Admin").font(.system(size: 13))
         }
         .padding(.horizontal, 16)
         .frame(height: 56)
@@ -143,10 +134,8 @@ struct DashboardShell: View {
         case .liveFeed: LiveFeedPage(model: model, searchText: searchText)
         case .today: TodayHighlightPage(model: model)
         case .timeline: TimelinePage(model: model, searchText: searchText)
-        case .transactions: TransactionsPage(model: model, searchText: searchText)
         case .alerts: DashboardAlertsPage(model: model, searchText: searchText)
         case .lineage: LineagePage(model: model, searchText: searchText)
-        case .feedback: FeedbackPage(model: model, searchText: searchText)
         case .harnesses: DashboardHarnessesPage(model: model)
         case .policy: DashboardPolicyPage(model: model)
         case .settings: DashboardSettingsPage(
@@ -175,9 +164,9 @@ private struct DashboardSidebar: View {
         VStack(alignment: .leading, spacing: 0) {
             navGroup("OVERVIEW", [.dashboard])
             separator
-            navGroup("ACTIVITY", [.liveFeed, .today, .timeline, .transactions])
+            navGroup("ACTIVITY", [.liveFeed, .today, .timeline])
             separator
-            navGroup("SECURITY", [.alerts, .lineage, .feedback])
+            navGroup("SECURITY", [.alerts, .lineage])
             separator
             navGroup("CONFIGURATION", [.harnesses, .policy, .settings])
             Spacer()

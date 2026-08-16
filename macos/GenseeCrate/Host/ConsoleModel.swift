@@ -12,6 +12,8 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var dailyDetailLoadState = DailyDetailLoadState.idle
     @Published private(set) var isRefreshing = false
     @Published private(set) var runningCommand: String?
+    @Published private(set) var feedbackAlertID: Int64?
+    @Published private(set) var readAlertIDs: Set<Int64> = []
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var dashboardRefreshIssue: String?
     @Published var errorMessage: String?
@@ -29,6 +31,7 @@ final class ConsoleModel: ObservableObject {
         homeURL = resolvedHome
         cli = GenseeCLI(homeURL: resolvedHome)
         endpointSensor = EndpointSecuritySensor(homeURL: resolvedHome, executableURL: cli.executableURL)
+        readAlertIDs = Self.loadReadAlertIDs(homeURL: resolvedHome)
         refreshIntegrations()
         Task { [weak self] in await self?.refreshIntegrationsWithCurrentBackend() }
     }
@@ -55,6 +58,26 @@ final class ConsoleModel: ObservableObject {
 
     var riskyArtifactCount: Int {
         snapshot.artifacts.filter { $0.riskLevel != nil || $0.isControlPlane != 0 }.count
+    }
+
+    var unreadAlertCount: Int {
+        snapshot.alerts.filter { !readAlertIDs.contains($0.alertID) }.count
+    }
+
+    func isAlertRead(_ alertID: Int64) -> Bool {
+        readAlertIDs.contains(alertID)
+    }
+
+    func markAlertRead(_ alertID: Int64) {
+        var updated = readAlertIDs
+        guard updated.insert(alertID).inserted else { return }
+        persistReadAlertIDs(updated)
+    }
+
+    func markAllAlertsRead() {
+        let currentAlertIDs = Set(snapshot.alerts.map(\.alertID))
+        guard !currentAlertIDs.isSubset(of: readAlertIDs) else { return }
+        persistReadAlertIDs(readAlertIDs.union(currentAlertIDs))
     }
 
     var recentActivity: [ActivityItem] {
@@ -193,17 +216,33 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
-    func recordFeedback(verdict: String, action: String, ruleID: String, path: String, note: String) async -> Bool {
-        runningCommand = "Recording verdict"
-        defer { runningCommand = nil }
-        var arguments = ["feedback", "record", "--verdict", verdict]
-        if !action.isEmpty { arguments += ["--gensee", action] }
-        if !ruleID.isEmpty { arguments += ["--rule", ruleID] }
-        if !path.isEmpty { arguments += ["--path", path] }
-        if !note.isEmpty { arguments += ["--note", note] }
+    func recordFeedback(for alert: SecurityAlert, agrees: Bool) async -> Bool {
+        guard feedbackAlertID == nil else { return false }
+        feedbackAlertID = alert.alertID
+        defer { feedbackAlertID = nil }
+
+        let action = alert.action.lowercased()
+        let verdict = agrees
+            ? "agree"
+            : (["allow", "watch"].contains(action) ? "deny" : "allow")
+        var arguments = [
+            "feedback", "record",
+            "--verdict", verdict,
+            "--event-key", "alert:\(alert.alertID)",
+            "--gensee", alert.action,
+            "--rule", alert.ruleID,
+        ]
+        if let sessionID = alert.sessionID, !sessionID.isEmpty {
+            arguments += ["--session", sessionID]
+        }
+        if let toolUseID = alert.toolUseID, !toolUseID.isEmpty {
+            arguments += ["--tool-use-id", toolUseID]
+        }
+        if let path = alert.path, !path.isEmpty {
+            arguments += ["--path", path]
+        }
         do {
-            let output = try await cli.run(arguments)
-            noticeMessage = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            _ = try await cli.run(arguments)
             await refreshDashboard(reportErrors: false)
             return true
         } catch {
@@ -322,6 +361,24 @@ final class ConsoleModel: ObservableObject {
         let output = try await cli.run(["policy", "get", key])
         guard let data = output.stdout.data(using: .utf8) else { return nil }
         return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    }
+
+    private static func readAlertsKey(homeURL: URL) -> String {
+        "gensee.alerts.read.\(homeURL.path)"
+    }
+
+    private static func loadReadAlertIDs(homeURL: URL) -> Set<Int64> {
+        let values = UserDefaults.standard.array(forKey: readAlertsKey(homeURL: homeURL)) as? [NSNumber] ?? []
+        return Set(values.map(\.int64Value))
+    }
+
+    private func persistReadAlertIDs(_ alertIDs: Set<Int64>) {
+        let retained = Array(alertIDs.sorted(by: >).prefix(5_000))
+        readAlertIDs = Set(retained)
+        UserDefaults.standard.set(
+            retained.map(NSNumber.init(value:)),
+            forKey: Self.readAlertsKey(homeURL: homeURL)
+        )
     }
 
     private func policyBool(_ key: String) async throws -> Bool? {

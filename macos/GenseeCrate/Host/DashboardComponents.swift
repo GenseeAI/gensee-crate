@@ -115,24 +115,6 @@ func actionColor(_ action: String) -> Color {
     }
 }
 
-struct DashboardAlertRow: View {
-    let alert: SecurityAlert
-
-    var body: some View {
-        GridRow {
-            DashboardTag(text: alert.severity, color: severityColor(alert.severity))
-                .gridColumnAlignment(.leading)
-            DashboardTag(text: alert.action, color: actionColor(alert.action))
-                .gridColumnAlignment(.leading)
-            Text(alert.ruleID).font(.system(size: 11, design: .monospaced)).lineLimit(1)
-            Text(alert.message).font(.system(size: 12)).lineLimit(2)
-            Text(alert.path.map(abbreviatedPath) ?? "—").font(.system(size: 11, design: .monospaced)).lineLimit(1)
-            Text(dashboardDate(alert.createdAt)).font(.system(size: 11)).foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 6)
-    }
-}
-
 func dashboardDate(_ milliseconds: Int64) -> String {
     let formatter = DateFormatter()
     formatter.dateStyle = .short

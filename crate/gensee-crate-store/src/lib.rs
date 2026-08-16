@@ -382,16 +382,62 @@ impl EventStore {
         let conn = db.connection();
         let alerts = query_json_rows(
             conn,
-            "SELECT alert_id, alerts.request_id, entity_kind, entity_id, severity,
-                action, rule_id, message, path, evidence, alerts.created_at,
-                requests.session_id
+            "SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
+                alerts.severity, alerts.action, alerts.rule_id, alerts.message,
+                alerts.path, alerts.evidence, alerts.created_at,
+                requests.session_id, requests.original_user_prompt,
+                trigger_event.source, trigger_event.type, trigger_event.tool_name,
+                trigger_event.tool_input, trigger_event.tool_use_id,
+                feedback.human_verdict, feedback.label, feedback.created_at
              FROM alerts
              LEFT JOIN requests ON requests.request_id = alerts.request_id
+             LEFT JOIN agent_events AS trigger_event
+               ON trigger_event.event_id = COALESCE(
+                 CASE
+                   WHEN alerts.entity_kind = 'agent_event' THEN alerts.entity_id
+                 END,
+                 (
+                   SELECT candidate.event_id
+                   FROM agent_events AS candidate
+                   WHERE candidate.request_id = alerts.request_id
+                     AND candidate.tool_use_id = json_extract(alerts.evidence, '$.tool_use_id')
+                   ORDER BY candidate.type = 'PreToolUse' DESC,
+                            candidate.ts DESC,
+                            candidate.event_id DESC
+                   LIMIT 1
+                 ),
+                 (
+                   SELECT candidate.event_id
+                   FROM agent_events AS candidate
+                   WHERE candidate.request_id = alerts.request_id
+                     AND candidate.type = 'PreToolUse'
+                     AND candidate.ts <= alerts.created_at
+                   ORDER BY candidate.ts DESC, candidate.event_id DESC
+                   LIMIT 1
+                 ),
+                 (
+                   SELECT candidate.event_id
+                   FROM agent_events AS candidate
+                   WHERE candidate.request_id = alerts.request_id
+                     AND candidate.ts <= alerts.created_at
+                   ORDER BY candidate.ts DESC, candidate.event_id DESC
+                   LIMIT 1
+                 )
+               )
+             LEFT JOIN human_feedback AS feedback
+               ON feedback.feedback_id = (
+                 SELECT candidate_feedback.feedback_id
+                 FROM human_feedback AS candidate_feedback
+                 WHERE candidate_feedback.event_key = 'alert:' || alerts.alert_id
+                 ORDER BY candidate_feedback.created_at DESC,
+                          candidate_feedback.feedback_id DESC
+                 LIMIT 1
+               )
              WHERE NOT (
-                (rule_id = 'unmatched_system_effect'
-                 AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
+                (alerts.rule_id = 'unmatched_system_effect'
+                 AND alerts.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
              )
-             ORDER BY alerts.created_at DESC, alert_id DESC
+             ORDER BY alerts.created_at DESC, alerts.alert_id DESC
              LIMIT 200",
             |row| {
                 Ok(json!({
@@ -407,6 +453,15 @@ impl EventStore {
                     "evidence": row.get::<_, Option<String>>(9)?,
                     "created_at": row.get::<_, i64>(10)?,
                     "session_id": row.get::<_, Option<String>>(11)?,
+                    "original_user_prompt": row.get::<_, Option<String>>(12)?,
+                    "event_source": row.get::<_, Option<String>>(13)?,
+                    "event_type": row.get::<_, Option<String>>(14)?,
+                    "tool_name": row.get::<_, Option<String>>(15)?,
+                    "tool_input": row.get::<_, Option<String>>(16)?,
+                    "tool_use_id": row.get::<_, Option<String>>(17)?,
+                    "human_verdict": row.get::<_, Option<String>>(18)?,
+                    "feedback_label": row.get::<_, Option<String>>(19)?,
+                    "feedback_created_at": row.get::<_, Option<i64>>(20)?,
                 }))
             },
         )?;
@@ -3817,6 +3872,96 @@ mod tests {
         assert_eq!(alerts[0].rule_id, "policy_write_outside_workspace");
         assert_eq!(alerts[0].session_id.as_deref(), Some("s1"));
         assert!(alerts[0].evidence.as_deref().unwrap().contains("tool_1"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_alerts_include_request_tool_and_latest_feedback() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-alert-detail-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"inspect the deployment settings"}"#,
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event(&AgentHookEvent {
+                provider: "claude-code".to_string(),
+                session_id: Some("s1".to_string()),
+                hook_event_name: Some("PreToolUse".to_string()),
+                cwd: Some("/repo".to_string()),
+                transcript_path: None,
+                tool_name: Some("Read".to_string()),
+                tool_use_id: Some("tool_alert_1".to_string()),
+                tool_input_command: None,
+                tool_input_description: None,
+                tool_response_stdout: None,
+                tool_response_stderr: None,
+                tool_response_interrupted: None,
+                duration_ms: None,
+                permission_mode: Some("default".to_string()),
+                effort_level: None,
+                observed_at_ms: 110,
+                raw_json: r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"Read","tool_use_id":"tool_alert_1","tool_input":{"file_path":"/repo/deploy.json"}}"#.to_string(),
+            })
+            .unwrap();
+        store
+            .append_policy_alert(&PolicyAlert {
+                session_id: Some("s1".to_string()),
+                tool_use_id: Some("tool_alert_1".to_string()),
+                severity: "high".to_string(),
+                action: "block".to_string(),
+                rule_id: "policy_sensitive_file_access".to_string(),
+                message: "Blocked access to deployment settings".to_string(),
+                path: Some("/repo/deploy.json".to_string()),
+                evidence: Some(json!({ "reason": "sensitive" })),
+                observed_at_ms: 120,
+            })
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        let alert = &dashboard["alerts"][0];
+        assert_eq!(
+            alert["original_user_prompt"],
+            "inspect the deployment settings"
+        );
+        assert_eq!(alert["event_source"], "claude-code");
+        assert_eq!(alert["event_type"], "PreToolUse");
+        assert_eq!(alert["tool_name"], "Read");
+        assert_eq!(alert["tool_use_id"], "tool_alert_1");
+        assert_eq!(
+            serde_json::from_str::<Value>(alert["tool_input"].as_str().unwrap()).unwrap()["path"],
+            "/repo/deploy.json"
+        );
+
+        let alert_id = alert["alert_id"].as_i64().unwrap();
+        store
+            .record_human_feedback(
+                Some(format!("alert:{alert_id}")),
+                Some("tool_alert_1".to_string()),
+                Some("s1".to_string()),
+                Some("block".to_string()),
+                "agree".to_string(),
+                Some("confirmed".to_string()),
+                Some("policy_sensitive_file_access".to_string()),
+                Some("/repo/deploy.json".to_string()),
+                None,
+                130,
+            )
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        let alert = &dashboard["alerts"][0];
+        assert_eq!(alert["human_verdict"], "agree");
+        assert_eq!(alert["feedback_label"], "confirmed");
+        assert_eq!(alert["feedback_created_at"], 130);
 
         fs::remove_dir_all(&dir).ok();
     }

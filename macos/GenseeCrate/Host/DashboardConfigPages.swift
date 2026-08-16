@@ -37,8 +37,11 @@ struct DashboardPolicyPage: View {
                                     .font(.system(size: 11, design: .monospaced))
                                     .frame(minHeight: 470)
                                     .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.dashboardLine))
-                                    .onChange(of: editorText) { _ in dirty = editorText != model.policyDocument }
-                            default: PolicySettingsView(document: document, model: model)
+                            default:
+                                PolicySettingsView(
+                                    document: document,
+                                    editorText: $editorText
+                                )
                             }
                         }
                     }
@@ -46,78 +49,387 @@ struct DashboardPolicyPage: View {
             }
         }
         .onAppear { if editorText.isEmpty { editorText = model.policyDocument } }
+        .onChange(of: editorText) { newValue in dirty = newValue != model.policyDocument }
         .onChange(of: model.policyDocument) { newValue in if !dirty { editorText = newValue } }
     }
 }
 
 private struct PolicySettingsView: View {
     let document: [String: Any]
-    @ObservedObject var model: ConsoleModel
+    @Binding var editorText: String
 
-    private let groups: [(String, String, [(String, String, String)])] = [
-        ("Resource governance", "Per-tool and per-session quotas. 0 / blank leaves the built-in default.", [
-            ("resource_governance.max_read_bytes", "Max read bytes", "Largest single file read the shield allows."),
-            ("resource_governance.max_file_subjects_per_tool", "Max file subjects / tool", "File paths a single tool call may touch."),
-            ("resource_governance.max_shell_segments_per_tool", "Max shell segments / tool", "Chained commands per Bash call."),
-            ("resource_governance.max_tool_calls_per_session", "Max tool calls / session", "Total tool calls before throttling."),
-            ("resource_governance.max_network_egress_per_session", "Max network egress / session", "Outbound network operations per session."),
-            ("resource_governance.max_file_accessed_rate_per_min", "Max file access rate / min", "File operations per minute before flagging."),
-            ("resource_governance.max_network_rate_per_min", "Max network rate / min", "Network operations per minute before flagging."),
-        ]),
-        ("Network egress", "Where the agent may reach out, and whether it must go through a proxy.", [
-            ("egress.allow_hosts", "Allowed hosts", "Hosts the agent may connect to."),
-            ("egress.proxy_url", "Proxy URL", "Egress proxy for outbound traffic."),
-            ("egress.require_proxy", "Require proxy", "Deny direct egress that bypasses the proxy."),
-        ]),
-        ("Runtime", "", [("runtime.max_runtime_seconds", "Max runtime (seconds)", "Wall-clock cap for a guarded run.")]),
-        ("Enforcement", "", [("enforcement.noninteractive", "Non-interactive fail-closed", "Escalate medium+ asks to deny when no human can answer.")]),
-        ("Endpoint Security", "Kernel-level observation and managed-tree enforcement on macOS.", [
-            ("endpoint_security.mode", "Sensor mode", "Off, observe, protect, or strict."),
-            ("endpoint_security.protected_paths", "Protected paths", "Extra absolute path prefixes denied to managed agent trees."),
-            ("endpoint_security.blocked_executables", "Blocked executables", "Executable paths denied before launch."),
-            ("endpoint_security.max_auth_latency_ms", "Authorization latency budget", "Target maximum local decision latency."),
-        ]),
-        ("Allowlisted paths", "Path prefixes that are always trusted.", [("allow_path_prefixes", "Allowed path prefixes", "Absolute path prefixes exempt from sensitive checks.")]),
+    private let groups: [PolicySettingGroup] = [
+        PolicySettingGroup(
+            title: "Resource governance",
+            detail: "Per-tool and per-session limits.",
+            settings: [
+                .integer("resource_governance.max_read_bytes", "Max read bytes", "Largest single file read the shield allows.", minimum: 1),
+                .integer("resource_governance.max_file_subjects_per_tool", "Max file subjects / tool", "File paths a single tool call may touch.", minimum: 1),
+                .integer("resource_governance.max_shell_segments_per_tool", "Max shell segments / tool", "Chained commands per shell call.", minimum: 1),
+                .integer("resource_governance.max_tool_calls_per_session", "Max tool calls / session", "Total tool calls permitted before throttling.", minimum: 1),
+                .integer("resource_governance.max_network_egress_per_session", "Max network egress / session", "Outbound network operations permitted per session.", minimum: 1),
+                .decimal("resource_governance.max_file_accessed_rate_per_min", "Max file access rate / min", "File operations per minute before flagging.", minimum: 0),
+                .decimal("resource_governance.max_network_rate_per_min", "Max network rate / min", "Network operations per minute before flagging.", minimum: 0),
+            ]
+        ),
+        PolicySettingGroup(
+            title: "Network egress",
+            detail: "Destinations and proxy requirements.",
+            settings: [
+                .list("egress.allow_hosts", "Allowed hosts", "Hostnames or IPs the agent may contact."),
+                .text("egress.proxy_url", "Proxy URL", "Outbound proxy URL. Leave blank for none.", nullable: true),
+                .boolean("egress.require_proxy", "Require proxy", "Deny direct egress that bypasses the configured proxy."),
+            ]
+        ),
+        PolicySettingGroup(
+            title: "Runtime & enforcement",
+            detail: "Guarded-run lifetime and unattended decisions.",
+            settings: [
+                .integer("runtime.max_runtime_seconds", "Max runtime (seconds)", "Wall-clock cap. Leave blank for no cap.", minimum: 1, nullable: true),
+                .boolean("enforcement.noninteractive", "Non-interactive fail-closed", "Escalate medium+ asks to deny when no human can answer."),
+            ]
+        ),
+        PolicySettingGroup(
+            title: "Endpoint Security",
+            detail: "Kernel-level macOS observation and managed-tree enforcement.",
+            settings: [
+                .choice("endpoint_security.mode", "Sensor mode", "Choose observation or authorization enforcement.", options: ["off", "observe", "protect", "strict"]),
+                .list("endpoint_security.protected_paths", "Protected paths", "Additional absolute path prefixes denied to managed agent trees."),
+                .list("endpoint_security.blocked_executables", "Blocked executables", "Absolute executable paths denied before launch."),
+                .integer("endpoint_security.max_auth_latency_ms", "Authorization latency budget", "Maximum local decision latency, from 1 to 100 ms.", minimum: 1, maximum: 100),
+            ]
+        ),
+        PolicySettingGroup(
+            title: "Linux controls",
+            detail: "Seccomp, fanotify, and network policy for Linux sandboxes.",
+            settings: [
+                .boolean("linux.seccomp.enabled", "Enable seccomp", "Apply the configured syscall restrictions."),
+                .boolean("linux.seccomp.deny_ptrace", "Deny ptrace", "Block process inspection and tracing syscalls."),
+                .boolean("linux.seccomp.deny_bpf", "Deny BPF", "Block loading BPF programs."),
+                .boolean("linux.seccomp.deny_kernel_modules", "Deny kernel modules", "Block kernel module loading and unloading."),
+                .boolean("linux.seccomp.deny_mount_namespace_changes", "Deny mount namespace changes", "Block mount and namespace mutation syscalls."),
+                .list("linux.fanotify.paths", "Fanotify paths", "Additional Linux path prefixes monitored by fanotify."),
+                .choice("linux.network.mode", "Linux network mode", "Select observation or network enforcement.", options: ["off", "monitor", "allowlist", "deny-all"]),
+                .list("linux.network.allow", "Allowed destinations", "Allowed IP addresses or CIDR ranges."),
+                .list("linux.network.deny", "Denied destinations", "Denied IP addresses or CIDR ranges."),
+            ]
+        ),
+        PolicySettingGroup(
+            title: "Observation & trust",
+            detail: "System-event source and explicitly trusted paths.",
+            settings: [
+                .choice("watch.system_events", "System event source", "Choose the host-level event backend.", options: ["none", "endpoint-security", "eslogger"]),
+                .list("allow_path_prefixes", "Allowed path prefixes", "Absolute prefixes exempt from sensitive-path checks."),
+            ]
+        ),
     ]
 
     var body: some View {
         VStack(spacing: 14) {
-            ForEach(groups, id: \.0) { group in
+            ForEach(groups) { group in
                 VStack(alignment: .leading, spacing: 0) {
-                    HStack { Text(group.0).font(.system(size: 13, weight: .semibold)); Spacer(); Text(group.1).font(.system(size: 10)).foregroundStyle(.secondary) }
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(group.title).font(.system(size: 13, weight: .semibold))
+                        Spacer()
+                        Text(group.detail).font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
                         .padding(.bottom, 9)
-                    ForEach(group.2, id: \.0) { item in
-                        HStack(alignment: .top, spacing: 18) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.1).font(.system(size: 12, weight: .semibold))
-                                Text(item.2).font(.system(size: 10)).foregroundStyle(.secondary)
-                            }.frame(width: 260, alignment: .leading)
-                            Text(displayValue(dottedValue(document, item.0)))
-                                .font(.system(size: 11, design: .monospaced))
-                                .textSelection(.enabled)
-                            Spacer()
-                        }.padding(.vertical, 7)
+                    ForEach(group.settings) { setting in
+                        PolicySettingRow(
+                            setting: setting,
+                            value: dottedValue(document, setting.key),
+                            onChange: { updatePolicyValue(setting.key, to: $0) }
+                        )
                         Divider()
                     }
                 }.padding(14).background(Color.dashboardMutedFill, in: RoundedRectangle(cornerRadius: 5))
             }
-            Text("Edit these values in Advanced (JSON), then use Save & Validate. Boolean quick controls remain available below.")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
             HStack {
-                Picker("Endpoint Security", selection: Binding(
-                    get: { model.policy.endpointSecurityMode },
-                    set: { value in Task { await model.setPolicy(key: "endpoint_security.mode", value: value) } }
-                )) {
-                    Text("Off").tag("off")
-                    Text("Observe").tag("observe")
-                    Text("Protect").tag("protect")
-                    Text("Strict").tag("strict")
-                }
-                .frame(width: 220)
-                Toggle("Non-interactive fail-closed", isOn: Binding(get: { model.policy.noninteractive }, set: { value in Task { await model.setPolicy(key: "enforcement.noninteractive", value: value ? "true" : "false") } }))
-                Toggle("Require proxy", isOn: Binding(get: { model.policy.requireProxy }, set: { value in Task { await model.setPolicy(key: "egress.require_proxy", value: value ? "true" : "false") } }))
+                Image(systemName: "checkmark.shield")
+                    .foregroundStyle(Color.dashboardGreen)
+                Text("Edits remain local until Save & Validate confirms the complete policy.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
                 Spacer()
-            }.toggleStyle(.switch)
+            }
+        }
+    }
+
+    private func updatePolicyValue(_ key: String, to value: Any) {
+        var root = document
+        setDottedValue(&root, key, value)
+        guard JSONSerialization.isValidJSONObject(root),
+              let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        else { return }
+        editorText = String(decoding: data, as: UTF8.self)
+    }
+}
+
+private struct PolicySettingGroup: Identifiable {
+    let title: String
+    let detail: String
+    let settings: [PolicySettingDefinition]
+    var id: String { title }
+}
+
+private struct PolicySettingDefinition: Identifiable {
+    enum Kind {
+        case integer(minimum: Int?, maximum: Int?, nullable: Bool)
+        case decimal(minimum: Double?, maximum: Double?)
+        case boolean
+        case list
+        case text(nullable: Bool)
+        case choice([String])
+    }
+
+    let key: String
+    let label: String
+    let help: String
+    let kind: Kind
+    var id: String { key }
+
+    static func integer(
+        _ key: String,
+        _ label: String,
+        _ help: String,
+        minimum: Int? = nil,
+        maximum: Int? = nil,
+        nullable: Bool = false
+    ) -> Self {
+        Self(key: key, label: label, help: help, kind: .integer(minimum: minimum, maximum: maximum, nullable: nullable))
+    }
+
+    static func decimal(
+        _ key: String,
+        _ label: String,
+        _ help: String,
+        minimum: Double? = nil,
+        maximum: Double? = nil
+    ) -> Self {
+        Self(key: key, label: label, help: help, kind: .decimal(minimum: minimum, maximum: maximum))
+    }
+
+    static func boolean(_ key: String, _ label: String, _ help: String) -> Self {
+        Self(key: key, label: label, help: help, kind: .boolean)
+    }
+
+    static func list(_ key: String, _ label: String, _ help: String) -> Self {
+        Self(key: key, label: label, help: help, kind: .list)
+    }
+
+    static func text(_ key: String, _ label: String, _ help: String, nullable: Bool = false) -> Self {
+        Self(key: key, label: label, help: help, kind: .text(nullable: nullable))
+    }
+
+    static func choice(
+        _ key: String,
+        _ label: String,
+        _ help: String,
+        options: [String]
+    ) -> Self {
+        Self(key: key, label: label, help: help, kind: .choice(options))
+    }
+}
+
+private struct PolicySettingRow: View {
+    let setting: PolicySettingDefinition
+    let value: Any?
+    let onChange: (Any) -> Void
+
+    @State private var text: String
+    @State private var validationMessage: String?
+    @FocusState private var textFieldFocused: Bool
+
+    init(setting: PolicySettingDefinition, value: Any?, onChange: @escaping (Any) -> Void) {
+        self.setting = setting
+        self.value = value
+        self.onChange = onChange
+        _text = State(initialValue: Self.editableText(value, kind: setting.kind))
+    }
+
+    private var sourceText: String { Self.editableText(value, kind: setting.kind) }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 22) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(setting.label)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(setting.help)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(width: 290, alignment: .leading)
+
+            editor
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .padding(.vertical, 8)
+        .onChange(of: sourceText) { newValue in
+            if !textFieldFocused { text = newValue }
+        }
+    }
+
+    @ViewBuilder
+    private var editor: some View {
+        switch setting.kind {
+        case .boolean:
+            HStack(spacing: 9) {
+                Text(booleanValue ? "Enabled" : "Disabled")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Toggle("", isOn: Binding(
+                    get: { booleanValue },
+                    set: { onChange($0) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .accessibilityLabel(setting.label)
+            }
+
+        case let .choice(options):
+            Picker(setting.label, selection: Binding(
+                get: { value as? String ?? options.first ?? "" },
+                set: { onChange($0) }
+            )) {
+                ForEach(options, id: \.self) { option in
+                    Text(choiceLabel(option)).tag(option)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 210)
+
+        case .integer, .decimal, .list, .text:
+            VStack(alignment: .trailing, spacing: 3) {
+                TextField(placeholder, text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: textFieldUsesMonospacedFont ? .monospaced : .default))
+                    .multilineTextAlignment(.leading)
+                    .focused($textFieldFocused)
+                    .frame(width: 360)
+                    .onChange(of: text) { validateAndUpdate($0) }
+                    .accessibilityLabel(setting.label)
+                if let validationMessage {
+                    Text(validationMessage)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(Color.dashboardRed)
+                } else if case .list = setting.kind {
+                    Text("Separate multiple values with commas.")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
+    private var booleanValue: Bool {
+        if let value = value as? Bool { return value }
+        return (value as? NSNumber)?.boolValue ?? false
+    }
+
+    private var placeholder: String {
+        switch setting.kind {
+        case let .integer(_, _, nullable): return nullable ? "No limit" : "Enter a whole number"
+        case .decimal: return "Enter a number"
+        case .list: return "None"
+        case let .text(nullable): return nullable ? "None" : "Enter a value"
+        default: return ""
+        }
+    }
+
+    private var textFieldUsesMonospacedFont: Bool {
+        switch setting.kind {
+        case .integer, .decimal: return true
+        default: return false
+        }
+    }
+
+    private func validateAndUpdate(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch setting.kind {
+        case let .integer(minimum, maximum, nullable):
+            if trimmed.isEmpty, nullable {
+                validationMessage = nil
+                onChange(NSNull())
+                return
+            }
+            guard let number = Int(trimmed) else {
+                validationMessage = nullable ? "Enter a whole number or leave blank." : "Enter a whole number."
+                onChange(raw)
+                return
+            }
+            if let minimum, number < minimum {
+                validationMessage = "Minimum: \(minimum)."
+                onChange(raw)
+                return
+            }
+            if let maximum, number > maximum {
+                validationMessage = "Maximum: \(maximum)."
+                onChange(raw)
+                return
+            }
+            validationMessage = nil
+            onChange(number)
+
+        case let .decimal(minimum, maximum):
+            guard let number = Double(trimmed), number.isFinite else {
+                validationMessage = "Enter a valid number."
+                onChange(raw)
+                return
+            }
+            if let minimum, number < minimum {
+                validationMessage = "Minimum: \(minimum.formatted())."
+                onChange(raw)
+                return
+            }
+            if let maximum, number > maximum {
+                validationMessage = "Maximum: \(maximum.formatted())."
+                onChange(raw)
+                return
+            }
+            validationMessage = nil
+            onChange(number)
+
+        case .list:
+            validationMessage = nil
+            let values = raw
+                .split(whereSeparator: { $0 == "," || $0.isNewline })
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            onChange(values)
+
+        case let .text(nullable):
+            validationMessage = nil
+            onChange(trimmed.isEmpty && nullable ? NSNull() : raw)
+
+        case .boolean, .choice:
+            break
+        }
+    }
+
+    private static func editableText(_ value: Any?, kind: PolicySettingDefinition.Kind) -> String {
+        if value == nil || value is NSNull { return "" }
+        switch kind {
+        case .list:
+            return (value as? [Any] ?? []).map(String.init(describing:)).joined(separator: ", ")
+        case .integer:
+            return (value as? NSNumber)?.int64Value.description ?? String(describing: value!)
+        case .decimal:
+            return (value as? NSNumber)?.doubleValue.formatted(.number.precision(.fractionLength(1...3)))
+                ?? String(describing: value!)
+        case .text:
+            return value as? String ?? String(describing: value!)
+        case .boolean, .choice:
+            return ""
+        }
+    }
+
+    private func choiceLabel(_ value: String) -> String {
+        switch value {
+        case "endpoint-security": return "Endpoint Security"
+        case "eslogger": return "Legacy eslogger"
+        case "deny-all": return "Deny all"
+        default: return value.replacingOccurrences(of: "-", with: " ").capitalized
         }
     }
 }
@@ -321,6 +633,30 @@ private func dottedValue(_ object: [String: Any], _ path: String) -> Any? {
         current = next
     }
     return current
+}
+
+private func setDottedValue(_ object: inout [String: Any], _ path: String, _ value: Any) {
+    setDottedValue(
+        &object,
+        components: ArraySlice(path.split(separator: ".").map(String.init)),
+        value: value
+    )
+}
+
+private func setDottedValue(
+    _ object: inout [String: Any],
+    components: ArraySlice<String>,
+    value: Any
+) {
+    guard let key = components.first else { return }
+    let remaining = components.dropFirst()
+    guard !remaining.isEmpty else {
+        object[key] = value
+        return
+    }
+    var child = object[key] as? [String: Any] ?? [:]
+    setDottedValue(&child, components: remaining, value: value)
+    object[key] = child
 }
 
 private func displayValue(_ value: Any?) -> String {

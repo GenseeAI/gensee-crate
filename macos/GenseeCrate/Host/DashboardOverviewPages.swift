@@ -45,15 +45,11 @@ struct DashboardOverviewPage: View {
                     if model.snapshot.alerts.isEmpty {
                         DashboardEmpty(text: "No recent alerts — all clear.", symbol: "checkmark.shield")
                     } else {
-                        Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 0) {
-                            GridRow {
-                                Text("Severity"); Text("Action"); Text("Rule"); Text("Message"); Text("Path"); Text("Time")
-                            }
-                            .font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                            Divider().gridCellColumns(6)
+                        VStack(spacing: 0) {
+                            AlertListHeader()
                             ForEach(model.snapshot.alerts.prefix(10)) { alert in
-                                DashboardAlertRow(alert: alert)
-                                Divider().gridCellColumns(6)
+                                Divider()
+                                ExpandableAlertRow(alert: alert, model: model)
                             }
                         }
                     }
@@ -364,6 +360,7 @@ private struct CalendarHeatmap: View {
     let value: KeyPath<DailyActivity, Int>
     let color: Color
     @Binding var selectedDate: Date
+    @State private var hoveredDay: HeatmapDay?
 
     private let cellSize: CGFloat = 11
     private let gap: CGFloat = 3
@@ -414,10 +411,30 @@ private struct CalendarHeatmap: View {
                     Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text("\(total.formatted()) total · \(activeDays) active days")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+                VStack(alignment: .trailing, spacing: 3) {
+                    if let hoveredDay {
+                        HStack(spacing: 5) {
+                            Text(hoveredDay.date.formatted(date: .abbreviated, time: .omitted))
+                                .foregroundStyle(.secondary)
+                            Text(hoveredDay.value.formatted())
+                                .fontWeight(.semibold)
+                                .foregroundStyle(Color.primary)
+                            Text(title.lowercased())
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.dashboardMutedFill, in: RoundedRectangle(cornerRadius: 4))
+                        .accessibilityLabel("\(hoveredDay.date.formatted(date: .complete, time: .omitted)), \(hoveredDay.value.formatted()) \(title.lowercased())")
+                    } else {
+                        Text("Hover a cell for its exact count")
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text("\(total.formatted()) total · \(activeDays) active days")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.system(size: 11, weight: .medium))
+                .monospacedDigit()
             }
 
             ScrollView(.horizontal, showsIndicators: false) {
@@ -492,6 +509,13 @@ private struct CalendarHeatmap: View {
         }
         .buttonStyle(.plain)
         .disabled(item.isFuture)
+        .onHover { hovering in
+            if hovering {
+                hoveredDay = item
+            } else if hoveredDay?.id == item.id {
+                hoveredDay = nil
+            }
+        }
         .help("\(item.date.formatted(date: .abbreviated, time: .omitted)): \(item.value.formatted()) \(title.lowercased())")
         .accessibilityLabel("\(item.date.formatted(date: .complete, time: .omitted)), \(item.value.formatted()) \(title.lowercased())")
     }

@@ -131,23 +131,44 @@ struct DashboardSummary: Decodable {
 
 struct SecurityAlert: Decodable, Identifiable {
     let alertID: Int64
+    let requestID: Int64?
     let sessionID: String?
     let severity: String
     let action: String
     let ruleID: String
     let message: String
     let path: String?
+    let evidence: String?
     let createdAt: Int64
+    let originalUserPrompt: String?
+    let eventSource: String?
+    let eventType: String?
+    let toolName: String?
+    let toolInput: String?
+    let toolUseID: String?
+    let humanVerdict: String?
+    let feedbackLabel: String?
+    let feedbackCreatedAt: Int64?
 
     var id: Int64 { alertID }
 
     enum CodingKeys: String, CodingKey {
         case alertID = "alert_id"
+        case requestID = "request_id"
         case sessionID = "session_id"
         case severity, action
         case ruleID = "rule_id"
-        case message, path
+        case message, path, evidence
         case createdAt = "created_at"
+        case originalUserPrompt = "original_user_prompt"
+        case eventSource = "event_source"
+        case eventType = "event_type"
+        case toolName = "tool_name"
+        case toolInput = "tool_input"
+        case toolUseID = "tool_use_id"
+        case humanVerdict = "human_verdict"
+        case feedbackLabel = "feedback_label"
+        case feedbackCreatedAt = "feedback_created_at"
     }
 }
 
