@@ -1,10 +1,10 @@
 #[cfg(test)]
 use crate::common::MAX_TEXT_FILE_BYTES;
 use crate::common::{
-    canonical_or_original, collect_json_commands, display_path, endpoint_must_be_redacted,
-    executable_dependency_is_unpinned, finding_fingerprint, hash_bytes, insecure_remote_http,
-    is_loopback_url, make_finding, normalize_secret_key, read_limited_text, sort_findings,
-    source_for, summarize,
+    canonical_or_original, collect_json_commands, display_path, endpoint_display_value,
+    endpoint_is_parseable, endpoint_must_be_redacted, executable_dependency_is_unpinned,
+    finding_fingerprint, hash_bytes, insecure_remote_http, is_loopback_url, make_finding,
+    normalize_secret_key, read_limited_text, sort_findings, source_for, summarize,
 };
 use crate::model::{
     Assessment, AuditFinding, AuditInventory, AuditReport, AuditSource, AuditTarget, Evidence,
@@ -886,7 +886,7 @@ fn evaluate_mcp_servers(
             transport: transport.to_string(),
             enabled,
             has_tool_allowlist: allowlist,
-            endpoint: endpoint.as_deref().map(sanitize_endpoint),
+            endpoint: endpoint.as_deref().map(endpoint_display_value),
         });
         if !enabled {
             continue;
@@ -930,6 +930,27 @@ fn evaluate_mcp_servers(
             ));
         }
         if let Some(url) = endpoint.as_deref() {
+            if !endpoint_is_parseable(url) {
+                findings.push(make_finding(
+                    "CAX-MCP-009",
+                    "mcp_apps_connectors",
+                    Severity::Info,
+                    "high",
+                    Assessment::Potential,
+                    "MCP endpoint could not be parsed",
+                    &format!(
+                        "Server `{id}` has an endpoint that could not be parsed; transport, host, and credential posture were not evaluated."
+                    ),
+                    vec![evidence(
+                        source,
+                        Some(&format!("mcp_servers.{id}.url")),
+                        Some("<redacted-url>"),
+                    )],
+                    "Use a valid absolute URL, including its scheme, and rerun the audit.",
+                    &[MCP_REFERENCE],
+                    &["OWASP-MCP1", "OWASP-MCP7"],
+                ));
+            }
             if insecure_remote_http(url) {
                 findings.push(make_finding(
                     "CAX-MCP-003",
@@ -2144,10 +2165,10 @@ fn secret_like(key: &str, value: &str) -> bool {
 }
 
 fn sanitize_evidence_value(key: Option<&str>, value: &str) -> String {
-    if key.is_some_and(|key| secret_like(key, value))
-        || key.is_some_and(endpoint_key) && endpoint_must_be_redacted(value)
-    {
+    if key.is_some_and(|key| secret_like(key, value)) {
         "<redacted>".to_string()
+    } else if key.is_some_and(endpoint_key) && endpoint_must_be_redacted(value) {
+        endpoint_display_value(value)
     } else {
         value.to_string()
     }
@@ -2157,14 +2178,6 @@ fn endpoint_key(key: &str) -> bool {
     let final_segment = key.rsplit('.').next().unwrap_or(key);
     let final_segment = normalize_secret_key(final_segment);
     final_segment.contains("url") || final_segment.contains("endpoint")
-}
-
-fn sanitize_endpoint(value: &str) -> String {
-    if endpoint_must_be_redacted(value) {
-        "<redacted-url>".to_string()
-    } else {
-        value.to_string()
-    }
 }
 
 fn is_broad_path(path: &str) -> bool {
@@ -2465,7 +2478,7 @@ mod tests {
         .unwrap();
         let encoded = serde_json::to_string(&report).unwrap();
         assert!(!encoded.contains("do-not-leak"));
-        assert!(encoded.contains("<redacted-url>"));
+        assert!(encoded.contains("<redacted-credential-url>"));
 
         write(
             &codex_home.join("config.toml"),
@@ -2513,6 +2526,17 @@ mod tests {
             assert!(!serialized.contains("do-not-leak"), "{endpoint}");
             assert_eq!(
                 report.inventory.mcp_servers[0].endpoint.as_deref(),
+                Some("<redacted-url>")
+            );
+            let parse_finding = report
+                .findings
+                .iter()
+                .find(|finding| finding.rule_id == "CAX-MCP-009")
+                .unwrap();
+            assert_eq!(parse_finding.severity, Severity::Info);
+            assert_eq!(parse_finding.assessment, Assessment::Potential);
+            assert_eq!(
+                parse_finding.evidence[0].value.as_deref(),
                 Some("<redacted-url>")
             );
             let _ = fs::remove_dir_all(root);

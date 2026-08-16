@@ -1,10 +1,11 @@
 #[cfg(test)]
 use crate::common::MAX_TEXT_FILE_BYTES;
 use crate::common::{
-    canonical_or_original, collect_json_commands, display_path, endpoint_has_credentials,
-    endpoint_must_be_redacted, executable_dependency_is_unpinned, finding_fingerprint, hash_bytes,
-    insecure_remote_http, make_finding, normalize_secret_key, read_limited_text, secret_key_name,
-    sort_findings, source_for, summarize,
+    canonical_or_original, collect_json_commands, display_path, endpoint_display_value,
+    endpoint_has_credentials, endpoint_is_parseable, endpoint_must_be_redacted,
+    executable_dependency_is_unpinned, finding_fingerprint, hash_bytes, insecure_remote_http,
+    make_finding, normalize_secret_key, read_limited_text, secret_key_name, sort_findings,
+    source_for, summarize,
 };
 use crate::model::{
     Assessment, AuditApplicability, AuditFinding, AuditInventory, AuditReport, AuditSource,
@@ -821,19 +822,13 @@ fn inspect_mcp_server(
         .get("url")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let endpoint_must_be_redacted = raw_endpoint
+    let redact_endpoint = raw_endpoint
         .as_deref()
         .is_some_and(endpoint_must_be_redacted);
-    let endpoint_has_credentials = raw_endpoint
+    let has_credentials = raw_endpoint
         .as_deref()
         .is_some_and(endpoint_has_credentials);
-    let inventory_endpoint = raw_endpoint.as_ref().map(|endpoint| {
-        if endpoint_must_be_redacted {
-            "<redacted-credential-url>".to_string()
-        } else {
-            endpoint.clone()
-        }
-    });
+    let inventory_endpoint = raw_endpoint.as_deref().map(endpoint_display_value);
     inventory.mcp_servers.push(McpInventory {
         id: id.to_string(),
         transport: transport.to_string(),
@@ -843,6 +838,27 @@ fn inspect_mcp_server(
     });
 
     if let Some(url) = raw_endpoint.as_deref() {
+        if !endpoint_is_parseable(url) {
+            findings.push(make_finding(
+                "VSC-MCP-010",
+                "mcp_and_external_tools",
+                Severity::Info,
+                "high",
+                Assessment::Potential,
+                "MCP endpoint could not be parsed",
+                &format!(
+                    "MCP server `{id}` has an endpoint that could not be parsed; transport, host, and credential posture were not evaluated."
+                ),
+                vec![evidence(
+                    source,
+                    Some(&format!("servers.{id}.url")),
+                    Some("<redacted-url>"),
+                )],
+                "Use a valid absolute URL, including its scheme, and rerun the audit.",
+                &[MCP_REFERENCE],
+                &["OWASP-MCP1", "OWASP-ASI04"],
+            ));
+        }
         if insecure_remote_http(url) {
             findings.push(mcp_finding(
                 "VSC-MCP-004",
@@ -852,15 +868,19 @@ fn inspect_mcp_server(
                 "Remote MCP endpoint uses plaintext HTTP",
                 "Tool requests, results, and authorization material can be intercepted in transit.",
                 "url",
-                if endpoint_must_be_redacted {
-                    "<redacted-credential-url>"
+                if redact_endpoint {
+                    if has_credentials {
+                        "<redacted-credential-url>"
+                    } else {
+                        "<redacted-url>"
+                    }
                 } else {
                     url
                 },
                 "Use an authenticated HTTPS endpoint.",
             ));
         }
-        if endpoint_has_credentials {
+        if has_credentials {
             findings.push(mcp_finding(
                 "VSC-MCP-005",
                 Severity::High,
@@ -2112,12 +2132,23 @@ mod tests {
             assert!(!serialized.contains("do-not-leak"), "{endpoint}");
             assert_eq!(
                 report.inventory.mcp_servers[0].endpoint.as_deref(),
-                Some("<redacted-credential-url>")
+                Some("<redacted-url>")
             );
             assert!(!report
                 .findings
                 .iter()
                 .any(|finding| finding.rule_id == "VSC-MCP-005"));
+            let parse_finding = report
+                .findings
+                .iter()
+                .find(|finding| finding.rule_id == "VSC-MCP-010")
+                .unwrap();
+            assert_eq!(parse_finding.severity, Severity::Info);
+            assert_eq!(parse_finding.assessment, Assessment::Potential);
+            assert_eq!(
+                parse_finding.evidence[0].value.as_deref(),
+                Some("<redacted-url>")
+            );
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -2144,12 +2175,16 @@ mod tests {
 
         assert_eq!(
             report.inventory.mcp_servers[0].endpoint.as_deref(),
-            Some("<redacted-credential-url>")
+            Some("<redacted-url>")
         );
         assert!(!report
             .findings
             .iter()
             .any(|finding| finding.rule_id == "VSC-MCP-005"));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "VSC-MCP-010"));
         let _ = fs::remove_dir_all(root);
     }
 

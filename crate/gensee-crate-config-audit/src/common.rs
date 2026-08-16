@@ -192,6 +192,23 @@ pub(crate) fn endpoint_must_be_redacted(value: &str) -> bool {
     Url::parse(value).map_or(true, |url| parsed_url_has_credentials(&url))
 }
 
+pub(crate) fn endpoint_is_parseable(value: &str) -> bool {
+    Url::parse(value).is_ok()
+}
+
+/// Returns a report-safe endpoint value. Confirmed credentials receive a
+/// credential-specific label; malformed endpoints fail closed with a neutral
+/// label because their credential posture could not be established.
+pub(crate) fn endpoint_display_value(value: &str) -> String {
+    if endpoint_has_credentials(value) {
+        "<redacted-credential-url>".to_string()
+    } else if endpoint_must_be_redacted(value) {
+        "<redacted-url>".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn parsed_url_has_credentials(url: &Url) -> bool {
     !url.username().is_empty()
         || url.password().is_some()
@@ -360,6 +377,17 @@ mod tests {
         }
         assert!(!endpoint_must_be_redacted("https://example.com/mcp"));
         assert!(!endpoint_has_credentials("https://example.com/mcp"));
+        assert!(endpoint_is_parseable("https://example.com/mcp"));
+        assert!(!endpoint_is_parseable("example.com/mcp"));
+        assert_eq!(
+            endpoint_display_value("https://user:secret@example.com/mcp"),
+            "<redacted-credential-url>"
+        );
+        assert_eq!(endpoint_display_value("example.com/mcp"), "<redacted-url>");
+        assert_eq!(
+            endpoint_display_value("https://example.com/mcp"),
+            "https://example.com/mcp"
+        );
     }
 
     #[test]

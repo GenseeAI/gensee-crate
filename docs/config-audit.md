@@ -170,6 +170,7 @@ the referenced variable name as a literal secret.
 | `CAX-MCP-002` | High | MCP tools are approved by default. |
 | `CAX-MCP-003`–`005` | High | A remote MCP endpoint uses plaintext HTTP, a server launches through a shell, or a package launcher dependency is mutable/unpinned. |
 | `CAX-MCP-006`–`008` | Medium–High | MCP config embeds a secret, requests a broad OAuth scope, or uses a non-loopback OAuth callback. |
+| `CAX-MCP-009` | Info | An MCP endpoint cannot be parsed, so its transport, host, and credential posture cannot be evaluated. |
 | `CAX-APP-001` | High | Destructive Apps tools are enabled and approved by default. |
 | `CAX-SKL-001`–`004` | Medium–High | Duplicate names, symlinked skills, poisoning indicators, or download-to-shell content affect skill trust. |
 | `CAX-SKL-005` | Info | An enabled skill includes scripts and needs code/dependency review. |
@@ -205,6 +206,7 @@ files, custom agents, hooks, and locally installed extension manifests.
 | --- | --- | --- |
 | `VSC-MCP-001`–`003` | High | MCP configuration is invalid, obtains input by executing an editor command, or grants broad sandbox access. |
 | `VSC-MCP-004`–`009` | Medium–High | An endpoint is plaintext or embeds credentials, a server launches through a shell or mutable package, a local server is unsandboxed, or configuration embeds a secret. |
+| `VSC-MCP-010` | Info | An MCP endpoint cannot be parsed, so its transport, host, and credential posture cannot be evaluated. |
 | `VSC-SKL-001`–`004` | Info–High | Skills contain scripts, poisoning/download-to-shell indicators, auto-invocable executable workflows, or an unusually large auto-invocable executable set. |
 | `VSC-INS-001`, `VSC-AGT-001` | Medium–High | Instructions/custom agents contain dangerous content or request a broad tool surface. |
 | `VSC-HOK-001` | High | A lifecycle hook downloads and executes remote content. |
