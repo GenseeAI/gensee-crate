@@ -96,6 +96,18 @@ final class HarnessActivationGuidanceTests: XCTestCase {
         XCTAssertFalse(source.contains("review-codex-hooks.command"))
     }
 
+    func testCodexReviewLauncherRecognizesAutomationPermissionFailures() {
+        for errorNumber in [-1743, -1744] {
+            XCTAssertTrue(CodexHookReviewLauncher.isAutomationPermissionError([
+                "NSAppleScriptErrorNumber": NSNumber(value: errorNumber),
+            ]))
+        }
+        XCTAssertFalse(CodexHookReviewLauncher.isAutomationPermissionError([
+            "NSAppleScriptErrorNumber": NSNumber(value: -1708),
+        ]))
+        XCTAssertFalse(CodexHookReviewLauncher.isAutomationPermissionError(nil))
+    }
+
     func testCodexVersionProbeTimesOut() throws {
         let executable = FileManager.default.temporaryDirectory
             .appendingPathComponent("gensee-codex-probe-\(UUID().uuidString)")

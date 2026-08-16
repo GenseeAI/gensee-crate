@@ -54,12 +54,14 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSApplicationCategoryType: public.app-category.utilities
         LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        NSAppleEventsUsageDescription: Gensee Crate uses Terminal to open the one-time Codex hook trust review.
         NSHumanReadableCopyright: Copyright © 2026 GenseeAI. All rights reserved.
         NSPrincipalClass: NSApplication
     entitlements:
       path: Host/GenseeCrate.entitlements
       properties:
         com.apple.developer.system-extension.install: true
+        com.apple.security.automation.apple-events: true
     settings:
       base:
         COMBINE_HIDPI_IMAGES: YES

@@ -33,6 +33,8 @@ final class EndpointSecuritySensor: ObservableObject {
 
     private let homeURL: URL
     private let executableURL: URL?
+    private let cursorDefaultsKey: String
+    private let bootIDDefaultsKey: String
     private var connection: GenseeEndpointSecurityBridge?
     private var ingestProcess: Process?
     private var ingestInput: FileHandle?
@@ -42,12 +44,21 @@ final class EndpointSecuritySensor: ObservableObject {
     private var started = false
     private var pendingConfiguration: [String: Any] = ["mode": "observe"]
     private var pendingConfigurationData: Data?
-    private var configurationNeedsPush = true
+    // Do not replace the extension's last known managed roots with an empty
+    // startup configuration. The console supplies a complete configuration
+    // only after it has loaded a valid dashboard snapshot.
+    private var configurationNeedsPush = false
     private var ingestErrorBuffer = Data()
 
     init(homeURL: URL, executableURL: URL?) {
         self.homeURL = homeURL
         self.executableURL = executableURL
+        let defaultsSuffix = homeURL.standardizedFileURL.path
+        cursorDefaultsKey = "gensee.endpointSecurity.cursor.\(defaultsSuffix)"
+        bootIDDefaultsKey = "gensee.endpointSecurity.bootID.\(defaultsSuffix)"
+        let defaults = UserDefaults.standard
+        cursor = (defaults.object(forKey: cursorDefaultsKey) as? NSNumber)?.uint64Value ?? 0
+        bootID = defaults.string(forKey: bootIDDefaultsKey) ?? ""
     }
 
     deinit {
@@ -233,6 +244,7 @@ final class EndpointSecuritySensor: ObservableObject {
             if !didRewind {
                 try await write(events: response.0)
                 cursor = pendingCursor
+                persistCursor()
             }
             health.connected = true
             health.error = nil
@@ -270,10 +282,19 @@ final class EndpointSecuritySensor: ObservableObject {
         let nextBootID = dictionary["boot_id"] as? String ?? ""
         let nextCursor = number(dictionary["next_cursor"])
         let oldestCursor = number(dictionary["oldest_cursor"])
-        let didRewind = bootID != nextBootID || cursor >= nextCursor
+        let firstObservation = bootID.isEmpty
+        let didRewind = firstObservation || bootID != nextBootID || cursor >= nextCursor
         if didRewind {
             bootID = nextBootID
-            cursor = oldestCursor > 0 ? oldestCursor - 1 : 0
+            // A pre-persistence build may already have ingested the extension
+            // ring. On the first observation, resume at the live head instead
+            // of replaying that ring and duplicating durable system events.
+            // For an actual extension restart/rewind, resume from its oldest
+            // available event so newly buffered evidence is retained.
+            cursor = firstObservation
+                ? (nextCursor > 0 ? nextCursor - 1 : 0)
+                : (oldestCursor > 0 ? oldestCursor - 1 : 0)
+            persistCursor()
         }
         health.running = (dictionary["running"] as? Bool) ?? false
         health.mode = (dictionary["mode"] as? String) ?? "observe"
@@ -291,6 +312,12 @@ final class EndpointSecuritySensor: ObservableObject {
         )
         health.managedProcesses = number(dictionary["managed_processes"])
         return didRewind
+    }
+
+    private func persistCursor() {
+        let defaults = UserDefaults.standard
+        defaults.set(NSNumber(value: cursor), forKey: cursorDefaultsKey)
+        defaults.set(bootID, forKey: bootIDDefaultsKey)
     }
 
     private func write(events: [[String: Any]]) async throws {

@@ -252,6 +252,8 @@ enum CodexHookReviewScript {
 }
 
 enum CodexHookReviewLauncher {
+    private static let automationPermissionErrorNumbers: Set<Int> = [-1743, -1744]
+
     static func appleScriptSource(shellCommand: String) -> String {
         let escaped = shellCommand
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -262,5 +264,12 @@ enum CodexHookReviewLauncher {
           do script "\(escaped)"
         end tell
         """
+    }
+
+    static func isAutomationPermissionError(_ error: NSDictionary?) -> Bool {
+        guard let number = error?["NSAppleScriptErrorNumber"] as? NSNumber else {
+            return false
+        }
+        return automationPermissionErrorNumbers.contains(number.intValue)
     }
 }

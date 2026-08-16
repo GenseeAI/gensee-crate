@@ -29,6 +29,7 @@ final class ConsoleModel: ObservableObject {
     private var readAlertBaselineCount = 0
     private var readThroughAlertID: Int64 = 0
     private var harnessVerificationBaselines: [String: Int64] = [:]
+    private var hasLoadedDashboardSnapshot = false
 
     init() {
         let environmentHome = ProcessInfo.processInfo.environment["GENSEE_HOME"]
@@ -186,6 +187,7 @@ final class ConsoleModel: ObservableObject {
                 SecuritySnapshot.self,
                 arguments: ["dashboard-state"]
             )
+            hasLoadedDashboardSnapshot = true
             reconcileReadAlertState(alertCount: refreshedSnapshot.summary.alertsCount)
             snapshot = refreshedSnapshot
             reconcileHarnessVerification()
@@ -471,6 +473,7 @@ final class ConsoleModel: ObservableObject {
                 SecuritySnapshot.self,
                 arguments: ["dashboard-state"]
             )
+            hasLoadedDashboardSnapshot = true
             snapshot = preparedSnapshot
             reconcileReadAlertState(alertCount: preparedSnapshot.summary.alertsCount)
             reconcileHarnessVerification()
@@ -512,6 +515,13 @@ final class ConsoleModel: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    func openAutomationPrivacy() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     func openCodexHookReview() {
         guard runningCommand == nil else { return }
         runningCommand = "Finding the installed Codex CLI"
@@ -539,6 +549,11 @@ final class ConsoleModel: ObservableObject {
             guard let appleScript = NSAppleScript(source: appleScriptSource),
                   appleScript.executeAndReturnError(&executionError) != nil
             else {
+                if CodexHookReviewLauncher.isAutomationPermissionError(executionError) {
+                    openAutomationPrivacy()
+                    errorMessage = "Gensee Crate needs permission to control Terminal. In System Settings → Privacy & Security → Automation, allow Gensee Crate to use Terminal, then try again."
+                    return
+                }
                 let detail = executionError?[NSAppleScript.errorMessage] as? String
                     ?? "Terminal could not start the review command."
                 errorMessage = "Could not open Codex hook review: \(detail)"
@@ -979,6 +994,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     private func configureEndpointSensor() {
+        // A failed dashboard query must not clear the system extension's
+        // existing process roots. Without a validated snapshot, an empty
+        // in-memory model means "unknown", not "no active sessions".
+        guard hasLoadedDashboardSnapshot else { return }
         let userHome = FileManager.default.homeDirectoryForCurrentUser
         var protectedPaths = [".ssh", ".aws", ".kube", ".config/gcloud"]
             .map { userHome.appendingPathComponent($0).path }
