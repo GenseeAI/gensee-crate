@@ -2073,7 +2073,7 @@ mod tests {
         write(
             &workspace.join(".vscode/mcp.json"),
             &format!(
-                r#"{{"servers":{{"demo":{{"type":"http","url":"https://example.test/mcp?token={endpoint_secret}","headers":{{"Authorization":"{secret}"}}}}}}}}"#
+                r#"{{"servers":{{"demo":{{"type":"http","url":"https://${{input:user}}:{endpoint_secret}@example.test/mcp","headers":{{"Authorization":"{secret}"}}}}}}}}"#
             ),
         );
 
@@ -2167,6 +2167,8 @@ mod tests {
         for (index, endpoint) in [
             "https://example.com/mcp?token=${input:api-key}",
             "https://${input:user}@example.com/mcp",
+            "https://admin:${input:token}@example.com/mcp",
+            "https://admin@example.com/mcp",
         ]
         .into_iter()
         .enumerate()

@@ -228,15 +228,76 @@ fn parsed_url_has_credentials(url: &Url) -> bool {
 }
 
 fn url_userinfo_has_literal_credentials(url: &Url) -> bool {
-    if url.username().is_empty() && url.password().is_none() {
+    let Some(password) = url.password() else {
         return false;
-    }
+    };
+    let encoded = format!("{}:{password}", url.username());
+    let Some((separator, separator_length)) = userinfo_password_separator(&encoded) else {
+        return false;
+    };
+    secret_value_is_literal(
+        &percent_decode_str(&encoded[separator + separator_length..]).decode_utf8_lossy(),
+    )
+}
 
-    let encoded = url.password().map_or_else(
-        || url.username().to_string(),
-        |password| format!("{}:{password}", url.username()),
-    );
-    secret_value_is_literal(&percent_decode_str(&encoded).decode_utf8_lossy())
+fn userinfo_password_separator(encoded: &str) -> Option<(usize, usize)> {
+    let mut index = 0;
+    let mut inside_runtime_reference = false;
+    let mut closed_runtime_reference = false;
+    while index < encoded.len() {
+        let tail = &encoded[index..];
+        if !inside_runtime_reference {
+            let marker_length = if tail.starts_with("${") {
+                Some(2)
+            } else if tail
+                .get(..4)
+                .is_some_and(|marker| marker.eq_ignore_ascii_case("$%7b"))
+            {
+                Some(4)
+            } else if tail
+                .get(..6)
+                .is_some_and(|marker| marker.eq_ignore_ascii_case("%24%7b"))
+            {
+                Some(6)
+            } else {
+                None
+            };
+            if let Some(marker_length) = marker_length {
+                inside_runtime_reference = true;
+                closed_runtime_reference = false;
+                index += marker_length;
+                continue;
+            }
+            if tail.starts_with(':') {
+                return Some((index, 1));
+            }
+            if closed_runtime_reference
+                && tail
+                    .get(..3)
+                    .is_some_and(|marker| marker.eq_ignore_ascii_case("%3a"))
+            {
+                // `url` treats the colon inside `${input:name}` as the URL's
+                // separator, then percent-encodes a real separator following
+                // the placeholder as part of the parsed password.
+                return Some((index, 3));
+            }
+        } else if tail.starts_with('}') {
+            inside_runtime_reference = false;
+            closed_runtime_reference = true;
+            index += 1;
+            continue;
+        } else if tail
+            .get(..3)
+            .is_some_and(|marker| marker.eq_ignore_ascii_case("%7d"))
+        {
+            inside_runtime_reference = false;
+            closed_runtime_reference = true;
+            index += 3;
+            continue;
+        }
+        index += 1;
+    }
+    None
 }
 
 fn parse_endpoint_for_credential_detection(value: &str) -> Option<Url> {
@@ -482,6 +543,27 @@ mod tests {
             "https://example.com/mcp?token=${input:api-key}",
             "https://${input:user}@example.com/mcp",
             "https://example.com/mcp?api_key=env:MCP_API_KEY",
+        ] {
+            assert!(endpoint_is_parseable(endpoint), "{endpoint}");
+            assert!(!endpoint_has_credentials(endpoint), "{endpoint}");
+            assert!(!endpoint_must_be_redacted(endpoint), "{endpoint}");
+            assert_eq!(endpoint_display_value(endpoint), endpoint);
+        }
+    }
+
+    #[test]
+    fn endpoint_credentials_evaluate_password_separately_from_username() {
+        let literal_password = "https://${input:user}:do-not-leak@example.com/mcp";
+        assert!(endpoint_has_credentials(literal_password));
+        assert!(endpoint_must_be_redacted(literal_password));
+        assert_eq!(
+            endpoint_display_value(literal_password),
+            "<redacted-credential-url>"
+        );
+
+        for endpoint in [
+            "https://admin:${input:token}@example.com/mcp",
+            "https://admin@example.com/mcp",
         ] {
             assert!(endpoint_is_parseable(endpoint), "{endpoint}");
             assert!(!endpoint_has_credentials(endpoint), "{endpoint}");
