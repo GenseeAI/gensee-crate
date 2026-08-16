@@ -2,6 +2,9 @@ import SwiftUI
 
 struct DashboardHarnessesPage: View {
     @ObservedObject var model: ConsoleModel
+    @State private var selectedAuditTarget: String?
+
+    private let auditPanelID = "harness-config-audit"
 
     private var installedCount: Int {
         model.integrations.filter(\.installed).count
@@ -16,40 +19,60 @@ struct DashboardHarnessesPage: View {
     }
 
     var body: some View {
-        DashboardPage {
-            VStack(alignment: .leading, spacing: 16) {
-                DashboardPageHeader(
-                    "Harnesses",
-                    description: "Choose which installed AI harnesses receive Gensee monitoring and policy enforcement."
-                ) {
-                    Button { Task { await model.refreshHarnesses() } } label: {
-                        Label("Scan again", systemImage: "arrow.clockwise")
+        ScrollViewReader { scrollProxy in
+            DashboardPage {
+                VStack(alignment: .leading, spacing: 16) {
+                    DashboardPageHeader(
+                        "Harnesses",
+                        description: "Audit local agent configuration and manage Gensee protection from one place."
+                    ) {
+                        Button { Task { await model.refreshHarnesses() } } label: {
+                            Label("Scan again", systemImage: "arrow.clockwise")
+                        }
+                        .controlSize(.small)
                     }
-                    .controlSize(.small)
-                }
 
-                coverageSummary
+                    coverageSummary
 
-                DashboardCard("Harness protection") {
-                    VStack(spacing: 0) {
-                        ForEach(Array(model.integrations.enumerated()), id: \.element.id) { index, integration in
-                            harnessRow(integration)
-                            if index < model.integrations.count - 1 {
-                                Divider().padding(.leading, 54)
+                    DashboardCard("Harness protection") {
+                        VStack(spacing: 0) {
+                            ForEach(Array(model.integrations.enumerated()), id: \.element.id) { index, integration in
+                                harnessRow(integration)
+                                if index < model.integrations.count - 1 {
+                                    Divider().padding(.leading, 54)
+                                }
                             }
                         }
                     }
-                }
 
-                HStack(alignment: .top, spacing: 9) {
-                    Image(systemName: "info.circle")
-                        .foregroundStyle(.secondary)
-                    Text("Gensee verifies hook coverage, the active event-store path, the backend executable, and harness-specific blockers. Repair rewrites only Gensee-owned entries; unrelated settings and hooks are preserved. Omnigent currently requires a managed `gensee run` launch because it does not yet expose a first-class policy bridge.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(alignment: .top, spacing: 9) {
+                        Image(systemName: "info.circle")
+                            .foregroundStyle(.secondary)
+                        Text("Gensee verifies hook coverage, the active event-store path, the backend executable, and harness-specific blockers. Repair rewrites only Gensee-owned entries; unrelated settings and hooks are preserved. Omnigent currently requires a managed `gensee run` launch because it does not yet expose a first-class policy bridge.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.horizontal, 4)
+
+                    if let selectedAuditTarget {
+                        HarnessConfigAuditPanel(
+                            model: model,
+                            target: selectedAuditTarget,
+                            onClose: { self.selectedAuditTarget = nil }
+                        )
+                        .id(auditPanelID)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    }
                 }
-                .padding(.horizontal, 4)
+            }
+            .onChange(of: selectedAuditTarget) { target in
+                guard target != nil else { return }
+                DispatchQueue.main.async {
+                    withAnimation(.easeOut(duration: 0.22)) {
+                        scrollProxy.scrollTo(auditPanelID, anchor: .top)
+                    }
+                }
             }
         }
     }
@@ -144,40 +167,8 @@ struct DashboardHarnessesPage: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if integration.requiresRepair {
-                Button {
-                    Task { await model.repairIntegration(integration.id) }
-                } label: {
-                    Label("Repair", systemImage: "wrench.and.screwdriver")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(!model.backendAvailable || model.runningCommand != nil)
-                .help("Reconnect \(integration.name) hooks to this app's event store and backend.")
-                .accessibilityLabel("Repair \(integration.name) protection")
-            }
-
-            HStack(spacing: 6) {
-                coverageLabel("Observe", active: integration.canToggle && integration.isHealthy)
-                coverageLabel("Enforce", active: integration.canToggle && integration.isHealthy)
-            }
-            .frame(width: 150, alignment: .trailing)
-
-            Toggle(
-                "Protect \(integration.name)",
-                isOn: Binding(
-                    get: { integration.canToggle && integration.configured },
-                    set: { enabled in
-                        Task { await model.setIntegrationEnabled(integration.id, enabled: enabled) }
-                    }
-                )
-            )
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .tint(.dashboardRed)
-            .disabled(!integration.canToggle || !model.backendAvailable || model.runningCommand != nil)
-            .help(toggleHelp(integration))
-            .frame(width: 48)
+            auditButton(integration)
+            protectionButton(integration)
         }
         .padding(.vertical, 13)
         .contentShape(Rectangle())
@@ -185,10 +176,104 @@ struct DashboardHarnessesPage: View {
         .accessibilityElement(children: .contain)
     }
 
-    private func coverageLabel(_ label: String, active: Bool) -> some View {
-        Label(label, systemImage: active ? "checkmark.circle.fill" : "circle")
-            .font(.system(size: 9, weight: .medium))
-            .foregroundStyle(active ? Color.dashboardGreen : Color.secondary)
+    private func auditButton(_ integration: IntegrationDescriptor) -> some View {
+        let target = configAuditTarget(integration)
+        return Button {
+            guard let target else { return }
+            withAnimation(.easeOut(duration: 0.18)) {
+                selectedAuditTarget = target
+            }
+        } label: {
+            VStack(spacing: 1) {
+                Label("Audit Config", systemImage: "checkmark.shield")
+                if target == nil {
+                    Text("Coming soon")
+                        .font(.system(size: 8, weight: .medium))
+                }
+            }
+            .frame(width: 104)
+            .frame(minHeight: 26)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .disabled(target == nil || !integration.installed || model.runningCommand != nil)
+        .help(auditHelp(integration, target: target))
+        .accessibilityLabel(target == nil ? "Audit Config coming soon for \(integration.name)" : "Audit \(integration.name) configuration")
+    }
+
+    private func protectionButton(_ integration: IntegrationDescriptor) -> some View {
+        Button {
+            Task {
+                if integration.requiresRepair {
+                    await model.repairIntegration(integration.id)
+                } else {
+                    await model.setIntegrationEnabled(integration.id, enabled: !integration.configured)
+                }
+            }
+        } label: {
+            Label(protectionActionLabel(integration), systemImage: protectionActionSymbol(integration))
+                .frame(width: 126)
+                .frame(minHeight: 26)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .tint(protectionActionColor(integration))
+        .disabled(protectionActionDisabled(integration))
+        .help(protectionHelp(integration))
+        .accessibilityLabel("\(protectionActionLabel(integration)) for \(integration.name)")
+    }
+
+    private func configAuditTarget(_ integration: IntegrationDescriptor) -> String? {
+        switch integration.id {
+        case "codex": "codex"
+        case "vscode": "vscode"
+        default: nil
+        }
+    }
+
+    private func auditHelp(_ integration: IntegrationDescriptor, target: String?) -> String {
+        guard target != nil else { return "Configuration Audit support for \(integration.name) is coming soon." }
+        guard integration.installed else { return "Install \(integration.name) before auditing its configuration." }
+        return "Run a read-only security audit of \(integration.name) configuration for a selected workspace."
+    }
+
+    private func protectionActionLabel(_ integration: IntegrationDescriptor) -> String {
+        if integration.requiresRepair { return "Repair Protection" }
+        return integration.configured ? "Disable Protection" : "Enable Protection"
+    }
+
+    private func protectionActionSymbol(_ integration: IntegrationDescriptor) -> String {
+        if integration.requiresRepair { return "wrench.and.screwdriver" }
+        return integration.configured ? "shield.slash" : "shield.checkered"
+    }
+
+    private func protectionActionColor(_ integration: IntegrationDescriptor) -> Color {
+        if integration.requiresRepair { return .dashboardGold }
+        return integration.configured ? .secondary : .dashboardRed
+    }
+
+    private func protectionActionDisabled(_ integration: IntegrationDescriptor) -> Bool {
+        !integration.canToggle
+            || !model.backendAvailable
+            || model.runningCommand != nil
+            || (integration.configurationIssue != nil && !integration.canRepair)
+    }
+
+    private func protectionHelp(_ integration: IntegrationDescriptor) -> String {
+        if !integration.installed { return "Install \(integration.name) before enabling Gensee protection." }
+        if !integration.supportsDirectHooks {
+            return "Omnigent protection currently requires launching it with gensee run."
+        }
+        if !model.backendAvailable { return "The bundled Gensee backend is unavailable." }
+        if integration.requiresRepair {
+            return "Reconnect \(integration.name) hooks to this app's event store and backend."
+        }
+        if integration.configurationIssue != nil {
+            return "This configuration must be fixed manually before Gensee can safely manage it."
+        }
+        return integration.configured
+            ? "Remove Gensee hooks while preserving unrelated harness settings."
+            : "Install Gensee monitoring and policy hooks."
     }
 
     private func rowAccent(_ integration: IntegrationDescriptor) -> Color {
@@ -202,22 +287,5 @@ struct DashboardHarnessesPage: View {
         if integration.configurationIssue != nil { return .dashboardGold }
         if !integration.supportsDirectHooks { return .dashboardBlue }
         return integration.configured ? .dashboardGreen : .secondary
-    }
-
-    private func toggleHelp(_ integration: IntegrationDescriptor) -> String {
-        if !integration.installed { return "Install \(integration.name) before enabling Gensee protection." }
-        if !integration.supportsDirectHooks {
-            return "Omnigent protection currently requires launching it with gensee run."
-        }
-        if !model.backendAvailable { return "The bundled Gensee backend is unavailable." }
-        if integration.requiresRepair {
-            return "Gensee hooks are present but unhealthy. Turn this off to remove them, or use Repair."
-        }
-        if integration.configurationIssue != nil {
-            return "This configuration must be fixed manually before Gensee can safely manage it."
-        }
-        return integration.configured
-            ? "Remove Gensee hooks while preserving unrelated harness settings."
-            : "Install Gensee monitoring and policy hooks."
     }
 }

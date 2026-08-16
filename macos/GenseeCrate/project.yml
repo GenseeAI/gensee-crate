@@ -37,6 +37,8 @@ targets:
       - Host/GenseeEndpointSecurityBridge.m
       - Host/GenseeCLI.swift
       - Host/HarnessConfigurationHealth.swift
+      - Host/AlertSeverityBreakdown.swift
+      - Host/TimelineModels.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
       - Host/ConsoleModel.swift
@@ -129,8 +131,13 @@ targets:
     platform: macOS
     sources:
       - Host/HarnessConfigurationHealth.swift
+      - Host/AlertSeverityBreakdown.swift
+      - Host/TimelineModels.swift
+      - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
       - Tests/HarnessConfigurationHealthTests.swift
+      - Tests/AlertSeverityBreakdownTests.swift
+      - Tests/TimelineModelsTests.swift
       - Tests/ConfigAuditModelsTests.swift
     settings:
       base:

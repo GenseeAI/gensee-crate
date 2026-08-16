@@ -17,6 +17,9 @@ console.
 - A **Daily Highlight** view with today's summary and rolling 53-week heatmaps
   for agent turns, tool calls, alerts, and captured token usage. Selecting a
   day in any heatmap updates the summary above it.
+- A nested **Timeline** that expands sessions into user requests and paired
+  tool calls, with parallel/sequential grouping, execution durations, affected
+  files, policy outcomes, and expandable inputs and results.
 - Installation, status, and removal of the signed Endpoint Security system
   extension.
 - Navigation to Full Disk Access, which macOS requires for complete protected
@@ -24,15 +27,17 @@ console.
 - Endpoint Security `off`, `observe`, `protect`, and `strict` policy modes.
 - Harness protection for Codex, Claude Code, Antigravity, Cursor, GitHub
   Copilot, and Omnigent.
-- A **Config Audit** tab backed by the shared OSS Rust audit library for static,
-  read-only review of Codex CLI and VS Code/Copilot configuration.
+- Per-harness Config Audit actions backed by the shared OSS Rust audit library
+  for static, read-only review of Codex and VS Code/Copilot configuration.
 
 ## Config Audit
 
-Choose **Codex CLI** or **VS Code + Copilot**, select a workspace, and run the
-audit from the native **Config Audit** tab. Findings are expandable with
-file-level evidence and remediation; Inventory, Sources, and Manual Checks
-retain the same versioned report content as `gensee audit --json`.
+Open **Harnesses** and choose **Audit Config** on the Codex or GitHub Copilot
+row. Select a workspace and run the audit inline on the same page. Findings are
+expandable with file-level evidence and remediation; Inventory, Sources, and
+Manual Checks retain the same versioned report content as `gensee audit --json`.
+Harnesses without a static audit adapter show a disabled **Audit
+Config** action marked **Coming soon**.
 
 The app invokes its embedded `gensee` backend. The audit bounds file size and
 directory depth and never launches agents, extensions, hooks, skills, MCP
@@ -53,24 +58,24 @@ harnesses:
 | GitHub Copilot | VS Code agent hooks |
 | Omnigent | Managed launch with `gensee run` |
 
-Installed direct-hook harnesses have an enable/disable switch. Enabling calls
-the matching `gensee setup <provider>` command; disabling calls its
-`--disable` form. Disable removes only Gensee-owned hook entries and preserves
-unrelated user settings and hooks. Harnesses that are not installed remain
-visible but muted and unavailable. Use **Scan again** after installing or
-removing a harness outside Gensee Crate.
+Installed direct-hook harnesses have **Enable Protection** or **Disable
+Protection** actions. Enabling calls the matching `gensee setup <provider>`
+command; disabling calls its `--disable` form. Disable removes only
+Gensee-owned hook entries and preserves unrelated user settings and hooks.
+Harnesses that are not installed remain visible but muted and unavailable. Use
+**Scan again** after installing or removing a harness outside Gensee Crate.
 
 For enabled integrations, the app verifies that every supported lifecycle
 event has a Gensee hook, every hook targets the app's active event store and
 backend executable, and harness-level settings do not disable execution. An
-unhealthy integration remains visibly enabled but changes to **Needs repair**;
-its Observe and Enforce indicators turn off so stale configuration is not
-presented as protection. **Repair** safely replaces stale or partial
-Gensee-owned entries. For Claude Code, an explicit repair also changes
+unhealthy integration changes to **Needs repair** and offers **Repair
+Protection**, so stale configuration is not presented as protection. Repair
+safely replaces stale or partial Gensee-owned entries. For Claude Code, an
+explicit repair also changes
 `disableAllHooks` from `true` to `false` while preserving the rest of the
 settings file.
 
-Omnigent currently has no direct hook switch. Launch it with `gensee run` to
+Omnigent currently has no direct hook protection action. Launch it with `gensee run` to
 place its process tree under Gensee monitoring and supported policy
 enforcement.
 

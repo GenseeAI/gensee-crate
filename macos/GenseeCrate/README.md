@@ -27,16 +27,20 @@ The console includes:
 - A Daily Highlight page with today's summary and four rolling-year activity
   heatmaps for agent turns, tool calls, alerts, and token usage. Heatmap days
   are selectable and update the detailed summary.
+- A Timeline page that expands sessions into their original requests and paired
+  tool calls, including parallel/sequential relationships, duration bars,
+  affected files, policy outcomes, and expandable event evidence.
 - Policy controls backed by `gensee policy get/set/path`.
-- A Config Audit tab backed by `gensee audit --json`, with native findings,
-  evidence, remediation, inventory, source provenance, and manual checks for
-  Codex CLI and VS Code/Copilot configuration.
 - A Harnesses page that detects Codex, Claude Code, Antigravity, Cursor,
   GitHub Copilot, and Omnigent. Installed direct-hook integrations can be
   enabled or disabled through `gensee setup`; unavailable harnesses remain
-  visible but disabled. Enabled integrations are checked for complete hook
-  coverage, the active event-store path, the current backend executable, and
-  harness-specific blockers, with a one-click Repair action when needed.
+  visible but disabled. Codex and GitHub Copilot rows also open the native
+  Config Audit workflow backed by `gensee audit --json`, with findings,
+  evidence, remediation, inventory, source provenance, and manual checks.
+  Other audit actions are visibly marked **Coming soon**. Enabled integrations
+  are checked for complete hook coverage, the active event-store path, the
+  current backend executable, and harness-specific blockers, with a one-click
+  repair action when needed.
 - Endpoint Security installation, removal, and Full Disk Access navigation.
 
 Token totals are captured from compatible Claude Code and Codex transcript
@@ -46,15 +50,20 @@ historical turns and harnesses without compatible usage metadata remain zero.
 ## Use the security console
 
 The **Harnesses** page always lists the six supported harnesses. When Codex,
-Claude Code, Antigravity, Cursor, or GitHub Copilot is detected, its switch
-enables or disables the existing Gensee hook integration through the embedded
-OSS CLI. A harness that is not installed remains visible with a disabled,
-muted switch so users can see what is supported without implying that it is
-active. **Scan again** refreshes installation and protection state. If hooks
-are installed but incomplete, disabled, or routed to a different store or
-backend, the row stays switched on and shows **Needs repair**. **Repair** reruns
-the matching OSS setup command with this app's active store and embedded
-backend; it changes only Gensee-owned hook entries.
+Claude Code, Antigravity, Cursor, or GitHub Copilot is detected, **Enable
+Protection** installs the existing Gensee hook integration through the embedded
+OSS CLI. A protected row instead offers **Disable Protection**. A harness that
+is not installed remains visible with disabled, muted actions so users can see
+what is supported without implying that it is active. **Scan again** refreshes
+installation and protection state. If hooks are incomplete, disabled, or
+routed to a different store or backend, **Repair Protection** reruns the
+matching OSS setup command with this app's active store and embedded backend;
+it changes only Gensee-owned hook entries.
+
+Use **Audit Config** on the Codex or GitHub Copilot row to select a workspace
+and open the read-only audit inline on the Harnesses page. Audit actions for
+Claude Code, Antigravity, Cursor, and Omnigent remain disabled and marked
+**Coming soon** until their static adapters are available.
 
 Omnigent is shown in the same inventory, but it currently uses managed-launch
 protection instead of a direct hook toggle. Launch it through `gensee run` to

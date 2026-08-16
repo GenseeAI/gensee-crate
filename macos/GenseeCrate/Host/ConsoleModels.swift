@@ -6,6 +6,7 @@ struct SecuritySnapshot: Decodable {
     var agentEvents: [AgentEvent] = []
     var systemEvents: [SystemEvent] = []
     var sessions: [RecordedSession] = []
+    var requests: [RecordedRequest] = []
     var artifacts: [ArtifactFact] = []
     var relations: [ArtifactEdge] = []
     var humanFeedback: [HumanFeedback] = []
@@ -15,7 +16,7 @@ struct SecuritySnapshot: Decodable {
     var dailyActivity: [DailyActivity] = []
 
     enum CodingKeys: String, CodingKey {
-        case summary, alerts, agentEvents, systemEvents, sessions, artifacts
+        case summary, alerts, agentEvents, systemEvents, sessions, requests, artifacts
         case relations, humanFeedback, transactionEvents, workspaceEffects, jsonSessions, dailyActivity
     }
 
@@ -28,6 +29,7 @@ struct SecuritySnapshot: Decodable {
         agentEvents = try values.decodeIfPresent([AgentEvent].self, forKey: .agentEvents) ?? []
         systemEvents = try values.decodeIfPresent([SystemEvent].self, forKey: .systemEvents) ?? []
         sessions = try values.decodeIfPresent([RecordedSession].self, forKey: .sessions) ?? []
+        requests = try values.decodeIfPresent([RecordedRequest].self, forKey: .requests) ?? []
         artifacts = try values.decodeIfPresent([ArtifactFact].self, forKey: .artifacts) ?? []
         relations = try values.decodeIfPresent([ArtifactEdge].self, forKey: .relations) ?? []
         humanFeedback = try values.decodeIfPresent([HumanFeedback].self, forKey: .humanFeedback) ?? []
@@ -184,6 +186,7 @@ struct AgentEvent: Decodable, Identifiable {
     let sessionID: String?
     let permissionMode: String?
     let toolInput: String?
+    let toolResponse: String?
     let toolUseID: String?
 
     var id: String { "agent-\(eventID)" }
@@ -198,6 +201,7 @@ struct AgentEvent: Decodable, Identifiable {
         case sessionID = "session_id"
         case permissionMode = "permission_mode"
         case toolInput = "tool_input"
+        case toolResponse = "tool_response"
         case toolUseID = "tool_use_id"
     }
 }
@@ -242,6 +246,26 @@ struct RecordedSession: Decodable, Identifiable {
         case flagged
         case requestCount = "req_count"
         case eventCount = "event_count"
+    }
+}
+
+struct RecordedRequest: Decodable, Identifiable {
+    let requestID: Int64
+    let sessionID: String
+    let originalUserPrompt: String?
+    let finalResponse: String?
+    let createdAt: Int64?
+    let completedAt: Int64?
+
+    var id: Int64 { requestID }
+
+    enum CodingKeys: String, CodingKey {
+        case requestID = "request_id"
+        case sessionID = "session_id"
+        case originalUserPrompt = "original_user_prompt"
+        case finalResponse = "final_response"
+        case createdAt = "created_at"
+        case completedAt = "completed_at"
     }
 }
 

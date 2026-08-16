@@ -27,8 +27,10 @@ struct DashboardAlertsPage: View {
                         Picker("Action", selection: $action) { ForEach(["All", "Allow", "Warn", "Ask", "Block"], id: \.self, content: Text.init) }.frame(width: 110)
                         Button { model.markAllAlertsRead() } label: {
                             Label("Mark All as Read", systemImage: "checkmark.circle")
+                                .frame(minWidth: 116)
                         }
                         .buttonStyle(.bordered)
+                        .fixedSize(horizontal: true, vertical: false)
                         .disabled(model.unreadAlertCount == 0)
                         .help("Clear the unread alert badge without deleting alert history")
                         DashboardRefreshButton(refreshing: model.isRefreshing) { Task { await model.refreshAll() } }
@@ -374,8 +376,8 @@ struct LineagePage: View {
                         }
                     }.frame(width: 330)
 
-                    DashboardCard("Lineage Graph") {
-                        ArtifactGraphView(facts: Array(artifacts.prefix(6)), edges: model.snapshot.relations, selectedURI: $selectedURI)
+                    DashboardCard("Lineage Graph (\(artifacts.count))") {
+                        ArtifactGraphView(facts: artifacts, edges: model.snapshot.relations, selectedURI: $selectedURI)
                             .frame(minHeight: 420)
                     }.frame(maxWidth: .infinity)
                 }
@@ -385,6 +387,12 @@ struct LineagePage: View {
 }
 
 private struct ArtifactGraphView: View {
+    private let nodeSize = CGSize(width: 150, height: 88)
+    private let horizontalInset: CGFloat = 16
+    private let verticalInset: CGFloat = 24
+    private let minimumColumnSpacing: CGFloat = 24
+    private let rowSpacing: CGFloat = 40
+
     let facts: [ArtifactFact]
     let edges: [ArtifactEdge]
     @Binding var selectedURI: String?
@@ -393,41 +401,106 @@ private struct ArtifactGraphView: View {
         if facts.isEmpty { DashboardEmpty(text: "No artifact facts recorded yet.") }
         else {
             GeometryReader { geometry in
-                let positions = Dictionary(uniqueKeysWithValues: facts.enumerated().map { index, fact in
-                    let columns = min(3, max(1, facts.count))
-                    let col = index % columns
-                    let row = index / columns
-                    let x = (geometry.size.width / CGFloat(columns)) * (CGFloat(col) + 0.5)
-                    let y = 84 + CGFloat(row) * 150
-                    return (fact.uri, CGPoint(x: x, y: y))
-                })
-                ZStack {
-                    Canvas { context, _ in
-                        for edge in edges {
-                            guard let source = positions[edge.sourceURI], let destination = positions[edge.destinationURI] else { continue }
-                            var path = Path(); path.move(to: source); path.addLine(to: destination)
-                            let highlighted = selectedURI == edge.sourceURI || selectedURI == edge.destinationURI
-                            context.stroke(path, with: .color(highlighted ? .dashboardRed : .secondary.opacity(0.45)), lineWidth: highlighted ? 2 : 1)
-                        }
-                    }
-                    ForEach(facts) { fact in
-                        if let position = positions[fact.uri] {
-                            Button { selectedURI = selectedURI == fact.uri ? nil : fact.uri } label: {
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text(URL(fileURLWithPath: fact.uri.replacingOccurrences(of: "file://", with: "")).lastPathComponent)
-                                        .font(.system(size: 12, weight: .semibold)).lineLimit(1)
-                                    Text(fact.lastModifiedSource ?? fact.kind).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
-                                    DashboardTag(text: artifactClass(fact), color: artifactClass(fact) == "sensitive" ? .orange : .dashboardBlue)
+                let layout = graphLayout(viewportSize: geometry.size)
+                ScrollViewReader { scrollProxy in
+                    ScrollView([.horizontal, .vertical]) {
+                        ZStack {
+                            Canvas { context, _ in
+                                for edge in edges {
+                                    guard let source = layout.uriPositions[edge.sourceURI],
+                                          let destination = layout.uriPositions[edge.destinationURI]
+                                    else { continue }
+                                    var path = Path()
+                                    path.move(to: source)
+                                    path.addLine(to: destination)
+                                    let highlighted = selectedURI == edge.sourceURI || selectedURI == edge.destinationURI
+                                    context.stroke(
+                                        path,
+                                        with: .color(highlighted ? .dashboardRed : .secondary.opacity(0.45)),
+                                        lineWidth: highlighted ? 2 : 1
+                                    )
                                 }
-                                .padding(10).frame(width: 150, height: 88, alignment: .leading)
-                                .background(Color.dashboardPanel, in: RoundedRectangle(cornerRadius: 8))
-                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(selectedURI == fact.uri ? Color.dashboardRed : Color.dashboardLine, lineWidth: selectedURI == fact.uri ? 2.5 : 1))
-                            }.buttonStyle(.plain).position(position)
+                            }
+                            ForEach(facts) { fact in
+                                if let position = layout.positions[fact.id] {
+                                    Button { selectedURI = selectedURI == fact.uri ? nil : fact.uri } label: {
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            Text(URL(fileURLWithPath: fact.uri.replacingOccurrences(of: "file://", with: "")).lastPathComponent)
+                                                .font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                                            Text(fact.lastModifiedSource ?? fact.kind).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                                            DashboardTag(text: artifactClass(fact), color: artifactClass(fact) == "sensitive" ? .orange : .dashboardBlue)
+                                        }
+                                        .padding(10).frame(width: nodeSize.width, height: nodeSize.height, alignment: .leading)
+                                        .background(Color.dashboardPanel, in: RoundedRectangle(cornerRadius: 8))
+                                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(selectedURI == fact.uri ? Color.dashboardRed : Color.dashboardLine, lineWidth: selectedURI == fact.uri ? 2.5 : 1))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .position(position)
+                                    .id(fact.id)
+                                }
+                            }
+                        }
+                        .frame(width: layout.canvasSize.width, height: layout.canvasSize.height)
+                    }
+                    .onChange(of: selectedURI) { uri in
+                        guard let uri, let fact = facts.first(where: { $0.uri == uri }) else { return }
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            scrollProxy.scrollTo(fact.id, anchor: .center)
                         }
                     }
                 }
             }
         }
+    }
+
+    private func graphLayout(viewportSize: CGSize) -> ArtifactGraphLayout {
+        let usableWidth = max(nodeSize.width, viewportSize.width - horizontalInset * 2)
+        let columns = max(
+            1,
+            Int((usableWidth + minimumColumnSpacing) / (nodeSize.width + minimumColumnSpacing))
+        )
+        let rows = Int(ceil(Double(facts.count) / Double(columns)))
+        let columnSpacing = columns > 1
+            ? max(minimumColumnSpacing, (usableWidth - CGFloat(columns) * nodeSize.width) / CGFloat(columns - 1))
+            : 0
+        let contentWidth = CGFloat(columns) * nodeSize.width
+            + CGFloat(max(0, columns - 1)) * columnSpacing
+        let requiredWidth = horizontalInset * 2 + contentWidth
+        let canvasWidth = max(viewportSize.width, requiredWidth)
+        let leadingInset = max(horizontalInset, (canvasWidth - contentWidth) / 2)
+        let requiredHeight = verticalInset * 2
+            + CGFloat(rows) * nodeSize.height
+            + CGFloat(max(0, rows - 1)) * rowSpacing
+        var positions: [String: CGPoint] = [:]
+        var uriPositions: [String: CGPoint] = [:]
+
+        for (index, fact) in facts.enumerated() {
+            let column = index % columns
+            let row = index / columns
+            let position = CGPoint(
+                x: leadingInset + nodeSize.width / 2 + CGFloat(column) * (nodeSize.width + columnSpacing),
+                y: verticalInset + nodeSize.height / 2 + CGFloat(row) * (nodeSize.height + rowSpacing)
+            )
+            positions[fact.id] = position
+            if uriPositions[fact.uri] == nil {
+                uriPositions[fact.uri] = position
+            }
+        }
+
+        return ArtifactGraphLayout(
+            positions: positions,
+            uriPositions: uriPositions,
+            canvasSize: CGSize(
+                width: canvasWidth,
+                height: max(viewportSize.height, requiredHeight)
+            )
+        )
+    }
+
+    private struct ArtifactGraphLayout {
+        let positions: [String: CGPoint]
+        let uriPositions: [String: CGPoint]
+        let canvasSize: CGSize
     }
 
     private func artifactClass(_ fact: ArtifactFact) -> String {

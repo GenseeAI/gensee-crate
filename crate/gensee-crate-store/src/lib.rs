@@ -468,7 +468,8 @@ impl EventStore {
         let agent_events = query_json_rows(
             conn,
             "SELECT event_id, pid, agent_events.request_id, requests.session_id, ts,
-                source, type, cwd, permission_mode, tool_name, tool_input, tool_use_id
+                source, type, cwd, permission_mode, tool_name, tool_input,
+                tool_response, tool_use_id
              FROM agent_events
              LEFT JOIN requests ON requests.request_id = agent_events.request_id
              ORDER BY ts DESC, event_id DESC
@@ -486,7 +487,8 @@ impl EventStore {
                     "permission_mode": row.get::<_, Option<String>>(8)?,
                     "tool_name": row.get::<_, Option<String>>(9)?,
                     "tool_input": row.get::<_, Option<String>>(10)?,
-                    "tool_use_id": row.get::<_, Option<String>>(11)?,
+                    "tool_response": row.get::<_, Option<String>>(11)?,
+                    "tool_use_id": row.get::<_, Option<String>>(12)?,
                 }))
             },
         )?;
@@ -532,6 +534,24 @@ impl EventStore {
                     "flagged": row.get::<_, i64>(4)?,
                     "req_count": row.get::<_, i64>(5)?,
                     "event_count": row.get::<_, i64>(6)?,
+                }))
+            },
+        )?;
+        let requests = query_json_rows(
+            conn,
+            "SELECT request_id, session_id, original_user_prompt, final_response,
+                created_at, completed_at
+             FROM requests
+             ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
+             LIMIT 500",
+            |row| {
+                Ok(json!({
+                    "request_id": row.get::<_, i64>(0)?,
+                    "session_id": row.get::<_, String>(1)?,
+                    "original_user_prompt": row.get::<_, Option<String>>(2)?,
+                    "final_response": row.get::<_, Option<String>>(3)?,
+                    "created_at": row.get::<_, Option<i64>>(4)?,
+                    "completed_at": row.get::<_, Option<i64>>(5)?,
                 }))
             },
         )?;
@@ -740,6 +760,7 @@ impl EventStore {
             "agentEvents": agent_events,
             "systemEvents": system_events,
             "sessions": sessions,
+            "requests": requests,
             "artifacts": artifacts,
             "relations": relations,
             "humanFeedback": human_feedback,
@@ -3913,6 +3934,27 @@ mod tests {
             })
             .unwrap();
         store
+            .append_hook_event(&AgentHookEvent {
+                provider: "claude-code".to_string(),
+                session_id: Some("s1".to_string()),
+                hook_event_name: Some("PostToolUse".to_string()),
+                cwd: Some("/repo".to_string()),
+                transcript_path: None,
+                tool_name: Some("Read".to_string()),
+                tool_use_id: Some("tool_alert_1".to_string()),
+                tool_input_command: None,
+                tool_input_description: None,
+                tool_response_stdout: Some("contents".to_string()),
+                tool_response_stderr: None,
+                tool_response_interrupted: Some(false),
+                duration_ms: Some(8),
+                permission_mode: Some("default".to_string()),
+                effort_level: None,
+                observed_at_ms: 118,
+                raw_json: r#"{"session_id":"s1","hook_event_name":"PostToolUse","cwd":"/repo","tool_name":"Read","tool_use_id":"tool_alert_1","tool_response":{"stdout":"contents"}}"#.to_string(),
+            })
+            .unwrap();
+        store
             .append_policy_alert(&PolicyAlert {
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool_alert_1".to_string()),
@@ -3927,6 +3969,19 @@ mod tests {
             .unwrap();
 
         let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(
+            dashboard["requests"][0]["original_user_prompt"],
+            "inspect the deployment settings"
+        );
+        let post_event = dashboard["agentEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["type"] == "PostToolUse")
+            .unwrap();
+        let response =
+            serde_json::from_str::<Value>(post_event["tool_response"].as_str().unwrap()).unwrap();
+        assert_eq!(response["duration_ms"], 8);
         let alert = &dashboard["alerts"][0];
         assert_eq!(
             alert["original_user_prompt"],

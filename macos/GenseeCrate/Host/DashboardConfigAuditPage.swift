@@ -1,9 +1,10 @@
 import AppKit
 import SwiftUI
 
-struct DashboardConfigAuditPage: View {
+struct HarnessConfigAuditPanel: View {
     @ObservedObject var model: ConsoleModel
-    @State private var target = "codex"
+    let target: String
+    let onClose: () -> Void
     @State private var workspacePath = Self.defaultWorkspace
     @State private var section = AuditSection.findings
 
@@ -18,65 +19,72 @@ struct DashboardConfigAuditPage: View {
     }
 
     var body: some View {
-        DashboardPage {
-            VStack(alignment: .leading, spacing: 16) {
-                DashboardPageHeader(
-                    "Config Audit",
-                    description: "Static, read-only review of coding-agent permissions, privacy, extensions, and trust boundaries."
-                ) {
-                    if let bundle {
-                        StatusPill(
-                            label: bundle.summary.assessment.capitalized,
-                            color: bundle.summary.assessment == "complete" ? .dashboardGreen : .dashboardGold,
-                            symbol: bundle.summary.assessment == "complete" ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
-                        )
-                    }
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.dashboardBlue.opacity(0.11))
+                    .frame(width: 38, height: 38)
+                    .overlay(
+                        Image(systemName: "checkmark.shield.fill")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(Color.dashboardBlue)
+                    )
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(targetName) Config Audit")
+                        .font(.system(size: 17, weight: .semibold))
+                    Text("Static, read-only review of permissions, privacy, extensions, and trust boundaries.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
-
-                auditControls
-
+                Spacer()
                 if let bundle {
-                    summary(bundle)
-                    Picker("Audit detail", selection: $section) {
-                        ForEach(AuditSection.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(maxWidth: 720)
+                    StatusPill(
+                        label: bundle.summary.assessment.capitalized,
+                        color: bundle.summary.assessment == "complete" ? .dashboardGreen : .dashboardGold,
+                        symbol: bundle.summary.assessment == "complete" ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
+                    )
+                }
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .help("Close Config Audit")
+                .accessibilityLabel("Close \(targetName) Config Audit")
+            }
 
-                    switch section {
-                    case .findings: findingsView(bundle)
-                    case .inventory: inventoryView(bundle)
-                    case .sources: sourcesView(bundle)
-                    case .manualChecks: manualChecksView(bundle)
-                    }
-                } else {
-                    DashboardCard {
-                        DashboardEmpty(
-                            text: "Choose Codex or VS Code, select a workspace, and run a local configuration audit.",
-                            symbol: "checkmark.shield"
-                        )
-                    }
+            auditControls
+
+            if let bundle {
+                summary(bundle)
+                Picker("Audit detail", selection: $section) {
+                    ForEach(AuditSection.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 720)
+
+                switch section {
+                case .findings: findingsView(bundle)
+                case .inventory: inventoryView(bundle)
+                case .sources: sourcesView(bundle)
+                case .manualChecks: manualChecksView(bundle)
+                }
+            } else {
+                DashboardCard {
+                    DashboardEmpty(
+                        text: "Select a workspace and run a local configuration audit for \(targetName).",
+                        symbol: "checkmark.shield"
+                    )
                 }
             }
         }
+        .padding(.top, 6)
     }
 
     private var auditControls: some View {
         DashboardCard("Audit scope") {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .bottom, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("Target").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                        Picker("Target", selection: $target) {
-                            Text("Codex CLI").tag("codex")
-                            Text("VS Code + Copilot").tag("vscode")
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .frame(width: 270)
-                    }
-
                     VStack(alignment: .leading, spacing: 5) {
                         Text("Workspace").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
                         HStack(spacing: 6) {
@@ -103,6 +111,10 @@ struct DashboardConfigAuditPage: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var targetName: String {
+        target == "vscode" ? "GitHub Copilot" : "Codex"
     }
 
     private func summary(_ bundle: ConfigAuditBundle) -> some View {

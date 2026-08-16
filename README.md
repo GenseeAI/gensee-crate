@@ -387,15 +387,17 @@ Build and install [`macos/GenseeCrate`](macos/GenseeCrate), approve its bundled
 system extension, and grant Gensee Crate Full Disk Access. `eslogger` remains an
 optional manual diagnostic backend. The app's Harnesses page detects Codex,
 Claude Code, Antigravity, Cursor, GitHub Copilot, and Omnigent. Installed
-direct-hook harnesses can be enabled or disabled; unavailable harnesses stay
-visible but muted. Enabled hooks are also checked for full event coverage and
-the app's active event-store/backend paths; stale or incomplete integrations
-show **Needs repair** with a one-click safe repair. See the
+direct-hook harnesses can be enabled or disabled with explicit protection
+actions; unavailable harnesses stay visible but muted. Enabled hooks are also
+checked for full event coverage and the app's active event-store/backend paths;
+stale or incomplete integrations show **Needs repair** with a one-click safe
+repair. See the
 [native macOS security console](docs/macos-app.md) guide. Its **Daily
 Highlight** page combines today's summary with rolling-year heatmaps for agent
-turns, tool calls, alerts, and supported transcript token totals. Its **Config
-Audit** tab runs the shared OSS auditor and presents Codex or VS Code/Copilot
-findings, evidence, inventory, source provenance, and manual checks natively.
+turns, tool calls, alerts, and supported transcript token totals. On the
+**Harnesses** page, **Audit Config** on Codex and GitHub Copilot runs the shared
+OSS auditor and presents findings, evidence, inventory, source provenance, and
+manual checks inline; unsupported harness auditors are marked **Coming soon**.
 
 **Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
 `sandbox-exec` and can stage workspace writes for review.

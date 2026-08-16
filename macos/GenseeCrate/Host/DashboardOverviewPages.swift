@@ -130,36 +130,49 @@ private struct ActivityChartCard: View {
 
 private struct SeverityBreakdownCard: View {
     let alerts: [SecurityAlert]
-    private let severities = ["critical", "high", "medium", "low", "info"]
-    private var counts: [(String, Int)] { severities.map { value in (value, alerts.filter { $0.severity.lowercased() == value }.count) } }
+    private var severityValues: [String] { alerts.map(\.severity) }
+    private var severityCounts: [String: Int] { AlertSeverityBreakdown.counts(for: severityValues) }
+    private var slices: [AlertSeveritySlice] { AlertSeverityBreakdown.slices(for: severityValues) }
 
     var body: some View {
         DashboardCard("Alert severity breakdown") {
             HStack(spacing: 22) {
                 ZStack {
                     Circle().stroke(Color.dashboardMutedFill, lineWidth: 16)
-                    Circle().trim(from: 0, to: min(1, alerts.isEmpty ? 0 : Double(alerts.filter { ["critical", "high"].contains($0.severity.lowercased()) }.count) / Double(alerts.count)))
-                        .stroke(Color.dashboardRed, style: StrokeStyle(lineWidth: 16, lineCap: .butt))
-                        .rotationEffect(.degrees(-90))
+                    ForEach(slices) { slice in
+                        Circle()
+                            .trim(from: slice.startFraction, to: slice.endFraction)
+                            .stroke(severityColor(slice.severity), style: StrokeStyle(lineWidth: 16, lineCap: .butt))
+                            .rotationEffect(.degrees(-90))
+                    }
                     VStack(spacing: 0) {
                         Text(alerts.count.formatted()).font(.system(size: 23, weight: .semibold))
                         Text("alerts").font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 .frame(width: 132, height: 132)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Alert severity chart")
+                .accessibilityValue(accessibilityBreakdown)
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(counts, id: \.0) { severity, count in
+                    ForEach(AlertSeverityBreakdown.orderedSeverities, id: \.self) { severity in
                         HStack {
                             Circle().fill(severityColor(severity)).frame(width: 8, height: 8)
                             Text(severity.capitalized).font(.system(size: 11))
                             Spacer()
-                            Text(count.formatted()).font(.system(size: 11, weight: .semibold))
+                            Text(severityCounts[severity, default: 0].formatted()).font(.system(size: 11, weight: .semibold))
                         }
                     }
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 220)
         }
+    }
+
+    private var accessibilityBreakdown: String {
+        AlertSeverityBreakdown.orderedSeverities
+            .map { "\($0.capitalized) \(severityCounts[$0, default: 0])" }
+            .joined(separator: ", ")
     }
 }
 
