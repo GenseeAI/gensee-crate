@@ -1,9 +1,10 @@
 #[cfg(test)]
 use crate::common::MAX_TEXT_FILE_BYTES;
 use crate::common::{
-    canonical_or_original, collect_json_commands, display_path, executable_dependency_is_unpinned,
-    finding_fingerprint, hash_bytes, insecure_remote_http, make_finding, normalize_secret_key,
-    read_limited_text, secret_key_name, sort_findings, source_for, summarize,
+    canonical_or_original, collect_json_commands, display_path, endpoint_contains_secret,
+    executable_dependency_is_unpinned, finding_fingerprint, hash_bytes, insecure_remote_http,
+    make_finding, normalize_secret_key, read_limited_text, secret_key_name, sort_findings,
+    source_for, summarize,
 };
 use crate::model::{
     Assessment, AuditApplicability, AuditFinding, AuditInventory, AuditReport, AuditSource,
@@ -20,7 +21,6 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use url::Url;
 
 const SETTINGS_REFERENCE: &str = "https://code.visualstudio.com/docs/configure/settings";
 const SECURITY_REFERENCE: &str = "https://code.visualstudio.com/docs/agents/security";
@@ -821,7 +821,9 @@ fn inspect_mcp_server(
         .get("url")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let endpoint_has_credentials = raw_endpoint.as_deref().is_some_and(url_has_credentials);
+    let endpoint_has_credentials = raw_endpoint
+        .as_deref()
+        .is_some_and(endpoint_contains_secret);
     let inventory_endpoint = raw_endpoint.as_ref().map(|endpoint| {
         if endpoint_has_credentials {
             "<redacted-credential-url>".to_string()
@@ -1638,18 +1640,6 @@ fn mcp_sandbox_is_broad(value: Option<&Value>) -> bool {
             .is_some_and(|domains| domains.iter().any(|domain| domain.as_str() == Some("*")))
 }
 
-fn url_has_credentials(url: &str) -> bool {
-    let Ok(url) = Url::parse(url) else {
-        return false;
-    };
-    !url.username().is_empty()
-        || url.password().is_some()
-        || url.query_pairs().any(|(key, _)| {
-            let key = normalize_secret_key(&key);
-            secret_key_name(&key)
-        })
-}
-
 fn shell_command(command: &str) -> bool {
     Path::new(command)
         .file_name()
@@ -1929,7 +1919,9 @@ fn evidence(path: &Path, key: Option<&str>, value: Option<&str>) -> Evidence {
         source: display_path(path),
         key: key.map(str::to_string),
         value: value.map(|value| {
-            if key.is_some_and(|key| key.ends_with("otlpEndpoint")) && url_has_credentials(value) {
+            if key.is_some_and(|key| key.ends_with("otlpEndpoint"))
+                && endpoint_contains_secret(value)
+            {
                 "<redacted-credential-url>".to_string()
             } else {
                 value.to_string()
@@ -2083,6 +2075,48 @@ mod tests {
         assert!(serialized.contains("<redacted>"));
         assert!(serialized.contains("<redacted-credential-url>"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn redacts_unparseable_mcp_endpoints_from_the_report() {
+        for (index, endpoint) in [
+            "//admin:do-not-leak@example.com/mcp",
+            "example.com/mcp?token=do-not-leak",
+            ":://admin:do-not-leak@example.com",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = temp_root(&format!("mcp-unparseable-endpoint-{index}"));
+            let _ = fs::remove_dir_all(&root);
+            let workspace = root.join("repo");
+            let user_data = root.join("User");
+            fs::create_dir_all(&workspace).unwrap();
+            write(
+                &workspace.join(".vscode/mcp.json"),
+                &format!(r#"{{"servers":{{"demo":{{"type":"http","url":"{endpoint}"}}}}}}"#),
+            );
+
+            let report = audit_vscode_host(&VscodeAuditOptions {
+                workspace,
+                user_data,
+                profile: None,
+                extension_roots: Vec::new(),
+            })
+            .unwrap();
+            let serialized = serde_json::to_string(&report).unwrap();
+
+            assert!(!serialized.contains("do-not-leak"), "{endpoint}");
+            assert_eq!(
+                report.inventory.mcp_servers[0].endpoint.as_deref(),
+                Some("<redacted-credential-url>")
+            );
+            assert!(report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "VSC-MCP-005"));
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

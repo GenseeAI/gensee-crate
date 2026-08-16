@@ -176,6 +176,27 @@ pub(crate) fn insecure_remote_http(value: &str) -> bool {
     )
 }
 
+/// Returns `true` when an endpoint contains URL credentials or cannot be
+/// parsed safely enough to prove that it does not. Callers use this only for
+/// values already known to be endpoint fields so malformed input fails closed
+/// without redacting unrelated evidence strings.
+pub(crate) fn endpoint_contains_secret(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return true;
+    };
+    !url.username().is_empty()
+        || url.password().is_some()
+        || url
+            .query_pairs()
+            .any(|(key, _)| secret_key_name(&normalize_secret_key(&key)))
+}
+
+pub(crate) fn is_loopback_url(value: &str) -> bool {
+    Url::parse(value)
+        .ok()
+        .is_some_and(|url| url_host_is_loopback(&url))
+}
+
 fn url_host_is_loopback(url: &Url) -> bool {
     url.host().is_some_and(|host| match host {
         Host::Domain(domain) => domain
@@ -309,5 +330,31 @@ mod tests {
         }
         assert!(!looks_like_path("@scope/server@1.2.3"));
         assert!(!looks_like_path("demo-server"));
+    }
+
+    #[test]
+    fn endpoint_redaction_fails_closed_for_unparseable_values() {
+        for endpoint in [
+            "//admin:do-not-leak@example.com/mcp",
+            "example.com/mcp?token=do-not-leak",
+            ":://admin:do-not-leak@example.com",
+        ] {
+            assert!(endpoint_contains_secret(endpoint), "{endpoint}");
+        }
+        assert!(endpoint_contains_secret(
+            "https://admin:do-not-leak@example.com/mcp"
+        ));
+        assert!(endpoint_contains_secret(
+            "https://example.com/mcp?access_token=do-not-leak"
+        ));
+        assert!(!endpoint_contains_secret("https://example.com/mcp"));
+    }
+
+    #[test]
+    fn loopback_urls_require_an_exact_loopback_host() {
+        assert!(is_loopback_url("http://localhost:3000/mcp"));
+        assert!(is_loopback_url("http://127.0.0.2:3000/mcp"));
+        assert!(is_loopback_url("http://[::1]:3000/mcp"));
+        assert!(!is_loopback_url("http://localhost.evil.example/mcp"));
     }
 }

@@ -1,9 +1,10 @@
 #[cfg(test)]
 use crate::common::MAX_TEXT_FILE_BYTES;
 use crate::common::{
-    canonical_or_original, collect_json_commands, display_path, executable_dependency_is_unpinned,
-    finding_fingerprint, hash_bytes, insecure_remote_http, make_finding, normalize_secret_key,
-    read_limited_text, secret_key_name, sort_findings, source_for, summarize,
+    canonical_or_original, collect_json_commands, display_path, endpoint_contains_secret,
+    executable_dependency_is_unpinned, finding_fingerprint, hash_bytes, insecure_remote_http,
+    is_loopback_url, make_finding, normalize_secret_key, read_limited_text, sort_findings,
+    source_for, summarize,
 };
 use crate::model::{
     Assessment, AuditFinding, AuditInventory, AuditReport, AuditSource, AuditTarget, Evidence,
@@ -17,7 +18,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use toml::Value as TomlValue;
-use url::{Host, Url};
 
 const CONFIG_REFERENCE: &str = "https://learn.chatgpt.com/docs/config-file/config-reference";
 const SECURITY_REFERENCE: &str = "https://learn.chatgpt.com/docs/agent-approvals-security";
@@ -2144,11 +2144,18 @@ fn secret_like(key: &str, value: &str) -> bool {
 }
 
 fn sanitize_evidence_value(key: Option<&str>, value: &str) -> String {
-    if key.is_some_and(|key| secret_like(key, value)) || endpoint_contains_secret(value) {
+    if key.is_some_and(|key| secret_like(key, value))
+        || key.is_some_and(endpoint_key) && endpoint_contains_secret(value)
+    {
         "<redacted>".to_string()
     } else {
         value.to_string()
     }
+}
+
+fn endpoint_key(key: &str) -> bool {
+    let key = normalize_secret_key(key);
+    key.contains("url") || key.contains("endpoint")
 }
 
 fn sanitize_endpoint(value: &str) -> String {
@@ -2157,20 +2164,6 @@ fn sanitize_endpoint(value: &str) -> String {
     } else {
         value.to_string()
     }
-}
-
-fn endpoint_contains_secret(value: &str) -> bool {
-    let Ok(url) = Url::parse(value) else {
-        return value
-            .split_once("://")
-            .and_then(|(_, remainder)| remainder.split('/').next())
-            .is_some_and(|authority| authority.contains('@'));
-    };
-    !url.username().is_empty()
-        || url.password().is_some()
-        || url
-            .query_pairs()
-            .any(|(key, _)| secret_key_name(&normalize_secret_key(&key)))
 }
 
 fn is_broad_path(path: &str) -> bool {
@@ -2184,18 +2177,6 @@ fn is_broad_path(path: &str) -> bool {
         || normalized.ends_with("/.ssh")
         || normalized.ends_with("/.aws")
         || normalized.ends_with("/.config")
-}
-
-fn is_loopback_url(value: &str) -> bool {
-    Url::parse(value).ok().is_some_and(|url| {
-        url.host().is_some_and(|host| match host {
-            Host::Domain(domain) => domain
-                .trim_end_matches('.')
-                .eq_ignore_ascii_case("localhost"),
-            Host::Ipv4(address) => address.is_loopback(),
-            Host::Ipv6(address) => address.is_loopback(),
-        })
-    })
 }
 
 fn contains_hidden_unicode(value: &str) -> bool {
@@ -2464,6 +2445,43 @@ mod tests {
         let encoded = serde_json::to_string(&report).unwrap();
         assert!(!encoded.contains("do-not-leak"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn redacts_unparseable_mcp_endpoints_from_the_report() {
+        for (index, endpoint) in [
+            "//admin:do-not-leak@example.com/mcp",
+            "example.com/mcp?token=do-not-leak",
+            ":://admin:do-not-leak@example.com",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = temp_root(&format!("unparseable-endpoint-{index}"));
+            let _ = fs::remove_dir_all(&root);
+            let workspace = root.join("repo");
+            let codex_home = root.join("codex");
+            fs::create_dir_all(&workspace).unwrap();
+            write(
+                &codex_home.join("config.toml"),
+                &format!("[mcp_servers.demo]\nurl = \"{endpoint}\"\n"),
+            );
+
+            let report = audit_codex(&CodexAuditOptions {
+                workspace,
+                codex_home,
+                profile: None,
+            })
+            .unwrap();
+            let serialized = serde_json::to_string(&report).unwrap();
+
+            assert!(!serialized.contains("do-not-leak"), "{endpoint}");
+            assert_eq!(
+                report.inventory.mcp_servers[0].endpoint.as_deref(),
+                Some("<redacted-url>")
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
