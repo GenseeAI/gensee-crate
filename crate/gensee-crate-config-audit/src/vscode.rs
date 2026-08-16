@@ -846,13 +846,19 @@ fn inspect_mcp_server(
                 "high",
                 Assessment::Potential,
                 "MCP endpoint could not be parsed",
-                &format!(
-                    "MCP server `{id}` has an endpoint that could not be parsed; transport, host, and credential posture were not evaluated."
-                ),
+                &if has_credentials {
+                    format!(
+                        "MCP server `{id}` has an endpoint that is not a valid absolute URL; embedded credentials were detected, but transport and host posture were not evaluated."
+                    )
+                } else {
+                    format!(
+                        "MCP server `{id}` has an endpoint that could not be parsed; transport, host, and credential posture were not evaluated."
+                    )
+                },
                 vec![evidence(
                     source,
                     Some(&format!("servers.{id}.url")),
-                    Some("<redacted-url>"),
+                    Some(&endpoint_display_value(url)),
                 )],
                 "Use a valid absolute URL, including its scheme, and rerun the audit.",
                 &[MCP_REFERENCE],
@@ -2101,11 +2107,11 @@ mod tests {
     }
 
     #[test]
-    fn redacts_unparseable_mcp_endpoints_without_confirmed_credential_findings() {
-        for (index, endpoint) in [
-            "//admin:do-not-leak@example.com/mcp",
-            "example.com/mcp?token=do-not-leak",
-            ":://admin:do-not-leak@example.com",
+    fn redacts_unparseable_mcp_endpoints_and_recovers_scheme_less_credentials() {
+        for (index, (endpoint, has_credentials)) in [
+            ("//admin:do-not-leak@example.com/mcp", true),
+            ("example.com/mcp?token=do-not-leak", true),
+            (":://admin:do-not-leak@example.com", false),
         ]
         .into_iter()
         .enumerate()
@@ -2132,12 +2138,19 @@ mod tests {
             assert!(!serialized.contains("do-not-leak"), "{endpoint}");
             assert_eq!(
                 report.inventory.mcp_servers[0].endpoint.as_deref(),
-                Some("<redacted-url>")
+                Some(if has_credentials {
+                    "<redacted-credential-url>"
+                } else {
+                    "<redacted-url>"
+                })
             );
-            assert!(!report
-                .findings
-                .iter()
-                .any(|finding| finding.rule_id == "VSC-MCP-005"));
+            assert_eq!(
+                report.findings.iter().any(|finding| {
+                    finding.rule_id == "VSC-MCP-005" && finding.severity == Severity::High
+                }),
+                has_credentials,
+                "{endpoint}"
+            );
             let parse_finding = report
                 .findings
                 .iter()
@@ -2147,7 +2160,11 @@ mod tests {
             assert_eq!(parse_finding.assessment, Assessment::Potential);
             assert_eq!(
                 parse_finding.evidence[0].value.as_deref(),
-                Some("<redacted-url>")
+                Some(if has_credentials {
+                    "<redacted-credential-url>"
+                } else {
+                    "<redacted-url>"
+                })
             );
             let _ = fs::remove_dir_all(root);
         }

@@ -2,9 +2,10 @@
 use crate::common::MAX_TEXT_FILE_BYTES;
 use crate::common::{
     canonical_or_original, collect_json_commands, display_path, endpoint_display_value,
-    endpoint_is_parseable, endpoint_must_be_redacted, executable_dependency_is_unpinned,
-    finding_fingerprint, hash_bytes, insecure_remote_http, is_loopback_url, make_finding,
-    normalize_secret_key, read_limited_text, sort_findings, source_for, summarize,
+    endpoint_has_credentials, endpoint_is_parseable, endpoint_must_be_redacted,
+    executable_dependency_is_unpinned, finding_fingerprint, hash_bytes, insecure_remote_http,
+    is_loopback_url, make_finding, normalize_secret_key, read_limited_text, sort_findings,
+    source_for, summarize,
 };
 use crate::model::{
     Assessment, AuditFinding, AuditInventory, AuditReport, AuditSource, AuditTarget, Evidence,
@@ -930,6 +931,7 @@ fn evaluate_mcp_servers(
             ));
         }
         if let Some(url) = endpoint.as_deref() {
+            let has_credentials = endpoint_has_credentials(url);
             if !endpoint_is_parseable(url) {
                 findings.push(make_finding(
                     "CAX-MCP-009",
@@ -938,17 +940,44 @@ fn evaluate_mcp_servers(
                     "high",
                     Assessment::Potential,
                     "MCP endpoint could not be parsed",
-                    &format!(
-                        "Server `{id}` has an endpoint that could not be parsed; transport, host, and credential posture were not evaluated."
-                    ),
+                    &if has_credentials {
+                        format!(
+                            "Server `{id}` has an endpoint that is not a valid absolute URL; embedded credentials were detected, but transport and host posture were not evaluated."
+                        )
+                    } else {
+                        format!(
+                            "Server `{id}` has an endpoint that could not be parsed; transport, host, and credential posture were not evaluated."
+                        )
+                    },
                     vec![evidence(
                         source,
                         Some(&format!("mcp_servers.{id}.url")),
-                        Some("<redacted-url>"),
+                        Some(&endpoint_display_value(url)),
                     )],
                     "Use a valid absolute URL, including its scheme, and rerun the audit.",
                     &[MCP_REFERENCE],
                     &["OWASP-MCP1", "OWASP-MCP7"],
+                ));
+            }
+            if has_credentials {
+                findings.push(make_finding(
+                    "CAX-MCP-006",
+                    "mcp_apps_connectors",
+                    Severity::High,
+                    "high",
+                    Assessment::Confirmed,
+                    "MCP endpoint embeds credentials",
+                    &format!(
+                        "Server `{id}` stores credentials directly in its endpoint configuration."
+                    ),
+                    vec![evidence(
+                        source,
+                        Some(&format!("mcp_servers.{id}.url")),
+                        Some("<redacted-credential-url>"),
+                    )],
+                    "Move the credential to an environment variable or approved secret store and use a valid absolute endpoint URL.",
+                    &[MCP_REFERENCE],
+                    &["OWASP-MCP1", "OWASP-ASI03"],
                 ));
             }
             if insecure_remote_http(url) {
@@ -2479,6 +2508,10 @@ mod tests {
         let encoded = serde_json::to_string(&report).unwrap();
         assert!(!encoded.contains("do-not-leak"));
         assert!(encoded.contains("<redacted-credential-url>"));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "CAX-MCP-006" && finding.severity == Severity::High));
 
         write(
             &codex_home.join("config.toml"),
@@ -2497,10 +2530,10 @@ mod tests {
 
     #[test]
     fn redacts_unparseable_mcp_endpoints_from_the_report() {
-        for (index, endpoint) in [
-            "//admin:do-not-leak@example.com/mcp",
-            "example.com/mcp?token=do-not-leak",
-            ":://admin:do-not-leak@example.com",
+        for (index, (endpoint, has_credentials)) in [
+            ("//admin:do-not-leak@example.com/mcp", true),
+            ("example.com/mcp?token=do-not-leak", true),
+            (":://admin:do-not-leak@example.com", false),
         ]
         .into_iter()
         .enumerate()
@@ -2526,7 +2559,20 @@ mod tests {
             assert!(!serialized.contains("do-not-leak"), "{endpoint}");
             assert_eq!(
                 report.inventory.mcp_servers[0].endpoint.as_deref(),
-                Some("<redacted-url>")
+                Some(if has_credentials {
+                    "<redacted-credential-url>"
+                } else {
+                    "<redacted-url>"
+                })
+            );
+            assert_eq!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.rule_id == "CAX-MCP-006"
+                        && finding.severity == Severity::High),
+                has_credentials,
+                "{endpoint}"
             );
             let parse_finding = report
                 .findings
@@ -2537,7 +2583,11 @@ mod tests {
             assert_eq!(parse_finding.assessment, Assessment::Potential);
             assert_eq!(
                 parse_finding.evidence[0].value.as_deref(),
-                Some("<redacted-url>")
+                Some(if has_credentials {
+                    "<redacted-credential-url>"
+                } else {
+                    "<redacted-url>"
+                })
             );
             let _ = fs::remove_dir_all(root);
         }

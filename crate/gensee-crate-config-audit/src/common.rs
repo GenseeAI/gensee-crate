@@ -176,11 +176,11 @@ pub(crate) fn insecure_remote_http(value: &str) -> bool {
     )
 }
 
-/// Returns `true` only when a parsed endpoint proves that it embeds
-/// credentials. An unparseable endpoint is not evidence of credentials.
+/// Returns `true` only when an endpoint proves that it embeds credentials.
+/// Scheme-less HTTP endpoints get one conservative HTTPS recovery attempt so
+/// credential-bearing authority and query components are still detectable.
 pub(crate) fn endpoint_has_credentials(value: &str) -> bool {
-    Url::parse(value)
-        .ok()
+    parse_endpoint_for_credential_detection(value)
         .is_some_and(|url| parsed_url_has_credentials(&url))
 }
 
@@ -200,6 +200,9 @@ pub(crate) fn endpoint_is_parseable(value: &str) -> bool {
 /// credential-specific label; malformed endpoints fail closed with a neutral
 /// label because their credential posture could not be established.
 pub(crate) fn endpoint_display_value(value: &str) -> String {
+    if matches!(value, "<redacted-credential-url>" | "<redacted-url>") {
+        return value.to_string();
+    }
     if endpoint_has_credentials(value) {
         "<redacted-credential-url>".to_string()
     } else if endpoint_must_be_redacted(value) {
@@ -215,6 +218,37 @@ fn parsed_url_has_credentials(url: &Url) -> bool {
         || url
             .query_pairs()
             .any(|(key, _)| secret_key_name(&normalize_secret_key(&key)))
+}
+
+fn parse_endpoint_for_credential_detection(value: &str) -> Option<Url> {
+    if let Ok(url) = Url::parse(value) {
+        return Some(url);
+    }
+
+    let value = value.trim();
+    if value.is_empty() || has_explicit_url_scheme(value) {
+        return None;
+    }
+
+    let authority = value.trim_start_matches('/');
+    if authority.is_empty() {
+        return None;
+    }
+    Url::parse(&format!("https://{authority}")).ok()
+}
+
+fn has_explicit_url_scheme(value: &str) -> bool {
+    let Some(separator) = value.find(':') else {
+        return false;
+    };
+    let scheme = &value[..separator];
+    scheme
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic())
+        && scheme.chars().skip(1).all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
 }
 
 pub(crate) fn is_loopback_url(value: &str) -> bool {
@@ -359,15 +393,28 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_redaction_fails_closed_without_claiming_unparseable_values_have_credentials() {
+    fn endpoint_redaction_recovers_scheme_less_credentials_and_fails_closed() {
         for endpoint in [
             "//admin:do-not-leak@example.com/mcp",
             "example.com/mcp?token=do-not-leak",
-            ":://admin:do-not-leak@example.com",
         ] {
             assert!(endpoint_must_be_redacted(endpoint), "{endpoint}");
-            assert!(!endpoint_has_credentials(endpoint), "{endpoint}");
+            assert!(endpoint_has_credentials(endpoint), "{endpoint}");
+            assert!(!endpoint_is_parseable(endpoint), "{endpoint}");
+            assert_eq!(
+                endpoint_display_value(endpoint),
+                "<redacted-credential-url>"
+            );
         }
+        let malformed = ":://admin:do-not-leak@example.com";
+        assert!(endpoint_must_be_redacted(malformed));
+        assert!(!endpoint_has_credentials(malformed));
+        assert!(!endpoint_is_parseable(malformed));
+        assert_eq!(endpoint_display_value(malformed), "<redacted-url>");
+        assert_eq!(
+            endpoint_display_value("<redacted-credential-url>"),
+            "<redacted-credential-url>"
+        );
         for endpoint in [
             "https://admin:do-not-leak@example.com/mcp",
             "https://example.com/mcp?access_token=do-not-leak",
