@@ -351,6 +351,7 @@ final class ConsoleModel: ObservableObject {
             let output = try await cli.run(arguments)
             noticeMessage = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
             await refreshIntegrationsWithCurrentBackend()
+            configureEndpointSensor()
         } catch {
             if let currentIndex = integrations.firstIndex(where: { $0.id == provider }) {
                 integrations[currentIndex].configured = previousValue
@@ -728,8 +729,13 @@ final class ConsoleModel: ObservableObject {
             blockedExecutables = endpoint["blocked_executables"] as? [String] ?? []
             maxAuthorizationLatencyMS = (endpoint["max_auth_latency_ms"] as? NSNumber)?.uint64Value ?? 10
         }
+        let enabledHarnesses = Set(integrations.lazy.filter(\.configured).map(\.id))
         let roots = snapshot.jsonSessions
-            .filter { $0.isActive && $0.rootPID != 0 }
+            .filter {
+                $0.isActive
+                    && $0.rootPID != 0
+                    && EndpointSessionScope.isEnabled($0, enabledHarnesses: enabledHarnesses)
+            }
             .map { ["pid": $0.rootPID, "session_id": $0.sessionID] as [String: Any] }
         endpointSensor.updateConfiguration(
             mode: policy.endpointSecurityMode,

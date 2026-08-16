@@ -5,6 +5,29 @@ final class HarnessConfigurationHealthTests: XCTestCase {
     private let homeURL = URL(fileURLWithPath: "/Users/test/.gensee")
     private let backendURL = URL(fileURLWithPath: "/Applications/Gensee Crate.app/Contents/Resources/bin/gensee")
 
+    func testEndpointRootsHonorHarnessToggleForHookSessions() {
+        let codex = AgentSessionRecord(
+            sessionID: "codex-session",
+            rootPID: 42,
+            agentBinary: "/Applications/Codex.app/Contents/MacOS/Codex",
+            mode: "hook",
+            endedAtMS: nil
+        )
+        XCTAssertFalse(EndpointSessionScope.isEnabled(codex, enabledHarnesses: []))
+        XCTAssertTrue(EndpointSessionScope.isEnabled(codex, enabledHarnesses: ["codex"]))
+    }
+
+    func testManagedLaunchRemainsEligibleWithoutHookToggle() {
+        let managed = AgentSessionRecord(
+            sessionID: "managed-session",
+            rootPID: 43,
+            agentBinary: "/opt/homebrew/bin/omnigent",
+            mode: "local",
+            endedAtMS: nil
+        )
+        XCTAssertTrue(EndpointSessionScope.isEnabled(managed, enabledHarnesses: []))
+    }
+
     func testHealthyClaudeConfigurationRequiresEveryCurrentHook() throws {
         let command = HarnessConfigurationHealth.expectedCommand(
             provider: "claude-code",

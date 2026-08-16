@@ -115,6 +115,13 @@ extension grants process-level bypass only to Gensee binaries carrying the
 approved Gensee Team ID and signing identifiers; it does not trust executable
 paths or file-content hashes.
 
+Harness protection toggles also scope Endpoint Security attribution. Disabled
+hook harnesses are removed from the extension's managed roots immediately;
+managed `gensee run` sessions remain eligible independently. User-facing bypass
+findings require a bounded active tool-call window and pass through bookkeeping
+filters, logical-operation coalescing, and durable deduplication. Raw OS events
+may still be observed to maintain ancestry without becoming alerts.
+
 See the [Endpoint Security sensor](endpoint-security.md) guide for captured
 events, policy keys, safety boundaries, and rollback.
 

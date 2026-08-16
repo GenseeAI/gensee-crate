@@ -710,6 +710,18 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         self.managedProcesses = activeProcesses;
         self.maxAuthorizationLatencyUS = (maxAuthorizationLatencyMS ?: @10).unsignedLongLongValue * 1000ULL;
     }
+    NSSet<NSString *> *activeSessions = [NSSet setWithArray:roots.allValues];
+    dispatch_sync(self.queue, ^{
+        NSIndexSet *inactiveIndexes = [self.events indexesOfObjectsPassingTest:^BOOL(
+            NSDictionary *event, NSUInteger index, BOOL *stop
+        ) {
+            NSString *sessionID = event[@"attribution"][@"session_id"];
+            return sessionID.length > 0 && ![activeSessions containsObject:sessionID];
+        }];
+        if (inactiveIndexes.count > 0) {
+            [self.events removeObjectsAtIndexes:inactiveIndexes];
+        }
+    });
     if (self.client != NULL) es_clear_cache(self.client);
     reply(YES, nil);
 }

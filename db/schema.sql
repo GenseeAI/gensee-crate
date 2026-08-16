@@ -134,6 +134,9 @@ CREATE TABLE IF NOT EXISTS alerts (
   CHECK (evidence IS NULL OR json_valid(evidence))
 );
 
+CREATE INDEX IF NOT EXISTS idx_alerts_dashboard_dedupe
+  ON alerts(rule_id, request_id, path, created_at, alert_id);
+
 -- Single-row anchor for the alert hash chain: the latest entry_hash and the
 -- count of chained alerts. Updated transactionally with each chained insert, so
 -- tail truncation (deleting the newest alerts, which leaves survivors' links

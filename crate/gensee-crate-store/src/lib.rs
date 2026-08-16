@@ -18,6 +18,7 @@ pub use gensee_crate_db::sqlite::{
     ChainVerification, HumanFeedbackRecord,
 };
 use gensee_crate_rules::policy::Policy;
+use rusqlite::OptionalExtension;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -97,6 +98,13 @@ pub struct PolicyAlert {
     pub path: Option<String>,
     pub evidence: Option<Value>,
     pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveToolCall {
+    pub provider: String,
+    pub tool_use_id: Option<String>,
+    pub started_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -383,11 +391,74 @@ impl EventStore {
             .map_err(sqlite_error)
     }
 
+    /// Returns a hook tool call that started before the OS event, has not yet
+    /// completed or been blocked, and is still inside a bounded correlation
+    /// window. Endpoint Security findings must not be attached to an idle turn.
+    pub fn active_tool_call(
+        &self,
+        session_id: &str,
+        observed_at_ms: u64,
+        window_ms: u64,
+    ) -> io::Result<Option<ActiveToolCall>> {
+        let db = self.sqlite_store()?;
+        let observed_at = to_i64(observed_at_ms)?;
+        let window = to_i64(window_ms)?;
+        db.connection()
+            .query_row(
+                "SELECT candidate.source, candidate.tool_use_id, candidate.ts
+                 FROM agent_events AS candidate
+                 JOIN requests ON requests.request_id = candidate.request_id
+                 WHERE requests.session_id = ?1
+                   AND candidate.type IN ('PreToolUse', 'PermissionRequest')
+                   AND candidate.ts <= ?2
+                   AND candidate.ts >= ?2 - ?3
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM agent_events AS completion
+                     WHERE completion.request_id = candidate.request_id
+                       AND completion.type IN ('PostToolUse', 'PostToolUseFailure')
+                       AND completion.ts >= candidate.ts
+                       AND completion.ts <= ?2
+                       AND (
+                         (candidate.tool_use_id IS NOT NULL
+                          AND completion.tool_use_id = candidate.tool_use_id)
+                         OR (candidate.tool_use_id IS NULL
+                             AND completion.tool_use_id IS NULL)
+                       )
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM alerts
+                     WHERE alerts.request_id = candidate.request_id
+                       AND alerts.action = 'block'
+                       AND alerts.created_at >= candidate.ts
+                       AND alerts.created_at <= ?2
+                       AND (
+                         candidate.tool_use_id IS NULL
+                         OR json_extract(alerts.evidence, '$.tool_use_id') = candidate.tool_use_id
+                       )
+                   )
+                 ORDER BY candidate.ts DESC, candidate.event_id DESC
+                 LIMIT 1",
+                rusqlite::params![session_id, observed_at, window],
+                |row| {
+                    Ok(ActiveToolCall {
+                        provider: row.get(0)?,
+                        tool_use_id: row.get(1)?,
+                        started_at_ms: u64::try_from(row.get::<_, i64>(2)?).unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(SqliteError::Database)
+            .map_err(sqlite_error)
+    }
+
     pub fn dashboard_state(&self) -> io::Result<Value> {
         let db = self.sqlite_store()?;
         let conn = db.connection();
-        let alerts = query_json_rows(
-            conn,
+        let alert_visibility = dashboard_alert_visibility_sql("alerts");
+        let alerts_sql = format!(
             "SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
                 alerts.severity, alerts.action, alerts.rule_id, alerts.message,
                 alerts.path, alerts.evidence, alerts.created_at,
@@ -440,38 +511,35 @@ impl EventStore {
                           candidate_feedback.feedback_id DESC
                  LIMIT 1
                )
-             WHERE NOT (
-                (alerts.rule_id = 'unmatched_system_effect'
-                 AND alerts.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-             )
+             WHERE {alert_visibility}
              ORDER BY alerts.created_at DESC, alerts.alert_id DESC
-             LIMIT 200",
-            |row| {
-                Ok(json!({
-                    "alert_id": row.get::<_, i64>(0)?,
-                    "request_id": row.get::<_, Option<i64>>(1)?,
-                    "entity_kind": row.get::<_, Option<String>>(2)?,
-                    "entity_id": row.get::<_, Option<i64>>(3)?,
-                    "severity": row.get::<_, String>(4)?,
-                    "action": row.get::<_, String>(5)?,
-                    "rule_id": row.get::<_, String>(6)?,
-                    "message": row.get::<_, String>(7)?,
-                    "path": row.get::<_, Option<String>>(8)?,
-                    "evidence": row.get::<_, Option<String>>(9)?,
-                    "created_at": row.get::<_, i64>(10)?,
-                    "session_id": row.get::<_, Option<String>>(11)?,
-                    "original_user_prompt": row.get::<_, Option<String>>(12)?,
-                    "event_source": row.get::<_, Option<String>>(13)?,
-                    "event_type": row.get::<_, Option<String>>(14)?,
-                    "tool_name": row.get::<_, Option<String>>(15)?,
-                    "tool_input": row.get::<_, Option<String>>(16)?,
-                    "tool_use_id": row.get::<_, Option<String>>(17)?,
-                    "human_verdict": row.get::<_, Option<String>>(18)?,
-                    "feedback_label": row.get::<_, Option<String>>(19)?,
-                    "feedback_created_at": row.get::<_, Option<i64>>(20)?,
-                }))
-            },
-        )?;
+             LIMIT 200"
+        );
+        let alerts = query_json_rows(conn, &alerts_sql, |row| {
+            Ok(json!({
+                "alert_id": row.get::<_, i64>(0)?,
+                "request_id": row.get::<_, Option<i64>>(1)?,
+                "entity_kind": row.get::<_, Option<String>>(2)?,
+                "entity_id": row.get::<_, Option<i64>>(3)?,
+                "severity": row.get::<_, String>(4)?,
+                "action": row.get::<_, String>(5)?,
+                "rule_id": row.get::<_, String>(6)?,
+                "message": row.get::<_, String>(7)?,
+                "path": row.get::<_, Option<String>>(8)?,
+                "evidence": row.get::<_, Option<String>>(9)?,
+                "created_at": row.get::<_, i64>(10)?,
+                "session_id": row.get::<_, Option<String>>(11)?,
+                "original_user_prompt": row.get::<_, Option<String>>(12)?,
+                "event_source": row.get::<_, Option<String>>(13)?,
+                "event_type": row.get::<_, Option<String>>(14)?,
+                "tool_name": row.get::<_, Option<String>>(15)?,
+                "tool_input": row.get::<_, Option<String>>(16)?,
+                "tool_use_id": row.get::<_, Option<String>>(17)?,
+                "human_verdict": row.get::<_, Option<String>>(18)?,
+                "feedback_label": row.get::<_, Option<String>>(19)?,
+                "feedback_created_at": row.get::<_, Option<i64>>(20)?,
+            }))
+        })?;
         let agent_events = query_json_rows(
             conn,
             "SELECT event_id, pid, agent_events.request_id, requests.session_id, ts,
@@ -677,8 +745,7 @@ impl EventStore {
                 }))
             },
         )?;
-        let mut dashboard_summary = query_json_rows(
-            conn,
+        let dashboard_summary_sql = format!(
             "SELECT
                 (SELECT COUNT(*) FROM sessions),
                 (SELECT COUNT(*) FROM requests),
@@ -688,33 +755,29 @@ impl EventStore {
                     source = 'macos-endpoint-security'
                     AND args LIKE '%\"session_id\":null%'
                   )),
+                (SELECT COUNT(*) FROM alerts WHERE {alert_visibility}),
                 (SELECT COUNT(*) FROM alerts
-                  WHERE NOT (
-                    (rule_id = 'unmatched_system_effect'
-                     AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-                  )),
-                (SELECT COUNT(*) FROM alerts
-                  WHERE severity IN ('high', 'critical')
+                  WHERE {alert_visibility}
+                    AND severity IN ('high', 'critical')
                     AND created_at >= (unixepoch('now') - 86400) * 1000),
-                (SELECT COUNT(*) FROM artifact_facts)",
-            |row| {
-                Ok(json!({
-                    "sessions_count": row.get::<_, i64>(0)?,
-                    "requests_count": row.get::<_, i64>(1)?,
-                    "agent_events_count": row.get::<_, i64>(2)?,
-                    "system_events_count": row.get::<_, i64>(3)?,
-                    "alerts_count": row.get::<_, i64>(4)?,
-                    "recent_high_alerts": row.get::<_, i64>(5)?,
-                    "artifacts_count": row.get::<_, i64>(6)?,
-                }))
-            },
-        )?
+                (SELECT COUNT(*) FROM artifact_facts)"
+        );
+        let mut dashboard_summary = query_json_rows(conn, &dashboard_summary_sql, |row| {
+            Ok(json!({
+                "sessions_count": row.get::<_, i64>(0)?,
+                "requests_count": row.get::<_, i64>(1)?,
+                "agent_events_count": row.get::<_, i64>(2)?,
+                "system_events_count": row.get::<_, i64>(3)?,
+                "alerts_count": row.get::<_, i64>(4)?,
+                "recent_high_alerts": row.get::<_, i64>(5)?,
+                "artifacts_count": row.get::<_, i64>(6)?,
+            }))
+        })?
         .into_iter()
         .next()
         .unwrap_or_else(|| json!({}));
         dashboard_summary["artifacts_count"] = json!(visible_artifact_count);
-        let daily_activity = query_json_rows(
-            conn,
+        let daily_activity_sql = format!(
             "WITH
              daily_requests AS (
                 SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
@@ -747,10 +810,7 @@ impl EventStore {
                        COUNT(*) AS count
                 FROM alerts
                 WHERE date(created_at / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-371 days')
-                  AND NOT (
-                    (rule_id = 'unmatched_system_effect'
-                     AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-                  )
+                  AND {alert_visibility}
                 GROUP BY day
              ),
              days AS (
@@ -767,17 +827,17 @@ impl EventStore {
              LEFT JOIN daily_requests ON daily_requests.day = days.day
              LEFT JOIN daily_tools ON daily_tools.day = days.day
              LEFT JOIN daily_alerts ON daily_alerts.day = days.day
-             ORDER BY days.day",
-            |row| {
-                Ok(json!({
-                    "date": row.get::<_, String>(0)?,
-                    "requests": row.get::<_, i64>(1)?,
-                    "tool_calls": row.get::<_, i64>(2)?,
-                    "alerts": row.get::<_, i64>(3)?,
-                    "tokens": row.get::<_, i64>(4)?,
-                }))
-            },
-        )?;
+             ORDER BY days.day"
+        );
+        let daily_activity = query_json_rows(conn, &daily_activity_sql, |row| {
+            Ok(json!({
+                "date": row.get::<_, String>(0)?,
+                "requests": row.get::<_, i64>(1)?,
+                "tool_calls": row.get::<_, i64>(2)?,
+                "alerts": row.get::<_, i64>(3)?,
+                "tokens": row.get::<_, i64>(4)?,
+            }))
+        })?;
         Ok(json!({
             "source": "gensee",
             "summary": dashboard_summary,
@@ -811,6 +871,7 @@ impl EventStore {
 
         let db = self.sqlite_store()?;
         let conn = db.connection();
+        let alert_visibility = dashboard_alert_visibility_sql("alerts");
         let valid: i64 = conn
             .query_row("SELECT date(?1) = ?1", [day], |row| row.get(0))
             .map_err(sqlite_error_from_rusqlite)?;
@@ -821,52 +882,50 @@ impl EventStore {
             ));
         }
 
+        let totals_sql = format!(
+            "SELECT
+               (SELECT COUNT(DISTINCT session_id) FROM requests
+                 WHERE session_id != 'system'
+                   AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
+               (SELECT COUNT(*) FROM requests
+                 WHERE session_id != 'system'
+                   AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1
+                   AND (original_user_prompt IS NOT NULL OR completed_at IS NOT NULL
+                        OR EXISTS (SELECT 1 FROM agent_events ae WHERE ae.request_id = requests.request_id))),
+               (SELECT COUNT(*) FROM agent_events
+                 WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1),
+               (SELECT COUNT(*) FROM alerts
+                 WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
+                   AND {alert_visibility}),
+               (SELECT COALESCE(SUM(total_tokens), 0) FROM requests
+                 WHERE session_id != 'system'
+                   AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
+               (SELECT COUNT(*) FROM agent_events
+                 WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+                   AND (lower(COALESCE(tool_name, '')) LIKE '%write%'
+                        OR lower(COALESCE(tool_name, '')) LIKE '%edit%'
+                        OR lower(COALESCE(tool_name, '')) LIKE '%create%')),
+               (SELECT COUNT(*) FROM agent_events
+                 WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+                   AND lower(COALESCE(tool_name, '')) LIKE '%read%'),
+               (SELECT COUNT(*) FROM agent_events
+                 WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+                   AND (lower(COALESCE(tool_name, '')) LIKE '%search%'
+                        OR lower(COALESCE(tool_name, '')) LIKE '%fetch%'))"
+        );
         let totals = conn
-            .query_row(
-                "SELECT
-                   (SELECT COUNT(DISTINCT session_id) FROM requests
-                     WHERE session_id != 'system'
-                       AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
-                   (SELECT COUNT(*) FROM requests
-                     WHERE session_id != 'system'
-                       AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1
-                       AND (original_user_prompt IS NOT NULL OR completed_at IS NOT NULL
-                            OR EXISTS (SELECT 1 FROM agent_events ae WHERE ae.request_id = requests.request_id))),
-                   (SELECT COUNT(*) FROM agent_events
-                     WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1),
-                   (SELECT COUNT(*) FROM alerts
-                     WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
-                       AND NOT (rule_id = 'unmatched_system_effect'
-                                AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')),
-                   (SELECT COALESCE(SUM(total_tokens), 0) FROM requests
-                     WHERE session_id != 'system'
-                       AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
-                   (SELECT COUNT(*) FROM agent_events
-                     WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
-                       AND (lower(COALESCE(tool_name, '')) LIKE '%write%'
-                            OR lower(COALESCE(tool_name, '')) LIKE '%edit%'
-                            OR lower(COALESCE(tool_name, '')) LIKE '%create%')),
-                   (SELECT COUNT(*) FROM agent_events
-                     WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
-                       AND lower(COALESCE(tool_name, '')) LIKE '%read%'),
-                   (SELECT COUNT(*) FROM agent_events
-                     WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
-                       AND (lower(COALESCE(tool_name, '')) LIKE '%search%'
-                            OR lower(COALESCE(tool_name, '')) LIKE '%fetch%'))",
-                [day],
-                |row| {
-                    Ok(json!({
-                        "sessions": row.get::<_, i64>(0)?,
-                        "requests": row.get::<_, i64>(1)?,
-                        "tool_calls": row.get::<_, i64>(2)?,
-                        "alerts": row.get::<_, i64>(3)?,
-                        "tokens": row.get::<_, i64>(4)?,
-                        "files_written": row.get::<_, i64>(5)?,
-                        "files_read": row.get::<_, i64>(6)?,
-                        "web_requests": row.get::<_, i64>(7)?,
-                    }))
-                },
-            )
+            .query_row(&totals_sql, [day], |row| {
+                Ok(json!({
+                    "sessions": row.get::<_, i64>(0)?,
+                    "requests": row.get::<_, i64>(1)?,
+                    "tool_calls": row.get::<_, i64>(2)?,
+                    "alerts": row.get::<_, i64>(3)?,
+                    "tokens": row.get::<_, i64>(4)?,
+                    "files_written": row.get::<_, i64>(5)?,
+                    "files_read": row.get::<_, i64>(6)?,
+                    "web_requests": row.get::<_, i64>(7)?,
+                }))
+            })
             .map_err(sqlite_error_from_rusqlite)?;
 
         let grouped = |sql: &str| -> io::Result<Vec<Value>> {
@@ -888,20 +947,20 @@ impl EventStore {
                AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
              GROUP BY tool_name ORDER BY COUNT(*) DESC, tool_name LIMIT 8",
         )?;
-        let alerts_by_action = grouped(
+        let alerts_by_action_sql = format!(
             "SELECT action, COUNT(*) FROM alerts
              WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
-               AND NOT (rule_id = 'unmatched_system_effect'
-                        AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-             GROUP BY action ORDER BY COUNT(*) DESC, action",
-        )?;
-        let alerts_by_severity = grouped(
+               AND {alert_visibility}
+             GROUP BY action ORDER BY COUNT(*) DESC, action"
+        );
+        let alerts_by_action = grouped(&alerts_by_action_sql)?;
+        let alerts_by_severity_sql = format!(
             "SELECT severity, COUNT(*) FROM alerts
              WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
-               AND NOT (rule_id = 'unmatched_system_effect'
-                        AND evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-             GROUP BY severity ORDER BY COUNT(*) DESC, severity",
-        )?;
+               AND {alert_visibility}
+             GROUP BY severity ORDER BY COUNT(*) DESC, severity"
+        );
+        let alerts_by_severity = grouped(&alerts_by_severity_sql)?;
 
         let mut result = totals.as_object().cloned().unwrap_or_default();
         result.insert("date".to_string(), json!(day));
@@ -937,6 +996,68 @@ impl EventStore {
                 refresh_request_resource_rates(db, request_id)?;
             }
             Ok(())
+        })
+    }
+
+    /// Inserts an Endpoint Security alert unless the same logical operation
+    /// was already persisted inside `window_ms`. The caller's key includes the
+    /// session, exact `(pid,pidversion)`, path, operation, and rule, providing a
+    /// durable second deduplication layer across app/ingester restarts.
+    pub fn append_endpoint_policy_alert(
+        &self,
+        alert: &PolicyAlert,
+        dedupe_key: &str,
+        window_ms: u64,
+    ) -> io::Result<bool> {
+        self.with_sqlite_transaction(|db| {
+            let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
+            ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
+            let request_id = latest_or_create_request(db, session_id)?;
+            let created_at = to_i64(alert.observed_at_ms)?;
+            let window = to_i64(window_ms)?;
+            let duplicate = db
+                .connection()
+                .query_row(
+                    "SELECT 1
+                     FROM alerts
+                     WHERE rule_id = ?1
+                       AND json_extract(evidence, '$.endpoint_dedupe_key') = ?2
+                       AND ABS(created_at - ?3) <= ?4
+                     LIMIT 1",
+                    rusqlite::params![alert.rule_id, dedupe_key, created_at, window],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(SqliteError::Database)
+                .map_err(sqlite_error)?
+                .is_some();
+            if duplicate {
+                return Ok(false);
+            }
+
+            let evidence = merge_alert_evidence(
+                add_alert_evidence_field(
+                    alert.evidence.clone(),
+                    "endpoint_dedupe_key",
+                    Value::String(dedupe_key.to_string()),
+                ),
+                alert.tool_use_id.as_deref(),
+            );
+            insert_alert(
+                db,
+                AlertInput {
+                    request_id: Some(request_id),
+                    entity: None,
+                    severity: &alert.severity,
+                    action: &alert.action,
+                    rule_id: &alert.rule_id,
+                    message: &alert.message,
+                    path: alert.path.as_deref(),
+                    evidence,
+                    created_at,
+                },
+            )?;
+            Ok(true)
         })
     }
 
@@ -1974,6 +2095,26 @@ fn merge_alert_evidence(evidence: Option<Value>, tool_use_id: Option<&str>) -> O
     }
 }
 
+fn add_alert_evidence_field(evidence: Option<Value>, key: &str, value: Value) -> Option<Value> {
+    match evidence {
+        Some(Value::Object(mut map)) => {
+            map.insert(key.to_string(), value);
+            Some(Value::Object(map))
+        }
+        Some(details) => {
+            let mut map = serde_json::Map::new();
+            map.insert(key.to_string(), value);
+            map.insert("details".to_string(), details);
+            Some(Value::Object(map))
+        }
+        None => {
+            let mut map = serde_json::Map::new();
+            map.insert(key.to_string(), value);
+            Some(Value::Object(map))
+        }
+    }
+}
+
 struct ArtifactFactUpdate<'a> {
     path: &'a str,
     artifact_id: i64,
@@ -2809,6 +2950,7 @@ fn should_materialize_system_artifact(
 }
 
 fn lineage_path_is_harness_runtime_noise(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
     path.starts_with("/dev/")
         || path.starts_with("/private/tmp/cc-socks/")
         || path.starts_with("/tmp/cc-socks/")
@@ -2820,6 +2962,22 @@ fn lineage_path_is_harness_runtime_noise(path: &str) -> bool {
         || path.contains("/.claude/shell-snapshots/")
         || (path.contains("/.claude/plugins/cache/")
             && (path.ends_with("/.in_use") || path.contains("/.in_use/")))
+        || lower.contains("/library/application support/codex/")
+        || lower.contains("/library/application support/claude/")
+        || lower.contains("/crashpad/")
+        || lower.contains("/diagnosticreports/")
+        || lower.contains("/crash reports/")
+        || lower.contains("/target/")
+        || lower.contains("/deriveddata/")
+        || lower.contains("/.build/")
+        || lower.contains("/node_modules/.cache/")
+        || lower.contains("/test-results/")
+        || lower.contains("/testresults/")
+        || ((lower.ends_with("-wal") || lower.ends_with("-shm") || lower.ends_with("-journal"))
+            && (lower.contains("/.codex/")
+                || lower.contains("/.claude/")
+                || lower.contains("/library/application support/cursor/")
+                || lower.contains("/library/application support/code/")))
 }
 
 fn lineage_path_is_system_dependency(path: &str) -> bool {
@@ -2889,6 +3047,43 @@ fn dashboard_path_visibility_sql(path: &str) -> String {
             OR {path} GLOB '/private/var/folders/*'
             OR {path} GLOB '/opt/homebrew/Cellar/*'
         )"
+    )
+}
+
+fn dashboard_alert_visibility_sql(alias: &str) -> String {
+    let path = format!("COALESCE({alias}.path, '')");
+    let lower_path = format!("lower({path})");
+    format!(
+        "NOT ({alias}.rule_id = 'unmatched_system_effect'
+              AND {alias}.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
+         AND NOT ({alias}.rule_id = 'hook_bypass_file_mutation' AND (
+              {path} GLOB '/dev/*'
+              OR {lower_path} LIKE '%/library/application support/codex/%'
+              OR {lower_path} LIKE '%/library/application support/claude/%'
+              OR {lower_path} LIKE '%/crashpad/%'
+              OR {lower_path} LIKE '%/diagnosticreports/%'
+              OR {lower_path} LIKE '%/crash reports/%'
+              OR {lower_path} LIKE '%/.codex/sessions/%.jsonl'
+              OR {lower_path} LIKE '%/.claude/projects/%.jsonl'
+              OR {lower_path} LIKE '%/target/%'
+              OR {lower_path} LIKE '%/deriveddata/%'
+              OR {lower_path} LIKE '%/.build/%'
+              OR {lower_path} LIKE '%/node_modules/.cache/%'
+              OR {lower_path} LIKE '%/test-results/%'
+              OR {lower_path} LIKE '%/testresults/%'
+         ))
+         AND NOT ({alias}.rule_id = 'hook_bypass_file_mutation' AND EXISTS (
+              SELECT 1 FROM alerts AS earlier
+              WHERE earlier.alert_id < {alias}.alert_id
+                AND earlier.rule_id = {alias}.rule_id
+                AND earlier.request_id IS {alias}.request_id
+                AND COALESCE(earlier.path, '') = COALESCE({alias}.path, '')
+                AND ABS(earlier.created_at - {alias}.created_at) <= 10000
+                AND COALESCE(json_extract(earlier.evidence, '$.actor.pid'), -1) =
+                    COALESCE(json_extract({alias}.evidence, '$.actor.pid'), -1)
+                AND COALESCE(json_extract(earlier.evidence, '$.actor.pidversion'), -1) =
+                    COALESCE(json_extract({alias}.evidence, '$.actor.pidversion'), -1)
+         ))"
     )
 }
 
@@ -4403,6 +4598,56 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_hides_legacy_endpoint_noise_and_duplicate_bursts() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-dashboard-endpoint-alert-filter-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"build"}"#,
+                100,
+            ))
+            .unwrap();
+
+        let endpoint_alert = |path: &str, observed_at_ms: u64| PolicyAlert {
+            session_id: Some("s1".to_string()),
+            tool_use_id: None,
+            severity: "medium".to_string(),
+            action: "warn".to_string(),
+            rule_id: "hook_bypass_file_mutation".to_string(),
+            message: "legacy endpoint mutation".to_string(),
+            path: Some(path.to_string()),
+            evidence: Some(json!({
+                "source": "macos-endpoint-security",
+                "actor": { "pid": 42, "pidversion": 7 }
+            })),
+            observed_at_ms,
+        };
+        store
+            .append_policy_alert(&endpoint_alert(
+                "/Users/test/Library/Application Support/Codex/Crashpad/new/report.dmp",
+                1_000,
+            ))
+            .unwrap();
+        for timestamp in [2_000, 2_001, 2_002] {
+            store
+                .append_policy_alert(&endpoint_alert("/repo/out.txt", timestamp))
+                .unwrap();
+        }
+
+        assert_eq!(store.list_alerts().unwrap().len(), 4);
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["summary"]["alerts_count"], 1);
+        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(dashboard["alerts"][0]["path"], "/repo/out.txt");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn failed_database_append_rolls_back_partial_graph_rows() {
         let dir =
             std::env::temp_dir().join(format!("gensee-store-test-rollback-{}", std::process::id()));
@@ -5530,6 +5775,93 @@ mod tests {
         assert!(!relations
             .iter()
             .any(|relation| relation.relation_type == "derived_from"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_active_tool_window_opens_closes_and_expires() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-endpoint-tool-window-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"write it"}"#,
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event(&native_tool_event(
+                "Bash",
+                "tool-active",
+                r#"{"command":"printf hi > out.txt"}"#,
+                200,
+            ))
+            .unwrap();
+
+        let active = store.active_tool_call("s1", 250, 1_000).unwrap().unwrap();
+        assert_eq!(active.provider, "claude-code");
+        assert_eq!(active.tool_use_id.as_deref(), Some("tool-active"));
+        assert!(store
+            .active_tool_call("s1", 1_201, 1_000)
+            .unwrap()
+            .is_none());
+
+        let mut completed = native_tool_event("Bash", "tool-active", "{}", 300);
+        completed.hook_event_name = Some("PostToolUse".to_string());
+        completed.raw_json = r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"tool-active"}"#.to_string();
+        store.append_hook_event(&completed).unwrap();
+        assert!(store.active_tool_call("s1", 350, 1_000).unwrap().is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_alert_deduplication_survives_pipeline_restarts() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-endpoint-alert-dedupe-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let alert = PolicyAlert {
+            session_id: Some("s1".to_string()),
+            tool_use_id: Some("tool-1".to_string()),
+            severity: "medium".to_string(),
+            action: "warn".to_string(),
+            rule_id: "hook_bypass_file_mutation".to_string(),
+            message: "unreported mutation".to_string(),
+            path: Some("/repo/out.txt".to_string()),
+            evidence: Some(json!({"source": "macos-endpoint-security"})),
+            observed_at_ms: 1_000,
+        };
+        let key = "s1:42:7:/repo/out.txt:mutation";
+        assert!(store
+            .append_endpoint_policy_alert(&alert, key, 10_000)
+            .unwrap());
+        assert!(!store
+            .append_endpoint_policy_alert(
+                &PolicyAlert {
+                    observed_at_ms: 2_000,
+                    ..alert.clone()
+                },
+                key,
+                10_000
+            )
+            .unwrap());
+        assert!(store
+            .append_endpoint_policy_alert(
+                &PolicyAlert {
+                    observed_at_ms: 12_001,
+                    ..alert
+                },
+                key,
+                10_000
+            )
+            .unwrap());
+        assert_eq!(store.list_alerts().unwrap().len(), 2);
 
         fs::remove_dir_all(&dir).ok();
     }

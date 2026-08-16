@@ -239,6 +239,148 @@ pub struct EndpointSecurityFinding {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EndpointAlertKey {
+    session_id: String,
+    process: ProcessKey,
+    path: String,
+    operation: &'static str,
+}
+
+/// Reduces the kernel's open/write/close stream to user-facing logical file
+/// operations. This is deliberately in-memory as a first-stage coalescer; the
+/// event store applies a second durable deduplication check across restarts.
+pub struct EndpointSecurityAlertPipeline {
+    recent_operations: HashMap<EndpointAlertKey, u64>,
+    coalescing_window_ms: u64,
+}
+
+impl Default for EndpointSecurityAlertPipeline {
+    fn default() -> Self {
+        Self::new(10_000)
+    }
+}
+
+impl EndpointSecurityAlertPipeline {
+    pub fn new(coalescing_window_ms: u64) -> Self {
+        Self {
+            recent_operations: HashMap::new(),
+            coalescing_window_ms,
+        }
+    }
+
+    /// Returns the normalized operation and reporting path when this event is
+    /// eligible to produce one new finding. Raw telemetry is stored regardless.
+    pub fn logical_operation(
+        &mut self,
+        event: &EndpointSecurityEvent,
+        session_id: &str,
+    ) -> Option<(&'static str, String)> {
+        if endpoint_security_event_is_bookkeeping(event) {
+            return None;
+        }
+        let operation = endpoint_security_logical_operation(event)?;
+        let path = endpoint_security_reporting_path(event)?.to_string();
+        let key = EndpointAlertKey {
+            session_id: session_id.to_string(),
+            process: event.actor.key(),
+            path: path.clone(),
+            operation,
+        };
+        let observed_at_ms = event.observed_at_ms;
+        self.recent_operations.retain(|_, last_seen| {
+            observed_at_ms.saturating_sub(*last_seen) <= self.coalescing_window_ms
+        });
+        if self.recent_operations.get(&key).is_some_and(|last_seen| {
+            observed_at_ms.abs_diff(*last_seen) <= self.coalescing_window_ms
+        }) {
+            return None;
+        }
+        self.recent_operations.insert(key, observed_at_ms);
+        Some((operation, path))
+    }
+}
+
+pub fn endpoint_security_logical_operation(event: &EndpointSecurityEvent) -> Option<&'static str> {
+    match event.event_type.as_str() {
+        "open" if event.is_write_open() => Some("mutation"),
+        "open" | "readdir" | "mmap" => Some("read"),
+        "create" | "write" | "truncate" => Some("mutation"),
+        "close" if event.modified == Some(true) => Some("mutation"),
+        "rename" => Some("rename"),
+        "unlink" => Some("delete"),
+        _ => None,
+    }
+}
+
+pub fn endpoint_security_reporting_path(event: &EndpointSecurityEvent) -> Option<&str> {
+    if event.event_type == "rename" {
+        event
+            .destination
+            .as_ref()
+            .map(|file| file.path.as_str())
+            .or_else(|| event.primary_path())
+    } else {
+        event.primary_path()
+    }
+}
+
+/// Known harness/runtime bookkeeping is useful as raw telemetry but is not a
+/// security finding. Keep this list narrow and based on dedicated state/build
+/// locations rather than filename extensions alone.
+pub fn endpoint_security_event_is_bookkeeping(event: &EndpointSecurityEvent) -> bool {
+    let executable = event
+        .actor
+        .executable_path
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if executable.contains("crashpad_handler")
+        || executable.contains("crashreporter")
+        || executable.ends_with("/reportcrash")
+    {
+        return true;
+    }
+
+    let Some(path) = endpoint_security_reporting_path(event) else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    if matches!(lower.as_str(), "/dev/null" | "/dev/zero" | "/dev/tty") {
+        return true;
+    }
+    if lower.contains("/library/application support/codex/")
+        || lower.contains("/library/application support/claude/")
+        || lower.contains("/crashpad/")
+        || lower.contains("/diagnosticreports/")
+        || lower.contains("/crash reports/")
+    {
+        return true;
+    }
+    if (lower.contains("/.codex/sessions/") || lower.contains("/.claude/projects/"))
+        && lower.ends_with(".jsonl")
+    {
+        return true;
+    }
+    if lower.contains("/target/")
+        || lower.contains("/deriveddata/")
+        || lower.contains("/.build/")
+        || lower.contains("/node_modules/.cache/")
+        || lower.contains("/test-results/")
+        || lower.contains("/testresults/")
+    {
+        return true;
+    }
+    let sqlite_sidecar =
+        lower.ends_with("-wal") || lower.ends_with("-shm") || lower.ends_with("-journal");
+    sqlite_sidecar
+        && (lower.contains("/.codex/")
+            || lower.contains("/.claude/")
+            || lower.contains("/library/application support/cursor/")
+            || lower.contains("/library/application support/code/"))
+}
+
 #[derive(Debug, Clone)]
 struct GraphNode {
     parent: Option<ProcessKey>,
@@ -394,7 +536,22 @@ impl EndpointSecurityIngestor {
                 }
             }
             "exit" => {
-                self.exited.insert(event.actor.key());
+                let key = event.actor.key();
+                self.exited.insert(key);
+                if let Some(node) = self.nodes.remove(&key) {
+                    if node.depth == Some(0) {
+                        self.active_roots.remove(&event.actor.pid);
+                        if let Some(session_id) = node.session_id {
+                            for descendant in self.nodes.values_mut() {
+                                if descendant.session_id.as_deref() == Some(&session_id) {
+                                    descendant.session_id = None;
+                                    descendant.root_pid = None;
+                                    descendant.depth = None;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -650,5 +807,93 @@ mod tests {
             attributed.attribution.session_id.as_deref(),
             Some("live-session")
         );
+    }
+
+    #[test]
+    fn root_exit_revokes_attribution_from_surviving_background_helpers() {
+        let mut ingestor = EndpointSecurityIngestor::new(&[session()]);
+        ingestor.ingest(event("open", process(10, 1, Some(1), Some(1))));
+
+        let mut fork = event("fork", process(10, 1, Some(1), Some(1)));
+        fork.target = Some(process(11, 1, Some(10), Some(1)));
+        ingestor.ingest(fork);
+        ingestor.ingest(event("exit", process(10, 1, Some(1), Some(1))));
+
+        let (helper_event, _) = ingestor.ingest(event("open", process(11, 1, Some(10), Some(1))));
+        assert_eq!(helper_event.attribution.session_id, None);
+        assert_eq!(ingestor.health()["active_session_roots"], 0);
+    }
+
+    #[test]
+    fn coalesces_open_write_and_close_into_one_mutation() {
+        let mut pipeline = EndpointSecurityAlertPipeline::new(10_000);
+        let mut open = event("open", process(20, 2, Some(10), Some(1)));
+        open.open_flags = Some(2);
+        open.file = Some(EndpointSecurityFile {
+            path: "/repo/output.txt".to_string(),
+            ..EndpointSecurityFile::default()
+        });
+        assert_eq!(
+            pipeline.logical_operation(&open, "session-1"),
+            Some(("mutation", "/repo/output.txt".to_string()))
+        );
+
+        let mut write = event("write", process(20, 2, Some(10), Some(1)));
+        write.observed_at_ms = 2;
+        write.file = open.file.clone();
+        assert_eq!(pipeline.logical_operation(&write, "session-1"), None);
+
+        let mut close = event("close", process(20, 2, Some(10), Some(1)));
+        close.observed_at_ms = 3;
+        close.modified = Some(true);
+        close.file = open.file;
+        assert_eq!(pipeline.logical_operation(&close, "session-1"), None);
+    }
+
+    #[test]
+    fn keeps_same_path_operations_from_different_processes_distinct() {
+        let mut pipeline = EndpointSecurityAlertPipeline::new(10_000);
+        let mut first = event("write", process(20, 2, Some(10), Some(1)));
+        first.file = Some(EndpointSecurityFile {
+            path: "/repo/output.txt".to_string(),
+            ..EndpointSecurityFile::default()
+        });
+        let mut second = first.clone();
+        second.actor = process(21, 1, Some(10), Some(1));
+        second.observed_at_ms = 2;
+        assert!(pipeline.logical_operation(&first, "session-1").is_some());
+        assert!(pipeline.logical_operation(&second, "session-1").is_some());
+    }
+
+    #[test]
+    fn excludes_crash_reports_transcripts_build_outputs_and_sqlite_sidecars() {
+        for (process_path, path) in [
+            (
+                "/Applications/Codex.app/Contents/Frameworks/browser_crashpad_handler",
+                "/tmp/report.dmp",
+            ),
+            ("/bin/codex", "/Users/me/.codex/sessions/2026/session.jsonl"),
+            ("/bin/rustc", "/repo/target/debug/deps/output.o"),
+            ("/bin/codex", "/Users/me/.codex/state.sqlite-wal"),
+            ("/bin/codex", "/dev/null"),
+        ] {
+            let mut raw = event("write", process(20, 2, Some(10), Some(1)));
+            raw.actor.executable_path = Some(process_path.to_string());
+            raw.file = Some(EndpointSecurityFile {
+                path: path.to_string(),
+                ..EndpointSecurityFile::default()
+            });
+            assert!(endpoint_security_event_is_bookkeeping(&raw), "{path}");
+        }
+    }
+
+    #[test]
+    fn does_not_hide_workspace_files_with_bookkeeping_like_extensions() {
+        let mut raw = event("write", process(20, 2, Some(10), Some(1)));
+        raw.file = Some(EndpointSecurityFile {
+            path: "/repo/security-events.log".to_string(),
+            ..EndpointSecurityFile::default()
+        });
+        assert!(!endpoint_security_event_is_bookkeeping(&raw));
     }
 }

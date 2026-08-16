@@ -5,7 +5,10 @@ pub(crate) use gensee_crate_core::{
     parse_mcp_file_intents, parse_vscode_file_intents, redact_text, redact_value, AgentHookEvent,
     AgentSession, FileIntent, ProcessObservation, SystemEvent, WorkspaceEffect,
 };
-pub(crate) use gensee_crate_macos::{EndpointSecurityEvent, EndpointSecurityIngestor};
+pub(crate) use gensee_crate_macos::{
+    endpoint_security_event_is_bookkeeping, EndpointSecurityAlertPipeline, EndpointSecurityEvent,
+    EndpointSecurityIngestor,
+};
 pub(crate) use gensee_crate_rules::policy::{self, Policy};
 pub(crate) use gensee_crate_store::{
     daemon_socket_path, default_root, AlertRecord, ArtifactObservationInput, ArtifactRiskTagInput,
@@ -30,6 +33,8 @@ pub(crate) const PROCESS_SAMPLE_WINDOW_MS: u64 = 15_000;
 pub(crate) const PROCESS_SAMPLE_INTERVAL_MS: u64 = 25;
 pub(crate) const STARTED_TOOL_WINDOW_MS: u64 = 15_000;
 pub(crate) const TOOL_WINDOW_TOLERANCE_MS: u64 = 250;
+pub(crate) const ENDPOINT_ACTIVE_TOOL_WINDOW_MS: u64 = 60_000;
+pub(crate) const ENDPOINT_ALERT_DEDUPE_WINDOW_MS: u64 = 10_000;
 pub(crate) const PREEXEC_CONTENT_READ_LIMIT_BYTES: u64 = 64 * 1024;
 pub(crate) const ARTIFACT_CONTENT_READ_TIMEOUT_MS: u64 = 150;
 pub(crate) const ARTIFACT_FACT_RECENT_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -3786,6 +3791,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
     let store = EventStore::default_local()?;
     let sessions = store.list_sessions()?;
     let mut ingestor = EndpointSecurityIngestor::new(&sessions);
+    let mut alert_pipeline = EndpointSecurityAlertPipeline::default();
     let mut count = 0_u64;
     let mut rejected = 0_u64;
     let stdin = io::stdin();
@@ -3804,14 +3810,34 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 continue;
             }
         };
-        let (event, findings) = ingestor.ingest(parsed);
-        let session_id = event.attribution.session_id.clone();
+        let (mut event, findings) = ingestor.ingest(parsed);
+        let attributed_session_id = event.attribution.session_id.clone();
         let observed_at_ms = event.observed_at_ms;
+        let active_tool = attributed_session_id
+            .as_deref()
+            .map(|session_id| {
+                store.active_tool_call(session_id, observed_at_ms, ENDPOINT_ACTIVE_TOOL_WINDOW_MS)
+            })
+            .transpose()?
+            .flatten();
+        let active_session_id = active_tool
+            .as_ref()
+            .and(attributed_session_id.as_ref())
+            .cloned();
+        let tool_use_id = active_tool
+            .as_ref()
+            .and_then(|tool| tool.tool_use_id.clone());
+        let bookkeeping = endpoint_security_event_is_bookkeeping(&event);
         let evidence = serde_json::to_value(&event).map_err(io::Error::other)?;
         for finding in findings {
-            store.append_policy_alert(&PolicyAlert {
-                session_id: session_id.clone(),
-                tool_use_id: None,
+            if finding.rule_id != "endpoint_security_event_gap"
+                && (active_session_id.is_none() || bookkeeping)
+            {
+                continue;
+            }
+            let alert = PolicyAlert {
+                session_id: active_session_id.clone(),
+                tool_use_id: tool_use_id.clone(),
                 severity: finding.severity.to_string(),
                 action: "warn".to_string(),
                 rule_id: finding.rule_id.to_string(),
@@ -3819,12 +3845,27 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 path: finding.path,
                 evidence: Some(evidence.clone()),
                 observed_at_ms,
-            })?;
+            };
+            if let Some(session_id) = active_session_id.as_deref() {
+                let path = alert.path.as_deref().unwrap_or("");
+                let key =
+                    endpoint_alert_dedupe_key(session_id, &event, path, event.event_type.as_str());
+                store.append_endpoint_policy_alert(
+                    &alert,
+                    &key,
+                    ENDPOINT_ALERT_DEDUPE_WINDOW_MS,
+                )?;
+            } else {
+                store.append_policy_alert(&alert)?;
+            }
         }
-        if event.decision.result.as_deref() == Some("deny") {
-            store.append_policy_alert(&PolicyAlert {
-                session_id: session_id.clone(),
-                tool_use_id: None,
+        if event.decision.result.as_deref() == Some("deny")
+            && active_session_id.is_some()
+            && !bookkeeping
+        {
+            let alert = PolicyAlert {
+                session_id: active_session_id.clone(),
+                tool_use_id: tool_use_id.clone(),
                 severity: "high".to_string(),
                 action: "block".to_string(),
                 rule_id: event
@@ -3838,53 +3879,62 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 path: event.primary_path().map(str::to_string),
                 evidence: Some(evidence.clone()),
                 observed_at_ms,
-            })?;
+            };
+            let session_id = active_session_id.as_deref().unwrap_or_default();
+            let path = alert.path.as_deref().unwrap_or("");
+            let key =
+                endpoint_alert_dedupe_key(session_id, &event, path, event.event_type.as_str());
+            store.append_endpoint_policy_alert(&alert, &key, ENDPOINT_ALERT_DEDUPE_WINDOW_MS)?;
         }
         if event.action == "notify" {
-            if let (Some(session_id), Some(path)) = (session_id.as_ref(), event.primary_path()) {
-                let operation = match event.event_type.as_str() {
-                    "open" if event.is_write_open() => Some("write"),
-                    "open" | "readdir" | "mmap" => Some("read"),
-                    "create" => Some("create"),
-                    "write" | "truncate" => Some("write"),
-                    "close" if event.modified == Some(true) => Some("write"),
-                    "rename" => Some("rename"),
-                    "unlink" => Some("delete"),
-                    _ => None,
-                };
-                if let Some(operation) = operation {
-                    for finding in Policy::global().evaluate_observation(operation, path) {
-                        store.append_policy_alert(&PolicyAlert {
-                            session_id: Some(session_id.clone()),
-                            tool_use_id: None,
-                            severity: finding.severity,
-                            action: "warn".to_string(),
-                            rule_id: if operation == "read" {
-                                "unreported_sensitive_open".to_string()
-                            } else {
-                                finding.rule_id
+            if let Some(session_id) = active_session_id.as_deref() {
+                if let Some((logical_operation, path)) =
+                    alert_pipeline.logical_operation(&event, session_id)
+                {
+                    let policy_operation = endpoint_policy_operation(&event, logical_operation);
+                    let key =
+                        endpoint_alert_dedupe_key(session_id, &event, &path, logical_operation);
+                    let evidence = endpoint_alert_evidence(
+                        evidence.clone(),
+                        logical_operation,
+                        active_tool.as_ref().map(|tool| tool.provider.as_str()),
+                    );
+                    for finding in Policy::global().evaluate_observation(policy_operation, &path) {
+                        store.append_endpoint_policy_alert(
+                            &PolicyAlert {
+                                session_id: Some(session_id.to_string()),
+                                tool_use_id: tool_use_id.clone(),
+                                severity: finding.severity,
+                                action: "warn".to_string(),
+                                rule_id: if policy_operation == "read" {
+                                    "unreported_sensitive_open".to_string()
+                                } else {
+                                    finding.rule_id
+                                },
+                                message: finding.message,
+                                path: Some(path.clone()),
+                                evidence: Some(evidence.clone()),
+                                observed_at_ms,
                             },
-                            message: finding.message,
-                            path: Some(path.to_string()),
-                            evidence: Some(evidence.clone()),
-                            observed_at_ms,
-                        })?;
+                            &key,
+                            ENDPOINT_ALERT_DEDUPE_WINDOW_MS,
+                        )?;
                     }
-                    if matches!(operation, "create" | "write" | "rename" | "delete")
-                        && !store.has_recent_file_intent(path, observed_at_ms)?
+                    if logical_operation != "read"
+                        && !store.has_recent_file_intent(&path, observed_at_ms)?
                     {
-                        store.append_policy_alert(&PolicyAlert {
-                            session_id: Some(session_id.clone()),
-                            tool_use_id: None,
+                        store.append_endpoint_policy_alert(&PolicyAlert {
+                            session_id: Some(session_id.to_string()),
+                            tool_use_id: tool_use_id.clone(),
                             severity: "medium".to_string(),
                             action: "warn".to_string(),
                             rule_id: "hook_bypass_file_mutation".to_string(),
                             message: "Agent process mutated a file without a matching hook-level file intent"
                                 .to_string(),
-                            path: Some(path.to_string()),
+                            path: Some(path),
                             evidence: Some(evidence.clone()),
                             observed_at_ms,
-                        })?;
+                        }, &key, ENDPOINT_ALERT_DEDUPE_WINDOW_MS)?;
                     }
                 }
             }
@@ -3896,6 +3946,16 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 None
             };
         let exit_code = event.exit_status;
+        // The ingestor retains ancestry internally, but idle or stale trees are
+        // persisted without request attribution. A later PreToolUse can make
+        // the same process tree eligible again inside its bounded window.
+        if active_session_id.is_none() {
+            event.attribution.session_id = None;
+            event.attribution.root_pid = None;
+            event.attribution.depth = None;
+            event.attribution.confidence = None;
+            event.attribution.matched_by = None;
+        }
         store.append_system_event(&event.into_system_event()?)?;
         if let Some(session_id) = ended_root_session {
             store.end_session(&session_id, observed_at_ms, exit_code)?;
@@ -3905,6 +3965,51 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
 
     eprintln!("gensee: ingested {count} Endpoint Security event(s), rejected {rejected}");
     Ok(())
+}
+
+fn endpoint_policy_operation(
+    event: &EndpointSecurityEvent,
+    logical_operation: &'static str,
+) -> &'static str {
+    match logical_operation {
+        "read" => "read",
+        "rename" => "rename",
+        "delete" => "delete",
+        "mutation" if event.event_type == "create" => "create",
+        "mutation" => "write",
+        _ => logical_operation,
+    }
+}
+
+fn endpoint_alert_dedupe_key(
+    session_id: &str,
+    event: &EndpointSecurityEvent,
+    path: &str,
+    operation: &str,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        session_id, event.actor.pid, event.actor.pidversion, operation, path
+    )
+}
+
+fn endpoint_alert_evidence(
+    evidence: Value,
+    logical_operation: &str,
+    provider: Option<&str>,
+) -> Value {
+    let mut object = evidence.as_object().cloned().unwrap_or_default();
+    object.insert(
+        "logical_operation".to_string(),
+        Value::String(logical_operation.to_string()),
+    );
+    if let Some(provider) = provider {
+        object.insert(
+            "active_harness".to_string(),
+            Value::String(provider.to_string()),
+        );
+    }
+    Value::Object(object)
 }
 
 pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {

@@ -68,6 +68,27 @@ callback never waits for the UI, XPC, SQLite, or human approval. Session-depende
 decisions use no authorization cache. The dashboard reports decisions, denials,
 maximum observed authorization latency, and kernel/ring gaps.
 
+## Alert correlation and noise control
+
+The extension observes the OS event stream globally so it can maintain exact
+process ancestry, but raw telemetry is not automatically a security finding.
+The macOS host sends only active roots for harnesses whose protection toggle is
+enabled. Removing a root also evicts its queued events and inherited process
+attribution from the extension.
+
+The Rust ingester attaches an event to a request only while that session has an
+unfinished `PreToolUse` or `PermissionRequest` event no more than 60 seconds old.
+`PostToolUse`, `PostToolUseFailure`, a blocking decision, or expiry closes that
+window. Outside it, the OS event remains audit telemetry without request
+attribution and cannot produce a hook-bypass finding.
+
+Before findings are stored, known harness bookkeeping (including Crashpad,
+transcripts, compiler/build output, test results, and harness SQLite sidecars)
+is excluded. Related `open`, `write`, and modified `close` notifications are
+coalesced into one mutation. Alerts are then deduplicated for 10 seconds by
+session, exact `(pid,pidversion)` identity, path, logical operation, and rule;
+the database repeats this check so app restarts cannot replay the same alert.
+
 ## Safety and rollback
 
 Start in `observe` and review evidence before using `protect`. Set mode back to

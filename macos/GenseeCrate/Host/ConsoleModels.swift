@@ -102,6 +102,7 @@ struct AgentSessionRecord: Decodable, Identifiable {
     let sessionID: String
     let rootPID: UInt32
     let agentBinary: String
+    let mode: String?
     let endedAtMS: UInt64?
 
     var id: String { sessionID }
@@ -111,7 +112,45 @@ struct AgentSessionRecord: Decodable, Identifiable {
         case sessionID = "session_id"
         case rootPID = "root_pid"
         case agentBinary = "agent_binary"
+        case mode
         case endedAtMS = "ended_at_ms"
+    }
+}
+
+enum EndpointSessionScope {
+    static func isEnabled(
+        _ session: AgentSessionRecord,
+        enabledHarnesses: Set<String>
+    ) -> Bool {
+        guard session.mode == "hook" else { return true }
+        guard let provider = harnessProvider(agentBinary: session.agentBinary) else {
+            return false
+        }
+        return enabledHarnesses.contains(provider)
+    }
+
+    static func harnessProvider(agentBinary: String) -> String? {
+        let lower = agentBinary.lowercased()
+        let name = URL(fileURLWithPath: lower).lastPathComponent
+        if name == "codex" || lower.contains("/codex.app/contents/macos/codex") {
+            return "codex"
+        }
+        if name == "claude" || name == "claude-code" || lower.contains("/claude.app/") {
+            return "claude-code"
+        }
+        if name == "antigravity" || name == "gemini" || lower.contains("/antigravity.app/") {
+            return "antigravity"
+        }
+        if name == "cursor" || lower.contains("/cursor.app/") {
+            return "cursor"
+        }
+        if name == "code" || name == "code-insiders" || lower.contains("visual studio code") {
+            return "vscode"
+        }
+        if name == "omnigent" {
+            return "omnigent"
+        }
+        return nil
     }
 }
 

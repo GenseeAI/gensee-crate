@@ -198,6 +198,12 @@ final class EndpointSecuritySensor: ObservableObject {
                     userInfo: [NSLocalizedDescriptionKey: "Endpoint Security sensor is not connected."]
                 )
             }
+            // Apply harness/root changes before fetching. Otherwise one batch
+            // from a just-disabled harness can be delivered after the user has
+            // turned protection off.
+            if configurationNeedsPush {
+                try await pushConfiguration(using: connection)
+            }
             let response = try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<([[String: Any]], UInt64, [String: Any]), Error>) in
                 connection.fetchEvents(
@@ -221,9 +227,6 @@ final class EndpointSecuritySensor: ObservableObject {
             }
             let pendingCursor = response.1
             let didRewind = applyHealth(response.2)
-            if configurationNeedsPush {
-                try await pushConfiguration(using: connection)
-            }
             // A boot/ring rewind means this batch was fetched from a stale
             // cursor. Refetch from the recovered cursor before ingesting it so
             // the first post-launch batch is never delivered twice.

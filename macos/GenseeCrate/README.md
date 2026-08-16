@@ -76,7 +76,11 @@ the system extension and to open the Full Disk Access pane. Start with
 to an enforcement mode.
 
 Disabling a direct-hook integration removes only Gensee-owned hook entries and
-preserves unrelated harness settings and hooks.
+preserves unrelated harness settings and hooks. It also removes that harness's
+active roots from Endpoint Security before the next event batch is fetched.
+Only events inside a bounded active tool-call window can become findings;
+runtime bookkeeping is filtered and related file events are coalesced and
+durably deduplicated.
 
 ## Apple Developer configuration
 
