@@ -79,6 +79,15 @@ with low runtime overhead.
 
 ### 1. Install
 
+On macOS, the [signed app download](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)
+includes the Gensee backend and SQLite support. Its first-launch assistant
+prepares `~/.gensee`, guides the Apple permissions, scans all six supported
+harnesses, and verifies a real hook event before reporting protection. It does
+not require Homebrew, Rust, jq, Xcode Command Line Tools, or a separate SQLite
+installation.
+
+For the command-line/source installation, use:
+
 One command installs Gensee Crate and checks or installs its command-line
 prerequisites on macOS. At the end, the installer can configure supported agent
 hooks for active safety policy enforcement, lets you choose `GENSEE_HOME`, and

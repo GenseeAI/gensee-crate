@@ -22,6 +22,11 @@ integration changes are submitted through the existing `gensee policy` and
 
 The console includes:
 
+- A first-launch setup assistant that installs the bundled backend at
+  `~/.gensee/bin/gensee`, initializes the encrypted event store and default
+  policy, guides Apple approvals, scans all six harnesses, and offers one-click
+  setup for every installed direct-hook integration. It does not require a
+  separate SQLite install, Homebrew, Rust, jq, or Xcode Command Line Tools.
 - Overview, activity, alerts, and run inventory backed by `gensee dashboard-state`
   and `gensee run list --json`.
 - A Daily Highlight page with today's summary and four rolling-year activity
@@ -40,7 +45,8 @@ The console includes:
   Other audit actions are visibly marked **Coming soon**. Enabled integrations
   are checked for complete hook coverage, the active event-store path, the
   current backend executable, and harness-specific blockers, with a one-click
-  repair action when needed.
+  repair action when needed. A hook configuration becomes **Protected** only
+  after a real event from that harness reaches the active local store.
 - Endpoint Security installation, removal, and Full Disk Access navigation.
 
 Token totals are captured from compatible Claude Code and Codex transcript
@@ -59,6 +65,15 @@ installation and protection state. If hooks are incomplete, disabled, or
 routed to a different store or backend, **Repair Protection** reruns the
 matching OSS setup command with this app's active store and embedded backend;
 it changes only Gensee-owned hook entries.
+
+After setup, follow the provider-specific restart or reload instruction and
+start a new agent turn. Codex additionally requires trust review for
+non-managed hooks: use **Open Codex Hook Review**, enter the copied `/hooks`
+command in the opened CLI, and trust Gensee. The assistant can use the Codex
+binary bundled with the ChatGPT app, so the user does not need a separately
+installed command on `PATH`. Until the first real event arrives, the harness is
+shown as **Restart & test** rather than **Protected**. Rerun the assistant from
+**Settings → Run Setup Assistant** at any time.
 
 Use **Audit Config** on the Codex or GitHub Copilot row to select a workspace
 and open the read-only audit inline on the Harnesses page. Audit actions for

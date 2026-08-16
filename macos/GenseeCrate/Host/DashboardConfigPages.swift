@@ -683,6 +683,7 @@ struct DashboardSettingsPage: View {
     @ObservedObject var extensionManager: EndpointSecurityExtensionManager
     @ObservedObject var sensor: EndpointSecuritySensor
     @Binding var darkMode: Bool
+    let onRunSetupAssistant: () -> Void
     @State private var confirmRemoval = false
 
     var body: some View {
@@ -712,8 +713,17 @@ struct DashboardSettingsPage: View {
                         }
                     }.frame(maxWidth: .infinity)
                     DashboardCard("About") {
-                        Text("Gensee Crate v0.2.4\nNative macOS security console\n\nGensee backend: \(model.backendAvailable ? "Connected" : "Unavailable")")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Gensee Crate v0.2.4\nNative macOS security console\n\nGensee backend: \(model.backendAvailable ? "Connected" : "Unavailable")")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                            Divider()
+                            Button {
+                                onRunSetupAssistant()
+                            } label: {
+                                Label("Run Setup Assistant", systemImage: "checklist")
+                            }
+                            .controlSize(.small)
+                        }
                     }.frame(maxWidth: .infinity)
                 }
             }

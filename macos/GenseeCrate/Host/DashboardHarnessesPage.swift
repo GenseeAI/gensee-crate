@@ -174,7 +174,13 @@ struct DashboardHarnessesPage: View {
                 Text(integration.detail)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                Text(integration.configurationIssue ?? integration.configurationNote ?? integration.installationDetail)
+                Text(
+                    integration.configurationIssue
+                        ?? integration.configurationNote
+                        ?? (integration.awaitingVerification
+                            ? HarnessActivationGuidance.instruction(for: integration.id).detail
+                            : integration.installationDetail)
+                )
                     .font(.system(size: 10))
                     .foregroundStyle(integration.configurationIssue == nil ? Color.secondary : Color.dashboardGold)
                     .lineLimit(2)
@@ -299,7 +305,8 @@ struct DashboardHarnessesPage: View {
 
     private func rowAccent(_ integration: IntegrationDescriptor) -> Color {
         if integration.configurationIssue != nil { return .dashboardGold }
-        if integration.configured { return .dashboardGreen }
+        if integration.isHealthy { return .dashboardGreen }
+        if integration.awaitingVerification { return .dashboardGold }
         return .dashboardBlue
     }
 
@@ -307,6 +314,8 @@ struct DashboardHarnessesPage: View {
         if !integration.installed { return .secondary }
         if integration.configurationIssue != nil { return .dashboardGold }
         if !integration.supportsDirectHooks { return .dashboardBlue }
-        return integration.configured ? .dashboardGreen : .secondary
+        if integration.isHealthy { return .dashboardGreen }
+        if integration.awaitingVerification { return .dashboardGold }
+        return .secondary
     }
 }

@@ -560,16 +560,20 @@ struct IntegrationDescriptor: Identifiable, Equatable {
     let canRepair: Bool
     let configuredBackendPath: String?
     var configured: Bool
+    var verified: Bool
 
     var canToggle: Bool { installed && supportsDirectHooks }
-    var isHealthy: Bool { configured && configurationIssue == nil }
+    var configurationHealthy: Bool { configured && configurationIssue == nil }
+    var isHealthy: Bool { configurationHealthy && verified }
     var requiresRepair: Bool { canToggle && configured && configurationIssue != nil && canRepair }
+    var awaitingVerification: Bool { configurationHealthy && !verified }
 
     var statusLabel: String {
         if !installed { return "Not installed" }
         if !supportsDirectHooks { return "Managed launch only" }
         if configurationIssue != nil { return canRepair ? "Needs repair" : "Manual fix needed" }
-        return configured ? "Protected" : "Ready to enable"
+        if !configured { return "Ready to enable" }
+        return verified ? "Protected" : "Restart & test"
     }
 }
 

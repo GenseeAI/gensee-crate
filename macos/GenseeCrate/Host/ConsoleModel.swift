@@ -12,6 +12,7 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var dailyDetailLoadState = DailyDetailLoadState.idle
     @Published private(set) var configAudit: ConfigAuditBundle?
     @Published private(set) var auditedIntegrationIDs: Set<String> = []
+    @Published private(set) var verifiedIntegrationIDs: Set<String> = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var runningCommand: String?
     @Published private(set) var feedbackAlertID: Int64?
@@ -27,6 +28,7 @@ final class ConsoleModel: ObservableObject {
     private var dashboardRefreshInProgress = false
     private var readAlertBaselineCount = 0
     private var readThroughAlertID: Int64 = 0
+    private var harnessVerificationBaselines: [String: Int64] = [:]
 
     init() {
         let environmentHome = ProcessInfo.processInfo.environment["GENSEE_HOME"]
@@ -36,6 +38,8 @@ final class ConsoleModel: ObservableObject {
         cli = GenseeCLI(homeURL: resolvedHome)
         endpointSensor = EndpointSecuritySensor(homeURL: resolvedHome, executableURL: cli.executableURL)
         auditedIntegrationIDs = Self.loadAuditedIntegrationIDs(homeURL: resolvedHome)
+        verifiedIntegrationIDs = Self.loadVerifiedIntegrationIDs(homeURL: resolvedHome)
+        harnessVerificationBaselines = Self.loadHarnessVerificationBaselines(homeURL: resolvedHome)
         readAlertIDs = Self.loadReadAlertIDs(homeURL: resolvedHome)
         readAlertBaselineCount = UserDefaults.standard.integer(
             forKey: Self.readAlertsBaselineKey(homeURL: resolvedHome)
@@ -50,7 +54,15 @@ final class ConsoleModel: ObservableObject {
     var backendPath: String? { cli.executableURL?.path }
     var backendAvailable: Bool { cli.executableURL != nil }
     var databaseURL: URL { homeURL.appendingPathComponent("gensee.db") }
+    var policyURL: URL { homeURL.appendingPathComponent("policy.json") }
     var databaseExists: Bool { FileManager.default.fileExists(atPath: databaseURL.path) }
+    var policyExists: Bool { FileManager.default.fileExists(atPath: policyURL.path) }
+    var stableBackendInstalled: Bool {
+        FileManager.default.isExecutableFile(
+            atPath: homeURL.appendingPathComponent("bin/gensee").path
+        )
+    }
+    var localRuntimePrepared: Bool { stableBackendInstalled && databaseExists && policyExists }
     var databaseEncrypted: Bool {
         guard let handle = try? FileHandle(forReadingFrom: databaseURL) else { return false }
         defer { try? handle.close() }
@@ -176,6 +188,7 @@ final class ConsoleModel: ObservableObject {
             )
             reconcileReadAlertState(alertCount: refreshedSnapshot.summary.alertsCount)
             snapshot = refreshedSnapshot
+            reconcileHarnessVerification()
             configureEndpointSensor()
             lastUpdated = Date()
             dashboardRefreshIssue = nil
@@ -333,7 +346,12 @@ final class ConsoleModel: ObservableObject {
         }
 
         let previousValue = integration.configured
+        let previousVerified = verifiedIntegrationIDs.contains(provider)
+        let previousBaseline = harnessVerificationBaselines[provider]
         integrations[index].configured = enabled
+        if enabled {
+            beginHarnessVerification(provider)
+        }
         runningCommand = "\(enabled ? "Enabling" : "Disabling") \(integration.name) protection"
         defer { runningCommand = nil }
         do {
@@ -349,6 +367,9 @@ final class ConsoleModel: ObservableObject {
                 arguments.append("--disable")
             }
             let output = try await cli.run(arguments)
+            if !enabled {
+                clearHarnessVerification(provider)
+            }
             noticeMessage = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
             await refreshIntegrationsWithCurrentBackend()
             configureEndpointSensor()
@@ -356,6 +377,11 @@ final class ConsoleModel: ObservableObject {
             if let currentIndex = integrations.firstIndex(where: { $0.id == provider }) {
                 integrations[currentIndex].configured = previousValue
             }
+            restoreHarnessVerification(
+                provider,
+                verified: previousVerified,
+                baseline: previousBaseline
+            )
             errorMessage = error.localizedDescription
         }
     }
@@ -372,7 +398,10 @@ final class ConsoleModel: ObservableObject {
 
         runningCommand = "Repairing \(integration.name) protection"
         defer { runningCommand = nil }
+        let previousVerified = verifiedIntegrationIDs.contains(provider)
+        let previousBaseline = harnessVerificationBaselines[provider]
         do {
+            beginHarnessVerification(provider)
             var arguments = ["setup", provider, "--gensee-home", homeURL.path]
             let configuredBackend = integration.configuredBackendPath.map(URL.init(fileURLWithPath:))
             let hookExecutable: URL
@@ -400,8 +429,72 @@ final class ConsoleModel: ObservableObject {
                     : detail
             }
         } catch {
+            restoreHarnessVerification(
+                provider,
+                verified: previousVerified,
+                baseline: previousBaseline
+            )
             await refreshIntegrationsWithCurrentBackend()
             errorMessage = error.localizedDescription
+        }
+    }
+
+    func prepareLocalRuntime() async -> Bool {
+        guard backendAvailable else {
+            errorMessage = GenseeCLIError.executableNotFound.localizedDescription
+            return false
+        }
+
+        runningCommand = "Preparing the local Gensee runtime"
+        defer { runningCommand = nil }
+        do {
+            try FileManager.default.createDirectory(
+                at: homeURL,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: homeURL.path
+            )
+            _ = try await cli.stableHookExecutableURL()
+            if !policyExists {
+                _ = try await cli.run(["policy", "init"])
+            }
+            if FileManager.default.fileExists(atPath: policyURL.path) {
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: policyURL.path
+                )
+            }
+            let preparedSnapshot = try await cli.decode(
+                SecuritySnapshot.self,
+                arguments: ["dashboard-state"]
+            )
+            snapshot = preparedSnapshot
+            reconcileReadAlertState(alertCount: preparedSnapshot.summary.alertsCount)
+            reconcileHarnessVerification()
+            await refreshPolicy()
+            await refreshIntegrationsWithCurrentBackend()
+            noticeMessage = nil
+            return localRuntimePrepared
+        } catch {
+            errorMessage = "Could not prepare the local Gensee runtime: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func enableAllInstalledIntegrations() async {
+        let providers = integrations
+            .filter { $0.installed && $0.supportsDirectHooks && !$0.isHealthy }
+            .map(\.id)
+        for provider in providers {
+            guard let integration = integrations.first(where: { $0.id == provider }) else { continue }
+            if integration.requiresRepair {
+                await repairIntegration(provider)
+            } else if !integration.configured {
+                await setIntegrationEnabled(provider, enabled: true)
+            }
         }
     }
 
@@ -412,6 +505,45 @@ final class ConsoleModel: ObservableObject {
     func openFullDiskAccess() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    func openPrivacyAndSecurity() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func openCodexHookReview() {
+        guard let codexURL = Self.codexExecutableURL() else {
+            errorMessage = "Gensee could not find a Codex CLI. Install the Codex CLI, then run it and enter /hooks to review the Gensee hook."
+            return
+        }
+        do {
+            let scriptURL = homeURL.appendingPathComponent("bin/review-codex-hooks.command")
+            let quotedCodex = Self.shellSingleQuote(codexURL.path)
+            let script = """
+            #!/bin/zsh
+            clear
+            echo 'Gensee configured Codex hooks.'
+            echo 'When Codex opens, enter /hooks and trust the Gensee hook command.'
+            echo
+            exec \(quotedCodex)
+            """
+            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("/hooks", forType: .string)
+            NSWorkspace.shared.open(scriptURL)
+            noticeMessage = "Opened Codex CLI and copied /hooks. Paste it there to review and trust Gensee."
+        } catch {
+            errorMessage = "Could not open Codex hook review: \(error.localizedDescription)"
+        }
+    }
+
+    func copyOmnigentManagedLaunch() {
+        let command = "\(homeURL.appendingPathComponent("bin/gensee").path) run -- omnigent"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+        noticeMessage = "Copied the Omnigent managed-launch command. Add the arguments for the agent you want to run."
     }
 
     func revealDataStore() {
@@ -432,6 +564,14 @@ final class ConsoleModel: ObservableObject {
         "gensee.harnesses.audited.\(homeURL.path)"
     }
 
+    private static func verifiedIntegrationsKey(homeURL: URL) -> String {
+        "gensee.harnesses.verified.\(homeURL.path)"
+    }
+
+    private static func verificationBaselinesKey(homeURL: URL) -> String {
+        "gensee.harnesses.verification-baselines.\(homeURL.path)"
+    }
+
     private static func loadAuditedIntegrationIDs(homeURL: URL) -> Set<String> {
         let values = UserDefaults.standard.stringArray(
             forKey: auditedIntegrationsKey(homeURL: homeURL)
@@ -439,11 +579,110 @@ final class ConsoleModel: ObservableObject {
         return Set(values)
     }
 
+    private static func loadVerifiedIntegrationIDs(homeURL: URL) -> Set<String> {
+        let values = UserDefaults.standard.stringArray(
+            forKey: verifiedIntegrationsKey(homeURL: homeURL)
+        ) ?? []
+        return Set(values)
+    }
+
+    private static func loadHarnessVerificationBaselines(homeURL: URL) -> [String: Int64] {
+        let values = UserDefaults.standard.dictionary(
+            forKey: verificationBaselinesKey(homeURL: homeURL)
+        ) ?? [:]
+        return values.reduce(into: [:]) { result, item in
+            if let number = item.value as? NSNumber {
+                result[item.key] = number.int64Value
+            }
+        }
+    }
+
     private func persistAuditedIntegrationIDs() {
         UserDefaults.standard.set(
             auditedIntegrationIDs.sorted(),
             forKey: Self.auditedIntegrationsKey(homeURL: homeURL)
         )
+    }
+
+    private func persistHarnessVerification() {
+        UserDefaults.standard.set(
+            verifiedIntegrationIDs.sorted(),
+            forKey: Self.verifiedIntegrationsKey(homeURL: homeURL)
+        )
+        UserDefaults.standard.set(
+            harnessVerificationBaselines.mapValues(NSNumber.init(value:)),
+            forKey: Self.verificationBaselinesKey(homeURL: homeURL)
+        )
+    }
+
+    private func beginHarnessVerification(_ provider: String) {
+        verifiedIntegrationIDs.remove(provider)
+        harnessVerificationBaselines[provider] = Int64(Date().timeIntervalSince1970 * 1_000)
+        persistHarnessVerification()
+        refreshIntegrations()
+    }
+
+    private func clearHarnessVerification(_ provider: String) {
+        verifiedIntegrationIDs.remove(provider)
+        harnessVerificationBaselines.removeValue(forKey: provider)
+        persistHarnessVerification()
+        refreshIntegrations()
+    }
+
+    private func restoreHarnessVerification(
+        _ provider: String,
+        verified: Bool,
+        baseline: Int64?
+    ) {
+        if verified {
+            verifiedIntegrationIDs.insert(provider)
+        } else {
+            verifiedIntegrationIDs.remove(provider)
+        }
+        harnessVerificationBaselines[provider] = baseline
+        persistHarnessVerification()
+        refreshIntegrations()
+    }
+
+    private func reconcileHarnessVerification() {
+        var changed = false
+        let configuredProviders = Set(
+            integrations
+                .filter { $0.configurationHealthy && $0.supportsDirectHooks }
+                .map(\.id)
+        )
+
+        for provider in Array(verifiedIntegrationIDs) where !configuredProviders.contains(provider) {
+            verifiedIntegrationIDs.remove(provider)
+            changed = true
+        }
+
+        for integration in integrations where configuredProviders.contains(integration.id) {
+            let baseline: Int64
+            if let existing = harnessVerificationBaselines[integration.id] {
+                baseline = existing
+            } else {
+                baseline = HarnessActivationGuidance.configurationTimestampMS(path: integration.configPath)
+                harnessVerificationBaselines[integration.id] = baseline
+                changed = true
+            }
+            if !verifiedIntegrationIDs.contains(integration.id),
+               snapshot.agentEvents.contains(where: {
+                   $0.timestamp >= baseline
+                       && HarnessActivationGuidance.eventMatches(
+                           provider: integration.id,
+                           source: $0.source
+                       )
+               })
+            {
+                verifiedIntegrationIDs.insert(integration.id)
+                changed = true
+            }
+        }
+
+        guard changed else { return }
+        persistHarnessVerification()
+        refreshIntegrations()
     }
 
     private static func readAlertsBaselineKey(homeURL: URL) -> String {
@@ -601,9 +840,36 @@ final class ConsoleModel: ObservableObject {
                 configurationNote: inspection.note,
                 canRepair: inspection.canRepair,
                 configuredBackendPath: inspection.backendPath,
-                configured: inspection.configured
+                configured: inspection.configured,
+                verified: verifiedIntegrationIDs.contains(provider)
             )
         }
+    }
+
+    private static func codexExecutableURL() -> URL? {
+        let manager = FileManager.default
+        let home = manager.homeDirectoryForCurrentUser
+        var candidates = [
+            URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
+            URL(fileURLWithPath: "/usr/local/bin/codex"),
+            home.appendingPathComponent(".local/bin/codex"),
+            home.appendingPathComponent(".cargo/bin/codex"),
+            URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
+            URL(fileURLWithPath: "/Applications/Codex.app/Contents/Resources/codex"),
+            home.appendingPathComponent("Applications/ChatGPT.app/Contents/Resources/codex"),
+            home.appendingPathComponent("Applications/Codex.app/Contents/Resources/codex"),
+        ]
+        if let application = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") {
+            candidates += [
+                application.appendingPathComponent("Contents/Resources/codex"),
+                application.appendingPathComponent("Contents/MacOS/codex"),
+            ]
+        }
+        return candidates.first { manager.isExecutableFile(atPath: $0.path) }
+    }
+
+    private static func shellSingleQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     private static func applicationInstalled(names: [String], bundleIdentifiers: [String]) -> Bool {

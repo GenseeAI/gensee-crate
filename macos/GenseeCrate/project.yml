@@ -23,6 +23,7 @@ targets:
     sources:
       - Host/GenseeCrateApp.swift
       - Host/ContentView.swift
+      - Host/SetupAssistantView.swift
       - Host/DashboardShell.swift
       - Host/DashboardComponents.swift
       - Host/DashboardOverviewPages.swift
@@ -37,6 +38,7 @@ targets:
       - Host/GenseeEndpointSecurityBridge.m
       - Host/GenseeCLI.swift
       - Host/HarnessConfigurationHealth.swift
+      - Host/HarnessActivationGuidance.swift
       - Host/AlertSeverityBreakdown.swift
       - Host/TimelineModels.swift
       - Host/ConsoleModels.swift
@@ -131,11 +133,13 @@ targets:
     platform: macOS
     sources:
       - Host/HarnessConfigurationHealth.swift
+      - Host/HarnessActivationGuidance.swift
       - Host/AlertSeverityBreakdown.swift
       - Host/TimelineModels.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
       - Tests/HarnessConfigurationHealthTests.swift
+      - Tests/HarnessActivationGuidanceTests.swift
       - Tests/AlertSeverityBreakdownTests.swift
       - Tests/TimelineModelsTests.swift
       - Tests/ConfigAuditModelsTests.swift

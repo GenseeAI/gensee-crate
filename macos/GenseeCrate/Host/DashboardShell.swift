@@ -29,6 +29,7 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
 struct DashboardShell: View {
     @ObservedObject var extensionManager: EndpointSecurityExtensionManager
     @ObservedObject var model: ConsoleModel
+    @Binding var showsSetupAssistant: Bool
     @State private var selection: DashboardDestination = .dashboard
     @State private var searchText = ""
     @AppStorage("gensee.dashboard.darkMode") private var darkMode = false
@@ -139,7 +140,8 @@ struct DashboardShell: View {
             model: model,
             extensionManager: extensionManager,
             sensor: model.endpointSensor,
-            darkMode: $darkMode
+            darkMode: $darkMode,
+            onRunSetupAssistant: { showsSetupAssistant = true }
         )
         }
     }

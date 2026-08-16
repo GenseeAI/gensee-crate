@@ -22,6 +22,9 @@ console.
   files, policy outcomes, and expandable inputs and results.
 - Installation, status, and removal of the signed Endpoint Security system
   extension.
+- A replayable first-launch setup assistant that prepares the embedded backend,
+  local event store, editable default policy, Apple permissions, and installed
+  harness integrations without installing a developer toolchain.
 - Navigation to Full Disk Access, which macOS requires for complete protected
   file visibility.
 - Endpoint Security `off`, `observe`, `protect`, and `strict` policy modes.
@@ -29,6 +32,36 @@ console.
   Copilot, and Omnigent.
 - Per-harness Config Audit actions backed by the shared OSS Rust audit library
   for static, read-only review of Codex and VS Code/Copilot configuration.
+
+## First-launch setup
+
+The signed app contains the universal `gensee` backend and its SQLite support.
+On first launch, the setup assistant:
+
+1. Copies the bundled backend to the stable `~/.gensee/bin/gensee` path used by
+   hook files.
+2. Initializes the encrypted local event store and writes an editable default
+   policy to `~/.gensee/policy.json`.
+3. Guides the user through Endpoint Security approval and Full Disk Access.
+   These are Apple-controlled approvals and cannot be silently granted by the
+   app.
+4. Scans Codex, Claude Code, Antigravity, Cursor, GitHub Copilot for VS Code,
+   and Omnigent, leaving unavailable harnesses visible but disabled.
+5. Offers individual setup or **Enable All Installed** for direct-hook
+   harnesses and provides the required reload step for each provider.
+6. Waits for a real post-setup harness event before showing that integration as
+   **Protected**.
+
+Codex requires separate review for non-managed command hooks. **Open Codex Hook
+Review** launches an installed Codex CLI—including the copy bundled with the
+ChatGPT app when present—and copies `/hooks` so the user can review and trust
+the exact Gensee command. A configured but untrusted or not-yet-exercised hook
+remains **Restart & test**, not **Protected**.
+
+Omnigent does not yet have a direct hook bridge. The assistant explains its
+managed-launch requirement and can copy a `gensee run -- omnigent` starter
+command. The assistant is optional and can be opened again from **Settings →
+Run Setup Assistant**.
 
 ## Config Audit
 
@@ -73,7 +106,9 @@ Protection**, so stale configuration is not presented as protection. Repair
 safely replaces stale or partial Gensee-owned entries. For Claude Code, an
 explicit repair also changes
 `disableAllHooks` from `true` to `false` while preserving the rest of the
-settings file.
+settings file. A healthy configuration remains **Restart & test** until a new
+event from that provider reaches the active store; only then does it become
+**Protected**.
 
 Omnigent currently has no direct hook protection action. Launch it with `gensee run` to
 place its process tree under Gensee monitoring and supported policy
@@ -136,9 +171,9 @@ approval and matching provisioning for the intended Development or Developer
 ID distribution method.
 
 Activation only works from a correctly signed app installed in `/Applications`.
-After opening it, use **Install & Enable**, approve the system extension in
-System Settings if prompted, grant Gensee Crate Full Disk Access, and confirm
-the Settings page reports event delivery.
+The first-launch assistant provides **Install & Enable**, opens the relevant
+System Settings panes, and confirms sensor connectivity. The same controls
+remain available on the Settings page.
 
 Certificates, private keys, `.p12` files, provisioning profiles, notarization
 credentials, archives, and built app/DMG artifacts must never be committed.
