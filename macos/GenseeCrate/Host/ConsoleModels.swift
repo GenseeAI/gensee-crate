@@ -16,14 +16,13 @@ struct SecuritySnapshot: Decodable {
     var artifacts: [ArtifactFact] = []
     var relations: [ArtifactEdge] = []
     var humanFeedback: [HumanFeedback] = []
-    var transactionEvents: [TransactionEvent] = []
     var workspaceEffects: [WorkspaceEffect] = []
     var jsonSessions: [AgentSessionRecord] = []
     var dailyActivity: [DailyActivity] = []
 
     enum CodingKeys: String, CodingKey {
         case summary, alerts, agentEvents, systemEvents, sessions, requests, artifacts
-        case relations, humanFeedback, transactionEvents, workspaceEffects, jsonSessions, dailyActivity
+        case relations, humanFeedback, workspaceEffects, jsonSessions, dailyActivity
     }
 
     init() {}
@@ -39,7 +38,6 @@ struct SecuritySnapshot: Decodable {
         artifacts = try values.decodeIfPresent([ArtifactFact].self, forKey: .artifacts) ?? []
         relations = try values.decodeIfPresent([ArtifactEdge].self, forKey: .relations) ?? []
         humanFeedback = try values.decodeIfPresent([HumanFeedback].self, forKey: .humanFeedback) ?? []
-        transactionEvents = try values.decodeIfPresent([TransactionEvent].self, forKey: .transactionEvents) ?? []
         workspaceEffects = try values.decodeIfPresent([WorkspaceEffect].self, forKey: .workspaceEffects) ?? []
         jsonSessions = try values.decodeIfPresent([AgentSessionRecord].self, forKey: .jsonSessions) ?? []
         dailyActivity = try values.decodeIfPresent([DailyActivity].self, forKey: .dailyActivity) ?? []
@@ -379,38 +377,6 @@ struct HumanFeedback: Decodable, Identifiable {
         case ruleID = "rule_id"
         case path, note
         case createdAt = "created_at"
-    }
-}
-
-struct TransactionEvent: Decodable, Identifiable {
-    let transactionEventID: Int64
-    let operationID: String
-    let environmentKind: String
-    let operation: String
-    let phase: String
-    let sourceRunID: String?
-    let targetRunID: String?
-    let parentRunID: String?
-    let workspace: String?
-    let summary: String
-    let errorKind: String?
-    let errorMessage: String?
-    let occurredAt: Int64
-
-    var id: Int64 { transactionEventID }
-
-    enum CodingKeys: String, CodingKey {
-        case transactionEventID = "transaction_event_id"
-        case operationID = "operation_id"
-        case environmentKind = "environment_kind"
-        case operation, phase
-        case sourceRunID = "source_run_id"
-        case targetRunID = "target_run_id"
-        case parentRunID = "parent_run_id"
-        case workspace, summary
-        case errorKind = "error_kind"
-        case errorMessage = "error_message"
-        case occurredAt = "occurred_at"
     }
 }
 

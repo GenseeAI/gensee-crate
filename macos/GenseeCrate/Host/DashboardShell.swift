@@ -2,7 +2,6 @@ import SwiftUI
 
 enum DashboardDestination: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
-    case liveFeed = "Live Feed"
     case today = "Daily Highlight"
     case timeline = "Timeline"
     case alerts = "Alerts"
@@ -16,7 +15,6 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .dashboard: "gauge.with.dots.needle.33percent"
-        case .liveFeed: "bolt"
         case .today: "star"
         case .timeline: "clock"
         case .alerts: "exclamationmark.triangle"
@@ -131,7 +129,6 @@ struct DashboardShell: View {
     private var destinationView: some View {
         switch selection {
         case .dashboard: DashboardOverviewPage(model: model, sensor: model.endpointSensor)
-        case .liveFeed: LiveFeedPage(model: model, searchText: searchText)
         case .today: TodayHighlightPage(model: model)
         case .timeline: TimelinePage(model: model, searchText: searchText)
         case .alerts: DashboardAlertsPage(model: model, searchText: searchText)
@@ -164,7 +161,7 @@ private struct DashboardSidebar: View {
         VStack(alignment: .leading, spacing: 0) {
             navGroup("OVERVIEW", [.dashboard])
             separator
-            navGroup("ACTIVITY", [.liveFeed, .today, .timeline])
+            navGroup("ACTIVITY", [.today, .timeline])
             separator
             navGroup("SECURITY", [.alerts, .lineage])
             separator
