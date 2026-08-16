@@ -45,6 +45,7 @@ and cgroup/nftables network controls. See
 | `macos/GenseeCrate` | Native Swift security console and signed Endpoint Security system extension |
 | `crate/gensee-crate-linux` | Experimental Linux capability detection, `/proc` monitoring, policy decisions, fanotify planning/debug probes, seccomp launcher profiles, and cgroup/nftables egress controls |
 | `crate/gensee-crate-cli` | `gensee` CLI entry point, including run/watch/timeline/policy commands |
+| `crate/gensee-crate-config-audit` | Static, read-only coding-agent configuration inventory and security/privacy rules; Codex is the first adapter |
 | `crate/gensee-crate-ml` | Behavioral model experiments |
 | `integrations/claude-code` | Claude Code hook bridge |
 | `integrations/codex` | Codex hook bridge |

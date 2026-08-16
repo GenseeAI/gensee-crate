@@ -24,6 +24,7 @@ import {
   MoonOutlined,
   QuestionCircleOutlined,
   SearchOutlined,
+  SafetyCertificateOutlined,
   SettingOutlined,
   StarOutlined,
   SunOutlined,
@@ -75,8 +76,9 @@ const NAV_ITEMS: MenuItem[] = [
     type: 'group',
     label: 'CONFIGURATION',
     children: [
-      { key: '/policy',   icon: <FileProtectOutlined />, label: 'Policy'   },
-      { key: '/settings', icon: <SettingOutlined />,     label: 'Settings' },
+      { key: '/config-audit', icon: <SafetyCertificateOutlined />, label: 'Config Audit' },
+      { key: '/policy',       icon: <FileProtectOutlined />,        label: 'Policy'       },
+      { key: '/settings',     icon: <SettingOutlined />,            label: 'Settings'     },
     ],
   },
 ];

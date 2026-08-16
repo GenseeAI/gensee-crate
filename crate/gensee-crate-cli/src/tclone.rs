@@ -5054,6 +5054,9 @@ fn run_tclone_clone_attempts(
     }
 }
 
+// This retry boundary mirrors the complete clone invocation state. Keeping the
+// arguments explicit makes cleanup and retry prefixes auditable at each call.
+#[allow(clippy::too_many_arguments)]
 fn retry_tclone_partial_multicopy_clone(
     podman: &OsString,
     copies: usize,

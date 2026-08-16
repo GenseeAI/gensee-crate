@@ -52,6 +52,7 @@ export default defineConfig({
           { text: 'gensee run', link: '/run-and-sandbox' },
           { text: 'Linux Host Support', link: '/linux' },
           { text: 'Tclone Runtime', link: '/tclone' },
+          { text: 'Config Audit', link: '/config-audit' },
           { text: 'Policy CLI', link: '/gensee-policy' },
           { text: 'Safety Policy', link: '/policy' }
         ]

@@ -5,6 +5,7 @@
 //! connection and apply `0600` permissions on creation.  No TCP server is
 //! started; the WebView communicates exclusively via Tauri IPC.
 
+use gensee_crate_config_audit::{audit_target, AuditBundle, AuditOptions, AuditTargetName};
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::{
@@ -97,6 +98,85 @@ fn get_store_security(state: tauri::State<AppState>) -> Result<Value, String> {
         "encrypted_at_rest": !database_is_plaintext(&db_path)?,
         "db_path": db_path,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Commands — coding-agent configuration audit
+// ---------------------------------------------------------------------------
+
+/// Run the same static coding-agent configuration audit exposed by the CLI.
+///
+/// This calls the audit library directly and never launches Codex, MCP
+/// servers, hooks, skills, plugins, package runners, or shell commands.
+#[tauri::command]
+fn get_config_audit(
+    target: Option<String>,
+    workspace: Option<String>,
+    codex_home: Option<String>,
+    codex_profile: Option<String>,
+    vscode_user_data: Option<String>,
+    vscode_profile: Option<String>,
+) -> Result<AuditBundle, String> {
+    let target = target
+        .as_deref()
+        .unwrap_or("vscode")
+        .parse::<AuditTargetName>()
+        .map_err(|error| error.to_string())?;
+    let workspace = resolve_audit_workspace(workspace)?;
+    let codex_home = nonempty_path(codex_home);
+    if let Some(path) = &codex_home {
+        if path.exists() && !path.is_dir() {
+            return Err(format!("Codex home is not a directory: {}", path.display()));
+        }
+    }
+    let codex_profile = codex_profile
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let vscode_user_data = nonempty_path(vscode_user_data);
+    if let Some(path) = &vscode_user_data {
+        if path.exists() && !path.is_dir() {
+            return Err(format!(
+                "VS Code user data is not a directory: {}",
+                path.display()
+            ));
+        }
+    }
+    let vscode_profile = vscode_profile
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    audit_target(target, &AuditOptions {
+        workspace,
+        codex_home,
+        codex_profile,
+        vscode_user_data,
+        vscode_profile,
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn resolve_audit_workspace(workspace: Option<String>) -> Result<PathBuf, String> {
+    let requested = nonempty_path(workspace).or_else(|| {
+        std::env::var_os("GENSEE_WORKSPACE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let path = match requested {
+        Some(path) => path,
+        None => std::env::current_dir()
+            .map_err(|error| format!("Unable to resolve the audit workspace: {error}"))?,
+    };
+    if !path.is_dir() {
+        return Err(format!("Audit workspace is not a directory: {}", path.display()));
+    }
+    Ok(path)
+}
+
+fn nonempty_path(value: Option<String>) -> Option<PathBuf> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,6 +1189,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             get_store_security,
+            get_config_audit,
             get_sessions,
             get_session,
             get_session_requests,
@@ -1144,4 +1225,60 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error running Gensee dashboard");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_audit_command_uses_the_shared_ruleset() {
+        let root = std::env::temp_dir().join(format!(
+            "gensee-dashboard-config-audit-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("workspace");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
+        )
+        .unwrap();
+
+        let report = get_config_audit(
+            Some("codex".to_string()),
+            Some(workspace.to_string_lossy().into_owned()),
+            Some(codex_home.to_string_lossy().into_owned()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.requested_target, "codex");
+        assert!(report.reports[0]
+            .report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "CAX-AUT-002"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_audit_rejects_a_file_as_workspace() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-dashboard-config-audit-file-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "not a directory").unwrap();
+
+        let error = get_config_audit(None, Some(path.to_string_lossy().into_owned()), None, None, None, None)
+            .expect_err("file workspace should be rejected");
+
+        assert!(error.contains("not a directory"));
+        let _ = fs::remove_file(path);
+    }
 }

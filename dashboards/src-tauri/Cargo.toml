@@ -25,3 +25,4 @@ rusqlite   = { version = "0.32", features = ["bundled-sqlcipher"] }
 hex        = "0.4"    # blob columns → hex strings
 dirs       = "5"      # platform home dir for GENSEE_HOME fallback
 getrandom  = "0.2"   # CSPRNG for temp-file name generation
+gensee-crate-config-audit = { path = "../../crate/gensee-crate-config-audit" }
