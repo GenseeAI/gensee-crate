@@ -513,23 +513,40 @@ final class ConsoleModel: ObservableObject {
     }
 
     func openCodexHookReview() {
-        guard let codexURL = Self.codexExecutableURL() else {
-            errorMessage = "Gensee could not find a working Codex CLI. Install or update Codex, then run it and enter /hooks to review the Gensee hook."
-            return
-        }
-        do {
-            let scriptURL = homeURL.appendingPathComponent("bin/review-codex-hooks.command")
-            let hooksURL = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".codex/hooks.json")
-            let script = CodexHookReviewScript.render(codexURL: codexURL, hooksURL: hooksURL)
-            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+        guard runningCommand == nil else { return }
+        runningCommand = "Finding the installed Codex CLI"
+        let candidates = Self.codexExecutableCandidates()
+        Task { [weak self] in
+            guard let self else { return }
+            let codexURL = await Task.detached(priority: .userInitiated) {
+                let manager = FileManager.default
+                return CodexExecutableResolver.firstRunnable(candidates: candidates) { candidate in
+                    manager.isExecutableFile(atPath: candidate.path)
+                        && CodexExecutableResolver.respondsToVersionProbe(candidate)
+                }
+            }.value
+            runningCommand = nil
+            guard let codexURL else {
+                errorMessage = "Gensee could not find a working Codex CLI. Install or update Codex, then run it and enter /hooks to review the Gensee hook."
+                return
+            }
+
+            let shellCommand = CodexHookReviewScript.shellCommand(codexURL: codexURL)
+            let appleScriptSource = CodexHookReviewLauncher.appleScriptSource(
+                shellCommand: shellCommand
+            )
+            var executionError: NSDictionary?
+            guard let appleScript = NSAppleScript(source: appleScriptSource),
+                  appleScript.executeAndReturnError(&executionError) != nil
+            else {
+                let detail = executionError?[NSAppleScript.errorMessage] as? String
+                    ?? "Terminal could not start the review command."
+                errorMessage = "Could not open Codex hook review: \(detail)"
+                return
+            }
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString("/hooks", forType: .string)
-            NSWorkspace.shared.open(scriptURL)
             noticeMessage = "Opened Codex CLI and copied /hooks. The review window closes automatically after Gensee hooks are trusted."
-        } catch {
-            errorMessage = "Could not open Codex hook review: \(error.localizedDescription)"
         }
     }
 
@@ -840,35 +857,16 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
-    private static func codexExecutableURL() -> URL? {
+    private static func codexExecutableCandidates() -> [URL] {
         let manager = FileManager.default
         let home = manager.homeDirectoryForCurrentUser
         let applicationURLs = ["com.openai.codex"].compactMap {
             NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
         }
-        let candidates = CodexExecutableResolver.orderedCandidates(
+        return CodexExecutableResolver.orderedCandidates(
             home: home,
             applicationURLs: applicationURLs
         )
-        return CodexExecutableResolver.firstRunnable(candidates: candidates) { candidate in
-            manager.isExecutableFile(atPath: candidate.path)
-                && codexExecutableResponds(candidate)
-        }
-    }
-
-    private static func codexExecutableResponds(_ executable: URL) -> Bool {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = ["--version"]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationReason == .exit && process.terminationStatus == 0
-        } catch {
-            return false
-        }
     }
 
     private static func applicationInstalled(names: [String], bundleIdentifiers: [String]) -> Bool {

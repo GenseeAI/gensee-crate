@@ -3810,7 +3810,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 continue;
             }
         };
-        let (event, findings) = ingestor.ingest(parsed);
+        let (mut event, findings) = ingestor.ingest(parsed);
         let attributed_session_id = event.attribution.session_id.clone();
         let observed_at_ms = event.observed_at_ms;
         let active_tool = attributed_session_id
@@ -3947,14 +3947,19 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 None
             };
         let exit_code = event.exit_status;
-        // Global events still flow through the in-memory ancestry graph, but
-        // only activity correlated to a live tool window belongs in the
-        // product event store. Persisting the idle global stream makes the
-        // dashboard scan host bookkeeping while providing no user-facing
-        // attribution value.
-        if active_session_id.is_some() && !bookkeeping {
-            store.append_system_event(&event.into_system_event()?)?;
+        // Preserve the complete OS evidence stream even when no tool call is
+        // currently eligible for user-facing findings. Idle or stale process
+        // trees must not inherit request attribution, but their raw events are
+        // still useful for later audit and forensic analysis. Dashboard noise
+        // filtering is intentionally kept separate from evidence retention.
+        if active_session_id.is_none() {
+            event.attribution.session_id = None;
+            event.attribution.root_pid = None;
+            event.attribution.depth = None;
+            event.attribution.confidence = None;
+            event.attribution.matched_by = None;
         }
+        store.append_system_event(&event.into_system_event()?)?;
         if let Some(session_id) = ended_root_session {
             store.end_session(&session_id, observed_at_ms, exit_code)?;
         }

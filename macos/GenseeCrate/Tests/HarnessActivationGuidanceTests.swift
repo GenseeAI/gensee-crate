@@ -53,21 +53,64 @@ final class HarnessActivationGuidanceTests: XCTestCase {
 
     func testCodexHookReviewClosesOnlyItsOriginatingTerminalAfterTrustChanges() {
         let script = CodexHookReviewScript.render(
-            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
-            hooksURL: URL(fileURLWithPath: "/Users/example/.codex/hooks.json")
+            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
         )
 
         XCTAssertTrue(script.contains("current_checksum\" != \"$initial_checksum"))
         XCTAssertTrue(script.contains("hooks_are_trusted"))
         XCTAssertTrue(script.contains("gensee hook codex"))
         XCTAssertTrue(script.contains("if tty of terminalTab is targetTTY"))
+        XCTAssertTrue(script.contains("return \"not-found\""))
         XCTAssertFalse(script.contains("close front window"))
+    }
+
+    func testCodexHookReviewUsesCodexHomeForConfigAndHooks() {
+        let script = CodexHookReviewScript.render(
+            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
+        )
+
+        XCTAssertTrue(script.contains("codex_home=\"${CODEX_HOME:-$HOME/.codex}\""))
+        XCTAssertTrue(script.contains("config_path=\"$codex_home/config.toml\""))
+        XCTAssertTrue(script.contains("hooks_path=\"$codex_home/hooks.json\""))
+    }
+
+    func testCodexHookReviewKeepsSecureMarkerAndUsesSentinel() {
+        let script = CodexHookReviewScript.render(
+            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
+        )
+
+        XCTAssertTrue(script.contains("printf 'approved\\n' > \"$approval_marker\""))
+        XCTAssertTrue(script.contains("if [[ -s \"$approval_marker\" ]]"))
+        XCTAssertFalse(script.contains("mktemp -t gensee-codex-hook-review)\n        /bin/rm"))
+    }
+
+    func testCodexReviewLauncherRunsInTerminalWithoutWritingACommandFile() {
+        let command = CodexHookReviewScript.shellCommand(
+            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
+        )
+        let source = CodexHookReviewLauncher.appleScriptSource(shellCommand: command)
+
+        XCTAssertTrue(command.contains("/usr/bin/base64 -D | /bin/zsh"))
+        XCTAssertTrue(source.contains("tell application \"Terminal\""))
+        XCTAssertTrue(source.contains("do script"))
+        XCTAssertFalse(source.contains("review-codex-hooks.command"))
+    }
+
+    func testCodexVersionProbeTimesOut() throws {
+        let executable = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gensee-codex-probe-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: executable) }
+        try "#!/bin/sh\nexec /bin/sleep 5\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+        let started = Date()
+        XCTAssertFalse(CodexExecutableResolver.respondsToVersionProbe(executable, timeout: 0.1))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.5)
     }
 
     func testCodexHookReviewScriptHasValidZshSyntax() throws {
         let script = CodexHookReviewScript.render(
-            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
-            hooksURL: URL(fileURLWithPath: "/Users/example/.codex/hooks.json")
+            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
         )
         let scriptURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("gensee-codex-review-\(UUID().uuidString).command")

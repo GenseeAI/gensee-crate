@@ -416,6 +416,9 @@ fn endpoint_security_event_is_known_build_output(
     if !known_build_process {
         return false;
     }
+    if !endpoint_security_executable_is_trusted_build_tool(&executable) {
+        return false;
+    }
 
     let Some(workspace_root) = workspace_root.filter(|root| !root.trim().is_empty()) else {
         return false;
@@ -441,6 +444,32 @@ fn endpoint_security_event_is_known_build_output(
         normalized_lower_path == build_root
             || normalized_lower_path.starts_with(&format!("{build_root}/"))
     })
+}
+
+fn endpoint_security_executable_is_trusted_build_tool(executable: &str) -> bool {
+    if !executable.starts_with('/') {
+        return false;
+    }
+
+    let fixed_prefixes = [
+        "/usr/bin/",
+        "/usr/local/bin/",
+        "/opt/homebrew/bin/",
+        "/library/developer/commandlinetools/usr/bin/",
+        "/applications/xcode.app/contents/developer/",
+        "/nix/store/",
+    ];
+    if fixed_prefixes
+        .iter()
+        .any(|prefix| executable.starts_with(prefix))
+    {
+        return true;
+    }
+
+    // rustup toolchain executables live below a per-user, versioned toolchain
+    // directory. Requiring both components prevents a workspace-local binary
+    // merely named `cargo`, `rustc`, or `npm` from suppressing its own writes.
+    executable.contains("/.rustup/toolchains/") && executable.contains("/bin/")
 }
 
 #[derive(Debug, Clone)]
@@ -968,7 +997,10 @@ mod tests {
                 "/tmp/report.dmp",
             ),
             ("/bin/codex", "/Users/me/.codex/sessions/2026/session.jsonl"),
-            ("/bin/rustc", "/repo/target/debug/deps/output.o"),
+            (
+                "/Users/me/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc",
+                "/repo/target/debug/deps/output.o",
+            ),
             ("/usr/bin/swiftc", "/repo/.build/debug/output.o"),
             ("/usr/bin/xcodebuild", "/repo/deriveddata/Build/output.o"),
             (
@@ -1020,6 +1052,17 @@ mod tests {
         });
         assert!(!endpoint_security_event_is_bookkeeping(
             &nested_build,
+            Some("/repo")
+        ));
+
+        let mut planted_build_name = event("write", process(20, 2, Some(10), Some(1)));
+        planted_build_name.actor.executable_path = Some("/repo/npm".to_string());
+        planted_build_name.file = Some(EndpointSecurityFile {
+            path: "/repo/target/exfil.env".to_string(),
+            ..EndpointSecurityFile::default()
+        });
+        assert!(!endpoint_security_event_is_bookkeeping(
+            &planted_build_name,
             Some("/repo")
         ));
     }

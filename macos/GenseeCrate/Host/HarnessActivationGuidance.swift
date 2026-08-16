@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct HarnessActivationInstruction: Equatable {
@@ -107,12 +108,40 @@ enum CodexExecutableResolver {
     ) -> URL? {
         candidates.first(where: isRunnable)
     }
+
+    static func respondsToVersionProbe(
+        _ executable: URL,
+        timeout: TimeInterval = 1.0
+    ) -> Bool {
+        let process = Process()
+        let completed = DispatchSemaphore(value: 0)
+        process.executableURL = executable
+        process.arguments = ["--version"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { _ in completed.signal() }
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+
+        if completed.wait(timeout: .now() + max(0.05, timeout)) == .timedOut {
+            process.terminate()
+            if completed.wait(timeout: .now() + 0.2) == .timedOut {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+                _ = completed.wait(timeout: .now() + 0.5)
+            }
+            return false
+        }
+        return process.terminationReason == .exit && process.terminationStatus == 0
+    }
 }
 
 enum CodexHookReviewScript {
-    static func render(codexURL: URL, hooksURL: URL) -> String {
+    static func render(codexURL: URL) -> String {
         let quotedCodex = shellSingleQuote(codexURL.path)
-        let quotedHooks = shellSingleQuote(hooksURL.path)
         return """
         #!/bin/zsh
         clear
@@ -121,15 +150,21 @@ enum CodexHookReviewScript {
         echo 'This review window will close automatically after approval.'
         echo
 
-        config_path="${CODEX_HOME:-$HOME/.codex}/config.toml"
-        hooks_path=\(quotedHooks)
+        codex_home="${CODEX_HOME:-$HOME/.codex}"
+        config_path="$codex_home/config.toml"
+        hooks_path="$codex_home/hooks.json"
         review_tty=$(/usr/bin/tty)
         approval_marker=$(/usr/bin/mktemp -t gensee-codex-hook-review)
-        /bin/rm -f "$approval_marker"
         initial_checksum=$(/usr/bin/cksum "$config_path" 2>/dev/null || true)
 
+        cleanup_review() {
+          /bin/rm -f "$approval_marker"
+        }
+        trap cleanup_review EXIT HUP INT TERM
+
         close_review_window() {
-          /usr/bin/osascript - "$review_tty" <<'APPLESCRIPT'
+          local close_result
+          close_result=$(/usr/bin/osascript - "$review_tty" <<'APPLESCRIPT'
         on run argv
           set targetTTY to item 1 of argv
           tell application "Terminal"
@@ -137,13 +172,18 @@ enum CodexHookReviewScript {
               repeat with terminalTab in tabs of terminalWindow
                 if tty of terminalTab is targetTTY then
                   close terminalWindow
-                  return
+                  return "closed"
                 end if
               end repeat
             end repeat
           end tell
+          return "not-found"
         end run
         APPLESCRIPT
+          )
+          if [[ "$close_result" != "closed" ]]; then
+            echo 'Hook approval is complete. You can close this terminal window.'
+          fi
         }
 
         hooks_are_trusted() {
@@ -175,10 +215,11 @@ enum CodexHookReviewScript {
         \(quotedCodex) &
         codex_pid=$!
         (
+          trap - EXIT HUP INT TERM
           while /bin/kill -0 "$codex_pid" 2>/dev/null; do
             current_checksum=$(/usr/bin/cksum "$config_path" 2>/dev/null || true)
             if [[ "$current_checksum" != "$initial_checksum" ]] && hooks_are_trusted; then
-              : > "$approval_marker"
+              /usr/bin/printf 'approved\\n' > "$approval_marker"
               /bin/kill -TERM "$codex_pid" 2>/dev/null || true
               exit 0
             fi
@@ -188,21 +229,38 @@ enum CodexHookReviewScript {
         watcher_pid=$!
 
         fg %1 >/dev/null 2>&1 || true
-        if [[ -f "$approval_marker" ]]; then
+        if [[ -s "$approval_marker" ]]; then
           wait "$watcher_pid" 2>/dev/null || true
-          /bin/rm -f "$approval_marker"
           echo
           echo 'Gensee hooks approved. Closing this review window…'
           /bin/sleep 0.4
           close_review_window
         else
           /bin/kill -TERM "$watcher_pid" 2>/dev/null || true
-          /bin/rm -f "$approval_marker"
         fi
         """
     }
 
+    static func shellCommand(codexURL: URL) -> String {
+        let payload = Data(render(codexURL: codexURL).utf8).base64EncodedString()
+        return "/usr/bin/printf '%s' \(shellSingleQuote(payload)) | /usr/bin/base64 -D | /bin/zsh"
+    }
+
     private static func shellSingleQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+enum CodexHookReviewLauncher {
+    static func appleScriptSource(shellCommand: String) -> String {
+        let escaped = shellCommand
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return """
+        tell application "Terminal"
+          activate
+          do script "\(escaped)"
+        end tell
+        """
     }
 }

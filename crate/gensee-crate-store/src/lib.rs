@@ -699,7 +699,26 @@ impl EventStore {
                 artifact
             })
             .collect::<Vec<_>>();
-        let visible_artifact_count = artifacts.len();
+        let artifact_count_query = format!(
+            "WITH candidates AS (
+                SELECT COALESCE(json_extract(facts.metadata, '$.source'),
+                                facts.last_modified_source, last_event.source) AS observation_source,
+                       json_extract(last_event.args, '$.file.mode') AS observation_mode,
+                       CASE WHEN facts.uri LIKE 'file://%'
+                            THEN substr(facts.uri, 8)
+                            ELSE facts.uri
+                       END AS observation_path
+                FROM artifact_facts AS facts
+                LEFT JOIN system_events AS last_event
+                  ON last_event.event_id = facts.last_system_event_id
+             )
+             SELECT COUNT(*)
+             FROM candidates
+             WHERE {artifact_visibility}"
+        );
+        let visible_artifact_count = conn
+            .query_row(&artifact_count_query, [], |row| row.get::<_, i64>(0))
+            .map_err(sqlite_error_from_rusqlite)?;
         let relation_query = format!(
             "WITH artifact_candidates AS (
                 SELECT facts.kind, facts.uri, facts.current_artifact_id, facts.last_seen_at,
@@ -5219,7 +5238,7 @@ mod tests {
         let artifacts = dashboard["artifacts"].as_array().unwrap();
         let relations = dashboard["relations"].as_array().unwrap();
         assert_eq!(artifacts.len(), 80);
-        assert_eq!(dashboard["summary"]["artifacts_count"], 80);
+        assert_eq!(dashboard["summary"]["artifacts_count"], 102);
         assert!(artifacts.iter().all(|artifact| artifact["uri"]
             .as_str()
             .unwrap()
