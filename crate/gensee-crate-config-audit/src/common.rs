@@ -187,7 +187,7 @@ pub(crate) fn insecure_remote_http(value: &str) -> bool {
 /// credential-bearing authority and query components are still detectable.
 pub(crate) fn endpoint_has_credentials(value: &str) -> bool {
     parse_endpoint_for_credential_detection(value)
-        .is_some_and(|url| parsed_url_has_credentials(&url))
+        .is_some_and(|url| parsed_url_has_credentials(value, &url))
 }
 
 /// Returns `true` when an endpoint contains URL credentials or cannot be
@@ -220,84 +220,51 @@ pub(crate) fn endpoint_display_value(value: &str) -> String {
     }
 }
 
-fn parsed_url_has_credentials(url: &Url) -> bool {
-    url_userinfo_has_literal_credentials(url)
+fn parsed_url_has_credentials(value: &str, url: &Url) -> bool {
+    url_userinfo_has_literal_credentials(value)
         || url.query_pairs().any(|(key, value)| {
             secret_key_name(&normalize_secret_key(&key)) && secret_value_is_literal(&value)
         })
 }
 
-fn url_userinfo_has_literal_credentials(url: &Url) -> bool {
-    let Some(password) = url.password() else {
+fn url_userinfo_has_literal_credentials(value: &str) -> bool {
+    let value = value.trim();
+    let authority = value
+        .split_once("://")
+        .map_or_else(
+            || value.strip_prefix("//").unwrap_or(value),
+            |(_, rest)| rest,
+        )
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let Some(userinfo_end) = authority.rfind('@') else {
         return false;
     };
-    let encoded = format!("{}:{password}", url.username());
-    let Some((separator, separator_length)) = userinfo_password_separator(&encoded) else {
+    let userinfo = &authority[..userinfo_end];
+    let Some(separator) = userinfo_password_separator(userinfo) else {
         return false;
     };
-    secret_value_is_literal(
-        &percent_decode_str(&encoded[separator + separator_length..]).decode_utf8_lossy(),
-    )
+    secret_value_is_literal(&percent_decode_str(&userinfo[separator + 1..]).decode_utf8_lossy())
 }
 
-fn userinfo_password_separator(encoded: &str) -> Option<(usize, usize)> {
+fn userinfo_password_separator(userinfo: &str) -> Option<usize> {
     let mut index = 0;
-    let mut inside_runtime_reference = false;
-    let mut closed_runtime_reference = false;
-    while index < encoded.len() {
-        let tail = &encoded[index..];
-        if !inside_runtime_reference {
-            let marker_length = if tail.starts_with("${") {
-                Some(2)
-            } else if tail
-                .get(..4)
-                .is_some_and(|marker| marker.eq_ignore_ascii_case("$%7b"))
-            {
-                Some(4)
-            } else if tail
-                .get(..6)
-                .is_some_and(|marker| marker.eq_ignore_ascii_case("%24%7b"))
-            {
-                Some(6)
-            } else {
-                None
-            };
-            if let Some(marker_length) = marker_length {
-                inside_runtime_reference = true;
-                closed_runtime_reference = false;
-                index += marker_length;
+    let mut separator = None;
+    while index < userinfo.len() {
+        let tail = &userinfo[index..];
+        if let Some(reference) = tail.strip_prefix("${") {
+            if let Some(reference_end) = reference.find('}') {
+                index += 2 + reference_end + 1;
                 continue;
             }
-            if tail.starts_with(':') {
-                return Some((index, 1));
-            }
-            if closed_runtime_reference
-                && tail
-                    .get(..3)
-                    .is_some_and(|marker| marker.eq_ignore_ascii_case("%3a"))
-            {
-                // `url` treats the colon inside `${input:name}` as the URL's
-                // separator, then percent-encodes a real separator following
-                // the placeholder as part of the parsed password.
-                return Some((index, 3));
-            }
-        } else if tail.starts_with('}') {
-            inside_runtime_reference = false;
-            closed_runtime_reference = true;
-            index += 1;
-            continue;
-        } else if tail
-            .get(..3)
-            .is_some_and(|marker| marker.eq_ignore_ascii_case("%7d"))
-        {
-            inside_runtime_reference = false;
-            closed_runtime_reference = true;
-            index += 3;
-            continue;
+        }
+        if tail.starts_with(':') {
+            separator = Some(index);
         }
         index += 1;
     }
-    None
+    separator
 }
 
 fn parse_endpoint_for_credential_detection(value: &str) -> Option<Url> {
@@ -553,17 +520,33 @@ mod tests {
 
     #[test]
     fn endpoint_credentials_evaluate_password_separately_from_username() {
-        let literal_password = "https://${input:user}:do-not-leak@example.com/mcp";
-        assert!(endpoint_has_credentials(literal_password));
-        assert!(endpoint_must_be_redacted(literal_password));
-        assert_eq!(
-            endpoint_display_value(literal_password),
-            "<redacted-credential-url>"
-        );
+        for literal_password in [
+            "https://${input:user}:do-not-leak@example.com/mcp",
+            "https://${input:a}:${input:b}:do-not-leak@example.com/mcp",
+            "https://${env:USER}:do-not-leak@example.com/mcp",
+            "https://%24%7Binput%3Auser%7D:do-not-leak@example.com/mcp",
+            "https://env:USER:do-not-leak@example.com/mcp",
+            "https://admin:do-not:leak@example.com/mcp",
+        ] {
+            assert!(
+                endpoint_has_credentials(literal_password),
+                "{literal_password}"
+            );
+            assert!(
+                endpoint_must_be_redacted(literal_password),
+                "{literal_password}"
+            );
+            assert_eq!(
+                endpoint_display_value(literal_password),
+                "<redacted-credential-url>",
+                "{literal_password}"
+            );
+        }
 
         for endpoint in [
             "https://admin:${input:token}@example.com/mcp",
             "https://admin@example.com/mcp",
+            "https://admin%3Aops@example.com/mcp",
         ] {
             assert!(endpoint_is_parseable(endpoint), "{endpoint}");
             assert!(!endpoint_has_credentials(endpoint), "{endpoint}");
