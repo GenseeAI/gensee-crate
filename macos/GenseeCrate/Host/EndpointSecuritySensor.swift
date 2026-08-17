@@ -53,7 +53,6 @@ final class EndpointSecuritySensor: ObservableObject {
     private var ingestErrorBuffer = Data()
     private var ingestAcknowledgementBuffer = Data()
     private var ingestionWarning: String?
-    private let acknowledgementTimeout: TimeInterval = 5.0
 
     init(homeURL: URL, executableURL: URL?) {
         self.homeURL = homeURL
@@ -264,9 +263,9 @@ final class EndpointSecuritySensor: ObservableObject {
                 )
                 cursor = pendingCursor
                 persistCursor()
-                if rejectedEvents > 0 {
-                    ingestionWarning = "Endpoint Security skipped \(rejectedEvents.formatted()) invalid event(s) in the latest batch. Update Gensee Crate if this continues."
-                }
+                ingestionWarning = EndpointIngestBatchPolicy.warning(
+                    forRejectedEvents: rejectedEvents
+                )
             }
             health.connected = true
             health.error = ingestionWarning
@@ -398,6 +397,9 @@ final class EndpointSecuritySensor: ObservableObject {
         bootID: String,
         eventCount: UInt64
     ) async throws -> UInt64 {
+        let acknowledgementTimeout = EndpointIngestBatchPolicy.acknowledgementTimeout(
+            forEventCount: eventCount
+        )
         let deadline = ProcessInfo.processInfo.systemUptime + acknowledgementTimeout
         while true {
             if let line = nextAcknowledgementLine() {

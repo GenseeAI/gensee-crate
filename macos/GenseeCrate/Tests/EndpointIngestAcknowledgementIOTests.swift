@@ -1,6 +1,26 @@
 import XCTest
 
 final class EndpointIngestAcknowledgementIOTests: XCTestCase {
+    func testAcknowledgementTimeoutScalesForBacklogBatches() {
+        XCTAssertEqual(
+            EndpointIngestBatchPolicy.acknowledgementTimeout(forEventCount: 0),
+            5
+        )
+        XCTAssertEqual(
+            EndpointIngestBatchPolicy.acknowledgementTimeout(forEventCount: 500),
+            55
+        )
+        XCTAssertEqual(
+            EndpointIngestBatchPolicy.acknowledgementTimeout(forEventCount: 1_000),
+            60
+        )
+    }
+
+    func testRejectionWarningClearsAfterAHealthyBatch() {
+        XCTAssertNotNil(EndpointIngestBatchPolicy.warning(forRejectedEvents: 1))
+        XCTAssertNil(EndpointIngestBatchPolicy.warning(forRejectedEvents: 0))
+    }
+
     func testReadChunkReturnsAvailableAcknowledgementData() throws {
         let pipe = Pipe()
         defer {

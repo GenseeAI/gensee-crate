@@ -1,6 +1,24 @@
 import Darwin
 import Foundation
 
+enum EndpointIngestBatchPolicy {
+    private static let minimumAcknowledgementTimeout: TimeInterval = 5
+    private static let acknowledgementTimeoutPerEvent: TimeInterval = 0.1
+    private static let maximumAcknowledgementTimeout: TimeInterval = 60
+
+    static func acknowledgementTimeout(forEventCount eventCount: UInt64) -> TimeInterval {
+        min(
+            maximumAcknowledgementTimeout,
+            minimumAcknowledgementTimeout + Double(eventCount) * acknowledgementTimeoutPerEvent
+        )
+    }
+
+    static func warning(forRejectedEvents rejectedEvents: UInt64) -> String? {
+        guard rejectedEvents > 0 else { return nil }
+        return "Endpoint Security skipped \(rejectedEvents.formatted()) invalid event(s) in the latest batch. Update Gensee Crate if this continues."
+    }
+}
+
 enum EndpointIngestAcknowledgementIO {
     static func readChunk(from handle: FileHandle, timeout: TimeInterval) throws -> Data {
         var descriptor = pollfd(
@@ -44,7 +62,7 @@ enum EndpointIngestAcknowledgementIO {
         NSError(
             domain: "ai.gensee.crate.endpoint-security",
             code: 7,
-            userInfo: [NSLocalizedDescriptionKey: "Endpoint Security ingestion did not confirm durable storage within five seconds. The ingester will restart automatically."]
+            userInfo: [NSLocalizedDescriptionKey: "Endpoint Security ingestion did not confirm durable storage before the batch deadline. The ingester will restart automatically."]
         )
     }
 }
