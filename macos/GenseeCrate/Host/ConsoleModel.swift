@@ -276,7 +276,10 @@ final class ConsoleModel: ObservableObject {
         runningCommand = "Validating policy"
         defer { runningCommand = nil }
         do {
-            let parsed = try JSONSerialization.jsonObject(with: Data(text.utf8))
+            guard var parsed = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+            parsed["schema_version"] = 2
             let canonical = try JSONSerialization.data(withJSONObject: parsed, options: [.prettyPrinted, .sortedKeys])
             let temporary = FileManager.default.temporaryDirectory
                 .appendingPathComponent("gensee-policy-\(UUID().uuidString).json")

@@ -231,7 +231,10 @@ pub struct EnforcementConfig {
 /// or invalid policy as deny for managed process trees. The system extension
 /// still scopes fail-closed behavior to explicitly registered agent roots.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+// Endpoint recording/retention settings evolve independently of the core
+// decision grammar. Unknown endpoint keys are ignored for forward-compatible
+// passive recording; the top-level schema_version still gates policy semantics.
+#[serde(default)]
 pub struct EndpointSecurityConfig {
     pub mode: EndpointSecurityMode,
     pub protected_paths: Vec<String>,
@@ -254,7 +257,7 @@ impl Default for EndpointSecurityConfig {
             fail_closed_managed_only: true,
             max_auth_latency_ms: 10,
             minimum_recorded_severity: AlertSeverity::Info,
-            raw_event_scope: RawEventScope::Active,
+            raw_event_scope: RawEventScope::All,
             raw_event_retention_hours: 24,
             max_raw_events: 100_000,
             low_severity_retention_hours: Some(48),
@@ -290,8 +293,8 @@ impl AlertSeverity {
 #[serde(rename_all = "kebab-case")]
 pub enum RawEventScope {
     None,
-    #[default]
     Active,
+    #[default]
     All,
 }
 
@@ -593,22 +596,36 @@ pub fn resolved_policy_source() -> (Option<PathBuf>, &'static str) {
 
 const DEFAULT_POLICY_JSON: &str = include_str!("../policy/default-policy.json");
 
-/// Policy-document schema version this build understands. A document with a
-/// different `schema_version` is rejected by [`Policy::from_json`] (and thus
-/// fails closed on enforcement paths) rather than silently mis-parsed.
-pub const POLICY_SCHEMA_VERSION: u32 = 1;
+/// Current policy-document schema version. Version 1 remains readable during
+/// migration; future versions are rejected by [`Policy::from_json`] (and thus
+/// fail closed on enforcement paths) rather than silently mis-parsed.
+pub const POLICY_SCHEMA_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_POLICY_SCHEMA_VERSION: u32 = 1;
 
 impl Policy {
     pub fn from_json(json: &str) -> Result<Self, String> {
-        let doc: PolicyDocument =
+        // Read the version before strict typed deserialization. This produces a
+        // useful upgrade error for future policy documents instead of an
+        // unrelated "unknown field" failure from a nested object.
+        let value: serde_json::Value =
             serde_json::from_str(json).map_err(|err| format!("invalid policy document: {err}"))?;
-        if doc.schema_version != POLICY_SCHEMA_VERSION {
+        let schema_version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                "invalid policy document: schema_version must be an integer".to_string()
+            })?;
+        if !(u64::from(MIN_SUPPORTED_POLICY_SCHEMA_VERSION)..=u64::from(POLICY_SCHEMA_VERSION))
+            .contains(&schema_version)
+        {
             return Err(format!(
-                "unsupported schema_version {} (this build supports {POLICY_SCHEMA_VERSION}); \
-                 update the policy document or the binary",
-                doc.schema_version
+                "unsupported schema_version {schema_version} (this build supports \
+                 {MIN_SUPPORTED_POLICY_SCHEMA_VERSION}..={POLICY_SCHEMA_VERSION}); update the \
+                 policy document or the binary"
             ));
         }
+        let doc: PolicyDocument = serde_json::from_value(value)
+            .map_err(|err| format!("invalid policy document: {err}"))?;
         if !doc.endpoint_security.fail_closed_managed_only {
             return Err(
                 "endpoint_security.fail_closed_managed_only is reserved and must remain true"
@@ -1518,12 +1535,22 @@ mod tests {
     }
 
     #[test]
+    fn schema_one_remains_readable_during_policy_migration() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(default_policy_json()).expect("default parses");
+        doc["schema_version"] = serde_json::json!(1);
+        doc["endpoint_security"]["future_passive_recording_key"] = serde_json::json!(true);
+        let policy = Policy::from_json(&doc.to_string()).expect("legacy policy should migrate");
+        assert_eq!(policy.document().schema_version, 1);
+    }
+
+    #[test]
     fn default_policy_json_round_trips() {
         assert!(Policy::from_json(default_policy_json()).is_ok());
         let policy = Policy::embedded_default();
         let endpoint = &policy.document().endpoint_security;
         assert_eq!(endpoint.minimum_recorded_severity, AlertSeverity::Info);
-        assert_eq!(endpoint.raw_event_scope, RawEventScope::Active);
+        assert_eq!(endpoint.raw_event_scope, RawEventScope::All);
         assert_eq!(endpoint.raw_event_retention_hours, 24);
         assert_eq!(endpoint.max_raw_events, 100_000);
         assert_eq!(endpoint.low_severity_retention_hours, Some(48));
@@ -1703,7 +1730,7 @@ mod tests {
     #[test]
     fn embedded_default_parses() {
         let policy = policy();
-        assert_eq!(policy.document().schema_version, 1);
+        assert_eq!(policy.document().schema_version, POLICY_SCHEMA_VERSION);
     }
 
     #[test]

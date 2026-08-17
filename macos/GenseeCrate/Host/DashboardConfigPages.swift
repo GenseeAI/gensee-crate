@@ -134,7 +134,7 @@ private struct PolicySettingsView: View {
             detail: "Control local disk use without weakening policy evaluation or enforcement.",
             settings: [
                 .choice("endpoint_security.minimum_recorded_severity", "Minimum recorded severity", "Evaluate every event, but persist alerts only at or above this severity.", options: ["info", "low", "medium", "high", "critical"], defaultValue: "info"),
-                .choice("endpoint_security.raw_event_scope", "Raw event recording", "Keep no raw telemetry, only active agent activity, or all OS observations.", options: ["active", "none", "all"], defaultValue: "active"),
+                .choice("endpoint_security.raw_event_scope", "Raw event recording", "Keep no raw telemetry, only active agent activity, or all OS observations. Age and count limits bound storage.", options: ["all", "active", "none"], defaultValue: "all"),
                 .integer("endpoint_security.raw_event_retention_hours", "Raw event retention (hours)", "Permanently remove raw Endpoint Security events after this period.", minimum: 1, maximum: 720, defaultValue: 24),
                 .integer("endpoint_security.max_raw_events", "Maximum raw events", "Hard cap prevents an event burst from growing the local database without bound.", minimum: 1000, maximum: 5_000_000, defaultValue: 100_000),
                 .integer("endpoint_security.low_severity_retention_hours", "Info–medium retention (hours)", "Permanently delete info, low, and medium alerts after this period. Leave blank to keep them.", minimum: 1, maximum: 8_760, nullable: true, defaultValue: 48),

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "version": "2026-06-13",
   "description": "Gensee Crate default policy for coding agents on a single endpoint. Use `gensee policy` or the local dashboard to set and view policy settings.",
 
@@ -511,7 +511,7 @@
     "fail_closed_managed_only": true,
     "max_auth_latency_ms": 10,
     "minimum_recorded_severity": "info",
-    "raw_event_scope": "active",
+    "raw_event_scope": "all",
     "raw_event_retention_hours": 24,
     "max_raw_events": 100000,
     "low_severity_retention_hours": 48

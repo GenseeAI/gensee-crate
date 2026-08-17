@@ -148,6 +148,38 @@ CREATE TABLE IF NOT EXISTS alert_chain_head (
   count      INTEGER NOT NULL
 );
 
+-- Append-only authorization records for intentional retention pruning. Each
+-- checkpoint commits to the exact pruned alert hashes and to the alert-chain
+-- head that was verified immediately before pruning. The surviving alert chain
+-- is re-rooted at the checkpoint hash, so a verifier can distinguish an
+-- authorized retention gap from an unexplained deletion.
+CREATE TABLE IF NOT EXISTS alert_retention_checkpoints (
+  checkpoint_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  prev_checkpoint_hash TEXT NOT NULL,
+  checkpoint_hash      TEXT NOT NULL,
+  previous_alert_head  TEXT NOT NULL,
+  previous_alert_count INTEGER NOT NULL,
+  pruned_count         INTEGER NOT NULL,
+  highest_pruned_alert_id INTEGER NOT NULL,
+  cutoff_ms            INTEGER NOT NULL,
+  pruned_entries_hash  TEXT NOT NULL,
+  created_at           INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alert_retention_head (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  head_hash  TEXT NOT NULL,
+  count      INTEGER NOT NULL
+);
+
+-- Cross-process throttle for bounded maintenance work. Hook clients are
+-- intentionally short-lived, so an in-memory timer cannot prevent every hook
+-- invocation from running retention.
+CREATE TABLE IF NOT EXISTS maintenance_state (
+  key         TEXT PRIMARY KEY,
+  last_run_at INTEGER NOT NULL
+);
+
 -- Human review verdicts recorded from the dashboard: an operator's after-the-fact
 -- judgement on a shield decision (the shield already enforced it inline at hook
 -- time). Used to label false positives / negatives for later policy tuning and
@@ -249,6 +281,7 @@ CREATE TABLE IF NOT EXISTS artifact_facts (
   is_memory_artifact                INTEGER NOT NULL DEFAULT 0,
   is_persistent_target              INTEGER NOT NULL DEFAULT 0,
   is_control_plane                  INTEGER NOT NULL DEFAULT 0,
+  dashboard_visible                INTEGER NOT NULL DEFAULT 1,
   risk_level                        TEXT CHECK (risk_level IS NULL OR risk_level IN ('info', 'low', 'medium', 'high', 'critical')),
   risk_rule_id                      TEXT,
   risk_digest                       TEXT,
@@ -266,8 +299,40 @@ CREATE TABLE IF NOT EXISTS artifact_facts (
   CHECK (is_memory_artifact IN (0, 1)),
   CHECK (is_persistent_target IN (0, 1)),
   CHECK (is_control_plane IN (0, 1)),
+  CHECK (dashboard_visible IN (0, 1)),
   CHECK (metadata IS NULL OR json_valid(metadata))
 );
+
+-- Exact O(1) dashboard count maintained as artifact facts change. Visibility
+-- is decided once on ingestion/migration instead of re-running every path
+-- predicate across the complete fact table on each UI refresh.
+CREATE TABLE IF NOT EXISTS dashboard_artifact_count (
+  id    INTEGER PRIMARY KEY CHECK (id = 1),
+  count INTEGER NOT NULL CHECK (count >= 0)
+);
+INSERT OR IGNORE INTO dashboard_artifact_count(id, count)
+  SELECT 1, COUNT(*) FROM artifact_facts WHERE dashboard_visible = 1;
+
+CREATE TRIGGER IF NOT EXISTS artifact_dashboard_count_insert
+AFTER INSERT ON artifact_facts WHEN NEW.dashboard_visible = 1
+BEGIN
+  UPDATE dashboard_artifact_count SET count = count + 1 WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS artifact_dashboard_count_delete
+AFTER DELETE ON artifact_facts WHEN OLD.dashboard_visible = 1
+BEGIN
+  UPDATE dashboard_artifact_count SET count = MAX(0, count - 1) WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS artifact_dashboard_count_update
+AFTER UPDATE OF dashboard_visible ON artifact_facts
+WHEN OLD.dashboard_visible != NEW.dashboard_visible
+BEGIN
+  UPDATE dashboard_artifact_count
+     SET count = MAX(0, count + NEW.dashboard_visible - OLD.dashboard_visible)
+   WHERE id = 1;
+END;
 
 -- Per-request event lookup: "show me everything that happened during request X".
 CREATE INDEX IF NOT EXISTS idx_agent_events_request_ts

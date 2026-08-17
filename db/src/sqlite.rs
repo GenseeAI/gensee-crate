@@ -64,6 +64,30 @@ fn alert_entry_hash(prev_hash: &str, alert: &NewAlert) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn retention_checkpoint_hash(
+    prev_checkpoint_hash: &str,
+    previous_alert_head: &str,
+    previous_alert_count: i64,
+    pruned_count: i64,
+    highest_pruned_alert_id: i64,
+    cutoff_ms: i64,
+    pruned_entries_hash: &str,
+    created_at: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    feed_field(&mut hasher, b"gensee-alert-retention-checkpoint-v1");
+    feed_field(&mut hasher, prev_checkpoint_hash.as_bytes());
+    feed_field(&mut hasher, previous_alert_head.as_bytes());
+    feed_field(&mut hasher, &previous_alert_count.to_le_bytes());
+    feed_field(&mut hasher, &pruned_count.to_le_bytes());
+    feed_field(&mut hasher, &highest_pruned_alert_id.to_le_bytes());
+    feed_field(&mut hasher, &cutoff_ms.to_le_bytes());
+    feed_field(&mut hasher, pruned_entries_hash.as_bytes());
+    feed_field(&mut hasher, &created_at.to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Result of [`SqliteStore::verify_alert_chain`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainVerification {
@@ -484,6 +508,7 @@ pub struct NewArtifactFact {
     pub is_memory_artifact: bool,
     pub is_persistent_target: bool,
     pub is_control_plane: bool,
+    pub dashboard_visible: bool,
     pub risk_level: Option<String>,
     pub risk_rule_id: Option<String>,
     pub risk_digest: Option<String>,
@@ -566,6 +591,7 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
     migrate_session_root_pid(&conn).map_err(SqliteError::Schema)?;
     migrate_session_token_usage(&conn).map_err(SqliteError::Schema)?;
     migrate_transcript_token_state(&conn).map_err(SqliteError::Schema)?;
+    migrate_artifact_dashboard_visibility(&conn).map_err(SqliteError::Schema)?;
 
     conn.execute_batch(include_str!("../schema.sql"))
         .map_err(SqliteError::Schema)?;
@@ -1019,18 +1045,51 @@ impl SqliteStore {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Atomically claim periodic maintenance across hook processes and the
+    /// long-lived Endpoint Security ingestor.
+    pub fn claim_maintenance(
+        &self,
+        key: &str,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<bool, SqliteError> {
+        self.conn
+            .execute(
+                "INSERT INTO maintenance_state(key, last_run_at) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET last_run_at = excluded.last_run_at
+                 WHERE maintenance_state.last_run_at <= ?2 - ?3",
+                params![key, now_ms, interval_ms],
+            )
+            .map(|changed| changed == 1)
+            .map_err(SqliteError::Database)
+    }
+
     /// Permanently remove bounded batches of expired Endpoint Security
     /// telemetry. The row cap is enforced independently from the time limit so
-    /// a burst cannot grow the local database without bound. Alert hashes are
-    /// rebuilt after intentional retention deletion to preserve verification
-    /// for the retained history.
+    /// a burst cannot grow the local database without bound. Intentional alert
+    /// deletion is committed to an append-only retention checkpoint before the
+    /// surviving chain is re-rooted.
     pub fn prune_endpoint_retention(
         &self,
         raw_cutoff_ms: i64,
         max_raw_events: i64,
         low_severity_cutoff_ms: Option<i64>,
         batch_limit: i64,
+        maintenance_at_ms: i64,
     ) -> Result<RetentionPruneResult, SqliteError> {
+        if low_severity_cutoff_ms.is_some() {
+            let verification = self.verify_alert_chain()?;
+            if !verification.is_valid() {
+                return Err(SqliteError::Database(
+                    rusqlite::Error::InvalidParameterName(format!(
+                        "refusing retention prune because alert-chain verification failed: {}",
+                        verification
+                            .reason
+                            .unwrap_or_else(|| "unknown break".to_string())
+                    )),
+                ));
+            }
+        }
         self.conn
             .execute_batch("SAVEPOINT gensee_retention_prune")
             .map_err(SqliteError::Database)?;
@@ -1080,13 +1139,6 @@ impl SqliteStore {
                  )",
                 [],
             )?;
-            let detached_alerts = self.conn.execute(
-                "UPDATE alerts SET entity_kind = NULL, entity_id = NULL
-                 WHERE entity_kind = 'system_event' AND entity_id IN (
-                     SELECT event_id FROM gensee_pruned_system_events
-                 )",
-                [],
-            )?;
             self.conn.execute(
                 "DELETE FROM system_events WHERE event_id IN (
                     SELECT event_id FROM gensee_pruned_system_events
@@ -1095,23 +1147,104 @@ impl SqliteStore {
             )?;
 
             let low_severity_alerts = if let Some(cutoff) = low_severity_cutoff_ms {
+                self.conn.execute_batch(
+                    "CREATE TEMP TABLE IF NOT EXISTS gensee_pruned_alerts (
+                        alert_id INTEGER PRIMARY KEY
+                     );
+                     DELETE FROM gensee_pruned_alerts;",
+                )?;
                 self.conn.execute(
-                    "DELETE FROM alerts
-                     WHERE alert_id IN (
-                         SELECT alert_id FROM alerts
-                         WHERE severity IN ('info', 'low', 'medium')
-                           AND created_at < ?1
-                         ORDER BY alert_id
-                         LIMIT ?2
-                     )",
+                    "INSERT INTO gensee_pruned_alerts(alert_id)
+                     SELECT alert_id FROM alerts
+                     WHERE severity IN ('info', 'low', 'medium')
+                       AND created_at < ?1
+                     ORDER BY alert_id
+                     LIMIT ?2",
                     params![cutoff, batch_limit],
-                )? as i64
+                )?;
+                let pruned_count = self.conn.query_row(
+                    "SELECT COUNT(*) FROM gensee_pruned_alerts",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                if pruned_count > 0 {
+                    let highest_pruned_alert_id = self.conn.query_row(
+                        "SELECT MAX(alert_id) FROM gensee_pruned_alerts",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    let mut digest = Sha256::new();
+                    let mut statement = self.conn.prepare(
+                        "SELECT alerts.alert_id, COALESCE(alerts.entry_hash, '')
+                         FROM alerts JOIN gensee_pruned_alerts USING(alert_id)
+                         ORDER BY alerts.alert_id",
+                    )?;
+                    let rows = statement.query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?;
+                    for row in rows {
+                        let (alert_id, entry_hash) = row?;
+                        feed_field(&mut digest, &alert_id.to_le_bytes());
+                        feed_field(&mut digest, entry_hash.as_bytes());
+                    }
+                    drop(statement);
+                    let pruned_entries_hash = format!("{:x}", digest.finalize());
+                    let (previous_alert_head, previous_alert_count) = self
+                        .conn
+                        .query_row(
+                            "SELECT head_hash, count FROM alert_chain_head WHERE id = 1",
+                            [],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                        )
+                        .optional()?
+                        .unwrap_or_else(|| (genesis_hash(), 0));
+                    let prev_checkpoint_hash = self.latest_retention_checkpoint_hash()?;
+                    let checkpoint_hash = retention_checkpoint_hash(
+                        &prev_checkpoint_hash,
+                        &previous_alert_head,
+                        previous_alert_count,
+                        pruned_count,
+                        highest_pruned_alert_id,
+                        cutoff,
+                        &pruned_entries_hash,
+                        maintenance_at_ms,
+                    );
+                    self.conn.execute(
+                        "INSERT INTO alert_retention_checkpoints (
+                            prev_checkpoint_hash, checkpoint_hash, previous_alert_head,
+                            previous_alert_count, pruned_count, highest_pruned_alert_id,
+                            cutoff_ms, pruned_entries_hash, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            prev_checkpoint_hash,
+                            checkpoint_hash,
+                            previous_alert_head,
+                            previous_alert_count,
+                            pruned_count,
+                            highest_pruned_alert_id,
+                            cutoff,
+                            pruned_entries_hash,
+                            maintenance_at_ms,
+                        ],
+                    )?;
+                    self.conn.execute(
+                        "INSERT INTO alert_retention_head(id, head_hash, count) VALUES (1, ?1, 1)
+                         ON CONFLICT(id) DO UPDATE SET
+                            head_hash = excluded.head_hash, count = count + 1",
+                        params![checkpoint_hash],
+                    )?;
+                    self.conn.execute(
+                        "DELETE FROM alerts WHERE alert_id IN (
+                            SELECT alert_id FROM gensee_pruned_alerts
+                         )",
+                        [],
+                    )?;
+                    self.rebuild_alert_chain(&checkpoint_hash)?;
+                }
+                pruned_count
             } else {
                 0
             };
-            if low_severity_alerts > 0 || detached_alerts > 0 {
-                self.rebuild_alert_chain()?;
-            }
             Ok(RetentionPruneResult {
                 system_events: system_events as u64,
                 low_severity_alerts: low_severity_alerts as u64,
@@ -1133,7 +1266,7 @@ impl SqliteStore {
         }
     }
 
-    fn rebuild_alert_chain(&self) -> rusqlite::Result<()> {
+    fn rebuild_alert_chain(&self, root_hash: &str) -> rusqlite::Result<()> {
         let alerts = {
             let mut statement = self.conn.prepare(
                 "SELECT alert_id, request_id, entity_kind, entity_id, severity, action,
@@ -1161,7 +1294,7 @@ impl SqliteStore {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
-        let mut previous = genesis_hash();
+        let mut previous = root_hash.to_string();
         for (alert_id, alert) in &alerts {
             let entry = alert_entry_hash(&previous, alert);
             self.conn.execute(
@@ -1170,13 +1303,11 @@ impl SqliteStore {
             )?;
             previous = entry;
         }
-        self.conn.execute("DELETE FROM alert_chain_head", [])?;
-        if !alerts.is_empty() {
-            self.conn.execute(
-                "INSERT INTO alert_chain_head(id, head_hash, count) VALUES (1, ?1, ?2)",
-                params![previous, alerts.len() as i64],
-            )?;
-        }
+        self.conn.execute(
+            "INSERT INTO alert_chain_head(id, head_hash, count) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET head_hash = excluded.head_hash, count = excluded.count",
+            params![previous, alerts.len() as i64],
+        )?;
         Ok(())
     }
 
@@ -1387,10 +1518,10 @@ impl SqliteStore {
                     recent_unmatched_effect_count, recent_cross_session_write_count,
                     is_agent_authored, is_unmatched_modified, is_memory_artifact,
                     is_persistent_target, is_control_plane, risk_level, risk_rule_id,
-                    risk_digest, risk_updated_at, metadata
+                    risk_digest, risk_updated_at, metadata, dashboard_visible
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
                  )
                  ON CONFLICT(kind, uri) DO UPDATE SET
                     current_artifact_id = excluded.current_artifact_id,
@@ -1413,7 +1544,8 @@ impl SqliteStore {
                     risk_rule_id = excluded.risk_rule_id,
                     risk_digest = excluded.risk_digest,
                     risk_updated_at = excluded.risk_updated_at,
-                    metadata = excluded.metadata",
+                    metadata = excluded.metadata,
+                    dashboard_visible = excluded.dashboard_visible",
                 params![
                     fact.kind,
                     fact.uri,
@@ -1438,6 +1570,7 @@ impl SqliteStore {
                     fact.risk_digest,
                     fact.risk_updated_at,
                     fact.metadata,
+                    bool_to_i64(fact.dashboard_visible),
                 ],
             )
             .map(|_| ())
@@ -1614,7 +1747,12 @@ impl SqliteStore {
 
     pub fn insert_alert(&self, alert: &NewAlert) -> Result<i64, SqliteError> {
         // Tamper-evident hash chain (T8): link this alert to the previous one.
-        let prev_hash = self.latest_alert_entry_hash()?.unwrap_or_else(genesis_hash);
+        let prev_hash = match self.latest_alert_entry_hash()? {
+            Some(hash) => hash,
+            None => self
+                .latest_retention_checkpoint_hash()
+                .map_err(SqliteError::Database)?,
+        };
         let entry_hash = alert_entry_hash(&prev_hash, alert);
 
         // The alert insert and the anchor update must be atomic — a crash
@@ -1697,6 +1835,99 @@ impl SqliteStore {
         }
     }
 
+    fn latest_retention_checkpoint_hash(&self) -> rusqlite::Result<String> {
+        self.conn
+            .query_row(
+                "SELECT head_hash FROM alert_retention_head WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or_else(genesis_hash))
+    }
+
+    fn verify_retention_checkpoints(&self) -> Result<String, SqliteError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT prev_checkpoint_hash, checkpoint_hash, previous_alert_head,
+                    previous_alert_count, pruned_count, highest_pruned_alert_id,
+                    cutoff_ms, pruned_entries_hash, created_at
+                 FROM alert_retention_checkpoints ORDER BY checkpoint_id",
+            )
+            .map_err(SqliteError::Database)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })
+            .map_err(SqliteError::Database)?;
+        let mut expected_prev = genesis_hash();
+        let mut count = 0_i64;
+        for row in rows {
+            let (
+                prev,
+                checkpoint,
+                previous_alert_head,
+                previous_alert_count,
+                pruned_count,
+                highest_pruned_alert_id,
+                cutoff_ms,
+                pruned_entries_hash,
+                created_at,
+            ) = row.map_err(SqliteError::Database)?;
+            let expected = retention_checkpoint_hash(
+                &prev,
+                &previous_alert_head,
+                previous_alert_count,
+                pruned_count,
+                highest_pruned_alert_id,
+                cutoff_ms,
+                &pruned_entries_hash,
+                created_at,
+            );
+            if prev != expected_prev || checkpoint != expected {
+                return Err(SqliteError::Database(
+                    rusqlite::Error::InvalidParameterName(
+                        "retention checkpoint chain was modified or reordered".to_string(),
+                    ),
+                ));
+            }
+            expected_prev = checkpoint;
+            count += 1;
+        }
+        let anchor = self
+            .conn
+            .query_row(
+                "SELECT head_hash, count FROM alert_retention_head WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(SqliteError::Database)?;
+        match anchor {
+            Some((head, anchored_count)) if head == expected_prev && anchored_count == count => {}
+            None if count == 0 => {}
+            _ => {
+                return Err(SqliteError::Database(
+                    rusqlite::Error::InvalidParameterName(
+                        "retention checkpoint head/count does not match its anchor".to_string(),
+                    ),
+                ))
+            }
+        }
+        Ok(expected_prev)
+    }
+
     /// Recompute the alert hash chain from the genesis hash and report the first
     /// break — any inserted, deleted, reordered, or modified row.
     ///
@@ -1706,6 +1937,15 @@ impl SqliteStore {
     /// NULL hashes after the chain exists is detected as a break rather than
     /// silently ignored.
     pub fn verify_alert_chain(&self) -> Result<ChainVerification, SqliteError> {
+        let chain_root = match self.verify_retention_checkpoints() {
+            Ok(root) => root,
+            Err(error) => {
+                return Ok(ChainVerification::broken_tail(
+                    0,
+                    &format!("retention checkpoint verification failed: {error}"),
+                ))
+            }
+        };
         // First chained row; `min()` over no matches yields NULL -> None.
         let chain_start: Option<i64> = self
             .conn
@@ -1716,7 +1956,23 @@ impl SqliteStore {
             )
             .map_err(SqliteError::Database)?;
         let Some(chain_start) = chain_start else {
-            return Ok(ChainVerification::valid(0)); // no chained alerts yet
+            let anchor = self
+                .conn
+                .query_row(
+                    "SELECT head_hash, count FROM alert_chain_head WHERE id = 1",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(SqliteError::Database)?;
+            return match anchor {
+                Some((head, 0)) if head == chain_root => Ok(ChainVerification::valid(0)),
+                None if chain_root == genesis_hash() => Ok(ChainVerification::valid(0)),
+                _ => Ok(ChainVerification::broken_tail(
+                    0,
+                    "empty alert chain does not match the retention root/anchor",
+                )),
+            };
         };
 
         let mut stmt = self
@@ -1751,7 +2007,7 @@ impl SqliteStore {
             })
             .map_err(SqliteError::Database)?;
 
-        let mut expected_prev = genesis_hash();
+        let mut expected_prev = chain_root;
         let mut checked = 0_u64;
         for row in rows {
             let (alert_id, alert, prev_hash, entry_hash) = row.map_err(SqliteError::Database)?;
@@ -2211,6 +2467,48 @@ fn migrate_transcript_token_state(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY (session_id) REFERENCES sessions(session_id),
             CHECK (json_valid(state_json))
          );",
+    )
+}
+
+fn migrate_artifact_dashboard_visibility(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = table_columns(conn, "artifact_facts")?;
+    if columns.is_empty() || columns.iter().any(|column| column == "dashboard_visible") {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE artifact_facts
+         ADD COLUMN dashboard_visible INTEGER NOT NULL DEFAULT 1",
+        [],
+    )?;
+    // One-time upgrade classification. Future writes compute visibility before
+    // upsert and triggers maintain the exact dashboard count incrementally.
+    conn.execute_batch(
+        "UPDATE artifact_facts
+         SET dashboard_visible = CASE
+           WHEN instr(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END, '*') > 0
+             OR instr(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END, '?') > 0
+             OR instr(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END, '[') > 0
+             OR instr(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END, '{') > 0
+           THEN 0
+           WHEN COALESCE(json_extract(metadata, '$.source'), last_modified_source, (
+                    SELECT source FROM system_events
+                    WHERE event_id = artifact_facts.last_system_event_id
+                ), '') = 'macos-endpoint-security'
+             AND (
+               COALESCE((SELECT json_extract(args, '$.file.mode') FROM system_events
+                         WHERE event_id = artifact_facts.last_system_event_id), 0) & 61440
+                   IN (4096, 8192, 16384, 24576, 49152)
+               OR lower(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END)
+                    LIKE '%/library/application support/codex/%'
+               OR lower(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END)
+                    LIKE '%/library/application support/claude/%'
+               OR CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END GLOB '/dev/*'
+               OR CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END GLOB '/System/*'
+               OR CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END GLOB '/usr/lib/*'
+               OR CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END GLOB '/private/var/db/*'
+               OR CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END GLOB '/private/var/folders/*'
+             )
+           THEN 0 ELSE 1 END;",
     )
 }
 
@@ -3015,7 +3313,7 @@ mod tests {
         }
 
         let pruned = store
-            .prune_endpoint_retention(0, 2, Some(100), 100)
+            .prune_endpoint_retention(0, 2, Some(100), 100, 250)
             .unwrap();
         assert_eq!(pruned.system_events, 3);
         assert_eq!(pruned.low_severity_alerts, 1);
@@ -3028,6 +3326,118 @@ mod tests {
         assert!(alerts.iter().any(|alert| alert.severity == "high"));
         assert!(alerts.iter().any(|alert| alert.severity == "low"));
         assert!(store.verify_alert_chain().unwrap().is_valid());
+        let checkpoint: (i64, i64, i64) = store
+            .connection()
+            .query_row(
+                "SELECT pruned_count, highest_pruned_alert_id, cutoff_ms
+                 FROM alert_retention_checkpoints",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(checkpoint, (1, 1, 100));
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn retention_refuses_to_launder_alert_chain_tampering() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-retention-tamper-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        for severity in ["medium", "high"] {
+            store
+                .insert_alert(&NewAlert {
+                    request_id: None,
+                    entity_kind: None,
+                    entity_id: None,
+                    severity: severity.to_string(),
+                    action: "warn".to_string(),
+                    rule_id: format!("tamper_{severity}"),
+                    message: "original".to_string(),
+                    path: None,
+                    evidence: None,
+                    created_at: 1,
+                })
+                .unwrap();
+        }
+        store
+            .connection()
+            .execute(
+                "UPDATE alerts SET message = 'modified' WHERE alert_id = 1",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .prune_endpoint_retention(0, 100, Some(2), 100, 3)
+            .is_err());
+        assert_eq!(store.list_alerts().unwrap().len(), 2);
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM alert_retention_checkpoints",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn dashboard_artifact_count_is_maintained_incrementally() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-artifact-count-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        let count = || {
+            store
+                .connection()
+                .query_row(
+                    "SELECT count FROM dashboard_artifact_count WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count(), 0);
+        store
+            .connection()
+            .execute(
+                "INSERT INTO artifact_facts(kind, uri, last_seen_at, dashboard_visible)
+                 VALUES ('file', 'file:///visible', 1, 1),
+                        ('file', 'file:///hidden', 1, 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(count(), 1);
+        store
+            .connection()
+            .execute(
+                "UPDATE artifact_facts SET dashboard_visible = 1
+                 WHERE uri = 'file:///hidden'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(count(), 2);
+        store
+            .connection()
+            .execute(
+                "DELETE FROM artifact_facts WHERE uri = 'file:///visible'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(count(), 1);
 
         drop(store);
         remove_sqlite_files(&path);

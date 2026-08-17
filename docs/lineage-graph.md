@@ -107,7 +107,8 @@ can be shifted into an adjacent field to forge a match.
 gensee verify-log
 ```
 
-walks the chain from genesis and reports the first break, exiting `0` if intact
+walks the retention-checkpoint chain and then the surviving alert chain,
+reporting the first break and exiting `0` if intact
 and `2` if tampering is detected. It catches:
 
 - **modification** of any chained row (its `entry_hash` no longer recomputes);
@@ -118,6 +119,14 @@ and `2` if tampering is detected. It catches:
   cleanly, so it is caught against a single-row anchor (`alert_chain_head`) that
   records the latest `entry_hash` and chained count, advanced transactionally
   with each insert. A head/count mismatch reports a break "at the tail".
+
+Configured retention is not treated as an unexplained deletion. Before pruning,
+Gensee verifies the current chain and refuses maintenance if it is already
+broken. It then appends a chained retention checkpoint containing the prior
+alert head/count, pruned count, highest pruned alert ID, cutoff, and a digest of
+the pruned entries. The surviving alert chain is rooted at that checkpoint.
+This preserves an auditable authorization boundary without claiming the deleted
+rows remain locally available.
 
 Legacy alerts written before the chain existed have a NULL `entry_hash` and are
 excluded; the chain starts fresh at the first new alert.

@@ -99,6 +99,11 @@ Policy configuration resolves in this order:
 unreadable, invalid JSON, or has an unsupported `schema_version`, Gensee Crate
 fails closed and denies tool calls until the policy is fixed.
 
+Policy schema version 2 adds Endpoint Security recording and retention controls.
+This build also reads version 1 during migration, while new policies are written
+as version 2. Unknown passive Endpoint Security recording keys do not turn every
+hook decision into a denial; unsupported top-level schema versions still do.
+
 ## Rule Authoring
 
 For the full policy document format, default rule behavior, matcher structure,

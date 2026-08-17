@@ -707,25 +707,12 @@ impl EventStore {
                 artifact
             })
             .collect::<Vec<_>>();
-        let artifact_count_query = format!(
-            "WITH candidates AS (
-                SELECT COALESCE(json_extract(facts.metadata, '$.source'),
-                                facts.last_modified_source, last_event.source) AS observation_source,
-                       json_extract(last_event.args, '$.file.mode') AS observation_mode,
-                       CASE WHEN facts.uri LIKE 'file://%'
-                            THEN substr(facts.uri, 8)
-                            ELSE facts.uri
-                       END AS observation_path
-                FROM artifact_facts AS facts
-                LEFT JOIN system_events AS last_event
-                  ON last_event.event_id = facts.last_system_event_id
-             )
-             SELECT COUNT(*)
-             FROM candidates
-             WHERE {artifact_visibility}"
-        );
         let visible_artifact_count = conn
-            .query_row(&artifact_count_query, [], |row| row.get::<_, i64>(0))
+            .query_row(
+                "SELECT count FROM dashboard_artifact_count WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
             .map_err(sqlite_error_from_rusqlite)?;
         let relation_query = format!(
             "WITH artifact_candidates AS (
@@ -1156,8 +1143,36 @@ impl EventStore {
                 i64::try_from(max_raw_events).unwrap_or(i64::MAX),
                 low_cutoff,
                 ENDPOINT_RETENTION_PRUNE_BATCH as i64,
+                to_i64(now_ms)?,
             )
             .map_err(sqlite_error)
+    }
+
+    /// Run one bounded retention batch at most once per interval across all
+    /// hook/ingest processes sharing this event store.
+    pub fn prune_endpoint_retention_if_due(
+        &self,
+        now_ms: u64,
+        interval_ms: u64,
+        raw_retention_hours: u64,
+        max_raw_events: u64,
+        low_severity_retention_hours: Option<u64>,
+    ) -> io::Result<Option<RetentionPruneResult>> {
+        let db = self.sqlite_store()?;
+        if !db
+            .claim_maintenance("endpoint-retention", to_i64(now_ms)?, to_i64(interval_ms)?)
+            .map_err(sqlite_error)?
+        {
+            return Ok(None);
+        }
+        drop(db);
+        self.prune_endpoint_retention(
+            now_ms,
+            raw_retention_hours,
+            max_raw_events,
+            low_severity_retention_hours,
+        )
+        .map(Some)
     }
 
     pub fn artifact_risk_tags_for_file_digest(
@@ -2378,6 +2393,11 @@ fn update_artifact_fact(db: &SqliteStore, update: ArtifactFactUpdate<'_>) -> io:
         is_memory_artifact: policy.is_memory_artifact_path(update.path),
         is_persistent_target: policy.is_persistent_target_path(update.path),
         is_control_plane: policy.is_control_plane_path(update.path),
+        dashboard_visible: artifact_path_is_concrete(update.path)
+            && (!update.metadata.as_ref().is_some_and(|metadata| {
+                metadata.get("source").and_then(Value::as_str) == Some("macos-endpoint-security")
+            }) || (!lineage_path_is_harness_runtime_noise(update.path)
+                && !lineage_path_is_system_dependency(update.path))),
         risk_level,
         risk_rule_id,
         risk_digest,
@@ -5270,15 +5290,17 @@ mod tests {
         let clean_destination = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO artifact_facts (
-                kind, uri, current_artifact_id, last_seen_at, last_modified_source, metadata
-             ) VALUES ('file', 'file:///repo/source', ?1, 10000, 'agent', '{}')",
+                kind, uri, current_artifact_id, last_seen_at, last_modified_source,
+                metadata, dashboard_visible
+             ) VALUES ('file', 'file:///repo/source', ?1, 10000, 'agent', '{}', 1)",
             [clean_source],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO artifact_facts (
-                kind, uri, current_artifact_id, last_seen_at, last_modified_source, metadata
-             ) VALUES ('file', 'file:///repo/destination', ?1, 9999, 'agent', '{}')",
+                kind, uri, current_artifact_id, last_seen_at, last_modified_source,
+                metadata, dashboard_visible
+             ) VALUES ('file', 'file:///repo/destination', ?1, 9999, 'agent', '{}', 1)",
             [clean_destination],
         )
         .unwrap();
@@ -5327,8 +5349,9 @@ mod tests {
         for index in 0..100 {
             conn.execute(
                 "INSERT INTO artifact_facts (
-                    kind, uri, last_seen_at, last_modified_source, metadata
-                 ) VALUES ('file', ?1, ?2, 'macos-endpoint-security', ?3)",
+                    kind, uri, last_seen_at, last_modified_source, metadata,
+                    dashboard_visible
+                 ) VALUES ('file', ?1, ?2, 'macos-endpoint-security', ?3, 1)",
                 rusqlite::params![
                     format!("file:///repo/artifact-{index}"),
                     index,
@@ -5340,8 +5363,9 @@ mod tests {
         for index in 0..500 {
             conn.execute(
                 "INSERT INTO artifact_facts (
-                    kind, uri, last_seen_at, last_modified_source, metadata
-                 ) VALUES ('file', ?1, ?2, 'macos-endpoint-security', ?3)",
+                    kind, uri, last_seen_at, last_modified_source, metadata,
+                    dashboard_visible
+                 ) VALUES ('file', ?1, ?2, 'macos-endpoint-security', ?3, 0)",
                 rusqlite::params![
                     format!("file:///System/Library/noise-{index}"),
                     1_000 + index,

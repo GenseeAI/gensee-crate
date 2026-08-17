@@ -13,7 +13,6 @@ pub(crate) use gensee_crate_rules::policy::{self, Policy};
 pub(crate) use gensee_crate_store::{
     daemon_socket_path, default_root, AlertRecord, ArtifactObservationInput, ArtifactRiskTagInput,
     ArtifactRiskTagRecord, EventStore, PolicyAlert, TransactionEventInput,
-    ENDPOINT_RETENTION_PRUNE_BATCH,
 };
 pub(crate) use serde_json::{json, Value};
 pub(crate) use sha2::{Digest, Sha256};
@@ -2394,10 +2393,10 @@ pub(crate) fn handle_policy(args: Vec<OsString>) -> io::Result<()> {
             })?;
             let contents = fs::read_to_string(file)?;
             match Policy::from_json(&contents) {
-                Ok(_) => {
+                Ok(validated) => {
                     println!(
                         "gensee policy: {file} is valid (schema_version {})",
-                        policy::POLICY_SCHEMA_VERSION
+                        validated.document().schema_version
                     );
                     Ok(())
                 }
@@ -2499,6 +2498,7 @@ pub(crate) fn handle_policy(args: Vec<OsString>) -> io::Result<()> {
             };
             policy_value_set(&mut root, key, coerce_policy_value(key, raw))
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            root["schema_version"] = json!(policy::POLICY_SCHEMA_VERSION);
             let serialized = serde_json::to_string_pretty(&root)?;
             // Reject a change that would make the document invalid, before writing.
             Policy::from_json(&serialized).map_err(|err| {
@@ -2575,6 +2575,7 @@ fn policy_setup(args: Vec<OsString>) -> io::Result<()> {
         }
     }
 
+    root["schema_version"] = json!(policy::POLICY_SCHEMA_VERSION);
     let serialized = serde_json::to_string_pretty(&root)?;
     Policy::from_json(&serialized).map_err(|err| {
         io::Error::new(
@@ -3816,7 +3817,6 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
     let mut persisted_in_batch = 0_u64;
     let mut suppressed_in_batch = 0_u64;
     let mut batch_started = Instant::now();
-    let mut last_prune = Instant::now() - Duration::from_secs(60);
     let mut recording = Policy::load_current().document().endpoint_security.clone();
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -3834,23 +3834,15 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             let mut pruned_system_events = 0_u64;
             let mut pruned_low_severity_alerts = 0_u64;
             recording = Policy::load_current().document().endpoint_security.clone();
-            if last_prune.elapsed() >= Duration::from_secs(60) {
-                let pruned = store.prune_endpoint_retention(
-                    unix_millis()?,
-                    recording.raw_event_retention_hours,
-                    recording.max_raw_events,
-                    recording.low_severity_retention_hours,
-                )?;
+            if let Some(pruned) = store.prune_endpoint_retention_if_due(
+                unix_millis()?,
+                60_000,
+                recording.raw_event_retention_hours,
+                recording.max_raw_events,
+                recording.low_severity_retention_hours,
+            )? {
                 pruned_system_events = pruned.system_events;
                 pruned_low_severity_alerts = pruned.low_severity_alerts;
-                // A full result means more expired rows remain. Continue in
-                // bounded chunks on subsequent commits instead of holding the
-                // ingest pipe for one unbounded deletion transaction.
-                if pruned.system_events < ENDPOINT_RETENTION_PRUNE_BATCH
-                    && pruned.low_severity_alerts < ENDPOINT_RETENTION_PRUNE_BATCH
-                {
-                    last_prune = Instant::now();
-                }
             }
             if let Some(object) = acknowledgement.as_object_mut() {
                 object.insert("persisted_events".to_string(), json!(persisted_in_batch));
@@ -4326,6 +4318,34 @@ fn hook_session_registration(_event: &AgentHookEvent) -> Option<AgentSession> {
 /// the memory/skill integrity scan finds poison — and `None` for events that
 /// only record into the lineage store (PostToolUse, clean UserPromptSubmit, Stop).
 pub(crate) fn process_hook_event(
+    payload: &str,
+    event: &AgentHookEvent,
+    store: &EventStore,
+) -> io::Result<Option<String>> {
+    let output = process_hook_event_inner(payload, event, store)?;
+    // Keep retention off the pre-tool authorization path. Any ordinary
+    // lifecycle event (PostToolUse, Stop, prompt submit, etc.) may claim one
+    // bounded maintenance batch; the SQLite throttle is shared by short-lived
+    // hook clients, the daemon, and the Endpoint Security ingestor.
+    if !matches!(
+        event.hook_event_name.as_deref(),
+        Some("PreToolUse" | "PermissionRequest" | "PreInvocation")
+    ) {
+        let recording = Policy::load_current().document().endpoint_security.clone();
+        if let Err(error) = store.prune_endpoint_retention_if_due(
+            event.observed_at_ms,
+            60_000,
+            recording.raw_event_retention_hours,
+            recording.max_raw_events,
+            recording.low_severity_retention_hours,
+        ) {
+            eprintln!("gensee hook: retention maintenance failed: {error}");
+        }
+    }
+    Ok(output)
+}
+
+fn process_hook_event_inner(
     payload: &str,
     event: &AgentHookEvent,
     store: &EventStore,
