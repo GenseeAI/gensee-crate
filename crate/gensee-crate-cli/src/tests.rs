@@ -7383,6 +7383,40 @@ fn hook_dedups_fork_suggestions_per_session_and_reason() {
     std::fs::remove_dir_all(workspace).ok();
 }
 
+#[test]
+fn endpoint_ingest_commit_parses_durable_cursor_barrier() {
+    let commit = endpoint_ingest_commit(
+        r#"{"gensee_ingest_control":"commit","protocol_version":1,"sensor_cursor":42,"boot_id":"boot-1","event_count":3}"#,
+    )
+    .unwrap()
+    .expect("commit record");
+
+    assert_eq!(commit.sensor_cursor, 42);
+    assert_eq!(commit.boot_id, "boot-1");
+    assert_eq!(commit.event_count, 3);
+    assert!(
+        endpoint_ingest_commit(r#"{"schema_version":1,"event_type":"exec"}"#)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn endpoint_ingest_commit_rejects_unsupported_or_incomplete_barriers() {
+    let unsupported = endpoint_ingest_commit(
+        r#"{"gensee_ingest_control":"commit","protocol_version":2,"sensor_cursor":42,"boot_id":"boot-1","event_count":3}"#,
+    )
+    .unwrap_err();
+    assert_eq!(unsupported.kind(), io::ErrorKind::InvalidData);
+
+    let incomplete = endpoint_ingest_commit(
+        r#"{"gensee_ingest_control":"commit","protocol_version":1,"sensor_cursor":42,"boot_id":"boot-1"}"#,
+    )
+    .unwrap_err();
+    assert_eq!(incomplete.kind(), io::ErrorKind::InvalidData);
+    assert!(incomplete.to_string().contains("event_count"));
+}
+
 fn test_resource_config() -> ResourceGovernanceConfig {
     ResourceGovernanceConfig {
         max_read_bytes: 4,

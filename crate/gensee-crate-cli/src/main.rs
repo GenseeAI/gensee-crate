@@ -3794,12 +3794,40 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
     let mut alert_pipeline = EndpointSecurityAlertPipeline::default();
     let mut count = 0_u64;
     let mut rejected = 0_u64;
+    let mut committed_in_batch = 0_u64;
     let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
 
     for line in stdin.lock().lines() {
         let line = line?;
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        if let Some(commit) = endpoint_ingest_commit(line)? {
+            if commit.event_count != committed_in_batch {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Endpoint Security batch declared {} event(s), but only {} were durably stored",
+                        commit.event_count, committed_in_batch
+                    ),
+                ));
+            }
+            writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string(&json!({
+                    "gensee_ingest_ack": "committed",
+                    "protocol_version": 1,
+                    "sensor_cursor": commit.sensor_cursor,
+                    "boot_id": commit.boot_id,
+                    "event_count": commit.event_count,
+                }))?
+            )?;
+            stdout.flush()?;
+            committed_in_batch = 0;
             continue;
         }
         let parsed = match EndpointSecurityEvent::parse(line) {
@@ -3964,10 +3992,62 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             store.end_session(&session_id, observed_at_ms, exit_code)?;
         }
         count += 1;
+        committed_in_batch += 1;
     }
 
     eprintln!("gensee: ingested {count} Endpoint Security event(s), rejected {rejected}");
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EndpointIngestCommit {
+    sensor_cursor: u64,
+    boot_id: String,
+    event_count: u64,
+}
+
+fn endpoint_ingest_commit(line: &str) -> io::Result<Option<EndpointIngestCommit>> {
+    let value = match serde_json::from_str::<Value>(line) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    let Some(control) = object.get("gensee_ingest_control") else {
+        return Ok(None);
+    };
+    if control.as_str() != Some("commit")
+        || object.get("protocol_version").and_then(Value::as_u64) != Some(1)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported Endpoint Security ingestion control record",
+        ));
+    }
+    let required_u64 = |name: &str| {
+        object.get(name).and_then(Value::as_u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Endpoint Security commit record is missing {name}"),
+            )
+        })
+    };
+    let boot_id = object
+        .get("boot_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Endpoint Security commit record is missing boot_id",
+            )
+        })?;
+    Ok(Some(EndpointIngestCommit {
+        sensor_cursor: required_u64("sensor_cursor")?,
+        boot_id: boot_id.to_string(),
+        event_count: required_u64("event_count")?,
+    }))
 }
 
 fn endpoint_policy_operation(

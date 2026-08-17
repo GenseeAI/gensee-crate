@@ -38,6 +38,7 @@ final class EndpointSecuritySensor: ObservableObject {
     private var connection: GenseeEndpointSecurityBridge?
     private var ingestProcess: Process?
     private var ingestInput: FileHandle?
+    private var ingestAcknowledgements: FileHandle?
     private var pollingTask: Task<Void, Never>?
     private var cursor: UInt64 = 0
     private var bootID = ""
@@ -49,6 +50,7 @@ final class EndpointSecuritySensor: ObservableObject {
     // only after it has loaded a valid dashboard snapshot.
     private var configurationNeedsPush = false
     private var ingestErrorBuffer = Data()
+    private var ingestAcknowledgementBuffer = Data()
 
     init(homeURL: URL, executableURL: URL?) {
         self.homeURL = homeURL
@@ -65,6 +67,7 @@ final class EndpointSecuritySensor: ObservableObject {
         pollingTask?.cancel()
         connection?.invalidate()
         try? ingestInput?.close()
+        try? ingestAcknowledgements?.close()
         ingestProcess?.terminate()
     }
 
@@ -164,15 +167,18 @@ final class EndpointSecuritySensor: ObservableObject {
         guard let executableURL else { throw GenseeCLIError.executableNotFound }
         let process = Process()
         let input = Pipe()
+        let acknowledgements = Pipe()
         let errors = Pipe()
         process.executableURL = executableURL
         process.arguments = ["ingest", "endpoint-security"]
         process.standardInput = input
+        process.standardOutput = acknowledgements
         process.standardError = errors
         var environment = ProcessInfo.processInfo.environment
         environment["GENSEE_HOME"] = homeURL.path
         process.environment = environment
         ingestErrorBuffer.removeAll(keepingCapacity: true)
+        ingestAcknowledgementBuffer.removeAll(keepingCapacity: true)
         errors.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
@@ -187,6 +193,7 @@ final class EndpointSecuritySensor: ObservableObject {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 self?.ingestProcess = nil
                 self?.ingestInput = nil
+                self?.ingestAcknowledgements = nil
                 if process.terminationStatus != 0 {
                     self?.health.error = detail.isEmpty
                         ? "Endpoint Security ingestion stopped unexpectedly."
@@ -197,6 +204,7 @@ final class EndpointSecuritySensor: ObservableObject {
         try process.run()
         ingestProcess = process
         ingestInput = input.fileHandleForWriting
+        ingestAcknowledgements = acknowledgements.fileHandleForReading
     }
 
     private func pollOnce() async {
@@ -242,7 +250,11 @@ final class EndpointSecuritySensor: ObservableObject {
             // cursor. Refetch from the recovered cursor before ingesting it so
             // the first post-launch batch is never delivered twice.
             if !didRewind {
-                try await write(events: response.0)
+                try await write(
+                    events: response.0,
+                    pendingCursor: pendingCursor,
+                    bootID: bootID
+                )
                 cursor = pendingCursor
                 persistCursor()
             }
@@ -294,7 +306,6 @@ final class EndpointSecuritySensor: ObservableObject {
             cursor = firstObservation
                 ? (nextCursor > 0 ? nextCursor - 1 : 0)
                 : (oldestCursor > 0 ? oldestCursor - 1 : 0)
-            persistCursor()
         }
         health.running = (dictionary["running"] as? Bool) ?? false
         health.mode = (dictionary["mode"] as? String) ?? "observe"
@@ -320,9 +331,12 @@ final class EndpointSecuritySensor: ObservableObject {
         defaults.set(bootID, forKey: bootIDDefaultsKey)
     }
 
-    private func write(events: [[String: Any]]) async throws {
-        guard !events.isEmpty else { return }
-        guard let ingestInput else {
+    private func write(
+        events: [[String: Any]],
+        pendingCursor: UInt64,
+        bootID: String
+    ) async throws {
+        guard let ingestInput, let ingestAcknowledgements else {
             throw NSError(
                 domain: "ai.gensee.crate.endpoint-security",
                 code: 3,
@@ -335,11 +349,73 @@ final class EndpointSecuritySensor: ObservableObject {
             batch.append(data)
             batch.append(0x0A)
         }
+        let commit: [String: Any] = [
+            "gensee_ingest_control": "commit",
+            "protocol_version": 1,
+            "sensor_cursor": NSNumber(value: pendingCursor),
+            "boot_id": bootID,
+            "event_count": NSNumber(value: events.count),
+        ]
+        batch.append(try JSONSerialization.data(withJSONObject: commit, options: [.sortedKeys]))
+        batch.append(0x0A)
         try await Task.detached(priority: .utility) {
             try ingestInput.write(contentsOf: batch)
         }.value
+        try await awaitDurableAcknowledgement(
+            from: ingestAcknowledgements,
+            cursor: pendingCursor,
+            bootID: bootID,
+            eventCount: UInt64(events.count)
+        )
         health.ingestedEvents += UInt64(events.count)
-        health.lastEventAt = Date()
+        if !events.isEmpty {
+            health.lastEventAt = Date()
+        }
+    }
+
+    private func awaitDurableAcknowledgement(
+        from handle: FileHandle,
+        cursor: UInt64,
+        bootID: String,
+        eventCount: UInt64
+    ) async throws {
+        while true {
+            if let line = nextAcknowledgementLine() {
+                let value = try JSONSerialization.jsonObject(with: line)
+                guard let acknowledgement = value as? [String: Any],
+                      acknowledgement["gensee_ingest_ack"] as? String == "committed",
+                      number(acknowledgement["protocol_version"]) == 1,
+                      number(acknowledgement["sensor_cursor"]) == cursor,
+                      acknowledgement["boot_id"] as? String == bootID,
+                      number(acknowledgement["event_count"]) == eventCount
+                else {
+                    throw NSError(
+                        domain: "ai.gensee.crate.endpoint-security",
+                        code: 5,
+                        userInfo: [NSLocalizedDescriptionKey: "Endpoint Security ingester returned a mismatched durability acknowledgement."]
+                    )
+                }
+                return
+            }
+            let data = try await Task.detached(priority: .utility) {
+                try handle.read(upToCount: 4_096) ?? Data()
+            }.value
+            guard !data.isEmpty else {
+                throw NSError(
+                    domain: "ai.gensee.crate.endpoint-security",
+                    code: 6,
+                    userInfo: [NSLocalizedDescriptionKey: "Endpoint Security ingester stopped before confirming durable storage."]
+                )
+            }
+            ingestAcknowledgementBuffer.append(data)
+        }
+    }
+
+    private func nextAcknowledgementLine() -> Data? {
+        guard let newline = ingestAcknowledgementBuffer.firstIndex(of: 0x0A) else { return nil }
+        let line = ingestAcknowledgementBuffer[..<newline]
+        ingestAcknowledgementBuffer.removeSubrange(...newline)
+        return Data(line)
     }
 
     private func appendIngesterError(_ data: Data) {
