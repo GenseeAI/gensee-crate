@@ -185,7 +185,11 @@ final class ConsoleModel: ObservableObject {
             let refreshedSnapshot = try await cli.decode(
                 SecuritySnapshot.self,
                 arguments: ["dashboard-state"],
-                timeout: 12
+                // Large experimental stores can legitimately take more than
+                // twelve seconds to summarize. Keep a finite deadline so a
+                // wedged backend is terminated and retried, while leaving
+                // enough headroom above the observed healthy query time.
+                timeout: 20
             )
             hasLoadedDashboardSnapshot = true
             reconcileReadAlertState(alertCount: refreshedSnapshot.summary.alertsCount)
