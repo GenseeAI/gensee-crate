@@ -13,6 +13,7 @@ quick start, then dive into the topic guides below.
 - [`gensee watch` (sidecar)](watch.md) — observe filesystem effects and macOS system events without launching the agent.
 - [`gensee run` and the macOS sandbox](run-and-sandbox.md) — managed launch with `sandbox-exec` confinement and staged workspaces.
 - [`gensee policy`](gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.
+- [`gensee audit`](config-audit.md) — statically review Codex and VS Code agent permissions, privacy, MCP, skills, hooks, extensions, rules, and instructions.
 - [Claude Code hooks](claude-code-hooks.md) — wire Claude Code prompts and tool intent into Gensee, and read the combined timeline.
 - [Codex hooks](codex-support.md) — wire Codex prompts and tool intent into Gensee, and read the combined timeline.
 - [Codex integration](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/codex) — setup commands, hook samples, and smoke-test payloads.

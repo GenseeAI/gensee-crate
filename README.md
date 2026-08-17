@@ -60,6 +60,10 @@ Gensee Crate helps you:
   agent, launch an agent with `gensee run`, or use the tclone runtime for
   full-workspace fork, merge, and rollback flows. Manage policy with
   `gensee policy` and inspect activity in the local dashboard.
+- **Review agent configuration before a run.** Use
+  [`gensee audit config`](docs/config-audit.md) to statically inventory Codex
+  permissions, privacy settings, MCP servers, skills, hooks, plugins, command
+  rules, and instruction files without executing them.
 
 ## Preliminary Benchmark Results
 
@@ -548,6 +552,7 @@ See [`docs/watch.md`](docs/watch.md),
 **CLI.** Inspect what happened at any time:
 
 ```bash
+gensee audit codex # review local Codex configuration and extensions
 gensee run list   # list guarded run sessions and staged workspaces
 gensee timeline   # show prompts, tool intent, file effects, and policy decisions
 ```
@@ -661,6 +666,8 @@ Full docs live in [`docs/`](docs/README.md):
 - [`gensee watch`](docs/watch.md) — sidecar filesystem and system-event audit, backends, and watch roots.
 - [`gensee run` and the macOS sandbox](docs/run-and-sandbox.md) — managed launch and staged workspaces.
 - [`gensee policy`](docs/gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.
+- [`gensee audit config`](docs/config-audit.md) — static Codex security and
+  privacy review with human and versioned JSON output.
 - [Claude Code hooks](docs/claude-code-hooks.md) — wiring Claude Code prompts and tool intent into Gensee.
 - [Codex hooks](docs/codex-support.md) — wiring Codex prompts and tool intent into Gensee.
 - [Antigravity support](docs/antigravity-support.md) — wiring Antigravity hooks and `.agents` customizations into Gensee.

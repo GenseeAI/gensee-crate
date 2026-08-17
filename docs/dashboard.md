@@ -8,6 +8,13 @@ Use it when you want to see live agent activity, policy decisions, alerts, file
 and request lineage, review verdicts, and the active policy document in one
 place.
 
+The **Config Audit** view exposes the static Codex and VS Code configuration
+review. Select the `codex` or `vscode` bundle and provide the relevant
+Codex/VS Code profile paths to inspect permissions, privacy settings,
+MCP servers, skills, extensions, hooks, command rules, instructions, and
+configuration provenance. The dashboard calls the shared Rust audit library
+over Tauri IPC; it does not shell out or execute configured extensions.
+
 ## Launch
 
 Build the CLI first so the dashboard can validate policy edits:
@@ -33,6 +40,12 @@ Then launch the Tauri desktop app:
 ```bash
 cd dashboards
 GENSEE_HOME="$HOME/.gensee" cargo tauri dev
+```
+
+Set `GENSEE_WORKSPACE` to preselect a workspace for Config Audit:
+
+```bash
+GENSEE_HOME="$HOME/.gensee" GENSEE_WORKSPACE=/path/to/repo cargo tauri dev
 ```
 
 This opens a native window backed by the Rust core — no TCP server is

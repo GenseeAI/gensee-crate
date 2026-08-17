@@ -4295,11 +4295,12 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         capability_guard.mark_clone_completed();
         capability_guard.start_restore()?;
         timing.mark("source_capability_restore_start");
-        let child_result = (|| -> io::Result<(
+        type ForkChildResult = (
             Vec<String>,
             Vec<Value>,
             Vec<(TransactionEventInput, String)>,
-        )> {
+        );
+        let child_result = (|| -> io::Result<ForkChildResult> {
             if clones.len() != copies {
                 return Err(io::Error::other(format!(
                     "podman returned {} cloned container metadata record(s), expected {copies}",
@@ -4309,117 +4310,116 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
             let mut fork_run_ids = Vec::new();
             let mut fork_records = Vec::new();
             let mut pending_successes = Vec::new();
-            for index in 0..copies {
-            let run_id = prepared_contexts.contexts[index].run_id.clone();
-            let clone = &clones[index];
-            let container_name = clone.name.clone();
-            let root_pid = clone.pid;
-            // Podman's tfork metadata emits cloneRootfsList[i], the same
-            // absolute merged rootfs path installed in the clone config.
-            // It is therefore the mountpoint to match in mountinfo.
-            let overlay_layers = match tclone_overlay_rootfs_from_path(&clone.rootfs) {
-                Ok(layers) => Some(layers),
-                Err(error) => {
-                    eprintln!(
+            for (index, clone) in clones.iter().enumerate().take(copies) {
+                let run_id = prepared_contexts.contexts[index].run_id.clone();
+                let container_name = clone.name.clone();
+                let root_pid = clone.pid;
+                // Podman's tfork metadata emits cloneRootfsList[i], the same
+                // absolute merged rootfs path installed in the clone config.
+                // It is therefore the mountpoint to match in mountinfo.
+                let overlay_layers = match tclone_overlay_rootfs_from_path(&clone.rootfs) {
+                    Ok(layers) => Some(layers),
+                    Err(error) => {
+                        eprintln!(
                         "gensee: warning: could not resolve overlay layers for cloned rootfs {}: {error}",
                         clone.rootfs.display()
                     );
-                    None
+                        None
+                    }
+                };
+                timing.mark("consume_clone_metadata");
+                let observed_at = unix_millis()?;
+                event_writer.append_session(&AgentSession {
+                    session_id: run_id.clone(),
+                    agent_binary: source.agent_cmd.first().cloned().unwrap_or_default(),
+                    root_pid,
+                    cwd: source.container_workspace.clone(),
+                    repo_path: None,
+                    mode: Some(format!("managed-run:tclone:fork:{}", source.run_id)),
+                    workspace_mode: Some("tclone-rootfs".to_string()),
+                    original_workspace: Some(source.workspace.clone()),
+                    staged_workspace: None,
+                    sandbox_profile: Some("tclone-container".to_string()),
+                    sandbox_profile_path: None,
+                    started_at_ms: observed_at,
+                    ended_at_ms: None,
+                    exit_code: None,
+                })?;
+                timing.mark("append_session");
+                let fork_record = TcloneRunRecord {
+                    run_id: run_id.clone(),
+                    parent_run_id: Some(source.run_id.clone()),
+                    role: "fork".to_string(),
+                    status: "running".to_string(),
+                    container_name: container_name.clone(),
+                    container_id: Some(clone.id.clone()),
+                    source_container: Some(source.container_name.clone()),
+                    host_control_owner_run_id: Some(
+                        tclone_host_control_owner_run_id(&source).to_string(),
+                    ),
+                    fork_prefix: Some(prefix.clone()),
+                    fork_group_id: Some(group_id.clone()),
+                    fork_index: Some(index),
+                    fork_count: Some(copies),
+                    fork_approach: Some(tclone_fork_approach(&approaches, index, copies)),
+                    image: source.image.clone(),
+                    workspace: source.workspace.clone(),
+                    container_workspace: source.container_workspace.clone(),
+                    container_home: source.container_home.clone(),
+                    agent_cmd: source.agent_cmd.clone(),
+                    fork_base_git_head: fork_base_git_head.clone(),
+                    fork_base_overlay_lowerdir: overlay_layers
+                        .as_ref()
+                        .map(|layers| layers.lowerdir.to_string_lossy().to_string()),
+                    fork_overlay_upperdir: overlay_layers
+                        .as_ref()
+                        .map(|layers| layers.upperdir.to_string_lossy().to_string()),
+                    started_at_ms: observed_at,
+                    updated_at_ms: observed_at,
+                    exit_code: None,
+                };
+                append_tclone_record(&fork_record)?;
+                timing.mark("append_run_record");
+                timing.mark("clone_context_preinstalled");
+                if let Some(handoff) = source_handoff.as_ref() {
+                    mark_tclone_fork_task_queued(&podman, &fork_record)?;
+                    let prompt = tclone_prompt_with_fork_context(&fork_record, &handoff.prompt);
+                    tclone_send_prompt_to_agent(&podman, &fork_record, &prompt, true)?;
                 }
-            };
-            timing.mark("consume_clone_metadata");
-            let observed_at = unix_millis()?;
-            event_writer.append_session(&AgentSession {
-                session_id: run_id.clone(),
-                agent_binary: source.agent_cmd.first().cloned().unwrap_or_default(),
-                root_pid,
-                cwd: source.container_workspace.clone(),
-                repo_path: None,
-                mode: Some(format!("managed-run:tclone:fork:{}", source.run_id)),
-                workspace_mode: Some("tclone-rootfs".to_string()),
-                original_workspace: Some(source.workspace.clone()),
-                staged_workspace: None,
-                sandbox_profile: Some("tclone-container".to_string()),
-                sandbox_profile_path: None,
-                started_at_ms: observed_at,
-                ended_at_ms: None,
-                exit_code: None,
-            })?;
-            timing.mark("append_session");
-            let fork_record = TcloneRunRecord {
-                run_id: run_id.clone(),
-                parent_run_id: Some(source.run_id.clone()),
-                role: "fork".to_string(),
-                status: "running".to_string(),
-                container_name: container_name.clone(),
-                container_id: Some(clone.id.clone()),
-                source_container: Some(source.container_name.clone()),
-                host_control_owner_run_id: Some(
-                    tclone_host_control_owner_run_id(&source).to_string(),
-                ),
-                fork_prefix: Some(prefix.clone()),
-                fork_group_id: Some(group_id.clone()),
-                fork_index: Some(index),
-                fork_count: Some(copies),
-                fork_approach: Some(tclone_fork_approach(&approaches, index, copies)),
-                image: source.image.clone(),
-                workspace: source.workspace.clone(),
-                container_workspace: source.container_workspace.clone(),
-                container_home: source.container_home.clone(),
-                agent_cmd: source.agent_cmd.clone(),
-                fork_base_git_head: fork_base_git_head.clone(),
-                fork_base_overlay_lowerdir: overlay_layers
-                    .as_ref()
-                    .map(|layers| layers.lowerdir.to_string_lossy().to_string()),
-                fork_overlay_upperdir: overlay_layers
-                    .as_ref()
-                    .map(|layers| layers.upperdir.to_string_lossy().to_string()),
-                started_at_ms: observed_at,
-                updated_at_ms: observed_at,
-                exit_code: None,
-            };
-            append_tclone_record(&fork_record)?;
-            timing.mark("append_run_record");
-            timing.mark("clone_context_preinstalled");
-            if let Some(handoff) = source_handoff.as_ref() {
-                mark_tclone_fork_task_queued(&podman, &fork_record)?;
-                let prompt = tclone_prompt_with_fork_context(&fork_record, &handoff.prompt);
-                tclone_send_prompt_to_agent(&podman, &fork_record, &prompt, true)?;
-            }
-            timing.mark("handoff_prompt");
-            let succeeded_event = tclone_transaction_event(
-                &operation_id,
-                "fork",
-                "succeeded",
-                Some(&source.run_id),
-                Some(&run_id),
-                Some(&source.run_id),
-                Some(&source.workspace),
-                format!("Forked {} from {}", run_id, source.run_id),
-                None,
-                Some(json!({
-                    "copies": copies,
-                    "copy_index": index,
-                    "container_name": container_name,
-                    "group_id": group_id,
+                timing.mark("handoff_prompt");
+                let succeeded_event = tclone_transaction_event(
+                    &operation_id,
+                    "fork",
+                    "succeeded",
+                    Some(&source.run_id),
+                    Some(&run_id),
+                    Some(&source.run_id),
+                    Some(&source.workspace),
+                    format!("Forked {} from {}", run_id, source.run_id),
+                    None,
+                    Some(json!({
+                        "copies": copies,
+                        "copy_index": index,
+                        "container_name": container_name,
+                        "group_id": group_id,
+                        "approach": fork_record.fork_approach.as_deref(),
+                    })),
+                )?;
+                pending_successes.push((
+                    succeeded_event,
+                    format!("{run_id} | container={container_name}"),
+                ));
+                fork_records.push(json!({
+                    "run_id": &run_id,
+                    "container": &container_name,
+                    "container_id": &clone.id,
+                    "role": "fork",
+                    "source_run_id": &source.run_id,
+                    "workspace": &source.container_workspace,
+                    "group_id": &group_id,
+                    "index": index,
                     "approach": fork_record.fork_approach.as_deref(),
-                })),
-            )?;
-            pending_successes.push((
-                succeeded_event,
-                format!("{run_id} | container={container_name}"),
-            ));
-            fork_records.push(json!({
-                "run_id": &run_id,
-                "container": &container_name,
-                "container_id": &clone.id,
-                "role": "fork",
-                "source_run_id": &source.run_id,
-                "workspace": &source.container_workspace,
-                "group_id": &group_id,
-                "index": index,
-                "approach": fork_record.fork_approach.as_deref(),
-            }));
+                }));
                 fork_run_ids.push(run_id);
             }
             Ok((fork_run_ids, fork_records, pending_successes))
@@ -5039,6 +5039,9 @@ fn run_tclone_clone_attempts(
     }
 }
 
+// This retry boundary mirrors the complete clone invocation state. Keeping the
+// arguments explicit makes cleanup and retry prefixes auditable at each call.
+#[allow(clippy::too_many_arguments)]
 fn retry_tclone_partial_multicopy_clone(
     podman: &OsString,
     copies: usize,
@@ -9392,7 +9395,7 @@ fn parse_tclone_container_inspection(
     output: &str,
     container: &str,
 ) -> io::Result<TcloneContainerInspection> {
-    let values = serde_json::from_str::<Vec<serde_json::Value>>(&output)
+    let values = serde_json::from_str::<Vec<serde_json::Value>>(output)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
     let Some(value) = values.first() else {
         return Err(io::Error::new(

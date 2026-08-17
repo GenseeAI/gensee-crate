@@ -17,6 +17,7 @@ import Feedback    from '@/pages/Feedback';
 import Policy      from '@/pages/Policy';
 import Settings    from '@/pages/Settings';
 import Transactions from '@/pages/Transactions';
+import ConfigAudit from '@/pages/ConfigAudit';
 
 // ---------------------------------------------------------------------------
 // ThemedApp is a separate component so it can read from ThemeContext.
@@ -42,6 +43,7 @@ function ThemedApp() {
               <Route path="lineage"    element={<LineageGraph />} />
               <Route path="feedback"   element={<Feedback />}     />
               <Route path="policy"     element={<Policy />}       />
+              <Route path="config-audit" element={<ConfigAudit />} />
               <Route path="settings"   element={<Settings />}     />
             </Route>
           </Routes>
