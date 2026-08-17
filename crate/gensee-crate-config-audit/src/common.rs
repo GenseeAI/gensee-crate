@@ -262,7 +262,7 @@ fn userinfo_password_separator(userinfo: &str) -> Option<usize> {
         if tail.starts_with(':') {
             separator = Some(index);
         }
-        index += 1;
+        index += tail.chars().next().map_or(1, char::len_utf8);
     }
     separator
 }
@@ -527,6 +527,7 @@ mod tests {
             "https://%24%7Binput%3Auser%7D:do-not-leak@example.com/mcp",
             "https://env:USER:do-not-leak@example.com/mcp",
             "https://admin:do-not:leak@example.com/mcp",
+            "https://admin:pässwort@example.com/mcp",
         ] {
             assert!(
                 endpoint_has_credentials(literal_password),
