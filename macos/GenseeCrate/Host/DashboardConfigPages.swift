@@ -761,6 +761,14 @@ struct DashboardSettingsPage: View {
                 )
             }
             HStack {
+                Text("Rejected events").font(.system(size: 11))
+                Spacer()
+                DashboardTag(
+                    text: sensor.health.rejectedEvents.formatted(),
+                    color: sensor.health.rejectedEvents > 0 ? .dashboardRed : .green
+                )
+            }
+            HStack {
                 Text("Authorization decisions").font(.system(size: 11))
                 Spacer()
                 Text("\(sensor.health.authorizationCount.formatted()) (\(sensor.health.deniedCount.formatted()) denied)")

@@ -3794,7 +3794,8 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
     let mut alert_pipeline = EndpointSecurityAlertPipeline::default();
     let mut count = 0_u64;
     let mut rejected = 0_u64;
-    let mut committed_in_batch = 0_u64;
+    let mut received_in_batch = 0_u64;
+    let mut rejected_in_batch = 0_u64;
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -3806,34 +3807,24 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             continue;
         }
         if let Some(commit) = endpoint_ingest_commit(line)? {
-            if commit.event_count != committed_in_batch {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Endpoint Security batch declared {} event(s), but only {} were durably stored",
-                        commit.event_count, committed_in_batch
-                    ),
-                ));
-            }
-            writeln!(
-                stdout,
-                "{}",
-                serde_json::to_string(&json!({
-                    "gensee_ingest_ack": "committed",
-                    "protocol_version": 1,
-                    "sensor_cursor": commit.sensor_cursor,
-                    "boot_id": commit.boot_id,
-                    "event_count": commit.event_count,
-                }))?
-            )?;
+            let acknowledgement =
+                endpoint_ingest_ack(&commit, received_in_batch, rejected_in_batch)?;
+            writeln!(stdout, "{}", serde_json::to_string(&acknowledgement)?)?;
             stdout.flush()?;
-            committed_in_batch = 0;
+            received_in_batch = 0;
+            rejected_in_batch = 0;
             continue;
         }
+        // The host's barrier counts every event line it sent. Rejected lines
+        // still belong to that batch; report them in the durable ack so the
+        // host can advance past malformed/version-skewed evidence and surface
+        // the loss instead of replaying the same poisoned batch forever.
+        received_in_batch += 1;
         let parsed = match EndpointSecurityEvent::parse(line) {
             Ok(event) => event,
             Err(error) => {
                 rejected += 1;
+                rejected_in_batch += 1;
                 eprintln!("gensee: rejected Endpoint Security event: {error}");
                 continue;
             }
@@ -3992,7 +3983,6 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             store.end_session(&session_id, observed_at_ms, exit_code)?;
         }
         count += 1;
-        committed_in_batch += 1;
     }
 
     eprintln!("gensee: ingested {count} Endpoint Security event(s), rejected {rejected}");
@@ -4047,6 +4037,30 @@ fn endpoint_ingest_commit(line: &str) -> io::Result<Option<EndpointIngestCommit>
         sensor_cursor: required_u64("sensor_cursor")?,
         boot_id: boot_id.to_string(),
         event_count: required_u64("event_count")?,
+    }))
+}
+
+fn endpoint_ingest_ack(
+    commit: &EndpointIngestCommit,
+    received_events: u64,
+    rejected_events: u64,
+) -> io::Result<Value> {
+    if commit.event_count != received_events || rejected_events > received_events {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Endpoint Security batch declared {} event(s), but the ingester received {} and rejected {}",
+                commit.event_count, received_events, rejected_events
+            ),
+        ));
+    }
+    Ok(json!({
+        "gensee_ingest_ack": "committed",
+        "protocol_version": 1,
+        "sensor_cursor": commit.sensor_cursor,
+        "boot_id": commit.boot_id,
+        "event_count": commit.event_count,
+        "rejected_events": rejected_events,
     }))
 }
 

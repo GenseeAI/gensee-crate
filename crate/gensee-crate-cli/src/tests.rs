@@ -7417,6 +7417,34 @@ fn endpoint_ingest_commit_rejects_unsupported_or_incomplete_barriers() {
     assert!(incomplete.to_string().contains("event_count"));
 }
 
+#[test]
+fn endpoint_ingest_ack_reports_rejected_lines_without_stalling_the_cursor() {
+    let commit = EndpointIngestCommit {
+        sensor_cursor: 42,
+        boot_id: "boot-1".to_string(),
+        event_count: 3,
+    };
+    let acknowledgement = endpoint_ingest_ack(&commit, 3, 1).unwrap();
+
+    assert_eq!(acknowledgement["gensee_ingest_ack"], "committed");
+    assert_eq!(acknowledgement["sensor_cursor"], 42);
+    assert_eq!(acknowledgement["event_count"], 3);
+    assert_eq!(acknowledgement["rejected_events"], 1);
+}
+
+#[test]
+fn endpoint_ingest_ack_still_rejects_a_real_batch_count_mismatch() {
+    let commit = EndpointIngestCommit {
+        sensor_cursor: 42,
+        boot_id: "boot-1".to_string(),
+        event_count: 3,
+    };
+
+    let error = endpoint_ingest_ack(&commit, 2, 1).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("received 2"));
+}
+
 fn test_resource_config() -> ResourceGovernanceConfig {
     ResourceGovernanceConfig {
         max_read_bytes: 4,

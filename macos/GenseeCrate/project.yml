@@ -34,6 +34,7 @@ targets:
       - Host/DashboardConfigPages.swift
       - Host/EndpointSecurityExtensionManager.swift
       - Host/EndpointSecuritySensor.swift
+      - Host/EndpointIngestAcknowledgementIO.swift
       - Host/GenseeEndpointSecurityBridge.h
       - Host/GenseeEndpointSecurityBridge.m
       - Host/GenseeCLI.swift
@@ -135,12 +136,14 @@ targets:
     platform: macOS
     sources:
       - Host/HarnessConfigurationHealth.swift
+      - Host/EndpointIngestAcknowledgementIO.swift
       - Host/HarnessActivationGuidance.swift
       - Host/AlertSeverityBreakdown.swift
       - Host/TimelineModels.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
       - Tests/HarnessConfigurationHealthTests.swift
+      - Tests/EndpointIngestAcknowledgementIOTests.swift
       - Tests/HarnessActivationGuidanceTests.swift
       - Tests/AlertSeverityBreakdownTests.swift
       - Tests/TimelineModelsTests.swift
