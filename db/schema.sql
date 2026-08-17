@@ -304,14 +304,16 @@ CREATE TABLE IF NOT EXISTS artifact_facts (
 );
 
 -- Exact O(1) dashboard count maintained as artifact facts change. Visibility
--- is decided once on ingestion/migration instead of re-running every path
--- predicate across the complete fact table on each UI refresh.
+-- is decided on ingestion and reclassified when rules_version changes instead
+-- of re-running every path predicate across the complete fact table on each UI
+-- refresh.
 CREATE TABLE IF NOT EXISTS dashboard_artifact_count (
-  id    INTEGER PRIMARY KEY CHECK (id = 1),
-  count INTEGER NOT NULL CHECK (count >= 0)
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  count         INTEGER NOT NULL CHECK (count >= 0),
+  rules_version INTEGER NOT NULL DEFAULT 0 CHECK (rules_version >= 0)
 );
-INSERT OR IGNORE INTO dashboard_artifact_count(id, count)
-  SELECT 1, COUNT(*) FROM artifact_facts WHERE dashboard_visible = 1;
+INSERT OR IGNORE INTO dashboard_artifact_count(id, count, rules_version)
+  SELECT 1, COUNT(*), 0 FROM artifact_facts WHERE dashboard_visible = 1;
 
 CREATE TRIGGER IF NOT EXISTS artifact_dashboard_count_insert
 AFTER INSERT ON artifact_facts WHEN NEW.dashboard_visible = 1

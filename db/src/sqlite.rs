@@ -6,6 +6,86 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// Increment whenever dashboard artifact visibility rules change. Existing
+// stores are reclassified before their cached count is used.
+const DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION: i64 = 2;
+
+/// Lineage represents concrete filesystem objects. Shell globs and brace
+/// expansions describe possible path sets, while square brackets are also
+/// valid literal route syntax in frameworks such as Next.js and SvelteKit.
+pub fn artifact_path_is_concrete(path: &str) -> bool {
+    !path.is_empty()
+        && !path
+            .chars()
+            .any(|character| matches!(character, '*' | '?' | '{'))
+}
+
+pub fn lineage_path_is_harness_runtime_noise(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    path.starts_with("/dev/")
+        || path.starts_with("/private/tmp/cc-socks/")
+        || path.starts_with("/tmp/cc-socks/")
+        || path.starts_with("/private/tmp/claude-")
+        || path.starts_with("/tmp/claude-")
+        || path.starts_with("/private/var/tmp/sh-thd-")
+        || path.contains("/.claude/sessions/")
+        || path.contains("/.claude/projects/")
+        || path.contains("/.claude/shell-snapshots/")
+        || (path.contains("/.claude/plugins/cache/")
+            && (path.ends_with("/.in_use") || path.contains("/.in_use/")))
+        || lower.contains("/library/application support/codex/")
+        || lower.contains("/library/application support/claude/")
+        || lower.contains("/crashpad/")
+        || lower.contains("/diagnosticreports/")
+        || lower.contains("/crash reports/")
+        || lower.contains("/target/")
+        || lower.contains("/deriveddata/")
+        || lower.contains("/.build/")
+        || lower.contains("/node_modules/.cache/")
+        || lower.contains("/test-results/")
+        || lower.contains("/testresults/")
+        || ((lower.ends_with("-wal") || lower.ends_with("-shm") || lower.ends_with("-journal"))
+            && (lower.contains("/.codex/")
+                || lower.contains("/.claude/")
+                || lower.contains("/library/application support/cursor/")
+                || lower.contains("/library/application support/code/")))
+}
+
+pub fn lineage_path_is_system_dependency(path: &str) -> bool {
+    path == "/bin"
+        || path.starts_with("/bin/")
+        || path == "/sbin"
+        || path.starts_with("/sbin/")
+        || path == "/usr/bin"
+        || path.starts_with("/usr/bin/")
+        || path == "/usr/local/bin"
+        || path.starts_with("/usr/local/bin/")
+        || path.starts_with("/usr/lib/")
+        || path.starts_with("/usr/share/")
+        || path.starts_with("/System/")
+        || path.starts_with("/Library/Developer/")
+        || path.starts_with("/Applications/Xcode.app/Contents/Developer/")
+        || path.starts_with("/Library/Preferences/Logging/")
+        || path.starts_with("/Library/Preferences/")
+        || path.starts_with("/private/var/db/")
+        || path.starts_with("/private/var/folders/")
+        || path.starts_with("/opt/homebrew/Cellar/")
+}
+
+pub fn lineage_mode_is_non_file(mode: u64) -> bool {
+    matches!(
+        mode & 0o170000,
+        0o010000 | 0o020000 | 0o040000 | 0o060000 | 0o140000
+    )
+}
+
+pub fn dashboard_artifact_is_visible(path: &str, source: Option<&str>, mode: Option<u64>) -> bool {
+    artifact_path_is_concrete(path)
+        && (source != Some("macos-endpoint-security")
+            || (mode.is_none_or(|mode| !lineage_mode_is_non_file(mode))
+                && !lineage_path_is_harness_runtime_noise(path)
+                && !lineage_path_is_system_dependency(path)))
+}
 
 /// Genesis hash for the alert tamper-evident chain (64 hex zeros).
 fn genesis_hash() -> String {
@@ -591,10 +671,13 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
     migrate_session_root_pid(&conn).map_err(SqliteError::Schema)?;
     migrate_session_token_usage(&conn).map_err(SqliteError::Schema)?;
     migrate_transcript_token_state(&conn).map_err(SqliteError::Schema)?;
-    migrate_artifact_dashboard_visibility(&conn).map_err(SqliteError::Schema)?;
+    ensure_artifact_dashboard_visibility_column(&conn).map_err(SqliteError::Schema)?;
+    ensure_dashboard_artifact_count_rules_version_column(&conn).map_err(SqliteError::Schema)?;
 
     conn.execute_batch(include_str!("../schema.sql"))
         .map_err(SqliteError::Schema)?;
+
+    migrate_artifact_dashboard_visibility_rules(&conn).map_err(SqliteError::Schema)?;
 
     // Must run AFTER schema.sql creates `alert_chain_head`: a DB upgraded from a
     // chain-without-anchor version already has chained alerts but an empty
@@ -2470,7 +2553,7 @@ fn migrate_transcript_token_state(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-fn migrate_artifact_dashboard_visibility(conn: &Connection) -> rusqlite::Result<()> {
+fn ensure_artifact_dashboard_visibility_column(conn: &Connection) -> rusqlite::Result<()> {
     let columns = table_columns(conn, "artifact_facts")?;
     if columns.is_empty() || columns.iter().any(|column| column == "dashboard_visible") {
         return Ok(());
@@ -2480,36 +2563,72 @@ fn migrate_artifact_dashboard_visibility(conn: &Connection) -> rusqlite::Result<
          ADD COLUMN dashboard_visible INTEGER NOT NULL DEFAULT 1",
         [],
     )?;
-    // One-time upgrade classification. Future writes compute visibility before
-    // upsert and triggers maintain the exact dashboard count incrementally.
-    conn.execute_batch(
-        "UPDATE artifact_facts
-         SET dashboard_visible = CASE
-           WHEN instr(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END, '*') > 0
-             OR instr(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END, '?') > 0
-             OR instr(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END, '[') > 0
-             OR instr(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END, '{') > 0
-           THEN 0
-           WHEN COALESCE(json_extract(metadata, '$.source'), last_modified_source, (
-                    SELECT source FROM system_events
-                    WHERE event_id = artifact_facts.last_system_event_id
-                ), '') = 'macos-endpoint-security'
-             AND (
-               COALESCE((SELECT json_extract(args, '$.file.mode') FROM system_events
-                         WHERE event_id = artifact_facts.last_system_event_id), 0) & 61440
-                   IN (4096, 8192, 16384, 24576, 49152)
-               OR lower(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END)
-                    LIKE '%/library/application support/codex/%'
-               OR lower(CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END)
-                    LIKE '%/library/application support/claude/%'
-               OR CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END GLOB '/dev/*'
-               OR CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END GLOB '/System/*'
-               OR CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END GLOB '/usr/lib/*'
-               OR CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END GLOB '/private/var/db/*'
-               OR CASE WHEN uri LIKE 'file://%' THEN substr(uri, 8) ELSE uri END GLOB '/private/var/folders/*'
-             )
-           THEN 0 ELSE 1 END;",
-    )
+    Ok(())
+}
+
+fn ensure_dashboard_artifact_count_rules_version_column(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = table_columns(conn, "dashboard_artifact_count")?;
+    if !columns.is_empty() && !columns.iter().any(|column| column == "rules_version") {
+        conn.execute(
+            "ALTER TABLE dashboard_artifact_count
+             ADD COLUMN rules_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_artifact_dashboard_visibility_rules(conn: &Connection) -> rusqlite::Result<()> {
+    let stored_version = conn.query_row(
+        "SELECT rules_version FROM dashboard_artifact_count WHERE id = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if stored_version == DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION {
+        return Ok(());
+    }
+
+    let classifications = {
+        let mut statement = conn.prepare(
+            "SELECT facts.kind, facts.uri,
+                    COALESCE(json_extract(facts.metadata, '$.source'),
+                             facts.last_modified_source, last_event.source),
+                    json_extract(last_event.args, '$.file.mode')
+             FROM artifact_facts AS facts
+             LEFT JOIN system_events AS last_event
+               ON last_event.event_id = facts.last_system_event_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let kind = row.get::<_, String>(0)?;
+            let uri = row.get::<_, String>(1)?;
+            let source = row.get::<_, Option<String>>(2)?;
+            let mode = row.get::<_, Option<i64>>(3)?.map(|value| value as u64);
+            let path = uri.strip_prefix("file://").unwrap_or(&uri);
+            let visible = dashboard_artifact_is_visible(path, source.as_deref(), mode);
+            Ok((kind, uri, visible))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let transaction = conn.unchecked_transaction()?;
+    {
+        let mut update = transaction.prepare(
+            "UPDATE artifact_facts
+             SET dashboard_visible = ?1
+             WHERE kind = ?2 AND uri = ?3 AND dashboard_visible != ?1",
+        )?;
+        for (kind, uri, visible) in classifications {
+            update.execute(params![bool_to_i64(visible), kind, uri])?;
+        }
+    }
+    transaction.execute(
+        "UPDATE dashboard_artifact_count
+         SET count = (SELECT COUNT(*) FROM artifact_facts WHERE dashboard_visible = 1),
+             rules_version = ?1
+         WHERE id = 1",
+        [DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION],
+    )?;
+    transaction.commit()
 }
 
 fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
@@ -3440,6 +3559,67 @@ mod tests {
         assert_eq!(count(), 1);
 
         drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn dashboard_visibility_rules_version_reclassifies_existing_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-artifact-visibility-version-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO artifact_facts(
+                    kind, uri, last_seen_at, metadata, dashboard_visible
+                 ) VALUES
+                    ('file', 'file:///repo/app/[slug]/page.tsx', 1,
+                     '{\"source\":\"bash-command-parser\"}', 0),
+                    ('file', 'file:///repo/*.sh', 1,
+                     '{\"source\":\"bash-command-parser\"}', 1),
+                    ('file', 'file:///System/Library/noise', 1,
+                     '{\"source\":\"macos-endpoint-security\"}', 1);
+                 DROP TRIGGER artifact_dashboard_count_insert;
+                 DROP TRIGGER artifact_dashboard_count_delete;
+                 DROP TRIGGER artifact_dashboard_count_update;
+                 DROP TABLE dashboard_artifact_count;
+                 CREATE TABLE dashboard_artifact_count (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    count INTEGER NOT NULL CHECK (count >= 0)
+                 );
+                 INSERT INTO dashboard_artifact_count(id, count) VALUES (1, 2);",
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = open_store(&test_config(&path)).expect("store should migrate");
+        let connection = reopened.connection();
+        let visibility = |uri: &str| {
+            connection
+                .query_row(
+                    "SELECT dashboard_visible FROM artifact_facts WHERE uri = ?1",
+                    [uri],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(visibility("file:///repo/app/[slug]/page.tsx"), 1);
+        assert_eq!(visibility("file:///repo/*.sh"), 0);
+        assert_eq!(visibility("file:///System/Library/noise"), 0);
+        let (count, rules_version): (i64, i64) = connection
+            .query_row(
+                "SELECT count, rules_version FROM dashboard_artifact_count WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rules_version, DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION);
+
+        drop(reopened);
         remove_sqlite_files(&path);
     }
 

@@ -8,10 +8,12 @@ use gensee_crate_core::{
     ProcessObservation, SystemEvent, WorkspaceEffect,
 };
 use gensee_crate_db::sqlite::{
-    open_store, AgentEventRecord, NewAgentEvent, NewAlert, NewArtifact, NewArtifactFact,
-    NewArtifactObservation, NewArtifactRiskTag, NewHumanFeedback, NewRelation, NewRequest,
-    NewSession, NewSystemEvent, NewTransactionEvent, RetentionPruneResult, SqliteConfig,
-    SqliteError, SqliteStore, TranscriptTokenStateRecord,
+    artifact_path_is_concrete, dashboard_artifact_is_visible as dashboard_artifact_path_is_visible,
+    lineage_mode_is_non_file, lineage_path_is_harness_runtime_noise,
+    lineage_path_is_system_dependency, open_store, AgentEventRecord, NewAgentEvent, NewAlert,
+    NewArtifact, NewArtifactFact, NewArtifactObservation, NewArtifactRiskTag, NewHumanFeedback,
+    NewRelation, NewRequest, NewSession, NewSystemEvent, NewTransactionEvent, RetentionPruneResult,
+    SqliteConfig, SqliteError, SqliteStore, TranscriptTokenStateRecord,
 };
 pub use gensee_crate_db::sqlite::{
     AlertRecord, ArtifactFactRecord, ArtifactObservationRecord, ArtifactRiskTagRecord,
@@ -641,42 +643,16 @@ impl EventStore {
                 }))
             },
         )?;
-        let artifact_visibility = dashboard_artifact_visibility_sql(
-            "observation_source",
-            "observation_mode",
-            "observation_path",
-        );
-        let artifact_query = format!(
-            "WITH candidates AS (
-                SELECT facts.kind, facts.uri, facts.current_digest, facts.last_seen_at,
-                    facts.last_modified_at, facts.last_modified_source,
-                    facts.last_modified_session_id, facts.risk_level,
-                    facts.risk_rule_id, facts.is_agent_authored,
-                    facts.is_unmatched_modified, facts.is_memory_artifact,
-                    facts.is_persistent_target, facts.is_control_plane,
-                    COALESCE(json_extract(facts.metadata, '$.source'),
-                             facts.last_modified_source, last_event.source) AS observation_source,
-                    json_extract(last_event.args, '$.file.mode') AS observation_mode,
-                    CASE WHEN facts.uri LIKE 'file://%'
-                         THEN substr(facts.uri, 8)
-                         ELSE facts.uri
-                    END AS observation_path
-                 FROM artifact_facts AS facts
-                 LEFT JOIN system_events AS last_event
-                   ON last_event.event_id = facts.last_system_event_id
-             )
-             SELECT kind, uri, current_digest, last_seen_at,
+        let artifact_query = "SELECT kind, uri, current_digest, last_seen_at,
                     last_modified_at, last_modified_source,
                     last_modified_session_id, risk_level, risk_rule_id,
                     is_agent_authored, is_unmatched_modified, is_memory_artifact,
-                    is_persistent_target, is_control_plane,
-                    observation_source, observation_mode
-             FROM candidates
-             WHERE {artifact_visibility}
+                    is_persistent_target, is_control_plane
+             FROM artifact_facts
+             WHERE dashboard_visible = 1
              ORDER BY last_seen_at DESC
-             LIMIT 80"
-        );
-        let artifact_rows = query_json_rows(conn, &artifact_query, |row| {
+             LIMIT 80";
+        let artifact_rows = query_json_rows(conn, artifact_query, |row| {
             Ok(json!({
                 "kind": row.get::<_, String>(0)?,
                 "uri": row.get::<_, String>(1)?,
@@ -692,21 +668,9 @@ impl EventStore {
                 "is_memory_artifact": row.get::<_, i64>(11)?,
                 "is_persistent_target": row.get::<_, i64>(12)?,
                 "is_control_plane": row.get::<_, i64>(13)?,
-                "_observation_source": row.get::<_, Option<String>>(14)?,
-                "_observation_mode": row.get::<_, Option<i64>>(15)?,
             }))
         })?;
-        let artifacts = artifact_rows
-            .into_iter()
-            .filter(dashboard_artifact_is_visible)
-            .map(|mut artifact| {
-                if let Some(object) = artifact.as_object_mut() {
-                    object.remove("_observation_source");
-                    object.remove("_observation_mode");
-                }
-                artifact
-            })
-            .collect::<Vec<_>>();
+        let artifacts = artifact_rows;
         let visible_artifact_count = conn
             .query_row(
                 "SELECT count FROM dashboard_artifact_count WHERE id = 1",
@@ -714,25 +678,10 @@ impl EventStore {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(sqlite_error_from_rusqlite)?;
-        let relation_query = format!(
-            "WITH artifact_candidates AS (
-                SELECT facts.kind, facts.uri, facts.current_artifact_id, facts.last_seen_at,
-                    COALESCE(json_extract(facts.metadata, '$.source'),
-                             facts.last_modified_source, last_event.source) AS observation_source,
-                    json_extract(last_event.args, '$.file.mode') AS observation_mode,
-                    CASE WHEN facts.uri LIKE 'file://%'
-                         THEN substr(facts.uri, 8)
-                         ELSE facts.uri
-                    END AS observation_path
-                FROM artifact_facts AS facts
-                LEFT JOIN system_events AS last_event
-                  ON last_event.event_id = facts.last_system_event_id
-             ),
-             visible_artifacts AS MATERIALIZED (
+        let relation_query = "WITH visible_artifacts AS MATERIALIZED (
                 SELECT kind, uri, current_artifact_id AS artifact_id
-                FROM artifact_candidates
-                WHERE {artifact_visibility}
-                  AND current_artifact_id IS NOT NULL
+                FROM artifact_facts
+                WHERE dashboard_visible = 1 AND current_artifact_id IS NOT NULL
                 ORDER BY last_seen_at DESC
                 LIMIT 80
              )
@@ -745,9 +694,8 @@ impl EventStore {
                ON r.dst_kind = 'artifact'
               AND r.dst_id = visible_destination.artifact_id
              ORDER BY r.relation_id DESC
-             LIMIT 200"
-        );
-        let relations = query_json_rows(conn, &relation_query, |row| {
+             LIMIT 200";
+        let relations = query_json_rows(conn, relation_query, |row| {
             Ok(json!({
                 "type": row.get::<_, String>(0)?,
                 "confidence": row.get::<_, f64>(1)?,
@@ -755,10 +703,6 @@ impl EventStore {
                 "dst_uri": row.get::<_, String>(3)?,
             }))
         })?;
-        let relations = relations
-            .into_iter()
-            .filter(dashboard_relation_is_visible)
-            .collect::<Vec<_>>();
         let human_feedback = query_json_rows(
             conn,
             "SELECT event_key, tool_use_id, session_id, gensee_action, human_verdict,
@@ -2393,11 +2337,15 @@ fn update_artifact_fact(db: &SqliteStore, update: ArtifactFactUpdate<'_>) -> io:
         is_memory_artifact: policy.is_memory_artifact_path(update.path),
         is_persistent_target: policy.is_persistent_target_path(update.path),
         is_control_plane: policy.is_control_plane_path(update.path),
-        dashboard_visible: artifact_path_is_concrete(update.path)
-            && (!update.metadata.as_ref().is_some_and(|metadata| {
-                metadata.get("source").and_then(Value::as_str) == Some("macos-endpoint-security")
-            }) || (!lineage_path_is_harness_runtime_noise(update.path)
-                && !lineage_path_is_system_dependency(update.path))),
+        dashboard_visible: dashboard_artifact_path_is_visible(
+            update.path,
+            update
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("source"))
+                .and_then(Value::as_str),
+            None,
+        ),
         risk_level,
         risk_rule_id,
         risk_digest,
@@ -2959,16 +2907,6 @@ fn upsert_file_artifact(
     .map_err(sqlite_error)
 }
 
-/// Lineage represents concrete filesystem objects. Shell globs and brace
-/// expansions describe a set of possible paths, so recording the pattern as a
-/// file would inflate artifact counts and create a node that never existed.
-fn artifact_path_is_concrete(path: &str) -> bool {
-    !path.is_empty()
-        && !path
-            .chars()
-            .any(|character| matches!(character, '*' | '?' | '[' | '{'))
-}
-
 fn is_agent_event(event: &AgentHookEvent) -> bool {
     matches!(
         event.hook_event_name.as_deref(),
@@ -3105,107 +3043,6 @@ fn should_materialize_system_artifact(
     true
 }
 
-fn lineage_path_is_harness_runtime_noise(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    path.starts_with("/dev/")
-        || path.starts_with("/private/tmp/cc-socks/")
-        || path.starts_with("/tmp/cc-socks/")
-        || path.starts_with("/private/tmp/claude-")
-        || path.starts_with("/tmp/claude-")
-        || path.starts_with("/private/var/tmp/sh-thd-")
-        || path.contains("/.claude/sessions/")
-        || path.contains("/.claude/projects/")
-        || path.contains("/.claude/shell-snapshots/")
-        || (path.contains("/.claude/plugins/cache/")
-            && (path.ends_with("/.in_use") || path.contains("/.in_use/")))
-        || lower.contains("/library/application support/codex/")
-        || lower.contains("/library/application support/claude/")
-        || lower.contains("/crashpad/")
-        || lower.contains("/diagnosticreports/")
-        || lower.contains("/crash reports/")
-        || lower.contains("/target/")
-        || lower.contains("/deriveddata/")
-        || lower.contains("/.build/")
-        || lower.contains("/node_modules/.cache/")
-        || lower.contains("/test-results/")
-        || lower.contains("/testresults/")
-        || ((lower.ends_with("-wal") || lower.ends_with("-shm") || lower.ends_with("-journal"))
-            && (lower.contains("/.codex/")
-                || lower.contains("/.claude/")
-                || lower.contains("/library/application support/cursor/")
-                || lower.contains("/library/application support/code/")))
-}
-
-fn lineage_path_is_system_dependency(path: &str) -> bool {
-    path == "/bin"
-        || path.starts_with("/bin/")
-        || path == "/sbin"
-        || path.starts_with("/sbin/")
-        || path == "/usr/bin"
-        || path.starts_with("/usr/bin/")
-        || path == "/usr/local/bin"
-        || path.starts_with("/usr/local/bin/")
-        || path.starts_with("/usr/lib/")
-        || path.starts_with("/usr/share/")
-        || path.starts_with("/System/")
-        || path.starts_with("/Library/Developer/")
-        || path.starts_with("/Applications/Xcode.app/Contents/Developer/")
-        || path.starts_with("/Library/Preferences/Logging/")
-        || path.starts_with("/Library/Preferences/")
-        || path.starts_with("/private/var/db/")
-        || path.starts_with("/private/var/folders/")
-        || path.starts_with("/opt/homebrew/Cellar/")
-}
-
-fn lineage_mode_is_non_file(mode: u64) -> bool {
-    matches!(
-        mode & 0o170000,
-        0o010000 | 0o020000 | 0o040000 | 0o060000 | 0o140000
-    )
-}
-
-fn file_path_from_uri(uri: &str) -> &str {
-    uri.strip_prefix("file://").unwrap_or(uri)
-}
-
-fn dashboard_path_visibility_sql(path: &str) -> String {
-    format!(
-        "NOT (
-            {path} GLOB '/dev/*'
-            OR {path} GLOB '/private/tmp/cc-socks/*'
-            OR {path} GLOB '/tmp/cc-socks/*'
-            OR {path} GLOB '/private/tmp/claude-*'
-            OR {path} GLOB '/tmp/claude-*'
-            OR {path} GLOB '/private/var/tmp/sh-thd-*'
-            OR {path} GLOB '*/.claude/sessions/*'
-            OR {path} GLOB '*/.claude/projects/*'
-            OR {path} GLOB '*/.claude/shell-snapshots/*'
-            OR (
-                {path} GLOB '*/.claude/plugins/cache/*'
-                AND ({path} GLOB '*/.in_use' OR {path} GLOB '*/.in_use/*')
-            )
-            OR {path} = '/bin'
-            OR {path} GLOB '/bin/*'
-            OR {path} = '/sbin'
-            OR {path} GLOB '/sbin/*'
-            OR {path} = '/usr/bin'
-            OR {path} GLOB '/usr/bin/*'
-            OR {path} = '/usr/local/bin'
-            OR {path} GLOB '/usr/local/bin/*'
-            OR {path} GLOB '/usr/lib/*'
-            OR {path} GLOB '/usr/share/*'
-            OR {path} GLOB '/System/*'
-            OR {path} GLOB '/Library/Developer/*'
-            OR {path} GLOB '/Applications/Xcode.app/Contents/Developer/*'
-            OR {path} GLOB '/Library/Preferences/Logging/*'
-            OR {path} GLOB '/Library/Preferences/*'
-            OR {path} GLOB '/private/var/db/*'
-            OR {path} GLOB '/private/var/folders/*'
-            OR {path} GLOB '/opt/homebrew/Cellar/*'
-        )"
-    )
-}
-
 fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
     let path = format!("COALESCE({alias}.path, '')");
     let lower_path = format!("lower({path})");
@@ -3255,68 +3092,6 @@ fn dashboard_visible_alerts_cte() -> String {
                OR created_at - previous_related_alert_at > 10000
          )"
     )
-}
-
-fn dashboard_artifact_visibility_sql(source: &str, mode: &str, path: &str) -> String {
-    let path_visibility = dashboard_path_visibility_sql(path);
-    format!(
-        "instr({path}, '*') = 0
-         AND instr({path}, '?') = 0
-         AND instr({path}, '[') = 0
-         AND instr({path}, '{{') = 0
-         AND (
-            COALESCE({source}, '') != 'macos-endpoint-security'
-            OR (
-                ({mode} IS NULL OR ({mode} & 61440) NOT IN (4096, 8192, 16384, 24576, 49152))
-                AND {path_visibility}
-            )
-         )"
-    )
-}
-
-fn dashboard_artifact_is_visible(artifact: &Value) -> bool {
-    let path = artifact
-        .get("uri")
-        .and_then(Value::as_str)
-        .map(file_path_from_uri);
-    if path.is_some_and(|path| !artifact_path_is_concrete(path)) {
-        return false;
-    }
-
-    let observed_by_endpoint_security = artifact.get("_observation_source").and_then(Value::as_str)
-        == Some("macos-endpoint-security");
-    if !observed_by_endpoint_security {
-        return true;
-    }
-
-    let Some(path) = path else {
-        return true;
-    };
-    if lineage_path_is_harness_runtime_noise(path) {
-        return false;
-    }
-    if artifact
-        .get("_observation_mode")
-        .and_then(Value::as_u64)
-        .is_some_and(lineage_mode_is_non_file)
-    {
-        return false;
-    }
-    !lineage_path_is_system_dependency(path)
-}
-
-fn dashboard_relation_is_visible(relation: &Value) -> bool {
-    ["src_uri", "dst_uri"].into_iter().all(|key| {
-        relation
-            .get(key)
-            .and_then(Value::as_str)
-            .map(file_path_from_uri)
-            .is_none_or(|path| {
-                artifact_path_is_concrete(path)
-                    && !lineage_path_is_harness_runtime_noise(path)
-                    && !lineage_path_is_system_dependency(path)
-            })
-    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5195,73 +4970,55 @@ mod tests {
 
     #[test]
     fn dashboard_hides_legacy_endpoint_runtime_artifacts() {
-        let legacy_system_read = json!({
-            "uri": "file:///System/Library/dyld/dyld_shared_cache_arm64e",
-            "_observation_source": "macos-endpoint-security",
-            "_observation_event_type": "open",
-            "_observation_event_kind": null,
-            "_observation_modified": null,
-        });
-        let real_system_mutation = json!({
-            "uri": "file:///System/Library/example.conf",
-            "_observation_source": "macos-endpoint-security",
-            "_observation_event_type": "write",
-            "_observation_event_kind": "file_mutation",
-            "_observation_modified": null,
-        });
-        let project_artifact = json!({
-            "uri": "file:///repo/src/lib.rs",
-            "_observation_source": "macos-endpoint-security",
-            "_observation_event_type": "write",
-            "_observation_event_kind": "file_mutation",
-            "_observation_modified": null,
-        });
-
-        assert!(!dashboard_artifact_is_visible(&legacy_system_read));
-        assert!(!dashboard_artifact_is_visible(&real_system_mutation));
-        assert!(dashboard_artifact_is_visible(&project_artifact));
+        assert!(!dashboard_artifact_path_is_visible(
+            "/System/Library/dyld/dyld_shared_cache_arm64e",
+            Some("macos-endpoint-security"),
+            None,
+        ));
+        assert!(!dashboard_artifact_path_is_visible(
+            "/System/Library/example.conf",
+            Some("macos-endpoint-security"),
+            None,
+        ));
+        assert!(dashboard_artifact_path_is_visible(
+            "/repo/src/lib.rs",
+            Some("macos-endpoint-security"),
+            None,
+        ));
     }
 
     #[test]
-    fn dashboard_hides_legacy_wildcard_artifacts_for_every_source() {
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        let visibility = dashboard_artifact_visibility_sql("'bash-command-parser'", "NULL", "?1");
+    fn artifact_visibility_preserves_bracket_routes_and_hides_globs() {
         for (path, expected_visible) in [
             ("/repo/src/lib.rs", true),
             ("/repo/*.sh", false),
             ("/repo/file?.md", false),
-            ("/repo/[ab].yml", false),
             ("/repo/{one,two}.json", false),
+            ("/repo/app/[slug]/page.tsx", true),
+            ("/repo/pages/[id].tsx", true),
+            ("/repo/app/[[...slug]]/page.tsx", true),
         ] {
-            let artifact = json!({
-                "uri": file_uri(path),
-                "_observation_source": "bash-command-parser",
-            });
-            let rust_visible = dashboard_artifact_is_visible(&artifact);
-            let sql_visible: bool = connection
-                .query_row(&format!("SELECT {visibility}"), [path], |row| row.get(0))
-                .unwrap();
-            assert_eq!(rust_visible, expected_visible, "Rust visibility for {path}");
-            assert_eq!(sql_visible, expected_visible, "SQL visibility for {path}");
+            assert_eq!(
+                dashboard_artifact_path_is_visible(path, Some("bash-command-parser"), None),
+                expected_visible,
+                "visibility for {path}",
+            );
         }
     }
 
     #[test]
-    fn dashboard_usr_local_bin_filter_matches_rust_predicate() {
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
+    fn dashboard_hides_endpoint_system_dependencies() {
         for (path, expected_visible) in [
             ("/usr/local/bin", false),
             ("/usr/local/bin/gensee", false),
             ("/usr/local/binaries/tool", true),
             ("/usr/local/bin-old/x", true),
         ] {
-            let rust_visible = !lineage_path_is_system_dependency(path);
-            let sql = format!("SELECT {}", dashboard_path_visibility_sql("?1"));
-            let sql_visible: bool = connection
-                .query_row(&sql, [path], |row| row.get(0))
-                .unwrap();
-            assert_eq!(rust_visible, expected_visible, "Rust visibility for {path}");
-            assert_eq!(sql_visible, expected_visible, "SQL visibility for {path}");
+            assert_eq!(
+                dashboard_artifact_path_is_visible(path, Some("macos-endpoint-security"), None,),
+                expected_visible,
+                "visibility for {path}",
+            );
         }
     }
 
@@ -5637,14 +5394,9 @@ mod tests {
                 100,
             ))
             .unwrap();
-        for (index, path) in [
-            "/repo/*.sh",
-            "/repo/file?.md",
-            "/repo/[ab].yml",
-            "/repo/{one,two}.json",
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, path) in ["/repo/*.sh", "/repo/file?.md", "/repo/{one,two}.json"]
+            .into_iter()
+            .enumerate()
         {
             store
                 .append_file_intent(&FileIntent {
@@ -5670,6 +5422,24 @@ mod tests {
             .append_file_intent(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
+                tool_use_id: Some("tool_route".to_string()),
+                observed_at_ms: 119,
+                operation: "read".to_string(),
+                path: "/repo/app/[slug]/page.tsx".to_string(),
+                source_command: "cat /repo/app/[slug]/page.tsx".to_string(),
+                sensitive: false,
+                confidence: "low".to_string(),
+            })
+            .unwrap();
+        assert!(store
+            .artifact_fact_for_file("/repo/app/[slug]/page.tsx")
+            .unwrap()
+            .is_some());
+
+        store
+            .append_file_intent(&FileIntent {
+                provider: "bash-command-parser".to_string(),
+                session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool_concrete".to_string()),
                 observed_at_ms: 120,
                 operation: "read".to_string(),
@@ -5680,8 +5450,15 @@ mod tests {
             })
             .unwrap();
         let dashboard = store.dashboard_state().unwrap();
-        assert_eq!(dashboard["summary"]["artifacts_count"], 1);
-        assert_eq!(dashboard["artifacts"][0]["uri"], "file:///repo/build.sh");
+        assert_eq!(dashboard["summary"]["artifacts_count"], 2);
+        let paths = dashboard["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|artifact| artifact["uri"].as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"file:///repo/build.sh"));
+        assert!(paths.contains(&"file:///repo/app/[slug]/page.tsx"));
 
         fs::remove_dir_all(&dir).ok();
     }

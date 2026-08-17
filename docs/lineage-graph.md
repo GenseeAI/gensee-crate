@@ -23,6 +23,14 @@ at `$GENSEE_HOME/gensee.db` (or `~/.gensee/gensee.db`).
 | `artifact_risk_tags` | Risk findings over a specific artifact **content digest**, so a tag is ignored once the file content changes. Drives the fast pre-exec block path. |
 | `artifact_facts` | One row per file **URI** (not per digest), summarizing provenance across content versions: last modifier/session, agent-authored vs. modified-outside-agent, registry membership (executable / memory / persistence / control-plane), and current risk. Updated at ingest; queried by exact-path lookup during `PreToolUse`. |
 
+The dashboard stores a `dashboard_visible` classification on each artifact fact
+and maintains its total incrementally. A version stamp records which visibility
+rules produced that classification; opening a store with newer rules atomically
+reclassifies existing facts and refreshes the total before the dashboard reads
+either the list or count. Shell glob and brace-expansion intents remain audit
+events but do not become lineage nodes. Literal bracket route paths such as
+`app/[slug]/page.tsx` remain concrete artifacts.
+
 ## Relationships
 
 The graph can currently establish:
