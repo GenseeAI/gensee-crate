@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
+pub const ENDPOINT_RETENTION_PRUNE_BATCH: u64 = 500;
 const STORE_KEY_FILE: &str = "gensee.key";
 const JSONL_ENCRYPTED_PREFIX: &str = "gensee-jsonl-v1";
 const UNKNOWN_SESSION_ID: &str = "unknown";
@@ -1144,7 +1145,6 @@ impl EventStore {
         low_severity_retention_hours: Option<u64>,
     ) -> io::Result<RetentionPruneResult> {
         const HOUR_MS: u64 = 60 * 60 * 1_000;
-        const PRUNE_BATCH: i64 = 25_000;
         let raw_cutoff = now_ms.saturating_sub(raw_retention_hours.saturating_mul(HOUR_MS));
         let low_cutoff = low_severity_retention_hours
             .map(|hours| now_ms.saturating_sub(hours.saturating_mul(HOUR_MS)))
@@ -1155,7 +1155,7 @@ impl EventStore {
                 to_i64(raw_cutoff)?,
                 i64::try_from(max_raw_events).unwrap_or(i64::MAX),
                 low_cutoff,
-                PRUNE_BATCH,
+                ENDPOINT_RETENTION_PRUNE_BATCH as i64,
             )
             .map_err(sqlite_error)
     }

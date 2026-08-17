@@ -13,6 +13,7 @@ pub(crate) use gensee_crate_rules::policy::{self, Policy};
 pub(crate) use gensee_crate_store::{
     daemon_socket_path, default_root, AlertRecord, ArtifactObservationInput, ArtifactRiskTagInput,
     ArtifactRiskTagRecord, EventStore, PolicyAlert, TransactionEventInput,
+    ENDPOINT_RETENTION_PRUNE_BATCH,
 };
 pub(crate) use serde_json::{json, Value};
 pub(crate) use sha2::{Digest, Sha256};
@@ -3757,17 +3758,6 @@ fn feedback_list(args: Vec<OsString>) -> io::Result<()> {
 
 fn dashboard_state() -> io::Result<()> {
     let store = EventStore::default_local()?;
-    let recording = Policy::load_current().document().endpoint_security.clone();
-    if let Err(error) = store.prune_endpoint_retention(
-        unix_millis()?,
-        recording.raw_event_retention_hours,
-        recording.max_raw_events,
-        recording.low_severity_retention_hours,
-    ) {
-        // Retention maintenance must never make the console unavailable. The
-        // next sensor commit or dashboard refresh will retry the bounded prune.
-        eprintln!("gensee: retention maintenance delayed: {error}");
-    }
     println!("{}", serde_json::to_string(&store.dashboard_state()?)?);
     Ok(())
 }
@@ -3856,7 +3846,9 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 // A full result means more expired rows remain. Continue in
                 // bounded chunks on subsequent commits instead of holding the
                 // ingest pipe for one unbounded deletion transaction.
-                if pruned.system_events < 25_000 && pruned.low_severity_alerts < 25_000 {
+                if pruned.system_events < ENDPOINT_RETENTION_PRUNE_BATCH
+                    && pruned.low_severity_alerts < ENDPOINT_RETENTION_PRUNE_BATCH
+                {
                     last_prune = Instant::now();
                 }
             }

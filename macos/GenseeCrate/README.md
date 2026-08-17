@@ -113,8 +113,8 @@ not removed by the low-severity expiry. Users can change the severity floor,
 raw-event scope, retention hours, and row cap without weakening inline policy
 decisions. Settings reports extension backlog, batch latency, suppressed raw
 events, and retention pruning so backpressure is visible instead of silently
-stalling the console. Expiry runs in bounded batches during ingestion and
-dashboard refresh, so a quiet sensor catches up the next time the app is open.
+stalling the console. Expiry runs in small bounded ingestion batches so it
+never blocks dashboard projection work and catches up while the sensor runs.
 
 ## Apple Developer configuration
 
