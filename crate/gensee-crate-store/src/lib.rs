@@ -1253,6 +1253,9 @@ impl EventStore {
         observation: &ArtifactObservationInput,
         tags: &[ArtifactRiskTagInput],
     ) -> io::Result<()> {
+        if !artifact_path_is_concrete(&observation.path) {
+            return Ok(());
+        }
         self.with_sqlite_transaction(|db| {
             let session_id = observation
                 .session_id
@@ -1748,7 +1751,7 @@ impl EventStore {
                     args: Some(json_record(effect)?),
                 })
                 .map_err(sqlite_error)?;
-            let artifact_id = upsert_file_artifact(
+            let Some(artifact_id) = upsert_file_artifact(
                 db,
                 &effect.path,
                 ts,
@@ -1757,7 +1760,10 @@ impl EventStore {
                     "confidence": effect.confidence,
                     "attribution": effect.attribution,
                 })),
-            )?;
+            )?
+            else {
+                return Ok(());
+            };
             insert_entity_relation(
                 db,
                 EntityRef::system_event(event_id),
@@ -2388,7 +2394,7 @@ fn record_file_intent_artifact(
     intent: &FileIntent,
 ) -> io::Result<()> {
     let ts = to_i64(intent.observed_at_ms)?;
-    let artifact_id = upsert_file_artifact(
+    let Some(artifact_id) = upsert_file_artifact(
         db,
         &intent.path,
         ts,
@@ -2399,7 +2405,10 @@ fn record_file_intent_artifact(
             "sensitive": intent.sensitive,
             "confidence": intent.confidence,
         })),
-    )?;
+    )?
+    else {
+        return Ok(());
+    };
 
     let access = artifact_access(&intent.operation);
     match access {
@@ -2493,7 +2502,7 @@ fn record_native_tool_artifact(
 
     let ts = to_i64(event.observed_at_ms)?;
     for tool in tools {
-        let artifact_id = upsert_file_artifact(
+        let Some(artifact_id) = upsert_file_artifact(
             db,
             &tool.path,
             ts,
@@ -2503,7 +2512,10 @@ fn record_native_tool_artifact(
                 "tool_name": event.tool_name,
                 "tool_use_id": event.tool_use_id,
             })),
-        )?;
+        )?
+        else {
+            continue;
+        };
 
         let access = artifact_access(&tool.operation);
         match access {
@@ -2754,7 +2766,7 @@ fn record_system_event_artifacts(
         if !should_materialize_system_artifact(event, &path, raw_event.as_ref()) {
             continue;
         }
-        let artifact_id = upsert_file_artifact(
+        let Some(artifact_id) = upsert_file_artifact(
             db,
             &path,
             ts,
@@ -2764,7 +2776,10 @@ fn record_system_event_artifacts(
                 "system_event_kind": event.event_kind,
                 "modified": modified,
             })),
-        )?;
+        )?
+        else {
+            continue;
+        };
         match relation_type {
             "read_by" => insert_entity_relation(
                 db,
@@ -2908,7 +2923,10 @@ fn upsert_file_artifact(
     path: &str,
     ts: i64,
     metadata: Option<Value>,
-) -> io::Result<i64> {
+) -> io::Result<Option<i64>> {
+    if !artifact_path_is_concrete(path) {
+        return Ok(None);
+    }
     db.insert_artifact(&NewArtifact {
         kind: "file".to_string(),
         uri: file_uri(path),
@@ -2917,7 +2935,18 @@ fn upsert_file_artifact(
         updated_at: Some(ts),
         metadata: metadata.map(|value| value.to_string()),
     })
+    .map(Some)
     .map_err(sqlite_error)
+}
+
+/// Lineage represents concrete filesystem objects. Shell globs and brace
+/// expansions describe a set of possible paths, so recording the pattern as a
+/// file would inflate artifact counts and create a node that never existed.
+fn artifact_path_is_concrete(path: &str) -> bool {
+    !path.is_empty()
+        && !path
+            .chars()
+            .any(|character| matches!(character, '*' | '?' | '[' | '{'))
 }
 
 fn is_agent_event(event: &AgentHookEvent) -> bool {
@@ -3211,26 +3240,36 @@ fn dashboard_visible_alerts_cte() -> String {
 fn dashboard_artifact_visibility_sql(source: &str, mode: &str, path: &str) -> String {
     let path_visibility = dashboard_path_visibility_sql(path);
     format!(
-        "COALESCE({source}, '') != 'macos-endpoint-security'
-         OR (
-            ({mode} IS NULL OR ({mode} & 61440) NOT IN (4096, 8192, 16384, 24576, 49152))
-            AND {path_visibility}
+        "instr({path}, '*') = 0
+         AND instr({path}, '?') = 0
+         AND instr({path}, '[') = 0
+         AND instr({path}, '{{') = 0
+         AND (
+            COALESCE({source}, '') != 'macos-endpoint-security'
+            OR (
+                ({mode} IS NULL OR ({mode} & 61440) NOT IN (4096, 8192, 16384, 24576, 49152))
+                AND {path_visibility}
+            )
          )"
     )
 }
 
 fn dashboard_artifact_is_visible(artifact: &Value) -> bool {
+    let path = artifact
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(file_path_from_uri);
+    if path.is_some_and(|path| !artifact_path_is_concrete(path)) {
+        return false;
+    }
+
     let observed_by_endpoint_security = artifact.get("_observation_source").and_then(Value::as_str)
         == Some("macos-endpoint-security");
     if !observed_by_endpoint_security {
         return true;
     }
 
-    let Some(path) = artifact
-        .get("uri")
-        .and_then(Value::as_str)
-        .map(file_path_from_uri)
-    else {
+    let Some(path) = path else {
         return true;
     };
     if lineage_path_is_harness_runtime_noise(path) {
@@ -3253,7 +3292,8 @@ fn dashboard_relation_is_visible(relation: &Value) -> bool {
             .and_then(Value::as_str)
             .map(file_path_from_uri)
             .is_none_or(|path| {
-                !lineage_path_is_harness_runtime_noise(path)
+                artifact_path_is_concrete(path)
+                    && !lineage_path_is_harness_runtime_noise(path)
                     && !lineage_path_is_system_dependency(path)
             })
     })
@@ -5163,6 +5203,30 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_hides_legacy_wildcard_artifacts_for_every_source() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let visibility = dashboard_artifact_visibility_sql("'bash-command-parser'", "NULL", "?1");
+        for (path, expected_visible) in [
+            ("/repo/src/lib.rs", true),
+            ("/repo/*.sh", false),
+            ("/repo/file?.md", false),
+            ("/repo/[ab].yml", false),
+            ("/repo/{one,two}.json", false),
+        ] {
+            let artifact = json!({
+                "uri": file_uri(path),
+                "_observation_source": "bash-command-parser",
+            });
+            let rust_visible = dashboard_artifact_is_visible(&artifact);
+            let sql_visible: bool = connection
+                .query_row(&format!("SELECT {visibility}"), [path], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rust_visible, expected_visible, "Rust visibility for {path}");
+            assert_eq!(sql_visible, expected_visible, "SQL visibility for {path}");
+        }
+    }
+
+    #[test]
     fn dashboard_usr_local_bin_filter_matches_rust_predicate() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         for (path, expected_visible) in [
@@ -5530,6 +5594,70 @@ mod tests {
             .any(|relation| relation.src_kind == "artifact"
                 && relation.dst_kind == "request"
                 && relation.relation_type == "consumed_by"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wildcard_file_intents_do_not_materialize_artifacts() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-wildcard-artifacts-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"inspect scripts"}"#,
+                100,
+            ))
+            .unwrap();
+        for (index, path) in [
+            "/repo/*.sh",
+            "/repo/file?.md",
+            "/repo/[ab].yml",
+            "/repo/{one,two}.json",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .append_file_intent(&FileIntent {
+                    provider: "bash-command-parser".to_string(),
+                    session_id: Some("s1".to_string()),
+                    tool_use_id: Some(format!("tool_{index}")),
+                    observed_at_ms: 110 + index as u64,
+                    operation: "read".to_string(),
+                    path: path.to_string(),
+                    source_command: format!("cat {path}"),
+                    sensitive: false,
+                    confidence: "low".to_string(),
+                })
+                .unwrap();
+            assert!(store.artifact_fact_for_file(path).unwrap().is_none());
+        }
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["summary"]["artifacts_count"], 0);
+        assert!(dashboard["artifacts"].as_array().unwrap().is_empty());
+
+        store
+            .append_file_intent(&FileIntent {
+                provider: "bash-command-parser".to_string(),
+                session_id: Some("s1".to_string()),
+                tool_use_id: Some("tool_concrete".to_string()),
+                observed_at_ms: 120,
+                operation: "read".to_string(),
+                path: "/repo/build.sh".to_string(),
+                source_command: "cat /repo/build.sh".to_string(),
+                sensitive: false,
+                confidence: "low".to_string(),
+            })
+            .unwrap();
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["summary"]["artifacts_count"], 1);
+        assert_eq!(dashboard["artifacts"][0]["uri"], "file:///repo/build.sh");
 
         fs::remove_dir_all(&dir).ok();
     }
