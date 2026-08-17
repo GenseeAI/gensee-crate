@@ -141,7 +141,12 @@
         "protected_paths": { "type": "array", "items": { "type": "string" }, "description": "Additional absolute path prefixes protected by authorization events." },
         "blocked_executables": { "type": "array", "items": { "type": "string" }, "description": "Absolute executable paths denied inside managed agent trees in protect/strict mode." },
         "fail_closed_managed_only": { "type": "boolean", "const": true, "default": true, "description": "Reserved safety invariant: authorization denies are always limited to explicitly managed agent process trees." },
-        "max_auth_latency_ms": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 }
+        "max_auth_latency_ms": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 },
+        "minimum_recorded_severity": { "type": "string", "enum": ["info", "low", "medium", "high", "critical"], "default": "info", "description": "Lowest alert severity persisted locally. Enforcement still evaluates every finding." },
+        "raw_event_scope": { "type": "string", "enum": ["none", "active", "all"], "default": "active", "description": "Persist no raw events, only events correlated to an active agent tool call, or every observed Endpoint Security event." },
+        "raw_event_retention_hours": { "type": "integer", "minimum": 1, "maximum": 720, "default": 24 },
+        "max_raw_events": { "type": "integer", "minimum": 1000, "maximum": 5000000, "default": 100000 },
+        "low_severity_retention_hours": { "type": ["integer", "null"], "minimum": 1, "maximum": 8760, "default": 48, "description": "Permanently delete info, low, and medium alerts after this many hours; null keeps them indefinitely." }
       }
     },
     "watch": {

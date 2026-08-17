@@ -6,10 +6,16 @@ struct EndpointSensorHealth: Equatable {
     var mode = "observe"
     var totalEvents: UInt64 = 0
     var bufferedEvents: UInt64 = 0
+    var backlogEvents: UInt64 = 0
     var kernelDrops: UInt64 = 0
     var ringDrops: UInt64 = 0
     var lastGlobalSequence: UInt64 = 0
     var ingestedEvents: UInt64 = 0
+    var persistedEvents: UInt64 = 0
+    var suppressedEvents: UInt64 = 0
+    var prunedSystemEvents: UInt64 = 0
+    var prunedLowSeverityAlerts: UInt64 = 0
+    var lastBatchDurationMS: UInt64 = 0
     var rejectedEvents: UInt64 = 0
     var authorizationCount: UInt64 = 0
     var deniedCount: UInt64 = 0
@@ -20,6 +26,7 @@ struct EndpointSensorHealth: Equatable {
     var error: String?
 
     var hasDataLoss: Bool { kernelDrops > 0 || ringDrops > 0 || rejectedEvents > 0 }
+    var hasBackpressure: Bool { backlogEvents >= 1_000 || lastBatchDurationMS >= 1_000 }
     var exceedsAuthorizationLatencyBudget: Bool {
         maxAuthorizationLatencyUS > configuredMaxAuthorizationLatencyUS
     }
@@ -233,7 +240,7 @@ final class EndpointSecuritySensor: ObservableObject {
                 (continuation: CheckedContinuation<([[String: Any]], UInt64, [String: Any]), Error>) in
                 connection.fetchEvents(
                     afterCursor: cursor,
-                    limit: 500,
+                    limit: health.hasBackpressure ? 100 : 500,
                     reply: { events, nextCursor, health in
                         guard let events = events as? [[String: Any]],
                               let health = health as? [String: Any]
@@ -251,7 +258,10 @@ final class EndpointSecuritySensor: ObservableObject {
                 )
             }
             let pendingCursor = response.1
-            let didRewind = applyHealth(response.2)
+            let didRewind = applyHealth(
+                response.2,
+                fetchedThroughCursor: pendingCursor
+            )
             // A boot/ring rewind means this batch was fetched from a stale
             // cursor. Refetch from the recovered cursor before ingesting it so
             // the first post-launch batch is never delivered twice.
@@ -299,7 +309,10 @@ final class EndpointSecuritySensor: ObservableObject {
     }
 
     @discardableResult
-    private func applyHealth(_ dictionary: [String: Any]) -> Bool {
+    private func applyHealth(
+        _ dictionary: [String: Any],
+        fetchedThroughCursor: UInt64
+    ) -> Bool {
         let nextBootID = dictionary["boot_id"] as? String ?? ""
         let nextCursor = number(dictionary["next_cursor"])
         let oldestCursor = number(dictionary["oldest_cursor"])
@@ -320,6 +333,10 @@ final class EndpointSecuritySensor: ObservableObject {
         health.mode = (dictionary["mode"] as? String) ?? "observe"
         health.totalEvents = number(dictionary["total_events"])
         health.bufferedEvents = number(dictionary["buffered_events"])
+        let effectiveCursor = didRewind ? cursor : fetchedThroughCursor
+        health.backlogEvents = nextCursor > effectiveCursor
+            ? nextCursor - effectiveCursor - 1
+            : 0
         health.kernelDrops = number(dictionary["kernel_drops"])
         health.ringDrops = number(dictionary["ring_drops"])
         health.lastGlobalSequence = number(dictionary["last_global_seq_num"])
@@ -370,7 +387,13 @@ final class EndpointSecuritySensor: ObservableObject {
         let rejectedEvents: UInt64
         do {
             try await Task.detached(priority: .utility) {
-                try ingestInput.write(contentsOf: batch)
+                try EndpointIngestAcknowledgementIO.write(
+                    batch,
+                    to: ingestInput,
+                    timeout: EndpointIngestBatchPolicy.acknowledgementTimeout(
+                        forEventCount: UInt64(events.count)
+                    )
+                )
             }.value
             rejectedEvents = try await awaitDurableAcknowledgement(
                 from: ingestAcknowledgements,
@@ -418,6 +441,11 @@ final class EndpointSecuritySensor: ObservableObject {
                         userInfo: [NSLocalizedDescriptionKey: "Endpoint Security ingester returned a mismatched durability acknowledgement."]
                     )
                 }
+                health.persistedEvents += number(acknowledgement["persisted_events"])
+                health.suppressedEvents += number(acknowledgement["suppressed_events"])
+                health.prunedSystemEvents += number(acknowledgement["pruned_system_events"])
+                health.prunedLowSeverityAlerts += number(acknowledgement["pruned_low_severity_alerts"])
+                health.lastBatchDurationMS = number(acknowledgement["ingest_duration_ms"])
                 return number(acknowledgement["rejected_events"])
             }
             let remaining = deadline - ProcessInfo.processInfo.systemUptime

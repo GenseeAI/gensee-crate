@@ -155,7 +155,6 @@ final class ConsoleModel: ObservableObject {
         }
 
         await refreshPolicy()
-        lastUpdated = Date()
     }
 
     func refreshPolicy() async {
@@ -185,7 +184,8 @@ final class ConsoleModel: ObservableObject {
         do {
             let refreshedSnapshot = try await cli.decode(
                 SecuritySnapshot.self,
-                arguments: ["dashboard-state"]
+                arguments: ["dashboard-state"],
+                timeout: 12
             )
             hasLoadedDashboardSnapshot = true
             reconcileReadAlertState(alertCount: refreshedSnapshot.summary.alertsCount)
@@ -196,6 +196,8 @@ final class ConsoleModel: ObservableObject {
             dashboardRefreshIssue = nil
         } catch {
             dashboardRefreshIssue = error.localizedDescription
+            // Keep the last good snapshot visible, but always release the
+            // in-progress guard so the next scheduled refresh can recover.
             if reportErrors, errorMessage == nil {
                 errorMessage = error.localizedDescription
             }

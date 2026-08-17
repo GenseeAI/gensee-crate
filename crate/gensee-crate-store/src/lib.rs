@@ -10,8 +10,8 @@ use gensee_crate_core::{
 use gensee_crate_db::sqlite::{
     open_store, AgentEventRecord, NewAgentEvent, NewAlert, NewArtifact, NewArtifactFact,
     NewArtifactObservation, NewArtifactRiskTag, NewHumanFeedback, NewRelation, NewRequest,
-    NewSession, NewSystemEvent, NewTransactionEvent, SqliteConfig, SqliteError, SqliteStore,
-    TranscriptTokenStateRecord,
+    NewSession, NewSystemEvent, NewTransactionEvent, RetentionPruneResult, SqliteConfig,
+    SqliteError, SqliteStore, TranscriptTokenStateRecord,
 };
 pub use gensee_crate_db::sqlite::{
     AlertRecord, ArtifactFactRecord, ArtifactObservationRecord, ArtifactRiskTagRecord,
@@ -297,6 +297,13 @@ impl EventStore {
 
     pub fn append_system_event(&self, event: &SystemEvent) -> io::Result<()> {
         self.append_system_event_database(event)?;
+        // Endpoint Security telemetry is already durable in SQLite and can be
+        // pruned transactionally. Duplicating this high-volume stream into an
+        // append-only JSONL file made retention ineffective and could consume
+        // gigabytes during an event burst. Keep JSONL only for legacy sources.
+        if event.source == "macos-endpoint-security" {
+            return Ok(());
+        }
         append_jsonl(
             &self.system_events_path(),
             event,
@@ -1023,6 +1030,14 @@ impl EventStore {
     }
 
     pub fn append_policy_alert(&self, alert: &PolicyAlert) -> io::Result<()> {
+        if !Policy::load_current()
+            .document()
+            .endpoint_security
+            .minimum_recorded_severity
+            .includes(&alert.severity)
+        {
+            return Ok(());
+        }
         self.with_sqlite_transaction(|db| {
             let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
@@ -1061,6 +1076,14 @@ impl EventStore {
         dedupe_key: &str,
         window_ms: u64,
     ) -> io::Result<bool> {
+        if !Policy::load_current()
+            .document()
+            .endpoint_security
+            .minimum_recorded_severity
+            .includes(&alert.severity)
+        {
+            return Ok(false);
+        }
         self.with_sqlite_transaction(|db| {
             let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
@@ -1111,6 +1134,30 @@ impl EventStore {
             )?;
             Ok(true)
         })
+    }
+
+    pub fn prune_endpoint_retention(
+        &self,
+        now_ms: u64,
+        raw_retention_hours: u64,
+        max_raw_events: u64,
+        low_severity_retention_hours: Option<u64>,
+    ) -> io::Result<RetentionPruneResult> {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        const PRUNE_BATCH: i64 = 25_000;
+        let raw_cutoff = now_ms.saturating_sub(raw_retention_hours.saturating_mul(HOUR_MS));
+        let low_cutoff = low_severity_retention_hours
+            .map(|hours| now_ms.saturating_sub(hours.saturating_mul(HOUR_MS)))
+            .map(to_i64)
+            .transpose()?;
+        self.sqlite_store()?
+            .prune_endpoint_retention(
+                to_i64(raw_cutoff)?,
+                i64::try_from(max_raw_events).unwrap_or(i64::MAX),
+                low_cutoff,
+                PRUNE_BATCH,
+            )
+            .map_err(sqlite_error)
     }
 
     pub fn artifact_risk_tags_for_file_digest(
@@ -2113,6 +2160,14 @@ fn insert_entity_relation(
 }
 
 fn insert_alert(db: &SqliteStore, input: AlertInput<'_>) -> io::Result<()> {
+    if !Policy::load_current()
+        .document()
+        .endpoint_security
+        .minimum_recorded_severity
+        .includes(input.severity)
+    {
+        return Ok(());
+    }
     db.insert_alert(&NewAlert {
         request_id: input.request_id,
         entity_kind: input.entity.map(|entity| entity.kind.to_string()),

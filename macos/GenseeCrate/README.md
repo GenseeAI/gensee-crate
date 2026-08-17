@@ -104,6 +104,18 @@ the mutable event store writable while always protecting
 available to the in-memory ancestry tracker but are not written to the
 dashboard event store.
 
+The Policy page controls local recording volume independently from
+enforcement. By default Gensee records alerts at `info` or higher, persists raw
+Endpoint Security events only during active agent tool calls, retains raw
+events for 24 hours with a 100,000-row hard cap, and permanently deletes
+`info`, `low`, and `medium` alerts after 48 hours. High and critical alerts are
+not removed by the low-severity expiry. Users can change the severity floor,
+raw-event scope, retention hours, and row cap without weakening inline policy
+decisions. Settings reports extension backlog, batch latency, suppressed raw
+events, and retention pruning so backpressure is visible instead of silently
+stalling the console. Expiry runs in bounded batches during ingestion and
+dashboard refresh, so a quiet sensor catches up the next time the app is open.
+
 ## Apple Developer configuration
 
 In Certificates, Identifiers & Profiles:

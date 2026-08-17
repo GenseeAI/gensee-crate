@@ -20,6 +20,43 @@ enum EndpointIngestBatchPolicy {
 }
 
 enum EndpointIngestAcknowledgementIO {
+    static func write(_ data: Data, to handle: FileHandle, timeout: TimeInterval) throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var offset = 0
+        while offset < data.count {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else { throw timeoutError() }
+            var descriptor = pollfd(
+                fd: handle.fileDescriptor,
+                events: Int16(POLLOUT | POLLHUP | POLLERR),
+                revents: 0
+            )
+            let timeoutMilliseconds = Int32(min(max(remaining * 1_000, 1), Double(Int32.max)))
+            var pollResult: Int32
+            repeat {
+                pollResult = Darwin.poll(&descriptor, 1, timeoutMilliseconds)
+            } while pollResult < 0 && errno == EINTR
+            guard pollResult > 0 else {
+                if pollResult == 0 { throw timeoutError() }
+                throw posixError("Could not wait for Endpoint Security ingestion capacity.")
+            }
+            let written = data.withUnsafeBytes { bytes -> Int in
+                guard let base = bytes.baseAddress else { return 0 }
+                return Darwin.write(
+                    handle.fileDescriptor,
+                    base.advanced(by: offset),
+                    min(16 * 1024, data.count - offset)
+                )
+            }
+            if written < 0 {
+                if errno == EINTR || errno == EAGAIN { continue }
+                throw posixError("Could not write Endpoint Security telemetry to the ingester.")
+            }
+            guard written > 0 else { throw timeoutError() }
+            offset += written
+        }
+    }
+
     static func readChunk(from handle: FileHandle, timeout: TimeInterval) throws -> Data {
         var descriptor = pollfd(
             fd: handle.fileDescriptor,
@@ -63,6 +100,14 @@ enum EndpointIngestAcknowledgementIO {
             domain: "ai.gensee.crate.endpoint-security",
             code: 7,
             userInfo: [NSLocalizedDescriptionKey: "Endpoint Security ingestion did not confirm durable storage before the batch deadline. The ingester will restart automatically."]
+        )
+    }
+
+    private static func posixError(_ message: String) -> Error {
+        NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: message]
         )
     }
 }

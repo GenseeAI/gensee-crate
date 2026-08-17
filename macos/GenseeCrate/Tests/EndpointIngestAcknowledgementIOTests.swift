@@ -59,4 +59,21 @@ final class EndpointIngestAcknowledgementIOTests: XCTestCase {
         }
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - startedAt, 0.5)
     }
+
+    func testWriteDeliversACompleteBatch() async throws {
+        let pipe = Pipe()
+        defer {
+            try? pipe.fileHandleForReading.close()
+            try? pipe.fileHandleForWriting.close()
+        }
+        let expected = Data(repeating: 0x41, count: 32 * 1024)
+        let reader = Task.detached { pipe.fileHandleForReading.readData(ofLength: expected.count) }
+        try EndpointIngestAcknowledgementIO.write(
+            expected,
+            to: pipe.fileHandleForWriting,
+            timeout: 1
+        )
+        let received = await reader.value
+        XCTAssertEqual(received, expected)
+    }
 }

@@ -130,6 +130,17 @@ private struct PolicySettingsView: View {
             ]
         ),
         PolicySettingGroup(
+            title: "Local recording & retention",
+            detail: "Control local disk use without weakening policy evaluation or enforcement.",
+            settings: [
+                .choice("endpoint_security.minimum_recorded_severity", "Minimum recorded severity", "Evaluate every event, but persist alerts only at or above this severity.", options: ["info", "low", "medium", "high", "critical"], defaultValue: "info"),
+                .choice("endpoint_security.raw_event_scope", "Raw event recording", "Keep no raw telemetry, only active agent activity, or all OS observations.", options: ["active", "none", "all"], defaultValue: "active"),
+                .integer("endpoint_security.raw_event_retention_hours", "Raw event retention (hours)", "Permanently remove raw Endpoint Security events after this period.", minimum: 1, maximum: 720, defaultValue: 24),
+                .integer("endpoint_security.max_raw_events", "Maximum raw events", "Hard cap prevents an event burst from growing the local database without bound.", minimum: 1000, maximum: 5_000_000, defaultValue: 100_000),
+                .integer("endpoint_security.low_severity_retention_hours", "Info–medium retention (hours)", "Permanently delete info, low, and medium alerts after this period. Leave blank to keep them.", minimum: 1, maximum: 8_760, nullable: true, defaultValue: 48),
+            ]
+        ),
+        PolicySettingGroup(
             title: "Observation & trust",
             detail: "System-event source and explicitly trusted paths.",
             settings: [
@@ -152,7 +163,7 @@ private struct PolicySettingsView: View {
                     ForEach(group.settings) { setting in
                         PolicySettingRow(
                             setting: setting,
-                            value: dottedValue(document, setting.key),
+                            value: dottedValue(document, setting.key) ?? setting.defaultValue,
                             onChange: { updatePolicyValue(setting.key, to: $0) }
                         )
                         Divider()
@@ -198,6 +209,7 @@ private struct PolicySettingDefinition: Identifiable {
     let label: String
     let help: String
     let kind: Kind
+    let defaultValue: Any?
     var id: String { key }
 
     static func integer(
@@ -206,9 +218,10 @@ private struct PolicySettingDefinition: Identifiable {
         _ help: String,
         minimum: Int? = nil,
         maximum: Int? = nil,
-        nullable: Bool = false
+        nullable: Bool = false,
+        defaultValue: Int? = nil
     ) -> Self {
-        Self(key: key, label: label, help: help, kind: .integer(minimum: minimum, maximum: maximum, nullable: nullable))
+        Self(key: key, label: label, help: help, kind: .integer(minimum: minimum, maximum: maximum, nullable: nullable), defaultValue: defaultValue)
     }
 
     static func decimal(
@@ -218,28 +231,29 @@ private struct PolicySettingDefinition: Identifiable {
         minimum: Double? = nil,
         maximum: Double? = nil
     ) -> Self {
-        Self(key: key, label: label, help: help, kind: .decimal(minimum: minimum, maximum: maximum))
+        Self(key: key, label: label, help: help, kind: .decimal(minimum: minimum, maximum: maximum), defaultValue: nil)
     }
 
     static func boolean(_ key: String, _ label: String, _ help: String) -> Self {
-        Self(key: key, label: label, help: help, kind: .boolean)
+        Self(key: key, label: label, help: help, kind: .boolean, defaultValue: nil)
     }
 
     static func list(_ key: String, _ label: String, _ help: String) -> Self {
-        Self(key: key, label: label, help: help, kind: .list)
+        Self(key: key, label: label, help: help, kind: .list, defaultValue: nil)
     }
 
     static func text(_ key: String, _ label: String, _ help: String, nullable: Bool = false) -> Self {
-        Self(key: key, label: label, help: help, kind: .text(nullable: nullable))
+        Self(key: key, label: label, help: help, kind: .text(nullable: nullable), defaultValue: nil)
     }
 
     static func choice(
         _ key: String,
         _ label: String,
         _ help: String,
-        options: [String]
+        options: [String],
+        defaultValue: String? = nil
     ) -> Self {
-        Self(key: key, label: label, help: help, kind: .choice(options))
+        Self(key: key, label: label, help: help, kind: .choice(options), defaultValue: defaultValue)
     }
 }
 
@@ -747,6 +761,16 @@ struct DashboardSettingsPage: View {
             settingsLine("Sensor transport", sensor.health.connected ? "Connected" : "Disconnected")
             settingsLine("Policy mode", sensor.health.mode.capitalized)
             HStack {
+                Text("Ingestion health").font(.system(size: 11))
+                Spacer()
+                DashboardTag(
+                    text: sensor.health.hasBackpressure ? "Backpressure" : "Healthy",
+                    color: sensor.health.hasBackpressure ? .dashboardGold : .green
+                )
+            }
+            settingsLine("Extension backlog", sensor.health.backlogEvents.formatted())
+            settingsLine("Latest batch", "\(sensor.health.lastBatchDurationMS) ms")
+            HStack {
                 Text("Events ingested").font(.system(size: 11))
                 Spacer()
                 Text(sensor.health.ingestedEvents.formatted())
@@ -768,6 +792,12 @@ struct DashboardSettingsPage: View {
                     color: sensor.health.rejectedEvents > 0 ? .dashboardRed : .green
                 )
             }
+            settingsLine("Raw events persisted", sensor.health.persistedEvents.formatted())
+            settingsLine("Raw events suppressed", sensor.health.suppressedEvents.formatted())
+            settingsLine(
+                "Records pruned",
+                (sensor.health.prunedSystemEvents + sensor.health.prunedLowSeverityAlerts).formatted()
+            )
             HStack {
                 Text("Authorization decisions").font(.system(size: 11))
                 Spacer()

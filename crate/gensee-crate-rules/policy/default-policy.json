@@ -509,7 +509,12 @@
     "protected_paths": [],
     "blocked_executables": [],
     "fail_closed_managed_only": true,
-    "max_auth_latency_ms": 10
+    "max_auth_latency_ms": 10,
+    "minimum_recorded_severity": "info",
+    "raw_event_scope": "active",
+    "raw_event_retention_hours": 24,
+    "max_raw_events": 100000,
+    "low_severity_retention_hours": 48
   },
   "watch": {
     "system_events": "endpoint-security"

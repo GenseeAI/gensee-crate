@@ -238,6 +238,11 @@ pub struct EndpointSecurityConfig {
     pub blocked_executables: Vec<String>,
     pub fail_closed_managed_only: bool,
     pub max_auth_latency_ms: u64,
+    pub minimum_recorded_severity: AlertSeverity,
+    pub raw_event_scope: RawEventScope,
+    pub raw_event_retention_hours: u64,
+    pub max_raw_events: u64,
+    pub low_severity_retention_hours: Option<u64>,
 }
 
 impl Default for EndpointSecurityConfig {
@@ -248,8 +253,46 @@ impl Default for EndpointSecurityConfig {
             blocked_executables: Vec::new(),
             fail_closed_managed_only: true,
             max_auth_latency_ms: 10,
+            minimum_recorded_severity: AlertSeverity::Info,
+            raw_event_scope: RawEventScope::Active,
+            raw_event_retention_hours: 24,
+            max_raw_events: 100_000,
+            low_severity_retention_hours: Some(48),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertSeverity {
+    #[default]
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl AlertSeverity {
+    pub fn includes(self, severity: &str) -> bool {
+        let observed = match severity.to_ascii_lowercase().as_str() {
+            "critical" => Self::Critical,
+            "high" => Self::High,
+            "medium" => Self::Medium,
+            "low" => Self::Low,
+            _ => Self::Info,
+        };
+        observed >= self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawEventScope {
+    None,
+    #[default]
+    Active,
+    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -575,6 +618,26 @@ impl Policy {
         if !(1..=100).contains(&doc.endpoint_security.max_auth_latency_ms) {
             return Err(
                 "endpoint_security.max_auth_latency_ms must be between 1 and 100".to_string(),
+            );
+        }
+        if !(1..=24 * 30).contains(&doc.endpoint_security.raw_event_retention_hours) {
+            return Err(
+                "endpoint_security.raw_event_retention_hours must be between 1 and 720".to_string(),
+            );
+        }
+        if !(1_000..=5_000_000).contains(&doc.endpoint_security.max_raw_events) {
+            return Err(
+                "endpoint_security.max_raw_events must be between 1000 and 5000000".to_string(),
+            );
+        }
+        if doc
+            .endpoint_security
+            .low_severity_retention_hours
+            .is_some_and(|hours| !(1..=24 * 365).contains(&hours))
+        {
+            return Err(
+                "endpoint_security.low_severity_retention_hours must be null or between 1 and 8760"
+                    .to_string(),
             );
         }
         Ok(Self {
@@ -1457,6 +1520,20 @@ mod tests {
     #[test]
     fn default_policy_json_round_trips() {
         assert!(Policy::from_json(default_policy_json()).is_ok());
+        let policy = Policy::embedded_default();
+        let endpoint = &policy.document().endpoint_security;
+        assert_eq!(endpoint.minimum_recorded_severity, AlertSeverity::Info);
+        assert_eq!(endpoint.raw_event_scope, RawEventScope::Active);
+        assert_eq!(endpoint.raw_event_retention_hours, 24);
+        assert_eq!(endpoint.max_raw_events, 100_000);
+        assert_eq!(endpoint.low_severity_retention_hours, Some(48));
+    }
+
+    #[test]
+    fn alert_severity_threshold_is_inclusive() {
+        assert!(!AlertSeverity::High.includes("medium"));
+        assert!(AlertSeverity::High.includes("high"));
+        assert!(AlertSeverity::High.includes("critical"));
     }
 
     #[test]

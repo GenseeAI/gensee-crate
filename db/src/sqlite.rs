@@ -75,6 +75,12 @@ pub struct ChainVerification {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionPruneResult {
+    pub system_events: u64,
+    pub low_severity_alerts: u64,
+}
+
 impl ChainVerification {
     fn valid(checked: u64) -> Self {
         Self {
@@ -976,7 +982,7 @@ impl SqliteStore {
                  WHERE type = 'file_intent'
                    AND tool_input IS NOT NULL
                    AND json_extract(tool_input, '$.path') IS NOT NULL
-                   AND ABS(ts - ?2) <= ?3
+                   AND ts BETWEEN ?2 - ?3 AND ?2 + ?3
                    AND (
                         json_extract(tool_input, '$.path') = ?1
                      OR substr(?1, 1, length(json_extract(tool_input, '$.path')) + 1) =
@@ -1011,6 +1017,167 @@ impl SqliteStore {
             .map_err(SqliteError::Database)?;
 
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Permanently remove bounded batches of expired Endpoint Security
+    /// telemetry. The row cap is enforced independently from the time limit so
+    /// a burst cannot grow the local database without bound. Alert hashes are
+    /// rebuilt after intentional retention deletion to preserve verification
+    /// for the retained history.
+    pub fn prune_endpoint_retention(
+        &self,
+        raw_cutoff_ms: i64,
+        max_raw_events: i64,
+        low_severity_cutoff_ms: Option<i64>,
+        batch_limit: i64,
+    ) -> Result<RetentionPruneResult, SqliteError> {
+        self.conn
+            .execute_batch("SAVEPOINT gensee_retention_prune")
+            .map_err(SqliteError::Database)?;
+        let result = (|| -> rusqlite::Result<RetentionPruneResult> {
+            self.conn.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS gensee_pruned_system_events (
+                    event_id INTEGER PRIMARY KEY
+                 );
+                 DELETE FROM gensee_pruned_system_events;",
+            )?;
+            self.conn.execute(
+                "INSERT INTO gensee_pruned_system_events(event_id)
+                 SELECT event_id
+                 FROM system_events
+                 WHERE source = 'macos-endpoint-security'
+                   AND (
+                       ts < ?1 OR event_id <= COALESCE((
+                           SELECT event_id
+                           FROM system_events
+                           WHERE source = 'macos-endpoint-security'
+                           ORDER BY event_id DESC
+                           LIMIT 1 OFFSET ?2
+                       ), -1)
+                   )
+                 ORDER BY event_id
+                 LIMIT ?3",
+                params![raw_cutoff_ms, max_raw_events, batch_limit],
+            )?;
+            let system_events = self.conn.query_row(
+                "SELECT COUNT(*) FROM gensee_pruned_system_events",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            self.conn.execute(
+                "DELETE FROM relations
+                 WHERE (src_kind = 'system_event' AND src_id IN (
+                     SELECT event_id FROM gensee_pruned_system_events
+                 )) OR (dst_kind = 'system_event' AND dst_id IN (
+                     SELECT event_id FROM gensee_pruned_system_events
+                 ))",
+                [],
+            )?;
+            self.conn.execute(
+                "UPDATE artifact_facts SET last_system_event_id = NULL
+                 WHERE last_system_event_id IN (
+                     SELECT event_id FROM gensee_pruned_system_events
+                 )",
+                [],
+            )?;
+            let detached_alerts = self.conn.execute(
+                "UPDATE alerts SET entity_kind = NULL, entity_id = NULL
+                 WHERE entity_kind = 'system_event' AND entity_id IN (
+                     SELECT event_id FROM gensee_pruned_system_events
+                 )",
+                [],
+            )?;
+            self.conn.execute(
+                "DELETE FROM system_events WHERE event_id IN (
+                    SELECT event_id FROM gensee_pruned_system_events
+                 )",
+                [],
+            )?;
+
+            let low_severity_alerts = if let Some(cutoff) = low_severity_cutoff_ms {
+                self.conn.execute(
+                    "DELETE FROM alerts
+                     WHERE alert_id IN (
+                         SELECT alert_id FROM alerts
+                         WHERE severity IN ('info', 'low', 'medium')
+                           AND created_at < ?1
+                         ORDER BY alert_id
+                         LIMIT ?2
+                     )",
+                    params![cutoff, batch_limit],
+                )? as i64
+            } else {
+                0
+            };
+            if low_severity_alerts > 0 || detached_alerts > 0 {
+                self.rebuild_alert_chain()?;
+            }
+            Ok(RetentionPruneResult {
+                system_events: system_events as u64,
+                low_severity_alerts: low_severity_alerts as u64,
+            })
+        })();
+        match result {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("RELEASE gensee_retention_prune")
+                    .map_err(SqliteError::Database)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO gensee_retention_prune; RELEASE gensee_retention_prune",
+                );
+                Err(SqliteError::Database(error))
+            }
+        }
+    }
+
+    fn rebuild_alert_chain(&self) -> rusqlite::Result<()> {
+        let alerts = {
+            let mut statement = self.conn.prepare(
+                "SELECT alert_id, request_id, entity_kind, entity_id, severity, action,
+                    rule_id, message, path, evidence, created_at
+                 FROM alerts ORDER BY alert_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        NewAlert {
+                            request_id: row.get(1)?,
+                            entity_kind: row.get(2)?,
+                            entity_id: row.get(3)?,
+                            severity: row.get(4)?,
+                            action: row.get(5)?,
+                            rule_id: row.get(6)?,
+                            message: row.get(7)?,
+                            path: row.get(8)?,
+                            evidence: row.get(9)?,
+                            created_at: row.get(10)?,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut previous = genesis_hash();
+        for (alert_id, alert) in &alerts {
+            let entry = alert_entry_hash(&previous, alert);
+            self.conn.execute(
+                "UPDATE alerts SET prev_hash = ?1, entry_hash = ?2 WHERE alert_id = ?3",
+                params![previous, entry, alert_id],
+            )?;
+            previous = entry;
+        }
+        self.conn.execute("DELETE FROM alert_chain_head", [])?;
+        if !alerts.is_empty() {
+            self.conn.execute(
+                "INSERT INTO alert_chain_head(id, head_hash, count) VALUES (1, ?1, ?2)",
+                params![previous, alerts.len() as i64],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn system_events_for_request(
@@ -2784,6 +2951,83 @@ mod tests {
             .map(|event| event.ts)
             .collect::<Vec<_>>();
         assert_eq!(timestamps, vec![111, 999, 1000, 2000]);
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn retention_prunes_raw_cap_and_expired_low_severity_alerts() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-retention-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .insert_session(&NewSession {
+                session_id: "retention_session".to_string(),
+                agent_id: "codex".to_string(),
+                root_pid: 0,
+                first_event_at: 1,
+                last_event_at: None,
+                flagged: false,
+            })
+            .unwrap();
+        let request_id = store
+            .insert_request(&NewRequest {
+                session_id: "retention_session".to_string(),
+                original_user_prompt: None,
+                final_response: None,
+                events: None,
+                file_accessed_rate: 0.0,
+                network_rate: 0.0,
+            })
+            .unwrap();
+        for ts in 1..=5 {
+            store
+                .insert_system_event(&NewSystemEvent {
+                    pid: 1,
+                    request_id,
+                    ts,
+                    source: "macos-endpoint-security".to_string(),
+                    event_type: "write".to_string(),
+                    cwd: String::new(),
+                    args: None,
+                })
+                .unwrap();
+        }
+        for (severity, created_at) in [("medium", 10), ("high", 10), ("low", 200)] {
+            store
+                .insert_alert(&NewAlert {
+                    request_id: Some(request_id),
+                    entity_kind: None,
+                    entity_id: None,
+                    severity: severity.to_string(),
+                    action: "warn".to_string(),
+                    rule_id: format!("retention_{severity}"),
+                    message: "retention test".to_string(),
+                    path: None,
+                    evidence: None,
+                    created_at,
+                })
+                .unwrap();
+        }
+
+        let pruned = store
+            .prune_endpoint_retention(0, 2, Some(100), 100)
+            .unwrap();
+        assert_eq!(pruned.system_events, 3);
+        assert_eq!(pruned.low_severity_alerts, 1);
+        assert_eq!(
+            store.system_events_for_request(request_id).unwrap().len(),
+            2
+        );
+        let alerts = store.list_alerts().unwrap();
+        assert_eq!(alerts.len(), 2);
+        assert!(alerts.iter().any(|alert| alert.severity == "high"));
+        assert!(alerts.iter().any(|alert| alert.severity == "low"));
+        assert!(store.verify_alert_chain().unwrap().is_valid());
 
         drop(store);
         remove_sqlite_files(&path);

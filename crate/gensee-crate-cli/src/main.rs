@@ -3353,6 +3353,11 @@ const SETTABLE_POLICY_KEYS: &[&str] = &[
     "endpoint_security.protected_paths",
     "endpoint_security.blocked_executables",
     "endpoint_security.max_auth_latency_ms",
+    "endpoint_security.minimum_recorded_severity",
+    "endpoint_security.raw_event_scope",
+    "endpoint_security.raw_event_retention_hours",
+    "endpoint_security.max_raw_events",
+    "endpoint_security.low_severity_retention_hours",
     "watch.system_events",
     "allow_path_prefixes",
 ];
@@ -3400,6 +3405,17 @@ pub(crate) fn telemetry_policy_key_bucket(key: &str) -> &'static str {
         "endpoint_security.mode" => "endpoint_security.mode",
         "endpoint_security.protected_paths" => "endpoint_security.protected_paths",
         "endpoint_security.blocked_executables" => "endpoint_security.blocked_executables",
+        "endpoint_security.minimum_recorded_severity" => {
+            "endpoint_security.minimum_recorded_severity"
+        }
+        "endpoint_security.raw_event_scope" => "endpoint_security.raw_event_scope",
+        "endpoint_security.raw_event_retention_hours" => {
+            "endpoint_security.raw_event_retention_hours"
+        }
+        "endpoint_security.max_raw_events" => "endpoint_security.max_raw_events",
+        "endpoint_security.low_severity_retention_hours" => {
+            "endpoint_security.low_severity_retention_hours"
+        }
         "watch.system_events" => "watch.system_events",
         "allow_path_prefixes" => "allow_path_prefixes",
         _ => "custom",
@@ -3741,6 +3757,17 @@ fn feedback_list(args: Vec<OsString>) -> io::Result<()> {
 
 fn dashboard_state() -> io::Result<()> {
     let store = EventStore::default_local()?;
+    let recording = Policy::load_current().document().endpoint_security.clone();
+    if let Err(error) = store.prune_endpoint_retention(
+        unix_millis()?,
+        recording.raw_event_retention_hours,
+        recording.max_raw_events,
+        recording.low_severity_retention_hours,
+    ) {
+        // Retention maintenance must never make the console unavailable. The
+        // next sensor commit or dashboard refresh will retry the bounded prune.
+        eprintln!("gensee: retention maintenance delayed: {error}");
+    }
     println!("{}", serde_json::to_string(&store.dashboard_state()?)?);
     Ok(())
 }
@@ -3796,6 +3823,11 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
     let mut rejected = 0_u64;
     let mut received_in_batch = 0_u64;
     let mut rejected_in_batch = 0_u64;
+    let mut persisted_in_batch = 0_u64;
+    let mut suppressed_in_batch = 0_u64;
+    let mut batch_started = Instant::now();
+    let mut last_prune = Instant::now() - Duration::from_secs(60);
+    let mut recording = Policy::load_current().document().endpoint_security.clone();
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -3807,12 +3839,53 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             continue;
         }
         if let Some(commit) = endpoint_ingest_commit(line)? {
-            let acknowledgement =
+            let mut acknowledgement =
                 endpoint_ingest_ack(&commit, received_in_batch, rejected_in_batch)?;
+            let mut pruned_system_events = 0_u64;
+            let mut pruned_low_severity_alerts = 0_u64;
+            recording = Policy::load_current().document().endpoint_security.clone();
+            if last_prune.elapsed() >= Duration::from_secs(60) {
+                let pruned = store.prune_endpoint_retention(
+                    unix_millis()?,
+                    recording.raw_event_retention_hours,
+                    recording.max_raw_events,
+                    recording.low_severity_retention_hours,
+                )?;
+                pruned_system_events = pruned.system_events;
+                pruned_low_severity_alerts = pruned.low_severity_alerts;
+                // A full result means more expired rows remain. Continue in
+                // bounded chunks on subsequent commits instead of holding the
+                // ingest pipe for one unbounded deletion transaction.
+                if pruned.system_events < 25_000 && pruned.low_severity_alerts < 25_000 {
+                    last_prune = Instant::now();
+                }
+            }
+            if let Some(object) = acknowledgement.as_object_mut() {
+                object.insert("persisted_events".to_string(), json!(persisted_in_batch));
+                object.insert("suppressed_events".to_string(), json!(suppressed_in_batch));
+                object.insert(
+                    "ingest_duration_ms".to_string(),
+                    json!(batch_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64),
+                );
+                object.insert(
+                    "pruned_system_events".to_string(),
+                    json!(pruned_system_events),
+                );
+                object.insert(
+                    "pruned_low_severity_alerts".to_string(),
+                    json!(pruned_low_severity_alerts),
+                );
+            }
             writeln!(stdout, "{}", serde_json::to_string(&acknowledgement)?)?;
             stdout.flush()?;
             received_in_batch = 0;
             rejected_in_batch = 0;
+            persisted_in_batch = 0;
+            suppressed_in_batch = 0;
+            batch_started = Instant::now();
             continue;
         }
         // The host's barrier counts every event line it sent. Rejected lines
@@ -3966,11 +4039,9 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 None
             };
         let exit_code = event.exit_status;
-        // Preserve the complete OS evidence stream even when no tool call is
-        // currently eligible for user-facing findings. Idle or stale process
-        // trees must not inherit request attribution, but their raw events are
-        // still useful for later audit and forensic analysis. Dashboard noise
-        // filtering is intentionally kept separate from evidence retention.
+        // Idle or stale process trees must not inherit request attribution.
+        // Raw evidence retention is an independent policy choice below: the
+        // default keeps only events correlated to an active tool-call window.
         if active_session_id.is_none() {
             event.attribution.session_id = None;
             event.attribution.root_pid = None;
@@ -3978,7 +4049,17 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             event.attribution.confidence = None;
             event.attribution.matched_by = None;
         }
-        store.append_system_event(&event.into_system_event()?)?;
+        let persist_raw_event = match recording.raw_event_scope {
+            policy::RawEventScope::None => false,
+            policy::RawEventScope::Active => active_session_id.is_some(),
+            policy::RawEventScope::All => true,
+        };
+        if persist_raw_event {
+            store.append_system_event(&event.into_system_event()?)?;
+            persisted_in_batch += 1;
+        } else {
+            suppressed_in_batch += 1;
+        }
         if let Some(session_id) = ended_root_session {
             store.end_session(&session_id, observed_at_ms, exit_code)?;
         }

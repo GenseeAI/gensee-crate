@@ -62,7 +62,10 @@ struct DashboardShell: View {
             model.endpointSensor.start()
             await model.refreshAll()
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
+                // Dashboard queries intentionally run less frequently than the
+                // sensor poll. This keeps UI projection work from competing
+                // with durable Endpoint Security ingestion under load.
+                try? await Task.sleep(for: .seconds(10))
                 await model.refreshDashboard(reportErrors: false)
             }
         }

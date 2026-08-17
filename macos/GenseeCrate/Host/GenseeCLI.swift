@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct GenseeCommandOutput: Sendable {
@@ -10,6 +11,7 @@ enum GenseeCLIError: LocalizedError {
     case executableNotFound
     case commandFailed(arguments: [String], output: String, exitCode: Int32)
     case commandTerminated(arguments: [String], signal: Int32)
+    case commandTimedOut(arguments: [String], seconds: TimeInterval)
     case invalidOutput(String)
 
     var errorDescription: String? {
@@ -25,6 +27,9 @@ enum GenseeCLIError: LocalizedError {
         case let .commandTerminated(arguments, signal):
             let command = (["gensee"] + arguments).joined(separator: " ")
             return "\(command) was terminated by signal \(signal)."
+        case let .commandTimedOut(arguments, seconds):
+            let command = (["gensee"] + arguments).joined(separator: " ")
+            return "\(command) did not finish within \(Int(seconds)) seconds. Gensee stopped that refresh and will retry automatically."
         case let .invalidOutput(message):
             return message
         }
@@ -133,13 +138,17 @@ struct GenseeCLI: Sendable {
         return manager.contentsEqual(atPath: source.path, andPath: destination.path)
     }
 
-    func run(_ arguments: [String]) async throws -> GenseeCommandOutput {
-        try await run(arguments, acceptingExitCodes: [0])
+    func run(
+        _ arguments: [String],
+        timeout: TimeInterval = 30
+    ) async throws -> GenseeCommandOutput {
+        try await run(arguments, acceptingExitCodes: [0], timeout: timeout)
     }
 
     func run(
         _ arguments: [String],
-        acceptingExitCodes: Set<Int32>
+        acceptingExitCodes: Set<Int32>,
+        timeout: TimeInterval = 30
     ) async throws -> GenseeCommandOutput {
         guard let executableURL else { throw GenseeCLIError.executableNotFound }
         let homeURL = homeURL
@@ -170,9 +179,30 @@ struct GenseeCLI: Sendable {
             let stderrTask = Task.detached {
                 stderrPipe.fileHandleForReading.readDataToEndOfFile()
             }
+            let deadline = ProcessInfo.processInfo.systemUptime + timeout
+            while process.isRunning,
+                  ProcessInfo.processInfo.systemUptime < deadline,
+                  !Task.isCancelled
+            {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if process.isRunning {
+                let processIdentifier = process.processIdentifier
+                process.terminate()
+                try? await Task.sleep(for: .milliseconds(250))
+                if process.isRunning {
+                    Darwin.kill(processIdentifier, SIGKILL)
+                }
+                while process.isRunning {
+                    try? await Task.sleep(for: .milliseconds(25))
+                }
+                _ = await stdoutTask.value
+                _ = await stderrTask.value
+                if Task.isCancelled { throw CancellationError() }
+                throw GenseeCLIError.commandTimedOut(arguments: arguments, seconds: timeout)
+            }
             let stdout = await stdoutTask.value
             let stderr = await stderrTask.value
-            process.waitUntilExit()
 
             let result = GenseeCommandOutput(
                 stdout: String(decoding: stdout, as: UTF8.self),
@@ -197,16 +227,25 @@ struct GenseeCLI: Sendable {
         }.value
     }
 
-    func decode<T: Decodable>(_ type: T.Type, arguments: [String]) async throws -> T {
-        try await decode(type, arguments: arguments, acceptingExitCodes: [0])
+    func decode<T: Decodable>(
+        _ type: T.Type,
+        arguments: [String],
+        timeout: TimeInterval = 30
+    ) async throws -> T {
+        try await decode(type, arguments: arguments, acceptingExitCodes: [0], timeout: timeout)
     }
 
     func decode<T: Decodable>(
         _ type: T.Type,
         arguments: [String],
-        acceptingExitCodes: Set<Int32>
+        acceptingExitCodes: Set<Int32>,
+        timeout: TimeInterval = 30
     ) async throws -> T {
-        let output = try await run(arguments, acceptingExitCodes: acceptingExitCodes)
+        let output = try await run(
+            arguments,
+            acceptingExitCodes: acceptingExitCodes,
+            timeout: timeout
+        )
         guard let data = output.stdout.data(using: .utf8) else {
             throw GenseeCLIError.invalidOutput("The Gensee backend returned non-UTF-8 output.")
         }

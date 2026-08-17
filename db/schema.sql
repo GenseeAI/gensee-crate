@@ -287,6 +287,13 @@ CREATE INDEX IF NOT EXISTS idx_requests_dashboard_activity
 CREATE INDEX IF NOT EXISTS idx_agent_events_tool_use
     ON agent_events(tool_use_id);
 
+-- File-intent correlation always starts with a narrow timestamp window. This
+-- partial index prevents every Endpoint Security file event from scanning the
+-- complete agent-event history before JSON path matching.
+CREATE INDEX IF NOT EXISTS idx_agent_events_file_intent_ts
+    ON agent_events(ts, event_id)
+    WHERE type = 'file_intent' AND tool_input IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_system_events_request_ts
     ON system_events(request_id, ts);
 
@@ -294,6 +301,9 @@ CREATE INDEX IF NOT EXISTS idx_system_events_request_ts
 -- Endpoint Security stream remains in the audit database.
 CREATE INDEX IF NOT EXISTS idx_system_events_dashboard_visibility
     ON system_events(source, request_id, ts DESC, event_id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_system_events_retention
+    ON system_events(source, ts, event_id);
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind_uri
     ON artifacts(kind, uri);
