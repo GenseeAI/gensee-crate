@@ -5,6 +5,10 @@ pub(crate) use gensee_crate_core::{
     parse_mcp_file_intents, parse_vscode_file_intents, redact_text, redact_value, AgentHookEvent,
     AgentSession, FileIntent, ProcessObservation, SystemEvent, WorkspaceEffect,
 };
+pub(crate) use gensee_crate_macos::{
+    endpoint_security_event_is_bookkeeping, EndpointSecurityAlertPipeline, EndpointSecurityEvent,
+    EndpointSecurityIngestor,
+};
 pub(crate) use gensee_crate_rules::policy::{self, Policy};
 pub(crate) use gensee_crate_store::{
     daemon_socket_path, default_root, AlertRecord, ArtifactObservationInput, ArtifactRiskTagInput,
@@ -25,10 +29,20 @@ pub(crate) use std::sync::mpsc;
 pub(crate) use std::thread;
 pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+pub(crate) fn cli_test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub(crate) const PROCESS_SAMPLE_WINDOW_MS: u64 = 15_000;
 pub(crate) const PROCESS_SAMPLE_INTERVAL_MS: u64 = 25;
 pub(crate) const STARTED_TOOL_WINDOW_MS: u64 = 15_000;
 pub(crate) const TOOL_WINDOW_TOLERANCE_MS: u64 = 250;
+pub(crate) const ENDPOINT_ACTIVE_TOOL_WINDOW_MS: u64 = 60_000;
+pub(crate) const ENDPOINT_ALERT_DEDUPE_WINDOW_MS: u64 = 10_000;
 pub(crate) const PREEXEC_CONTENT_READ_LIMIT_BYTES: u64 = 64 * 1024;
 pub(crate) const ARTIFACT_CONTENT_READ_TIMEOUT_MS: u64 = 150;
 pub(crate) const ARTIFACT_FACT_RECENT_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -260,6 +274,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
         Some("dashboard-state") => {
             args.remove(0);
             dashboard_state()
+        }
+        Some("dashboard-day") => {
+            args.remove(0);
+            dashboard_day(args)
         }
         Some("telemetry") => {
             args.remove(0);
@@ -873,7 +891,7 @@ pub(crate) fn handle_setup(args: Vec<OsString>) -> io::Result<()> {
         Some("cursor") => setup_cursor(args[1..].to_vec()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee setup <claude-code|codex|antigravity|vscode|cursor> [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
+            "usage: gensee setup <claude-code|codex|antigravity|vscode|cursor> [--disable] [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
         )),
     }
 }
@@ -888,6 +906,8 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
     let mut gateway = ClaudeCodeGatewaySettings::default();
+    let mut disable = false;
+    let mut repair = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -895,6 +915,14 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
         })?;
         match arg {
+            "--disable" => {
+                disable = true;
+                index += 1;
+            }
+            "--repair" => {
+                repair = true;
+                index += 1;
+            }
             "--yes" => {
                 index += 1;
             }
@@ -947,7 +975,7 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup claude-code [--gensee-home <path>] [--settings <path>] [--bin <path>] [--anthropic-base-url <url>] [--anthropic-auth-token <token>|--anthropic-api-key <key>|--api-key-helper <command>]"
+                    "usage: gensee setup claude-code [--disable|--repair] [--gensee-home <path>] [--settings <path>] [--bin <path>] [--anthropic-base-url <url>] [--anthropic-auth-token <token>|--anthropic-api-key <key>|--api-key-helper <command>]"
                 );
                 return Ok(());
             }
@@ -961,10 +989,27 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
     }
     gateway.validate()?;
 
+    if disable {
+        remove_hook_settings(
+            &settings_path,
+            PROVIDER_CLAUDE_CODE,
+            HookLayout::Nested,
+            &["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"],
+            "settings",
+            Some(0o600),
+        )?;
+        remove_managed_claude_code_gateway_settings(&settings_path)?;
+        println!(
+            "gensee setup: disabled Claude Code hooks in {}",
+            settings_path.display()
+        );
+        return Ok(());
+    }
+
     gensee_home = absolutize_for_hook(&gensee_home)?;
     bin_path = absolutize_for_hook(&bin_path)?;
     let command = claude_code_hook_command(&gensee_home, &bin_path);
-    let hooks_disabled = write_claude_code_settings(&settings_path, &command, &gateway)?;
+    let hooks_disabled = write_claude_code_settings(&settings_path, &command, &gateway, repair)?;
 
     println!(
         "gensee setup: configured Claude Code hooks in {}",
@@ -972,6 +1017,9 @@ fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {
     );
     if !gateway.is_empty() {
         println!("gensee setup: configured Claude Code gateway routing.");
+    }
+    if repair {
+        println!("gensee setup: repaired Claude Code hook activation and routing.");
     }
     if let Some(warning) = claude_code_disabled_hooks_warning(hooks_disabled) {
         eprintln!("{warning}");
@@ -996,6 +1044,7 @@ fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
+    let mut disable = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -1003,6 +1052,10 @@ fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
         })?;
         match arg {
+            "--disable" => {
+                disable = true;
+                index += 1;
+            }
             "--yes" => {
                 index += 1;
             }
@@ -1035,7 +1088,7 @@ fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup codex [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                    "usage: gensee setup codex [--disable] [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
                 );
                 return Ok(());
             }
@@ -1046,6 +1099,28 @@ fn setup_codex(args: Vec<OsString>) -> io::Result<()> {
                 ));
             }
         }
+    }
+
+    if disable {
+        remove_hook_settings(
+            &hooks_path,
+            PROVIDER_CODEX,
+            HookLayout::Nested,
+            &[
+                "UserPromptSubmit",
+                "PreToolUse",
+                "PermissionRequest",
+                "PostToolUse",
+                "Stop",
+            ],
+            "hooks",
+            None,
+        )?;
+        println!(
+            "gensee setup: disabled Codex hooks in {}",
+            hooks_path.display()
+        );
+        return Ok(());
     }
 
     gensee_home = absolutize_for_hook(&gensee_home)?;
@@ -1069,6 +1144,7 @@ fn setup_antigravity(args: Vec<OsString>) -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
+    let mut disable = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -1076,6 +1152,10 @@ fn setup_antigravity(args: Vec<OsString>) -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
         })?;
         match arg {
+            "--disable" => {
+                disable = true;
+                index += 1;
+            }
             "--yes" => {
                 index += 1;
             }
@@ -1108,7 +1188,7 @@ fn setup_antigravity(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup antigravity [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                    "usage: gensee setup antigravity [--disable] [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
                 );
                 return Ok(());
             }
@@ -1119,6 +1199,15 @@ fn setup_antigravity(args: Vec<OsString>) -> io::Result<()> {
                 ));
             }
         }
+    }
+
+    if disable {
+        remove_antigravity_hook_settings(&hooks_path)?;
+        println!(
+            "gensee setup: disabled Antigravity hooks in {}",
+            hooks_path.display()
+        );
+        return Ok(());
     }
 
     gensee_home = absolutize_for_hook(&gensee_home)?;
@@ -1164,6 +1253,7 @@ fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
+    let mut disable = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -1171,6 +1261,10 @@ fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
         })?;
         match arg {
+            "--disable" => {
+                disable = true;
+                index += 1;
+            }
             "--yes" => {
                 index += 1;
             }
@@ -1203,7 +1297,7 @@ fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup vscode [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                    "usage: gensee setup vscode [--disable] [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
                 );
                 return Ok(());
             }
@@ -1214,6 +1308,22 @@ fn setup_vscode(args: Vec<OsString>) -> io::Result<()> {
                 ));
             }
         }
+    }
+
+    if disable {
+        remove_hook_settings(
+            &hooks_path,
+            PROVIDER_VSCODE,
+            HookLayout::Flat,
+            &["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"],
+            "hooks",
+            None,
+        )?;
+        println!(
+            "gensee setup: disabled VS Code hooks in {}",
+            hooks_path.display()
+        );
+        return Ok(());
     }
 
     gensee_home = absolutize_for_hook(&gensee_home)?;
@@ -1289,6 +1399,7 @@ fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or(default_root()?);
     let mut bin_path = env::current_exe()?;
+    let mut disable = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -1296,6 +1407,10 @@ fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "setup: non-UTF8 argument")
         })?;
         match arg {
+            "--disable" => {
+                disable = true;
+                index += 1;
+            }
             "--yes" => {
                 index += 1;
             }
@@ -1328,7 +1443,7 @@ fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: gensee setup cursor [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
+                    "usage: gensee setup cursor [--disable] [--gensee-home <path>] [--hooks <path>] [--bin <path>]"
                 );
                 return Ok(());
             }
@@ -1339,6 +1454,28 @@ fn setup_cursor(args: Vec<OsString>) -> io::Result<()> {
                 ));
             }
         }
+    }
+
+    if disable {
+        remove_hook_settings(
+            &hooks_path,
+            PROVIDER_CURSOR,
+            HookLayout::Flat,
+            &[
+                "preToolUse",
+                "postToolUse",
+                "beforeShellExecution",
+                "beforeSubmitPrompt",
+                "stop",
+            ],
+            "hooks",
+            None,
+        )?;
+        println!(
+            "gensee setup: disabled Cursor hooks in {}",
+            hooks_path.display()
+        );
+        return Ok(());
     }
 
     gensee_home = absolutize_for_hook(&gensee_home)?;
@@ -1622,6 +1759,175 @@ fn merge_nested_hook_event(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum HookLayout {
+    Flat,
+    Nested,
+}
+
+fn remove_flat_hook_event(
+    hooks: &mut serde_json::Map<String, Value>,
+    event_name: &str,
+    provider: &str,
+    integration: &str,
+) -> io::Result<bool> {
+    let Some(value) = hooks.get_mut(event_name) else {
+        return Ok(false);
+    };
+    let entries = value.as_array_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{integration} {event_name} hooks must be a JSON array"),
+        )
+    })?;
+    let context = format!("{integration} {event_name}");
+    let owned = entries
+        .iter()
+        .map(|entry| command_hook_owned_by(entry, provider, &context))
+        .collect::<io::Result<Vec<_>>>()?;
+    let removed = owned.iter().any(|is_owned| *is_owned);
+    let mut index = 0;
+    entries.retain(|_| {
+        let keep = !owned[index];
+        index += 1;
+        keep
+    });
+    if entries.is_empty() {
+        hooks.remove(event_name);
+    }
+    Ok(removed)
+}
+
+fn remove_nested_hook_event(
+    hooks: &mut serde_json::Map<String, Value>,
+    event_name: &str,
+    provider: &str,
+    integration: &str,
+) -> io::Result<bool> {
+    let Some(value) = hooks.get_mut(event_name) else {
+        return Ok(false);
+    };
+    let entries = value.as_array_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{integration} {event_name} hooks must be a JSON array"),
+        )
+    })?;
+    let context = format!("{integration} {event_name}");
+    let owned = validate_nested_hook_groups(entries, provider, &context)?;
+    let removed = owned
+        .iter()
+        .any(|group| group.iter().any(|is_owned| *is_owned));
+
+    for (entry, group_owned) in entries.iter_mut().zip(owned.iter()) {
+        let commands = entry
+            .get_mut("hooks")
+            .and_then(Value::as_array_mut)
+            .expect("nested hook groups were validated");
+        let mut index = 0;
+        commands.retain(|_| {
+            let keep = !group_owned[index];
+            index += 1;
+            keep
+        });
+    }
+    entries.retain(|entry| {
+        entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|commands| !commands.is_empty())
+    });
+    if entries.is_empty() {
+        hooks.remove(event_name);
+    }
+    Ok(removed)
+}
+
+fn remove_hook_settings(
+    path: &Path,
+    provider: &str,
+    layout: HookLayout,
+    event_names: &[&str],
+    backup_subject: &str,
+    new_file_mode: Option<u32>,
+) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let (existing_contents, mut root) = read_json_config(path)?;
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} must be a JSON object", path.display()),
+        )
+    })?;
+    let Some(hooks_value) = root_object.get_mut("hooks") else {
+        return Ok(false);
+    };
+    let hooks = hooks_value.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "hooks field must be a JSON object",
+        )
+    })?;
+    let mut changed = false;
+    for event_name in event_names {
+        changed |= match layout {
+            HookLayout::Flat => remove_flat_hook_event(hooks, event_name, provider, "Agent")?,
+            HookLayout::Nested => remove_nested_hook_event(hooks, event_name, provider, "Agent")?,
+        };
+    }
+    if hooks.is_empty() {
+        root_object.remove("hooks");
+    }
+    if !changed {
+        return Ok(false);
+    }
+    write_json_config_if_changed_with_mode(
+        path,
+        existing_contents.as_deref(),
+        &root,
+        backup_subject,
+        new_file_mode,
+    )
+}
+
+fn remove_antigravity_hook_settings(path: &Path) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let (existing_contents, mut root) = read_json_config(path)?;
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Antigravity hooks must be a JSON object",
+        )
+    })?;
+    let Some(policy_value) = root_object.get_mut("gensee-policy") else {
+        return Ok(false);
+    };
+    let policy = policy_value.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Antigravity gensee-policy field must be a JSON object",
+        )
+    })?;
+    let mut changed = false;
+    for event_name in ["PreToolUse", "PostToolUse"] {
+        changed |=
+            remove_nested_hook_event(policy, event_name, PROVIDER_ANTIGRAVITY, "Antigravity")?;
+    }
+    changed |=
+        remove_flat_hook_event(policy, "PreInvocation", PROVIDER_ANTIGRAVITY, "Antigravity")?;
+    if policy.is_empty() {
+        root_object.remove("gensee-policy");
+    }
+    if !changed {
+        return Ok(false);
+    }
+    write_json_config_if_changed(path, existing_contents.as_deref(), &root, "hooks")
+}
+
 pub(crate) fn apply_cursor_hook_settings(root: &mut Value, command: &str) -> io::Result<()> {
     let root_object = root.as_object_mut().ok_or_else(|| {
         io::Error::new(
@@ -1729,10 +2035,16 @@ fn write_claude_code_settings(
     settings_path: &Path,
     command: &str,
     gateway: &ClaudeCodeGatewaySettings,
+    repair_disabled_hooks: bool,
 ) -> io::Result<bool> {
     let (existing_contents, mut root) = read_json_config(settings_path)?;
     apply_claude_code_hook_settings(&mut root, command)?;
     apply_claude_code_gateway_settings(&mut root, gateway)?;
+    if repair_disabled_hooks && root.get("disableAllHooks").and_then(Value::as_bool) == Some(true) {
+        root.as_object_mut()
+            .expect("Claude Code settings are an object after hook configuration")
+            .insert("disableAllHooks".to_string(), json!(false));
+    }
     let hooks_disabled = root
         .get("disableAllHooks")
         .and_then(Value::as_bool)
@@ -1760,6 +2072,8 @@ fn apply_claude_code_gateway_settings(
             "Claude Code settings must be a JSON object",
         )
     })?;
+    remove_managed_claude_code_gateway_settings_from_root(root_object);
+    let mut managed_keys = Vec::new();
     {
         let env_value = root_object
             .entry("env".to_string())
@@ -1771,20 +2085,24 @@ fn apply_claude_code_gateway_settings(
 
         if let Some(base_url) = gateway.base_url.as_deref() {
             env_object.insert("ANTHROPIC_BASE_URL".to_string(), json!(base_url));
+            managed_keys.push("ANTHROPIC_BASE_URL");
         }
         if let Some(custom_headers) = gateway.custom_headers.as_deref() {
             env_object.insert(
                 "ANTHROPIC_CUSTOM_HEADERS".to_string(),
                 json!(custom_headers),
             );
+            managed_keys.push("ANTHROPIC_CUSTOM_HEADERS");
         }
         if let Some(auth_token) = gateway.auth_token.as_deref() {
             env_object.insert("ANTHROPIC_AUTH_TOKEN".to_string(), json!(auth_token));
             env_object.remove("ANTHROPIC_API_KEY");
+            managed_keys.push("ANTHROPIC_AUTH_TOKEN");
         }
         if let Some(api_key) = gateway.api_key.as_deref() {
             env_object.insert("ANTHROPIC_API_KEY".to_string(), json!(api_key));
             env_object.remove("ANTHROPIC_AUTH_TOKEN");
+            managed_keys.push("ANTHROPIC_API_KEY");
         }
         if gateway.api_key_helper.is_some() {
             env_object.remove("ANTHROPIC_AUTH_TOKEN");
@@ -1797,8 +2115,54 @@ fn apply_claude_code_gateway_settings(
     }
     if let Some(helper) = gateway.api_key_helper.as_deref() {
         root_object.insert("apiKeyHelper".to_string(), json!(helper));
+        managed_keys.push("apiKeyHelper");
     }
+    root_object.insert("genseeGatewayManagedKeys".to_string(), json!(managed_keys));
     Ok(())
+}
+
+fn remove_managed_claude_code_gateway_settings(settings_path: &Path) -> io::Result<()> {
+    let (existing_contents, mut root) = read_json_config(settings_path)?;
+    let root_object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Claude Code settings must be a JSON object",
+        )
+    })?;
+    remove_managed_claude_code_gateway_settings_from_root(root_object);
+    write_json_config_if_changed_with_mode(
+        settings_path,
+        existing_contents.as_deref(),
+        &root,
+        "settings",
+        Some(0o600),
+    )
+    .map(|_| ())
+}
+
+fn remove_managed_claude_code_gateway_settings_from_root(
+    root_object: &mut serde_json::Map<String, Value>,
+) {
+    let managed_keys = root_object
+        .remove("genseeGatewayManagedKeys")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    if let Some(env_object) = root_object.get_mut("env").and_then(Value::as_object_mut) {
+        for key in &managed_keys {
+            if let Some(key) = key.as_str().filter(|key| *key != "apiKeyHelper") {
+                env_object.remove(key);
+            }
+        }
+        if env_object.is_empty() {
+            root_object.remove("env");
+        }
+    }
+    if managed_keys
+        .iter()
+        .any(|key| key.as_str() == Some("apiKeyHelper"))
+    {
+        root_object.remove("apiKeyHelper");
+    }
 }
 
 fn write_codex_hook_settings(hooks_path: &Path, command: &str) -> io::Result<()> {
@@ -1984,6 +2348,12 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn absolutize_for_hook(path: &Path) -> io::Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hook paths must not be empty",
+        ));
+    }
     if path.is_absolute() {
         Ok(path.to_path_buf())
     } else {
@@ -2031,10 +2401,10 @@ pub(crate) fn handle_policy(args: Vec<OsString>) -> io::Result<()> {
             })?;
             let contents = fs::read_to_string(file)?;
             match Policy::from_json(&contents) {
-                Ok(_) => {
+                Ok(validated) => {
                     println!(
                         "gensee policy: {file} is valid (schema_version {})",
-                        policy::POLICY_SCHEMA_VERSION
+                        validated.document().schema_version
                     );
                     Ok(())
                 }
@@ -2136,6 +2506,7 @@ pub(crate) fn handle_policy(args: Vec<OsString>) -> io::Result<()> {
             };
             policy_value_set(&mut root, key, coerce_policy_value(key, raw))
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            root["schema_version"] = json!(policy::POLICY_SCHEMA_VERSION);
             let serialized = serde_json::to_string_pretty(&root)?;
             // Reject a change that would make the document invalid, before writing.
             Policy::from_json(&serialized).map_err(|err| {
@@ -2212,6 +2583,7 @@ fn policy_setup(args: Vec<OsString>) -> io::Result<()> {
         }
     }
 
+    root["schema_version"] = json!(policy::POLICY_SCHEMA_VERSION);
     let serialized = serde_json::to_string_pretty(&root)?;
     Policy::from_json(&serialized).map_err(|err| {
         io::Error::new(
@@ -2825,11 +3197,35 @@ const ENFORCEMENT_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[PolicySetupItem {
     allow_null: false,
 }];
 
+const ENDPOINT_SECURITY_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[
+    PolicySetupItem {
+        key: "endpoint_security.mode",
+        value_type: PolicySetupValueType::String,
+        label: "Endpoint Security mode",
+        help: "off, observe, protect, or strict",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "endpoint_security.protected_paths",
+        value_type: PolicySetupValueType::List,
+        label: "Protected macOS paths",
+        help: "Additional absolute path prefixes denied to managed agent trees",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "endpoint_security.blocked_executables",
+        value_type: PolicySetupValueType::List,
+        label: "Blocked macOS executables",
+        help: "Absolute executable paths denied to managed agent trees",
+        allow_null: false,
+    },
+];
+
 const WATCH_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[PolicySetupItem {
     key: "watch.system_events",
     value_type: PolicySetupValueType::String,
     label: "System events",
-    help: "System-event backend for gensee watch: eslogger or none",
+    help: "System-event backend: endpoint-security, eslogger, or none",
     allow_null: false,
 }];
 
@@ -2866,6 +3262,11 @@ const POLICY_SETUP_GROUPS: &[PolicySetupGroup] = &[
         name: "Enforcement",
         hint: "How policy behaves when no human can approve an ask decision.",
         items: ENFORCEMENT_POLICY_SETUP_ITEMS,
+    },
+    PolicySetupGroup {
+        name: "Endpoint Security",
+        hint: "First-party macOS observation and authorization.",
+        items: ENDPOINT_SECURITY_POLICY_SETUP_ITEMS,
     },
     PolicySetupGroup {
         name: "Watch",
@@ -2958,6 +3359,15 @@ const SETTABLE_POLICY_KEYS: &[&str] = &[
     "linux.network.allow",
     "linux.network.deny",
     "enforcement.noninteractive",
+    "endpoint_security.mode",
+    "endpoint_security.protected_paths",
+    "endpoint_security.blocked_executables",
+    "endpoint_security.max_auth_latency_ms",
+    "endpoint_security.minimum_recorded_severity",
+    "endpoint_security.raw_event_scope",
+    "endpoint_security.raw_event_retention_hours",
+    "endpoint_security.max_raw_events",
+    "endpoint_security.low_severity_retention_hours",
     "watch.system_events",
     "allow_path_prefixes",
 ];
@@ -3002,6 +3412,20 @@ pub(crate) fn telemetry_policy_key_bucket(key: &str) -> &'static str {
         "linux.network.allow" => "linux.network.allow",
         "linux.network.deny" => "linux.network.deny",
         "enforcement.noninteractive" => "enforcement.noninteractive",
+        "endpoint_security.mode" => "endpoint_security.mode",
+        "endpoint_security.protected_paths" => "endpoint_security.protected_paths",
+        "endpoint_security.blocked_executables" => "endpoint_security.blocked_executables",
+        "endpoint_security.minimum_recorded_severity" => {
+            "endpoint_security.minimum_recorded_severity"
+        }
+        "endpoint_security.raw_event_scope" => "endpoint_security.raw_event_scope",
+        "endpoint_security.raw_event_retention_hours" => {
+            "endpoint_security.raw_event_retention_hours"
+        }
+        "endpoint_security.max_raw_events" => "endpoint_security.max_raw_events",
+        "endpoint_security.low_severity_retention_hours" => {
+            "endpoint_security.low_severity_retention_hours"
+        }
         "watch.system_events" => "watch.system_events",
         "allow_path_prefixes" => "allow_path_prefixes",
         _ => "custom",
@@ -3071,9 +3495,10 @@ fn coerce_policy_value(key: &str, raw: &str) -> Value {
 pub(crate) fn handle_ingest(args: Vec<OsString>) -> io::Result<()> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("eslogger") => ingest_eslogger(),
+        Some("endpoint-security") => ingest_endpoint_security(),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee ingest eslogger",
+            "usage: gensee ingest eslogger|endpoint-security",
         )),
     }
 }
@@ -3346,6 +3771,21 @@ fn dashboard_state() -> io::Result<()> {
     Ok(())
 }
 
+fn dashboard_day(args: Vec<OsString>) -> io::Result<()> {
+    let [day] = args.as_slice() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee dashboard-day <YYYY-MM-DD>",
+        ));
+    };
+    let day = day.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "dashboard day must be UTF-8")
+    })?;
+    let store = EventStore::default_local()?;
+    println!("{}", serde_json::to_string(&store.dashboard_day(day)?)?);
+    Ok(())
+}
+
 pub(crate) fn ingest_eslogger() -> io::Result<()> {
     let store = EventStore::default_local()?;
     let mut count = 0_u64;
@@ -3368,6 +3808,389 @@ pub(crate) fn ingest_eslogger() -> io::Result<()> {
 
     eprintln!("gensee: ingested {count} eslogger event(s)");
     Ok(())
+}
+
+/// Persist the versioned JSONL stream emitted by the signed Gensee Endpoint
+/// Security system extension. This process is intentionally long-lived: its
+/// in-memory graph carries exact `(pid,pidversion)` ancestry across fork/exec.
+pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
+    let store = EventStore::default_local()?;
+    let sessions = store.list_sessions()?;
+    let mut ingestor = EndpointSecurityIngestor::new(&sessions);
+    let mut alert_pipeline = EndpointSecurityAlertPipeline::default();
+    let mut count = 0_u64;
+    let mut rejected = 0_u64;
+    let mut received_in_batch = 0_u64;
+    let mut rejected_in_batch = 0_u64;
+    let mut persisted_in_batch = 0_u64;
+    let mut suppressed_in_batch = 0_u64;
+    let mut batch_started = Instant::now();
+    let mut recording = Policy::load_current().document().endpoint_security.clone();
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(commit) = endpoint_ingest_commit(line)? {
+            let mut acknowledgement =
+                endpoint_ingest_ack(&commit, received_in_batch, rejected_in_batch)?;
+            let mut pruned_system_events = 0_u64;
+            let mut pruned_low_severity_alerts = 0_u64;
+            recording = Policy::load_current().document().endpoint_security.clone();
+            if let Some(pruned) = store.prune_endpoint_retention_if_due(
+                unix_millis()?,
+                60_000,
+                recording.raw_event_retention_hours,
+                recording.max_raw_events,
+                recording.low_severity_retention_hours,
+            )? {
+                pruned_system_events = pruned.system_events;
+                pruned_low_severity_alerts = pruned.low_severity_alerts;
+            }
+            // An ingest commit is outside authorization latency and can safely
+            // advance one throttled artifact-visibility migration batch.
+            if let Err(error) = store.migrate_artifact_dashboard_visibility_if_due(
+                unix_millis()?,
+                gensee_crate_store::ARTIFACT_VISIBILITY_MAINTENANCE_INTERVAL_MS,
+            ) {
+                eprintln!(
+                    "gensee endpoint ingest: artifact visibility maintenance failed: {error}"
+                );
+            }
+            if let Some(object) = acknowledgement.as_object_mut() {
+                object.insert("persisted_events".to_string(), json!(persisted_in_batch));
+                object.insert("suppressed_events".to_string(), json!(suppressed_in_batch));
+                object.insert(
+                    "ingest_duration_ms".to_string(),
+                    json!(batch_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64),
+                );
+                object.insert(
+                    "pruned_system_events".to_string(),
+                    json!(pruned_system_events),
+                );
+                object.insert(
+                    "pruned_low_severity_alerts".to_string(),
+                    json!(pruned_low_severity_alerts),
+                );
+            }
+            writeln!(stdout, "{}", serde_json::to_string(&acknowledgement)?)?;
+            stdout.flush()?;
+            received_in_batch = 0;
+            rejected_in_batch = 0;
+            persisted_in_batch = 0;
+            suppressed_in_batch = 0;
+            batch_started = Instant::now();
+            continue;
+        }
+        // The host's barrier counts every event line it sent. Rejected lines
+        // still belong to that batch; report them in the durable ack so the
+        // host can advance past malformed/version-skewed evidence and surface
+        // the loss instead of replaying the same poisoned batch forever.
+        received_in_batch += 1;
+        let parsed = match EndpointSecurityEvent::parse(line) {
+            Ok(event) => event,
+            Err(error) => {
+                rejected += 1;
+                rejected_in_batch += 1;
+                eprintln!("gensee: rejected Endpoint Security event: {error}");
+                continue;
+            }
+        };
+        let (mut event, findings) = ingestor.ingest(parsed);
+        let attributed_session_id = event.attribution.session_id.clone();
+        let observed_at_ms = event.observed_at_ms;
+        let active_tool = attributed_session_id
+            .as_deref()
+            .map(|session_id| {
+                store.active_tool_call(session_id, observed_at_ms, ENDPOINT_ACTIVE_TOOL_WINDOW_MS)
+            })
+            .transpose()?
+            .flatten();
+        let active_session_id = active_tool
+            .as_ref()
+            .and(attributed_session_id.as_ref())
+            .cloned();
+        let tool_use_id = active_tool
+            .as_ref()
+            .and_then(|tool| tool.tool_use_id.clone());
+        let workspace_root = active_tool.as_ref().map(|tool| tool.cwd.as_str());
+        event.attribution.workspace_root = workspace_root.map(str::to_string);
+        let bookkeeping = endpoint_security_event_is_bookkeeping(&event, workspace_root);
+        let evidence = serde_json::to_value(&event).map_err(io::Error::other)?;
+        for finding in findings {
+            if finding.rule_id != "endpoint_security_event_gap"
+                && (active_session_id.is_none() || bookkeeping)
+            {
+                continue;
+            }
+            let alert = PolicyAlert {
+                session_id: active_session_id.clone(),
+                tool_use_id: tool_use_id.clone(),
+                severity: finding.severity.to_string(),
+                action: "warn".to_string(),
+                rule_id: finding.rule_id.to_string(),
+                message: finding.message,
+                path: finding.path,
+                evidence: Some(evidence.clone()),
+                observed_at_ms,
+            };
+            if let Some(session_id) = active_session_id.as_deref() {
+                let path = alert.path.as_deref().unwrap_or("");
+                let key =
+                    endpoint_alert_dedupe_key(session_id, &event, path, event.event_type.as_str());
+                store.append_endpoint_policy_alert(
+                    &alert,
+                    &key,
+                    ENDPOINT_ALERT_DEDUPE_WINDOW_MS,
+                )?;
+            } else {
+                store.append_policy_alert(&alert)?;
+            }
+        }
+        if event.decision.result.as_deref() == Some("deny")
+            && active_session_id.is_some()
+            && !bookkeeping
+        {
+            let alert = PolicyAlert {
+                session_id: active_session_id.clone(),
+                tool_use_id: tool_use_id.clone(),
+                severity: "high".to_string(),
+                action: "block".to_string(),
+                rule_id: event
+                    .decision
+                    .rule_id
+                    .clone()
+                    .unwrap_or_else(|| "endpoint_security_enforced".to_string()),
+                message: event.decision.reason.clone().unwrap_or_else(|| {
+                    "Endpoint Security denied an operating-system action".to_string()
+                }),
+                path: event.primary_path().map(str::to_string),
+                evidence: Some(evidence.clone()),
+                observed_at_ms,
+            };
+            let session_id = active_session_id.as_deref().unwrap_or_default();
+            let path = alert.path.as_deref().unwrap_or("");
+            let key =
+                endpoint_alert_dedupe_key(session_id, &event, path, event.event_type.as_str());
+            store.append_endpoint_policy_alert(&alert, &key, ENDPOINT_ALERT_DEDUPE_WINDOW_MS)?;
+        }
+        if event.action == "notify" {
+            if let Some(session_id) = active_session_id.as_deref() {
+                if let Some((logical_operation, path)) =
+                    alert_pipeline.logical_operation(&event, session_id, workspace_root)
+                {
+                    let policy_operation = endpoint_policy_operation(&event, logical_operation);
+                    let key =
+                        endpoint_alert_dedupe_key(session_id, &event, &path, logical_operation);
+                    let evidence = endpoint_alert_evidence(
+                        evidence.clone(),
+                        logical_operation,
+                        active_tool.as_ref().map(|tool| tool.provider.as_str()),
+                    );
+                    for finding in Policy::global().evaluate_observation(policy_operation, &path) {
+                        store.append_endpoint_policy_alert(
+                            &PolicyAlert {
+                                session_id: Some(session_id.to_string()),
+                                tool_use_id: tool_use_id.clone(),
+                                severity: finding.severity,
+                                action: "warn".to_string(),
+                                rule_id: if policy_operation == "read" {
+                                    "unreported_sensitive_open".to_string()
+                                } else {
+                                    finding.rule_id
+                                },
+                                message: finding.message,
+                                path: Some(path.clone()),
+                                evidence: Some(evidence.clone()),
+                                observed_at_ms,
+                            },
+                            &key,
+                            ENDPOINT_ALERT_DEDUPE_WINDOW_MS,
+                        )?;
+                    }
+                    if logical_operation != "read"
+                        && !store.has_recent_file_intent(&path, observed_at_ms)?
+                    {
+                        store.append_endpoint_policy_alert(&PolicyAlert {
+                            session_id: Some(session_id.to_string()),
+                            tool_use_id: tool_use_id.clone(),
+                            severity: "medium".to_string(),
+                            action: "warn".to_string(),
+                            rule_id: "hook_bypass_file_mutation".to_string(),
+                            message: "Agent process mutated a file without a matching hook-level file intent"
+                                .to_string(),
+                            path: Some(path),
+                            evidence: Some(evidence.clone()),
+                            observed_at_ms,
+                        }, &key, ENDPOINT_ALERT_DEDUPE_WINDOW_MS)?;
+                    }
+                }
+            }
+        }
+        let ended_root_session =
+            if event.event_type == "exit" && event.attribution.root_pid == Some(event.actor.pid) {
+                event.attribution.session_id.clone()
+            } else {
+                None
+            };
+        let exit_code = event.exit_status;
+        // Idle or stale process trees must not inherit request attribution.
+        // Raw evidence retention is an independent policy choice below: the
+        // default keeps only events correlated to an active tool-call window.
+        if active_session_id.is_none() {
+            event.attribution.session_id = None;
+            event.attribution.root_pid = None;
+            event.attribution.depth = None;
+            event.attribution.confidence = None;
+            event.attribution.matched_by = None;
+        }
+        let persist_raw_event = match recording.raw_event_scope {
+            policy::RawEventScope::None => false,
+            policy::RawEventScope::Active => active_session_id.is_some(),
+            policy::RawEventScope::All => true,
+        };
+        if persist_raw_event {
+            store.append_system_event(&event.into_system_event()?)?;
+            persisted_in_batch += 1;
+        } else {
+            suppressed_in_batch += 1;
+        }
+        if let Some(session_id) = ended_root_session {
+            store.end_session(&session_id, observed_at_ms, exit_code)?;
+        }
+        count += 1;
+    }
+
+    eprintln!("gensee: ingested {count} Endpoint Security event(s), rejected {rejected}");
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EndpointIngestCommit {
+    sensor_cursor: u64,
+    boot_id: String,
+    event_count: u64,
+}
+
+fn endpoint_ingest_commit(line: &str) -> io::Result<Option<EndpointIngestCommit>> {
+    let value = match serde_json::from_str::<Value>(line) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    let Some(control) = object.get("gensee_ingest_control") else {
+        return Ok(None);
+    };
+    if control.as_str() != Some("commit")
+        || object.get("protocol_version").and_then(Value::as_u64) != Some(1)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported Endpoint Security ingestion control record",
+        ));
+    }
+    let required_u64 = |name: &str| {
+        object.get(name).and_then(Value::as_u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Endpoint Security commit record is missing {name}"),
+            )
+        })
+    };
+    let boot_id = object
+        .get("boot_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Endpoint Security commit record is missing boot_id",
+            )
+        })?;
+    Ok(Some(EndpointIngestCommit {
+        sensor_cursor: required_u64("sensor_cursor")?,
+        boot_id: boot_id.to_string(),
+        event_count: required_u64("event_count")?,
+    }))
+}
+
+fn endpoint_ingest_ack(
+    commit: &EndpointIngestCommit,
+    received_events: u64,
+    rejected_events: u64,
+) -> io::Result<Value> {
+    if commit.event_count != received_events || rejected_events > received_events {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Endpoint Security batch declared {} event(s), but the ingester received {} and rejected {}",
+                commit.event_count, received_events, rejected_events
+            ),
+        ));
+    }
+    Ok(json!({
+        "gensee_ingest_ack": "committed",
+        "protocol_version": 1,
+        "sensor_cursor": commit.sensor_cursor,
+        "boot_id": commit.boot_id,
+        "event_count": commit.event_count,
+        "rejected_events": rejected_events,
+    }))
+}
+
+fn endpoint_policy_operation(
+    event: &EndpointSecurityEvent,
+    logical_operation: &'static str,
+) -> &'static str {
+    match logical_operation {
+        "read" => "read",
+        "rename" => "rename",
+        "delete" => "delete",
+        "mutation" if event.event_type == "create" => "create",
+        "mutation" => "write",
+        _ => logical_operation,
+    }
+}
+
+fn endpoint_alert_dedupe_key(
+    session_id: &str,
+    event: &EndpointSecurityEvent,
+    path: &str,
+    operation: &str,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        session_id, event.actor.pid, event.actor.pidversion, operation, path
+    )
+}
+
+fn endpoint_alert_evidence(
+    evidence: Value,
+    logical_operation: &str,
+    provider: Option<&str>,
+) -> Value {
+    let mut object = evidence.as_object().cloned().unwrap_or_default();
+    object.insert(
+        "logical_operation".to_string(),
+        Value::String(logical_operation.to_string()),
+    );
+    if let Some(provider) = provider {
+        object.insert(
+            "active_harness".to_string(),
+            Value::String(provider.to_string()),
+        );
+    }
+    Value::Object(object)
 }
 
 pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
@@ -3413,21 +4236,99 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     };
 
     let event = build_hook_event(&payload, effective_provider)?;
+    let session_registration = hook_session_registration(&event);
 
     // Fast path: if the warm daemon is up, hand off over its socket — PreToolUse
     // waits for the decision (warm eval, no per-call store open), observational
     // events fire-and-forget off the critical path. Falls through to the
     // in-process path if the daemon is unreachable, so enforcement never
     // silently disappears.
-    if dispatch_via_daemon(&payload, &event) {
+    if dispatch_via_daemon(&payload, &event, session_registration.as_ref()) {
         return Ok(());
     }
 
     let store = EventStore::default_local()?;
+    if let Some(registration) = &session_registration {
+        store.append_session(registration)?;
+    }
     if let Some(decision_json) = process_hook_event(&payload, &event, &store)? {
         print!("{decision_json}");
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn hook_session_registration(event: &AgentHookEvent) -> Option<AgentSession> {
+    if event.hook_event_name.as_deref() != Some("UserPromptSubmit") {
+        return None;
+    }
+    let session_id = event.session_id.as_ref()?.clone();
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,comm="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut processes = HashMap::<u32, (u32, String)>::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            continue;
+        };
+        let path = parts.collect::<Vec<_>>().join(" ");
+        processes.insert(pid, (ppid, path));
+    }
+    let mut pid = unsafe { libc::getppid() as u32 };
+    let mut selected = None;
+    let provider = event.provider.to_ascii_lowercase();
+    for _ in 0..24 {
+        let (ppid, path) = processes.get(&pid)?.clone();
+        let lower = path.to_ascii_lowercase();
+        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        let recognized = match provider.as_str() {
+            "codex" => name == "codex" || lower.contains("/codex.app/contents/macos/codex"),
+            "claude-code" => name == "claude" || name == "claude-code",
+            "antigravity" => name == "antigravity" || name == "gemini",
+            // Cursor/VS Code may multiplex several agent sessions in one app
+            // process. Do not turn that ambiguous ancestor into an enforcement
+            // root; their OS events remain observable without session binding.
+            _ => false,
+        };
+        if recognized {
+            selected = Some((pid, path));
+            break;
+        }
+        if ppid == 0 || ppid == pid {
+            break;
+        }
+        pid = ppid;
+    }
+    let (root_pid, agent_binary) = selected?;
+    Some(AgentSession {
+        session_id,
+        agent_binary,
+        root_pid,
+        cwd: event.cwd.clone().unwrap_or_default(),
+        repo_path: event.cwd.clone(),
+        mode: Some("hook".to_string()),
+        workspace_mode: None,
+        original_workspace: event.cwd.clone(),
+        staged_workspace: None,
+        sandbox_profile: None,
+        sandbox_profile_path: None,
+        started_at_ms: event.observed_at_ms,
+        ended_at_ms: None,
+        exit_code: None,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hook_session_registration(_event: &AgentHookEvent) -> Option<AgentSession> {
+    None
 }
 
 /// Core per-event processing shared by the in-process path and the daemon.
@@ -3436,6 +4337,40 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
 /// the memory/skill integrity scan finds poison — and `None` for events that
 /// only record into the lineage store (PostToolUse, clean UserPromptSubmit, Stop).
 pub(crate) fn process_hook_event(
+    payload: &str,
+    event: &AgentHookEvent,
+    store: &EventStore,
+) -> io::Result<Option<String>> {
+    let output = process_hook_event_inner(payload, event, store)?;
+    // Keep retention off the pre-tool authorization path. Any ordinary
+    // lifecycle event (PostToolUse, Stop, prompt submit, etc.) may claim one
+    // bounded maintenance batch; the SQLite throttle is shared by short-lived
+    // hook clients, the daemon, and the Endpoint Security ingestor.
+    if !matches!(
+        event.hook_event_name.as_deref(),
+        Some("PreToolUse" | "PermissionRequest" | "PreInvocation")
+    ) {
+        let recording = Policy::load_current().document().endpoint_security.clone();
+        if let Err(error) = store.prune_endpoint_retention_if_due(
+            event.observed_at_ms,
+            60_000,
+            recording.raw_event_retention_hours,
+            recording.max_raw_events,
+            recording.low_severity_retention_hours,
+        ) {
+            eprintln!("gensee hook: retention maintenance failed: {error}");
+        }
+        if let Err(error) = store.migrate_artifact_dashboard_visibility_if_due(
+            event.observed_at_ms,
+            gensee_crate_store::ARTIFACT_VISIBILITY_MAINTENANCE_INTERVAL_MS,
+        ) {
+            eprintln!("gensee hook: artifact visibility maintenance failed: {error}");
+        }
+    }
+    Ok(output)
+}
+
+fn process_hook_event_inner(
     payload: &str,
     event: &AgentHookEvent,
     store: &EventStore,

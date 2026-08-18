@@ -3,20 +3,25 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use gensee_crate_core::{
-    extract_apply_patch_input, normalize_agent_path, parse_apply_patch_changes,
-    parse_mcp_file_intents, parse_vscode_file_intents, AgentHookEvent, AgentSession, FileIntent,
-    ProcessObservation, SystemEvent, WorkspaceEffect,
+    endpoint_security_path_is_known_build_output, extract_apply_patch_input, normalize_agent_path,
+    parse_apply_patch_changes, parse_mcp_file_intents, parse_vscode_file_intents, AgentHookEvent,
+    AgentSession, FileIntent, ProcessObservation, SystemEvent, WorkspaceEffect,
 };
 use gensee_crate_db::sqlite::{
-    open_store, AgentEventRecord, NewAgentEvent, NewAlert, NewArtifact, NewArtifactFact,
+    artifact_path_is_concrete, dashboard_artifact_is_visible as dashboard_artifact_path_is_visible,
+    lineage_mode_is_non_file, lineage_path_is_harness_runtime_noise,
+    lineage_path_is_system_dependency, open_store, AgentEventRecord,
+    ArtifactVisibilityMigrationResult, NewAgentEvent, NewAlert, NewArtifact, NewArtifactFact,
     NewArtifactObservation, NewArtifactRiskTag, NewHumanFeedback, NewRelation, NewRequest,
-    NewSession, NewSystemEvent, NewTransactionEvent, SqliteConfig, SqliteError, SqliteStore,
+    NewSession, NewSystemEvent, NewTransactionEvent, RetentionPruneResult, SqliteConfig,
+    SqliteError, SqliteStore, TranscriptTokenStateRecord,
 };
 pub use gensee_crate_db::sqlite::{
     AlertRecord, ArtifactFactRecord, ArtifactObservationRecord, ArtifactRiskTagRecord,
     ChainVerification, HumanFeedbackRecord,
 };
 use gensee_crate_rules::policy::Policy;
+use rusqlite::OptionalExtension;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -24,13 +29,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
+pub const ENDPOINT_RETENTION_PRUNE_BATCH: u64 = 500;
+pub const ARTIFACT_VISIBILITY_MIGRATION_BATCH: u64 = 1_000;
+pub const ARTIFACT_VISIBILITY_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
 const STORE_KEY_FILE: &str = "gensee.key";
 const JSONL_ENCRYPTED_PREFIX: &str = "gensee-jsonl-v1";
 const UNKNOWN_SESSION_ID: &str = "unknown";
@@ -41,8 +49,10 @@ const ARTIFACT_FACT_RECENT_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 // Tool inputs are operator-visible telemetry. Bound their at-rest size so a
 // single tool invocation cannot bloat the local store with arbitrary payloads.
 const MAX_STORED_TOOL_INPUT_BYTES: usize = 16 * 1024;
+const MAX_STORED_TOOL_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_TRANSACTION_TEXT_CHARS: usize = 2 * 1024;
 const MAX_TRANSACTION_METADATA_BYTES: usize = 16 * 1024;
+const MAX_TOKEN_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
@@ -66,6 +76,23 @@ pub struct EventStore {
     encryption_key: Option<[u8; 32]>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct TranscriptTokenState {
+    offset: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    claude_messages: HashMap<String, i64>,
+    codex_total: i64,
+}
+
+struct TranscriptTokenUpdate {
+    total: Option<i64>,
+    record: TranscriptTokenStateRecord,
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyAlert {
     pub session_id: Option<String>,
@@ -77,6 +104,14 @@ pub struct PolicyAlert {
     pub path: Option<String>,
     pub evidence: Option<Value>,
     pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveToolCall {
+    pub provider: String,
+    pub tool_use_id: Option<String>,
+    pub started_at_ms: u64,
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone)]
@@ -193,16 +228,54 @@ impl EventStore {
     }
 
     pub fn append_session(&self, session: &AgentSession) -> io::Result<()> {
+        if session.ended_at_ms.is_none() {
+            let duplicate = self
+                .sqlite_store()?
+                .get_session(&session.session_id)
+                .map_err(sqlite_error)?
+                .is_some_and(|existing| {
+                    existing.last_event_at.is_none()
+                        && existing.root_pid == i64::from(session.root_pid)
+                        && existing.agent_id == session.agent_binary
+                });
+            if duplicate {
+                return Ok(());
+            }
+        }
         let db = self.sqlite_store()?;
         db.insert_session(&NewSession {
             session_id: session.session_id.clone(),
             agent_id: session.agent_binary.clone(),
+            root_pid: i64::from(session.root_pid),
             first_event_at: to_i64(session.started_at_ms)?,
             last_event_at: session.ended_at_ms.map(to_i64).transpose()?,
             flagged: false,
         })
         .map_err(sqlite_error)?;
         append_jsonl(&self.sessions_path(), session, self.encryption_key.as_ref())
+    }
+
+    pub fn end_session(
+        &self,
+        session_id: &str,
+        ended_at_ms: u64,
+        exit_code: Option<i32>,
+    ) -> io::Result<bool> {
+        let Some(mut session) = latest_session_by_id(
+            &self.sessions_path(),
+            self.encryption_key.as_ref(),
+            session_id,
+        )?
+        .filter(|session| session.ended_at_ms.is_none()) else {
+            return Ok(false);
+        };
+        session.ended_at_ms = Some(ended_at_ms);
+        session.exit_code = exit_code;
+        self.append_session(&session)?;
+        self.sqlite_store()?
+            .delete_transcript_token_state_for_session(session_id)
+            .map_err(sqlite_error)?;
+        Ok(true)
     }
 
     pub fn append_hook_event(&self, event: &AgentHookEvent) -> io::Result<()> {
@@ -230,6 +303,13 @@ impl EventStore {
 
     pub fn append_system_event(&self, event: &SystemEvent) -> io::Result<()> {
         self.append_system_event_database(event)?;
+        // Endpoint Security telemetry is already durable in SQLite and can be
+        // pruned transactionally. Duplicating this high-volume stream into an
+        // append-only JSONL file made retention ineffective and could consume
+        // gigabytes during an event burst. Keep JSONL only for legacy sources.
+        if event.source == "macos-endpoint-security" {
+            return Ok(());
+        }
         append_jsonl(
             &self.system_events_path(),
             event,
@@ -317,39 +397,179 @@ impl EventStore {
         db.list_alerts().map_err(sqlite_error)
     }
 
+    pub fn has_recent_file_intent(&self, path: &str, observed_at_ms: u64) -> io::Result<bool> {
+        let db = self.sqlite_store()?;
+        let ts = to_i64(observed_at_ms)?;
+        db.request_for_file_intent_path(path, ts, SYSTEM_EVENT_CORRELATION_WINDOW_MS)
+            .map(|event| event.is_some())
+            .map_err(sqlite_error)
+    }
+
+    /// Returns a hook tool call that started before the OS event, has not yet
+    /// completed or been blocked, and is still inside a bounded correlation
+    /// window. Endpoint Security findings must not be attached to an idle turn.
+    pub fn active_tool_call(
+        &self,
+        session_id: &str,
+        observed_at_ms: u64,
+        window_ms: u64,
+    ) -> io::Result<Option<ActiveToolCall>> {
+        let db = self.sqlite_store()?;
+        let observed_at = to_i64(observed_at_ms)?;
+        let window = to_i64(window_ms)?;
+        db.connection()
+            .query_row(
+                "SELECT candidate.source, candidate.tool_use_id, candidate.ts, candidate.cwd
+                 FROM agent_events AS candidate
+                 JOIN requests ON requests.request_id = candidate.request_id
+                 WHERE requests.session_id = ?1
+                   AND candidate.type IN ('PreToolUse', 'PermissionRequest')
+                   AND candidate.ts <= ?2
+                   AND candidate.ts >= ?2 - ?3
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM agent_events AS completion
+                     WHERE completion.request_id = candidate.request_id
+                       AND completion.type IN ('PostToolUse', 'PostToolUseFailure')
+                       AND completion.ts >= candidate.ts
+                       AND completion.ts <= ?2
+                       AND (
+                         (candidate.tool_use_id IS NOT NULL
+                          AND completion.tool_use_id = candidate.tool_use_id)
+                         OR (candidate.tool_use_id IS NULL
+                             AND completion.tool_use_id IS NULL)
+                       )
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM alerts
+                     WHERE alerts.request_id = candidate.request_id
+                       AND alerts.action = 'block'
+                       AND alerts.created_at >= candidate.ts
+                       AND alerts.created_at <= ?2
+                       AND (
+                         candidate.tool_use_id IS NULL
+                         OR json_extract(alerts.evidence, '$.tool_use_id') = candidate.tool_use_id
+                       )
+                   )
+                 ORDER BY candidate.ts DESC, candidate.event_id DESC
+                 LIMIT 1",
+                rusqlite::params![session_id, observed_at, window],
+                |row| {
+                    Ok(ActiveToolCall {
+                        provider: row.get(0)?,
+                        tool_use_id: row.get(1)?,
+                        started_at_ms: u64::try_from(row.get::<_, i64>(2)?).unwrap_or_default(),
+                        cwd: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(SqliteError::Database)
+            .map_err(sqlite_error)
+    }
+
     pub fn dashboard_state(&self) -> io::Result<Value> {
+        // Dashboard refresh is outside the agent authorization path and is a
+        // natural opportunity to advance one bounded visibility-rules batch.
+        // Failure leaves the previous cached classification usable and will be
+        // retried by a later refresh or lifecycle event.
+        if let Err(error) = self.migrate_artifact_dashboard_visibility_if_due(
+            current_unix_millis()?,
+            ARTIFACT_VISIBILITY_MAINTENANCE_INTERVAL_MS,
+        ) {
+            eprintln!("gensee dashboard: artifact visibility maintenance failed: {error}");
+        }
         let db = self.sqlite_store()?;
         let conn = db.connection();
-        let alerts = query_json_rows(
-            conn,
-            "SELECT alert_id, alerts.request_id, entity_kind, entity_id, severity,
-                action, rule_id, message, path, evidence, created_at,
-                requests.session_id
-             FROM alerts
+        let visible_alerts_cte = dashboard_visible_alerts_cte();
+        let alerts_sql = format!(
+            "WITH {visible_alerts_cte}
+             SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
+                alerts.severity, alerts.action, alerts.rule_id, alerts.message,
+                alerts.path, alerts.evidence, alerts.created_at,
+                requests.session_id,
+                substr(requests.original_user_prompt, 1, 1024),
+                trigger_event.source, trigger_event.type, trigger_event.tool_name,
+                trigger_event.tool_input, trigger_event.tool_use_id,
+                feedback.human_verdict, feedback.label, feedback.created_at
+             FROM visible_alerts AS alerts
              LEFT JOIN requests ON requests.request_id = alerts.request_id
-             ORDER BY created_at DESC, alert_id DESC
+             LEFT JOIN agent_events AS trigger_event
+               ON trigger_event.event_id = COALESCE(
+                 CASE
+                   WHEN alerts.entity_kind = 'agent_event' THEN alerts.entity_id
+                 END,
+                 (
+                   SELECT candidate.event_id
+                   FROM agent_events AS candidate
+                   WHERE candidate.request_id = alerts.request_id
+                     AND candidate.tool_use_id = json_extract(alerts.evidence, '$.tool_use_id')
+                   ORDER BY candidate.type = 'PreToolUse' DESC,
+                            candidate.ts DESC,
+                            candidate.event_id DESC
+                   LIMIT 1
+                 ),
+                 (
+                   SELECT candidate.event_id
+                   FROM agent_events AS candidate
+                   WHERE candidate.request_id = alerts.request_id
+                     AND candidate.type = 'PreToolUse'
+                     AND candidate.ts <= alerts.created_at
+                   ORDER BY candidate.ts DESC, candidate.event_id DESC
+                   LIMIT 1
+                 ),
+                 (
+                   SELECT candidate.event_id
+                   FROM agent_events AS candidate
+                   WHERE candidate.request_id = alerts.request_id
+                     AND candidate.ts <= alerts.created_at
+                   ORDER BY candidate.ts DESC, candidate.event_id DESC
+                   LIMIT 1
+                 )
+               )
+             LEFT JOIN human_feedback AS feedback
+               ON feedback.feedback_id = (
+                 SELECT candidate_feedback.feedback_id
+                 FROM human_feedback AS candidate_feedback
+                 WHERE candidate_feedback.event_key = 'alert:' || alerts.alert_id
+                 ORDER BY candidate_feedback.created_at DESC,
+                          candidate_feedback.feedback_id DESC
+                 LIMIT 1
+               )
+             ORDER BY alerts.created_at DESC, alerts.alert_id DESC
              LIMIT 200",
-            |row| {
-                Ok(json!({
-                    "alert_id": row.get::<_, i64>(0)?,
-                    "request_id": row.get::<_, Option<i64>>(1)?,
-                    "entity_kind": row.get::<_, Option<String>>(2)?,
-                    "entity_id": row.get::<_, Option<i64>>(3)?,
-                    "severity": row.get::<_, String>(4)?,
-                    "action": row.get::<_, String>(5)?,
-                    "rule_id": row.get::<_, String>(6)?,
-                    "message": row.get::<_, String>(7)?,
-                    "path": row.get::<_, Option<String>>(8)?,
-                    "evidence": row.get::<_, Option<String>>(9)?,
-                    "created_at": row.get::<_, i64>(10)?,
-                    "session_id": row.get::<_, Option<String>>(11)?,
-                }))
-            },
-        )?;
+        );
+        let alerts = query_json_rows(conn, &alerts_sql, |row| {
+            Ok(json!({
+                "alert_id": row.get::<_, i64>(0)?,
+                "request_id": row.get::<_, Option<i64>>(1)?,
+                "entity_kind": row.get::<_, Option<String>>(2)?,
+                "entity_id": row.get::<_, Option<i64>>(3)?,
+                "severity": row.get::<_, String>(4)?,
+                "action": row.get::<_, String>(5)?,
+                "rule_id": row.get::<_, String>(6)?,
+                "message": row.get::<_, String>(7)?,
+                "path": row.get::<_, Option<String>>(8)?,
+                "evidence": row.get::<_, Option<String>>(9)?,
+                "created_at": row.get::<_, i64>(10)?,
+                "session_id": row.get::<_, Option<String>>(11)?,
+                "original_user_prompt": row.get::<_, Option<String>>(12)?,
+                "event_source": row.get::<_, Option<String>>(13)?,
+                "event_type": row.get::<_, Option<String>>(14)?,
+                "tool_name": row.get::<_, Option<String>>(15)?,
+                "tool_input": row.get::<_, Option<String>>(16)?,
+                "tool_use_id": row.get::<_, Option<String>>(17)?,
+                "human_verdict": row.get::<_, Option<String>>(18)?,
+                "feedback_label": row.get::<_, Option<String>>(19)?,
+                "feedback_created_at": row.get::<_, Option<i64>>(20)?,
+            }))
+        })?;
         let agent_events = query_json_rows(
             conn,
             "SELECT event_id, pid, agent_events.request_id, requests.session_id, ts,
-                source, type, cwd, permission_mode, tool_name, tool_input, tool_use_id
+                source, type, cwd, permission_mode, tool_name, tool_input,
+                json_extract(tool_response, '$.duration_ms'), tool_use_id
              FROM agent_events
              LEFT JOIN requests ON requests.request_id = agent_events.request_id
              ORDER BY ts DESC, event_id DESC
@@ -367,7 +587,8 @@ impl EventStore {
                     "permission_mode": row.get::<_, Option<String>>(8)?,
                     "tool_name": row.get::<_, Option<String>>(9)?,
                     "tool_input": row.get::<_, Option<String>>(10)?,
-                    "tool_use_id": row.get::<_, Option<String>>(11)?,
+                    "duration_ms": row.get::<_, Option<i64>>(11)?,
+                    "tool_use_id": row.get::<_, Option<String>>(12)?,
                 }))
             },
         )?;
@@ -375,6 +596,12 @@ impl EventStore {
             conn,
             "SELECT event_id, pid, request_id, ts, source, type, cwd, args
              FROM system_events
+             WHERE NOT (
+                source = 'macos-endpoint-security'
+                AND request_id IN (
+                    SELECT request_id FROM requests WHERE session_id = 'system'
+                )
+             )
              ORDER BY ts DESC, event_id DESC
              LIMIT 200",
             |row| {
@@ -392,10 +619,14 @@ impl EventStore {
         )?;
         let sessions = query_json_rows(
             conn,
-            "SELECT session_id, agent_id, first_event_at, last_event_at, flagged
-             FROM sessions
+            "SELECT s.session_id, s.agent_id, s.first_event_at, s.last_event_at, s.flagged,
+                (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.session_id),
+                (SELECT COUNT(*) FROM agent_events ae
+                   JOIN requests r ON ae.request_id = r.request_id
+                  WHERE r.session_id = s.session_id)
+             FROM sessions s
              ORDER BY COALESCE(last_event_at, first_event_at) DESC
-             LIMIT 20",
+             LIMIT 100",
             |row| {
                 Ok(json!({
                     "session_id": row.get::<_, String>(0)?,
@@ -403,55 +634,88 @@ impl EventStore {
                     "first_event_at": row.get::<_, i64>(2)?,
                     "last_event_at": row.get::<_, Option<i64>>(3)?,
                     "flagged": row.get::<_, i64>(4)?,
+                    "req_count": row.get::<_, i64>(5)?,
+                    "event_count": row.get::<_, i64>(6)?,
                 }))
             },
         )?;
-        let artifacts = query_json_rows(
+        let requests = query_json_rows(
             conn,
-            "SELECT kind, uri, current_digest, last_seen_at, last_modified_at,
-                last_modified_source, last_modified_session_id, risk_level,
-                risk_rule_id, is_agent_authored, is_unmatched_modified,
-                is_memory_artifact, is_persistent_target, is_control_plane
+            "SELECT request_id, session_id,
+                substr(original_user_prompt, 1, 1024), created_at, completed_at
+             FROM requests
+             ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
+             LIMIT 500",
+            |row| {
+                Ok(json!({
+                    "request_id": row.get::<_, i64>(0)?,
+                    "session_id": row.get::<_, String>(1)?,
+                    "original_user_prompt": row.get::<_, Option<String>>(2)?,
+                    "created_at": row.get::<_, Option<i64>>(3)?,
+                    "completed_at": row.get::<_, Option<i64>>(4)?,
+                }))
+            },
+        )?;
+        let artifact_query = "SELECT kind, uri, current_digest, last_seen_at,
+                    last_modified_at, last_modified_source,
+                    last_modified_session_id, risk_level, risk_rule_id,
+                    is_agent_authored, is_unmatched_modified, is_memory_artifact,
+                    is_persistent_target, is_control_plane
              FROM artifact_facts
+             WHERE dashboard_visible = 1
              ORDER BY last_seen_at DESC
-             LIMIT 80",
-            |row| {
-                Ok(json!({
-                    "kind": row.get::<_, String>(0)?,
-                    "uri": row.get::<_, String>(1)?,
-                    "current_digest": row.get::<_, Option<String>>(2)?,
-                    "last_seen_at": row.get::<_, i64>(3)?,
-                    "last_modified_at": row.get::<_, Option<i64>>(4)?,
-                    "last_modified_source": row.get::<_, Option<String>>(5)?,
-                    "last_modified_session_id": row.get::<_, Option<String>>(6)?,
-                    "risk_level": row.get::<_, Option<String>>(7)?,
-                    "risk_rule_id": row.get::<_, Option<String>>(8)?,
-                    "is_agent_authored": row.get::<_, i64>(9)?,
-                    "is_unmatched_modified": row.get::<_, i64>(10)?,
-                    "is_memory_artifact": row.get::<_, i64>(11)?,
-                    "is_persistent_target": row.get::<_, i64>(12)?,
-                    "is_control_plane": row.get::<_, i64>(13)?,
-                }))
-            },
-        )?;
-        let relations = query_json_rows(
-            conn,
-            "SELECT r.relation_type AS type, r.confidence AS confidence,
-                sa.uri AS src_uri, da.uri AS dst_uri
-             FROM relations r
-             JOIN artifacts sa ON r.src_kind = 'artifact' AND r.src_id = sa.artifact_id
-             JOIN artifacts da ON r.dst_kind = 'artifact' AND r.dst_id = da.artifact_id
+             LIMIT 80";
+        let artifact_rows = query_json_rows(conn, artifact_query, |row| {
+            Ok(json!({
+                "kind": row.get::<_, String>(0)?,
+                "uri": row.get::<_, String>(1)?,
+                "current_digest": row.get::<_, Option<String>>(2)?,
+                "last_seen_at": row.get::<_, i64>(3)?,
+                "last_modified_at": row.get::<_, Option<i64>>(4)?,
+                "last_modified_source": row.get::<_, Option<String>>(5)?,
+                "last_modified_session_id": row.get::<_, Option<String>>(6)?,
+                "risk_level": row.get::<_, Option<String>>(7)?,
+                "risk_rule_id": row.get::<_, Option<String>>(8)?,
+                "is_agent_authored": row.get::<_, i64>(9)?,
+                "is_unmatched_modified": row.get::<_, i64>(10)?,
+                "is_memory_artifact": row.get::<_, i64>(11)?,
+                "is_persistent_target": row.get::<_, i64>(12)?,
+                "is_control_plane": row.get::<_, i64>(13)?,
+            }))
+        })?;
+        let artifacts = artifact_rows;
+        let visible_artifact_count = conn
+            .query_row(
+                "SELECT count FROM dashboard_artifact_count WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sqlite_error_from_rusqlite)?;
+        let relation_query = "WITH visible_artifacts AS MATERIALIZED (
+                SELECT kind, uri, current_artifact_id AS artifact_id
+                FROM artifact_facts
+                WHERE dashboard_visible = 1 AND current_artifact_id IS NOT NULL
+                ORDER BY last_seen_at DESC
+                LIMIT 80
+             )
+             SELECT r.relation_type, r.confidence,
+                    visible_source.uri, visible_destination.uri
+             FROM visible_artifacts AS visible_source
+             CROSS JOIN relations AS r INDEXED BY idx_relations_src
+               ON r.src_kind = 'artifact' AND r.src_id = visible_source.artifact_id
+             JOIN visible_artifacts AS visible_destination
+               ON r.dst_kind = 'artifact'
+              AND r.dst_id = visible_destination.artifact_id
              ORDER BY r.relation_id DESC
-             LIMIT 200",
-            |row| {
-                Ok(json!({
-                    "type": row.get::<_, String>(0)?,
-                    "confidence": row.get::<_, f64>(1)?,
-                    "src_uri": row.get::<_, String>(2)?,
-                    "dst_uri": row.get::<_, String>(3)?,
-                }))
-            },
-        )?;
+             LIMIT 200";
+        let relations = query_json_rows(conn, relation_query, |row| {
+            Ok(json!({
+                "type": row.get::<_, String>(0)?,
+                "confidence": row.get::<_, f64>(1)?,
+                "src_uri": row.get::<_, String>(2)?,
+                "dst_uri": row.get::<_, String>(3)?,
+            }))
+        })?;
         let human_feedback = query_json_rows(
             conn,
             "SELECT event_key, tool_use_id, session_id, gensee_action, human_verdict,
@@ -474,22 +738,251 @@ impl EventStore {
                 }))
             },
         )?;
+        let dashboard_summary_sql = format!(
+            "WITH {visible_alerts_cte}
+             SELECT
+                (SELECT COUNT(*) FROM sessions),
+                (SELECT COUNT(*) FROM requests),
+                (SELECT COUNT(*) FROM agent_events),
+                (SELECT COUNT(*) FROM system_events
+                  WHERE NOT (
+                    source = 'macos-endpoint-security'
+                    AND request_id IN (
+                        SELECT request_id FROM requests WHERE session_id = 'system'
+                    )
+                  )),
+                (SELECT COUNT(*) FROM visible_alerts),
+                (SELECT COUNT(*) FROM visible_alerts
+                  WHERE severity IN ('high', 'critical')
+                    AND created_at >= (unixepoch('now') - 86400) * 1000),
+                (SELECT COUNT(*) FROM artifact_facts),
+                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'critical'),
+                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'high'),
+                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'medium'),
+                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'low'),
+                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'info')"
+        );
+        let mut dashboard_summary = query_json_rows(conn, &dashboard_summary_sql, |row| {
+            Ok(json!({
+                "sessions_count": row.get::<_, i64>(0)?,
+                "requests_count": row.get::<_, i64>(1)?,
+                "agent_events_count": row.get::<_, i64>(2)?,
+                "system_events_count": row.get::<_, i64>(3)?,
+                "alerts_count": row.get::<_, i64>(4)?,
+                "recent_high_alerts": row.get::<_, i64>(5)?,
+                "artifacts_count": row.get::<_, i64>(6)?,
+                "critical_alerts_count": row.get::<_, i64>(7)?,
+                "high_alerts_count": row.get::<_, i64>(8)?,
+                "medium_alerts_count": row.get::<_, i64>(9)?,
+                "low_alerts_count": row.get::<_, i64>(10)?,
+                "info_alerts_count": row.get::<_, i64>(11)?,
+            }))
+        })?
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| json!({}));
+        dashboard_summary["artifacts_count"] = json!(visible_artifact_count);
+        let daily_activity_sql = format!(
+            "WITH {visible_alerts_cte},
+             daily_requests AS (
+                SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
+                       COUNT(*) AS count,
+                       COALESCE(SUM(total_tokens), 0) AS tokens
+                FROM requests
+                WHERE created_at IS NOT NULL
+                  AND session_id != 'system'
+                  AND (
+                    original_user_prompt IS NOT NULL
+                    OR completed_at IS NOT NULL
+                    OR EXISTS (
+                        SELECT 1 FROM agent_events
+                        WHERE agent_events.request_id = requests.request_id
+                    )
+                  )
+                  AND date(created_at / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-371 days')
+                GROUP BY day
+             ),
+             daily_tools AS (
+                SELECT date(ts / 1000, 'unixepoch', 'localtime') AS day,
+                       COUNT(*) AS count
+                FROM agent_events
+                WHERE type = 'PreToolUse'
+                  AND date(ts / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-371 days')
+                GROUP BY day
+             ),
+             daily_alerts AS (
+                SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
+                       COUNT(*) AS count
+                FROM visible_alerts
+                WHERE date(created_at / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-371 days')
+                GROUP BY day
+             ),
+             days AS (
+                SELECT day FROM daily_requests
+                UNION SELECT day FROM daily_tools
+                UNION SELECT day FROM daily_alerts
+             )
+             SELECT days.day,
+                    COALESCE(daily_requests.count, 0),
+                    COALESCE(daily_tools.count, 0),
+                    COALESCE(daily_alerts.count, 0),
+                    COALESCE(daily_requests.tokens, 0)
+             FROM days
+             LEFT JOIN daily_requests ON daily_requests.day = days.day
+             LEFT JOIN daily_tools ON daily_tools.day = days.day
+             LEFT JOIN daily_alerts ON daily_alerts.day = days.day
+             ORDER BY days.day"
+        );
+        let daily_activity = query_json_rows(conn, &daily_activity_sql, |row| {
+            Ok(json!({
+                "date": row.get::<_, String>(0)?,
+                "requests": row.get::<_, i64>(1)?,
+                "tool_calls": row.get::<_, i64>(2)?,
+                "alerts": row.get::<_, i64>(3)?,
+                "tokens": row.get::<_, i64>(4)?,
+            }))
+        })?;
         Ok(json!({
             "source": "gensee",
+            "summary": dashboard_summary,
             "alerts": alerts,
             "agentEvents": agent_events,
             "systemEvents": system_events,
             "sessions": sessions,
+            "requests": requests,
             "artifacts": artifacts,
             "relations": relations,
             "humanFeedback": human_feedback,
-            "hookEvents": self.list_hook_events()?,
-            "workspaceEffects": self.list_workspace_effects()?,
+            "dailyActivity": daily_activity,
             "jsonSessions": self.list_sessions()?,
         }))
     }
 
+    pub fn dashboard_day(&self, day: &str) -> io::Result<Value> {
+        if day.len() != 10
+            || day.as_bytes().get(4) != Some(&b'-')
+            || day.as_bytes().get(7) != Some(&b'-')
+            || !day
+                .chars()
+                .enumerate()
+                .all(|(index, character)| matches!(index, 4 | 7) || character.is_ascii_digit())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dashboard day must use YYYY-MM-DD",
+            ));
+        }
+
+        let db = self.sqlite_store()?;
+        let conn = db.connection();
+        let visible_alerts_cte = dashboard_visible_alerts_cte();
+        let valid: i64 = conn
+            .query_row("SELECT date(?1) = ?1", [day], |row| row.get(0))
+            .map_err(sqlite_error_from_rusqlite)?;
+        if valid != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dashboard day is not a valid calendar date",
+            ));
+        }
+
+        let totals_sql = format!(
+            "WITH {visible_alerts_cte}
+             SELECT
+               (SELECT COUNT(DISTINCT session_id) FROM requests
+                 WHERE session_id != 'system'
+                   AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
+               (SELECT COUNT(*) FROM requests
+                 WHERE session_id != 'system'
+                   AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1
+                   AND (original_user_prompt IS NOT NULL OR completed_at IS NOT NULL
+                        OR EXISTS (SELECT 1 FROM agent_events ae WHERE ae.request_id = requests.request_id))),
+               (SELECT COUNT(*) FROM agent_events
+                 WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1),
+               (SELECT COUNT(*) FROM visible_alerts
+                 WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
+               (SELECT COALESCE(SUM(total_tokens), 0) FROM requests
+                 WHERE session_id != 'system'
+                   AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
+               (SELECT COUNT(*) FROM agent_events
+                 WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+                   AND (lower(COALESCE(tool_name, '')) LIKE '%write%'
+                        OR lower(COALESCE(tool_name, '')) LIKE '%edit%'
+                        OR lower(COALESCE(tool_name, '')) LIKE '%create%')),
+               (SELECT COUNT(*) FROM agent_events
+                 WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+                   AND lower(COALESCE(tool_name, '')) LIKE '%read%'),
+               (SELECT COUNT(*) FROM agent_events
+                 WHERE type = 'PreToolUse' AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+                   AND (lower(COALESCE(tool_name, '')) LIKE '%search%'
+                        OR lower(COALESCE(tool_name, '')) LIKE '%fetch%'))"
+        );
+        let totals = conn
+            .query_row(&totals_sql, [day], |row| {
+                Ok(json!({
+                    "sessions": row.get::<_, i64>(0)?,
+                    "requests": row.get::<_, i64>(1)?,
+                    "tool_calls": row.get::<_, i64>(2)?,
+                    "alerts": row.get::<_, i64>(3)?,
+                    "tokens": row.get::<_, i64>(4)?,
+                    "files_written": row.get::<_, i64>(5)?,
+                    "files_read": row.get::<_, i64>(6)?,
+                    "web_requests": row.get::<_, i64>(7)?,
+                }))
+            })
+            .map_err(sqlite_error_from_rusqlite)?;
+
+        let grouped = |sql: &str| -> io::Result<Vec<Value>> {
+            let mut statement = conn.prepare(sql).map_err(sqlite_error_from_rusqlite)?;
+            let rows = statement
+                .query_map([day], |row| {
+                    Ok(json!({
+                        "name": row.get::<_, String>(0)?,
+                        "count": row.get::<_, i64>(1)?,
+                    }))
+                })
+                .map_err(sqlite_error_from_rusqlite)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sqlite_error_from_rusqlite)
+        };
+        let top_tools = grouped(
+            "SELECT tool_name, COUNT(*) FROM agent_events
+             WHERE type = 'PreToolUse' AND tool_name IS NOT NULL
+               AND date(ts / 1000, 'unixepoch', 'localtime') = ?1
+             GROUP BY tool_name ORDER BY COUNT(*) DESC, tool_name LIMIT 8",
+        )?;
+        let alerts_by_action_sql = format!(
+            "WITH {visible_alerts_cte}
+             SELECT action, COUNT(*) FROM visible_alerts
+             WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
+             GROUP BY action ORDER BY COUNT(*) DESC, action"
+        );
+        let alerts_by_action = grouped(&alerts_by_action_sql)?;
+        let alerts_by_severity_sql = format!(
+            "WITH {visible_alerts_cte}
+             SELECT severity, COUNT(*) FROM visible_alerts
+             WHERE date(created_at / 1000, 'unixepoch', 'localtime') = ?1
+             GROUP BY severity ORDER BY COUNT(*) DESC, severity"
+        );
+        let alerts_by_severity = grouped(&alerts_by_severity_sql)?;
+
+        let mut result = totals.as_object().cloned().unwrap_or_default();
+        result.insert("date".to_string(), json!(day));
+        result.insert("top_tools".to_string(), json!(top_tools));
+        result.insert("alerts_by_action".to_string(), json!(alerts_by_action));
+        result.insert("alerts_by_severity".to_string(), json!(alerts_by_severity));
+        Ok(Value::Object(result))
+    }
+
     pub fn append_policy_alert(&self, alert: &PolicyAlert) -> io::Result<()> {
+        if !Policy::load_current()
+            .document()
+            .endpoint_security
+            .minimum_recorded_severity
+            .includes(&alert.severity)
+        {
+            return Ok(());
+        }
         self.with_sqlite_transaction(|db| {
             let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
@@ -516,6 +1009,158 @@ impl EventStore {
             }
             Ok(())
         })
+    }
+
+    /// Inserts an Endpoint Security alert unless the same logical operation
+    /// was already persisted inside `window_ms`. The caller's key includes the
+    /// session, exact `(pid,pidversion)`, path, operation, and rule, providing a
+    /// durable second deduplication layer across app/ingester restarts.
+    pub fn append_endpoint_policy_alert(
+        &self,
+        alert: &PolicyAlert,
+        dedupe_key: &str,
+        window_ms: u64,
+    ) -> io::Result<bool> {
+        if !Policy::load_current()
+            .document()
+            .endpoint_security
+            .minimum_recorded_severity
+            .includes(&alert.severity)
+        {
+            return Ok(false);
+        }
+        self.with_sqlite_transaction(|db| {
+            let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
+            ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
+            let request_id = latest_or_create_request(db, session_id)?;
+            let created_at = to_i64(alert.observed_at_ms)?;
+            let window = to_i64(window_ms)?;
+            let duplicate = db
+                .connection()
+                .query_row(
+                    "SELECT 1
+                     FROM alerts
+                     WHERE rule_id = ?1
+                       AND json_extract(evidence, '$.endpoint_dedupe_key') = ?2
+                       AND ABS(created_at - ?3) <= ?4
+                     LIMIT 1",
+                    rusqlite::params![alert.rule_id, dedupe_key, created_at, window],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(SqliteError::Database)
+                .map_err(sqlite_error)?
+                .is_some();
+            if duplicate {
+                return Ok(false);
+            }
+
+            let evidence = merge_alert_evidence(
+                add_alert_evidence_field(
+                    alert.evidence.clone(),
+                    "endpoint_dedupe_key",
+                    Value::String(dedupe_key.to_string()),
+                ),
+                alert.tool_use_id.as_deref(),
+            );
+            insert_alert(
+                db,
+                AlertInput {
+                    request_id: Some(request_id),
+                    entity: None,
+                    severity: &alert.severity,
+                    action: &alert.action,
+                    rule_id: &alert.rule_id,
+                    message: &alert.message,
+                    path: alert.path.as_deref(),
+                    evidence,
+                    created_at,
+                },
+            )?;
+            Ok(true)
+        })
+    }
+
+    pub fn prune_endpoint_retention(
+        &self,
+        now_ms: u64,
+        raw_retention_hours: u64,
+        max_raw_events: u64,
+        low_severity_retention_hours: Option<u64>,
+    ) -> io::Result<RetentionPruneResult> {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        let raw_cutoff = now_ms.saturating_sub(raw_retention_hours.saturating_mul(HOUR_MS));
+        let low_cutoff = low_severity_retention_hours
+            .map(|hours| now_ms.saturating_sub(hours.saturating_mul(HOUR_MS)))
+            .map(to_i64)
+            .transpose()?;
+        self.sqlite_store()?
+            .prune_endpoint_retention(
+                to_i64(raw_cutoff)?,
+                i64::try_from(max_raw_events).unwrap_or(i64::MAX),
+                low_cutoff,
+                ENDPOINT_RETENTION_PRUNE_BATCH as i64,
+                to_i64(now_ms)?,
+            )
+            .map_err(sqlite_error)
+    }
+
+    /// Run one bounded retention batch at most once per interval across all
+    /// hook/ingest processes sharing this event store.
+    pub fn prune_endpoint_retention_if_due(
+        &self,
+        now_ms: u64,
+        interval_ms: u64,
+        raw_retention_hours: u64,
+        max_raw_events: u64,
+        low_severity_retention_hours: Option<u64>,
+    ) -> io::Result<Option<RetentionPruneResult>> {
+        let db = self.sqlite_store()?;
+        if !db
+            .claim_maintenance("endpoint-retention", to_i64(now_ms)?, to_i64(interval_ms)?)
+            .map_err(sqlite_error)?
+        {
+            return Ok(None);
+        }
+        drop(db);
+        self.prune_endpoint_retention(
+            now_ms,
+            raw_retention_hours,
+            max_raw_events,
+            low_severity_retention_hours,
+        )
+        .map(Some)
+    }
+
+    /// Advance one bounded artifact-visibility rules batch at most once per
+    /// interval across all processes sharing this store. Current stores avoid
+    /// claiming the maintenance key, so normal dashboard polling remains
+    /// read-only after a migration finishes.
+    pub fn migrate_artifact_dashboard_visibility_if_due(
+        &self,
+        now_ms: u64,
+        interval_ms: u64,
+    ) -> io::Result<Option<ArtifactVisibilityMigrationResult>> {
+        let db = self.sqlite_store()?;
+        if db
+            .dashboard_artifact_visibility_rules_are_current()
+            .map_err(sqlite_error)?
+        {
+            return Ok(None);
+        }
+        if !db
+            .claim_maintenance(
+                "dashboard-artifact-visibility",
+                to_i64(now_ms)?,
+                to_i64(interval_ms)?,
+            )
+            .map_err(sqlite_error)?
+        {
+            return Ok(None);
+        }
+        db.migrate_artifact_dashboard_visibility_rules_batch(ARTIFACT_VISIBILITY_MIGRATION_BATCH)
+            .map(Some)
+            .map_err(sqlite_error)
     }
 
     pub fn artifact_risk_tags_for_file_digest(
@@ -611,6 +1256,9 @@ impl EventStore {
         observation: &ArtifactObservationInput,
         tags: &[ArtifactRiskTagInput],
     ) -> io::Result<()> {
+        if !artifact_path_is_concrete(&observation.path) {
+            return Ok(());
+        }
         self.with_sqlite_transaction(|db| {
             let session_id = observation
                 .session_id
@@ -780,44 +1428,83 @@ impl EventStore {
     }
 
     fn append_hook_event_database(&self, event: &AgentHookEvent) -> io::Result<()> {
+        let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
+        // Transcript reads can be tens of megabytes. Prepare their incremental
+        // state before BEGIN IMMEDIATE so dashboard readers and other hook
+        // writers are never blocked on filesystem I/O. Token accounting is
+        // best-effort: the Stop event remains durable if the transcript cannot
+        // be read.
+        let transcript_update: Option<TranscriptTokenUpdate> =
+            if event.hook_event_name.as_deref() == Some("Stop") {
+                event.transcript_path.as_deref().and_then(|path| {
+                    self.prepare_transcript_token_update(
+                        session_id,
+                        &event.provider,
+                        Path::new(path),
+                        event.observed_at_ms,
+                    )
+                    .ok()
+                    .flatten()
+                })
+            } else {
+                None
+            };
         self.with_sqlite_transaction(|db| {
-            let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, &event.provider, event.observed_at_ms)?;
 
             match event.hook_event_name.as_deref() {
                 Some("UserPromptSubmit") => {
-                    db.insert_request(&NewRequest {
-                        session_id: session_id.to_string(),
-                        original_user_prompt: text_from_raw_json(
-                            &event.raw_json,
-                            &["prompt", "user_prompt", "message"],
-                        ),
-                        final_response: None,
-                        events: Some(event.raw_json.clone()),
-                        file_accessed_rate: 0.0,
-                        network_rate: 0.0,
-                    })
-                    .map_err(sqlite_error)?;
-                }
-                Some("Stop") => {
-                    let response = text_from_raw_json(&event.raw_json, &["last_assistant_message"]);
-                    if let Some(request) = db
-                        .latest_request_for_session(session_id)
-                        .map_err(sqlite_error)?
-                    {
-                        db.set_request_response(request.request_id, response.as_deref())
-                            .map_err(sqlite_error)?;
-                    } else {
-                        db.insert_request(&NewRequest {
+                    let request_id = db
+                        .insert_request(&NewRequest {
                             session_id: session_id.to_string(),
-                            original_user_prompt: None,
-                            final_response: response,
+                            original_user_prompt: text_from_raw_json(
+                                &event.raw_json,
+                                &["prompt", "user_prompt", "message"],
+                            ),
+                            final_response: None,
                             events: Some(event.raw_json.clone()),
                             file_accessed_rate: 0.0,
                             network_rate: 0.0,
                         })
                         .map_err(sqlite_error)?;
-                    }
+                    db.set_request_created_at(request_id, to_i64(event.observed_at_ms)?)
+                        .map_err(sqlite_error)?;
+                }
+                Some("Stop") => {
+                    let transcript_tokens = transcript_update.as_ref().and_then(|update| {
+                        db.upsert_transcript_token_state(&update.record)
+                            .ok()
+                            .and(update.total)
+                    });
+                    let response = text_from_raw_json(&event.raw_json, &["last_assistant_message"]);
+                    let request_id = if let Some(request) = db
+                        .latest_request_for_session(session_id)
+                        .map_err(sqlite_error)?
+                    {
+                        db.set_request_response(request.request_id, response.as_deref())
+                            .map_err(sqlite_error)?;
+                        request.request_id
+                    } else {
+                        let request_id = db
+                            .insert_request(&NewRequest {
+                                session_id: session_id.to_string(),
+                                original_user_prompt: None,
+                                final_response: response,
+                                events: Some(event.raw_json.clone()),
+                                file_accessed_rate: 0.0,
+                                network_rate: 0.0,
+                            })
+                            .map_err(sqlite_error)?;
+                        db.set_request_created_at(request_id, to_i64(event.observed_at_ms)?)
+                            .map_err(sqlite_error)?;
+                        request_id
+                    };
+                    db.complete_request_with_token_total(
+                        request_id,
+                        to_i64(event.observed_at_ms)?,
+                        transcript_tokens,
+                    )
+                    .map_err(sqlite_error)?;
                 }
                 _ if is_agent_event(event) => {
                     let request_id = latest_or_create_request(db, session_id)?;
@@ -846,6 +1533,64 @@ impl EventStore {
 
             Ok(())
         })
+    }
+
+    fn prepare_transcript_token_update(
+        &self,
+        session_id: &str,
+        provider: &str,
+        path: &Path,
+        observed_at_ms: u64,
+    ) -> io::Result<Option<TranscriptTokenUpdate>> {
+        let Some(canonical) = allowed_transcript_path(provider, path)? else {
+            return Ok(None);
+        };
+        let canonical_text = canonical.to_string_lossy().into_owned();
+        let persisted = self
+            .sqlite_store()?
+            .transcript_token_state(session_id, &canonical_text)
+            .map_err(sqlite_error)?;
+        let mut state = persisted
+            .as_ref()
+            .and_then(|record| serde_json::from_str(&record.state_json).ok())
+            .unwrap_or_default();
+        let total = transcript_total_tokens_with_state(&canonical, &mut state)?;
+        Ok(Some(TranscriptTokenUpdate {
+            total,
+            record: TranscriptTokenStateRecord {
+                session_id: session_id.to_string(),
+                transcript_path: canonical_text,
+                state_json: serde_json::to_string(&state).map_err(io::Error::other)?,
+                updated_at: to_i64(observed_at_ms)?,
+            },
+        }))
+    }
+
+    #[cfg(test)]
+    fn transcript_total_tokens_at_path(
+        &self,
+        db: &SqliteStore,
+        session_id: &str,
+        canonical: &Path,
+        observed_at_ms: u64,
+    ) -> io::Result<Option<i64>> {
+        let canonical_text = canonical.to_string_lossy().into_owned();
+        let persisted = db
+            .transcript_token_state(session_id, &canonical_text)
+            .map_err(sqlite_error)?;
+        let mut state = persisted
+            .as_ref()
+            .and_then(|record| serde_json::from_str(&record.state_json).ok())
+            .unwrap_or_default();
+        let total = transcript_total_tokens_with_state(canonical, &mut state)?;
+        db.upsert_transcript_token_state(&TranscriptTokenStateRecord {
+            session_id: session_id.to_string(),
+            transcript_path: canonical_text,
+            state_json: serde_json::to_string(&state).map_err(io::Error::other)?,
+            updated_at: to_i64(observed_at_ms)?,
+        })
+        .map_err(sqlite_error)?;
+        Ok(total)
     }
 
     fn append_process_observation_database(
@@ -924,9 +1669,19 @@ impl EventStore {
         self.with_sqlite_transaction(|db| {
             let ts = to_i64(event.observed_at_ms)?;
             let matched_agent_event = agent_event_for_system_event(db, event, ts)?;
-            let request_id = match &matched_agent_event {
-                Some(agent_event) => agent_event.request_id,
-                None => system_request_id(db, event.observed_at_ms)?,
+            let endpoint_session_id = endpoint_security_session_id(event);
+            let request_id = if let Some(session_id) = endpoint_session_id.as_deref() {
+                ensure_session(
+                    db,
+                    session_id,
+                    "macos-endpoint-security",
+                    event.observed_at_ms,
+                )?;
+                latest_or_create_request(db, session_id)?
+            } else if let Some(agent_event) = &matched_agent_event {
+                agent_event.request_id
+            } else {
+                system_request_id(db, event.observed_at_ms)?
             };
 
             let event_id = db
@@ -940,7 +1695,8 @@ impl EventStore {
                     args: Some(event.raw_json.clone()),
                 })
                 .map_err(sqlite_error)?;
-            let matched = matched_agent_event.is_some();
+            let process_tree_matched = endpoint_session_id.is_some();
+            let matched = matched_agent_event.is_some() || process_tree_matched;
             if let Some(agent_event) = matched_agent_event {
                 insert_entity_relation(
                     db,
@@ -956,8 +1712,23 @@ impl EventStore {
                     ts,
                 )?;
             }
+            if process_tree_matched {
+                insert_entity_relation(
+                    db,
+                    EntityRef::request(request_id),
+                    EntityRef::system_event(event_id),
+                    "observed",
+                    1.0,
+                    Some(json!({
+                        "matched_by": "endpoint_security_process_tree",
+                        "session_id": endpoint_session_id,
+                        "system_event_type": event.event_type,
+                    })),
+                    ts,
+                )?;
+            }
             record_system_event_artifacts(db, request_id, event_id, event, ts, matched)?;
-            if !matched {
+            if !matched && event.source != "macos-endpoint-security" {
                 record_unmatched_system_event_alert(db, request_id, event_id, event, ts)?;
             }
 
@@ -983,7 +1754,7 @@ impl EventStore {
                     args: Some(json_record(effect)?),
                 })
                 .map_err(sqlite_error)?;
-            let artifact_id = upsert_file_artifact(
+            let Some(artifact_id) = upsert_file_artifact(
                 db,
                 &effect.path,
                 ts,
@@ -992,7 +1763,10 @@ impl EventStore {
                     "confidence": effect.confidence,
                     "attribution": effect.attribution,
                 })),
-            )?;
+            )?
+            else {
+                return Ok(());
+            };
             insert_entity_relation(
                 db,
                 EntityRef::system_event(event_id),
@@ -1117,11 +1891,155 @@ fn ensure_session(
     db.insert_session(&NewSession {
         session_id: session_id.to_string(),
         agent_id: agent_id.to_string(),
+        root_pid: 0,
         first_event_at: to_i64(observed_at_ms)?,
         last_event_at: None,
         flagged: false,
     })
     .map_err(sqlite_error)
+}
+
+/// Read only numeric usage metadata from a supported JSONL transcript. Claude
+/// emits usage per assistant message (sometimes repeating a message while it is
+/// streaming), while Codex emits a cumulative `total_token_usage` snapshot.
+/// Prompt and response content is never persisted by this path.
+#[cfg(test)]
+fn transcript_total_tokens(path: &Path) -> io::Result<Option<i64>> {
+    transcript_total_tokens_cached(path, &mut HashMap::new())
+}
+
+fn allowed_transcript_path(provider: &str, path: &Path) -> io::Result<Option<PathBuf>> {
+    let home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let claude_config = env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let codex_home = env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let Some(allowed_root) = transcript_root(provider, home, claude_config, codex_home) else {
+        return Ok(None);
+    };
+    let Ok(allowed_root) = allowed_root.canonicalize() else {
+        return Ok(None);
+    };
+    let Ok(canonical) = path.canonicalize() else {
+        return Ok(None);
+    };
+    Ok(canonical.starts_with(&allowed_root).then_some(canonical))
+}
+
+fn transcript_root(
+    provider: &str,
+    home: Option<PathBuf>,
+    claude_config: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match provider {
+        "claude-code" => claude_config
+            .or_else(|| home.map(|home| home.join(".claude")))
+            .map(|root| root.join("projects")),
+        "codex" => codex_home
+            .or_else(|| home.map(|home| home.join(".codex")))
+            .map(|root| root.join("sessions")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn transcript_total_tokens_cached(
+    path: &Path,
+    cache: &mut HashMap<PathBuf, TranscriptTokenState>,
+) -> io::Result<Option<i64>> {
+    let state = cache.entry(path.to_path_buf()).or_default();
+    transcript_total_tokens_with_state(path, state)
+}
+
+fn transcript_total_tokens_with_state(
+    path: &Path,
+    state: &mut TranscriptTokenState,
+) -> io::Result<Option<i64>> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_TOKEN_TRANSCRIPT_BYTES {
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    let identity_changed =
+        state.offset > 0 && (state.device != metadata.dev() || state.inode != metadata.ino());
+    #[cfg(not(unix))]
+    let identity_changed = false;
+    if identity_changed || metadata.len() < state.offset {
+        *state = TranscriptTokenState::default();
+    }
+    #[cfg(unix)]
+    {
+        state.device = metadata.dev();
+        state.inode = metadata.ino();
+    }
+
+    if metadata.len() > state.offset {
+        let mut file = fs::File::open(path)?;
+        file.seek(SeekFrom::Start(state.offset))?;
+        let mut appended = Vec::new();
+        file.read_to_end(&mut appended)?;
+
+        let complete_len = appended
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .or_else(|| {
+                serde_json::from_slice::<Value>(&appended)
+                    .ok()
+                    .map(|_| appended.len())
+            })
+            .unwrap_or(0);
+        for line in String::from_utf8_lossy(&appended[..complete_len]).lines() {
+            process_transcript_usage_line(line, state);
+        }
+        state.offset += complete_len as u64;
+    }
+
+    let total = state
+        .codex_total
+        .max(state.claude_messages.values().sum::<i64>());
+    Ok((total > 0).then_some(total))
+}
+
+fn process_transcript_usage_line(line: &str, state: &mut TranscriptTokenState) {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    if let Some(total) = value
+        .pointer("/payload/info/total_token_usage/total_tokens")
+        .and_then(Value::as_i64)
+    {
+        state.codex_total = state.codex_total.max(total);
+    }
+
+    let Some(message_id) = value.pointer("/message/id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(usage) = value.pointer("/message/usage") else {
+        return;
+    };
+    let total = [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .into_iter()
+    .filter_map(|key| usage.get(key).and_then(Value::as_i64))
+    .sum::<i64>();
+    if total > 0 {
+        state
+            .claude_messages
+            .entry(message_id.to_string())
+            .and_modify(|stored| *stored = (*stored).max(total))
+            .or_insert(total);
+    }
 }
 
 fn latest_or_create_request(db: &SqliteStore, session_id: &str) -> io::Result<i64> {
@@ -1251,6 +2169,14 @@ fn insert_entity_relation(
 }
 
 fn insert_alert(db: &SqliteStore, input: AlertInput<'_>) -> io::Result<()> {
+    if !Policy::load_current()
+        .document()
+        .endpoint_security
+        .minimum_recorded_severity
+        .includes(input.severity)
+    {
+        return Ok(());
+    }
     db.insert_alert(&NewAlert {
         request_id: input.request_id,
         entity_kind: input.entity.map(|entity| entity.kind.to_string()),
@@ -1282,6 +2208,26 @@ fn merge_alert_evidence(evidence: Option<Value>, tool_use_id: Option<&str>) -> O
         })),
         (None, Some(tool_use_id)) => Some(json!({ "tool_use_id": tool_use_id })),
         (evidence, None) => evidence,
+    }
+}
+
+fn add_alert_evidence_field(evidence: Option<Value>, key: &str, value: Value) -> Option<Value> {
+    match evidence {
+        Some(Value::Object(mut map)) => {
+            map.insert(key.to_string(), value);
+            Some(Value::Object(map))
+        }
+        Some(details) => {
+            let mut map = serde_json::Map::new();
+            map.insert(key.to_string(), value);
+            map.insert("details".to_string(), details);
+            Some(Value::Object(map))
+        }
+        None => {
+            let mut map = serde_json::Map::new();
+            map.insert(key.to_string(), value);
+            Some(Value::Object(map))
+        }
     }
 }
 
@@ -1435,6 +2381,16 @@ fn update_artifact_fact(db: &SqliteStore, update: ArtifactFactUpdate<'_>) -> io:
         is_memory_artifact: policy.is_memory_artifact_path(update.path),
         is_persistent_target: policy.is_persistent_target_path(update.path),
         is_control_plane: policy.is_control_plane_path(update.path),
+        dashboard_visible: dashboard_artifact_path_is_visible(
+            update.path,
+            update
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("source"))
+                .and_then(Value::as_str),
+            None,
+            false,
+        ),
         risk_level,
         risk_rule_id,
         risk_digest,
@@ -1451,7 +2407,7 @@ fn record_file_intent_artifact(
     intent: &FileIntent,
 ) -> io::Result<()> {
     let ts = to_i64(intent.observed_at_ms)?;
-    let artifact_id = upsert_file_artifact(
+    let Some(artifact_id) = upsert_file_artifact(
         db,
         &intent.path,
         ts,
@@ -1462,7 +2418,10 @@ fn record_file_intent_artifact(
             "sensitive": intent.sensitive,
             "confidence": intent.confidence,
         })),
-    )?;
+    )?
+    else {
+        return Ok(());
+    };
 
     let access = artifact_access(&intent.operation);
     match access {
@@ -1556,7 +2515,7 @@ fn record_native_tool_artifact(
 
     let ts = to_i64(event.observed_at_ms)?;
     for tool in tools {
-        let artifact_id = upsert_file_artifact(
+        let Some(artifact_id) = upsert_file_artifact(
             db,
             &tool.path,
             ts,
@@ -1566,7 +2525,10 @@ fn record_native_tool_artifact(
                 "tool_name": event.tool_name,
                 "tool_use_id": event.tool_use_id,
             })),
-        )?;
+        )?
+        else {
+            continue;
+        };
 
         let access = artifact_access(&tool.operation);
         match access {
@@ -1806,18 +2768,31 @@ fn record_system_event_artifacts(
     ts: i64,
     matched_agent_intent: bool,
 ) -> io::Result<()> {
-    let relation_type = system_artifact_relation_type(&event.event_type);
-    let request_relation_type = request_artifact_relation_type(&event.event_type);
+    let raw_event = serde_json::from_str::<Value>(&event.raw_json).ok();
+    let modified = raw_event
+        .as_ref()
+        .and_then(|value| value.get("modified"))
+        .and_then(Value::as_bool);
+    let relation_type = system_artifact_relation_type_for_event(event);
+    let request_relation_type = request_artifact_relation_type_for_event(event);
     for path in system_event_paths(event) {
-        let artifact_id = upsert_file_artifact(
+        if !should_materialize_system_artifact(event, &path, raw_event.as_ref()) {
+            continue;
+        }
+        let Some(artifact_id) = upsert_file_artifact(
             db,
             &path,
             ts,
             Some(json!({
                 "source": event.source,
                 "system_event_type": event.event_type,
+                "system_event_kind": event.event_kind,
+                "modified": modified,
             })),
-        )?;
+        )?
+        else {
+            continue;
+        };
         match relation_type {
             "read_by" => insert_entity_relation(
                 db,
@@ -1867,6 +2842,8 @@ fn record_system_event_artifacts(
                 metadata: Some(json!({
                     "source": event.source,
                     "system_event_type": event.event_type,
+                    "system_event_kind": event.event_kind,
+                    "modified": modified,
                     "matched_agent_intent": matched_agent_intent,
                 })),
             },
@@ -1959,7 +2936,10 @@ fn upsert_file_artifact(
     path: &str,
     ts: i64,
     metadata: Option<Value>,
-) -> io::Result<i64> {
+) -> io::Result<Option<i64>> {
+    if !artifact_path_is_concrete(path) {
+        return Ok(None);
+    }
     db.insert_artifact(&NewArtifact {
         kind: "file".to_string(),
         uri: file_uri(path),
@@ -1968,6 +2948,7 @@ fn upsert_file_artifact(
         updated_at: Some(ts),
         metadata: metadata.map(|value| value.to_string()),
     })
+    .map(Some)
     .map_err(sqlite_error)
 }
 
@@ -1983,6 +2964,19 @@ fn text_from_raw_json(raw_json: &str, keys: &[&str]) -> Option<String> {
     let value = serde_json::from_str::<Value>(raw_json).ok()?;
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
+}
+
+fn endpoint_security_session_id(event: &SystemEvent) -> Option<String> {
+    if event.source != "macos-endpoint-security" {
+        return None;
+    }
+    serde_json::from_str::<Value>(&event.raw_json)
+        .ok()?
+        .get("attribution")?
+        .get("session_id")?
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
 }
 
 fn system_event_paths(event: &SystemEvent) -> Vec<String> {
@@ -2045,6 +3039,126 @@ fn add_path_variants(path: &str, paths: &mut BTreeSet<String>) {
     }
 }
 
+fn should_materialize_system_artifact(
+    event: &SystemEvent,
+    path: &str,
+    raw_event: Option<&Value>,
+) -> bool {
+    if event.source != "macos-endpoint-security" {
+        return true;
+    }
+
+    // Authorization records describe an attempted operation. The matching
+    // notify record represents the operation that actually happened; a denied
+    // authorization should remain audit evidence without becoming lineage.
+    if event.event_type.starts_with("auth_")
+        || raw_event
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
+            == Some("auth")
+    {
+        return false;
+    }
+
+    // Endpoint Security emits close notifications for ordinary reads too. A
+    // close is a mutation only when ES explicitly reports modified=true.
+    if event.event_type == "close"
+        && raw_event
+            .and_then(|value| value.get("modified"))
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return false;
+    }
+
+    // Directories, devices, FIFOs, and sockets are useful in the raw event
+    // stream but are not file artifacts. Preserve regular files and symlinks.
+    if raw_event
+        .and_then(|value| value.get("file"))
+        .and_then(|value| value.get("mode"))
+        .and_then(Value::as_u64)
+        .is_some_and(lineage_mode_is_non_file)
+    {
+        return false;
+    }
+
+    if lineage_path_is_harness_runtime_noise(path)
+        || lineage_path_is_system_dependency(path)
+        || endpoint_system_event_is_known_build_output(event, path, raw_event)
+    {
+        return false;
+    }
+    true
+}
+
+fn endpoint_system_event_is_known_build_output(
+    event: &SystemEvent,
+    path: &str,
+    raw_event: Option<&Value>,
+) -> bool {
+    if event.source != "macos-endpoint-security" {
+        return false;
+    }
+    let workspace_root = raw_event
+        .and_then(|value| value.pointer("/attribution/workspace_root"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            raw_event
+                .and_then(|value| value.get("cwd"))
+                .and_then(Value::as_str)
+        });
+    endpoint_security_path_is_known_build_output(
+        event.executable_path.as_deref(),
+        path,
+        workspace_root,
+    )
+}
+
+fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
+    let path = format!("COALESCE({alias}.path, '')");
+    let lower_path = format!("lower({path})");
+    format!(
+        "NOT ({alias}.rule_id = 'unmatched_system_effect'
+              AND {alias}.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
+         AND NOT ({alias}.rule_id = 'hook_bypass_file_mutation' AND (
+              {path} GLOB '/dev/*'
+              OR {lower_path} LIKE '%/library/application support/codex/%'
+              OR {lower_path} LIKE '%/library/application support/claude/%'
+              OR {lower_path} LIKE '%/crashpad/%'
+              OR {lower_path} LIKE '%/diagnosticreports/%'
+              OR {lower_path} LIKE '%/crash reports/%'
+              OR {lower_path} LIKE '%/.codex/sessions/%.jsonl'
+              OR {lower_path} LIKE '%/.claude/projects/%.jsonl'
+         ))"
+    )
+}
+
+fn dashboard_visible_alerts_cte() -> String {
+    let base_visibility = dashboard_alert_base_visibility_sql("alerts");
+    format!(
+        "ranked_dashboard_alerts AS MATERIALIZED (
+            SELECT alerts.*,
+                   LAG(alerts.created_at) OVER (
+                       PARTITION BY alerts.rule_id,
+                                    alerts.request_id,
+                                    COALESCE(alerts.path, ''),
+                                    COALESCE(json_extract(alerts.evidence, '$.actor.pid'), -1),
+                                    COALESCE(json_extract(alerts.evidence, '$.actor.pidversion'), -1)
+                       ORDER BY alerts.created_at, alerts.alert_id
+                   ) AS previous_related_alert_at
+            FROM alerts
+            WHERE {base_visibility}
+         ),
+         visible_alerts AS MATERIALIZED (
+            SELECT *
+            FROM ranked_dashboard_alerts
+            WHERE rule_id != 'hook_bypass_file_mutation'
+               OR previous_related_alert_at IS NULL
+               OR created_at - previous_related_alert_at > 10000
+         )"
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArtifactAccess {
     Consumed,
@@ -2063,26 +3177,46 @@ fn artifact_access(operation: &str) -> ArtifactAccess {
     }
 }
 
+fn system_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str {
+    if event.event_kind == "file_read" {
+        return "read_by";
+    }
+    if event.event_type == "open" && event.event_kind == "file_mutation" {
+        return "modified";
+    }
+    system_artifact_relation_type(&event.event_type)
+}
+
 fn system_artifact_relation_type(event_type: &str) -> &'static str {
     match event_type {
+        value if value.starts_with("auth_") => "attempted_access",
         "open" | "lookup" | "access" | "stat" | "getattrlist" | "readlink" | "readdir"
-        | "getextattr" | "listextattr" | "fsgetpath" => "read_by",
+        | "getextattr" | "listextattr" | "fsgetpath" | "mmap" => "read_by",
         "unlink" => "deleted",
-        "setmode" | "setowner" | "setflags" | "setacl" | "setextattr" | "deleteextattr" => {
-            "modified"
-        }
+        "close" | "truncate" | "rename" | "setmode" | "setowner" | "setflags" | "setacl"
+        | "setextattr" | "deleteextattr" => "modified",
         _ => "wrote",
     }
 }
 
+fn request_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str {
+    if event.event_kind == "file_read" {
+        return "consumed_by";
+    }
+    if event.event_type == "open" && event.event_kind == "file_mutation" {
+        return "modified";
+    }
+    request_artifact_relation_type(&event.event_type)
+}
+
 fn request_artifact_relation_type(event_type: &str) -> &'static str {
     match event_type {
+        value if value.starts_with("auth_") => "attempted_access",
         "open" | "lookup" | "access" | "stat" | "getattrlist" | "readlink" | "readdir"
-        | "getextattr" | "listextattr" | "fsgetpath" => "consumed_by",
+        | "getextattr" | "listextattr" | "fsgetpath" | "mmap" => "consumed_by",
         "unlink" => "deleted",
-        "setmode" | "setowner" | "setflags" | "setacl" | "setextattr" | "deleteextattr" => {
-            "modified"
-        }
+        "close" | "truncate" | "rename" | "setmode" | "setowner" | "setflags" | "setacl"
+        | "setextattr" | "deleteextattr" => "modified",
         _ => "produced",
     }
 }
@@ -2292,10 +3426,22 @@ fn tool_response_json(event: &AgentHookEvent) -> Option<String> {
         return None;
     }
 
+    let response = json!({
+        "stdout": event.tool_response_stdout.as_deref(),
+        "stderr": event.tool_response_stderr.as_deref(),
+        "interrupted": event.tool_response_interrupted,
+        "duration_ms": event.duration_ms,
+    });
+    let encoded = response.to_string();
+    if encoded.len() <= MAX_STORED_TOOL_RESPONSE_BYTES {
+        return Some(encoded);
+    }
+
     Some(
         json!({
-            "stdout": event.tool_response_stdout.as_deref(),
-            "stderr": event.tool_response_stderr.as_deref(),
+            "truncated": true,
+            "original_bytes": encoded.len(),
+            "max_bytes": MAX_STORED_TOOL_RESPONSE_BYTES,
             "interrupted": event.tool_response_interrupted,
             "duration_ms": event.duration_ms,
         })
@@ -2308,7 +3454,20 @@ fn to_i64(value: u64) -> io::Result<i64> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "timestamp too large"))
 }
 
+fn current_unix_millis() -> io::Result<u64> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| io::Error::other(format!("system clock is before Unix epoch: {error}")))?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "timestamp too large"))
+}
+
 fn sqlite_error(error: gensee_crate_db::sqlite::SqliteError) -> io::Error {
+    io::Error::other(error)
+}
+
+fn sqlite_error_from_rusqlite(error: rusqlite::Error) -> io::Error {
     io::Error::other(error)
 }
 
@@ -2389,6 +3548,44 @@ fn read_jsonl<T: DeserializeOwned>(
     }
 
     Ok(records)
+}
+
+/// Scan lifecycle records for one session without materializing and
+/// decrypting every session into a collection. The latest matching record is
+/// authoritative, matching `list_sessions` semantics.
+fn latest_session_by_id(
+    path: &Path,
+    encryption_key: Option<&[u8; 32]>,
+    session_id: &str,
+) -> io::Result<Option<AgentSession>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let file = OpenOptions::new().read(true).open(path)?;
+    let mut latest = None;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let decoded = if line.starts_with(JSONL_ENCRYPTED_PREFIX) {
+            let Some(key) = encryption_key else { continue };
+            let Ok(decoded) = decrypt_jsonl_line(key, &line) else {
+                continue;
+            };
+            decoded
+        } else {
+            line
+        };
+        let Ok(session) = serde_json::from_str::<AgentSession>(&decoded) else {
+            continue;
+        };
+        if session.session_id == session_id {
+            latest = Some(session);
+        }
+    }
+    Ok(latest)
 }
 
 fn store_encryption_enabled() -> bool {
@@ -2542,6 +3739,280 @@ mod tests {
     use super::*;
 
     #[test]
+    fn artifact_visibility_migration_is_bounded_and_cross_process_throttled() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-visibility-maintenance-test-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        {
+            let db = store.sqlite_store().unwrap();
+            let transaction = db.connection().unchecked_transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO artifact_facts(
+                            kind, uri, last_seen_at, metadata, dashboard_visible
+                         ) VALUES ('file', ?1, 1,
+                                   '{\"source\":\"macos-endpoint-security\"}', 1)",
+                    )
+                    .unwrap();
+                for index in 0..=ARTIFACT_VISIBILITY_MIGRATION_BATCH {
+                    insert
+                        .execute([format!("file:///System/Library/noise-{index:04}")])
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+
+        let first = store
+            .migrate_artifact_dashboard_visibility_if_due(1_000, 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.scanned, ARTIFACT_VISIBILITY_MIGRATION_BATCH);
+        assert_eq!(first.updated, ARTIFACT_VISIBILITY_MIGRATION_BATCH);
+        assert!(!first.complete);
+        assert!(store
+            .migrate_artifact_dashboard_visibility_if_due(1_000, 1_000)
+            .unwrap()
+            .is_none());
+
+        let final_batch = store
+            .migrate_artifact_dashboard_visibility_if_due(2_000, 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_batch.scanned, 1);
+        assert_eq!(final_batch.updated, 1);
+        assert!(final_batch.complete);
+        assert!(store
+            .migrate_artifact_dashboard_visibility_if_due(3_000, 1_000)
+            .unwrap()
+            .is_none());
+
+        let db = store.sqlite_store().unwrap();
+        let visible = db
+            .connection()
+            .query_row(
+                "SELECT count FROM dashboard_artifact_count WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(visible, 0);
+        assert!(db
+            .dashboard_artifact_visibility_rules_are_current()
+            .unwrap());
+        drop(db);
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transcript_token_usage_supports_claude_and_codex_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-token-transcript-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let claude_path = dir.join("claude.jsonl");
+        fs::write(
+            &claude_path,
+            concat!(
+                "{\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":4}}}\n",
+                "{\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":4}}}\n",
+                "{\"message\":{\"id\":\"m2\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(transcript_total_tokens(&claude_path).unwrap(), Some(25));
+        let mut cache = HashMap::new();
+        assert_eq!(
+            transcript_total_tokens_cached(&claude_path, &mut cache).unwrap(),
+            Some(25)
+        );
+        writeln!(
+            OpenOptions::new().append(true).open(&claude_path).unwrap(),
+            "{{\"message\":{{\"id\":\"m3\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":2}}}}}}"
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_total_tokens_cached(&claude_path, &mut cache).unwrap(),
+            Some(30)
+        );
+
+        let codex_path = dir.join("codex.jsonl");
+        fs::write(
+            &codex_path,
+            concat!(
+                "{\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":21}}}}\n",
+                "{\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":42}}}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(transcript_total_tokens(&codex_path).unwrap(), Some(42));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transcript_roots_honor_harness_configuration_directories() {
+        let home = PathBuf::from("/Users/tester");
+        assert_eq!(
+            transcript_root(
+                "claude-code",
+                Some(home.clone()),
+                Some(PathBuf::from("/Volumes/config/claude")),
+                None,
+            ),
+            Some(PathBuf::from("/Volumes/config/claude/projects"))
+        );
+        assert_eq!(
+            transcript_root(
+                "codex",
+                Some(home.clone()),
+                None,
+                Some(PathBuf::from("/Volumes/config/codex")),
+            ),
+            Some(PathBuf::from("/Volumes/config/codex/sessions"))
+        );
+        assert_eq!(
+            transcript_root("claude-code", Some(home.clone()), None, None),
+            Some(home.join(".claude/projects"))
+        );
+        assert_eq!(transcript_root("cursor", None, None, None), None);
+    }
+
+    #[test]
+    fn transcript_offset_survives_event_store_restarts() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-transcript-state-test-{}-{now}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("claude.jsonl");
+        fs::write(
+            &transcript,
+            "{\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+        )
+        .unwrap();
+
+        {
+            let store = EventStore::new(&dir).unwrap();
+            let db = store.sqlite_store().unwrap();
+            ensure_session(&db, "persisted-session", "claude-code", 1).unwrap();
+            assert_eq!(
+                store
+                    .transcript_total_tokens_at_path(&db, "persisted-session", &transcript, 1,)
+                    .unwrap(),
+                Some(15)
+            );
+        }
+
+        writeln!(
+            OpenOptions::new().append(true).open(&transcript).unwrap(),
+            "{{\"message\":{{\"id\":\"m2\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":2}}}}}}"
+        )
+        .unwrap();
+        {
+            let store = EventStore::new(&dir).unwrap();
+            let db = store.sqlite_store().unwrap();
+            assert_eq!(
+                store
+                    .transcript_total_tokens_at_path(&db, "persisted-session", &transcript, 2,)
+                    .unwrap(),
+                Some(20)
+            );
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_reports_daily_turn_tool_alert_and_token_totals() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-daily-activity-test-{}-{now}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"test"}"#,
+                now,
+            ))
+            .unwrap();
+        let mut read = hook_event(
+            "PreToolUse",
+            r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Read"}"#,
+            now + 1,
+        );
+        read.tool_name = Some("Read".to_string());
+        store.append_hook_event(&read).unwrap();
+
+        let transcript = dir.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            "{\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":20,\"output_tokens\":5}}}\n",
+        )
+        .unwrap();
+        let mut stop = hook_event(
+            "Stop",
+            r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
+            now + 2,
+        );
+        stop.transcript_path = Some(transcript.display().to_string());
+        store.append_hook_event(&stop).unwrap();
+        store
+            .append_policy_alert(&PolicyAlert {
+                session_id: Some("s1".to_string()),
+                tool_use_id: None,
+                severity: "medium".to_string(),
+                action: "warn".to_string(),
+                rule_id: "test_alert".to_string(),
+                message: "test".to_string(),
+                path: None,
+                evidence: None,
+                observed_at_ms: now + 3,
+            })
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        let today = dashboard["dailyActivity"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(today["requests"], 1);
+        assert_eq!(today["tool_calls"], 1);
+        assert_eq!(today["alerts"], 1);
+        // The first cumulative transcript observation establishes a baseline;
+        // it must not attribute earlier session usage to this request.
+        assert_eq!(today["tokens"], 0);
+        let day = today["date"].as_str().unwrap();
+        let detail = store.dashboard_day(day).unwrap();
+        assert_eq!(detail["sessions"], 1);
+        assert_eq!(detail["requests"], 1);
+        assert_eq!(detail["tool_calls"], 1);
+        assert_eq!(detail["alerts"], 1);
+        assert_eq!(detail["files_read"], 1);
+        assert_eq!(detail["top_tools"][0]["name"], "Read");
+        assert!(store.dashboard_day("2026-02-30").is_err());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn transaction_text_is_bounded_and_strips_control_characters() {
         let input = format!("safe\0{}", "x".repeat(MAX_TRANSACTION_TEXT_CHARS + 20));
         let bounded = bounded_transaction_text(&input);
@@ -2557,6 +4028,25 @@ mod tests {
         let decoded: Value = serde_json::from_str(&bounded).unwrap();
         assert_eq!(decoded["truncated"], true);
         assert_eq!(decoded["max_bytes"], MAX_TRANSACTION_METADATA_BYTES);
+    }
+
+    #[test]
+    fn oversized_tool_response_is_replaced_with_truncation_metadata() {
+        let mut event = hook_event("PostToolUse", "{}", 100);
+        event.tool_response_stdout = Some("x".repeat(MAX_STORED_TOOL_RESPONSE_BYTES + 1));
+        event.tool_response_stderr = Some("sensitive stderr".to_string());
+        event.tool_response_interrupted = Some(false);
+        event.duration_ms = Some(42);
+
+        let encoded = tool_response_json(&event).unwrap();
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+
+        assert!(encoded.len() < MAX_STORED_TOOL_RESPONSE_BYTES);
+        assert_eq!(decoded["truncated"], true);
+        assert_eq!(decoded["max_bytes"], MAX_STORED_TOOL_RESPONSE_BYTES);
+        assert_eq!(decoded["duration_ms"], 42);
+        assert!(decoded.get("stdout").is_none());
+        assert!(decoded.get("stderr").is_none());
     }
 
     #[test]
@@ -2606,7 +4096,7 @@ mod tests {
             std::process::id()
         ));
         let store = EventStore::new(&dir).unwrap();
-        let mut session = AgentSession {
+        let session = AgentSession {
             session_id: "run_deduplicated".to_string(),
             agent_binary: "codex".to_string(),
             root_pid: 1234,
@@ -2626,15 +4116,39 @@ mod tests {
         // Model both a lost daemon acknowledgement retry and the eventual
         // lifecycle update. Consumers must see one latest session record.
         store.append_session(&session).unwrap();
-        session.ended_at_ms = Some(200);
-        session.exit_code = Some(0);
-        store.append_session(&session).unwrap();
+        {
+            let db = store.sqlite_store().unwrap();
+            db.upsert_transcript_token_state(&TranscriptTokenStateRecord {
+                session_id: session.session_id.clone(),
+                transcript_path: "/tmp/test-transcript.jsonl".to_string(),
+                state_json: "{}".to_string(),
+                updated_at: 150,
+            })
+            .unwrap();
+        }
+        assert!(store
+            .end_session(&session.session_id, 200, Some(0))
+            .unwrap());
 
         let loaded = store.list_sessions().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].session_id, "run_deduplicated");
         assert_eq!(loaded[0].ended_at_ms, Some(200));
         assert_eq!(loaded[0].exit_code, Some(0));
+        assert_eq!(
+            fs::read_to_string(store.sessions_path())
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "one start and one end record should be persisted"
+        );
+        assert!(store
+            .sqlite_store()
+            .unwrap()
+            .transcript_token_state(&session.session_id, "/tmp/test-transcript.jsonl")
+            .unwrap()
+            .is_none());
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -2976,6 +4490,285 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_alerts_include_request_tool_and_latest_feedback() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-alert-detail-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"inspect the deployment settings"}"#,
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event(&AgentHookEvent {
+                provider: "claude-code".to_string(),
+                session_id: Some("s1".to_string()),
+                hook_event_name: Some("PreToolUse".to_string()),
+                cwd: Some("/repo".to_string()),
+                transcript_path: None,
+                tool_name: Some("Read".to_string()),
+                tool_use_id: Some("tool_alert_1".to_string()),
+                tool_input_command: None,
+                tool_input_description: None,
+                tool_response_stdout: None,
+                tool_response_stderr: None,
+                tool_response_interrupted: None,
+                duration_ms: None,
+                permission_mode: Some("default".to_string()),
+                effort_level: None,
+                observed_at_ms: 110,
+                raw_json: r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"Read","tool_use_id":"tool_alert_1","tool_input":{"file_path":"/repo/deploy.json"}}"#.to_string(),
+            })
+            .unwrap();
+        store
+            .append_hook_event(&AgentHookEvent {
+                provider: "claude-code".to_string(),
+                session_id: Some("s1".to_string()),
+                hook_event_name: Some("PostToolUse".to_string()),
+                cwd: Some("/repo".to_string()),
+                transcript_path: None,
+                tool_name: Some("Read".to_string()),
+                tool_use_id: Some("tool_alert_1".to_string()),
+                tool_input_command: None,
+                tool_input_description: None,
+                tool_response_stdout: Some("contents".to_string()),
+                tool_response_stderr: None,
+                tool_response_interrupted: Some(false),
+                duration_ms: Some(8),
+                permission_mode: Some("default".to_string()),
+                effort_level: None,
+                observed_at_ms: 118,
+                raw_json: r#"{"session_id":"s1","hook_event_name":"PostToolUse","cwd":"/repo","tool_name":"Read","tool_use_id":"tool_alert_1","tool_response":{"stdout":"contents"}}"#.to_string(),
+            })
+            .unwrap();
+        store
+            .append_policy_alert(&PolicyAlert {
+                session_id: Some("s1".to_string()),
+                tool_use_id: Some("tool_alert_1".to_string()),
+                severity: "high".to_string(),
+                action: "block".to_string(),
+                rule_id: "policy_sensitive_file_access".to_string(),
+                message: "Blocked access to deployment settings".to_string(),
+                path: Some("/repo/deploy.json".to_string()),
+                evidence: Some(json!({ "reason": "sensitive" })),
+                observed_at_ms: 120,
+            })
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(
+            dashboard["requests"][0]["original_user_prompt"],
+            "inspect the deployment settings"
+        );
+        let post_event = dashboard["agentEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["type"] == "PostToolUse")
+            .unwrap();
+        assert_eq!(post_event["duration_ms"], 8);
+        assert!(post_event.get("tool_response").is_none());
+        assert!(dashboard["requests"][0].get("final_response").is_none());
+        let alert = &dashboard["alerts"][0];
+        assert_eq!(
+            alert["original_user_prompt"],
+            "inspect the deployment settings"
+        );
+        assert_eq!(alert["event_source"], "claude-code");
+        assert_eq!(alert["event_type"], "PreToolUse");
+        assert_eq!(alert["tool_name"], "Read");
+        assert_eq!(alert["tool_use_id"], "tool_alert_1");
+        assert_eq!(
+            serde_json::from_str::<Value>(alert["tool_input"].as_str().unwrap()).unwrap()["path"],
+            "/repo/deploy.json"
+        );
+
+        let alert_id = alert["alert_id"].as_i64().unwrap();
+        store
+            .record_human_feedback(
+                Some(format!("alert:{alert_id}")),
+                Some("tool_alert_1".to_string()),
+                Some("s1".to_string()),
+                Some("block".to_string()),
+                "agree".to_string(),
+                Some("confirmed".to_string()),
+                Some("policy_sensitive_file_access".to_string()),
+                Some("/repo/deploy.json".to_string()),
+                None,
+                130,
+            )
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        let alert = &dashboard["alerts"][0];
+        assert_eq!(alert["human_verdict"], "agree");
+        assert_eq!(alert["feedback_label"], "confirmed");
+        assert_eq!(alert["feedback_created_at"], 130);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_snapshot_bounds_request_text_and_omits_final_response() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-dashboard-request-projection-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let prompt = "p".repeat(2_048);
+        let response_marker = "response-that-must-not-enter-dashboard-state";
+        let response = format!("{response_marker}{}", "r".repeat(32 * 1_024));
+
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                &json!({
+                    "session_id": "s1",
+                    "hook_event_name": "UserPromptSubmit",
+                    "cwd": "/repo",
+                    "prompt": prompt,
+                })
+                .to_string(),
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "Stop",
+                &json!({
+                    "session_id": "s1",
+                    "hook_event_name": "Stop",
+                    "cwd": "/repo",
+                    "last_assistant_message": response,
+                })
+                .to_string(),
+                110,
+            ))
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        let request = &dashboard["requests"][0];
+        assert_eq!(
+            request["original_user_prompt"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            1_024
+        );
+        assert!(request.get("final_response").is_none());
+        assert!(!dashboard.to_string().contains(response_marker));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_snapshot_omits_transaction_events() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-dashboard-transaction-projection-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_transaction_event(&TransactionEventInput {
+                operation_id: "op-1".to_string(),
+                environment_kind: "container".to_string(),
+                operation: "create".to_string(),
+                phase: "succeeded".to_string(),
+                source_run_id: None,
+                target_run_id: Some("run-1".to_string()),
+                parent_run_id: None,
+                workspace: Some("/repo".to_string()),
+                summary: "transaction payload must stay off the dashboard refresh path".to_string(),
+                error_kind: None,
+                error_message: None,
+                metadata: Some(json!({"large": "metadata"})),
+                occurred_at_ms: 100,
+            })
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert!(dashboard.get("transactionEvents").is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_hides_legacy_endpoint_noise_and_duplicate_bursts() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-dashboard-endpoint-alert-filter-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"build"}"#,
+                100,
+            ))
+            .unwrap();
+
+        let endpoint_alert = |path: &str, observed_at_ms: u64| PolicyAlert {
+            session_id: Some("s1".to_string()),
+            tool_use_id: None,
+            severity: "medium".to_string(),
+            action: "warn".to_string(),
+            rule_id: "hook_bypass_file_mutation".to_string(),
+            message: "legacy endpoint mutation".to_string(),
+            path: Some(path.to_string()),
+            evidence: Some(json!({
+                "source": "macos-endpoint-security",
+                "actor": { "pid": 42, "pidversion": 7 }
+            })),
+            observed_at_ms,
+        };
+        store
+            .append_policy_alert(&endpoint_alert(
+                "/Users/test/Library/Application Support/Codex/Crashpad/new/report.dmp",
+                1_000,
+            ))
+            .unwrap();
+        for timestamp in [2_000, 2_001, 2_002] {
+            store
+                .append_policy_alert(&endpoint_alert("/repo/out.txt", timestamp))
+                .unwrap();
+        }
+        store
+            .append_policy_alert(&endpoint_alert("/repo/target/exfil.env", 3_000))
+            .unwrap();
+
+        assert_eq!(store.list_alerts().unwrap().len(), 5);
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["summary"]["alerts_count"], 2);
+        assert_eq!(dashboard["summary"]["medium_alerts_count"], 2);
+        let severity_total = ["critical", "high", "medium", "low", "info"]
+            .into_iter()
+            .map(|severity| {
+                dashboard["summary"][format!("{severity}_alerts_count")]
+                    .as_i64()
+                    .unwrap()
+            })
+            .sum::<i64>();
+        assert_eq!(severity_total, dashboard["summary"]["alerts_count"]);
+        let alert_paths = dashboard["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|alert| alert["path"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(alert_paths.len(), 2);
+        assert!(alert_paths.contains(&"/repo/out.txt"));
+        assert!(alert_paths.contains(&"/repo/target/exfil.env"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn failed_database_append_rolls_back_partial_graph_rows() {
         let dir =
             std::env::temp_dir().join(format!("gensee-store-test-rollback-{}", std::process::id()));
@@ -3068,6 +4861,79 @@ mod tests {
     }
 
     #[test]
+    fn unattributed_endpoint_security_events_do_not_create_legacy_unmatched_alerts() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-endpoint-global-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_system_event(&SystemEvent {
+                source: "macos-endpoint-security".to_string(),
+                event_type: "write".to_string(),
+                event_kind: "file_mutation".to_string(),
+                observed_at_ms: 130,
+                pid: Some(42),
+                ppid: Some(1),
+                process_name: Some("unmanaged".to_string()),
+                executable_path: Some("/usr/bin/unmanaged".to_string()),
+                file_path: Some("/private/tmp/unmanaged.txt".to_string()),
+                command_line: None,
+                raw_json: r#"{"attribution":{"session_id":null}}"#.to_string(),
+            })
+            .unwrap();
+
+        assert!(store
+            .list_alerts()
+            .unwrap()
+            .iter()
+            .all(|alert| alert.rule_id != "unmatched_system_effect"));
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["systemEvents"].as_array().unwrap().len(), 0);
+        assert_eq!(dashboard["summary"]["system_events_count"], 0);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_surfaces_endpoint_sequence_gap_alerts() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-endpoint-gap-dashboard-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let db = store.sqlite_store().unwrap();
+        insert_alert(
+            &db,
+            AlertInput {
+                request_id: None,
+                entity: None,
+                severity: "high",
+                action: "warn",
+                rule_id: "endpoint_security_event_gap",
+                message: "legacy prototype sequence gap",
+                path: None,
+                evidence: None,
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+            },
+        )
+        .unwrap();
+        drop(db);
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(dashboard["summary"]["alerts_count"], 1);
+        assert_eq!(dashboard["summary"]["recent_high_alerts"], 1);
+        assert_eq!(dashboard["summary"]["high_alerts_count"], 1);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn system_events_attach_when_path_matches_file_intent() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-store-test-system-match-{}",
@@ -3143,6 +5009,349 @@ mod tests {
         assert!(agent_relations.iter().any(
             |relation| relation.dst_kind == "artifact" && relation.relation_type == "produced"
         ));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_runtime_noise_stays_in_audit_stream_but_out_of_lineage() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-endpoint-lineage-filter-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let endpoint_event = |event_type: &str,
+                              event_kind: &str,
+                              path: &str,
+                              mode: u64,
+                              modified: Option<bool>,
+                              observed_at_ms: u64| {
+            let mut raw = json!({
+                "action": "notify",
+                "file": { "path": path, "mode": mode },
+                "attribution": {
+                    "session_id": "claude-session",
+                    "workspace_root": "/repo"
+                }
+            });
+            if let Some(modified) = modified {
+                raw["modified"] = json!(modified);
+            }
+            SystemEvent {
+                source: "macos-endpoint-security".to_string(),
+                event_type: event_type.to_string(),
+                event_kind: event_kind.to_string(),
+                observed_at_ms,
+                pid: Some(5311),
+                ppid: Some(5310),
+                process_name: Some("claude".to_string()),
+                executable_path: Some("/Applications/Claude.app/Contents/MacOS/Claude".to_string()),
+                file_path: Some(path.to_string()),
+                command_line: None,
+                raw_json: raw.to_string(),
+            }
+        };
+
+        let ignored = [
+            endpoint_event(
+                "open",
+                "file_read",
+                "/Library/Preferences/Logging/com.apple.diagnosticd.filter.plist",
+                0o100644,
+                None,
+                100,
+            ),
+            endpoint_event(
+                "unlink",
+                "file_mutation",
+                "/Users/test/.claude/sessions/5311.json",
+                0o100600,
+                None,
+                101,
+            ),
+            endpoint_event(
+                "unlink",
+                "file_mutation",
+                "/private/tmp/cc-socks/5311.sock",
+                0o140600,
+                None,
+                102,
+            ),
+            endpoint_event(
+                "close",
+                "system",
+                "/repo/merely-read.txt",
+                0o100644,
+                Some(false),
+                103,
+            ),
+            endpoint_event(
+                "readdir",
+                "file_read",
+                "/Users/test/.claude/skills",
+                0o040755,
+                None,
+                104,
+            ),
+        ];
+        for event in &ignored {
+            store.append_system_event(event).unwrap();
+            assert!(store
+                .artifact_fact_for_file(event.file_path.as_deref().unwrap())
+                .unwrap()
+                .is_none());
+        }
+
+        store
+            .append_system_event(&endpoint_event(
+                "write",
+                "file_mutation",
+                "/repo/src/lib.rs",
+                0o100644,
+                None,
+                105,
+            ))
+            .unwrap();
+        assert!(store
+            .artifact_fact_for_file("/repo/src/lib.rs")
+            .unwrap()
+            .is_some());
+
+        store
+            .append_system_event(&endpoint_event(
+                "write",
+                "file_mutation",
+                "/repo/target/exfil.env",
+                0o100600,
+                None,
+                106,
+            ))
+            .unwrap();
+        assert!(store
+            .artifact_fact_for_file("/repo/target/exfil.env")
+            .unwrap()
+            .is_some());
+
+        let mut build_output = endpoint_event(
+            "write",
+            "file_mutation",
+            "/repo/target/debug/output.o",
+            0o100644,
+            None,
+            107,
+        );
+        build_output.process_name = Some("rustc".to_string());
+        build_output.executable_path =
+            Some("/Users/test/.rustup/toolchains/stable/bin/rustc".to_string());
+        store.append_system_event(&build_output).unwrap();
+        assert!(store
+            .artifact_fact_for_file("/repo/target/debug/output.o")
+            .unwrap()
+            .is_none());
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["systemEvents"].as_array().unwrap().len(), 8);
+        assert_eq!(dashboard["summary"]["artifacts_count"], 2);
+        let artifact_paths = dashboard["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|artifact| artifact["uri"].as_str())
+            .collect::<Vec<_>>();
+        assert!(artifact_paths.contains(&"file:///repo/src/lib.rs"));
+        assert!(artifact_paths.contains(&"file:///repo/target/exfil.env"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_hides_legacy_endpoint_runtime_artifacts() {
+        assert!(!dashboard_artifact_path_is_visible(
+            "/System/Library/dyld/dyld_shared_cache_arm64e",
+            Some("macos-endpoint-security"),
+            None,
+            false,
+        ));
+        assert!(!dashboard_artifact_path_is_visible(
+            "/System/Library/example.conf",
+            Some("macos-endpoint-security"),
+            None,
+            false,
+        ));
+        assert!(dashboard_artifact_path_is_visible(
+            "/repo/src/lib.rs",
+            Some("macos-endpoint-security"),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn artifact_visibility_preserves_bracket_routes_and_hides_globs() {
+        for (path, expected_visible) in [
+            ("/repo/src/lib.rs", true),
+            ("/repo/*.sh", false),
+            ("/repo/file?.md", false),
+            ("/repo/{one,two}.json", false),
+            ("/repo/app/[slug]/page.tsx", true),
+            ("/repo/pages/[id].tsx", true),
+            ("/repo/app/[[...slug]]/page.tsx", true),
+        ] {
+            assert_eq!(
+                dashboard_artifact_path_is_visible(path, Some("bash-command-parser"), None, false,),
+                expected_visible,
+                "visibility for {path}",
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_hides_endpoint_system_dependencies() {
+        for (path, expected_visible) in [
+            ("/usr/local/bin", false),
+            ("/usr/local/bin/gensee", false),
+            ("/usr/local/binaries/tool", true),
+            ("/usr/local/bin-old/x", true),
+        ] {
+            assert_eq!(
+                dashboard_artifact_path_is_visible(
+                    path,
+                    Some("macos-endpoint-security"),
+                    None,
+                    false,
+                ),
+                expected_visible,
+                "visibility for {path}",
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_sql_filters_noise_before_applying_lineage_limits() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-dashboard-filter-limits-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let db = store.sqlite_store().unwrap();
+        let conn = db.connection();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        conn.execute(
+            "INSERT INTO artifacts (kind, uri, digest) VALUES ('file', 'file:///repo/source', '')",
+            [],
+        )
+        .unwrap();
+        let clean_source = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO artifacts (kind, uri, digest) VALUES ('file', 'file:///repo/destination', '')",
+            [],
+        )
+        .unwrap();
+        let clean_destination = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO artifact_facts (
+                kind, uri, current_artifact_id, last_seen_at, last_modified_source,
+                metadata, dashboard_visible
+             ) VALUES ('file', 'file:///repo/source', ?1, 10000, 'agent', '{}', 1)",
+            [clean_source],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO artifact_facts (
+                kind, uri, current_artifact_id, last_seen_at, last_modified_source,
+                metadata, dashboard_visible
+             ) VALUES ('file', 'file:///repo/destination', ?1, 9999, 'agent', '{}', 1)",
+            [clean_destination],
+        )
+        .unwrap();
+        for index in 0..300 {
+            conn.execute(
+                "INSERT INTO relations (
+                    src_kind, src_id, dst_kind, dst_id, relation_type, confidence, created_at
+                 ) VALUES ('artifact', ?1, 'artifact', ?2, ?3, 1.0, ?4)",
+                rusqlite::params![
+                    clean_source,
+                    clean_destination,
+                    format!("clean-{index}"),
+                    index
+                ],
+            )
+            .unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO artifacts (kind, uri, digest) VALUES ('file', 'file:///usr/lib/noise-a', '')",
+            [],
+        )
+        .unwrap();
+        let noise_source = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO artifacts (kind, uri, digest) VALUES ('file', 'file:///usr/lib/noise-b', '')",
+            [],
+        )
+        .unwrap();
+        let noise_destination = conn.last_insert_rowid();
+        for index in 0..5_199 {
+            conn.execute(
+                "INSERT INTO relations (
+                    src_kind, src_id, dst_kind, dst_id, relation_type, confidence, created_at
+                 ) VALUES ('artifact', ?1, 'artifact', ?2, ?3, 1.0, ?4)",
+                rusqlite::params![
+                    noise_source,
+                    noise_destination,
+                    format!("noise-{index}"),
+                    1_000 + index
+                ],
+            )
+            .unwrap();
+        }
+
+        for index in 0..100 {
+            conn.execute(
+                "INSERT INTO artifact_facts (
+                    kind, uri, last_seen_at, last_modified_source, metadata,
+                    dashboard_visible
+                 ) VALUES ('file', ?1, ?2, 'macos-endpoint-security', ?3, 1)",
+                rusqlite::params![
+                    format!("file:///repo/artifact-{index}"),
+                    index,
+                    r#"{"source":"macos-endpoint-security"}"#
+                ],
+            )
+            .unwrap();
+        }
+        for index in 0..500 {
+            conn.execute(
+                "INSERT INTO artifact_facts (
+                    kind, uri, last_seen_at, last_modified_source, metadata,
+                    dashboard_visible
+                 ) VALUES ('file', ?1, ?2, 'macos-endpoint-security', ?3, 0)",
+                rusqlite::params![
+                    format!("file:///System/Library/noise-{index}"),
+                    1_000 + index,
+                    r#"{"source":"macos-endpoint-security"}"#
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        drop(db);
+
+        let dashboard = store.dashboard_state().unwrap();
+        let artifacts = dashboard["artifacts"].as_array().unwrap();
+        let relations = dashboard["relations"].as_array().unwrap();
+        assert_eq!(artifacts.len(), 80);
+        assert_eq!(dashboard["summary"]["artifacts_count"], 102);
+        assert!(artifacts.iter().all(|artifact| artifact["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("file:///repo/")));
+        assert_eq!(relations.len(), 200);
+        assert!(relations.iter().all(|relation| {
+            relation["src_uri"] == "file:///repo/source"
+                && relation["dst_uri"] == "file:///repo/destination"
+        }));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -3370,6 +5579,90 @@ mod tests {
             .any(|relation| relation.src_kind == "artifact"
                 && relation.dst_kind == "request"
                 && relation.relation_type == "consumed_by"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wildcard_file_intents_do_not_materialize_artifacts() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-wildcard-artifacts-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"inspect scripts"}"#,
+                100,
+            ))
+            .unwrap();
+        for (index, path) in ["/repo/*.sh", "/repo/file?.md", "/repo/{one,two}.json"]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .append_file_intent(&FileIntent {
+                    provider: "bash-command-parser".to_string(),
+                    session_id: Some("s1".to_string()),
+                    tool_use_id: Some(format!("tool_{index}")),
+                    observed_at_ms: 110 + index as u64,
+                    operation: "read".to_string(),
+                    path: path.to_string(),
+                    source_command: format!("cat {path}"),
+                    sensitive: false,
+                    confidence: "low".to_string(),
+                })
+                .unwrap();
+            assert!(store.artifact_fact_for_file(path).unwrap().is_none());
+        }
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["summary"]["artifacts_count"], 0);
+        assert!(dashboard["artifacts"].as_array().unwrap().is_empty());
+
+        store
+            .append_file_intent(&FileIntent {
+                provider: "bash-command-parser".to_string(),
+                session_id: Some("s1".to_string()),
+                tool_use_id: Some("tool_route".to_string()),
+                observed_at_ms: 119,
+                operation: "read".to_string(),
+                path: "/repo/app/[slug]/page.tsx".to_string(),
+                source_command: "cat /repo/app/[slug]/page.tsx".to_string(),
+                sensitive: false,
+                confidence: "low".to_string(),
+            })
+            .unwrap();
+        assert!(store
+            .artifact_fact_for_file("/repo/app/[slug]/page.tsx")
+            .unwrap()
+            .is_some());
+
+        store
+            .append_file_intent(&FileIntent {
+                provider: "bash-command-parser".to_string(),
+                session_id: Some("s1".to_string()),
+                tool_use_id: Some("tool_concrete".to_string()),
+                observed_at_ms: 120,
+                operation: "read".to_string(),
+                path: "/repo/build.sh".to_string(),
+                source_command: "cat /repo/build.sh".to_string(),
+                sensitive: false,
+                confidence: "low".to_string(),
+            })
+            .unwrap();
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["summary"]["artifacts_count"], 2);
+        let paths = dashboard["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|artifact| artifact["uri"].as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"file:///repo/build.sh"));
+        assert!(paths.contains(&"file:///repo/app/[slug]/page.tsx"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -3761,6 +6054,94 @@ mod tests {
         assert!(!relations
             .iter()
             .any(|relation| relation.relation_type == "derived_from"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_active_tool_window_opens_closes_and_expires() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-endpoint-tool-window-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"write it"}"#,
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event(&native_tool_event(
+                "Bash",
+                "tool-active",
+                r#"{"command":"printf hi > out.txt"}"#,
+                200,
+            ))
+            .unwrap();
+
+        let active = store.active_tool_call("s1", 250, 1_000).unwrap().unwrap();
+        assert_eq!(active.provider, "claude-code");
+        assert_eq!(active.tool_use_id.as_deref(), Some("tool-active"));
+        assert_eq!(active.cwd, "/repo");
+        assert!(store
+            .active_tool_call("s1", 1_201, 1_000)
+            .unwrap()
+            .is_none());
+
+        let mut completed = native_tool_event("Bash", "tool-active", "{}", 300);
+        completed.hook_event_name = Some("PostToolUse".to_string());
+        completed.raw_json = r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"tool-active"}"#.to_string();
+        store.append_hook_event(&completed).unwrap();
+        assert!(store.active_tool_call("s1", 350, 1_000).unwrap().is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn endpoint_alert_deduplication_survives_pipeline_restarts() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-endpoint-alert-dedupe-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let alert = PolicyAlert {
+            session_id: Some("s1".to_string()),
+            tool_use_id: Some("tool-1".to_string()),
+            severity: "medium".to_string(),
+            action: "warn".to_string(),
+            rule_id: "hook_bypass_file_mutation".to_string(),
+            message: "unreported mutation".to_string(),
+            path: Some("/repo/out.txt".to_string()),
+            evidence: Some(json!({"source": "macos-endpoint-security"})),
+            observed_at_ms: 1_000,
+        };
+        let key = "s1:42:7:/repo/out.txt:mutation";
+        assert!(store
+            .append_endpoint_policy_alert(&alert, key, 10_000)
+            .unwrap());
+        assert!(!store
+            .append_endpoint_policy_alert(
+                &PolicyAlert {
+                    observed_at_ms: 2_000,
+                    ..alert.clone()
+                },
+                key,
+                10_000
+            )
+            .unwrap());
+        assert!(store
+            .append_endpoint_policy_alert(
+                &PolicyAlert {
+                    observed_at_ms: 12_001,
+                    ..alert
+                },
+                key,
+                10_000
+            )
+            .unwrap());
+        assert_eq!(store.list_alerts().unwrap().len(), 2);
 
         fs::remove_dir_all(&dir).ok();
     }

@@ -52,7 +52,7 @@ dashboard Policy tab:
 
 Press Enter to keep each current value, or type a new value. Lists are
 comma-separated; nullable fields such as proxy URL and max runtime accept
-`none` or `unset`. Watch system events accept `eslogger` or `none`; decision
+`none` or `unset`. Watch system events accept `endpoint-security`, `eslogger`, or `none`; decision
 rules accept `deny`, `ask`, or `allow`.
 
 ## Supported `set` Keys
@@ -81,6 +81,9 @@ Use a text editor for rule-content changes.
 - `linux.network.allow`
 - `linux.network.deny`
 - `enforcement.noninteractive`
+- `endpoint_security.mode`
+- `endpoint_security.protected_paths`
+- `endpoint_security.blocked_executables`
 - `watch.system_events`
 - `allow_path_prefixes`
 
@@ -95,6 +98,11 @@ Policy configuration resolves in this order:
 `GENSEE_POLICY_FILE` can point at a custom policy path. If that file is
 unreadable, invalid JSON, or has an unsupported `schema_version`, Gensee Crate
 fails closed and denies tool calls until the policy is fixed.
+
+Policy schema version 2 adds Endpoint Security recording and retention controls.
+This build also reads version 1 during migration, while new policies are written
+as version 2. Unknown passive Endpoint Security recording keys do not turn every
+hook decision into a denial; unsupported top-level schema versions still do.
 
 ## Rule Authoring
 

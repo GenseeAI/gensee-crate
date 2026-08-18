@@ -2,7 +2,7 @@
 
 Gensee Crate is a local-first runtime security layer for AI coding agents. The
 current v0.2 release supports native macOS and Linux controls, agent hooks, and
-transactional tclone environments across five workflows:
+transactional tclone environments across six workflows:
 
 - `gensee watch` — sidecar audit of workspace effects and macOS system events
   for users who do not want Gensee launching their agent. See [watch.md](watch.md).
@@ -19,13 +19,17 @@ transactional tclone environments across five workflows:
 - `dashboards/` — native timeline, lineage, policy, transaction, and review UI
   (React + Tauri) backed by the same `GENSEE_HOME` store as the CLI. See
   [dashboard.md](dashboard.md).
+- `macos/GenseeCrate` — SwiftUI security console for the signed Endpoint
+  Security extension, sensor policy, and installed harness protection. It
+  embeds the monorepo's `gensee` CLI rather than implementing a separate
+  backend. See [macos-app.md](macos-app.md).
 
-The tclone container runtime is available on prepared Linux hosts. `eslogger`
-is the default `gensee watch` system-event backend on macOS when available and
-can be disabled by policy, while a signed EndpointSecurity client remains a
-future enrichment. Linux host support includes `/proc` process attribution,
-capability planning, fanotify sensitive-path enforcement, seccomp launcher
-profiles for dangerous syscalls, and cgroup/nftables network controls. See
+The tclone container runtime is available on prepared Linux hosts. The signed
+Gensee Endpoint Security system extension is the default macOS system-event
+backend; `eslogger` remains only a manual compatibility path. Linux host support
+includes `/proc` process attribution, capability planning, fanotify
+sensitive-path enforcement, seccomp launcher profiles for dangerous syscalls,
+and cgroup/nftables network controls. See
 [endpoint-security.md](endpoint-security.md), [linux.md](linux.md), and
 [tclone.md](tclone.md).
 
@@ -38,6 +42,7 @@ profiles for dangerous syscalls, and cgroup/nftables network controls. See
 | `crate/gensee-crate-rules` | Deterministic detection rules and the data-driven [policy engine](policy.md) |
 | `crate/gensee-crate-store` | Local storage and migrations |
 | `crate/gensee-crate-macos` | macOS EndpointSecurity integration |
+| `macos/GenseeCrate` | Native Swift security console and signed Endpoint Security system extension |
 | `crate/gensee-crate-linux` | Experimental Linux capability detection, `/proc` monitoring, policy decisions, fanotify planning/debug probes, seccomp launcher profiles, and cgroup/nftables egress controls |
 | `crate/gensee-crate-cli` | `gensee` CLI entry point, including run/watch/timeline/policy commands |
 | `crate/gensee-crate-config-audit` | Static, read-only coding-agent configuration inventory and security/privacy rules; Codex is the first adapter |
@@ -65,7 +70,7 @@ to appear together.
 | --- | --- |
 | `$GENSEE_HOME/sessions.jsonl` | Local run records from `gensee run` |
 | `$GENSEE_HOME/workspace-effects.jsonl` | Filesystem effects observed by `gensee watch` |
-| `$GENSEE_HOME/system-events.jsonl` | Normalized exec/open/create/write/rename/unlink events from `gensee watch` system-event capture or `gensee ingest eslogger` |
+| `$GENSEE_HOME/system-events.jsonl` | Normalized process/file/auth events from the signed Endpoint Security sensor (or manual `gensee ingest eslogger`) |
 | `$GENSEE_HOME/hooks.jsonl` | Agent hook events |
 | `$GENSEE_HOME/gensee.db` | Normalized SQLite [lineage graph](lineage-graph.md) |
 | `$GENSEE_HOME/gensee.key` | Local store encryption key; keep private and do not share with telemetry snapshots |
@@ -78,12 +83,9 @@ the old `GENSEE_HOME` to start a fresh encrypted store. Set
 
 ## Roadmap / not yet solved
 
-- FSEvents does not prove which process caused a file effect; it is path/time
-  correlation only, so "modified outside the agent" drives `ask`, not `deny`.
-  EndpointSecurity exec/actor attribution is the planned upgrade.
-- `eslogger` gives `gensee watch` useful macOS exec/file system-event context,
-  but it is still an interim source. A signed EndpointSecurity client is the
-  durable path for production-grade actor attribution and tighter event control.
+- FSEvents remains path/time reconciliation only. Endpoint Security now supplies
+  exact process identities and actor attribution for supported process/file
+  events; unobserved operations and packet-level network activity remain gaps.
 - Hook enforcement is deterministic and path/tool based; it does not yet use
   semantic prompt analysis.
 - Content rules and the executable resolver are deterministic and best-effort —

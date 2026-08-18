@@ -246,6 +246,7 @@ dependencies = [
  "gensee-crate-config-audit",
  "gensee-crate-core",
  "gensee-crate-linux",
+ "gensee-crate-macos",
  "gensee-crate-rules",
  "gensee-crate-store",
  "hmac",
@@ -281,6 +282,7 @@ dependencies = [
 name = "gensee-crate-db"
 version = "0.2.0"
 dependencies = [
+ "gensee-crate-core",
  "rusqlite",
  "serde",
  "sha2",
@@ -302,6 +304,8 @@ name = "gensee-crate-macos"
 version = "0.2.0"
 dependencies = [
  "gensee-crate-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

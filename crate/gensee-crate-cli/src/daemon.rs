@@ -94,6 +94,19 @@ pub(crate) fn serve_connection(mut stream: UnixStream, store: &EventStore) -> io
         Ok(event) => event,
         Err(_) => return Ok(()), // malformed payload: nothing to do, nothing to answer
     };
+    if let Ok(value) = serde_json::from_str::<Value>(&request) {
+        if let Some(registration) = value
+            .get("session_registration")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<AgentSession>(value).ok())
+        {
+            if registration.root_pid != 0
+                && event.session_id.as_deref() == Some(registration.session_id.as_str())
+            {
+                store.append_session(&registration)?;
+            }
+        }
+    }
     if let Some(decision_json) = process_hook_event(&payload, &event, store)? {
         // Best-effort: the client may have already gone away on a non-blocking
         // event; that is not an error worth failing the connection over.
@@ -242,7 +255,11 @@ pub(crate) fn daemon_request_parts(request: &str) -> io::Result<(String, String)
 /// daemon (and, for PreToolUse, the decision was written to stdout). Returns
 /// `false` if the daemon is unreachable or the round trip failed, so the caller
 /// falls back to in-process evaluation (never skipping enforcement).
-pub(crate) fn dispatch_via_daemon(payload: &str, event: &AgentHookEvent) -> bool {
+pub(crate) fn dispatch_via_daemon(
+    payload: &str,
+    event: &AgentHookEvent,
+    session_registration: Option<&AgentSession>,
+) -> bool {
     let Ok(root) = default_root() else {
         return false;
     };
@@ -254,6 +271,7 @@ pub(crate) fn dispatch_via_daemon(payload: &str, event: &AgentHookEvent) -> bool
         "gensee_daemon_protocol": 1,
         "provider": event.provider,
         "payload": payload,
+        "session_registration": session_registration,
     })
     .to_string();
     if stream.write_all(request.as_bytes()).is_err() {

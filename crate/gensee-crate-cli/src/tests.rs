@@ -1,9 +1,29 @@
 use super::*;
-use std::sync::{Mutex, OnceLock};
 
 fn telemetry_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    cli_test_env_lock()
+}
+
+#[test]
+fn cli_test_environment_mutations_share_one_process_wide_lock() {
+    let first_guard = cli_test_env_lock();
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let contender = std::thread::spawn(move || {
+        let _second_guard = cli_test_env_lock();
+        acquired_tx.send(()).unwrap();
+    });
+
+    assert!(
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "a second environment-mutating test acquired the shared lock concurrently"
+    );
+    drop(first_guard);
+    acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the waiting environment-mutating test should resume after unlock");
+    contender.join().unwrap();
 }
 
 fn telemetry_test_root(suffix: &str) -> PathBuf {
@@ -517,6 +537,7 @@ fn claude_code_setup_reports_disabled_hooks_without_changing_setting() {
         &settings_path,
         "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
         &ClaudeCodeGatewaySettings::default(),
+        false,
     )
     .unwrap();
 
@@ -529,6 +550,53 @@ fn claude_code_setup_reports_disabled_hooks_without_changing_setting() {
     let updated: Value =
         serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
     assert_eq!(updated["disableAllHooks"], json!(true));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn claude_code_repair_enables_hooks_without_losing_other_settings() {
+    let root = env::temp_dir().join(format!(
+        "gensee-claude-repair-hooks-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let settings_path = root.join("settings.json");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&json!({
+            "disableAllHooks": true,
+            "theme": "dark",
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Read",
+                    "hooks": [{"type": "command", "command": "./keep-me.sh"}]
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let hooks_disabled = write_claude_code_settings(
+        &settings_path,
+        "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
+        &ClaudeCodeGatewaySettings::default(),
+        true,
+    )
+    .unwrap();
+
+    assert!(!hooks_disabled);
+    let updated: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(updated["disableAllHooks"], json!(false));
+    assert_eq!(updated["theme"], json!("dark"));
+    assert!(updated["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .any(|hook| hook["command"] == json!("./keep-me.sh")));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -566,6 +634,7 @@ fn claude_code_setup_updates_symlink_target_without_replacing_link() {
         &settings_path,
         "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
         &ClaudeCodeGatewaySettings::default(),
+        false,
     )
     .unwrap();
 
@@ -626,6 +695,7 @@ fn claude_code_setup_rejects_dangling_settings_symlink() {
         &settings_path,
         "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
         &ClaudeCodeGatewaySettings::default(),
+        false,
     )
     .unwrap_err();
 
@@ -664,6 +734,7 @@ fn claude_code_setup_creates_new_settings_owner_only() {
         &settings_path,
         "GENSEE_HOME=/tmp/gensee /usr/local/bin/gensee hook claude-code",
         &gateway,
+        false,
     )
     .unwrap();
 
@@ -714,6 +785,19 @@ fn claude_code_gateway_settings_merge_into_env() {
     );
     assert!(settings["env"]["ANTHROPIC_API_KEY"].is_null());
     assert!(settings["apiKeyHelper"].is_null());
+    assert_eq!(
+        settings["genseeGatewayManagedKeys"],
+        json!([
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "ANTHROPIC_AUTH_TOKEN"
+        ])
+    );
+
+    remove_managed_claude_code_gateway_settings_from_root(settings.as_object_mut().unwrap());
+    assert_eq!(settings["env"]["EXISTING"], json!("keep"));
+    assert!(settings["env"]["ANTHROPIC_BASE_URL"].is_null());
+    assert!(settings.get("genseeGatewayManagedKeys").is_none());
 }
 
 #[test]
@@ -765,6 +849,11 @@ fn claude_code_gateway_settings_require_base_url_for_credential() {
         api_key_helper: None,
     };
     assert!(gateway.validate().is_err());
+}
+
+#[test]
+fn empty_hook_path_is_rejected_instead_of_becoming_the_working_directory() {
+    assert!(absolutize_for_hook(Path::new("")).is_err());
 }
 
 #[test]
@@ -892,6 +981,128 @@ fn codex_hook_command_quotes_paths_with_spaces() {
         command,
         "GENSEE_HOME='/Users/example/Gensee Store' '/Applications/Gensee Crate/gensee' hook codex"
     );
+}
+
+#[test]
+fn hook_disable_removes_only_gensee_owned_entries() {
+    let mut nested = json!({
+        "PreToolUse": [
+            {
+                "matcher": "Read",
+                "hooks": [
+                    {"type": "command", "command": "./keep-before.sh"},
+                    {
+                        "type": "command",
+                        "command": "GENSEE_HOME=/old /old/gensee hook codex"
+                    },
+                    {"type": "command", "command": "./keep-after.sh"}
+                ]
+            },
+            {
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "GENSEE_HOME=/duplicate /duplicate/gensee hook codex"
+                }]
+            }
+        ],
+        "PermissionRequest": [{
+            "matcher": "*",
+            "hooks": [{
+                "type": "command",
+                "command": "GENSEE_HOME=/old /old/gensee hook codex"
+            }]
+        }],
+        "Unrelated": [{"matcher": "keep"}]
+    });
+    let hooks = nested.as_object_mut().unwrap();
+    assert!(remove_nested_hook_event(hooks, "PreToolUse", PROVIDER_CODEX, "Codex").unwrap());
+    assert!(remove_nested_hook_event(hooks, "PermissionRequest", PROVIDER_CODEX, "Codex").unwrap());
+
+    assert_eq!(hooks["Unrelated"][0]["matcher"], json!("keep"));
+    assert!(hooks.get("PermissionRequest").is_none());
+    let remaining = hooks["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .filter_map(|hook| hook["command"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(remaining, vec!["./keep-before.sh", "./keep-after.sh"]);
+
+    let mut flat = json!({
+        "preToolUse": [
+            {"command": "./keep.sh"},
+            {"command": "GENSEE_HOME=/old /old/gensee hook cursor"}
+        ],
+        "unrelated": [{"command": "./also-keep.sh"}]
+    });
+    let hooks = flat.as_object_mut().unwrap();
+    assert!(remove_flat_hook_event(hooks, "preToolUse", PROVIDER_CURSOR, "Cursor").unwrap());
+    assert_eq!(hooks["preToolUse"], json!([{"command": "./keep.sh"}]));
+    assert_eq!(hooks["unrelated"], json!([{"command": "./also-keep.sh"}]));
+}
+
+#[test]
+fn antigravity_disable_preserves_unrelated_policy_hooks() {
+    let root = env::temp_dir().join(format!(
+        "gensee-antigravity-disable-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let hooks_path = root.join("hooks.json");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        &hooks_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "other-setting": true,
+                "gensee-policy": {
+                    "PreToolUse": [{
+                        "matcher": "*",
+                        "hooks": [
+                            {"type": "command", "command": "./keep.sh"},
+                            {
+                                "type": "command",
+                                "command": "GENSEE_HOME=/old /old/gensee hook antigravity"
+                            }
+                        ]
+                    }],
+                    "PostToolUse": [{
+                        "matcher": "*",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook antigravity"
+                        }]
+                    }],
+                    "PreInvocation": [
+                        {"type": "command", "command": "./keep-invocation.sh"},
+                        {
+                            "type": "command",
+                            "command": "GENSEE_HOME=/old /old/gensee hook antigravity"
+                        }
+                    ]
+                }
+            }))
+            .unwrap()
+        ),
+    )
+    .unwrap();
+
+    assert!(remove_antigravity_hook_settings(&hooks_path).unwrap());
+    let updated: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    assert_eq!(updated["other-setting"], json!(true));
+    assert_eq!(
+        updated["gensee-policy"]["PreToolUse"][0]["hooks"][0]["command"],
+        json!("./keep.sh")
+    );
+    assert!(updated["gensee-policy"].get("PostToolUse").is_none());
+    assert_eq!(
+        updated["gensee-policy"]["PreInvocation"][0]["command"],
+        json!("./keep-invocation.sh")
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5152,6 +5363,7 @@ fn pretool_policy_asks_on_credential_hint_paths() {
 
 #[test]
 fn pretool_sampler_gated_by_env_then_allowed_decisions() {
+    let _guard = telemetry_test_lock();
     let allowed = PolicyDecision {
         action: PolicyAction::Allow,
         findings: Vec::new(),
@@ -5905,6 +6117,14 @@ fn parses_watch_system_events_backend() {
         SystemEventBackend::None
     );
     assert_eq!(
+        SystemEventBackend::parse(
+            Some("endpoint-security".to_string()),
+            SystemEventBackend::None
+        )
+        .unwrap(),
+        SystemEventBackend::EndpointSecurity
+    );
+    assert_eq!(
         SystemEventBackend::parse(Some("eslogger".to_string()), SystemEventBackend::None).unwrap(),
         SystemEventBackend::Eslogger
     );
@@ -6559,6 +6779,9 @@ fn policy_setup_flow_updates_dashboard_settings() {
         "1.1.1.1, 10.0.0.0/8",             // linux.network.allow
         "169.254.169.254",                 // linux.network.deny
         "yes",                             // enforcement.noninteractive
+        "protect",                         // endpoint_security.mode
+        "/Users/me/.ssh,/Users/me/.aws",   // endpoint_security.protected_paths
+        "/usr/bin/osascript",              // endpoint_security.blocked_executables
         "none",                            // watch.system_events
         "/Users/me/templates,/opt/shared", // allow_path_prefixes
     ]
@@ -6616,6 +6839,18 @@ fn policy_setup_flow_updates_dashboard_settings() {
     assert_eq!(
         policy_value_get(&root, "enforcement.noninteractive"),
         Some(&json!(true))
+    );
+    assert_eq!(
+        policy_value_get(&root, "endpoint_security.mode"),
+        Some(&json!("protect"))
+    );
+    assert_eq!(
+        policy_value_get(&root, "endpoint_security.protected_paths"),
+        Some(&json!(["/Users/me/.ssh", "/Users/me/.aws"]))
+    );
+    assert_eq!(
+        policy_value_get(&root, "endpoint_security.blocked_executables"),
+        Some(&json!(["/usr/bin/osascript"]))
     );
     assert_eq!(
         policy_value_get(&root, "watch.system_events"),
@@ -7167,6 +7402,68 @@ fn hook_dedups_fork_suggestions_per_session_and_reason() {
         .as_deref()
         .is_some_and(|evidence| { evidence.contains(r#""reason":"schema_migration""#) })));
     std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn endpoint_ingest_commit_parses_durable_cursor_barrier() {
+    let commit = endpoint_ingest_commit(
+        r#"{"gensee_ingest_control":"commit","protocol_version":1,"sensor_cursor":42,"boot_id":"boot-1","event_count":3}"#,
+    )
+    .unwrap()
+    .expect("commit record");
+
+    assert_eq!(commit.sensor_cursor, 42);
+    assert_eq!(commit.boot_id, "boot-1");
+    assert_eq!(commit.event_count, 3);
+    assert!(
+        endpoint_ingest_commit(r#"{"schema_version":1,"event_type":"exec"}"#)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn endpoint_ingest_commit_rejects_unsupported_or_incomplete_barriers() {
+    let unsupported = endpoint_ingest_commit(
+        r#"{"gensee_ingest_control":"commit","protocol_version":2,"sensor_cursor":42,"boot_id":"boot-1","event_count":3}"#,
+    )
+    .unwrap_err();
+    assert_eq!(unsupported.kind(), io::ErrorKind::InvalidData);
+
+    let incomplete = endpoint_ingest_commit(
+        r#"{"gensee_ingest_control":"commit","protocol_version":1,"sensor_cursor":42,"boot_id":"boot-1"}"#,
+    )
+    .unwrap_err();
+    assert_eq!(incomplete.kind(), io::ErrorKind::InvalidData);
+    assert!(incomplete.to_string().contains("event_count"));
+}
+
+#[test]
+fn endpoint_ingest_ack_reports_rejected_lines_without_stalling_the_cursor() {
+    let commit = EndpointIngestCommit {
+        sensor_cursor: 42,
+        boot_id: "boot-1".to_string(),
+        event_count: 3,
+    };
+    let acknowledgement = endpoint_ingest_ack(&commit, 3, 1).unwrap();
+
+    assert_eq!(acknowledgement["gensee_ingest_ack"], "committed");
+    assert_eq!(acknowledgement["sensor_cursor"], 42);
+    assert_eq!(acknowledgement["event_count"], 3);
+    assert_eq!(acknowledgement["rejected_events"], 1);
+}
+
+#[test]
+fn endpoint_ingest_ack_still_rejects_a_real_batch_count_mismatch() {
+    let commit = EndpointIngestCommit {
+        sensor_cursor: 42,
+        boot_id: "boot-1".to_string(),
+        event_count: 3,
+    };
+
+    let error = endpoint_ingest_ack(&commit, 2, 1).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("received 2"));
 }
 
 fn test_resource_config() -> ResourceGovernanceConfig {

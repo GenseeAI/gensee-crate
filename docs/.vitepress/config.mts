@@ -71,6 +71,7 @@ export default defineConfig({
         text: 'Data And Lineage',
         items: [
           { text: 'Dashboard', link: '/dashboard' },
+          { text: 'macOS Security Console', link: '/macos-app' },
           { text: 'SQLite Lineage Graph', link: '/lineage-graph' },
           { text: 'Endpoint Security', link: '/endpoint-security' }
         ]

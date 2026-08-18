@@ -1,0 +1,20 @@
+.DS_Store
+
+# Xcode and XcodeGen output
+DerivedData/
+build/
+xcuserdata/
+*.xcuserstate
+*.xcarchive/
+*.app/
+*.dmg
+*.pkg
+
+# Signing and notarization material must never be committed.
+*.cer
+*.p12
+*.p8
+*.key
+*.mobileprovision
+*.provisionprofile
+notarytool-profile*

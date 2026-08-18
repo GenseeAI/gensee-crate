@@ -25,6 +25,8 @@
   <a href="https://crate-docs.gensee.ai">Docs</a>
   ·
   <a href="https://www.gensee.ai/discord">Join Discord</a>
+  ·
+  <strong><a href="https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg">⬇️ Download the macOS app</a></strong>
 </p>
 
 <p align="center">
@@ -76,6 +78,15 @@ with low runtime overhead.
 ## Quick start
 
 ### 1. Install
+
+On macOS, the [signed app download](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)
+includes the Gensee backend and SQLite support. Its first-launch assistant
+prepares `~/.gensee`, guides the Apple permissions, scans all six supported
+harnesses, and verifies a real hook event before reporting protection. It does
+not require Homebrew, Rust, jq, Xcode Command Line Tools, or a separate SQLite
+installation.
+
+For the command-line/source installation, use:
 
 One command installs Gensee Crate and checks or installs its command-line
 prerequisites on macOS. At the end, the installer can configure supported agent
@@ -304,6 +315,25 @@ If you are running from a source checkout instead of an installed binary:
 ./target/debug/gensee setup cursor --gensee-home "$GENSEE_HOME"
 ```
 
+To disable a configured hook integration without disturbing any unrelated
+harness settings or hooks, pass `--disable`:
+
+```bash
+gensee setup codex --disable
+gensee setup claude-code --disable
+gensee setup antigravity --disable
+gensee setup vscode --disable
+gensee setup cursor --disable
+```
+
+The native app's **Repair** action reruns setup with its active event store and
+embedded backend. For Claude Code, the equivalent explicit CLI repair also
+reenables globally disabled hooks:
+
+```bash
+gensee setup claude-code --repair --gensee-home "$GENSEE_HOME"
+```
+
 The setup commands merge Gensee into the previous hook settings, update
 `~/.claude/settings.json`, `~/.codex/hooks.json`, or
 `~/.gemini/config/hooks.json` or `~/.cursor/hooks.json`, or write
@@ -354,18 +384,29 @@ sidecar watching, and managed `gensee run` launches.
 **Hooks only.** Agent requests and tool calls are checked by Gensee policy after
 Step 1 setup. No extra command needs to keep running.
 
-**Watch.** Observe workspace file effects, and optionally ingest macOS
-EndpointSecurityLogger events:
+**Watch.** Observe workspace file effects. The native Gensee Crate app
+independently ingests signed Endpoint Security process and file events:
 
 ```bash
 gensee watch # optional flags: --workspace --watch-root --duration-seconds
-sudo gensee watch --system-events eslogger
+gensee policy set watch.system_events endpoint-security
 ```
 
-If you use `--system-events eslogger`, open Apple menu > System Settings >
-Privacy & Security > Full Disk Access, click `+`, add the app hosting `gensee`
-(for example Terminal, iTerm, or Visual Studio Code), then quit and reopen that
-app.
+Build and install [`macos/GenseeCrate`](macos/GenseeCrate), approve its bundled
+system extension, and grant Gensee Crate Full Disk Access. `eslogger` remains an
+optional manual diagnostic backend. The app's Harnesses page detects Codex,
+Claude Code, Antigravity, Cursor, GitHub Copilot, and Omnigent. Installed
+direct-hook harnesses can be enabled or disabled with explicit protection
+actions; unavailable harnesses stay visible but muted. Enabled hooks are also
+checked for full event coverage and the app's active event-store/backend paths;
+stale or incomplete integrations show **Needs repair** with a one-click safe
+repair. See the
+[native macOS security console](docs/macos-app.md) guide. Its **Daily
+Highlight** page combines today's summary with rolling-year heatmaps for agent
+turns, tool calls, alerts, and supported transcript token totals. On the
+**Harnesses** page, **Audit Config** on Codex and GitHub Copilot runs the shared
+OSS auditor and presents findings, evidence, inventory, source provenance, and
+manual checks inline; unsupported harness auditors are marked **Coming soon**.
 
 **Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
 `sandbox-exec` and can stage workspace writes for review.
@@ -639,8 +680,9 @@ dashboard. Next directions include:
 - **Transactional Linux runtimes:** initial tclone launch/fork/shell/diff/keep
   support is available; next work is post-fork hook rebind, policy-controlled
   rollback, and multi-fork lifecycle management.
-- **Endpoint Security-based macOS defense:** deeper host-level file, process,
-  and network visibility once the Apple Endpoint Security path is available.
+- **Endpoint Security-based macOS defense:** process and file observation plus
+  managed-agent authorization are available; network visibility remains a
+  separate Network Extension or packet-sensor direction.
 - **Sandbox support:** stronger `gensee run` confinement, staged writes, and
   speculative or transactional execution for risky agent actions.
 - **ML-based policy and rules:** learning from controlled traces, blocked
@@ -656,7 +698,7 @@ See [`docs/roadmap.md`](docs/roadmap.md) for more detail.
 Full docs live in [`docs/`](docs/README.md):
 
 - [Architecture](docs/architecture.md) — the v0.2 runtime, workspace crates, and roadmap.
-- [Roadmap](docs/roadmap.md) — planned Linux enforcement, macOS Endpoint Security, sandbox, ML policy, and integration work.
+- [Roadmap](docs/roadmap.md) — current host controls and planned sandbox, sensor, ML policy, and integration work.
 - [Linux host support](docs/linux.md) — `/proc` monitoring, fanotify
   sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress
   controls, and the Linux enforcement plan.
@@ -672,7 +714,9 @@ Full docs live in [`docs/`](docs/README.md):
 - [Codex hooks](docs/codex-support.md) — wiring Codex prompts and tool intent into Gensee.
 - [Antigravity support](docs/antigravity-support.md) — wiring Antigravity hooks and `.agents` customizations into Gensee.
 - [VS Code / GitHub Copilot hooks](docs/vscode-support.md) — wiring VS Code agent hooks and native tool intent into Gensee.
+- [Cursor hooks](docs/cursor-support.md) — wiring Cursor prompts, tools, shell commands, and lifecycle events into Gensee.
 - [Omnigent integration](integrations/omnigent/README.md) — thin sidecar/managed-run support and the deeper policy-bridge plan.
 - [Safety policy](docs/policy.md) — the data-driven allow/ask/deny engine and `gensee policy` workflow.
+- [Native macOS security console](docs/macos-app.md) — manage the Endpoint Security extension, policy modes, and harness protection.
 - [SQLite lineage graph](docs/lineage-graph.md) — the provenance schema and example queries.
-- [Endpoint Security spike](docs/endpoint-security.md) — `eslogger` system events and the future signed EndpointSecurity path.
+- [Endpoint Security sensor](docs/endpoint-security.md) — signed macOS process/file observation and managed-tree authorization.

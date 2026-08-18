@@ -39,7 +39,8 @@ The policy is a single JSON document. Manage it with `gensee policy`:
 **Auto-discovery.** When `GENSEE_POLICY_FILE` is unset, the loader reads
 `$GENSEE_HOME/policy.json` (else `~/.gensee/policy.json`) if present — so a file
 written by `gensee policy set` takes effect with no env var. A file that fails
-to parse, or whose `schema_version` differs from the binary's, **fails closed**.
+to parse, or whose `schema_version` is newer than the binary supports, **fails
+closed**. Version 2 is current; version 1 remains readable for migration.
 
 **Config lives in the document**, not just env vars — these top-level sections
 (all optional; omitted ⇒ built-in defaults):
@@ -56,7 +57,11 @@ to parse, or whose `schema_version` differs from the binary's, **fails closed**.
   top of built-in credential-path defaults)
 - `linux.network` — `mode`, `allow`, `deny`
 - `enforcement` — `noninteractive` (escalate medium+ `ask` → `deny`)
-- `watch` — `system_events` (`eslogger` by default; set `none` to disable)
+- `endpoint_security` — `mode`, `protected_paths`, `blocked_executables`,
+  `max_auth_latency_ms` (1–100). The compatibility field
+  `fail_closed_managed_only` is reserved at `true`; Endpoint Security denies
+  never apply outside explicitly managed agent process trees.
+- `watch` — `system_events` (`endpoint-security` by default; set `none` to disable)
 - `allow_path_prefixes` — list (JSON form of `GENSEE_POLICY_ALLOW_PATH_PREFIXES`)
 
 **Precedence: env var > JSON document > built-in default.** The matching
@@ -75,8 +80,8 @@ The fastest path is the guided setup: `gensee policy setup` walks through the
 same settings, artifact definitions, and decision-rule actions shown in the
 dashboard Policy tab and writes `$GENSEE_HOME/policy.json`; `gensee policy
 validate <file>` checks it; it is auto-loaded on the next hook. The document is
-**fail-closed** — a parse error or a `schema_version` mismatch denies every
-tool call rather than silently reverting.
+**fail-closed** — a parse error or an unsupported future `schema_version` denies
+every tool call rather than silently reverting.
 
 **Editor autocomplete + external validation.** A JSON Schema ships at
 [`crate/gensee-crate-rules/policy/policy.schema.json`](https://github.com/GenseeAI/gensee-crate/blob/main/crate/gensee-crate-rules/policy/policy.schema.json).
@@ -88,7 +93,7 @@ remains the authoritative check (it parses with the same types the engine uses).
 
 | Key | Required | Purpose |
 | --- | :--: | --- |
-| `schema_version` | yes | Must be `1`; mismatches are rejected. |
+| `schema_version` | yes | Use `2`; version `1` remains readable for migration, and newer unsupported versions are rejected. |
 | `operations` | yes | Which file operations are read / destructive / metadata / mutating. |
 | `secret_paths` | yes | Protected-secret + credential-hint path matchers (`segments` / `filenames` / `filename_prefixes` / `filename_suffixes` / `filename_contains` / `exact_paths` / `path_suffixes` / `path_contains`, plus per-rule `action` / `severity` / `message`). |
 | `persistence_writes` | yes | Persistence/startup-file matcher (ask). |

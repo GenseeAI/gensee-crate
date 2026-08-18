@@ -95,6 +95,8 @@ pub struct PolicyDocument {
     pub enforcement: EnforcementConfig,
     #[serde(default)]
     pub watch: WatchPolicyConfig,
+    #[serde(default)]
+    pub endpoint_security: EndpointSecurityConfig,
     /// Trusted path prefixes exempt from the FP-prone secret/persistence
     /// findings (the JSON form of `GENSEE_POLICY_ALLOW_PATH_PREFIXES`).
     #[serde(default)]
@@ -224,6 +226,99 @@ pub struct EnforcementConfig {
     pub noninteractive: bool,
 }
 
+/// macOS Endpoint Security sensor posture. `protect` and `strict` enable the
+/// same local authorization engine; strict additionally treats an unavailable
+/// or invalid policy as deny for managed process trees. The system extension
+/// still scopes fail-closed behavior to explicitly registered agent roots.
+#[derive(Debug, Clone, Deserialize)]
+// Endpoint recording/retention settings evolve independently of the core
+// decision grammar. Unknown endpoint keys are ignored for forward-compatible
+// passive recording; the top-level schema_version still gates policy semantics.
+#[serde(default)]
+pub struct EndpointSecurityConfig {
+    pub mode: EndpointSecurityMode,
+    pub protected_paths: Vec<String>,
+    pub blocked_executables: Vec<String>,
+    pub fail_closed_managed_only: bool,
+    pub max_auth_latency_ms: u64,
+    pub minimum_recorded_severity: AlertSeverity,
+    pub raw_event_scope: RawEventScope,
+    pub raw_event_retention_hours: u64,
+    pub max_raw_events: u64,
+    pub low_severity_retention_hours: Option<u64>,
+}
+
+impl Default for EndpointSecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: EndpointSecurityMode::Observe,
+            protected_paths: Vec::new(),
+            blocked_executables: Vec::new(),
+            fail_closed_managed_only: true,
+            max_auth_latency_ms: 10,
+            minimum_recorded_severity: AlertSeverity::Info,
+            raw_event_scope: RawEventScope::All,
+            raw_event_retention_hours: 24,
+            max_raw_events: 100_000,
+            low_severity_retention_hours: Some(48),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertSeverity {
+    #[default]
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl AlertSeverity {
+    pub fn includes(self, severity: &str) -> bool {
+        let observed = match severity.to_ascii_lowercase().as_str() {
+            "critical" => Self::Critical,
+            "high" => Self::High,
+            "medium" => Self::Medium,
+            "low" => Self::Low,
+            _ => Self::Info,
+        };
+        observed >= self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawEventScope {
+    None,
+    Active,
+    #[default]
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointSecurityMode {
+    Off,
+    #[default]
+    Observe,
+    Protect,
+    Strict,
+}
+
+impl EndpointSecurityMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Observe => "observe",
+            Self::Protect => "protect",
+            Self::Strict => "strict",
+        }
+    }
+}
+
 /// Sidecar watch defaults.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -234,16 +329,17 @@ pub struct WatchPolicyConfig {
 impl Default for WatchPolicyConfig {
     fn default() -> Self {
         Self {
-            system_events: SystemEventMode::Eslogger,
+            system_events: SystemEventMode::EndpointSecurity,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum SystemEventMode {
     None,
     #[default]
+    EndpointSecurity,
     Eslogger,
 }
 
@@ -251,6 +347,7 @@ impl SystemEventMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::EndpointSecurity => "endpoint-security",
             Self::Eslogger => "eslogger",
         }
     }
@@ -499,21 +596,66 @@ pub fn resolved_policy_source() -> (Option<PathBuf>, &'static str) {
 
 const DEFAULT_POLICY_JSON: &str = include_str!("../policy/default-policy.json");
 
-/// Policy-document schema version this build understands. A document with a
-/// different `schema_version` is rejected by [`Policy::from_json`] (and thus
-/// fails closed on enforcement paths) rather than silently mis-parsed.
-pub const POLICY_SCHEMA_VERSION: u32 = 1;
+/// Current policy-document schema version. Version 1 remains readable during
+/// migration; future versions are rejected by [`Policy::from_json`] (and thus
+/// fail closed on enforcement paths) rather than silently mis-parsed.
+pub const POLICY_SCHEMA_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_POLICY_SCHEMA_VERSION: u32 = 1;
 
 impl Policy {
     pub fn from_json(json: &str) -> Result<Self, String> {
-        let doc: PolicyDocument =
+        // Read the version before strict typed deserialization. This produces a
+        // useful upgrade error for future policy documents instead of an
+        // unrelated "unknown field" failure from a nested object.
+        let value: serde_json::Value =
             serde_json::from_str(json).map_err(|err| format!("invalid policy document: {err}"))?;
-        if doc.schema_version != POLICY_SCHEMA_VERSION {
+        let schema_version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                "invalid policy document: schema_version must be an integer".to_string()
+            })?;
+        if !(u64::from(MIN_SUPPORTED_POLICY_SCHEMA_VERSION)..=u64::from(POLICY_SCHEMA_VERSION))
+            .contains(&schema_version)
+        {
             return Err(format!(
-                "unsupported schema_version {} (this build supports {POLICY_SCHEMA_VERSION}); \
-                 update the policy document or the binary",
-                doc.schema_version
+                "unsupported schema_version {schema_version} (this build supports \
+                 {MIN_SUPPORTED_POLICY_SCHEMA_VERSION}..={POLICY_SCHEMA_VERSION}); update the \
+                 policy document or the binary"
             ));
+        }
+        let doc: PolicyDocument = serde_json::from_value(value)
+            .map_err(|err| format!("invalid policy document: {err}"))?;
+        if !doc.endpoint_security.fail_closed_managed_only {
+            return Err(
+                "endpoint_security.fail_closed_managed_only is reserved and must remain true"
+                    .to_string(),
+            );
+        }
+        if !(1..=100).contains(&doc.endpoint_security.max_auth_latency_ms) {
+            return Err(
+                "endpoint_security.max_auth_latency_ms must be between 1 and 100".to_string(),
+            );
+        }
+        if !(1..=24 * 30).contains(&doc.endpoint_security.raw_event_retention_hours) {
+            return Err(
+                "endpoint_security.raw_event_retention_hours must be between 1 and 720".to_string(),
+            );
+        }
+        if !(1_000..=5_000_000).contains(&doc.endpoint_security.max_raw_events) {
+            return Err(
+                "endpoint_security.max_raw_events must be between 1000 and 5000000".to_string(),
+            );
+        }
+        if doc
+            .endpoint_security
+            .low_severity_retention_hours
+            .is_some_and(|hours| !(1..=24 * 365).contains(&hours))
+        {
+            return Err(
+                "endpoint_security.low_severity_retention_hours must be null or between 1 and 8760"
+                    .to_string(),
+            );
         }
         Ok(Self {
             doc,
@@ -1393,8 +1535,59 @@ mod tests {
     }
 
     #[test]
+    fn schema_one_remains_readable_during_policy_migration() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(default_policy_json()).expect("default parses");
+        doc["schema_version"] = serde_json::json!(1);
+        doc["endpoint_security"]["future_passive_recording_key"] = serde_json::json!(true);
+        let policy = Policy::from_json(&doc.to_string()).expect("legacy policy should migrate");
+        assert_eq!(policy.document().schema_version, 1);
+    }
+
+    #[test]
     fn default_policy_json_round_trips() {
         assert!(Policy::from_json(default_policy_json()).is_ok());
+        let policy = Policy::embedded_default();
+        let endpoint = &policy.document().endpoint_security;
+        assert_eq!(endpoint.minimum_recorded_severity, AlertSeverity::Info);
+        assert_eq!(endpoint.raw_event_scope, RawEventScope::All);
+        assert_eq!(endpoint.raw_event_retention_hours, 24);
+        assert_eq!(endpoint.max_raw_events, 100_000);
+        assert_eq!(endpoint.low_severity_retention_hours, Some(48));
+    }
+
+    #[test]
+    fn alert_severity_threshold_is_inclusive() {
+        assert!(!AlertSeverity::High.includes("medium"));
+        assert!(AlertSeverity::High.includes("high"));
+        assert!(AlertSeverity::High.includes("critical"));
+    }
+
+    #[test]
+    fn endpoint_security_scope_cannot_be_widened_beyond_managed_sessions() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(default_policy_json()).expect("default parses");
+        doc["endpoint_security"]["fail_closed_managed_only"] = serde_json::json!(false);
+        let err = Policy::from_json(&doc.to_string()).expect_err("unsafe scope must be rejected");
+        assert!(err.contains("must remain true"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn endpoint_security_authorization_latency_is_bounded() {
+        for invalid in [0, 101] {
+            let mut doc: serde_json::Value =
+                serde_json::from_str(default_policy_json()).expect("default parses");
+            doc["endpoint_security"]["max_auth_latency_ms"] = serde_json::json!(invalid);
+            let err =
+                Policy::from_json(&doc.to_string()).expect_err("out-of-range latency must fail");
+            assert!(err.contains("between 1 and 100"), "unexpected error: {err}");
+        }
+        for valid in [1, 100] {
+            let mut doc: serde_json::Value =
+                serde_json::from_str(default_policy_json()).expect("default parses");
+            doc["endpoint_security"]["max_auth_latency_ms"] = serde_json::json!(valid);
+            Policy::from_json(&doc.to_string()).expect("boundary latency should parse");
+        }
     }
 
     #[test]
@@ -1410,6 +1603,7 @@ mod tests {
             "linux",
             "enforcement",
             "watch",
+            "endpoint_security",
             "allow_path_prefixes",
         ] {
             doc.as_object_mut().unwrap().remove(key);
@@ -1424,7 +1618,8 @@ mod tests {
         assert_eq!(d.linux.network.mode, LinuxNetworkMode::Off);
         assert!(!d.enforcement.noninteractive);
         assert!(d.runtime.max_runtime_seconds.is_none());
-        assert_eq!(d.watch.system_events, SystemEventMode::Eslogger);
+        assert_eq!(d.watch.system_events, SystemEventMode::EndpointSecurity);
+        assert_eq!(d.endpoint_security.mode, EndpointSecurityMode::Observe);
         assert!(d.allow_path_prefixes.is_empty());
     }
 
@@ -1535,7 +1730,7 @@ mod tests {
     #[test]
     fn embedded_default_parses() {
         let policy = policy();
-        assert_eq!(policy.document().schema_version, 1);
+        assert_eq!(policy.document().schema_version, POLICY_SCHEMA_VERSION);
     }
 
     #[test]

@@ -154,6 +154,7 @@ impl WatchBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SystemEventBackend {
     None,
+    EndpointSecurity,
     Eslogger,
 }
 
@@ -161,6 +162,7 @@ impl SystemEventBackend {
     pub(crate) fn parse(value: Option<String>, default: Self) -> io::Result<Self> {
         match value.as_deref().unwrap_or(default.label()) {
             "none" => Ok(Self::None),
+            "endpoint-security" => Ok(Self::EndpointSecurity),
             "eslogger" => Ok(Self::Eslogger),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -172,6 +174,7 @@ impl SystemEventBackend {
     fn label(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::EndpointSecurity => "endpoint-security",
             Self::Eslogger => "eslogger",
         }
     }
@@ -179,6 +182,7 @@ impl SystemEventBackend {
     fn from_policy(mode: policy::SystemEventMode) -> Self {
         match mode {
             policy::SystemEventMode::None => Self::None,
+            policy::SystemEventMode::EndpointSecurity => Self::EndpointSecurity,
             policy::SystemEventMode::Eslogger => Self::Eslogger,
         }
     }
@@ -581,6 +585,14 @@ fn start_system_event_watcher(
 ) -> io::Result<Option<SystemEventWatcher>> {
     match backend {
         SystemEventBackend::None => Ok(None),
+        SystemEventBackend::EndpointSecurity => {
+            eprintln!(
+                "gensee: Endpoint Security events are ingested by the signed Gensee Crate app; \
+                 this watch process does not start or verify that sensor. Keep the app running, \
+                 or use --system-events eslogger for a manual diagnostic watcher"
+            );
+            Ok(None)
+        }
         SystemEventBackend::Eslogger => start_eslogger_watcher(store).map(Some),
     }
 }

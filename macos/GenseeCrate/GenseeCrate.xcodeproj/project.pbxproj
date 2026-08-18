@@ -1,0 +1,726 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		04161812076C359D9D1DA56D /* DashboardSecurityPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 23D1D4F2FC41CDD9893C88C2 /* DashboardSecurityPages.swift */; };
+		051752191996C457E065E5B0 /* GenseeEndpointSecurityBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 5F1702DD7F563FB2B6DE975E /* GenseeEndpointSecurityBridge.m */; };
+		076516A9E8D79FF29811936D /* ConfigAuditModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7294E1EB1AB2BC3775FC1E9D /* ConfigAuditModelsTests.swift */; };
+		0783AAA9D10980D16D10D045 /* AlertSeverityBreakdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = 544562E0263496009681ED4B /* AlertSeverityBreakdown.swift */; };
+		084354B2A7A75325026F3D73 /* GenseeCrateEndpointSecurity.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = ADF9199FEAE114BBFADFEDDB /* GenseeCrateEndpointSecurity.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		0A89B2A6582326443FD14EEF /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 710E9EC4A241B8850EB0EB60 /* main.m */; };
+		1FF0AC00136C8DD45831F049 /* SetupAssistantView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A351A24BA68D1A981D3A8EE /* SetupAssistantView.swift */; };
+		298C38A67499075882B9EF04 /* EndpointIngestAcknowledgementIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18415BCF8F97E3CDBF1D9A21 /* EndpointIngestAcknowledgementIO.swift */; };
+		2A060F6B2698D71FBAA89ADB /* GenseeCrateApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A3D55DA761A91C70B3F68CB /* GenseeCrateApp.swift */; };
+		3005C416C510768DDF39A195 /* TimelineModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39CFE24CFF06C20FEC203C0B /* TimelineModelsTests.swift */; };
+		30D03A7F9A136550F0A72DE7 /* HarnessConfigurationHealthTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDC43B9627D7C217071C5275 /* HarnessConfigurationHealthTests.swift */; };
+		342907D8F3EE64BED760F9F9 /* ConsoleModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8473EB5830E8F39EB110349 /* ConsoleModels.swift */; };
+		3C8D8EFE80616515AA2B1929 /* ConfigAuditModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 757B3C5FC8B9C600B17829C8 /* ConfigAuditModels.swift */; };
+		3D884526B883F80941BD09BD /* DashboardActivityPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 606554A9090B30CB60EEC12A /* DashboardActivityPages.swift */; };
+		3F9DAD52588ED94CD01C84AC /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FBE05DBB986CBCE7BE09ED0 /* ContentView.swift */; };
+		3F9F454E448CC418E94FBA38 /* Brand.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5CBE9AE8A3819CA0AF3116D /* Brand.swift */; };
+		4EEC361E0A4D91AD7B5C2563 /* DashboardConfigAuditPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F87253473BB92366EC06A2A /* DashboardConfigAuditPage.swift */; };
+		55F95CB261F2C459B47E86FC /* AlertSeverityBreakdownTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EABB784CC4CC45204E63CA1 /* AlertSeverityBreakdownTests.swift */; };
+		5C8C0C9C960C90C0231177A0 /* EndpointSecurityExtensionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA20B771E8184937A5C2C57E /* EndpointSecurityExtensionManager.swift */; };
+		6710AB1884EF2EC50408D9CC /* AlertSeverityBreakdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = 544562E0263496009681ED4B /* AlertSeverityBreakdown.swift */; };
+		6BF5DFA70A4E71DF3EC3343C /* ConfigAuditModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 757B3C5FC8B9C600B17829C8 /* ConfigAuditModels.swift */; };
+		6F1EFE76386D67BDF9581E7B /* DashboardOverviewPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E5F6044F8B4D45BBBC38D88 /* DashboardOverviewPages.swift */; };
+		70FCB6B396339C7CE0DF1B79 /* DashboardShell.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F9083239FB55EA68146A81F /* DashboardShell.swift */; };
+		7931867F15D1E07955D3F193 /* EndpointIngestAcknowledgementIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18415BCF8F97E3CDBF1D9A21 /* EndpointIngestAcknowledgementIO.swift */; };
+		83F8664AFB2123015E35C5CA /* DashboardConfigPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF1B808391332D1FC13CD1D0 /* DashboardConfigPages.swift */; };
+		8ABF7A89C5FD85514EAAC0DC /* TimelineModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B81B0DF2C0A3C05A62D73211 /* TimelineModels.swift */; };
+		8DC557F61F6BE8CA39728CE2 /* HarnessActivationGuidance.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A26DF6DC7DD3F0CAA81BD6 /* HarnessActivationGuidance.swift */; };
+		91306ABA52E6F4472DD1DA3E /* TimelineModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B81B0DF2C0A3C05A62D73211 /* TimelineModels.swift */; };
+		93363E255308C619A9B45594 /* EndpointSecuritySensor.swift in Sources */ = {isa = PBXBuildFile; fileRef = C27E47B1FED91B645603F7B8 /* EndpointSecuritySensor.swift */; };
+		953ADF0AC9D10BB7EDA306B6 /* ConsoleModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8473EB5830E8F39EB110349 /* ConsoleModels.swift */; };
+		AF95DF2961EB5EB25758D917 /* DashboardComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3722B66B15A9D0C6A0542AB1 /* DashboardComponents.swift */; };
+		B3A01A811214C31B36C00F18 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C1B023EFF7B2DE9556556E9E /* Assets.xcassets */; };
+		B4EC3AFD2169905AA662360D /* ConsoleModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92AD1DC256F292439A6C70BA /* ConsoleModel.swift */; };
+		C1CFBA97FF43FD867550E37E /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
+		CABD267D92A105B162179646 /* ArtifactFactTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D50189280D53EE5D350B921A /* ArtifactFactTests.swift */; };
+		CEBB5434E3FFBD87829EB8C0 /* DashboardHarnessesPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */; };
+		D50CF93055DEC2DF49AD2240 /* libEndpointSecurity.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C7E850A448A571324F7CA4F /* libEndpointSecurity.tbd */; };
+		DBA4A9B1E7D7F48F940E66CC /* HarnessActivationGuidance.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A26DF6DC7DD3F0CAA81BD6 /* HarnessActivationGuidance.swift */; };
+		DF38FDB826769C79187233CA /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
+		F0620C2EBDB564E7762C995E /* HarnessActivationGuidanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F7E9D2CD5956A984D2F51D8 /* HarnessActivationGuidanceTests.swift */; };
+		F189FD121BF62C54B3887CDC /* EndpointIngestAcknowledgementIOTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FB2BA4717E0AC963EDF2CD1 /* EndpointIngestAcknowledgementIOTests.swift */; };
+		FC2ACB45E9ADD76BD8EBAFA1 /* GenseeCLI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B06211CB7A3B1543D9B7B5D /* GenseeCLI.swift */; };
+		FC7C99ABF3344039085F8FE9 /* SystemExtensions.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 646FCF1F1969644B69EFB35E /* SystemExtensions.framework */; };
+		FF12BE5F512989900F05B603 /* libbsm.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 393E28A9F1D61AA09BA25DC8 /* libbsm.tbd */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		059A847BE45F45867EF9C28A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 55C05576E07CC4E518B005CC /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = C6621234195F53E9D3C6A708;
+			remoteInfo = GenseeCrateEndpointSecurity;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		19F52F19C24122C91DB5EBBA /* Embed System Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(SYSTEM_EXTENSIONS_FOLDER_PATH)";
+			dstSubfolderSpec = 16;
+			files = (
+				084354B2A7A75325026F3D73 /* GenseeCrateEndpointSecurity.systemextension in Embed System Extensions */,
+			);
+			name = "Embed System Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		0EABB784CC4CC45204E63CA1 /* AlertSeverityBreakdownTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlertSeverityBreakdownTests.swift; sourceTree = "<group>"; };
+		18415BCF8F97E3CDBF1D9A21 /* EndpointIngestAcknowledgementIO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointIngestAcknowledgementIO.swift; sourceTree = "<group>"; };
+		23D1D4F2FC41CDD9893C88C2 /* DashboardSecurityPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardSecurityPages.swift; sourceTree = "<group>"; };
+		33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HarnessConfigurationHealth.swift; sourceTree = "<group>"; };
+		35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardHarnessesPage.swift; sourceTree = "<group>"; };
+		3722B66B15A9D0C6A0542AB1 /* DashboardComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardComponents.swift; sourceTree = "<group>"; };
+		393E28A9F1D61AA09BA25DC8 /* libbsm.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libbsm.tbd; path = usr/lib/libbsm.tbd; sourceTree = SDKROOT; };
+		39CFE24CFF06C20FEC203C0B /* TimelineModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimelineModelsTests.swift; sourceTree = "<group>"; };
+		3A351A24BA68D1A981D3A8EE /* SetupAssistantView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupAssistantView.swift; sourceTree = "<group>"; };
+		544562E0263496009681ED4B /* AlertSeverityBreakdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlertSeverityBreakdown.swift; sourceTree = "<group>"; };
+		5F1702DD7F563FB2B6DE975E /* GenseeEndpointSecurityBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = GenseeEndpointSecurityBridge.m; sourceTree = "<group>"; };
+		606554A9090B30CB60EEC12A /* DashboardActivityPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardActivityPages.swift; sourceTree = "<group>"; };
+		646FCF1F1969644B69EFB35E /* SystemExtensions.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemExtensions.framework; path = System/Library/Frameworks/SystemExtensions.framework; sourceTree = SDKROOT; };
+		6F9083239FB55EA68146A81F /* DashboardShell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardShell.swift; sourceTree = "<group>"; };
+		6FBE05DBB986CBCE7BE09ED0 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		710E9EC4A241B8850EB0EB60 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
+		7294E1EB1AB2BC3775FC1E9D /* ConfigAuditModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigAuditModelsTests.swift; sourceTree = "<group>"; };
+		757B3C5FC8B9C600B17829C8 /* ConfigAuditModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigAuditModels.swift; sourceTree = "<group>"; };
+		7E4A8A78340952674B35776F /* GenseeCrate.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GenseeCrate.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		8A3D55DA761A91C70B3F68CB /* GenseeCrateApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GenseeCrateApp.swift; sourceTree = "<group>"; };
+		8B06211CB7A3B1543D9B7B5D /* GenseeCLI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GenseeCLI.swift; sourceTree = "<group>"; };
+		8C7E850A448A571324F7CA4F /* libEndpointSecurity.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libEndpointSecurity.tbd; path = usr/lib/libEndpointSecurity.tbd; sourceTree = SDKROOT; };
+		8E5F6044F8B4D45BBBC38D88 /* DashboardOverviewPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardOverviewPages.swift; sourceTree = "<group>"; };
+		8F7E9D2CD5956A984D2F51D8 /* HarnessActivationGuidanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HarnessActivationGuidanceTests.swift; sourceTree = "<group>"; };
+		8F87253473BB92366EC06A2A /* DashboardConfigAuditPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardConfigAuditPage.swift; sourceTree = "<group>"; };
+		92AD1DC256F292439A6C70BA /* ConsoleModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsoleModel.swift; sourceTree = "<group>"; };
+		9FB2BA4717E0AC963EDF2CD1 /* EndpointIngestAcknowledgementIOTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointIngestAcknowledgementIOTests.swift; sourceTree = "<group>"; };
+		ADF9199FEAE114BBFADFEDDB /* GenseeCrateEndpointSecurity.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = GenseeCrateEndpointSecurity.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
+		B25B76EA154890044AB13C42 /* GenseeEndpointSecurityBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = GenseeEndpointSecurityBridge.h; sourceTree = "<group>"; };
+		B81B0DF2C0A3C05A62D73211 /* TimelineModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimelineModels.swift; sourceTree = "<group>"; };
+		C1B023EFF7B2DE9556556E9E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		C27E47B1FED91B645603F7B8 /* EndpointSecuritySensor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointSecuritySensor.swift; sourceTree = "<group>"; };
+		C8473EB5830E8F39EB110349 /* ConsoleModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsoleModels.swift; sourceTree = "<group>"; };
+		D50189280D53EE5D350B921A /* ArtifactFactTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArtifactFactTests.swift; sourceTree = "<group>"; };
+		D5CBE9AE8A3819CA0AF3116D /* Brand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Brand.swift; sourceTree = "<group>"; };
+		D8A26DF6DC7DD3F0CAA81BD6 /* HarnessActivationGuidance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HarnessActivationGuidance.swift; sourceTree = "<group>"; };
+		EA24B5D008AE2C71CB3FC844 /* GenseeCrateHarnessTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GenseeCrateHarnessTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		EDC43B9627D7C217071C5275 /* HarnessConfigurationHealthTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HarnessConfigurationHealthTests.swift; sourceTree = "<group>"; };
+		FA20B771E8184937A5C2C57E /* EndpointSecurityExtensionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointSecurityExtensionManager.swift; sourceTree = "<group>"; };
+		FF1B808391332D1FC13CD1D0 /* DashboardConfigPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardConfigPages.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		66BE68F054745FC257DC77C9 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D50CF93055DEC2DF49AD2240 /* libEndpointSecurity.tbd in Frameworks */,
+				FF12BE5F512989900F05B603 /* libbsm.tbd in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		9D61BBDFF10E537F5D7B086A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FC7C99ABF3344039085F8FE9 /* SystemExtensions.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		1856380B5FB50790F4546C93 /* Host */ = {
+			isa = PBXGroup;
+			children = (
+				544562E0263496009681ED4B /* AlertSeverityBreakdown.swift */,
+				C1B023EFF7B2DE9556556E9E /* Assets.xcassets */,
+				D5CBE9AE8A3819CA0AF3116D /* Brand.swift */,
+				757B3C5FC8B9C600B17829C8 /* ConfigAuditModels.swift */,
+				92AD1DC256F292439A6C70BA /* ConsoleModel.swift */,
+				C8473EB5830E8F39EB110349 /* ConsoleModels.swift */,
+				6FBE05DBB986CBCE7BE09ED0 /* ContentView.swift */,
+				606554A9090B30CB60EEC12A /* DashboardActivityPages.swift */,
+				3722B66B15A9D0C6A0542AB1 /* DashboardComponents.swift */,
+				8F87253473BB92366EC06A2A /* DashboardConfigAuditPage.swift */,
+				FF1B808391332D1FC13CD1D0 /* DashboardConfigPages.swift */,
+				35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */,
+				8E5F6044F8B4D45BBBC38D88 /* DashboardOverviewPages.swift */,
+				23D1D4F2FC41CDD9893C88C2 /* DashboardSecurityPages.swift */,
+				6F9083239FB55EA68146A81F /* DashboardShell.swift */,
+				18415BCF8F97E3CDBF1D9A21 /* EndpointIngestAcknowledgementIO.swift */,
+				FA20B771E8184937A5C2C57E /* EndpointSecurityExtensionManager.swift */,
+				C27E47B1FED91B645603F7B8 /* EndpointSecuritySensor.swift */,
+				8B06211CB7A3B1543D9B7B5D /* GenseeCLI.swift */,
+				8A3D55DA761A91C70B3F68CB /* GenseeCrateApp.swift */,
+				B25B76EA154890044AB13C42 /* GenseeEndpointSecurityBridge.h */,
+				5F1702DD7F563FB2B6DE975E /* GenseeEndpointSecurityBridge.m */,
+				D8A26DF6DC7DD3F0CAA81BD6 /* HarnessActivationGuidance.swift */,
+				33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */,
+				3A351A24BA68D1A981D3A8EE /* SetupAssistantView.swift */,
+				B81B0DF2C0A3C05A62D73211 /* TimelineModels.swift */,
+			);
+			path = Host;
+			sourceTree = "<group>";
+		};
+		40E381BF48378ACA4DDA0CCF /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				0EABB784CC4CC45204E63CA1 /* AlertSeverityBreakdownTests.swift */,
+				D50189280D53EE5D350B921A /* ArtifactFactTests.swift */,
+				7294E1EB1AB2BC3775FC1E9D /* ConfigAuditModelsTests.swift */,
+				9FB2BA4717E0AC963EDF2CD1 /* EndpointIngestAcknowledgementIOTests.swift */,
+				8F7E9D2CD5956A984D2F51D8 /* HarnessActivationGuidanceTests.swift */,
+				EDC43B9627D7C217071C5275 /* HarnessConfigurationHealthTests.swift */,
+				39CFE24CFF06C20FEC203C0B /* TimelineModelsTests.swift */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		56385FD66570FC4349E724E3 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				393E28A9F1D61AA09BA25DC8 /* libbsm.tbd */,
+				8C7E850A448A571324F7CA4F /* libEndpointSecurity.tbd */,
+				646FCF1F1969644B69EFB35E /* SystemExtensions.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		5ECC1E060C5D10191A581373 /* EndpointSecurityExtension */ = {
+			isa = PBXGroup;
+			children = (
+				710E9EC4A241B8850EB0EB60 /* main.m */,
+			);
+			path = EndpointSecurityExtension;
+			sourceTree = "<group>";
+		};
+		AA79DDC9A1C3210D49161EE0 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				7E4A8A78340952674B35776F /* GenseeCrate.app */,
+				ADF9199FEAE114BBFADFEDDB /* GenseeCrateEndpointSecurity.systemextension */,
+				EA24B5D008AE2C71CB3FC844 /* GenseeCrateHarnessTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		E37DD8BAFC7878EFA426C679 = {
+			isa = PBXGroup;
+			children = (
+				5ECC1E060C5D10191A581373 /* EndpointSecurityExtension */,
+				1856380B5FB50790F4546C93 /* Host */,
+				40E381BF48378ACA4DDA0CCF /* Tests */,
+				56385FD66570FC4349E724E3 /* Frameworks */,
+				AA79DDC9A1C3210D49161EE0 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		3EF66EB313E503EE013D6C3D /* GenseeCrateHarnessTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 39FBEF9177939BD4A910C6F9 /* Build configuration list for PBXNativeTarget "GenseeCrateHarnessTests" */;
+			buildPhases = (
+				E87884EA8F44707D48DE2D88 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = GenseeCrateHarnessTests;
+			packageProductDependencies = (
+			);
+			productName = GenseeCrateHarnessTests;
+			productReference = EA24B5D008AE2C71CB3FC844 /* GenseeCrateHarnessTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		C6621234195F53E9D3C6A708 /* GenseeCrateEndpointSecurity */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AE64166EE2F793774BB3845A /* Build configuration list for PBXNativeTarget "GenseeCrateEndpointSecurity" */;
+			buildPhases = (
+				790EC23215CAF1840913E004 /* Sources */,
+				66BE68F054745FC257DC77C9 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = GenseeCrateEndpointSecurity;
+			packageProductDependencies = (
+			);
+			productName = GenseeCrateEndpointSecurity;
+			productReference = ADF9199FEAE114BBFADFEDDB /* GenseeCrateEndpointSecurity.systemextension */;
+			productType = "com.apple.product-type.system-extension";
+		};
+		EE8F32919081C8457EAA3B80 /* GenseeCrate */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4DBFAD267E4D558ACCF2FC7D /* Build configuration list for PBXNativeTarget "GenseeCrate" */;
+			buildPhases = (
+				0CF2FAA83E1D6BD9C78722E9 /* Build and Embed Gensee Backend */,
+				BBA49522253AD174296DE17C /* Sources */,
+				9D7F70CF33752FD1E68A7AF8 /* Resources */,
+				9D61BBDFF10E537F5D7B086A /* Frameworks */,
+				19F52F19C24122C91DB5EBBA /* Embed System Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				E61BBA2856783090E565D2C8 /* PBXTargetDependency */,
+			);
+			name = GenseeCrate;
+			packageProductDependencies = (
+			);
+			productName = GenseeCrate;
+			productReference = 7E4A8A78340952674B35776F /* GenseeCrate.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		55C05576E07CC4E518B005CC /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1620;
+				TargetAttributes = {
+					3EF66EB313E503EE013D6C3D = {
+						DevelopmentTeam = 3KWVB4M63F;
+						ProvisioningStyle = Automatic;
+					};
+					C6621234195F53E9D3C6A708 = {
+						DevelopmentTeam = 3KWVB4M63F;
+						ProvisioningStyle = Automatic;
+					};
+					EE8F32919081C8457EAA3B80 = {
+						DevelopmentTeam = 3KWVB4M63F;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 8CEED93253CD9CE83DA57085 /* Build configuration list for PBXProject "GenseeCrate" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = E37DD8BAFC7878EFA426C679;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = AA79DDC9A1C3210D49161EE0 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				EE8F32919081C8457EAA3B80 /* GenseeCrate */,
+				C6621234195F53E9D3C6A708 /* GenseeCrateEndpointSecurity */,
+				3EF66EB313E503EE013D6C3D /* GenseeCrateHarnessTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		9D7F70CF33752FD1E68A7AF8 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B3A01A811214C31B36C00F18 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		0CF2FAA83E1D6BD9C78722E9 /* Build and Embed Gensee Backend */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build and Embed Gensee Backend";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\nREPOSITORY_ROOT=\"$PROJECT_DIR/../..\"\nGENSEE_RESOURCES=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/bin\"\nmkdir -p \"$GENSEE_RESOURCES\"\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n  cargo build --manifest-path \"$REPOSITORY_ROOT/Cargo.toml\" -p gensee-crate-cli --release --target aarch64-apple-darwin\n  cargo build --manifest-path \"$REPOSITORY_ROOT/Cargo.toml\" -p gensee-crate-cli --release --target x86_64-apple-darwin\n  /usr/bin/lipo -create \\\n    \"$REPOSITORY_ROOT/target/aarch64-apple-darwin/release/gensee\" \\\n    \"$REPOSITORY_ROOT/target/x86_64-apple-darwin/release/gensee\" \\\n    -output \"$GENSEE_RESOURCES/gensee\"\nelse\n  cargo build --manifest-path \"$REPOSITORY_ROOT/Cargo.toml\" -p gensee-crate-cli\n  cp \"$REPOSITORY_ROOT/target/debug/gensee\" \"$GENSEE_RESOURCES/gensee\"\nfi\nif [ \"${CODE_SIGNING_ALLOWED:-YES}\" != \"NO\" ] && [ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]; then\n  /usr/bin/codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" --identifier ai.gensee.crate.cli --options runtime --timestamp \"$GENSEE_RESOURCES/gensee\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		790EC23215CAF1840913E004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0A89B2A6582326443FD14EEF /* main.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		BBA49522253AD174296DE17C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6710AB1884EF2EC50408D9CC /* AlertSeverityBreakdown.swift in Sources */,
+				3F9F454E448CC418E94FBA38 /* Brand.swift in Sources */,
+				6BF5DFA70A4E71DF3EC3343C /* ConfigAuditModels.swift in Sources */,
+				B4EC3AFD2169905AA662360D /* ConsoleModel.swift in Sources */,
+				342907D8F3EE64BED760F9F9 /* ConsoleModels.swift in Sources */,
+				3F9DAD52588ED94CD01C84AC /* ContentView.swift in Sources */,
+				3D884526B883F80941BD09BD /* DashboardActivityPages.swift in Sources */,
+				AF95DF2961EB5EB25758D917 /* DashboardComponents.swift in Sources */,
+				4EEC361E0A4D91AD7B5C2563 /* DashboardConfigAuditPage.swift in Sources */,
+				83F8664AFB2123015E35C5CA /* DashboardConfigPages.swift in Sources */,
+				CEBB5434E3FFBD87829EB8C0 /* DashboardHarnessesPage.swift in Sources */,
+				6F1EFE76386D67BDF9581E7B /* DashboardOverviewPages.swift in Sources */,
+				04161812076C359D9D1DA56D /* DashboardSecurityPages.swift in Sources */,
+				70FCB6B396339C7CE0DF1B79 /* DashboardShell.swift in Sources */,
+				7931867F15D1E07955D3F193 /* EndpointIngestAcknowledgementIO.swift in Sources */,
+				5C8C0C9C960C90C0231177A0 /* EndpointSecurityExtensionManager.swift in Sources */,
+				93363E255308C619A9B45594 /* EndpointSecuritySensor.swift in Sources */,
+				FC2ACB45E9ADD76BD8EBAFA1 /* GenseeCLI.swift in Sources */,
+				2A060F6B2698D71FBAA89ADB /* GenseeCrateApp.swift in Sources */,
+				051752191996C457E065E5B0 /* GenseeEndpointSecurityBridge.m in Sources */,
+				8DC557F61F6BE8CA39728CE2 /* HarnessActivationGuidance.swift in Sources */,
+				DF38FDB826769C79187233CA /* HarnessConfigurationHealth.swift in Sources */,
+				1FF0AC00136C8DD45831F049 /* SetupAssistantView.swift in Sources */,
+				8ABF7A89C5FD85514EAAC0DC /* TimelineModels.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E87884EA8F44707D48DE2D88 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0783AAA9D10980D16D10D045 /* AlertSeverityBreakdown.swift in Sources */,
+				55F95CB261F2C459B47E86FC /* AlertSeverityBreakdownTests.swift in Sources */,
+				CABD267D92A105B162179646 /* ArtifactFactTests.swift in Sources */,
+				3C8D8EFE80616515AA2B1929 /* ConfigAuditModels.swift in Sources */,
+				076516A9E8D79FF29811936D /* ConfigAuditModelsTests.swift in Sources */,
+				953ADF0AC9D10BB7EDA306B6 /* ConsoleModels.swift in Sources */,
+				298C38A67499075882B9EF04 /* EndpointIngestAcknowledgementIO.swift in Sources */,
+				F189FD121BF62C54B3887CDC /* EndpointIngestAcknowledgementIOTests.swift in Sources */,
+				DBA4A9B1E7D7F48F940E66CC /* HarnessActivationGuidance.swift in Sources */,
+				F0620C2EBDB564E7762C995E /* HarnessActivationGuidanceTests.swift in Sources */,
+				C1CFBA97FF43FD867550E37E /* HarnessConfigurationHealth.swift in Sources */,
+				30D03A7F9A136550F0A72DE7 /* HarnessConfigurationHealthTests.swift in Sources */,
+				91306ABA52E6F4472DD1DA3E /* TimelineModels.swift in Sources */,
+				3005C416C510768DDF39A195 /* TimelineModelsTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		E61BBA2856783090E565D2C8 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = C6621234195F53E9D3C6A708 /* GenseeCrateEndpointSecurity */;
+			targetProxy = 059A847BE45F45867EF9C28A /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		0C49A9C5983EB004C4576270 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = EndpointSecurityExtension/GenseeCrateEndpointSecurity.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = EndpointSecurityExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "ai.gensee.crate.endpoint-security";
+				PRODUCT_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		313C0617F409E476A6EAFD16 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = EndpointSecurityExtension/GenseeCrateEndpointSecurity.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = EndpointSecurityExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "ai.gensee.crate.endpoint-security";
+				PRODUCT_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+		7C1D15DB97EC08114217E181 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "ai.gensee.crate.harness-tests";
+				SDKROOT = macosx;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		95F30764088D6A10B5681D5F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 6;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 3KWVB4M63F;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.2.4;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		9DA0275794D9F31D2994D03F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 6;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 3KWVB4M63F;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.2.4;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		AECFBBDD289EBF9586156565 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Host/GenseeCrate.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Host/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.gensee.crate;
+				PRODUCT_NAME = "Gensee Crate";
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "Host/GenseeCrate-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		F6EB57BDE8E5A1C6635919F5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Host/GenseeCrate.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Host/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.gensee.crate;
+				PRODUCT_NAME = "Gensee Crate";
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "Host/GenseeCrate-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		F7E12DECCAD7E30502C968C0 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "ai.gensee.crate.harness-tests";
+				SDKROOT = macosx;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		39FBEF9177939BD4A910C6F9 /* Build configuration list for PBXNativeTarget "GenseeCrateHarnessTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F7E12DECCAD7E30502C968C0 /* Debug */,
+				7C1D15DB97EC08114217E181 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		4DBFAD267E4D558ACCF2FC7D /* Build configuration list for PBXNativeTarget "GenseeCrate" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AECFBBDD289EBF9586156565 /* Debug */,
+				F6EB57BDE8E5A1C6635919F5 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		8CEED93253CD9CE83DA57085 /* Build configuration list for PBXProject "GenseeCrate" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				95F30764088D6A10B5681D5F /* Debug */,
+				9DA0275794D9F31D2994D03F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		AE64166EE2F793774BB3845A /* Build configuration list for PBXNativeTarget "GenseeCrateEndpointSecurity" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0C49A9C5983EB004C4576270 /* Debug */,
+				313C0617F409E476A6EAFD16 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 55C05576E07CC4E518B005CC /* Project object */;
+}

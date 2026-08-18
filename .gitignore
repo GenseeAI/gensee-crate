@@ -14,6 +14,20 @@
 /db/gensee-crate.db-*
 __pycache__/
 
+# macOS build products and private signing/notarization material
+.DS_Store
+**/DerivedData/
+**/*.xcarchive/
+**/*.app/
+**/*.dmg
+**/*.pkg
+**/*.cer
+**/*.p12
+**/*.p8
+**/*.mobileprovision
+**/*.provisionprofile
+**/notarytool-profile*
+
 # latency bench generated artifacts
 bench/results/
 

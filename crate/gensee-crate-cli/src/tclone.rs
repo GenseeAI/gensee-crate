@@ -4295,12 +4295,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         capability_guard.mark_clone_completed();
         capability_guard.start_restore()?;
         timing.mark("source_capability_restore_start");
-        type ForkChildResult = (
-            Vec<String>,
-            Vec<Value>,
-            Vec<(TransactionEventInput, String)>,
-        );
-        let child_result = (|| -> io::Result<ForkChildResult> {
+        let child_result = (|| -> io::Result<TcloneForkChildResult> {
             if clones.len() != copies {
                 return Err(io::Error::other(format!(
                     "podman returned {} cloned container metadata record(s), expected {copies}",
@@ -4681,6 +4676,12 @@ struct TcloneCloneOutput {
     output: String,
 }
 
+type TcloneForkChildResult = (
+    Vec<String>,
+    Vec<Value>,
+    Vec<(TransactionEventInput, String)>,
+);
+
 #[derive(Debug, serde::Deserialize)]
 struct TcloneForkCloneMetadata {
     id: String,
@@ -4692,6 +4693,12 @@ struct TcloneForkCloneMetadata {
 struct TclonePreparedForkContext {
     run_id: String,
     payload_path: PathBuf,
+}
+
+struct TcloneCloneRetryContext<'a> {
+    use_overlay: bool,
+    env: &'a [(String, String)],
+    prepared_contexts: &'a [TclonePreparedForkContext],
 }
 
 struct TclonePreparedForkContexts {
@@ -4967,9 +4974,11 @@ fn run_tclone_clone_attempts(
                     copies,
                     prefix,
                     source,
-                    use_overlay,
-                    &env,
-                    prepared_contexts,
+                    TcloneCloneRetryContext {
+                        use_overlay,
+                        env: &env,
+                        prepared_contexts,
+                    },
                     error,
                 )
             }
@@ -5007,9 +5016,11 @@ fn run_tclone_clone_attempts(
                             copies,
                             &fallback_prefix,
                             source,
-                            false,
-                            &env,
-                            prepared_contexts,
+                            TcloneCloneRetryContext {
+                                use_overlay: false,
+                                env: &env,
+                                prepared_contexts,
+                            },
                             error,
                         )
                     }
@@ -5019,9 +5030,11 @@ fn run_tclone_clone_attempts(
                     copies,
                     &fallback_prefix,
                     source,
-                    false,
-                    &env,
-                    prepared_contexts,
+                    TcloneCloneRetryContext {
+                        use_overlay: false,
+                        env: &env,
+                        prepared_contexts,
+                    },
                     error,
                 ),
             }
@@ -5031,9 +5044,11 @@ fn run_tclone_clone_attempts(
             copies,
             prefix,
             source,
-            use_overlay,
-            &env,
-            prepared_contexts,
+            TcloneCloneRetryContext {
+                use_overlay,
+                env: &env,
+                prepared_contexts,
+            },
             error,
         ),
     }
@@ -5047,9 +5062,7 @@ fn retry_tclone_partial_multicopy_clone(
     copies: usize,
     prefix: &str,
     source: &TcloneRunRecord,
-    use_overlay: bool,
-    env: &[(String, String)],
-    prepared_contexts: &[TclonePreparedForkContext],
+    context: TcloneCloneRetryContext<'_>,
     error: io::Error,
 ) -> io::Result<TcloneCloneOutput> {
     if copies <= 1 || !should_retry_tclone_partial_multicopy(&error.to_string()) {
@@ -5069,10 +5082,10 @@ fn retry_tclone_partial_multicopy_clone(
         copies,
         &retry_prefix,
         &source.container_name,
-        use_overlay,
-        prepared_contexts,
+        context.use_overlay,
+        context.prepared_contexts,
     );
-    let output = run_command_capture_with_env(podman, &retry_args, env)?;
+    let output = run_command_capture_with_env(podman, &retry_args, context.env)?;
     validate_tclone_clone_output(&output, copies)?;
     Ok(TcloneCloneOutput {
         prefix: retry_prefix,
@@ -10665,8 +10678,7 @@ mod tests {
     }
 
     fn tclone_test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::cli_test_env_lock()
     }
 
     #[cfg(unix)]

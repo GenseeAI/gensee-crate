@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+gensee-crate-core = { path = "../crate/gensee-crate-core" }
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
 serde = { workspace = true }
 sha2 = "0.10"

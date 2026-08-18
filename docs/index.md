@@ -4,7 +4,7 @@ layout: home
 hero:
   name: Gensee Crate
   text: Full-stack, long-horizon runtime safety<br>for AI coding agents.
-  tagline: Gensee Crate watches system events,<br>requests, tool calls, skills, and memory<br>behind Claude Code, Codex, Antigravity, VS Code, and Cursor.
+  tagline: Gensee Crate watches system events,<br>requests, tool calls, skills, and memory<br>behind Claude Code, Codex, Antigravity, Cursor, GitHub Copilot, and Omnigent.
   image:
     src: /gensee-crate-defense-in-depth.png
     alt: Gensee Crate defense-in-depth architecture
@@ -33,7 +33,7 @@ features:
     link: /run-and-sandbox
     linkText: Use gensee run
   - title: Connect Agent Surfaces
-    details: Wire Claude Code, Codex, Antigravity, VS Code, and Cursor hooks into the same timeline, with sidecar coverage for unmanaged runs.
+    details: Wire Claude Code, Codex, Antigravity, Cursor, and GitHub Copilot hooks into the same timeline, with managed-launch coverage for Omnigent.
     link: /vscode-support
     linkText: Configure integrations
   - title: Protect Linux Hosts
@@ -48,4 +48,8 @@ features:
     details: Review live activity, lineage, policy decisions, alerts, and policy edits against the same endpoint store.
     link: /dashboard
     linkText: Open dashboard docs
+  - title: Protect macOS Agents
+    details: Use the native SwiftUI console to manage the signed Endpoint Security extension, policy mode, and protection for six supported harnesses.
+    link: /macos-app
+    linkText: Open macOS app docs
 ---

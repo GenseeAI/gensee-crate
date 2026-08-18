@@ -9,8 +9,8 @@
   "properties": {
     "schema_version": {
       "type": "integer",
-      "const": 1,
-      "description": "Must match the binary's supported version (1) or the document is rejected (fails closed)."
+      "enum": [1, 2],
+      "description": "Version 2 adds Endpoint Security recording and retention controls. Version 1 remains readable for migration; new documents should use 2."
     },
     "version": { "type": "string", "description": "Human-readable revision tag, e.g. a date." },
     "description": { "type": "string" },
@@ -132,6 +132,23 @@
         "noninteractive": { "type": "boolean", "default": false, "description": "When true, escalate medium+ `ask` findings to `deny` (fail closed with no operator)." }
       }
     },
+    "endpoint_security": {
+      "type": "object",
+      "description": "First-party macOS Endpoint Security sensor and authorization posture.",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "type": "string", "enum": ["off", "observe", "protect", "strict"], "default": "observe" },
+        "protected_paths": { "type": "array", "items": { "type": "string" }, "description": "Additional absolute path prefixes protected by authorization events." },
+        "blocked_executables": { "type": "array", "items": { "type": "string" }, "description": "Absolute executable paths denied inside managed agent trees in protect/strict mode." },
+        "fail_closed_managed_only": { "type": "boolean", "const": true, "default": true, "description": "Reserved safety invariant: authorization denies are always limited to explicitly managed agent process trees." },
+        "max_auth_latency_ms": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 },
+        "minimum_recorded_severity": { "type": "string", "enum": ["info", "low", "medium", "high", "critical"], "default": "info", "description": "Lowest alert severity persisted locally. Enforcement still evaluates every finding." },
+        "raw_event_scope": { "type": "string", "enum": ["none", "active", "all"], "default": "all", "description": "Persist no raw events, only events correlated to an active agent tool call, or every observed Endpoint Security event. All is the default; age and count retention bound storage." },
+        "raw_event_retention_hours": { "type": "integer", "minimum": 1, "maximum": 720, "default": 24 },
+        "max_raw_events": { "type": "integer", "minimum": 1000, "maximum": 5000000, "default": 100000 },
+        "low_severity_retention_hours": { "type": ["integer", "null"], "minimum": 1, "maximum": 8760, "default": 48, "description": "Permanently delete info, low, and medium alerts after this many hours; null keeps them indefinitely." }
+      }
+    },
     "watch": {
       "type": "object",
       "description": "Sidecar watch defaults.",
@@ -139,8 +156,8 @@
       "properties": {
         "system_events": {
           "type": "string",
-          "enum": ["none", "eslogger"],
-          "default": "eslogger",
+          "enum": ["none", "endpoint-security", "eslogger"],
+          "default": "endpoint-security",
           "description": "System-event backend started by `gensee watch` unless overridden with --system-events."
         }
       }

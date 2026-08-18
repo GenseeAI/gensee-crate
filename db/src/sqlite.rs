@@ -1,11 +1,93 @@
 use std::path::Path;
 use std::time::Duration;
 
+use gensee_crate_core::endpoint_security_path_is_known_build_output;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// Increment whenever dashboard artifact visibility rules change. Existing
+// stores are reclassified by bounded background maintenance before this
+// version is stamped on their cached count.
+const DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION: i64 = 3;
+
+/// Lineage represents concrete filesystem objects. Shell globs and brace
+/// expansions describe possible path sets, while square brackets are also
+/// valid literal route syntax in frameworks such as Next.js and SvelteKit.
+pub fn artifact_path_is_concrete(path: &str) -> bool {
+    !path.is_empty()
+        && !path
+            .chars()
+            .any(|character| matches!(character, '*' | '?' | '{'))
+}
+
+pub fn lineage_path_is_harness_runtime_noise(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    path.starts_with("/dev/")
+        || path.starts_with("/private/tmp/cc-socks/")
+        || path.starts_with("/tmp/cc-socks/")
+        || path.starts_with("/private/tmp/claude-")
+        || path.starts_with("/tmp/claude-")
+        || path.starts_with("/private/var/tmp/sh-thd-")
+        || path.contains("/.claude/sessions/")
+        || path.contains("/.claude/projects/")
+        || path.contains("/.claude/shell-snapshots/")
+        || (path.contains("/.claude/plugins/cache/")
+            && (path.ends_with("/.in_use") || path.contains("/.in_use/")))
+        || lower.contains("/library/application support/codex/")
+        || lower.contains("/library/application support/claude/")
+        || lower.contains("/crashpad/")
+        || lower.contains("/diagnosticreports/")
+        || lower.contains("/crash reports/")
+        || ((lower.ends_with("-wal") || lower.ends_with("-shm") || lower.ends_with("-journal"))
+            && (lower.contains("/.codex/")
+                || lower.contains("/.claude/")
+                || lower.contains("/library/application support/cursor/")
+                || lower.contains("/library/application support/code/")))
+}
+
+pub fn lineage_path_is_system_dependency(path: &str) -> bool {
+    path == "/bin"
+        || path.starts_with("/bin/")
+        || path == "/sbin"
+        || path.starts_with("/sbin/")
+        || path == "/usr/bin"
+        || path.starts_with("/usr/bin/")
+        || path == "/usr/local/bin"
+        || path.starts_with("/usr/local/bin/")
+        || path.starts_with("/usr/lib/")
+        || path.starts_with("/usr/share/")
+        || path.starts_with("/System/")
+        || path.starts_with("/Library/Developer/")
+        || path.starts_with("/Applications/Xcode.app/Contents/Developer/")
+        || path.starts_with("/Library/Preferences/Logging/")
+        || path.starts_with("/Library/Preferences/")
+        || path.starts_with("/private/var/db/")
+        || path.starts_with("/private/var/folders/")
+        || path.starts_with("/opt/homebrew/Cellar/")
+}
+
+pub fn lineage_mode_is_non_file(mode: u64) -> bool {
+    matches!(
+        mode & 0o170000,
+        0o010000 | 0o020000 | 0o040000 | 0o060000 | 0o140000
+    )
+}
+
+pub fn dashboard_artifact_is_visible(
+    path: &str,
+    source: Option<&str>,
+    mode: Option<u64>,
+    known_build_output: bool,
+) -> bool {
+    artifact_path_is_concrete(path)
+        && (source != Some("macos-endpoint-security")
+            || (mode.is_none_or(|mode| !lineage_mode_is_non_file(mode))
+                && !lineage_path_is_harness_runtime_noise(path)
+                && !lineage_path_is_system_dependency(path)
+                && !known_build_output))
+}
 
 /// Genesis hash for the alert tamper-evident chain (64 hex zeros).
 fn genesis_hash() -> String {
@@ -64,6 +146,30 @@ fn alert_entry_hash(prev_hash: &str, alert: &NewAlert) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn retention_checkpoint_hash(
+    prev_checkpoint_hash: &str,
+    previous_alert_head: &str,
+    previous_alert_count: i64,
+    pruned_count: i64,
+    highest_pruned_alert_id: i64,
+    cutoff_ms: i64,
+    pruned_entries_hash: &str,
+    created_at: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    feed_field(&mut hasher, b"gensee-alert-retention-checkpoint-v1");
+    feed_field(&mut hasher, prev_checkpoint_hash.as_bytes());
+    feed_field(&mut hasher, previous_alert_head.as_bytes());
+    feed_field(&mut hasher, &previous_alert_count.to_le_bytes());
+    feed_field(&mut hasher, &pruned_count.to_le_bytes());
+    feed_field(&mut hasher, &highest_pruned_alert_id.to_le_bytes());
+    feed_field(&mut hasher, &cutoff_ms.to_le_bytes());
+    feed_field(&mut hasher, pruned_entries_hash.as_bytes());
+    feed_field(&mut hasher, &created_at.to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Result of [`SqliteStore::verify_alert_chain`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainVerification {
@@ -73,6 +179,21 @@ pub struct ChainVerification {
     pub broken_at: Option<i64>,
     /// Human-readable reason for the break.
     pub reason: Option<String>,
+}
+
+/// Progress made by one bounded dashboard-artifact visibility maintenance
+/// batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactVisibilityMigrationResult {
+    pub scanned: u64,
+    pub updated: u64,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionPruneResult {
+    pub system_events: u64,
+    pub low_severity_alerts: u64,
 }
 
 impl ChainVerification {
@@ -147,6 +268,7 @@ pub enum SqliteError {
 pub struct SessionRecord {
     pub session_id: String,
     pub agent_id: String,
+    pub root_pid: i64,
     pub first_event_at: i64,
     pub last_event_at: Option<i64>,
     pub flagged: bool,
@@ -156,9 +278,18 @@ pub struct SessionRecord {
 pub struct NewSession {
     pub session_id: String,
     pub agent_id: String,
+    pub root_pid: i64,
     pub first_event_at: i64,
     pub last_event_at: Option<i64>,
     pub flagged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptTokenStateRecord {
+    pub session_id: String,
+    pub transcript_path: String,
+    pub state_json: String,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -468,6 +599,7 @@ pub struct NewArtifactFact {
     pub is_memory_artifact: bool,
     pub is_persistent_target: bool,
     pub is_control_plane: bool,
+    pub dashboard_visible: bool,
     pub risk_level: Option<String>,
     pub risk_rule_id: Option<String>,
     pub risk_digest: Option<String>,
@@ -546,6 +678,12 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
     migrate_legacy_relations(&conn).map_err(SqliteError::Schema)?;
     migrate_alert_hash_chain(&conn).map_err(SqliteError::Schema)?;
     migrate_agent_event_tool_use_id(&conn).map_err(SqliteError::Schema)?;
+    migrate_request_activity_fields(&conn).map_err(SqliteError::Schema)?;
+    migrate_session_root_pid(&conn).map_err(SqliteError::Schema)?;
+    migrate_session_token_usage(&conn).map_err(SqliteError::Schema)?;
+    migrate_transcript_token_state(&conn).map_err(SqliteError::Schema)?;
+    ensure_artifact_dashboard_visibility_column(&conn).map_err(SqliteError::Schema)?;
+    ensure_dashboard_artifact_count_rules_version_column(&conn).map_err(SqliteError::Schema)?;
 
     conn.execute_batch(include_str!("../schema.sql"))
         .map_err(SqliteError::Schema)?;
@@ -582,16 +720,18 @@ impl SqliteStore {
     pub fn insert_session(&self, session: &NewSession) -> Result<(), SqliteError> {
         self.conn
             .execute(
-                "INSERT INTO sessions (session_id, agent_id, first_event_at, last_event_at, flagged)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO sessions (session_id, agent_id, root_pid, first_event_at, last_event_at, flagged)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(session_id) DO UPDATE SET
                     agent_id = excluded.agent_id,
+                    root_pid = CASE WHEN excluded.root_pid > 0 THEN excluded.root_pid ELSE sessions.root_pid END,
                     first_event_at = MIN(sessions.first_event_at, excluded.first_event_at),
                     last_event_at = COALESCE(excluded.last_event_at, sessions.last_event_at),
                     flagged = excluded.flagged",
                 params![
                     session.session_id,
                     session.agent_id,
+                    session.root_pid,
                     session.first_event_at,
                     session.last_event_at,
                     bool_to_i64(session.flagged),
@@ -604,7 +744,7 @@ impl SqliteStore {
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>, SqliteError> {
         self.conn
             .query_row(
-                "SELECT session_id, agent_id, first_event_at, last_event_at, flagged
+                "SELECT session_id, agent_id, root_pid, first_event_at, last_event_at, flagged
                  FROM sessions
                  WHERE session_id = ?1",
                 [session_id],
@@ -619,6 +759,66 @@ impl SqliteStore {
             .execute(
                 "UPDATE sessions SET flagged = ?2 WHERE session_id = ?1",
                 params![session_id, bool_to_i64(flagged)],
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn transcript_token_state(
+        &self,
+        session_id: &str,
+        transcript_path: &str,
+    ) -> Result<Option<TranscriptTokenStateRecord>, SqliteError> {
+        self.conn
+            .query_row(
+                "SELECT session_id, transcript_path, state_json, updated_at
+                 FROM transcript_token_state
+                 WHERE session_id = ?1 AND transcript_path = ?2",
+                params![session_id, transcript_path],
+                |row| {
+                    Ok(TranscriptTokenStateRecord {
+                        session_id: row.get(0)?,
+                        transcript_path: row.get(1)?,
+                        state_json: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn upsert_transcript_token_state(
+        &self,
+        state: &TranscriptTokenStateRecord,
+    ) -> Result<(), SqliteError> {
+        self.conn
+            .execute(
+                "INSERT INTO transcript_token_state (
+                    session_id, transcript_path, state_json, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id, transcript_path) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at",
+                params![
+                    state.session_id,
+                    state.transcript_path,
+                    state.state_json,
+                    state.updated_at,
+                ],
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn delete_transcript_token_state_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), SqliteError> {
+        self.conn
+            .execute(
+                "DELETE FROM transcript_token_state WHERE session_id = ?1",
+                [session_id],
             )
             .map(|_| ())
             .map_err(SqliteError::Database)
@@ -702,6 +902,71 @@ impl SqliteStore {
             .execute(
                 "UPDATE requests SET final_response = ?2 WHERE request_id = ?1",
                 params![request_id, final_response],
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn set_request_created_at(
+        &self,
+        request_id: i64,
+        created_at: i64,
+    ) -> Result<(), SqliteError> {
+        self.conn
+            .execute(
+                "UPDATE requests SET created_at = ?2 WHERE request_id = ?1",
+                params![request_id, created_at],
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn complete_request_with_token_total(
+        &self,
+        request_id: i64,
+        completed_at: i64,
+        cumulative_session_tokens: Option<i64>,
+    ) -> Result<(), SqliteError> {
+        let total_tokens = cumulative_session_tokens
+            .map(|cumulative| {
+                let session_id: String = self.conn.query_row(
+                    "SELECT session_id FROM requests WHERE request_id = ?1",
+                    [request_id],
+                    |row| row.get(0),
+                )?;
+                let previous = self
+                    .conn
+                    .query_row(
+                        "SELECT last_cumulative_tokens FROM session_token_usage WHERE session_id = ?1",
+                        [&session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                self.conn.execute(
+                    "INSERT INTO session_token_usage (session_id, last_cumulative_tokens, updated_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                       last_cumulative_tokens = excluded.last_cumulative_tokens,
+                       updated_at = excluded.updated_at",
+                    params![session_id, cumulative, completed_at],
+                )?;
+                Ok::<i64, rusqlite::Error>(previous
+                    .map(|baseline| cumulative.saturating_sub(baseline).max(0))
+                    .unwrap_or(0))
+            })
+            .transpose()
+            .map_err(SqliteError::Database)?;
+
+        self.conn
+            .execute(
+                "UPDATE requests
+                 SET completed_at = ?2,
+                     total_tokens = CASE
+                       WHEN ?3 IS NULL THEN total_tokens
+                       ELSE COALESCE(total_tokens, 0) + ?3
+                     END
+                 WHERE request_id = ?1",
+                params![request_id, completed_at, total_tokens],
             )
             .map(|_| ())
             .map_err(SqliteError::Database)
@@ -835,7 +1100,7 @@ impl SqliteStore {
                  WHERE type = 'file_intent'
                    AND tool_input IS NOT NULL
                    AND json_extract(tool_input, '$.path') IS NOT NULL
-                   AND ABS(ts - ?2) <= ?3
+                   AND ts BETWEEN ?2 - ?3 AND ?2 + ?3
                    AND (
                         json_extract(tool_input, '$.path') = ?1
                      OR substr(?1, 1, length(json_extract(tool_input, '$.path')) + 1) =
@@ -870,6 +1135,296 @@ impl SqliteStore {
             .map_err(SqliteError::Database)?;
 
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Atomically claim periodic maintenance across hook processes and the
+    /// long-lived Endpoint Security ingestor.
+    pub fn claim_maintenance(
+        &self,
+        key: &str,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<bool, SqliteError> {
+        self.conn
+            .execute(
+                "INSERT INTO maintenance_state(key, last_run_at) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET last_run_at = excluded.last_run_at
+                 WHERE maintenance_state.last_run_at <= ?2 - ?3",
+                params![key, now_ms, interval_ms],
+            )
+            .map(|changed| changed == 1)
+            .map_err(SqliteError::Database)
+    }
+
+    /// Reclassify at most `batch_limit` artifact facts for the current
+    /// dashboard visibility rules. Progress is persisted as a `(kind, uri)`
+    /// keyset cursor so memory and latency stay bounded regardless of store
+    /// size. The cached count is reconciled and the rules version is stamped
+    /// only after the final batch completes.
+    pub fn migrate_artifact_dashboard_visibility_rules_batch(
+        &self,
+        batch_limit: u64,
+    ) -> Result<ArtifactVisibilityMigrationResult, SqliteError> {
+        migrate_artifact_dashboard_visibility_rules_batch(&self.conn, batch_limit)
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn dashboard_artifact_visibility_rules_are_current(&self) -> Result<bool, SqliteError> {
+        self.conn
+            .query_row(
+                "SELECT rules_version = ?1
+                 FROM dashboard_artifact_count WHERE id = 1",
+                [DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(SqliteError::Database)
+    }
+
+    /// Permanently remove bounded batches of expired Endpoint Security
+    /// telemetry. The row cap is enforced independently from the time limit so
+    /// a burst cannot grow the local database without bound. Intentional alert
+    /// deletion is committed to an append-only retention checkpoint before the
+    /// surviving chain is re-rooted.
+    pub fn prune_endpoint_retention(
+        &self,
+        raw_cutoff_ms: i64,
+        max_raw_events: i64,
+        low_severity_cutoff_ms: Option<i64>,
+        batch_limit: i64,
+        maintenance_at_ms: i64,
+    ) -> Result<RetentionPruneResult, SqliteError> {
+        if low_severity_cutoff_ms.is_some() {
+            let verification = self.verify_alert_chain()?;
+            if !verification.is_valid() {
+                return Err(SqliteError::Database(
+                    rusqlite::Error::InvalidParameterName(format!(
+                        "refusing retention prune because alert-chain verification failed: {}",
+                        verification
+                            .reason
+                            .unwrap_or_else(|| "unknown break".to_string())
+                    )),
+                ));
+            }
+        }
+        self.conn
+            .execute_batch("SAVEPOINT gensee_retention_prune")
+            .map_err(SqliteError::Database)?;
+        let result = (|| -> rusqlite::Result<RetentionPruneResult> {
+            self.conn.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS gensee_pruned_system_events (
+                    event_id INTEGER PRIMARY KEY
+                 );
+                 DELETE FROM gensee_pruned_system_events;",
+            )?;
+            self.conn.execute(
+                "INSERT INTO gensee_pruned_system_events(event_id)
+                 SELECT event_id
+                 FROM system_events
+                 WHERE source = 'macos-endpoint-security'
+                   AND (
+                       ts < ?1 OR event_id <= COALESCE((
+                           SELECT event_id
+                           FROM system_events
+                           WHERE source = 'macos-endpoint-security'
+                           ORDER BY event_id DESC
+                           LIMIT 1 OFFSET ?2
+                       ), -1)
+                   )
+                 ORDER BY event_id
+                 LIMIT ?3",
+                params![raw_cutoff_ms, max_raw_events, batch_limit],
+            )?;
+            let system_events = self.conn.query_row(
+                "SELECT COUNT(*) FROM gensee_pruned_system_events",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            self.conn.execute(
+                "DELETE FROM relations
+                 WHERE (src_kind = 'system_event' AND src_id IN (
+                     SELECT event_id FROM gensee_pruned_system_events
+                 )) OR (dst_kind = 'system_event' AND dst_id IN (
+                     SELECT event_id FROM gensee_pruned_system_events
+                 ))",
+                [],
+            )?;
+            self.conn.execute(
+                "UPDATE artifact_facts SET last_system_event_id = NULL
+                 WHERE last_system_event_id IN (
+                     SELECT event_id FROM gensee_pruned_system_events
+                 )",
+                [],
+            )?;
+            self.conn.execute(
+                "DELETE FROM system_events WHERE event_id IN (
+                    SELECT event_id FROM gensee_pruned_system_events
+                 )",
+                [],
+            )?;
+
+            let low_severity_alerts = if let Some(cutoff) = low_severity_cutoff_ms {
+                self.conn.execute_batch(
+                    "CREATE TEMP TABLE IF NOT EXISTS gensee_pruned_alerts (
+                        alert_id INTEGER PRIMARY KEY
+                     );
+                     DELETE FROM gensee_pruned_alerts;",
+                )?;
+                self.conn.execute(
+                    "INSERT INTO gensee_pruned_alerts(alert_id)
+                     SELECT alert_id FROM alerts
+                     WHERE severity IN ('info', 'low', 'medium')
+                       AND created_at < ?1
+                     ORDER BY alert_id
+                     LIMIT ?2",
+                    params![cutoff, batch_limit],
+                )?;
+                let pruned_count = self.conn.query_row(
+                    "SELECT COUNT(*) FROM gensee_pruned_alerts",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                if pruned_count > 0 {
+                    let highest_pruned_alert_id = self.conn.query_row(
+                        "SELECT MAX(alert_id) FROM gensee_pruned_alerts",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    let mut digest = Sha256::new();
+                    let mut statement = self.conn.prepare(
+                        "SELECT alerts.alert_id, COALESCE(alerts.entry_hash, '')
+                         FROM alerts JOIN gensee_pruned_alerts USING(alert_id)
+                         ORDER BY alerts.alert_id",
+                    )?;
+                    let rows = statement.query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?;
+                    for row in rows {
+                        let (alert_id, entry_hash) = row?;
+                        feed_field(&mut digest, &alert_id.to_le_bytes());
+                        feed_field(&mut digest, entry_hash.as_bytes());
+                    }
+                    drop(statement);
+                    let pruned_entries_hash = format!("{:x}", digest.finalize());
+                    let (previous_alert_head, previous_alert_count) = self
+                        .conn
+                        .query_row(
+                            "SELECT head_hash, count FROM alert_chain_head WHERE id = 1",
+                            [],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                        )
+                        .optional()?
+                        .unwrap_or_else(|| (genesis_hash(), 0));
+                    let prev_checkpoint_hash = self.latest_retention_checkpoint_hash()?;
+                    let checkpoint_hash = retention_checkpoint_hash(
+                        &prev_checkpoint_hash,
+                        &previous_alert_head,
+                        previous_alert_count,
+                        pruned_count,
+                        highest_pruned_alert_id,
+                        cutoff,
+                        &pruned_entries_hash,
+                        maintenance_at_ms,
+                    );
+                    self.conn.execute(
+                        "INSERT INTO alert_retention_checkpoints (
+                            prev_checkpoint_hash, checkpoint_hash, previous_alert_head,
+                            previous_alert_count, pruned_count, highest_pruned_alert_id,
+                            cutoff_ms, pruned_entries_hash, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            prev_checkpoint_hash,
+                            checkpoint_hash,
+                            previous_alert_head,
+                            previous_alert_count,
+                            pruned_count,
+                            highest_pruned_alert_id,
+                            cutoff,
+                            pruned_entries_hash,
+                            maintenance_at_ms,
+                        ],
+                    )?;
+                    self.conn.execute(
+                        "INSERT INTO alert_retention_head(id, head_hash, count) VALUES (1, ?1, 1)
+                         ON CONFLICT(id) DO UPDATE SET
+                            head_hash = excluded.head_hash, count = count + 1",
+                        params![checkpoint_hash],
+                    )?;
+                    self.conn.execute(
+                        "DELETE FROM alerts WHERE alert_id IN (
+                            SELECT alert_id FROM gensee_pruned_alerts
+                         )",
+                        [],
+                    )?;
+                    self.rebuild_alert_chain(&checkpoint_hash)?;
+                }
+                pruned_count
+            } else {
+                0
+            };
+            Ok(RetentionPruneResult {
+                system_events: system_events as u64,
+                low_severity_alerts: low_severity_alerts as u64,
+            })
+        })();
+        match result {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("RELEASE gensee_retention_prune")
+                    .map_err(SqliteError::Database)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO gensee_retention_prune; RELEASE gensee_retention_prune",
+                );
+                Err(SqliteError::Database(error))
+            }
+        }
+    }
+
+    fn rebuild_alert_chain(&self, root_hash: &str) -> rusqlite::Result<()> {
+        let alerts = {
+            let mut statement = self.conn.prepare(
+                "SELECT alert_id, request_id, entity_kind, entity_id, severity, action,
+                    rule_id, message, path, evidence, created_at
+                 FROM alerts ORDER BY alert_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        NewAlert {
+                            request_id: row.get(1)?,
+                            entity_kind: row.get(2)?,
+                            entity_id: row.get(3)?,
+                            severity: row.get(4)?,
+                            action: row.get(5)?,
+                            rule_id: row.get(6)?,
+                            message: row.get(7)?,
+                            path: row.get(8)?,
+                            evidence: row.get(9)?,
+                            created_at: row.get(10)?,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut previous = root_hash.to_string();
+        for (alert_id, alert) in &alerts {
+            let entry = alert_entry_hash(&previous, alert);
+            self.conn.execute(
+                "UPDATE alerts SET prev_hash = ?1, entry_hash = ?2 WHERE alert_id = ?3",
+                params![previous, entry, alert_id],
+            )?;
+            previous = entry;
+        }
+        self.conn.execute(
+            "INSERT INTO alert_chain_head(id, head_hash, count) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET head_hash = excluded.head_hash, count = excluded.count",
+            params![previous, alerts.len() as i64],
+        )?;
+        Ok(())
     }
 
     pub fn system_events_for_request(
@@ -1079,10 +1634,10 @@ impl SqliteStore {
                     recent_unmatched_effect_count, recent_cross_session_write_count,
                     is_agent_authored, is_unmatched_modified, is_memory_artifact,
                     is_persistent_target, is_control_plane, risk_level, risk_rule_id,
-                    risk_digest, risk_updated_at, metadata
+                    risk_digest, risk_updated_at, metadata, dashboard_visible
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
                  )
                  ON CONFLICT(kind, uri) DO UPDATE SET
                     current_artifact_id = excluded.current_artifact_id,
@@ -1105,7 +1660,8 @@ impl SqliteStore {
                     risk_rule_id = excluded.risk_rule_id,
                     risk_digest = excluded.risk_digest,
                     risk_updated_at = excluded.risk_updated_at,
-                    metadata = excluded.metadata",
+                    metadata = excluded.metadata,
+                    dashboard_visible = excluded.dashboard_visible",
                 params![
                     fact.kind,
                     fact.uri,
@@ -1130,6 +1686,7 @@ impl SqliteStore {
                     fact.risk_digest,
                     fact.risk_updated_at,
                     fact.metadata,
+                    bool_to_i64(fact.dashboard_visible),
                 ],
             )
             .map(|_| ())
@@ -1306,7 +1863,12 @@ impl SqliteStore {
 
     pub fn insert_alert(&self, alert: &NewAlert) -> Result<i64, SqliteError> {
         // Tamper-evident hash chain (T8): link this alert to the previous one.
-        let prev_hash = self.latest_alert_entry_hash()?.unwrap_or_else(genesis_hash);
+        let prev_hash = match self.latest_alert_entry_hash()? {
+            Some(hash) => hash,
+            None => self
+                .latest_retention_checkpoint_hash()
+                .map_err(SqliteError::Database)?,
+        };
         let entry_hash = alert_entry_hash(&prev_hash, alert);
 
         // The alert insert and the anchor update must be atomic — a crash
@@ -1389,6 +1951,99 @@ impl SqliteStore {
         }
     }
 
+    fn latest_retention_checkpoint_hash(&self) -> rusqlite::Result<String> {
+        self.conn
+            .query_row(
+                "SELECT head_hash FROM alert_retention_head WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or_else(genesis_hash))
+    }
+
+    fn verify_retention_checkpoints(&self) -> Result<String, SqliteError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT prev_checkpoint_hash, checkpoint_hash, previous_alert_head,
+                    previous_alert_count, pruned_count, highest_pruned_alert_id,
+                    cutoff_ms, pruned_entries_hash, created_at
+                 FROM alert_retention_checkpoints ORDER BY checkpoint_id",
+            )
+            .map_err(SqliteError::Database)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })
+            .map_err(SqliteError::Database)?;
+        let mut expected_prev = genesis_hash();
+        let mut count = 0_i64;
+        for row in rows {
+            let (
+                prev,
+                checkpoint,
+                previous_alert_head,
+                previous_alert_count,
+                pruned_count,
+                highest_pruned_alert_id,
+                cutoff_ms,
+                pruned_entries_hash,
+                created_at,
+            ) = row.map_err(SqliteError::Database)?;
+            let expected = retention_checkpoint_hash(
+                &prev,
+                &previous_alert_head,
+                previous_alert_count,
+                pruned_count,
+                highest_pruned_alert_id,
+                cutoff_ms,
+                &pruned_entries_hash,
+                created_at,
+            );
+            if prev != expected_prev || checkpoint != expected {
+                return Err(SqliteError::Database(
+                    rusqlite::Error::InvalidParameterName(
+                        "retention checkpoint chain was modified or reordered".to_string(),
+                    ),
+                ));
+            }
+            expected_prev = checkpoint;
+            count += 1;
+        }
+        let anchor = self
+            .conn
+            .query_row(
+                "SELECT head_hash, count FROM alert_retention_head WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(SqliteError::Database)?;
+        match anchor {
+            Some((head, anchored_count)) if head == expected_prev && anchored_count == count => {}
+            None if count == 0 => {}
+            _ => {
+                return Err(SqliteError::Database(
+                    rusqlite::Error::InvalidParameterName(
+                        "retention checkpoint head/count does not match its anchor".to_string(),
+                    ),
+                ))
+            }
+        }
+        Ok(expected_prev)
+    }
+
     /// Recompute the alert hash chain from the genesis hash and report the first
     /// break — any inserted, deleted, reordered, or modified row.
     ///
@@ -1398,6 +2053,15 @@ impl SqliteStore {
     /// NULL hashes after the chain exists is detected as a break rather than
     /// silently ignored.
     pub fn verify_alert_chain(&self) -> Result<ChainVerification, SqliteError> {
+        let chain_root = match self.verify_retention_checkpoints() {
+            Ok(root) => root,
+            Err(error) => {
+                return Ok(ChainVerification::broken_tail(
+                    0,
+                    &format!("retention checkpoint verification failed: {error}"),
+                ))
+            }
+        };
         // First chained row; `min()` over no matches yields NULL -> None.
         let chain_start: Option<i64> = self
             .conn
@@ -1408,7 +2072,23 @@ impl SqliteStore {
             )
             .map_err(SqliteError::Database)?;
         let Some(chain_start) = chain_start else {
-            return Ok(ChainVerification::valid(0)); // no chained alerts yet
+            let anchor = self
+                .conn
+                .query_row(
+                    "SELECT head_hash, count FROM alert_chain_head WHERE id = 1",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(SqliteError::Database)?;
+            return match anchor {
+                Some((head, 0)) if head == chain_root => Ok(ChainVerification::valid(0)),
+                None if chain_root == genesis_hash() => Ok(ChainVerification::valid(0)),
+                _ => Ok(ChainVerification::broken_tail(
+                    0,
+                    "empty alert chain does not match the retention root/anchor",
+                )),
+            };
         };
 
         let mut stmt = self
@@ -1443,7 +2123,7 @@ impl SqliteStore {
             })
             .map_err(SqliteError::Database)?;
 
-        let mut expected_prev = genesis_hash();
+        let mut expected_prev = chain_root;
         let mut checked = 0_u64;
         for row in rows {
             let (alert_id, alert, prev_hash, entry_hash) = row.map_err(SqliteError::Database)?;
@@ -1503,11 +2183,11 @@ impl SqliteStore {
             .conn
             .prepare(
                 "SELECT alert_id, alerts.request_id, entity_kind, entity_id, severity,
-                    action, rule_id, message, path, evidence, created_at,
+                    action, rule_id, message, path, evidence, alerts.created_at,
                     requests.session_id
                  FROM alerts
                  LEFT JOIN requests ON requests.request_id = alerts.request_id
-                 ORDER BY created_at, alert_id",
+                 ORDER BY alerts.created_at, alert_id",
             )
             .map_err(SqliteError::Database)?;
         let rows = stmt
@@ -1522,12 +2202,12 @@ impl SqliteStore {
             .conn
             .prepare(
                 "SELECT alert_id, alerts.request_id, entity_kind, entity_id, severity,
-                    action, rule_id, message, path, evidence, created_at,
+                    action, rule_id, message, path, evidence, alerts.created_at,
                     requests.session_id
                  FROM alerts
                  LEFT JOIN requests ON requests.request_id = alerts.request_id
                  WHERE alerts.request_id = ?1
-                 ORDER BY created_at, alert_id",
+                 ORDER BY alerts.created_at, alert_id",
             )
             .map_err(SqliteError::Database)?;
         let rows = stmt
@@ -1841,6 +2521,217 @@ fn migrate_agent_event_tool_use_id(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Add activity timestamps and token totals to databases created before the
+/// Daily Highlight view. Existing requests are dated from their first agent
+/// event (or session start when no agent event exists).
+fn migrate_request_activity_fields(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = table_columns(conn, "requests")?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    if !columns.iter().any(|column| column == "created_at") {
+        conn.execute("ALTER TABLE requests ADD COLUMN created_at INTEGER", [])?;
+    }
+    if !columns.iter().any(|column| column == "completed_at") {
+        conn.execute("ALTER TABLE requests ADD COLUMN completed_at INTEGER", [])?;
+    }
+    if !columns.iter().any(|column| column == "total_tokens") {
+        conn.execute("ALTER TABLE requests ADD COLUMN total_tokens INTEGER", [])?;
+    }
+    conn.execute_batch(
+        "UPDATE requests
+         SET created_at = COALESCE(
+             created_at,
+             (SELECT MIN(ts) FROM agent_events WHERE agent_events.request_id = requests.request_id),
+             (SELECT first_event_at FROM sessions WHERE sessions.session_id = requests.session_id)
+         )
+         WHERE created_at IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);",
+    )
+}
+
+fn migrate_session_root_pid(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = table_columns(conn, "sessions")?;
+    if !columns.is_empty() && !columns.iter().any(|column| column == "root_pid") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN root_pid INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_session_token_usage(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_token_usage (
+            session_id TEXT PRIMARY KEY,
+            last_cumulative_tokens INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+         );",
+    )
+}
+
+fn migrate_transcript_token_state(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS transcript_token_state (
+            session_id TEXT NOT NULL,
+            transcript_path TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (session_id, transcript_path),
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+            CHECK (json_valid(state_json))
+         );",
+    )
+}
+
+fn ensure_artifact_dashboard_visibility_column(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = table_columns(conn, "artifact_facts")?;
+    if columns.is_empty() || columns.iter().any(|column| column == "dashboard_visible") {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE artifact_facts
+         ADD COLUMN dashboard_visible INTEGER NOT NULL DEFAULT 1",
+        [],
+    )?;
+    Ok(())
+}
+
+fn ensure_dashboard_artifact_count_rules_version_column(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = table_columns(conn, "dashboard_artifact_count")?;
+    if !columns.is_empty() && !columns.iter().any(|column| column == "rules_version") {
+        conn.execute(
+            "ALTER TABLE dashboard_artifact_count
+             ADD COLUMN rules_version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_artifact_dashboard_visibility_rules_batch(
+    conn: &Connection,
+    batch_limit: u64,
+) -> rusqlite::Result<ArtifactVisibilityMigrationResult> {
+    let batch_limit = i64::try_from(batch_limit.max(1)).unwrap_or(i64::MAX);
+    let stored_version = conn.query_row(
+        "SELECT rules_version FROM dashboard_artifact_count WHERE id = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if stored_version == DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION {
+        conn.execute(
+            "DELETE FROM dashboard_artifact_visibility_migration WHERE id = 1",
+            [],
+        )?;
+        return Ok(ArtifactVisibilityMigrationResult {
+            scanned: 0,
+            updated: 0,
+            complete: true,
+        });
+    }
+
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        "INSERT INTO dashboard_artifact_visibility_migration(
+            id, target_rules_version, last_kind, last_uri
+         ) VALUES (1, ?1, '', '')
+         ON CONFLICT(id) DO UPDATE SET
+            target_rules_version = excluded.target_rules_version,
+            last_kind = '',
+            last_uri = ''
+         WHERE dashboard_artifact_visibility_migration.target_rules_version !=
+               excluded.target_rules_version",
+        [DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION],
+    )?;
+    let (last_kind, last_uri) = transaction.query_row(
+        "SELECT last_kind, last_uri
+         FROM dashboard_artifact_visibility_migration WHERE id = 1",
+        [],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+
+    let classifications = {
+        let mut statement = transaction.prepare(
+            "SELECT facts.kind, facts.uri,
+                    COALESCE(json_extract(facts.metadata, '$.source'),
+                             facts.last_modified_source, last_event.source),
+                    json_extract(last_event.args, '$.file.mode'),
+                    json_extract(last_event.args, '$.actor.executable_path'),
+                    COALESCE(
+                        json_extract(last_event.args, '$.attribution.workspace_root'),
+                        json_extract(last_event.args, '$.cwd')
+                    )
+             FROM artifact_facts AS facts
+             LEFT JOIN system_events AS last_event
+               ON last_event.event_id = facts.last_system_event_id
+             WHERE facts.kind > ?1 OR (facts.kind = ?1 AND facts.uri > ?2)
+             ORDER BY facts.kind, facts.uri
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![last_kind, last_uri, batch_limit], |row| {
+            let kind = row.get::<_, String>(0)?;
+            let uri = row.get::<_, String>(1)?;
+            let source = row.get::<_, Option<String>>(2)?;
+            let mode = row.get::<_, Option<i64>>(3)?.map(|value| value as u64);
+            let executable_path = row.get::<_, Option<String>>(4)?;
+            let workspace_root = row.get::<_, Option<String>>(5)?;
+            let path = uri.strip_prefix("file://").unwrap_or(&uri);
+            let known_build_output = endpoint_security_path_is_known_build_output(
+                executable_path.as_deref(),
+                path,
+                workspace_root.as_deref(),
+            );
+            let visible =
+                dashboard_artifact_is_visible(path, source.as_deref(), mode, known_build_output);
+            Ok((kind, uri, visible))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let scanned = classifications.len() as u64;
+    let mut updated = 0_u64;
+    {
+        let mut update = transaction.prepare(
+            "UPDATE artifact_facts
+             SET dashboard_visible = ?1
+             WHERE kind = ?2 AND uri = ?3 AND dashboard_visible != ?1",
+        )?;
+        for (kind, uri, visible) in &classifications {
+            updated += update.execute(params![bool_to_i64(*visible), kind, uri])? as u64;
+        }
+    }
+
+    let complete = scanned < batch_limit as u64;
+    if complete {
+        transaction.execute(
+            "UPDATE dashboard_artifact_count
+             SET count = (SELECT COUNT(*) FROM artifact_facts WHERE dashboard_visible = 1),
+                 rules_version = ?1
+             WHERE id = 1",
+            [DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION],
+        )?;
+        transaction.execute(
+            "DELETE FROM dashboard_artifact_visibility_migration WHERE id = 1",
+            [],
+        )?;
+    } else if let Some((kind, uri, _)) = classifications.last() {
+        transaction.execute(
+            "UPDATE dashboard_artifact_visibility_migration
+             SET last_kind = ?1, last_uri = ?2 WHERE id = 1",
+            params![kind, uri],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(ArtifactVisibilityMigrationResult {
+        scanned,
+        updated,
+        complete,
+    })
+}
+
 fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -1858,9 +2749,10 @@ fn map_session(row: &Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
         session_id: row.get(0)?,
         agent_id: row.get(1)?,
-        first_event_at: row.get(2)?,
-        last_event_at: row.get(3)?,
-        flagged: row.get::<_, i64>(4)? != 0,
+        root_pid: row.get(2)?,
+        first_event_at: row.get(3)?,
+        last_event_at: row.get(4)?,
+        flagged: row.get::<_, i64>(5)? != 0,
     })
 }
 
@@ -2073,6 +2965,8 @@ mod tests {
         for table in [
             "sessions",
             "requests",
+            "session_token_usage",
+            "transcript_token_state",
             "agent_events",
             "system_events",
             "artifacts",
@@ -2100,6 +2994,161 @@ mod tests {
             std::fs::remove_file(path.with_file_name(format!("{}-wal", db_name.to_string_lossy())));
         let _ =
             std::fs::remove_file(path.with_file_name(format!("{}-shm", db_name.to_string_lossy())));
+    }
+
+    #[test]
+    fn cumulative_token_usage_starts_with_a_baseline_and_records_deltas() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-token-delta-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .insert_session(&NewSession {
+                session_id: "legacy-session".to_string(),
+                agent_id: "claude-code".to_string(),
+                root_pid: 0,
+                first_event_at: 1,
+                last_event_at: None,
+                flagged: false,
+            })
+            .unwrap();
+
+        let insert_request = || {
+            store
+                .insert_request(&NewRequest {
+                    session_id: "legacy-session".to_string(),
+                    original_user_prompt: Some("turn".to_string()),
+                    final_response: None,
+                    events: None,
+                    file_accessed_rate: 0.0,
+                    network_rate: 0.0,
+                })
+                .unwrap()
+        };
+        let first = insert_request();
+        store
+            .complete_request_with_token_total(first, 10, Some(100))
+            .unwrap();
+        let second = insert_request();
+        store
+            .complete_request_with_token_total(second, 20, Some(135))
+            .unwrap();
+        let reset = insert_request();
+        store
+            .complete_request_with_token_total(reset, 30, Some(12))
+            .unwrap();
+
+        let token_total = |request_id| {
+            store
+                .connection()
+                .query_row(
+                    "SELECT total_tokens FROM requests WHERE request_id = ?1",
+                    [request_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(token_total(first), Some(0));
+        assert_eq!(token_total(second), Some(35));
+        assert_eq!(token_total(reset), Some(0));
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn repeated_completion_accumulates_new_token_delta_on_the_same_request() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-repeated-stop-token-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .insert_session(&NewSession {
+                session_id: "repeat-session".to_string(),
+                agent_id: "claude-code".to_string(),
+                root_pid: 0,
+                first_event_at: 1,
+                last_event_at: None,
+                flagged: false,
+            })
+            .unwrap();
+        let request_id = store
+            .insert_request(&NewRequest {
+                session_id: "repeat-session".to_string(),
+                original_user_prompt: Some("turn".to_string()),
+                final_response: None,
+                events: None,
+                file_accessed_rate: 0.0,
+                network_rate: 0.0,
+            })
+            .unwrap();
+
+        store
+            .complete_request_with_token_total(request_id, 10, Some(100))
+            .unwrap();
+        store
+            .complete_request_with_token_total(request_id, 20, Some(135))
+            .unwrap();
+
+        let total: Option<i64> = store
+            .connection()
+            .query_row(
+                "SELECT total_tokens FROM requests WHERE request_id = ?1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, Some(35));
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn transcript_token_state_round_trips_and_is_deleted_by_session() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-transcript-state-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .insert_session(&NewSession {
+                session_id: "state-session".to_string(),
+                agent_id: "claude-code".to_string(),
+                root_pid: 0,
+                first_event_at: 1,
+                last_event_at: None,
+                flagged: false,
+            })
+            .unwrap();
+        let state = TranscriptTokenStateRecord {
+            session_id: "state-session".to_string(),
+            transcript_path: "/tmp/transcript.jsonl".to_string(),
+            state_json: r#"{"offset":42}"#.to_string(),
+            updated_at: 10,
+        };
+        store.upsert_transcript_token_state(&state).unwrap();
+        assert_eq!(
+            store
+                .transcript_token_state("state-session", "/tmp/transcript.jsonl")
+                .unwrap(),
+            Some(state)
+        );
+        store
+            .delete_transcript_token_state_for_session("state-session")
+            .unwrap();
+        assert!(store
+            .transcript_token_state("state-session", "/tmp/transcript.jsonl")
+            .unwrap()
+            .is_none());
+
+        drop(store);
+        remove_sqlite_files(&path);
     }
 
     #[test]
@@ -2173,6 +3222,7 @@ mod tests {
             .insert_session(&NewSession {
                 session_id: "sess_1".to_string(),
                 agent_id: "agent_a".to_string(),
+                root_pid: 0,
                 first_event_at: 100,
                 last_event_at: None,
                 flagged: false,
@@ -2184,6 +3234,7 @@ mod tests {
             SessionRecord {
                 session_id: "sess_1".to_string(),
                 agent_id: "agent_a".to_string(),
+                root_pid: 0,
                 first_event_at: 100,
                 last_event_at: None,
                 flagged: true,
@@ -2380,6 +3431,7 @@ mod tests {
             .insert_session(&NewSession {
                 session_id: "sess_1".to_string(),
                 agent_id: "agent_a".to_string(),
+                root_pid: 0,
                 first_event_at: 1,
                 last_event_at: None,
                 flagged: false,
@@ -2423,6 +3475,319 @@ mod tests {
     }
 
     #[test]
+    fn retention_prunes_raw_cap_and_expired_low_severity_alerts() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-retention-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .insert_session(&NewSession {
+                session_id: "retention_session".to_string(),
+                agent_id: "codex".to_string(),
+                root_pid: 0,
+                first_event_at: 1,
+                last_event_at: None,
+                flagged: false,
+            })
+            .unwrap();
+        let request_id = store
+            .insert_request(&NewRequest {
+                session_id: "retention_session".to_string(),
+                original_user_prompt: None,
+                final_response: None,
+                events: None,
+                file_accessed_rate: 0.0,
+                network_rate: 0.0,
+            })
+            .unwrap();
+        for ts in 1..=5 {
+            store
+                .insert_system_event(&NewSystemEvent {
+                    pid: 1,
+                    request_id,
+                    ts,
+                    source: "macos-endpoint-security".to_string(),
+                    event_type: "write".to_string(),
+                    cwd: String::new(),
+                    args: None,
+                })
+                .unwrap();
+        }
+        for (severity, created_at) in [("medium", 10), ("high", 10), ("low", 200)] {
+            store
+                .insert_alert(&NewAlert {
+                    request_id: Some(request_id),
+                    entity_kind: None,
+                    entity_id: None,
+                    severity: severity.to_string(),
+                    action: "warn".to_string(),
+                    rule_id: format!("retention_{severity}"),
+                    message: "retention test".to_string(),
+                    path: None,
+                    evidence: None,
+                    created_at,
+                })
+                .unwrap();
+        }
+
+        let pruned = store
+            .prune_endpoint_retention(0, 2, Some(100), 100, 250)
+            .unwrap();
+        assert_eq!(pruned.system_events, 3);
+        assert_eq!(pruned.low_severity_alerts, 1);
+        assert_eq!(
+            store.system_events_for_request(request_id).unwrap().len(),
+            2
+        );
+        let alerts = store.list_alerts().unwrap();
+        assert_eq!(alerts.len(), 2);
+        assert!(alerts.iter().any(|alert| alert.severity == "high"));
+        assert!(alerts.iter().any(|alert| alert.severity == "low"));
+        assert!(store.verify_alert_chain().unwrap().is_valid());
+        let checkpoint: (i64, i64, i64) = store
+            .connection()
+            .query_row(
+                "SELECT pruned_count, highest_pruned_alert_id, cutoff_ms
+                 FROM alert_retention_checkpoints",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(checkpoint, (1, 1, 100));
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn retention_refuses_to_launder_alert_chain_tampering() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-retention-tamper-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        for severity in ["medium", "high"] {
+            store
+                .insert_alert(&NewAlert {
+                    request_id: None,
+                    entity_kind: None,
+                    entity_id: None,
+                    severity: severity.to_string(),
+                    action: "warn".to_string(),
+                    rule_id: format!("tamper_{severity}"),
+                    message: "original".to_string(),
+                    path: None,
+                    evidence: None,
+                    created_at: 1,
+                })
+                .unwrap();
+        }
+        store
+            .connection()
+            .execute(
+                "UPDATE alerts SET message = 'modified' WHERE alert_id = 1",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .prune_endpoint_retention(0, 100, Some(2), 100, 3)
+            .is_err());
+        assert_eq!(store.list_alerts().unwrap().len(), 2);
+        assert_eq!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM alert_retention_checkpoints",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn dashboard_artifact_count_is_maintained_incrementally() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-artifact-count-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        let count = || {
+            store
+                .connection()
+                .query_row(
+                    "SELECT count FROM dashboard_artifact_count WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count(), 0);
+        store
+            .connection()
+            .execute(
+                "INSERT INTO artifact_facts(kind, uri, last_seen_at, dashboard_visible)
+                 VALUES ('file', 'file:///visible', 1, 1),
+                        ('file', 'file:///hidden', 1, 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(count(), 1);
+        store
+            .connection()
+            .execute(
+                "UPDATE artifact_facts SET dashboard_visible = 1
+                 WHERE uri = 'file:///hidden'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(count(), 2);
+        store
+            .connection()
+            .execute(
+                "DELETE FROM artifact_facts WHERE uri = 'file:///visible'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(count(), 1);
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn dashboard_visibility_rules_version_reclassifies_existing_rows_in_bounded_batches() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-artifact-visibility-version-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO artifact_facts(
+                    kind, uri, last_seen_at, metadata, dashboard_visible
+                 ) VALUES
+                    ('file', 'file:///repo/app/[slug]/page.tsx', 1,
+                     '{\"source\":\"bash-command-parser\"}', 0),
+                    ('file', 'file:///repo/*.sh', 1,
+                     '{\"source\":\"bash-command-parser\"}', 1),
+                    ('file', 'file:///System/Library/noise', 1,
+                     '{\"source\":\"macos-endpoint-security\"}', 1),
+                    ('file', 'file:///repo/target/exfil.env', 1,
+                     '{\"source\":\"macos-endpoint-security\"}', 0);
+                 DROP TRIGGER artifact_dashboard_count_insert;
+                 DROP TRIGGER artifact_dashboard_count_delete;
+                 DROP TRIGGER artifact_dashboard_count_update;
+                 DROP TABLE dashboard_artifact_count;
+                 CREATE TABLE dashboard_artifact_count (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    count INTEGER NOT NULL CHECK (count >= 0)
+                 );
+                 INSERT INTO dashboard_artifact_count(id, count) VALUES (1, 2);",
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = open_store(&test_config(&path)).expect("store should reopen");
+        let connection = reopened.connection();
+        let visibility = |uri: &str| {
+            connection
+                .query_row(
+                    "SELECT dashboard_visible FROM artifact_facts WHERE uri = ?1",
+                    [uri],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        // Opening the store only performs schema setup. It must not scan or
+        // reclassify the artifact table on a latency-sensitive hook path.
+        assert_eq!(visibility("file:///repo/app/[slug]/page.tsx"), 0);
+        assert_eq!(visibility("file:///repo/*.sh"), 1);
+        assert_eq!(visibility("file:///System/Library/noise"), 1);
+        assert_eq!(visibility("file:///repo/target/exfil.env"), 0);
+        let rules_version_before = connection
+            .query_row(
+                "SELECT rules_version FROM dashboard_artifact_count WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(rules_version_before, 0);
+
+        let first = reopened
+            .migrate_artifact_dashboard_visibility_rules_batch(2)
+            .unwrap();
+        assert_eq!(
+            first,
+            ArtifactVisibilityMigrationResult {
+                scanned: 2,
+                updated: 2,
+                complete: false,
+            }
+        );
+        let second = reopened
+            .migrate_artifact_dashboard_visibility_rules_batch(2)
+            .unwrap();
+        assert_eq!(
+            second,
+            ArtifactVisibilityMigrationResult {
+                scanned: 2,
+                updated: 2,
+                complete: false,
+            }
+        );
+        let final_batch = reopened
+            .migrate_artifact_dashboard_visibility_rules_batch(2)
+            .unwrap();
+        assert_eq!(
+            final_batch,
+            ArtifactVisibilityMigrationResult {
+                scanned: 0,
+                updated: 0,
+                complete: true,
+            }
+        );
+
+        assert_eq!(visibility("file:///repo/app/[slug]/page.tsx"), 1);
+        assert_eq!(visibility("file:///repo/*.sh"), 0);
+        assert_eq!(visibility("file:///System/Library/noise"), 0);
+        assert_eq!(visibility("file:///repo/target/exfil.env"), 1);
+        let (count, rules_version): (i64, i64) = connection
+            .query_row(
+                "SELECT count, rules_version FROM dashboard_artifact_count WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(rules_version, DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION);
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM dashboard_artifact_visibility_migration",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        drop(reopened);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
     fn request_for_file_intent_path_matches_nearby_paths() {
         let path = std::env::temp_dir().join(format!(
             "gensee-db-file-intent-match-test-{}.db",
@@ -2436,6 +3801,7 @@ mod tests {
             .insert_session(&NewSession {
                 session_id: "sess_1".to_string(),
                 agent_id: "claude-code".to_string(),
+                root_pid: 0,
                 first_event_at: 1,
                 last_event_at: None,
                 flagged: false,
