@@ -3844,6 +3844,16 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 pruned_system_events = pruned.system_events;
                 pruned_low_severity_alerts = pruned.low_severity_alerts;
             }
+            // An ingest commit is outside authorization latency and can safely
+            // advance one throttled artifact-visibility migration batch.
+            if let Err(error) = store.migrate_artifact_dashboard_visibility_if_due(
+                unix_millis()?,
+                gensee_crate_store::ARTIFACT_VISIBILITY_MAINTENANCE_INTERVAL_MS,
+            ) {
+                eprintln!(
+                    "gensee endpoint ingest: artifact visibility maintenance failed: {error}"
+                );
+            }
             if let Some(object) = acknowledgement.as_object_mut() {
                 object.insert("persisted_events".to_string(), json!(persisted_in_batch));
                 object.insert("suppressed_events".to_string(), json!(suppressed_in_batch));
@@ -4341,6 +4351,12 @@ pub(crate) fn process_hook_event(
             recording.low_severity_retention_hours,
         ) {
             eprintln!("gensee hook: retention maintenance failed: {error}");
+        }
+        if let Err(error) = store.migrate_artifact_dashboard_visibility_if_due(
+            event.observed_at_ms,
+            gensee_crate_store::ARTIFACT_VISIBILITY_MAINTENANCE_INTERVAL_MS,
+        ) {
+            eprintln!("gensee hook: artifact visibility maintenance failed: {error}");
         }
     }
     Ok(output)

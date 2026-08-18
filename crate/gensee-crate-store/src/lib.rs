@@ -10,10 +10,11 @@ use gensee_crate_core::{
 use gensee_crate_db::sqlite::{
     artifact_path_is_concrete, dashboard_artifact_is_visible as dashboard_artifact_path_is_visible,
     lineage_mode_is_non_file, lineage_path_is_harness_runtime_noise,
-    lineage_path_is_system_dependency, open_store, AgentEventRecord, NewAgentEvent, NewAlert,
-    NewArtifact, NewArtifactFact, NewArtifactObservation, NewArtifactRiskTag, NewHumanFeedback,
-    NewRelation, NewRequest, NewSession, NewSystemEvent, NewTransactionEvent, RetentionPruneResult,
-    SqliteConfig, SqliteError, SqliteStore, TranscriptTokenStateRecord,
+    lineage_path_is_system_dependency, open_store, AgentEventRecord,
+    ArtifactVisibilityMigrationResult, NewAgentEvent, NewAlert, NewArtifact, NewArtifactFact,
+    NewArtifactObservation, NewArtifactRiskTag, NewHumanFeedback, NewRelation, NewRequest,
+    NewSession, NewSystemEvent, NewTransactionEvent, RetentionPruneResult, SqliteConfig,
+    SqliteError, SqliteStore, TranscriptTokenStateRecord,
 };
 pub use gensee_crate_db::sqlite::{
     AlertRecord, ArtifactFactRecord, ArtifactObservationRecord, ArtifactRiskTagRecord,
@@ -36,6 +37,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 pub const ENDPOINT_RETENTION_PRUNE_BATCH: u64 = 500;
+pub const ARTIFACT_VISIBILITY_MIGRATION_BATCH: u64 = 1_000;
+pub const ARTIFACT_VISIBILITY_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
 const STORE_KEY_FILE: &str = "gensee.key";
 const JSONL_ENCRYPTED_PREFIX: &str = "gensee-jsonl-v1";
 const UNKNOWN_SESSION_ID: &str = "unknown";
@@ -467,6 +470,16 @@ impl EventStore {
     }
 
     pub fn dashboard_state(&self) -> io::Result<Value> {
+        // Dashboard refresh is outside the agent authorization path and is a
+        // natural opportunity to advance one bounded visibility-rules batch.
+        // Failure leaves the previous cached classification usable and will be
+        // retried by a later refresh or lifecycle event.
+        if let Err(error) = self.migrate_artifact_dashboard_visibility_if_due(
+            current_unix_millis()?,
+            ARTIFACT_VISIBILITY_MAINTENANCE_INTERVAL_MS,
+        ) {
+            eprintln!("gensee dashboard: artifact visibility maintenance failed: {error}");
+        }
         let db = self.sqlite_store()?;
         let conn = db.connection();
         let visible_alerts_cte = dashboard_visible_alerts_cte();
@@ -1117,6 +1130,37 @@ impl EventStore {
             low_severity_retention_hours,
         )
         .map(Some)
+    }
+
+    /// Advance one bounded artifact-visibility rules batch at most once per
+    /// interval across all processes sharing this store. Current stores avoid
+    /// claiming the maintenance key, so normal dashboard polling remains
+    /// read-only after a migration finishes.
+    pub fn migrate_artifact_dashboard_visibility_if_due(
+        &self,
+        now_ms: u64,
+        interval_ms: u64,
+    ) -> io::Result<Option<ArtifactVisibilityMigrationResult>> {
+        let db = self.sqlite_store()?;
+        if db
+            .dashboard_artifact_visibility_rules_are_current()
+            .map_err(sqlite_error)?
+        {
+            return Ok(None);
+        }
+        if !db
+            .claim_maintenance(
+                "dashboard-artifact-visibility",
+                to_i64(now_ms)?,
+                to_i64(interval_ms)?,
+            )
+            .map_err(sqlite_error)?
+        {
+            return Ok(None);
+        }
+        db.migrate_artifact_dashboard_visibility_rules_batch(ARTIFACT_VISIBILITY_MIGRATION_BATCH)
+            .map(Some)
+            .map_err(sqlite_error)
     }
 
     pub fn artifact_risk_tags_for_file_digest(
@@ -3410,6 +3454,15 @@ fn to_i64(value: u64) -> io::Result<i64> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "timestamp too large"))
 }
 
+fn current_unix_millis() -> io::Result<u64> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| io::Error::other(format!("system clock is before Unix epoch: {error}")))?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "timestamp too large"))
+}
+
 fn sqlite_error(error: gensee_crate_db::sqlite::SqliteError) -> io::Error {
     io::Error::other(error)
 }
@@ -3684,6 +3737,77 @@ fn hex_value(byte: u8) -> io::Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_visibility_migration_is_bounded_and_cross_process_throttled() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-visibility-maintenance-test-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        {
+            let db = store.sqlite_store().unwrap();
+            let transaction = db.connection().unchecked_transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO artifact_facts(
+                            kind, uri, last_seen_at, metadata, dashboard_visible
+                         ) VALUES ('file', ?1, 1,
+                                   '{\"source\":\"macos-endpoint-security\"}', 1)",
+                    )
+                    .unwrap();
+                for index in 0..=ARTIFACT_VISIBILITY_MIGRATION_BATCH {
+                    insert
+                        .execute([format!("file:///System/Library/noise-{index:04}")])
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+
+        let first = store
+            .migrate_artifact_dashboard_visibility_if_due(1_000, 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.scanned, ARTIFACT_VISIBILITY_MIGRATION_BATCH);
+        assert_eq!(first.updated, ARTIFACT_VISIBILITY_MIGRATION_BATCH);
+        assert!(!first.complete);
+        assert!(store
+            .migrate_artifact_dashboard_visibility_if_due(1_000, 1_000)
+            .unwrap()
+            .is_none());
+
+        let final_batch = store
+            .migrate_artifact_dashboard_visibility_if_due(2_000, 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_batch.scanned, 1);
+        assert_eq!(final_batch.updated, 1);
+        assert!(final_batch.complete);
+        assert!(store
+            .migrate_artifact_dashboard_visibility_if_due(3_000, 1_000)
+            .unwrap()
+            .is_none());
+
+        let db = store.sqlite_store().unwrap();
+        let visible = db
+            .connection()
+            .query_row(
+                "SELECT count FROM dashboard_artifact_count WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(visible, 0);
+        assert!(db
+            .dashboard_artifact_visibility_rules_are_current()
+            .unwrap());
+        drop(db);
+        drop(store);
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn transcript_token_usage_supports_claude_and_codex_jsonl() {

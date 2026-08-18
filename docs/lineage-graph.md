@@ -25,10 +25,13 @@ at `$GENSEE_HOME/gensee.db` (or `~/.gensee/gensee.db`).
 
 The dashboard stores a `dashboard_visible` classification on each artifact fact
 and maintains its total incrementally. A version stamp records which visibility
-rules produced that classification; opening a store with newer rules atomically
-reclassifies existing facts and refreshes the total before the dashboard reads
-either the list or count. Shell glob and brace-expansion intents remain audit
-events but do not become lineage nodes. Literal bracket route paths such as
+rules produced that classification. Newer rules reclassify existing facts with
+a persisted keyset cursor in bounded, cross-process-throttled batches during
+dashboard refreshes, Endpoint Security ingest commits, and non-authorization
+hook lifecycle events. Store opening and pre-tool authorization never scan the
+artifact table. The final batch reconciles the cached total and stamps the new
+rules version. Shell glob and brace-expansion intents remain audit events but do
+not become lineage nodes. Literal bracket route paths such as
 `app/[slug]/page.tsx` remain concrete artifacts.
 
 Endpoint Security build output is hidden only when all three signals agree: a

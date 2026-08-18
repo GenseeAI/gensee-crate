@@ -180,6 +180,18 @@ CREATE TABLE IF NOT EXISTS maintenance_state (
   last_run_at INTEGER NOT NULL
 );
 
+-- Keyset cursor for bounded dashboard-artifact visibility reclassification.
+-- Rule changes can require revisiting every artifact fact, but that work must
+-- never run inline while opening the store because hook clients open it on the
+-- authorization path. The cursor lets ordinary lifecycle/ingest/dashboard
+-- maintenance advance the migration in small, indexed batches.
+CREATE TABLE IF NOT EXISTS dashboard_artifact_visibility_migration (
+  id                   INTEGER PRIMARY KEY CHECK (id = 1),
+  target_rules_version INTEGER NOT NULL CHECK (target_rules_version >= 0),
+  last_kind            TEXT NOT NULL,
+  last_uri             TEXT NOT NULL
+);
+
 -- Human review verdicts recorded from the dashboard: an operator's after-the-fact
 -- judgement on a shield decision (the shield already enforced it inline at hook
 -- time). Used to label false positives / negatives for later policy tuning and

@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // Increment whenever dashboard artifact visibility rules change. Existing
-// stores are reclassified before their cached count is used.
+// stores are reclassified by bounded background maintenance before this
+// version is stamped on their cached count.
 const DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION: i64 = 3;
 
 /// Lineage represents concrete filesystem objects. Shell globs and brace
@@ -178,6 +179,15 @@ pub struct ChainVerification {
     pub broken_at: Option<i64>,
     /// Human-readable reason for the break.
     pub reason: Option<String>,
+}
+
+/// Progress made by one bounded dashboard-artifact visibility maintenance
+/// batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactVisibilityMigrationResult {
+    pub scanned: u64,
+    pub updated: u64,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -678,8 +688,6 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
     conn.execute_batch(include_str!("../schema.sql"))
         .map_err(SqliteError::Schema)?;
 
-    migrate_artifact_dashboard_visibility_rules(&conn).map_err(SqliteError::Schema)?;
-
     // Must run AFTER schema.sql creates `alert_chain_head`: a DB upgraded from a
     // chain-without-anchor version already has chained alerts but an empty
     // anchor; seed it from those rows so the next insert doesn't reset count to 1.
@@ -1145,6 +1153,30 @@ impl SqliteStore {
                 params![key, now_ms, interval_ms],
             )
             .map(|changed| changed == 1)
+            .map_err(SqliteError::Database)
+    }
+
+    /// Reclassify at most `batch_limit` artifact facts for the current
+    /// dashboard visibility rules. Progress is persisted as a `(kind, uri)`
+    /// keyset cursor so memory and latency stay bounded regardless of store
+    /// size. The cached count is reconciled and the rules version is stamped
+    /// only after the final batch completes.
+    pub fn migrate_artifact_dashboard_visibility_rules_batch(
+        &self,
+        batch_limit: u64,
+    ) -> Result<ArtifactVisibilityMigrationResult, SqliteError> {
+        migrate_artifact_dashboard_visibility_rules_batch(&self.conn, batch_limit)
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn dashboard_artifact_visibility_rules_are_current(&self) -> Result<bool, SqliteError> {
+        self.conn
+            .query_row(
+                "SELECT rules_version = ?1
+                 FROM dashboard_artifact_count WHERE id = 1",
+                [DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION],
+                |row| row.get::<_, bool>(0),
+            )
             .map_err(SqliteError::Database)
     }
 
@@ -2579,18 +2611,50 @@ fn ensure_dashboard_artifact_count_rules_version_column(conn: &Connection) -> ru
     Ok(())
 }
 
-fn migrate_artifact_dashboard_visibility_rules(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate_artifact_dashboard_visibility_rules_batch(
+    conn: &Connection,
+    batch_limit: u64,
+) -> rusqlite::Result<ArtifactVisibilityMigrationResult> {
+    let batch_limit = i64::try_from(batch_limit.max(1)).unwrap_or(i64::MAX);
     let stored_version = conn.query_row(
         "SELECT rules_version FROM dashboard_artifact_count WHERE id = 1",
         [],
         |row| row.get::<_, i64>(0),
     )?;
     if stored_version == DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION {
-        return Ok(());
+        conn.execute(
+            "DELETE FROM dashboard_artifact_visibility_migration WHERE id = 1",
+            [],
+        )?;
+        return Ok(ArtifactVisibilityMigrationResult {
+            scanned: 0,
+            updated: 0,
+            complete: true,
+        });
     }
 
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        "INSERT INTO dashboard_artifact_visibility_migration(
+            id, target_rules_version, last_kind, last_uri
+         ) VALUES (1, ?1, '', '')
+         ON CONFLICT(id) DO UPDATE SET
+            target_rules_version = excluded.target_rules_version,
+            last_kind = '',
+            last_uri = ''
+         WHERE dashboard_artifact_visibility_migration.target_rules_version !=
+               excluded.target_rules_version",
+        [DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION],
+    )?;
+    let (last_kind, last_uri) = transaction.query_row(
+        "SELECT last_kind, last_uri
+         FROM dashboard_artifact_visibility_migration WHERE id = 1",
+        [],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+
     let classifications = {
-        let mut statement = conn.prepare(
+        let mut statement = transaction.prepare(
             "SELECT facts.kind, facts.uri,
                     COALESCE(json_extract(facts.metadata, '$.source'),
                              facts.last_modified_source, last_event.source),
@@ -2602,9 +2666,12 @@ fn migrate_artifact_dashboard_visibility_rules(conn: &Connection) -> rusqlite::R
                     )
              FROM artifact_facts AS facts
              LEFT JOIN system_events AS last_event
-               ON last_event.event_id = facts.last_system_event_id",
+               ON last_event.event_id = facts.last_system_event_id
+             WHERE facts.kind > ?1 OR (facts.kind = ?1 AND facts.uri > ?2)
+             ORDER BY facts.kind, facts.uri
+             LIMIT ?3",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map(params![last_kind, last_uri, batch_limit], |row| {
             let kind = row.get::<_, String>(0)?;
             let uri = row.get::<_, String>(1)?;
             let source = row.get::<_, Option<String>>(2)?;
@@ -2624,25 +2691,45 @@ fn migrate_artifact_dashboard_visibility_rules(conn: &Connection) -> rusqlite::R
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let transaction = conn.unchecked_transaction()?;
+    let scanned = classifications.len() as u64;
+    let mut updated = 0_u64;
     {
         let mut update = transaction.prepare(
             "UPDATE artifact_facts
              SET dashboard_visible = ?1
              WHERE kind = ?2 AND uri = ?3 AND dashboard_visible != ?1",
         )?;
-        for (kind, uri, visible) in classifications {
-            update.execute(params![bool_to_i64(visible), kind, uri])?;
+        for (kind, uri, visible) in &classifications {
+            updated += update.execute(params![bool_to_i64(*visible), kind, uri])? as u64;
         }
     }
-    transaction.execute(
-        "UPDATE dashboard_artifact_count
-         SET count = (SELECT COUNT(*) FROM artifact_facts WHERE dashboard_visible = 1),
-             rules_version = ?1
-         WHERE id = 1",
-        [DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION],
-    )?;
-    transaction.commit()
+
+    let complete = scanned < batch_limit as u64;
+    if complete {
+        transaction.execute(
+            "UPDATE dashboard_artifact_count
+             SET count = (SELECT COUNT(*) FROM artifact_facts WHERE dashboard_visible = 1),
+                 rules_version = ?1
+             WHERE id = 1",
+            [DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION],
+        )?;
+        transaction.execute(
+            "DELETE FROM dashboard_artifact_visibility_migration WHERE id = 1",
+            [],
+        )?;
+    } else if let Some((kind, uri, _)) = classifications.last() {
+        transaction.execute(
+            "UPDATE dashboard_artifact_visibility_migration
+             SET last_kind = ?1, last_uri = ?2 WHERE id = 1",
+            params![kind, uri],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(ArtifactVisibilityMigrationResult {
+        scanned,
+        updated,
+        complete,
+    })
 }
 
 fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
@@ -3577,7 +3664,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_visibility_rules_version_reclassifies_existing_rows() {
+    fn dashboard_visibility_rules_version_reclassifies_existing_rows_in_bounded_batches() {
         let path = std::env::temp_dir().join(format!(
             "gensee-db-artifact-visibility-version-test-{}.db",
             std::process::id()
@@ -3611,7 +3698,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let reopened = open_store(&test_config(&path)).expect("store should migrate");
+        let reopened = open_store(&test_config(&path)).expect("store should reopen");
         let connection = reopened.connection();
         let visibility = |uri: &str| {
             connection
@@ -3622,6 +3709,55 @@ mod tests {
                 )
                 .unwrap()
         };
+        // Opening the store only performs schema setup. It must not scan or
+        // reclassify the artifact table on a latency-sensitive hook path.
+        assert_eq!(visibility("file:///repo/app/[slug]/page.tsx"), 0);
+        assert_eq!(visibility("file:///repo/*.sh"), 1);
+        assert_eq!(visibility("file:///System/Library/noise"), 1);
+        assert_eq!(visibility("file:///repo/target/exfil.env"), 0);
+        let rules_version_before = connection
+            .query_row(
+                "SELECT rules_version FROM dashboard_artifact_count WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(rules_version_before, 0);
+
+        let first = reopened
+            .migrate_artifact_dashboard_visibility_rules_batch(2)
+            .unwrap();
+        assert_eq!(
+            first,
+            ArtifactVisibilityMigrationResult {
+                scanned: 2,
+                updated: 2,
+                complete: false,
+            }
+        );
+        let second = reopened
+            .migrate_artifact_dashboard_visibility_rules_batch(2)
+            .unwrap();
+        assert_eq!(
+            second,
+            ArtifactVisibilityMigrationResult {
+                scanned: 2,
+                updated: 2,
+                complete: false,
+            }
+        );
+        let final_batch = reopened
+            .migrate_artifact_dashboard_visibility_rules_batch(2)
+            .unwrap();
+        assert_eq!(
+            final_batch,
+            ArtifactVisibilityMigrationResult {
+                scanned: 0,
+                updated: 0,
+                complete: true,
+            }
+        );
+
         assert_eq!(visibility("file:///repo/app/[slug]/page.tsx"), 1);
         assert_eq!(visibility("file:///repo/*.sh"), 0);
         assert_eq!(visibility("file:///System/Library/noise"), 0);
@@ -3635,6 +3771,17 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2);
         assert_eq!(rules_version, DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION);
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM dashboard_artifact_visibility_migration",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
 
         drop(reopened);
         remove_sqlite_files(&path);
