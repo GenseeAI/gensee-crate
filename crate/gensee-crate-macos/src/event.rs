@@ -1,4 +1,4 @@
-use gensee_crate_core::{AgentSession, SystemEvent};
+use gensee_crate_core::{endpoint_security_path_is_known_build_output, AgentSession, SystemEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -75,6 +75,8 @@ pub struct EndpointSecurityAttribution {
     pub confidence: Option<f64>,
     #[serde(default)]
     pub matched_by: Option<String>,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -385,91 +387,11 @@ fn endpoint_security_event_is_known_build_output(
     normalized_lower_path: &str,
     workspace_root: Option<&str>,
 ) -> bool {
-    let executable = event
-        .actor
-        .executable_path
-        .as_deref()
-        .unwrap_or_default()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    let executable_name = executable.rsplit('/').next().unwrap_or_default();
-    let known_build_process = matches!(
-        executable_name,
-        "cargo"
-            | "rustc"
-            | "cc"
-            | "c++"
-            | "clang"
-            | "clang++"
-            | "ld"
-            | "swift"
-            | "swiftc"
-            | "swift-frontend"
-            | "xcodebuild"
-            | "xctest"
-            | "npm"
-            | "npx"
-            | "yarn"
-            | "pnpm"
-            | "bun"
-    );
-    if !known_build_process {
-        return false;
-    }
-    if !endpoint_security_executable_is_trusted_build_tool(&executable) {
-        return false;
-    }
-
-    let Some(workspace_root) = workspace_root.filter(|root| !root.trim().is_empty()) else {
-        return false;
-    };
-    let workspace_root = workspace_root
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase();
-    if workspace_root.is_empty() {
-        return false;
-    }
-    [
-        "target",
-        "deriveddata",
-        ".build",
-        "node_modules/.cache",
-        "test-results",
-        "testresults",
-    ]
-    .iter()
-    .any(|relative| {
-        let build_root = format!("{workspace_root}/{relative}");
-        normalized_lower_path == build_root
-            || normalized_lower_path.starts_with(&format!("{build_root}/"))
-    })
-}
-
-fn endpoint_security_executable_is_trusted_build_tool(executable: &str) -> bool {
-    if !executable.starts_with('/') {
-        return false;
-    }
-
-    let fixed_prefixes = [
-        "/usr/bin/",
-        "/usr/local/bin/",
-        "/opt/homebrew/bin/",
-        "/library/developer/commandlinetools/usr/bin/",
-        "/applications/xcode.app/contents/developer/",
-        "/nix/store/",
-    ];
-    if fixed_prefixes
-        .iter()
-        .any(|prefix| executable.starts_with(prefix))
-    {
-        return true;
-    }
-
-    // rustup toolchain executables live below a per-user, versioned toolchain
-    // directory. Requiring both components prevents a workspace-local binary
-    // merely named `cargo`, `rustc`, or `npm` from suppressing its own writes.
-    executable.contains("/.rustup/toolchains/") && executable.contains("/bin/")
+    endpoint_security_path_is_known_build_output(
+        event.actor.executable_path.as_deref(),
+        normalized_lower_path,
+        workspace_root,
+    )
 }
 
 #[derive(Debug, Clone)]

@@ -31,6 +31,13 @@ either the list or count. Shell glob and brace-expansion intents remain audit
 events but do not become lineage nodes. Literal bracket route paths such as
 `app/[slug]/page.tsx` remain concrete artifacts.
 
+Endpoint Security build output is hidden only when all three signals agree: a
+trusted build executable produced it, the event is tied to an active workspace,
+and the path is beneath a recognized top-level build root in that workspace.
+A directory name alone is not enough, so bypass writes such as
+`target/exfil.env` or `src/test-results/id_rsa` remain visible findings and
+lineage.
+
 ## Relationships
 
 The graph can currently establish:

@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use gensee_crate_core::endpoint_security_path_is_known_build_output;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -8,7 +9,7 @@ use sha2::{Digest, Sha256};
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // Increment whenever dashboard artifact visibility rules change. Existing
 // stores are reclassified before their cached count is used.
-const DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION: i64 = 2;
+const DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION: i64 = 3;
 
 /// Lineage represents concrete filesystem objects. Shell globs and brace
 /// expansions describe possible path sets, while square brackets are also
@@ -38,12 +39,6 @@ pub fn lineage_path_is_harness_runtime_noise(path: &str) -> bool {
         || lower.contains("/crashpad/")
         || lower.contains("/diagnosticreports/")
         || lower.contains("/crash reports/")
-        || lower.contains("/target/")
-        || lower.contains("/deriveddata/")
-        || lower.contains("/.build/")
-        || lower.contains("/node_modules/.cache/")
-        || lower.contains("/test-results/")
-        || lower.contains("/testresults/")
         || ((lower.ends_with("-wal") || lower.ends_with("-shm") || lower.ends_with("-journal"))
             && (lower.contains("/.codex/")
                 || lower.contains("/.claude/")
@@ -79,12 +74,18 @@ pub fn lineage_mode_is_non_file(mode: u64) -> bool {
     )
 }
 
-pub fn dashboard_artifact_is_visible(path: &str, source: Option<&str>, mode: Option<u64>) -> bool {
+pub fn dashboard_artifact_is_visible(
+    path: &str,
+    source: Option<&str>,
+    mode: Option<u64>,
+    known_build_output: bool,
+) -> bool {
     artifact_path_is_concrete(path)
         && (source != Some("macos-endpoint-security")
             || (mode.is_none_or(|mode| !lineage_mode_is_non_file(mode))
                 && !lineage_path_is_harness_runtime_noise(path)
-                && !lineage_path_is_system_dependency(path)))
+                && !lineage_path_is_system_dependency(path)
+                && !known_build_output))
 }
 
 /// Genesis hash for the alert tamper-evident chain (64 hex zeros).
@@ -2593,7 +2594,12 @@ fn migrate_artifact_dashboard_visibility_rules(conn: &Connection) -> rusqlite::R
             "SELECT facts.kind, facts.uri,
                     COALESCE(json_extract(facts.metadata, '$.source'),
                              facts.last_modified_source, last_event.source),
-                    json_extract(last_event.args, '$.file.mode')
+                    json_extract(last_event.args, '$.file.mode'),
+                    json_extract(last_event.args, '$.actor.executable_path'),
+                    COALESCE(
+                        json_extract(last_event.args, '$.attribution.workspace_root'),
+                        json_extract(last_event.args, '$.cwd')
+                    )
              FROM artifact_facts AS facts
              LEFT JOIN system_events AS last_event
                ON last_event.event_id = facts.last_system_event_id",
@@ -2603,8 +2609,16 @@ fn migrate_artifact_dashboard_visibility_rules(conn: &Connection) -> rusqlite::R
             let uri = row.get::<_, String>(1)?;
             let source = row.get::<_, Option<String>>(2)?;
             let mode = row.get::<_, Option<i64>>(3)?.map(|value| value as u64);
+            let executable_path = row.get::<_, Option<String>>(4)?;
+            let workspace_root = row.get::<_, Option<String>>(5)?;
             let path = uri.strip_prefix("file://").unwrap_or(&uri);
-            let visible = dashboard_artifact_is_visible(path, source.as_deref(), mode);
+            let known_build_output = endpoint_security_path_is_known_build_output(
+                executable_path.as_deref(),
+                path,
+                workspace_root.as_deref(),
+            );
+            let visible =
+                dashboard_artifact_is_visible(path, source.as_deref(), mode, known_build_output);
             Ok((kind, uri, visible))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -3581,7 +3595,9 @@ mod tests {
                     ('file', 'file:///repo/*.sh', 1,
                      '{\"source\":\"bash-command-parser\"}', 1),
                     ('file', 'file:///System/Library/noise', 1,
-                     '{\"source\":\"macos-endpoint-security\"}', 1);
+                     '{\"source\":\"macos-endpoint-security\"}', 1),
+                    ('file', 'file:///repo/target/exfil.env', 1,
+                     '{\"source\":\"macos-endpoint-security\"}', 0);
                  DROP TRIGGER artifact_dashboard_count_insert;
                  DROP TRIGGER artifact_dashboard_count_delete;
                  DROP TRIGGER artifact_dashboard_count_update;
@@ -3609,6 +3625,7 @@ mod tests {
         assert_eq!(visibility("file:///repo/app/[slug]/page.tsx"), 1);
         assert_eq!(visibility("file:///repo/*.sh"), 0);
         assert_eq!(visibility("file:///System/Library/noise"), 0);
+        assert_eq!(visibility("file:///repo/target/exfil.env"), 1);
         let (count, rules_version): (i64, i64) = connection
             .query_row(
                 "SELECT count, rules_version FROM dashboard_artifact_count WHERE id = 1",
@@ -3616,7 +3633,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
         assert_eq!(rules_version, DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION);
 
         drop(reopened);

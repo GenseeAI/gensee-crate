@@ -282,6 +282,7 @@ dependencies = [
 name = "gensee-crate-db"
 version = "0.2.0"
 dependencies = [
+ "gensee-crate-core",
  "rusqlite",
  "serde",
  "sha2",

@@ -3,9 +3,9 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use gensee_crate_core::{
-    extract_apply_patch_input, normalize_agent_path, parse_apply_patch_changes,
-    parse_mcp_file_intents, parse_vscode_file_intents, AgentHookEvent, AgentSession, FileIntent,
-    ProcessObservation, SystemEvent, WorkspaceEffect,
+    endpoint_security_path_is_known_build_output, extract_apply_patch_input, normalize_agent_path,
+    parse_apply_patch_changes, parse_mcp_file_intents, parse_vscode_file_intents, AgentHookEvent,
+    AgentSession, FileIntent, ProcessObservation, SystemEvent, WorkspaceEffect,
 };
 use gensee_crate_db::sqlite::{
     artifact_path_is_concrete, dashboard_artifact_is_visible as dashboard_artifact_path_is_visible,
@@ -2345,6 +2345,7 @@ fn update_artifact_fact(db: &SqliteStore, update: ArtifactFactUpdate<'_>) -> io:
                 .and_then(|metadata| metadata.get("source"))
                 .and_then(Value::as_str),
             None,
+            false,
         ),
         risk_level,
         risk_rule_id,
@@ -3037,10 +3038,36 @@ fn should_materialize_system_artifact(
         return false;
     }
 
-    if lineage_path_is_harness_runtime_noise(path) || lineage_path_is_system_dependency(path) {
+    if lineage_path_is_harness_runtime_noise(path)
+        || lineage_path_is_system_dependency(path)
+        || endpoint_system_event_is_known_build_output(event, path, raw_event)
+    {
         return false;
     }
     true
+}
+
+fn endpoint_system_event_is_known_build_output(
+    event: &SystemEvent,
+    path: &str,
+    raw_event: Option<&Value>,
+) -> bool {
+    if event.source != "macos-endpoint-security" {
+        return false;
+    }
+    let workspace_root = raw_event
+        .and_then(|value| value.pointer("/attribution/workspace_root"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            raw_event
+                .and_then(|value| value.get("cwd"))
+                .and_then(Value::as_str)
+        });
+    endpoint_security_path_is_known_build_output(
+        event.executable_path.as_deref(),
+        path,
+        workspace_root,
+    )
 }
 
 fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
@@ -3058,12 +3085,6 @@ fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
               OR {lower_path} LIKE '%/crash reports/%'
               OR {lower_path} LIKE '%/.codex/sessions/%.jsonl'
               OR {lower_path} LIKE '%/.claude/projects/%.jsonl'
-              OR {lower_path} LIKE '%/target/%'
-              OR {lower_path} LIKE '%/deriveddata/%'
-              OR {lower_path} LIKE '%/.build/%'
-              OR {lower_path} LIKE '%/node_modules/.cache/%'
-              OR {lower_path} LIKE '%/test-results/%'
-              OR {lower_path} LIKE '%/testresults/%'
          ))"
     )
 }
@@ -4593,11 +4614,14 @@ mod tests {
                 .append_policy_alert(&endpoint_alert("/repo/out.txt", timestamp))
                 .unwrap();
         }
+        store
+            .append_policy_alert(&endpoint_alert("/repo/target/exfil.env", 3_000))
+            .unwrap();
 
-        assert_eq!(store.list_alerts().unwrap().len(), 4);
+        assert_eq!(store.list_alerts().unwrap().len(), 5);
         let dashboard = store.dashboard_state().unwrap();
-        assert_eq!(dashboard["summary"]["alerts_count"], 1);
-        assert_eq!(dashboard["summary"]["medium_alerts_count"], 1);
+        assert_eq!(dashboard["summary"]["alerts_count"], 2);
+        assert_eq!(dashboard["summary"]["medium_alerts_count"], 2);
         let severity_total = ["critical", "high", "medium", "low", "info"]
             .into_iter()
             .map(|severity| {
@@ -4607,8 +4631,15 @@ mod tests {
             })
             .sum::<i64>();
         assert_eq!(severity_total, dashboard["summary"]["alerts_count"]);
-        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 1);
-        assert_eq!(dashboard["alerts"][0]["path"], "/repo/out.txt");
+        let alert_paths = dashboard["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|alert| alert["path"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(alert_paths.len(), 2);
+        assert!(alert_paths.contains(&"/repo/out.txt"));
+        assert!(alert_paths.contains(&"/repo/target/exfil.env"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -4874,7 +4905,10 @@ mod tests {
             let mut raw = json!({
                 "action": "notify",
                 "file": { "path": path, "mode": mode },
-                "attribution": { "session_id": "claude-session" }
+                "attribution": {
+                    "session_id": "claude-session",
+                    "workspace_root": "/repo"
+                }
             });
             if let Some(modified) = modified {
                 raw["modified"] = json!(modified);
@@ -4959,11 +4993,49 @@ mod tests {
             .unwrap()
             .is_some());
 
+        store
+            .append_system_event(&endpoint_event(
+                "write",
+                "file_mutation",
+                "/repo/target/exfil.env",
+                0o100600,
+                None,
+                106,
+            ))
+            .unwrap();
+        assert!(store
+            .artifact_fact_for_file("/repo/target/exfil.env")
+            .unwrap()
+            .is_some());
+
+        let mut build_output = endpoint_event(
+            "write",
+            "file_mutation",
+            "/repo/target/debug/output.o",
+            0o100644,
+            None,
+            107,
+        );
+        build_output.process_name = Some("rustc".to_string());
+        build_output.executable_path =
+            Some("/Users/test/.rustup/toolchains/stable/bin/rustc".to_string());
+        store.append_system_event(&build_output).unwrap();
+        assert!(store
+            .artifact_fact_for_file("/repo/target/debug/output.o")
+            .unwrap()
+            .is_none());
+
         let dashboard = store.dashboard_state().unwrap();
-        assert_eq!(dashboard["systemEvents"].as_array().unwrap().len(), 6);
-        assert_eq!(dashboard["summary"]["artifacts_count"], 1);
-        assert_eq!(dashboard["artifacts"].as_array().unwrap().len(), 1);
-        assert_eq!(dashboard["artifacts"][0]["uri"], "file:///repo/src/lib.rs");
+        assert_eq!(dashboard["systemEvents"].as_array().unwrap().len(), 8);
+        assert_eq!(dashboard["summary"]["artifacts_count"], 2);
+        let artifact_paths = dashboard["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|artifact| artifact["uri"].as_str())
+            .collect::<Vec<_>>();
+        assert!(artifact_paths.contains(&"file:///repo/src/lib.rs"));
+        assert!(artifact_paths.contains(&"file:///repo/target/exfil.env"));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -4974,16 +5046,19 @@ mod tests {
             "/System/Library/dyld/dyld_shared_cache_arm64e",
             Some("macos-endpoint-security"),
             None,
+            false,
         ));
         assert!(!dashboard_artifact_path_is_visible(
             "/System/Library/example.conf",
             Some("macos-endpoint-security"),
             None,
+            false,
         ));
         assert!(dashboard_artifact_path_is_visible(
             "/repo/src/lib.rs",
             Some("macos-endpoint-security"),
             None,
+            false,
         ));
     }
 
@@ -4999,7 +5074,7 @@ mod tests {
             ("/repo/app/[[...slug]]/page.tsx", true),
         ] {
             assert_eq!(
-                dashboard_artifact_path_is_visible(path, Some("bash-command-parser"), None),
+                dashboard_artifact_path_is_visible(path, Some("bash-command-parser"), None, false,),
                 expected_visible,
                 "visibility for {path}",
             );
@@ -5015,7 +5090,12 @@ mod tests {
             ("/usr/local/bin-old/x", true),
         ] {
             assert_eq!(
-                dashboard_artifact_path_is_visible(path, Some("macos-endpoint-security"), None,),
+                dashboard_artifact_path_is_visible(
+                    path,
+                    Some("macos-endpoint-security"),
+                    None,
+                    false,
+                ),
                 expected_visible,
                 "visibility for {path}",
             );

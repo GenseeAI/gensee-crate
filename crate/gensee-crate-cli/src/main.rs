@@ -3904,6 +3904,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             .as_ref()
             .and_then(|tool| tool.tool_use_id.clone());
         let workspace_root = active_tool.as_ref().map(|tool| tool.cwd.as_str());
+        event.attribution.workspace_root = workspace_root.map(str::to_string);
         let bookkeeping = endpoint_security_event_is_bookkeeping(&event, workspace_root);
         let evidence = serde_json::to_value(&event).map_err(io::Error::other)?;
         for finding in findings {
