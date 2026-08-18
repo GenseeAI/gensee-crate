@@ -82,14 +82,42 @@ xcodebuild -exportArchive \
   -exportOptionsPlist "$export_options" \
   -allowProvisioningUpdates
 
+# Xcode exports the host and system extension with Developer ID, but the Rust CLI
+# is an embedded resource rather than an Xcode target. Re-sign it with the same
+# Developer ID identity and then re-seal the containing app bundle.
+developer_id_application="$(
+  codesign -dv --verbose=4 "$app_path" 2>&1 \
+    | sed -n 's/^Authority=\(Developer ID Application:.*\)$/\1/p' \
+    | head -n 1
+)"
+if [ -z "$developer_id_application" ]; then
+  echo "Could not determine the exported app's Developer ID Application identity." >&2
+  exit 1
+fi
+
+codesign \
+  --force \
+  --sign "$developer_id_application" \
+  --identifier ai.gensee.crate.cli \
+  --options runtime \
+  --timestamp \
+  "$cli_path"
+codesign \
+  --force \
+  --sign "$developer_id_application" \
+  --options runtime \
+  --timestamp \
+  --preserve-metadata=identifier,requirements,entitlements \
+  "$app_path"
+
 codesign --verify --deep --strict --verbose=4 "$app_path"
-if ! codesign -dv --verbose=4 "$cli_path" 2>&1 | grep -q 'flags=.*runtime'; then
+if ! codesign -dv --verbose=4 "$cli_path" 2>&1 | grep 'flags=.*runtime' >/dev/null; then
   echo "The embedded Gensee CLI is missing Hardened Runtime." >&2
   exit 1
 fi
-lipo -verify_arch x86_64 arm64 "$app_path/Contents/MacOS/Gensee Crate"
-lipo -verify_arch x86_64 arm64 "$extension_path/Contents/MacOS/ai.gensee.crate.endpoint-security"
-lipo -verify_arch x86_64 arm64 "$cli_path"
+lipo "$app_path/Contents/MacOS/Gensee Crate" -verify_arch x86_64 arm64
+lipo "$extension_path/Contents/MacOS/ai.gensee.crate.endpoint-security" -verify_arch x86_64 arm64
+lipo "$cli_path" -verify_arch x86_64 arm64
 
 /usr/bin/ditto "$app_path" "$dmg_staging/Gensee Crate.app"
 ln -s /Applications "$dmg_staging/Applications"
