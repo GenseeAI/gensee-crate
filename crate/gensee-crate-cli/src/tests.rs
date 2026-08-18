@@ -1,9 +1,29 @@
 use super::*;
-use std::sync::{Mutex, OnceLock};
 
 fn telemetry_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    cli_test_env_lock()
+}
+
+#[test]
+fn cli_test_environment_mutations_share_one_process_wide_lock() {
+    let first_guard = cli_test_env_lock();
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let contender = std::thread::spawn(move || {
+        let _second_guard = cli_test_env_lock();
+        acquired_tx.send(()).unwrap();
+    });
+
+    assert!(
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "a second environment-mutating test acquired the shared lock concurrently"
+    );
+    drop(first_guard);
+    acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the waiting environment-mutating test should resume after unlock");
+    contender.join().unwrap();
 }
 
 fn telemetry_test_root(suffix: &str) -> PathBuf {
@@ -5343,6 +5363,7 @@ fn pretool_policy_asks_on_credential_hint_paths() {
 
 #[test]
 fn pretool_sampler_gated_by_env_then_allowed_decisions() {
+    let _guard = telemetry_test_lock();
     let allowed = PolicyDecision {
         action: PolicyAction::Allow,
         findings: Vec::new(),

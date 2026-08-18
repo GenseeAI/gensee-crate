@@ -29,6 +29,14 @@ pub(crate) use std::sync::mpsc;
 pub(crate) use std::thread;
 pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+pub(crate) fn cli_test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub(crate) const PROCESS_SAMPLE_WINDOW_MS: u64 = 15_000;
 pub(crate) const PROCESS_SAMPLE_INTERVAL_MS: u64 = 25;
 pub(crate) const STARTED_TOOL_WINDOW_MS: u64 = 15_000;

@@ -10678,8 +10678,7 @@ mod tests {
     }
 
     fn tclone_test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::cli_test_env_lock()
     }
 
     #[cfg(unix)]
