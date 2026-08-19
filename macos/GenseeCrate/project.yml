@@ -44,6 +44,7 @@ targets:
       - Host/TimelineModels.swift
       - Host/AgentCompletionModels.swift
       - Host/CompletionNotificationCoordinator.swift
+      - Host/ProgressiveTrust.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
       - Host/ConsoleModel.swift
@@ -143,6 +144,7 @@ targets:
       - Host/AlertSeverityBreakdown.swift
       - Host/TimelineModels.swift
       - Host/AgentCompletionModels.swift
+      - Host/ProgressiveTrust.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
       - Tests/HarnessConfigurationHealthTests.swift
@@ -153,6 +155,7 @@ targets:
       - Tests/AgentCompletionModelsTests.swift
       - Tests/ConfigAuditModelsTests.swift
       - Tests/ArtifactFactTests.swift
+      - Tests/ProgressiveTrustTests.swift
     settings:
       base:
         CODE_SIGNING_ALLOWED: NO

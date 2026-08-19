@@ -56,18 +56,30 @@ struct DashboardOverviewPage: View {
                 NotificationPreferenceCard(notifications: notifications)
 
                 HStack(spacing: 10) {
-                    Image(systemName: sensor.health.connected ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
-                        .foregroundStyle(sensor.health.connected ? .green : .orange)
-                    Text(sensor.health.connected ? "Endpoint Security sensor connected" : "Endpoint Security sensor disconnected")
-                        .font(.system(size: 12, weight: .semibold))
-                    DashboardTag(text: sensor.health.mode.capitalized, color: sensor.health.mode == "observe" ? .dashboardBlue : .dashboardRed)
-                    Text("\(sensor.health.ingestedEvents.formatted()) events ingested")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                    Spacer()
-                    if sensor.health.hasDataLoss {
-                        DashboardTag(text: "Event gaps detected", color: .dashboardRed)
+                    if model.isDemoMode {
+                        Image(systemName: "sparkles.rectangle.stack")
+                            .foregroundStyle(Color.dashboardBlue)
+                        Text("Synthetic product tour")
+                            .font(.system(size: 12, weight: .semibold))
+                        DashboardTag(text: "Demo data", color: .dashboardBlue)
+                        Text("Explore the evidence model before connecting a harness.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                        Spacer()
+                        DashboardTag(text: "This Mac untouched", color: .dashboardGreen)
                     } else {
-                        DashboardTag(text: "No event gaps", color: .green)
+                        Image(systemName: sensor.health.connected ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
+                            .foregroundStyle(sensor.health.connected ? .green : .orange)
+                        Text(sensor.health.connected ? "Endpoint Security sensor connected" : "Endpoint Security sensor disconnected")
+                            .font(.system(size: 12, weight: .semibold))
+                        DashboardTag(text: sensor.health.mode.capitalized, color: sensor.health.mode == "observe" ? .dashboardBlue : .dashboardRed)
+                        Text("\(sensor.health.ingestedEvents.formatted()) events ingested")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                        Spacer()
+                        if sensor.health.hasDataLoss {
+                            DashboardTag(text: "Event gaps detected", color: .dashboardRed)
+                        } else {
+                            DashboardTag(text: "No event gaps", color: .green)
+                        }
                     }
                 }
                 .padding(12)

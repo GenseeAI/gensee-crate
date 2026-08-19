@@ -13,6 +13,7 @@
 		076516A9E8D79FF29811936D /* ConfigAuditModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7294E1EB1AB2BC3775FC1E9D /* ConfigAuditModelsTests.swift */; };
 		0783AAA9D10980D16D10D045 /* AlertSeverityBreakdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = 544562E0263496009681ED4B /* AlertSeverityBreakdown.swift */; };
 		084354B2A7A75325026F3D73 /* GenseeCrateEndpointSecurity.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = ADF9199FEAE114BBFADFEDDB /* GenseeCrateEndpointSecurity.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		098391E414D76F83B30EA1CC /* ProgressiveTrust.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8ED1C38BD6A424DB96F9CD1 /* ProgressiveTrust.swift */; };
 		0A89B2A6582326443FD14EEF /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 710E9EC4A241B8850EB0EB60 /* main.m */; };
 		1FF0AC00136C8DD45831F049 /* SetupAssistantView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A351A24BA68D1A981D3A8EE /* SetupAssistantView.swift */; };
 		298C38A67499075882B9EF04 /* EndpointIngestAcknowledgementIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18415BCF8F97E3CDBF1D9A21 /* EndpointIngestAcknowledgementIO.swift */; };
@@ -43,6 +44,7 @@
 		B3A01A811214C31B36C00F18 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C1B023EFF7B2DE9556556E9E /* Assets.xcassets */; };
 		B4EC3AFD2169905AA662360D /* ConsoleModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92AD1DC256F292439A6C70BA /* ConsoleModel.swift */; };
 		C1CFBA97FF43FD867550E37E /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
+		C63DB304AAE36E38326D4231 /* ProgressiveTrust.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8ED1C38BD6A424DB96F9CD1 /* ProgressiveTrust.swift */; };
 		CABD267D92A105B162179646 /* ArtifactFactTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D50189280D53EE5D350B921A /* ArtifactFactTests.swift */; };
 		CCAD36DFFBDEE018878BD96D /* AgentCompletionModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8855DA4350FF617E9D6441C2 /* AgentCompletionModels.swift */; };
 		CEBB5434E3FFBD87829EB8C0 /* DashboardHarnessesPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */; };
@@ -51,6 +53,7 @@
 		DBA4A9B1E7D7F48F940E66CC /* HarnessActivationGuidance.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A26DF6DC7DD3F0CAA81BD6 /* HarnessActivationGuidance.swift */; };
 		DF38FDB826769C79187233CA /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
 		F0620C2EBDB564E7762C995E /* HarnessActivationGuidanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F7E9D2CD5956A984D2F51D8 /* HarnessActivationGuidanceTests.swift */; };
+		F0B51B6C4F3DBC996FC99208 /* ProgressiveTrustTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B48A140830CDA099A21BBE9F /* ProgressiveTrustTests.swift */; };
 		F189FD121BF62C54B3887CDC /* EndpointIngestAcknowledgementIOTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FB2BA4717E0AC963EDF2CD1 /* EndpointIngestAcknowledgementIOTests.swift */; };
 		FC2ACB45E9ADD76BD8EBAFA1 /* GenseeCLI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B06211CB7A3B1543D9B7B5D /* GenseeCLI.swift */; };
 		FC7C99ABF3344039085F8FE9 /* SystemExtensions.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 646FCF1F1969644B69EFB35E /* SystemExtensions.framework */; };
@@ -114,7 +117,9 @@
 		9FB2BA4717E0AC963EDF2CD1 /* EndpointIngestAcknowledgementIOTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointIngestAcknowledgementIOTests.swift; sourceTree = "<group>"; };
 		ADF9199FEAE114BBFADFEDDB /* GenseeCrateEndpointSecurity.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = GenseeCrateEndpointSecurity.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		B25B76EA154890044AB13C42 /* GenseeEndpointSecurityBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = GenseeEndpointSecurityBridge.h; sourceTree = "<group>"; };
+		B48A140830CDA099A21BBE9F /* ProgressiveTrustTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgressiveTrustTests.swift; sourceTree = "<group>"; };
 		B81B0DF2C0A3C05A62D73211 /* TimelineModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimelineModels.swift; sourceTree = "<group>"; };
+		B8ED1C38BD6A424DB96F9CD1 /* ProgressiveTrust.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgressiveTrust.swift; sourceTree = "<group>"; };
 		C1B023EFF7B2DE9556556E9E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C27E47B1FED91B645603F7B8 /* EndpointSecuritySensor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointSecuritySensor.swift; sourceTree = "<group>"; };
 		C8473EB5830E8F39EB110349 /* ConsoleModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConsoleModels.swift; sourceTree = "<group>"; };
@@ -177,6 +182,7 @@
 				5F1702DD7F563FB2B6DE975E /* GenseeEndpointSecurityBridge.m */,
 				D8A26DF6DC7DD3F0CAA81BD6 /* HarnessActivationGuidance.swift */,
 				33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */,
+				B8ED1C38BD6A424DB96F9CD1 /* ProgressiveTrust.swift */,
 				3A351A24BA68D1A981D3A8EE /* SetupAssistantView.swift */,
 				B81B0DF2C0A3C05A62D73211 /* TimelineModels.swift */,
 			);
@@ -193,6 +199,7 @@
 				9FB2BA4717E0AC963EDF2CD1 /* EndpointIngestAcknowledgementIOTests.swift */,
 				8F7E9D2CD5956A984D2F51D8 /* HarnessActivationGuidanceTests.swift */,
 				EDC43B9627D7C217071C5275 /* HarnessConfigurationHealthTests.swift */,
+				B48A140830CDA099A21BBE9F /* ProgressiveTrustTests.swift */,
 				39CFE24CFF06C20FEC203C0B /* TimelineModelsTests.swift */,
 			);
 			path = Tests;
@@ -411,6 +418,7 @@
 				051752191996C457E065E5B0 /* GenseeEndpointSecurityBridge.m in Sources */,
 				8DC557F61F6BE8CA39728CE2 /* HarnessActivationGuidance.swift in Sources */,
 				DF38FDB826769C79187233CA /* HarnessConfigurationHealth.swift in Sources */,
+				098391E414D76F83B30EA1CC /* ProgressiveTrust.swift in Sources */,
 				1FF0AC00136C8DD45831F049 /* SetupAssistantView.swift in Sources */,
 				8ABF7A89C5FD85514EAAC0DC /* TimelineModels.swift in Sources */,
 			);
@@ -434,6 +442,8 @@
 				F0620C2EBDB564E7762C995E /* HarnessActivationGuidanceTests.swift in Sources */,
 				C1CFBA97FF43FD867550E37E /* HarnessConfigurationHealth.swift in Sources */,
 				30D03A7F9A136550F0A72DE7 /* HarnessConfigurationHealthTests.swift in Sources */,
+				C63DB304AAE36E38326D4231 /* ProgressiveTrust.swift in Sources */,
+				F0B51B6C4F3DBC996FC99208 /* ProgressiveTrustTests.swift in Sources */,
 				91306ABA52E6F4472DD1DA3E /* TimelineModels.swift in Sources */,
 				3005C416C510768DDF39A195 /* TimelineModelsTests.swift in Sources */,
 			);

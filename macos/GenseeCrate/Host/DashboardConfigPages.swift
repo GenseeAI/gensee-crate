@@ -714,6 +714,53 @@ struct DashboardSettingsPage: View {
                     }.padding(12).background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 5)).overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.orange.opacity(0.35)))
                 }
 
+                DashboardCard("Protection Level") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Start with visibility, then increase enforcement when the evidence earns your trust. Decision rules remain editable in Policy at every level.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        HStack(alignment: .top, spacing: 10) {
+                            ForEach(ProtectionLevel.allCases) { level in
+                                Button {
+                                    Task { _ = await model.applyProtectionLevel(level) }
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        HStack {
+                                            Image(systemName: level.symbol)
+                                            Text(level.title).fontWeight(.semibold)
+                                            Spacer()
+                                            if model.protectionLevel == level {
+                                                Image(systemName: "checkmark.circle.fill")
+                                            }
+                                        }
+                                        .foregroundStyle(level.tint)
+                                        Text(level.tagline)
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    .padding(12)
+                                    .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .background(
+                                    model.protectionLevel == level ? level.tint.opacity(0.09) : Color.dashboardMutedFill,
+                                    in: RoundedRectangle(cornerRadius: 7)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .stroke(model.protectionLevel == level ? level.tint.opacity(0.45) : Color.dashboardLine)
+                                )
+                                .disabled(model.runningCommand != nil)
+                            }
+                        }
+                        Text(model.protectionLevel.detail)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 HStack(alignment: .top, spacing: 16) {
                     DashboardCard("Endpoint Security") { endpointSecurity }.frame(maxWidth: .infinity)
                     DashboardCard("Local Store") { localStore }.frame(maxWidth: .infinity)

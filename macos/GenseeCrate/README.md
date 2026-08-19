@@ -32,6 +32,19 @@ The console includes:
   opt-in end-of-day briefing. The first refresh establishes a historical
   baseline, so enabling notifications never floods Notification Center with
   old work.
+- An explicit, in-memory **synthetic demo** that can be entered before setup or
+  from the app toolbar. It uses invented sessions, requests, tool calls,
+  findings, artifacts, and activity history; a persistent banner identifies the
+  data as synthetic. Entering the demo does not initialize a database, install
+  hooks, request Apple permissions, change policy, or touch harness settings.
+  Real configuration pages remain locked until the user exits the demo.
+- A progressive protection ladder. **Observe** keeps Endpoint Security
+  notification-only while existing hook decision rules still apply;
+  **Guarded** enables configured OS authorization while keeping ask decisions
+  interactive; **Unattended** selects strict OS authorization and escalates
+  medium-or-higher asks to deny so an agent stops instead of waiting for an
+  approval. The ladder changes these two policy controls atomically and never
+  rewrites the user's decision rules.
 - A first-launch setup assistant that installs the bundled backend at
   `~/.gensee/bin/gensee`, initializes the encrypted event store and default
   policy, guides Apple approvals, scans all six harnesses, and offers one-click
@@ -96,11 +109,13 @@ Omnigent is shown in the same inventory, but it currently uses managed-launch
 protection instead of a direct hook toggle. Launch it through `gensee run` to
 associate its process tree with Gensee policy and Endpoint Security decisions.
 
-Use **Policy** to choose the Endpoint Security mode and configure protected
-paths or blocked executables. Use **Settings** to install, inspect, or remove
-the system extension and to open the Full Disk Access pane. Start with
-`observe`, confirm event delivery, and review the local evidence before moving
-to an enforcement mode.
+Use **Settings → Protection Level** to move between Observe, Guarded, and
+Unattended with a plain-language explanation of the tradeoff. Use **Policy**
+for the underlying Endpoint Security mode, decision rules, protected paths, and
+blocked executables. Use **Settings** to install, inspect, or remove the system
+extension and to open the Full Disk Access pane. Start with Observe, confirm
+event delivery, and review the local evidence before moving to an enforcement
+level.
 
 Disabling a direct-hook integration removes only Gensee-owned hook entries and
 preserves unrelated harness settings and hooks. It also removes that harness's
