@@ -32,6 +32,8 @@ console.
   Copilot, and Omnigent.
 - Per-harness Config Audit actions backed by the shared OSS Rust audit library
   for static, read-only review of Codex and VS Code/Copilot configuration.
+- Local workspace checkpoints and explicitly confirmed restore from the
+  **Recovery** page.
 
 ## First-launch setup
 
@@ -126,6 +128,25 @@ usage metadata when a turn completes and stores only that turn's total token
 count. It does not copy transcript content into the activity aggregate. Token
 history begins after this version is installed; prior turns remain at zero,
 and harnesses that do not expose compatible usage metadata also report zero.
+
+## Recovery checkpoints
+
+Before handing an agent a substantial change, open **Recovery**, select its Git
+workspace, and create a labeled checkpoint. Gensee writes a private commit to
+`refs/gensee/checkpoints/*`; it does not move the current branch, create a
+normal commit, or alter the user's staging index. Tracked and untracked
+non-ignored files are included.
+
+Restore is intentionally two-step. The app explains the affected scope and
+requires **Create Rescue & Restore**; the backend also requires `--yes`. Before
+changing the workspace, Gensee creates a rescue checkpoint of its current
+state. Ignored files remain untouched, while non-ignored files created after
+the selected checkpoint may be removed.
+
+These checkpoints do not capture ignored files, nested repository contents,
+files outside the workspace, processes, databases, credentials, or remote side
+effects. They are a recovery aid for direct macOS work, not the same isolation
+or transactional guarantee as the Linux tclone runtime.
 
 ## Endpoint Security modes
 

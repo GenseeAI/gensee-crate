@@ -407,6 +407,11 @@ turns, tool calls, alerts, and supported transcript token totals. On the
 **Harnesses** page, **Audit Config** on Codex and GitHub Copilot runs the shared
 OSS auditor and presents findings, evidence, inventory, source provenance, and
 manual checks inline; unsupported harness auditors are marked **Coming soon**.
+The **Recovery** page creates Git-backed local workspace checkpoints before
+large agent changes and creates a rescue point before every restore. It
+preserves the real staging index and ignored files; it is a recovery aid rather
+than the process, database, and remote-side-effect isolation provided by Linux
+tclone.
 
 **Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
 `sandbox-exec` and can stage workspace writes for review.

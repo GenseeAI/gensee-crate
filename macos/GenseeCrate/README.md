@@ -48,10 +48,34 @@ The console includes:
   repair action when needed. A hook configuration becomes **Protected** only
   after a real event from that harness reaches the active local store.
 - Endpoint Security installation, removal, and Full Disk Access navigation.
+- A **Recovery** page for explicit, Git-backed local checkpoints before large
+  agent tasks, with a rescue checkpoint created before every restore.
 
 Token totals are captured from compatible Claude Code and Codex transcript
 usage metadata when a turn completes. Only the numeric per-turn total is stored;
 historical turns and harnesses without compatible usage metadata remain zero.
+
+## Workspace recovery
+
+The **Recovery** page provides a practical macOS undo point without committing
+to the user's branch or changing the real Git staging index. A checkpoint
+captures tracked files and untracked, non-ignored files in the repository's
+local Git object database. Restoring one requires an explicit confirmation and
+first captures the current state as a rescue checkpoint.
+
+This is recovery, not isolation. Ignored files, nested repository contents,
+files outside the selected workspace, running processes, databases, and remote
+side effects are outside the checkpoint. Restoring may remove non-ignored files
+created after the checkpoint. Linux tclone remains the stronger transactional
+runtime when an agent needs a fully cloneable environment.
+
+The same primitive is available from the embedded OSS CLI:
+
+```bash
+gensee checkpoint create --workspace . --label "Before agent refactor"
+gensee checkpoint list --workspace . --json
+gensee checkpoint restore cp-123-deadbeef --workspace . --yes
+```
 
 ## Use the security console
 

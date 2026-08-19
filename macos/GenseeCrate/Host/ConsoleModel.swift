@@ -13,6 +13,8 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var configAudit: ConfigAuditBundle?
     @Published private(set) var auditedIntegrationIDs: Set<String> = []
     @Published private(set) var verifiedIntegrationIDs: Set<String> = []
+    @Published private(set) var checkpoints: [WorkspaceCheckpointRecord] = []
+    @Published private(set) var checkpointWorkspace: String?
     @Published private(set) var isRefreshing = false
     @Published private(set) var runningCommand: String?
     @Published private(set) var feedbackAlertID: Int64?
@@ -270,6 +272,92 @@ final class ConsoleModel: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func loadCheckpoints(workspace: String, reportErrors: Bool = true) async {
+        guard backendAvailable else {
+            if reportErrors { errorMessage = GenseeCLIError.executableNotFound.localizedDescription }
+            return
+        }
+        guard let workspaceURL = existingWorkspaceURL(workspace) else {
+            checkpoints = []
+            checkpointWorkspace = nil
+            if reportErrors { errorMessage = "Choose an existing Git workspace to view recovery checkpoints." }
+            return
+        }
+        do {
+            let response = try await cli.decode(
+                CheckpointListResponse.self,
+                arguments: ["checkpoint", "list", "--workspace", workspaceURL.path, "--json"]
+            )
+            checkpoints = response.checkpoints
+            checkpointWorkspace = response.workspace
+        } catch {
+            checkpoints = []
+            checkpointWorkspace = nil
+            if reportErrors { errorMessage = error.localizedDescription }
+        }
+    }
+
+    func createCheckpoint(workspace: String, label: String) async {
+        guard let workspaceURL = existingWorkspaceURL(workspace) else {
+            errorMessage = "Choose an existing Git workspace before creating a checkpoint."
+            return
+        }
+        runningCommand = "Creating a local recovery checkpoint"
+        defer { runningCommand = nil }
+        var arguments = ["checkpoint", "create", "--workspace", workspaceURL.path, "--json"]
+        let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedLabel.isEmpty {
+            arguments += ["--label", trimmedLabel]
+        }
+        do {
+            let checkpoint = try await cli.decode(
+                WorkspaceCheckpointRecord.self,
+                arguments: arguments,
+                timeout: 60
+            )
+            noticeMessage = "Checkpoint \(checkpoint.id) is ready."
+            await loadCheckpoints(workspace: workspaceURL.path, reportErrors: false)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func restoreCheckpoint(_ checkpoint: WorkspaceCheckpointRecord, workspace: String) async {
+        guard let workspaceURL = existingWorkspaceURL(workspace) else {
+            errorMessage = "Choose the checkpoint's Git workspace before restoring it."
+            return
+        }
+        runningCommand = "Restoring checkpoint and creating a rescue point"
+        defer { runningCommand = nil }
+        do {
+            let response = try await cli.decode(
+                CheckpointRestoreResponse.self,
+                arguments: [
+                    "checkpoint", "restore", checkpoint.id,
+                    "--workspace", workspaceURL.path,
+                    "--yes", "--json",
+                ],
+                timeout: 60
+            )
+            noticeMessage = "Restored \(response.restored.label ?? response.restored.id). Rescue checkpoint: \(response.rescue.id)."
+            await loadCheckpoints(workspace: workspaceURL.path, reportErrors: false)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func existingWorkspaceURL(_ workspace: String) -> URL? {
+        let expanded = (workspace as NSString).expandingTildeInPath
+        let url = URL(fileURLWithPath: expanded)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else { return nil }
+        return url
     }
 
     func savePolicyDocument(_ text: String) async -> Bool {

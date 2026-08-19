@@ -23,7 +23,9 @@
 		3D884526B883F80941BD09BD /* DashboardActivityPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 606554A9090B30CB60EEC12A /* DashboardActivityPages.swift */; };
 		3F9DAD52588ED94CD01C84AC /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FBE05DBB986CBCE7BE09ED0 /* ContentView.swift */; };
 		3F9F454E448CC418E94FBA38 /* Brand.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5CBE9AE8A3819CA0AF3116D /* Brand.swift */; };
+		4768900C4797F5BA5C125F3A /* CheckpointModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B2C9863EF44DBED1995C05A /* CheckpointModels.swift */; };
 		4EEC361E0A4D91AD7B5C2563 /* DashboardConfigAuditPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F87253473BB92366EC06A2A /* DashboardConfigAuditPage.swift */; };
+		54D7EAAB7240944B2DD6A040 /* CheckpointModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 805C2FF6EE4D2777B55AD043 /* CheckpointModelsTests.swift */; };
 		55F95CB261F2C459B47E86FC /* AlertSeverityBreakdownTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EABB784CC4CC45204E63CA1 /* AlertSeverityBreakdownTests.swift */; };
 		5C8C0C9C960C90C0231177A0 /* EndpointSecurityExtensionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA20B771E8184937A5C2C57E /* EndpointSecurityExtensionManager.swift */; };
 		6710AB1884EF2EC50408D9CC /* AlertSeverityBreakdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = 544562E0263496009681ED4B /* AlertSeverityBreakdown.swift */; };
@@ -31,6 +33,7 @@
 		6F1EFE76386D67BDF9581E7B /* DashboardOverviewPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E5F6044F8B4D45BBBC38D88 /* DashboardOverviewPages.swift */; };
 		70FCB6B396339C7CE0DF1B79 /* DashboardShell.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F9083239FB55EA68146A81F /* DashboardShell.swift */; };
 		7931867F15D1E07955D3F193 /* EndpointIngestAcknowledgementIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18415BCF8F97E3CDBF1D9A21 /* EndpointIngestAcknowledgementIO.swift */; };
+		80200C2E55A9BCB9B006893A /* DashboardRecoveryPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72E1263942F8D5014008EF95 /* DashboardRecoveryPage.swift */; };
 		83F8664AFB2123015E35C5CA /* DashboardConfigPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF1B808391332D1FC13CD1D0 /* DashboardConfigPages.swift */; };
 		8ABF7A89C5FD85514EAAC0DC /* TimelineModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B81B0DF2C0A3C05A62D73211 /* TimelineModels.swift */; };
 		8DC557F61F6BE8CA39728CE2 /* HarnessActivationGuidance.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A26DF6DC7DD3F0CAA81BD6 /* HarnessActivationGuidance.swift */; };
@@ -43,6 +46,7 @@
 		C1CFBA97FF43FD867550E37E /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
 		CABD267D92A105B162179646 /* ArtifactFactTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D50189280D53EE5D350B921A /* ArtifactFactTests.swift */; };
 		CEBB5434E3FFBD87829EB8C0 /* DashboardHarnessesPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */; };
+		D32CD262C64B7DD61E04017E /* CheckpointModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B2C9863EF44DBED1995C05A /* CheckpointModels.swift */; };
 		D50CF93055DEC2DF49AD2240 /* libEndpointSecurity.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C7E850A448A571324F7CA4F /* libEndpointSecurity.tbd */; };
 		DBA4A9B1E7D7F48F940E66CC /* HarnessActivationGuidance.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A26DF6DC7DD3F0CAA81BD6 /* HarnessActivationGuidance.swift */; };
 		DF38FDB826769C79187233CA /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
@@ -88,6 +92,7 @@
 		39CFE24CFF06C20FEC203C0B /* TimelineModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TimelineModelsTests.swift; sourceTree = "<group>"; };
 		3A351A24BA68D1A981D3A8EE /* SetupAssistantView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupAssistantView.swift; sourceTree = "<group>"; };
 		544562E0263496009681ED4B /* AlertSeverityBreakdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlertSeverityBreakdown.swift; sourceTree = "<group>"; };
+		5B2C9863EF44DBED1995C05A /* CheckpointModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheckpointModels.swift; sourceTree = "<group>"; };
 		5F1702DD7F563FB2B6DE975E /* GenseeEndpointSecurityBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = GenseeEndpointSecurityBridge.m; sourceTree = "<group>"; };
 		606554A9090B30CB60EEC12A /* DashboardActivityPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardActivityPages.swift; sourceTree = "<group>"; };
 		646FCF1F1969644B69EFB35E /* SystemExtensions.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemExtensions.framework; path = System/Library/Frameworks/SystemExtensions.framework; sourceTree = SDKROOT; };
@@ -95,8 +100,10 @@
 		6FBE05DBB986CBCE7BE09ED0 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		710E9EC4A241B8850EB0EB60 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
 		7294E1EB1AB2BC3775FC1E9D /* ConfigAuditModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigAuditModelsTests.swift; sourceTree = "<group>"; };
+		72E1263942F8D5014008EF95 /* DashboardRecoveryPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardRecoveryPage.swift; sourceTree = "<group>"; };
 		757B3C5FC8B9C600B17829C8 /* ConfigAuditModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigAuditModels.swift; sourceTree = "<group>"; };
 		7E4A8A78340952674B35776F /* GenseeCrate.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GenseeCrate.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		805C2FF6EE4D2777B55AD043 /* CheckpointModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheckpointModelsTests.swift; sourceTree = "<group>"; };
 		8A3D55DA761A91C70B3F68CB /* GenseeCrateApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GenseeCrateApp.swift; sourceTree = "<group>"; };
 		8B06211CB7A3B1543D9B7B5D /* GenseeCLI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GenseeCLI.swift; sourceTree = "<group>"; };
 		8C7E850A448A571324F7CA4F /* libEndpointSecurity.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libEndpointSecurity.tbd; path = usr/lib/libEndpointSecurity.tbd; sourceTree = SDKROOT; };
@@ -147,6 +154,7 @@
 				544562E0263496009681ED4B /* AlertSeverityBreakdown.swift */,
 				C1B023EFF7B2DE9556556E9E /* Assets.xcassets */,
 				D5CBE9AE8A3819CA0AF3116D /* Brand.swift */,
+				5B2C9863EF44DBED1995C05A /* CheckpointModels.swift */,
 				757B3C5FC8B9C600B17829C8 /* ConfigAuditModels.swift */,
 				92AD1DC256F292439A6C70BA /* ConsoleModel.swift */,
 				C8473EB5830E8F39EB110349 /* ConsoleModels.swift */,
@@ -157,6 +165,7 @@
 				FF1B808391332D1FC13CD1D0 /* DashboardConfigPages.swift */,
 				35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */,
 				8E5F6044F8B4D45BBBC38D88 /* DashboardOverviewPages.swift */,
+				72E1263942F8D5014008EF95 /* DashboardRecoveryPage.swift */,
 				23D1D4F2FC41CDD9893C88C2 /* DashboardSecurityPages.swift */,
 				6F9083239FB55EA68146A81F /* DashboardShell.swift */,
 				18415BCF8F97E3CDBF1D9A21 /* EndpointIngestAcknowledgementIO.swift */,
@@ -179,6 +188,7 @@
 			children = (
 				0EABB784CC4CC45204E63CA1 /* AlertSeverityBreakdownTests.swift */,
 				D50189280D53EE5D350B921A /* ArtifactFactTests.swift */,
+				805C2FF6EE4D2777B55AD043 /* CheckpointModelsTests.swift */,
 				7294E1EB1AB2BC3775FC1E9D /* ConfigAuditModelsTests.swift */,
 				9FB2BA4717E0AC963EDF2CD1 /* EndpointIngestAcknowledgementIOTests.swift */,
 				8F7E9D2CD5956A984D2F51D8 /* HarnessActivationGuidanceTests.swift */,
@@ -379,6 +389,7 @@
 			files = (
 				6710AB1884EF2EC50408D9CC /* AlertSeverityBreakdown.swift in Sources */,
 				3F9F454E448CC418E94FBA38 /* Brand.swift in Sources */,
+				D32CD262C64B7DD61E04017E /* CheckpointModels.swift in Sources */,
 				6BF5DFA70A4E71DF3EC3343C /* ConfigAuditModels.swift in Sources */,
 				B4EC3AFD2169905AA662360D /* ConsoleModel.swift in Sources */,
 				342907D8F3EE64BED760F9F9 /* ConsoleModels.swift in Sources */,
@@ -389,6 +400,7 @@
 				83F8664AFB2123015E35C5CA /* DashboardConfigPages.swift in Sources */,
 				CEBB5434E3FFBD87829EB8C0 /* DashboardHarnessesPage.swift in Sources */,
 				6F1EFE76386D67BDF9581E7B /* DashboardOverviewPages.swift in Sources */,
+				80200C2E55A9BCB9B006893A /* DashboardRecoveryPage.swift in Sources */,
 				04161812076C359D9D1DA56D /* DashboardSecurityPages.swift in Sources */,
 				70FCB6B396339C7CE0DF1B79 /* DashboardShell.swift in Sources */,
 				7931867F15D1E07955D3F193 /* EndpointIngestAcknowledgementIO.swift in Sources */,
@@ -411,6 +423,8 @@
 				0783AAA9D10980D16D10D045 /* AlertSeverityBreakdown.swift in Sources */,
 				55F95CB261F2C459B47E86FC /* AlertSeverityBreakdownTests.swift in Sources */,
 				CABD267D92A105B162179646 /* ArtifactFactTests.swift in Sources */,
+				4768900C4797F5BA5C125F3A /* CheckpointModels.swift in Sources */,
+				54D7EAAB7240944B2DD6A040 /* CheckpointModelsTests.swift in Sources */,
 				3C8D8EFE80616515AA2B1929 /* ConfigAuditModels.swift in Sources */,
 				076516A9E8D79FF29811936D /* ConfigAuditModelsTests.swift in Sources */,
 				953ADF0AC9D10BB7EDA306B6 /* ConsoleModels.swift in Sources */,

@@ -6,6 +6,7 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
     case timeline = "Timeline"
     case alerts = "Alerts"
     case lineage = "Lineage Graph"
+    case recovery = "Recovery"
     case harnesses = "Harnesses"
     case policy = "Policy"
     case settings = "Settings"
@@ -19,6 +20,7 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
         case .timeline: "clock"
         case .alerts: "exclamationmark.triangle"
         case .lineage: "point.3.connected.trianglepath.dotted"
+        case .recovery: "arrow.uturn.backward.circle"
         case .harnesses: "switch.2"
         case .policy: "checkmark.shield"
         case .settings: "gearshape"
@@ -137,6 +139,7 @@ struct DashboardShell: View {
         case .timeline: TimelinePage(model: model, searchText: searchText)
         case .alerts: DashboardAlertsPage(model: model, searchText: searchText)
         case .lineage: LineagePage(model: model, searchText: searchText)
+        case .recovery: DashboardRecoveryPage(model: model)
         case .harnesses: DashboardHarnessesPage(model: model)
         case .policy: DashboardPolicyPage(model: model)
         case .settings: DashboardSettingsPage(
@@ -170,7 +173,7 @@ private struct DashboardSidebar: View {
             separator
             navGroup("SECURITY", [.alerts, .lineage])
             separator
-            navGroup("CONFIGURATION", [.harnesses, .policy, .settings])
+            navGroup("CONFIGURATION", [.harnesses, .policy, .recovery, .settings])
             Spacer()
         }
         .padding(.top, 8)
