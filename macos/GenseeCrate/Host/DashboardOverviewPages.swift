@@ -4,11 +4,56 @@ import SwiftUI
 struct DashboardOverviewPage: View {
     @ObservedObject var model: ConsoleModel
     @ObservedObject var sensor: EndpointSecuritySensor
+    @ObservedObject var notifications: CompletionNotificationCoordinator
+    let onOpenTimeline: () -> Void
+    let onOpenAlerts: () -> Void
+
+    @State private var selectedRequestID: Int64?
+
+    private var completionSummaries: [AgentCompletionSummary] {
+        AgentCompletionDerivation.summaries(from: model.snapshot)
+    }
+
+    private var selectedSummary: AgentCompletionSummary? {
+        completionSummaries.first(where: { $0.requestID == selectedRequestID })
+            ?? completionSummaries.first
+    }
 
     var body: some View {
         DashboardPage {
             VStack(alignment: .leading, spacing: 16) {
-                DashboardPageHeader("Dashboard", description: "Overview of agent activity, security alerts, and system health.")
+                DashboardPageHeader(
+                    "Control Center",
+                    description: "Let agents work. Return to a concise, verified account of what changed."
+                ) {
+                    if let updated = model.lastUpdated {
+                        Text("Updated \(updated.formatted(.relative(presentation: .named)))")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let selectedSummary {
+                    CompletionReviewCard(
+                        summary: selectedSummary,
+                        onOpenTimeline: onOpenTimeline,
+                        onOpenAlerts: onOpenAlerts
+                    )
+                } else {
+                    EmptyControlCenterCard(activeRunCount: model.activeRunCount)
+                }
+
+                if completionSummaries.count > 1 {
+                    RecentCompletionStrip(
+                        summaries: Array(completionSummaries.prefix(6)),
+                        selectedRequestID: Binding(
+                            get: { selectedSummary?.requestID },
+                            set: { selectedRequestID = $0 }
+                        )
+                    )
+                }
+
+                NotificationPreferenceCard(notifications: notifications)
 
                 HStack(spacing: 10) {
                     Image(systemName: sensor.health.connected ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
@@ -30,10 +75,10 @@ struct DashboardOverviewPage: View {
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.dashboardLine))
 
                 HStack(spacing: 16) {
-                    DashboardStatCard(title: "Sessions", value: model.snapshot.summary.sessionsCount, symbol: "person.2", color: .dashboardBlue)
-                    DashboardStatCard(title: "Requests", value: model.snapshot.summary.requestsCount, symbol: "doc.text", color: .dashboardGreen)
-                    DashboardStatCard(title: "Agent Events", value: model.snapshot.summary.agentEventsCount, symbol: "bolt", color: .dashboardGold)
-                    DashboardStatCard(title: "High + Critical (24 h)", value: model.snapshot.summary.recentHighAlerts, symbol: "exclamationmark.triangle", color: .dashboardRed)
+                    DashboardStatCard(title: "Recent completions", value: completionSummaries.count, symbol: "checkmark.circle", color: .dashboardBlue)
+                    DashboardStatCard(title: "Agent turns", value: model.snapshot.summary.requestsCount, symbol: "arrow.triangle.turn.up.right.diamond", color: .dashboardGreen)
+                    DashboardStatCard(title: "Tool calls", value: model.snapshot.dailyActivity.last?.toolCalls ?? 0, symbol: "hammer", color: .dashboardGold)
+                    DashboardStatCard(title: "High-risk findings (24 h)", value: model.snapshot.summary.recentHighAlerts, symbol: "exclamationmark.triangle", color: .dashboardRed)
                         .help("High and critical describe potential impact. The alert action separately shows whether Gensee warned, asked, or blocked.")
                 }
 
@@ -58,6 +103,289 @@ struct DashboardOverviewPage: View {
             }
         }
     }
+}
+
+private struct CompletionReviewCard: View {
+    let summary: AgentCompletionSummary
+    let onOpenTimeline: () -> Void
+    let onOpenAlerts: () -> Void
+
+    var body: some View {
+        DashboardCard {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .top, spacing: 16) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(stateColor.opacity(0.12))
+                        Image(systemName: stateSymbol)
+                            .font(.system(size: 23, weight: .semibold))
+                            .foregroundStyle(stateColor)
+                    }
+                    .frame(width: 52, height: 52)
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 8) {
+                            Text(summary.reviewState.title)
+                                .font(.system(size: 18, weight: .semibold))
+                            DashboardTag(text: summary.harness, color: .dashboardBlue)
+                            Text(relativeTimestamp(summary.completedAt))
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(summary.prompt)
+                            .font(.system(size: 14, weight: .medium))
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Text(formattedDuration(summary.durationMS))
+                            .font(.system(size: 17, weight: .semibold, design: .rounded))
+                        Text("elapsed")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                HStack(spacing: 0) {
+                    ReviewMetric(value: summary.toolCallCount, label: "tool calls", symbol: "hammer")
+                    reviewDivider
+                    ReviewMetric(value: summary.commandCount, label: "commands", symbol: "terminal")
+                    reviewDivider
+                    ReviewMetric(value: summary.affectedFiles.count, label: "files changed", symbol: "doc.badge.ellipsis")
+                    reviewDivider
+                    ReviewMetric(value: summary.testCommandCount, label: "test runs observed", symbol: "checkmark.diamond")
+                }
+                .padding(.vertical, 12)
+                .background(Color.dashboardMutedFill.opacity(0.72), in: RoundedRectangle(cornerRadius: 7))
+
+                HStack(alignment: .top, spacing: 14) {
+                    VerificationLine(
+                        symbol: "checkmark.circle.fill",
+                        color: .dashboardGreen,
+                        title: "Completion captured",
+                        detail: "Gensee observed the request lifecycle finish."
+                    )
+                    VerificationLine(
+                        symbol: summary.highRiskAlertCount == 0 ? "shield.checkered" : "exclamationmark.shield.fill",
+                        color: summary.highRiskAlertCount == 0 ? .dashboardGreen : .dashboardRed,
+                        title: summary.highRiskAlertCount == 0 ? "No high-risk findings" : "\(summary.highRiskAlertCount) high-risk finding\(summary.highRiskAlertCount == 1 ? "" : "s")",
+                        detail: policyDetail
+                    )
+                    VerificationLine(
+                        symbol: summary.testCommandCount > 0 ? "checkmark.diamond" : "minus.circle",
+                        color: summary.testCommandCount > 0 ? .dashboardBlue : .secondary,
+                        title: summary.testCommandCount > 0 ? "Test command observed" : "No test command observed",
+                        detail: summary.testCommandCount > 0
+                            ? "Open Timeline to inspect the command and duration."
+                            : "Gensee will not claim tests passed without evidence."
+                    )
+                }
+
+                HStack(spacing: 10) {
+                    Button(action: onOpenTimeline) {
+                        Label("Review timeline", systemImage: "clock.arrow.circlepath")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button(action: onOpenAlerts) {
+                        Label(summary.alertCount == 0 ? "View findings" : "Review \(summary.alertCount) finding\(summary.alertCount == 1 ? "" : "s")", systemImage: "exclamationmark.triangle")
+                    }
+                    .buttonStyle(.bordered)
+                    Spacer()
+                    Text("The summary describes only evidence Gensee captured.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(4)
+        }
+        .overlay(alignment: .leading) {
+            Rectangle().fill(stateColor).frame(width: 3).padding(.vertical, 1)
+        }
+    }
+
+    private var reviewDivider: some View {
+        Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 34)
+    }
+
+    private var stateColor: Color {
+        switch summary.reviewState {
+        case .verified: .dashboardGreen
+        case .review: .dashboardGold
+        case .attention: .dashboardRed
+        }
+    }
+
+    private var stateSymbol: String {
+        switch summary.reviewState {
+        case .verified: "checkmark.shield.fill"
+        case .review: "eye.trianglebadge.exclamationmark"
+        case .attention: "exclamationmark.shield.fill"
+        }
+    }
+
+    private var policyDetail: String {
+        if summary.alertCount == 0 { return "Policy checks completed without a surfaced finding." }
+        return "Strongest outcome: \(summary.strongestAction.uppercased()) · \(summary.strongestSeverity.uppercased())."
+    }
+}
+
+private struct ReviewMetric: View {
+    let value: Int
+    let label: String
+    let symbol: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: symbol).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(value.formatted()).font(.system(size: 15, weight: .semibold))
+                Text(label).font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+}
+
+private struct VerificationLine: View {
+    let symbol: String
+    let color: Color
+    let title: String
+    let detail: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: symbol).foregroundStyle(color).padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 11, weight: .semibold))
+                Text(detail).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct RecentCompletionStrip: View {
+    let summaries: [AgentCompletionSummary]
+    @Binding var selectedRequestID: Int64?
+
+    var body: some View {
+        DashboardCard("Recent completed tasks") {
+            HStack(spacing: 8) {
+                ForEach(summaries) { summary in
+                    Button {
+                        selectedRequestID = summary.requestID
+                    } label: {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Circle().fill(stateColor(summary.reviewState)).frame(width: 7, height: 7)
+                                Text(summary.harness).font(.system(size: 10, weight: .semibold))
+                                Spacer()
+                                Text(relativeTimestamp(summary.completedAt)).font(.system(size: 9)).foregroundStyle(.secondary)
+                            }
+                            Text(summary.prompt)
+                                .font(.system(size: 10))
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                        }
+                        .padding(9)
+                        .frame(maxWidth: .infinity, minHeight: 62, alignment: .topLeading)
+                        .background(
+                            selectedRequestID == summary.requestID ? Color.dashboardBlue.opacity(0.10) : Color.dashboardMutedFill,
+                            in: RoundedRectangle(cornerRadius: 6)
+                        )
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(
+                            selectedRequestID == summary.requestID ? Color.dashboardBlue : Color.dashboardLine
+                        ))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private func stateColor(_ state: AgentReviewState) -> Color {
+        switch state {
+        case .verified: .dashboardGreen
+        case .review: .dashboardGold
+        case .attention: .dashboardRed
+        }
+    }
+}
+
+private struct EmptyControlCenterCard: View {
+    let activeRunCount: Int
+
+    var body: some View {
+        DashboardCard {
+            HStack(spacing: 18) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12).fill(Color.dashboardBlue.opacity(0.10))
+                    Image(systemName: activeRunCount > 0 ? "gearshape.2.fill" : "checkmark.shield")
+                        .font(.system(size: 26)).foregroundStyle(Color.dashboardBlue)
+                }.frame(width: 62, height: 62)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(activeRunCount > 0 ? "Your agent is working" : "No completed task to review yet")
+                        .font(.system(size: 18, weight: .semibold))
+                    Text(activeRunCount > 0
+                         ? "You can leave it running. Gensee will surface a concise review when the request finishes."
+                         : "Start a request in a protected harness. Gensee will connect tool calls, changed files, policy outcomes, and completion evidence here.")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }.padding(8)
+        }
+    }
+}
+
+private struct NotificationPreferenceCard: View {
+    @ObservedObject var notifications: CompletionNotificationCoordinator
+
+    var body: some View {
+        DashboardCard {
+            HStack(spacing: 14) {
+                Image(systemName: "bell.badge")
+                    .font(.system(size: 18))
+                    .foregroundStyle(Color.dashboardBlue)
+                    .frame(width: 30)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Know when substantial work is ready")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("One quiet notification for large completed tasks—never for every tool call. Optional daily briefing after 5 PM.")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if notifications.isAuthorized {
+                    Toggle("Task completions", isOn: $notifications.completionNotificationsEnabled)
+                        .toggleStyle(.switch).controlSize(.small)
+                    Toggle("Daily briefing", isOn: $notifications.dailyBriefingEnabled)
+                        .toggleStyle(.switch).controlSize(.small)
+                } else {
+                    Button("Enable notifications") {
+                        Task { await notifications.requestAuthorization() }
+                    }
+                    .controlSize(.small)
+                    .disabled(notifications.authorizationStatus == .denied)
+                    if notifications.authorizationStatus == .denied {
+                        Text("Enable in System Settings")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private func formattedDuration(_ milliseconds: Int64) -> String {
+    if milliseconds < 1_000 { return "< 1 sec" }
+    let seconds = milliseconds / 1_000
+    if seconds < 60 { return "\(seconds) sec" }
+    let minutes = seconds / 60
+    let remainder = seconds % 60
+    if minutes < 60 { return remainder == 0 ? "\(minutes) min" : "\(minutes)m \(remainder)s" }
+    let hours = minutes / 60
+    let minuteRemainder = minutes % 60
+    return minuteRemainder == 0 ? "\(hours) hr" : "\(hours)h \(minuteRemainder)m"
 }
 
 private struct ActivityPoint: Identifiable {

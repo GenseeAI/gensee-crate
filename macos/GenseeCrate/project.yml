@@ -42,6 +42,8 @@ targets:
       - Host/HarnessActivationGuidance.swift
       - Host/AlertSeverityBreakdown.swift
       - Host/TimelineModels.swift
+      - Host/AgentCompletionModels.swift
+      - Host/CompletionNotificationCoordinator.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
       - Host/ConsoleModel.swift
@@ -140,6 +142,7 @@ targets:
       - Host/HarnessActivationGuidance.swift
       - Host/AlertSeverityBreakdown.swift
       - Host/TimelineModels.swift
+      - Host/AgentCompletionModels.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
       - Tests/HarnessConfigurationHealthTests.swift
@@ -147,6 +150,7 @@ targets:
       - Tests/HarnessActivationGuidanceTests.swift
       - Tests/AlertSeverityBreakdownTests.swift
       - Tests/TimelineModelsTests.swift
+      - Tests/AgentCompletionModelsTests.swift
       - Tests/ConfigAuditModelsTests.swift
       - Tests/ArtifactFactTests.swift
     settings:

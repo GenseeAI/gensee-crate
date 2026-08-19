@@ -4,12 +4,11 @@
 </h1>
 
 <p align="center">
-  <strong>Approve outcomes, not commands.</strong>
+  <strong>Let your coding agents run unattended. Review the result in 60 seconds.</strong>
 </p>
 
 <p align="center">
-  Gensee Crate lets AI harness like Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a> do real work inside a disposable full-workspace fork.
-  With Gensee, you can let the harness install packages, edit files, run tests, and crash in isolation; then review the diff and test summary, merge the result, keep exploring, or throw the runtime away. Essentially, Gensee gives agents room to move without letting untrusted work land in your main workspace unreviewed. Behind the scenes, Gensee ties prompts, tool calls, commands, files, packages, network activity, system events, and policy decisions into a protected transaction runtime.
+  Gensee Crate is a local control center for Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>. It lets agents keep moving within your boundaries, catches risky behavior while they work, and turns each completed task into a concise, evidence-backed review: what ran, what changed, which tests were attempted, and what needs attention. On Linux, agents can also work inside a disposable full-workspace fork that you merge, keep, or discard after review.
 </p>
 
 <p align="center">
@@ -45,6 +44,13 @@
 
 Gensee Crate helps you:
 
+- **Come back to an answer, not a transcript.** The macOS Control Center turns a
+  completed agent task into a short review of commands, mutation paths,
+  observed test runs, duration, and policy findings. Optional quiet
+  notifications tell you when substantial work is ready.
+- **Spend less time supervising agents.** Deterministic boundaries run before
+  supported tools and OS operations, so you can step away without approving
+  every low-risk command and focus your attention on exceptions and outcomes.
 - **Run risky agent work transactionally.** Launch an agent in a disposable
   runtime, fork the full workspace for speculative changes, then merge, keep
   working, or discard the fork after review.
