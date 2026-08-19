@@ -37,6 +37,9 @@ struct DashboardShell: View {
     var body: some View {
         VStack(spacing: 0) {
             topBar
+            if model.isDemoMode {
+                demoBanner
+            }
             HStack(spacing: 0) {
                 DashboardSidebar(selection: $selection, alertCount: model.unreadAlertCount)
                     .frame(width: 220)
@@ -110,6 +113,17 @@ struct DashboardShell: View {
             .background(Color.dashboardMutedFill, in: RoundedRectangle(cornerRadius: 5))
 
             Spacer()
+            if !model.isDemoMode {
+                Button {
+                    model.enterDemoMode()
+                    selection = .dashboard
+                } label: {
+                    Label("Try Demo", systemImage: "play.rectangle")
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10, weight: .semibold))
+                .help("Explore synthetic data without changing this Mac")
+            }
             if let issue = model.dashboardRefreshIssue {
                 Label("Refresh delayed", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
                     .font(.system(size: 10, weight: .semibold))
@@ -129,23 +143,52 @@ struct DashboardShell: View {
         .overlay(alignment: .bottom) { Rectangle().fill(Color.dashboardLine).frame(height: 1) }
     }
 
+    private var demoBanner: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "sparkles.rectangle.stack")
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Synthetic demo — nothing here came from this Mac")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("No hooks, database, policy, Apple permissions, or harness settings are changed.")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Exit Demo") {
+                Task { await model.exitDemoMode() }
+            }
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 48)
+        .foregroundStyle(Color.dashboardBlue)
+        .background(Color.dashboardBlue.opacity(0.10))
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.dashboardBlue.opacity(0.25)).frame(height: 1) }
+    }
+
     @ViewBuilder
     private var destinationView: some View {
-        switch selection {
-        case .dashboard: DashboardOverviewPage(model: model, sensor: model.endpointSensor)
-        case .today: TodayHighlightPage(model: model)
-        case .timeline: TimelinePage(model: model, searchText: searchText)
-        case .alerts: DashboardAlertsPage(model: model, searchText: searchText)
-        case .lineage: LineagePage(model: model, searchText: searchText)
-        case .harnesses: DashboardHarnessesPage(model: model)
-        case .policy: DashboardPolicyPage(model: model)
-        case .settings: DashboardSettingsPage(
-            model: model,
-            extensionManager: extensionManager,
-            sensor: model.endpointSensor,
-            darkMode: $darkMode,
-            onRunSetupAssistant: { showsSetupAssistant = true }
-        )
+        if model.isDemoMode && [.harnesses, .policy, .settings].contains(selection) {
+            DemoConfigurationPage(destination: selection) {
+                Task { await model.exitDemoMode() }
+            }
+        } else {
+            switch selection {
+            case .dashboard: DashboardOverviewPage(model: model, sensor: model.endpointSensor)
+            case .today: TodayHighlightPage(model: model)
+            case .timeline: TimelinePage(model: model, searchText: searchText)
+            case .alerts: DashboardAlertsPage(model: model, searchText: searchText)
+            case .lineage: LineagePage(model: model, searchText: searchText)
+            case .harnesses: DashboardHarnessesPage(model: model)
+            case .policy: DashboardPolicyPage(model: model)
+            case .settings: DashboardSettingsPage(
+                model: model,
+                extensionManager: extensionManager,
+                sensor: model.endpointSensor,
+                darkMode: $darkMode,
+                onRunSetupAssistant: { showsSetupAssistant = true }
+            )
+            }
         }
     }
 
@@ -155,6 +198,37 @@ struct DashboardShell: View {
 
     private var noticePresented: Binding<Bool> {
         Binding(get: { model.noticeMessage != nil }, set: { if !$0 { model.noticeMessage = nil } })
+    }
+}
+
+private struct DemoConfigurationPage: View {
+    let destination: DashboardDestination
+    let onExit: () -> Void
+
+    var body: some View {
+        DashboardPage {
+            VStack(alignment: .leading, spacing: 16) {
+                DashboardPageHeader(destination.rawValue, description: "Real configuration is intentionally unavailable in synthetic demo mode.")
+                DashboardCard {
+                    VStack(spacing: 14) {
+                        Image(systemName: "lock.shield")
+                            .font(.system(size: 30))
+                            .foregroundStyle(Color.dashboardBlue)
+                        Text("Your Mac is untouched")
+                            .font(.system(size: 18, weight: .semibold))
+                        Text("Exit the demo when you are ready to scan installed harnesses, choose a protection level, or change local settings. Gensee will show every required permission before it makes a change.")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 520)
+                        Button("Exit Demo and Configure", action: onExit)
+                            .buttonStyle(.borderedProminent)
+                            .tint(.dashboardBlue)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 300)
+                }
+            }
+        }
     }
 }
 

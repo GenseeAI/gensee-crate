@@ -19,6 +19,7 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var readAlertIDs: Set<Int64> = []
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var dashboardRefreshIssue: String?
+    @Published private(set) var isDemoMode = false
     @Published var errorMessage: String?
     @Published var noticeMessage: String?
 
@@ -30,6 +31,7 @@ final class ConsoleModel: ObservableObject {
     private var readThroughAlertID: Int64 = 0
     private var harnessVerificationBaselines: [String: Int64] = [:]
     private var hasLoadedDashboardSnapshot = false
+    private var snapshotBeforeDemo = SecuritySnapshot()
 
     init() {
         let environmentHome = ProcessInfo.processInfo.environment["GENSEE_HOME"]
@@ -64,6 +66,12 @@ final class ConsoleModel: ObservableObject {
         )
     }
     var localRuntimePrepared: Bool { stableBackendInstalled && databaseExists && policyExists }
+    var protectionLevel: ProtectionLevel {
+        ProtectionLevel.current(
+            endpointMode: policy.endpointSecurityMode,
+            noninteractive: policy.noninteractive
+        )
+    }
     var databaseEncrypted: Bool {
         guard let handle = try? FileHandle(forReadingFrom: databaseURL) else { return false }
         defer { try? handle.close() }
@@ -95,6 +103,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func markAlertRead(_ alertID: Int64) {
+        guard !isDemoMode else { return }
         guard !isAlertRead(alertID) else { return }
         var updated = readAlertIDs
         guard updated.insert(alertID).inserted else { return }
@@ -103,6 +112,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func markAllAlertsRead() {
+        guard !isDemoMode else { return }
         guard unreadAlertCount > 0 else { return }
         readAlertBaselineCount = snapshot.summary.alertsCount
         readThroughAlertID = max(readThroughAlertID, snapshot.alerts.map(\.alertID).max() ?? 0)
@@ -135,6 +145,11 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshAll() async {
+        guard !isDemoMode else {
+            snapshot = DemoSnapshotFactory.make()
+            lastUpdated = Date()
+            return
+        }
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
@@ -158,6 +173,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshPolicy() async {
+        guard !isDemoMode else { return }
         guard backendAvailable else { return }
         var next = policy
         do {
@@ -177,6 +193,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshDashboard(reportErrors: Bool = true) async {
+        guard !isDemoMode else { return }
         guard backendAvailable else { return }
         guard !dashboardRefreshInProgress else { return }
         dashboardRefreshInProgress = true
@@ -209,6 +226,13 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshDailyDetail(day: String) async {
+        if isDemoMode {
+            dailyDetail = DemoSnapshotFactory.dailyDetail(for: day, snapshot: snapshot)
+            dailyDetailLoadState = dailyDetail == nil
+                ? .unavailable(day: day, message: "No synthetic activity is available for this day.")
+                : .loaded(day)
+            return
+        }
         guard backendAvailable else {
             dailyDetailLoadState = .unavailable(
                 day: day,
@@ -237,6 +261,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     func runConfigAudit(target: String, workspace: String) async {
+        guard !isDemoMode else {
+            noticeMessage = "Config Audit is read-only in the synthetic demo. Exit demo mode to audit this Mac."
+            return
+        }
         guard backendAvailable else {
             errorMessage = GenseeCLIError.executableNotFound.localizedDescription
             return
@@ -273,6 +301,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     func savePolicyDocument(_ text: String) async -> Bool {
+        guard !isDemoMode else {
+            noticeMessage = "Synthetic demo mode never changes your policy."
+            return false
+        }
         runningCommand = "Validating policy"
         defer { runningCommand = nil }
         do {
@@ -301,6 +333,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     func recordFeedback(for alert: SecurityAlert, agrees: Bool) async -> Bool {
+        guard !isDemoMode else {
+            noticeMessage = "Feedback is not stored for synthetic demo findings."
+            return false
+        }
         guard feedbackAlertID == nil else { return false }
         feedbackAlertID = alert.alertID
         defer { feedbackAlertID = nil }
@@ -336,6 +372,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     func setPolicy(key: String, value: String) async {
+        guard !isDemoMode else {
+            noticeMessage = "Synthetic demo mode never changes your policy."
+            return
+        }
         runningCommand = "Updating policy"
         defer { runningCommand = nil }
         do {
@@ -348,6 +388,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     func setIntegrationEnabled(_ provider: String, enabled: Bool) async {
+        guard !isDemoMode else {
+            noticeMessage = "Synthetic demo mode never installs or removes harness hooks."
+            return
+        }
         guard let index = integrations.firstIndex(where: { $0.id == provider }) else { return }
         let integration = integrations[index]
         guard integration.canToggle else { return }
@@ -398,6 +442,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     func repairIntegration(_ provider: String) async {
+        guard !isDemoMode else {
+            noticeMessage = "Synthetic demo mode never changes harness configuration."
+            return
+        }
         guard let integration = integrations.first(where: { $0.id == provider }),
               integration.canToggle,
               integration.requiresRepair
@@ -451,6 +499,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func prepareLocalRuntime() async -> Bool {
+        guard !isDemoMode else { return true }
         guard backendAvailable else {
             errorMessage = GenseeCLIError.executableNotFound.localizedDescription
             return false
@@ -497,6 +546,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func enableAllInstalledIntegrations() async {
+        guard !isDemoMode else { return }
         let providers = integrations
             .filter { $0.installed && $0.supportsDirectHooks && !$0.isHealthy }
             .map(\.id)
@@ -511,7 +561,60 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshHarnesses() async {
+        guard !isDemoMode else { return }
         await refreshIntegrationsWithCurrentBackend()
+    }
+
+    func enterDemoMode() {
+        guard !isDemoMode else { return }
+        snapshotBeforeDemo = snapshot
+        snapshot = DemoSnapshotFactory.make()
+        isDemoMode = true
+        dashboardRefreshIssue = nil
+        errorMessage = nil
+        lastUpdated = Date()
+    }
+
+    func exitDemoMode() async {
+        guard isDemoMode else { return }
+        isDemoMode = false
+        snapshot = snapshotBeforeDemo
+        dailyDetail = nil
+        dailyDetailLoadState = .idle
+        await refreshAll()
+    }
+
+    func applyProtectionLevel(_ level: ProtectionLevel) async -> Bool {
+        guard !isDemoMode else {
+            noticeMessage = "Exit synthetic demo mode before changing protection."
+            return false
+        }
+        if policyDocument.isEmpty {
+            await refreshPolicy()
+        }
+        do {
+            guard var root = try JSONSerialization.jsonObject(with: Data(policyDocument.utf8)) as? [String: Any] else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+            var endpoint = root["endpoint_security"] as? [String: Any] ?? [:]
+            endpoint["mode"] = level.endpointMode
+            root["endpoint_security"] = endpoint
+            var enforcement = root["enforcement"] as? [String: Any] ?? [:]
+            enforcement["noninteractive"] = level.noninteractive
+            root["enforcement"] = enforcement
+            let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw CocoaError(.fileReadInapplicableStringEncoding)
+            }
+            let saved = await savePolicyDocument(text)
+            if saved {
+                noticeMessage = "Protection level set to \(level.title)."
+            }
+            return saved
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
     }
 
     func openFullDiskAccess() {
