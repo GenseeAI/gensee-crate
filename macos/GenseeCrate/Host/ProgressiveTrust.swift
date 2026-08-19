@@ -61,10 +61,13 @@ enum ProtectionLevel: String, CaseIterable, Identifiable {
         }
     }
 
-    static func current(endpointMode: String, noninteractive: Bool) -> ProtectionLevel {
-        if noninteractive || endpointMode == "strict" { return .unattended }
-        if endpointMode == "protect" { return .guarded }
-        return .observe
+    static func current(endpointMode: String, noninteractive: Bool) -> ProtectionLevel? {
+        switch (endpointMode, noninteractive) {
+        case ("observe", false): .observe
+        case ("protect", false): .guarded
+        case ("strict", true): .unattended
+        default: nil
+        }
     }
 }
 

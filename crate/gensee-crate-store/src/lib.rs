@@ -484,90 +484,7 @@ impl EventStore {
         let db = self.sqlite_store()?;
         let conn = db.connection();
         let visible_alerts_cte = dashboard_visible_alerts_cte();
-        let alerts_sql = format!(
-            "WITH {visible_alerts_cte}
-             SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
-                alerts.severity, alerts.action, alerts.rule_id, alerts.message,
-                alerts.path, alerts.evidence, alerts.created_at,
-                requests.session_id,
-                requests.original_user_prompt,
-                trigger_event.source, trigger_event.type, trigger_event.tool_name,
-                trigger_event.tool_input, trigger_event.tool_use_id,
-                feedback.human_verdict, feedback.label, feedback.created_at
-             FROM visible_alerts AS alerts
-             LEFT JOIN requests ON requests.request_id = alerts.request_id
-             LEFT JOIN agent_events AS trigger_event
-               ON trigger_event.event_id = COALESCE(
-                 CASE
-                   WHEN alerts.entity_kind = 'agent_event' THEN alerts.entity_id
-                 END,
-                 (
-                   SELECT candidate.event_id
-                   FROM agent_events AS candidate
-                   WHERE candidate.request_id = alerts.request_id
-                     AND candidate.tool_use_id = json_extract(alerts.evidence, '$.tool_use_id')
-                   ORDER BY candidate.type = 'PreToolUse' DESC,
-                            candidate.ts DESC,
-                            candidate.event_id DESC
-                   LIMIT 1
-                 ),
-                 (
-                   SELECT candidate.event_id
-                   FROM agent_events AS candidate
-                   WHERE candidate.request_id = alerts.request_id
-                     AND candidate.type = 'PreToolUse'
-                     AND candidate.ts <= alerts.created_at
-                   ORDER BY candidate.ts DESC, candidate.event_id DESC
-                   LIMIT 1
-                 ),
-                 (
-                   SELECT candidate.event_id
-                   FROM agent_events AS candidate
-                   WHERE candidate.request_id = alerts.request_id
-                     AND candidate.ts <= alerts.created_at
-                   ORDER BY candidate.ts DESC, candidate.event_id DESC
-                   LIMIT 1
-                 )
-               )
-             LEFT JOIN human_feedback AS feedback
-               ON feedback.feedback_id = (
-                 SELECT candidate_feedback.feedback_id
-                 FROM human_feedback AS candidate_feedback
-                 WHERE candidate_feedback.event_key = 'alert:' || alerts.alert_id
-                 ORDER BY candidate_feedback.created_at DESC,
-                          candidate_feedback.feedback_id DESC
-                 LIMIT 1
-               )
-             ORDER BY alerts.created_at DESC, alerts.alert_id DESC
-             LIMIT 200",
-        );
-        let alerts = query_json_rows(conn, &alerts_sql, |row| {
-            Ok(json!({
-                "alert_id": row.get::<_, i64>(0)?,
-                "request_id": row.get::<_, Option<i64>>(1)?,
-                "entity_kind": row.get::<_, Option<String>>(2)?,
-                "entity_id": row.get::<_, Option<i64>>(3)?,
-                "severity": row.get::<_, String>(4)?,
-                "action": row.get::<_, String>(5)?,
-                "rule_id": row.get::<_, String>(6)?,
-                "message": row.get::<_, String>(7)?,
-                "path": row.get::<_, Option<String>>(8)?,
-                "evidence": row.get::<_, Option<String>>(9)?,
-                "created_at": row.get::<_, i64>(10)?,
-                "session_id": row.get::<_, Option<String>>(11)?,
-                "original_user_prompt": dashboard_request_prompt(
-                    row.get::<_, Option<String>>(12)?.as_deref()
-                ),
-                "event_source": row.get::<_, Option<String>>(13)?,
-                "event_type": row.get::<_, Option<String>>(14)?,
-                "tool_name": row.get::<_, Option<String>>(15)?,
-                "tool_input": row.get::<_, Option<String>>(16)?,
-                "tool_use_id": row.get::<_, Option<String>>(17)?,
-                "human_verdict": row.get::<_, Option<String>>(18)?,
-                "feedback_label": row.get::<_, Option<String>>(19)?,
-                "feedback_created_at": row.get::<_, Option<i64>>(20)?,
-            }))
-        })?;
+        let alerts = dashboard_alerts(conn, None, Some(200))?;
         let agent_events = query_json_rows(
             conn,
             "SELECT event_id, pid, agent_events.request_id, requests.session_id, ts,
@@ -623,26 +540,73 @@ impl EventStore {
                 }))
             },
         )?;
-        let requests = query_json_rows(
-            conn,
-            "SELECT request_id, session_id, original_user_prompt, created_at, completed_at
-             FROM requests
-             ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
-             LIMIT 100",
-            |row| {
-                Ok(json!({
-                    "request_id": row.get::<_, i64>(0)?,
-                    "session_id": row.get::<_, String>(1)?,
-                    "original_user_prompt": dashboard_request_prompt(
-                        row.get::<_, Option<String>>(2)?.as_deref()
-                    ),
-                    "created_at": row.get::<_, Option<i64>>(3)?,
-                    "completed_at": row.get::<_, Option<i64>>(4)?,
-                    "file_touches": [],
-                    "ignored_file_touch_paths": [],
-                }))
-            },
-        )?;
+        let requests_sql = format!(
+            "WITH {visible_alerts_cte},
+             recent_requests AS MATERIALIZED (
+               SELECT request_id, session_id,
+                      substr(original_user_prompt, 1, 16384) AS original_user_prompt,
+                      created_at, completed_at
+               FROM requests
+               ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
+               LIMIT 100
+             ),
+             event_rollups AS (
+               SELECT agent_events.request_id,
+                      SUM(CASE WHEN agent_events.type = 'PreToolUse' THEN 1 ELSE 0 END) AS tool_call_count
+               FROM agent_events
+               JOIN recent_requests ON recent_requests.request_id = agent_events.request_id
+               GROUP BY agent_events.request_id
+             ),
+             alert_rollups AS (
+               SELECT visible_alerts.request_id,
+                      COUNT(*) AS alert_count,
+                      SUM(CASE WHEN lower(visible_alerts.severity) IN ('high', 'critical') THEN 1 ELSE 0 END) AS high_risk_alert_count,
+                      CASE MAX(CASE lower(visible_alerts.severity)
+                        WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3
+                        WHEN 'low' THEN 2 ELSE 1 END)
+                        WHEN 5 THEN 'critical' WHEN 4 THEN 'high' WHEN 3 THEN 'medium'
+                        WHEN 2 THEN 'low' ELSE 'info' END AS strongest_severity,
+                      CASE MAX(CASE lower(visible_alerts.action)
+                        WHEN 'deny' THEN 4 WHEN 'block' THEN 4 WHEN 'ask' THEN 3
+                        WHEN 'warn' THEN 2 ELSE 1 END)
+                        WHEN 4 THEN 'block' WHEN 3 THEN 'ask' WHEN 2 THEN 'warn'
+                        ELSE 'allow' END AS strongest_action
+               FROM visible_alerts
+               JOIN recent_requests ON recent_requests.request_id = visible_alerts.request_id
+               GROUP BY visible_alerts.request_id
+             )
+             SELECT recent_requests.request_id, recent_requests.session_id,
+                    recent_requests.original_user_prompt, recent_requests.created_at,
+                    recent_requests.completed_at,
+                    COALESCE(event_rollups.tool_call_count, 0),
+                    COALESCE(alert_rollups.alert_count, 0),
+                    COALESCE(alert_rollups.high_risk_alert_count, 0),
+                    COALESCE(alert_rollups.strongest_severity, 'info'),
+                    COALESCE(alert_rollups.strongest_action, 'allow')
+             FROM recent_requests
+             LEFT JOIN event_rollups ON event_rollups.request_id = recent_requests.request_id
+             LEFT JOIN alert_rollups ON alert_rollups.request_id = recent_requests.request_id
+             ORDER BY COALESCE(recent_requests.completed_at, recent_requests.created_at, recent_requests.request_id) DESC,
+                      recent_requests.request_id DESC"
+        );
+        let requests = query_json_rows(conn, &requests_sql, |row| {
+            Ok(json!({
+                "request_id": row.get::<_, i64>(0)?,
+                "session_id": row.get::<_, String>(1)?,
+                "original_user_prompt": dashboard_request_prompt(
+                    row.get::<_, Option<String>>(2)?.as_deref()
+                ),
+                "created_at": row.get::<_, Option<i64>>(3)?,
+                "completed_at": row.get::<_, Option<i64>>(4)?,
+                "tool_call_count": row.get::<_, i64>(5)?,
+                "alert_count": row.get::<_, i64>(6)?,
+                "high_risk_alert_count": row.get::<_, i64>(7)?,
+                "strongest_severity": row.get::<_, String>(8)?,
+                "strongest_action": row.get::<_, String>(9)?,
+                "file_touches": [],
+                "ignored_file_touch_paths": [],
+            }))
+        })?;
         let artifact_query = "SELECT kind, uri, current_digest, last_seen_at,
                     last_modified_at, last_modified_source,
                     last_modified_session_id, risk_level, risk_rule_id,
@@ -850,7 +814,7 @@ impl EventStore {
 
         let mut request = conn
             .query_row(
-                "SELECT request_id, session_id, original_user_prompt, created_at, completed_at
+                "SELECT request_id, session_id, substr(original_user_prompt, 1, 16384), created_at, completed_at
                  FROM requests
                  WHERE request_id = ?1",
                 [request_id],
@@ -929,72 +893,7 @@ impl EventStore {
             },
         )?;
 
-        let visible_alerts_cte = dashboard_visible_alerts_cte();
-        let alerts_sql = format!(
-            "WITH {visible_alerts_cte}
-             SELECT alerts.alert_id, alerts.request_id, alerts.severity, alerts.action,
-                    alerts.rule_id, alerts.message, alerts.path, alerts.evidence,
-                    alerts.created_at, requests.session_id,
-                    trigger_event.source, trigger_event.type, trigger_event.tool_name,
-                    trigger_event.tool_input, trigger_event.tool_use_id,
-                    feedback.human_verdict, feedback.label, feedback.created_at
-             FROM visible_alerts AS alerts
-             LEFT JOIN requests ON requests.request_id = alerts.request_id
-             LEFT JOIN agent_events AS trigger_event
-               ON trigger_event.event_id = COALESCE(
-                 CASE WHEN alerts.entity_kind = 'agent_event' THEN alerts.entity_id END,
-                 (
-                   SELECT candidate.event_id FROM agent_events AS candidate
-                   WHERE candidate.request_id = alerts.request_id
-                     AND candidate.tool_use_id = json_extract(alerts.evidence, '$.tool_use_id')
-                   ORDER BY candidate.type = 'PreToolUse' DESC,
-                            candidate.ts DESC, candidate.event_id DESC
-                   LIMIT 1
-                 ),
-                 (
-                   SELECT candidate.event_id FROM agent_events AS candidate
-                   WHERE candidate.request_id = alerts.request_id
-                     AND candidate.type = 'PreToolUse'
-                     AND candidate.ts <= alerts.created_at
-                   ORDER BY candidate.ts DESC, candidate.event_id DESC
-                   LIMIT 1
-                 )
-               )
-             LEFT JOIN human_feedback AS feedback
-               ON feedback.feedback_id = (
-                 SELECT candidate_feedback.feedback_id
-                 FROM human_feedback AS candidate_feedback
-                 WHERE candidate_feedback.event_key = 'alert:' || alerts.alert_id
-                 ORDER BY candidate_feedback.created_at DESC,
-                          candidate_feedback.feedback_id DESC
-                 LIMIT 1
-               )
-             WHERE alerts.request_id = ?1
-             ORDER BY alerts.created_at DESC, alerts.alert_id DESC"
-        );
-        let alerts = query_json_rows_with_i64(conn, &alerts_sql, request_id, |row| {
-            Ok(json!({
-                "alert_id": row.get::<_, i64>(0)?,
-                "request_id": row.get::<_, Option<i64>>(1)?,
-                "severity": row.get::<_, String>(2)?,
-                "action": row.get::<_, String>(3)?,
-                "rule_id": row.get::<_, String>(4)?,
-                "message": row.get::<_, String>(5)?,
-                "path": row.get::<_, Option<String>>(6)?,
-                "evidence": row.get::<_, Option<String>>(7)?,
-                "created_at": row.get::<_, i64>(8)?,
-                "session_id": row.get::<_, Option<String>>(9)?,
-                "original_user_prompt": request["original_user_prompt"].clone(),
-                "event_source": row.get::<_, Option<String>>(10)?,
-                "event_type": row.get::<_, Option<String>>(11)?,
-                "tool_name": row.get::<_, Option<String>>(12)?,
-                "tool_input": row.get::<_, Option<String>>(13)?,
-                "tool_use_id": row.get::<_, Option<String>>(14)?,
-                "human_verdict": row.get::<_, Option<String>>(15)?,
-                "feedback_label": row.get::<_, Option<String>>(16)?,
-                "feedback_created_at": row.get::<_, Option<i64>>(17)?,
-            }))
-        })?;
+        let alerts = dashboard_alerts(conn, Some(request_id), None)?;
 
         Ok(json!({
             "request": request,
@@ -3451,6 +3350,102 @@ fn dashboard_visible_alerts_cte() -> String {
     )
 }
 
+fn dashboard_alerts(
+    conn: &rusqlite::Connection,
+    request_id: Option<i64>,
+    limit: Option<usize>,
+) -> io::Result<Vec<Value>> {
+    let visible_alerts_cte = dashboard_visible_alerts_cte();
+    let where_clause = request_id
+        .map(|_| "WHERE alerts.request_id = ?1")
+        .unwrap_or_default();
+    let limit_clause = limit
+        .map(|value| format!("LIMIT {value}"))
+        .unwrap_or_default();
+    let sql = format!(
+        "WITH {visible_alerts_cte}
+         SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
+                alerts.severity, alerts.action, alerts.rule_id, alerts.message,
+                alerts.path, alerts.evidence, alerts.created_at,
+                requests.session_id, substr(requests.original_user_prompt, 1, 16384),
+                trigger_event.source, trigger_event.type, trigger_event.tool_name,
+                trigger_event.tool_input, trigger_event.tool_use_id,
+                feedback.human_verdict, feedback.label, feedback.created_at
+         FROM visible_alerts AS alerts
+         LEFT JOIN requests ON requests.request_id = alerts.request_id
+         LEFT JOIN agent_events AS trigger_event
+           ON trigger_event.event_id = COALESCE(
+             CASE WHEN alerts.entity_kind = 'agent_event' THEN alerts.entity_id END,
+             (
+               SELECT candidate.event_id FROM agent_events AS candidate
+               WHERE candidate.request_id = alerts.request_id
+                 AND candidate.tool_use_id = json_extract(alerts.evidence, '$.tool_use_id')
+               ORDER BY candidate.type = 'PreToolUse' DESC,
+                        candidate.ts DESC, candidate.event_id DESC
+               LIMIT 1
+             ),
+             (
+               SELECT candidate.event_id FROM agent_events AS candidate
+               WHERE candidate.request_id = alerts.request_id
+                 AND candidate.type = 'PreToolUse'
+                 AND candidate.ts <= alerts.created_at
+               ORDER BY candidate.ts DESC, candidate.event_id DESC
+               LIMIT 1
+             ),
+             (
+               SELECT candidate.event_id FROM agent_events AS candidate
+               WHERE candidate.request_id = alerts.request_id
+                 AND candidate.ts <= alerts.created_at
+               ORDER BY candidate.ts DESC, candidate.event_id DESC
+               LIMIT 1
+             )
+           )
+         LEFT JOIN human_feedback AS feedback
+           ON feedback.feedback_id = (
+             SELECT candidate_feedback.feedback_id
+             FROM human_feedback AS candidate_feedback
+             WHERE candidate_feedback.event_key = 'alert:' || alerts.alert_id
+             ORDER BY candidate_feedback.created_at DESC,
+                      candidate_feedback.feedback_id DESC
+             LIMIT 1
+           )
+         {where_clause}
+         ORDER BY alerts.created_at DESC, alerts.alert_id DESC
+         {limit_clause}"
+    );
+    let mapper = |row: &rusqlite::Row<'_>| {
+        Ok(json!({
+            "alert_id": row.get::<_, i64>(0)?,
+            "request_id": row.get::<_, Option<i64>>(1)?,
+            "entity_kind": row.get::<_, Option<String>>(2)?,
+            "entity_id": row.get::<_, Option<i64>>(3)?,
+            "severity": row.get::<_, String>(4)?,
+            "action": row.get::<_, String>(5)?,
+            "rule_id": row.get::<_, String>(6)?,
+            "message": row.get::<_, String>(7)?,
+            "path": row.get::<_, Option<String>>(8)?,
+            "evidence": row.get::<_, Option<String>>(9)?,
+            "created_at": row.get::<_, i64>(10)?,
+            "session_id": row.get::<_, Option<String>>(11)?,
+            "original_user_prompt": dashboard_request_prompt(
+                row.get::<_, Option<String>>(12)?.as_deref()
+            ),
+            "event_source": row.get::<_, Option<String>>(13)?,
+            "event_type": row.get::<_, Option<String>>(14)?,
+            "tool_name": row.get::<_, Option<String>>(15)?,
+            "tool_input": row.get::<_, Option<String>>(16)?,
+            "tool_use_id": row.get::<_, Option<String>>(17)?,
+            "human_verdict": row.get::<_, Option<String>>(18)?,
+            "feedback_label": row.get::<_, Option<String>>(19)?,
+            "feedback_created_at": row.get::<_, Option<i64>>(20)?,
+        }))
+    };
+    match request_id {
+        Some(request_id) => query_json_rows_with_i64(conn, &sql, request_id, mapper),
+        None => query_json_rows(conn, &sql, mapper),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArtifactAccess {
     Consumed,
@@ -4381,14 +4376,31 @@ mod tests {
         tool.tool_use_id = Some("read-1".to_string());
         store.append_hook_event(&tool).unwrap();
         store
+            .append_policy_alert(&PolicyAlert {
+                session_id: Some("s1".to_string()),
+                tool_use_id: None,
+                severity: "high".to_string(),
+                action: "warn".to_string(),
+                rule_id: "request_rollup_test".to_string(),
+                message: "Review the preceding read".to_string(),
+                path: None,
+                evidence: None,
+                observed_at_ms: now + 2,
+            })
+            .unwrap();
+        store
             .append_hook_event(&hook_event(
                 "Stop",
                 r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
-                now + 2,
+                now + 3,
             ))
             .unwrap();
 
         let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["requests"][0]["tool_call_count"], 1);
+        assert_eq!(dashboard["requests"][0]["alert_count"], 1);
+        assert_eq!(dashboard["requests"][0]["high_risk_alert_count"], 1);
+        assert_eq!(dashboard["requests"][0]["strongest_severity"], "high");
         let request_id = dashboard["requests"][0]["request_id"].as_i64().unwrap();
         let detail = store.dashboard_request(request_id).unwrap();
         assert_eq!(detail["request"]["request_id"], request_id);
@@ -4398,6 +4410,7 @@ mod tests {
         );
         assert_eq!(detail["agentEvents"].as_array().unwrap().len(), 1);
         assert_eq!(detail["agentEvents"][0]["type"], "PreToolUse");
+        assert_eq!(detail["alerts"][0]["tool_name"], "Read");
         assert!(detail["agentEvents"]
             .as_array()
             .unwrap()

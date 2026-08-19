@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const CHECKPOINT_REF_PREFIX: &str = "refs/gensee/checkpoints";
+const DEFAULT_CHECKPOINT_PRUNE_HOURS: u64 = 24 * 30;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct WorkspaceCheckpoint {
@@ -28,15 +29,20 @@ struct CheckpointRestoreResponse {
     rescue: WorkspaceCheckpoint,
 }
 
+#[derive(Debug, Serialize)]
+struct CheckpointDeleteResponse {
+    deleted: Vec<String>,
+}
+
 pub(crate) fn handle_checkpoint(args: Vec<OsString>) -> io::Result<()> {
     let command = args.first().and_then(|arg| arg.to_str()).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "checkpoint requires create, list, or restore",
+            "checkpoint requires create, list, restore, delete, or prune",
         )
     })?;
     let parsed = CheckpointArgs::parse(&args[1..])?;
-    let workspace = parsed.workspace.unwrap_or(env::current_dir()?);
+    let workspace = parsed.workspace.clone().unwrap_or(env::current_dir()?);
     let storage_root = checkpoint_storage_root()?;
 
     match command {
@@ -102,6 +108,52 @@ pub(crate) fn handle_checkpoint(args: Vec<OsString>) -> io::Result<()> {
             }
             Ok(())
         }
+        "delete" => {
+            let id = parsed.positionals.first().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "checkpoint delete requires an id",
+                )
+            })?;
+            require_checkpoint_confirmation(&parsed, "delete")?;
+            let repository = git_repository_root(&workspace)?;
+            delete_checkpoint_at(&repository, &storage_root, id)?;
+            if parsed.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&CheckpointDeleteResponse {
+                        deleted: vec![id.clone()],
+                    })?
+                );
+            } else {
+                println!("Deleted checkpoint {id}");
+            }
+            Ok(())
+        }
+        "prune" => {
+            require_checkpoint_confirmation(&parsed, "prune")?;
+            let repository = git_repository_root(&workspace)?;
+            let older_than_hours = parsed
+                .older_than_hours
+                .unwrap_or(DEFAULT_CHECKPOINT_PRUNE_HOURS);
+            let cutoff = now_ms()?.saturating_sub(older_than_hours.saturating_mul(3_600_000));
+            let mut deleted = Vec::new();
+            for checkpoint in list_checkpoints_at(&repository, &storage_root)? {
+                if checkpoint.created_at_ms < cutoff {
+                    delete_checkpoint_at(&repository, &storage_root, &checkpoint.id)?;
+                    deleted.push(checkpoint.id);
+                }
+            }
+            if parsed.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&CheckpointDeleteResponse { deleted })?
+                );
+            } else {
+                println!("Pruned {} checkpoint(s)", deleted.len());
+            }
+            Ok(())
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unknown checkpoint command: {other}"),
@@ -115,6 +167,7 @@ struct CheckpointArgs {
     label: Option<String>,
     json: bool,
     yes: bool,
+    older_than_hours: Option<u64>,
     positionals: Vec<String>,
 }
 
@@ -135,6 +188,25 @@ impl CheckpointArgs {
                 }
                 Some("--json") => parsed.json = true,
                 Some("--yes") => parsed.yes = true,
+                Some("--older-than-hours") => {
+                    index += 1;
+                    parsed.older_than_hours = Some(
+                        required_value(args, index, "--older-than-hours")?
+                            .parse()
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "--older-than-hours must be a positive integer",
+                                )
+                            })?,
+                    );
+                    if parsed.older_than_hours == Some(0) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--older-than-hours must be greater than zero",
+                        ));
+                    }
+                }
                 Some(value) if value.starts_with('-') => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -153,6 +225,16 @@ impl CheckpointArgs {
         }
         Ok(parsed)
     }
+}
+
+fn require_checkpoint_confirmation(parsed: &CheckpointArgs, operation: &str) -> io::Result<()> {
+    if parsed.yes {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("checkpoint {operation} removes recovery data; pass --yes after reviewing it"),
+    ))
 }
 
 fn required_value<'a>(args: &'a [OsString], index: usize, option: &str) -> io::Result<&'a str> {
@@ -323,6 +405,36 @@ fn restore_checkpoint_at(
     Ok(CheckpointRestoreResponse { restored, rescue })
 }
 
+fn delete_checkpoint_at(repository: &Path, storage_root: &Path, id: &str) -> io::Result<()> {
+    validate_checkpoint_id(id)?;
+    let repository = fs::canonicalize(repository)?;
+    let metadata_path =
+        repository_checkpoint_directory(storage_root, &repository).join(format!("{id}.json"));
+    let checkpoint: WorkspaceCheckpoint =
+        serde_json::from_slice(&fs::read(&metadata_path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "checkpoint {id} does not exist for {}",
+                        repository.display()
+                    ),
+                )
+            } else {
+                error
+            }
+        })?)?;
+    if checkpoint.workspace != repository.to_string_lossy() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint metadata belongs to a different workspace",
+        ));
+    }
+    let reference = format!("{CHECKPOINT_REF_PREFIX}/{id}");
+    git(&repository, None, &["update-ref", "-d", &reference])?;
+    fs::remove_file(metadata_path)
+}
+
 fn validate_checkpoint_id(id: &str) -> io::Result<()> {
     if id.is_empty()
         || !id
@@ -426,14 +538,37 @@ fn now_ms() -> io::Result<u64> {
 
 struct TemporaryGitIndex {
     path: PathBuf,
+    directory: PathBuf,
 }
 
 impl TemporaryGitIndex {
     fn new() -> io::Result<Self> {
-        let directory = env::temp_dir().join("gensee-checkpoints");
-        fs::create_dir_all(&directory)?;
-        let path = directory.join(format!("index-{}-{}.index", std::process::id(), now_ms()?));
-        Ok(Self { path })
+        let parent = env::temp_dir().join("gensee-checkpoints");
+        fs::create_dir_all(&parent)?;
+        let mut nonce = now_ms()?;
+        for _ in 0..128 {
+            let directory = parent.join(format!("{}-{nonce}", std::process::id()));
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&directory) {
+                Ok(()) => {
+                    let path = directory.join("index");
+                    return Ok(Self { path, directory });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    nonce = nonce.wrapping_add(1);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a private checkpoint workspace",
+        ))
     }
 }
 
@@ -441,6 +576,7 @@ impl Drop for TemporaryGitIndex {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
         let _ = fs::remove_file(self.path.with_extension("index.lock"));
+        let _ = fs::remove_dir(&self.directory);
     }
 }
 
@@ -535,6 +671,35 @@ mod tests {
         let error = restore_checkpoint_at(&second, &storage, &checkpoint.id)
             .expect_err("cross-repository restore must fail");
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(sandbox).expect("cleanup");
+    }
+
+    #[test]
+    fn deleting_checkpoint_removes_metadata_and_git_reference() {
+        let sandbox = test_directory("delete");
+        let repository = sandbox.join("repo");
+        let storage = sandbox.join("storage");
+        fs::create_dir_all(&repository).expect("create repository");
+        run_git(&repository, &["init"]);
+        fs::write(repository.join("file.txt"), "captured").expect("write file");
+        let checkpoint =
+            create_checkpoint_at(&repository, &storage, None, None).expect("create checkpoint");
+
+        delete_checkpoint_at(&repository, &storage, &checkpoint.id).expect("delete checkpoint");
+
+        assert!(list_checkpoints_at(&repository, &storage)
+            .expect("list checkpoints")
+            .is_empty());
+        assert!(git_optional(
+            &repository,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{CHECKPOINT_REF_PREFIX}/{}", checkpoint.id)
+            ]
+        )
+        .expect("check reference")
+        .is_none());
         fs::remove_dir_all(sandbox).expect("cleanup");
     }
 }

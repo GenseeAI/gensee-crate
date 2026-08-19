@@ -6,6 +6,7 @@ struct DashboardRecoveryPage: View {
     @AppStorage("gensee.recovery.workspace") private var workspacePath = ""
     @State private var label = ""
     @State private var restoreCandidate: WorkspaceCheckpointRecord?
+    @State private var deleteCandidate: WorkspaceCheckpointRecord?
 
     var body: some View {
         DashboardPage {
@@ -40,6 +41,15 @@ struct DashboardRecoveryPage: View {
             }
         } message: { checkpoint in
             Text("Gensee will first preserve the workspace as it is now, then restore \(checkpoint.label ?? checkpoint.id). Tracked and untracked non-ignored files may change or be removed. Ignored files and your Git staging index stay untouched.")
+        }
+        .alert("Delete this checkpoint?", isPresented: deletePresented, presenting: deleteCandidate) { checkpoint in
+            Button("Cancel", role: .cancel) { deleteCandidate = nil }
+            Button("Delete", role: .destructive) {
+                deleteCandidate = nil
+                Task { await model.deleteCheckpoint(checkpoint, workspace: workspacePath) }
+            }
+        } message: { checkpoint in
+            Text("This removes \(checkpoint.label ?? checkpoint.id) and its local Git recovery reference. It cannot be restored afterward.")
         }
     }
 
@@ -156,6 +166,12 @@ struct DashboardRecoveryPage: View {
             Button("Restore…") { restoreCandidate = checkpoint }
                 .controlSize(.small)
                 .disabled(model.runningCommand != nil)
+            Button(role: .destructive) { deleteCandidate = checkpoint } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .help("Delete checkpoint")
+            .disabled(model.runningCommand != nil)
         }
         .padding(.vertical, 11)
     }
@@ -164,6 +180,13 @@ struct DashboardRecoveryPage: View {
         Binding(
             get: { restoreCandidate != nil },
             set: { if !$0 { restoreCandidate = nil } }
+        )
+    }
+
+    private var deletePresented: Binding<Bool> {
+        Binding(
+            get: { deleteCandidate != nil },
+            set: { if !$0 { deleteCandidate = nil } }
         )
     }
 

@@ -700,6 +700,7 @@ struct DashboardSettingsPage: View {
     @Binding var darkMode: Bool
     let onRunSetupAssistant: () -> Void
     @State private var confirmRemoval = false
+    @State private var pendingProtectionLevel: ProtectionLevel?
 
     var body: some View {
         DashboardPage {
@@ -723,7 +724,11 @@ struct DashboardSettingsPage: View {
                         HStack(alignment: .top, spacing: 10) {
                             ForEach(ProtectionLevel.allCases) { level in
                                 Button {
-                                    Task { _ = await model.applyProtectionLevel(level) }
+                                    if model.wouldLowerProtection(level) {
+                                        pendingProtectionLevel = level
+                                    } else {
+                                        Task { _ = await model.applyProtectionLevel(level) }
+                                    }
                                 } label: {
                                     VStack(alignment: .leading, spacing: 5) {
                                         HStack {
@@ -756,7 +761,8 @@ struct DashboardSettingsPage: View {
                                 .disabled(model.runningCommand != nil)
                             }
                         }
-                        Text(model.protectionLevel.detail)
+                        Text(model.protectionLevel?.detail
+                            ?? "Custom policy: Endpoint Security mode and noninteractive enforcement do not match a preset. Gensee preserves both settings until you explicitly choose a profile.")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                     }
@@ -798,6 +804,22 @@ struct DashboardSettingsPage: View {
             Button("Cancel", role: .cancel) {}
             Button("Remove Extension", role: .destructive) { extensionManager.deactivate() }
         } message: { Text("Crate will stop receiving operating-system process and file events until the extension is installed again.") }
+        .alert("Lower protection?", isPresented: loweringProtectionPresented, presenting: pendingProtectionLevel) { level in
+            Button("Cancel", role: .cancel) { pendingProtectionLevel = nil }
+            Button("Use \(level.title)", role: .destructive) {
+                pendingProtectionLevel = nil
+                Task { _ = await model.applyProtectionLevel(level) }
+            }
+        } message: { level in
+            Text("This changes both Endpoint Security mode and interactive enforcement. Review the \(level.title) description before continuing.")
+        }
+    }
+
+    private var loweringProtectionPresented: Binding<Bool> {
+        Binding(
+            get: { pendingProtectionLevel != nil },
+            set: { if !$0 { pendingProtectionLevel = nil } }
+        )
     }
 
     private var notificationSettings: some View {

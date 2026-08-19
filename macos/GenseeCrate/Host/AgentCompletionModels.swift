@@ -201,15 +201,20 @@ enum AgentCompletionDerivation {
             let unmatchedFiles = request.fileTouches
                 .filter { !$0.intendedAndVerified }
                 .map(\.path)
-            let strongestAction = alerts.map(\.action).max(by: { actionRank($0) < actionRank($1) }) ?? "allow"
-            let strongestSeverity = alerts.map(\.severity).max(by: { severityRank($0) < severityRank($1) }) ?? "info"
-            let highRiskCount = alerts.filter {
+            let strongestAction = request.strongestAction
+                ?? alerts.map(\.action).max(by: { actionRank($0) < actionRank($1) })
+                ?? "allow"
+            let strongestSeverity = request.strongestSeverity
+                ?? alerts.map(\.severity).max(by: { severityRank($0) < severityRank($1) })
+                ?? "info"
+            let highRiskCount = request.highRiskAlertCount ?? alerts.filter {
                 ["high", "critical"].contains($0.severity.lowercased())
             }.count
+            let alertCount = request.alertCount ?? alerts.count
             let reviewState: AgentReviewState
             if highRiskCount > 0 || ["block", "deny"].contains(strongestAction.lowercased()) {
                 reviewState = .attention
-            } else if !alerts.isEmpty || ["warn", "ask"].contains(strongestAction.lowercased()) {
+            } else if alertCount > 0 || ["warn", "ask"].contains(strongestAction.lowercased()) {
                 reviewState = .review
             } else {
                 reviewState = .verified
@@ -228,14 +233,14 @@ enum AgentCompletionDerivation {
                 startedAt: startedAt,
                 completedAt: completedAt,
                 durationMS: completedAt - startedAt,
-                toolCallCount: calls.count,
+                toolCallCount: request.toolCallCount ?? calls.count,
                 commandCount: calls.filter { isCommandTool($0.toolName) }.count,
                 affectedFiles: affectedFiles,
                 verifiedFiles: verifiedFiles,
                 unmatchedFiles: unmatchedFiles,
                 ignoredFiles: request.ignoredFileTouchPaths,
                 testCommandCount: calls.filter(isTestCall).count,
-                alertCount: alerts.count,
+                alertCount: alertCount,
                 highRiskAlertCount: highRiskCount,
                 strongestAction: strongestAction,
                 strongestSeverity: strongestSeverity,
@@ -293,8 +298,7 @@ enum AgentCompletionDerivation {
 
     private static func isTestCall(_ call: TimelineToolCall) -> Bool {
         guard isCommandTool(call.toolName), let input = call.input?.lowercased() else { return false }
-        return [" test", "test ", "pytest", "xcodebuild test", "npm test", "pnpm test", "yarn test", "cargo test", "go test", "swift test"]
-            .contains { input.contains($0) }
+        return input.range(of: #"\b(?:test|tests|pytest)\b"#, options: .regularExpression) != nil
     }
 
     private static func actionRank(_ action: String) -> Int {

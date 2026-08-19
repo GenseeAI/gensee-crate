@@ -68,14 +68,18 @@ struct DashboardShell: View {
             model.endpointSensor.start()
             await notifications.refreshAuthorizationStatus()
             await model.refreshAll()
-            await notifications.process(snapshot: model.snapshot)
+            if !model.isDemoMode {
+                await notifications.process(snapshot: model.snapshot)
+            }
             while !Task.isCancelled {
                 // Dashboard queries intentionally run less frequently than the
                 // sensor poll. This keeps UI projection work from competing
                 // with durable Endpoint Security ingestion under load.
                 try? await Task.sleep(for: .seconds(10))
                 await model.refreshDashboard(reportErrors: false)
-                await notifications.process(snapshot: model.snapshot)
+                if !model.isDemoMode {
+                    await notifications.process(snapshot: model.snapshot)
+                }
             }
         }
         .alert("Gensee needs attention", isPresented: errorPresented) {

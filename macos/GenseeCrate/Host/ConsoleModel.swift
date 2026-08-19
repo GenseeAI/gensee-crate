@@ -70,11 +70,17 @@ final class ConsoleModel: ObservableObject {
         )
     }
     var localRuntimePrepared: Bool { stableBackendInstalled && databaseExists && policyExists }
-    var protectionLevel: ProtectionLevel {
+    var protectionLevel: ProtectionLevel? {
         ProtectionLevel.current(
             endpointMode: policy.endpointSecurityMode,
             noninteractive: policy.noninteractive
         )
+    }
+
+    func wouldLowerProtection(_ level: ProtectionLevel) -> Bool {
+        let rank = ["observe": 0, "protect": 1, "strict": 2]
+        return (rank[level.endpointMode] ?? 0) < (rank[policy.endpointSecurityMode] ?? 0)
+            || (policy.noninteractive && !level.noninteractive)
     }
     var databaseEncrypted: Bool {
         guard let handle = try? FileHandle(forReadingFrom: databaseURL) else { return false }
@@ -354,6 +360,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func loadCheckpoints(workspace: String, reportErrors: Bool = true) async {
+        guard !isDemoMode else { return }
         guard backendAvailable else {
             if reportErrors { errorMessage = GenseeCLIError.executableNotFound.localizedDescription }
             return
@@ -379,6 +386,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func createCheckpoint(workspace: String, label: String) async {
+        guard !isDemoMode else { return }
         guard let workspaceURL = existingWorkspaceURL(workspace) else {
             errorMessage = "Choose an existing Git workspace before creating a checkpoint."
             return
@@ -404,6 +412,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func restoreCheckpoint(_ checkpoint: WorkspaceCheckpointRecord, workspace: String) async {
+        guard !isDemoMode else { return }
         guard let workspaceURL = existingWorkspaceURL(workspace) else {
             errorMessage = "Choose the checkpoint's Git workspace before restoring it."
             return
@@ -418,9 +427,33 @@ final class ConsoleModel: ObservableObject {
                     "--workspace", workspaceURL.path,
                     "--yes", "--json",
                 ],
-                timeout: 60
+                timeout: 300
             )
             noticeMessage = "Restored \(response.restored.label ?? response.restored.id). Rescue checkpoint: \(response.rescue.id)."
+            await loadCheckpoints(workspace: workspaceURL.path, reportErrors: false)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func deleteCheckpoint(_ checkpoint: WorkspaceCheckpointRecord, workspace: String) async {
+        guard !isDemoMode else { return }
+        guard let workspaceURL = existingWorkspaceURL(workspace) else {
+            errorMessage = "Choose the checkpoint's Git workspace before deleting it."
+            return
+        }
+        runningCommand = "Deleting recovery checkpoint"
+        defer { runningCommand = nil }
+        do {
+            _ = try await cli.run(
+                [
+                    "checkpoint", "delete", checkpoint.id,
+                    "--workspace", workspaceURL.path,
+                    "--yes", "--json",
+                ],
+                timeout: 60
+            )
+            noticeMessage = "Deleted checkpoint \(checkpoint.label ?? checkpoint.id)."
             await loadCheckpoints(workspace: workspaceURL.path, reportErrors: false)
         } catch {
             errorMessage = error.localizedDescription
@@ -710,6 +743,10 @@ final class ConsoleModel: ObservableObject {
         snapshot = DemoSnapshotFactory.make()
         isDemoMode = true
         dashboardRefreshIssue = nil
+        dailyDetail = nil
+        dailyDetailLoadState = .idle
+        requestReviewPayload = nil
+        requestReviewLoadState = .idle
         errorMessage = nil
         lastUpdated = Date()
     }
@@ -720,6 +757,8 @@ final class ConsoleModel: ObservableObject {
         snapshot = snapshotBeforeDemo
         dailyDetail = nil
         dailyDetailLoadState = .idle
+        requestReviewPayload = nil
+        requestReviewLoadState = .idle
         await refreshAll()
     }
 

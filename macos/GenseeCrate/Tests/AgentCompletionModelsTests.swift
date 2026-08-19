@@ -103,6 +103,38 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertEqual(summary.reviewState, .verified)
     }
 
+    func testRequestRollupsSurviveBoundedGlobalEventArrays() throws {
+        var snapshot = SecuritySnapshot()
+        var recordedRequest = request(id: 9, started: 1_000, completed: 4_000)
+        recordedRequest.toolCallCount = 14
+        recordedRequest.alertCount = 6
+        recordedRequest.highRiskAlertCount = 2
+        recordedRequest.strongestSeverity = "critical"
+        recordedRequest.strongestAction = "block"
+        snapshot.requests = [recordedRequest]
+
+        let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
+
+        XCTAssertEqual(summary.toolCallCount, 14)
+        XCTAssertEqual(summary.alertCount, 6)
+        XCTAssertEqual(summary.highRiskAlertCount, 2)
+        XCTAssertEqual(summary.strongestSeverity, "critical")
+        XCTAssertEqual(summary.strongestAction, "block")
+        XCTAssertEqual(summary.reviewState, .attention)
+    }
+
+    func testTestDetectionDoesNotMatchWordsContainingTest() throws {
+        var snapshot = SecuritySnapshot()
+        snapshot.requests = [request(id: 7, started: 1_000, completed: 4_000)]
+        snapshot.agentEvents = [
+            event(id: 1, type: "PreToolUse", timestamp: 2_000, tool: "Bash", input: #"{"command":"show latest build"}"#, useID: "latest"),
+            event(id: 2, type: "PreToolUse", timestamp: 3_000, tool: "Bash", input: #"{"command":"cargo test"}"#, useID: "test"),
+        ]
+
+        let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
+        XCTAssertEqual(summary.testCommandCount, 1)
+    }
+
     func testBuildsSessionSummaryAcrossCompletedRequests() throws {
         var snapshot = SecuritySnapshot()
         snapshot.sessions = [RecordedSession(

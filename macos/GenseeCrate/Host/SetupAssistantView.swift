@@ -43,7 +43,9 @@ struct SetupAssistantView: View {
             extensionManager.refreshStatus()
             if model.localRuntimePrepared {
                 await model.refreshPolicy()
-                selectedLevel = model.protectionLevel
+                if let currentLevel = model.protectionLevel {
+                    selectedLevel = currentLevel
+                }
             }
         }
         .onChange(of: step) { newStep in

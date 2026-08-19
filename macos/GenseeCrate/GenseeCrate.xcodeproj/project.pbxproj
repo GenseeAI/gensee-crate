@@ -46,6 +46,7 @@
 		AF95DF2961EB5EB25758D917 /* DashboardComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3722B66B15A9D0C6A0542AB1 /* DashboardComponents.swift */; };
 		B3A01A811214C31B36C00F18 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C1B023EFF7B2DE9556556E9E /* Assets.xcassets */; };
 		B4EC3AFD2169905AA662360D /* ConsoleModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92AD1DC256F292439A6C70BA /* ConsoleModel.swift */; };
+		BC224BEF818643D287EDE948 /* CompletionNotificationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5696221C8D3C509E13414C00 /* CompletionNotificationCoordinator.swift */; };
 		C1CFBA97FF43FD867550E37E /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
 		C63DB304AAE36E38326D4231 /* ProgressiveTrust.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8ED1C38BD6A424DB96F9CD1 /* ProgressiveTrust.swift */; };
 		CABD267D92A105B162179646 /* ArtifactFactTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D50189280D53EE5D350B921A /* ArtifactFactTests.swift */; };
@@ -56,6 +57,7 @@
 		D50CF93055DEC2DF49AD2240 /* libEndpointSecurity.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C7E850A448A571324F7CA4F /* libEndpointSecurity.tbd */; };
 		DBA4A9B1E7D7F48F940E66CC /* HarnessActivationGuidance.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A26DF6DC7DD3F0CAA81BD6 /* HarnessActivationGuidance.swift */; };
 		DF38FDB826769C79187233CA /* HarnessConfigurationHealth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */; };
+		E39A7EDCA850C9B26BFAABCF /* CompletionNotificationCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2399100F5A9B8E60BF3E7E75 /* CompletionNotificationCoordinatorTests.swift */; };
 		F0620C2EBDB564E7762C995E /* HarnessActivationGuidanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F7E9D2CD5956A984D2F51D8 /* HarnessActivationGuidanceTests.swift */; };
 		F0B51B6C4F3DBC996FC99208 /* ProgressiveTrustTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B48A140830CDA099A21BBE9F /* ProgressiveTrustTests.swift */; };
 		F189FD121BF62C54B3887CDC /* EndpointIngestAcknowledgementIOTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FB2BA4717E0AC963EDF2CD1 /* EndpointIngestAcknowledgementIOTests.swift */; };
@@ -91,6 +93,7 @@
 /* Begin PBXFileReference section */
 		0EABB784CC4CC45204E63CA1 /* AlertSeverityBreakdownTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlertSeverityBreakdownTests.swift; sourceTree = "<group>"; };
 		18415BCF8F97E3CDBF1D9A21 /* EndpointIngestAcknowledgementIO.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointIngestAcknowledgementIO.swift; sourceTree = "<group>"; };
+		2399100F5A9B8E60BF3E7E75 /* CompletionNotificationCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompletionNotificationCoordinatorTests.swift; sourceTree = "<group>"; };
 		23D1D4F2FC41CDD9893C88C2 /* DashboardSecurityPages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardSecurityPages.swift; sourceTree = "<group>"; };
 		33796E13EB1EF4E91A5B2DA1 /* HarnessConfigurationHealth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HarnessConfigurationHealth.swift; sourceTree = "<group>"; };
 		35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardHarnessesPage.swift; sourceTree = "<group>"; };
@@ -205,6 +208,7 @@
 				0EABB784CC4CC45204E63CA1 /* AlertSeverityBreakdownTests.swift */,
 				D50189280D53EE5D350B921A /* ArtifactFactTests.swift */,
 				805C2FF6EE4D2777B55AD043 /* CheckpointModelsTests.swift */,
+				2399100F5A9B8E60BF3E7E75 /* CompletionNotificationCoordinatorTests.swift */,
 				7294E1EB1AB2BC3775FC1E9D /* ConfigAuditModelsTests.swift */,
 				9FB2BA4717E0AC963EDF2CD1 /* EndpointIngestAcknowledgementIOTests.swift */,
 				8F7E9D2CD5956A984D2F51D8 /* HarnessActivationGuidanceTests.swift */,
@@ -447,6 +451,8 @@
 				CABD267D92A105B162179646 /* ArtifactFactTests.swift in Sources */,
 				4768900C4797F5BA5C125F3A /* CheckpointModels.swift in Sources */,
 				54D7EAAB7240944B2DD6A040 /* CheckpointModelsTests.swift in Sources */,
+				BC224BEF818643D287EDE948 /* CompletionNotificationCoordinator.swift in Sources */,
+				E39A7EDCA850C9B26BFAABCF /* CompletionNotificationCoordinatorTests.swift in Sources */,
 				3C8D8EFE80616515AA2B1929 /* ConfigAuditModels.swift in Sources */,
 				076516A9E8D79FF29811936D /* ConfigAuditModelsTests.swift in Sources */,
 				953ADF0AC9D10BB7EDA306B6 /* ConsoleModels.swift in Sources */,

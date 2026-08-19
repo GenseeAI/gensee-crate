@@ -13,8 +13,9 @@ final class ProgressiveTrustTests: XCTestCase {
     func testCurrentLevelPrefersFailClosedConfiguration() {
         XCTAssertEqual(ProtectionLevel.current(endpointMode: "observe", noninteractive: false), .observe)
         XCTAssertEqual(ProtectionLevel.current(endpointMode: "protect", noninteractive: false), .guarded)
-        XCTAssertEqual(ProtectionLevel.current(endpointMode: "protect", noninteractive: true), .unattended)
-        XCTAssertEqual(ProtectionLevel.current(endpointMode: "strict", noninteractive: false), .unattended)
+        XCTAssertNil(ProtectionLevel.current(endpointMode: "protect", noninteractive: true))
+        XCTAssertNil(ProtectionLevel.current(endpointMode: "strict", noninteractive: false))
+        XCTAssertEqual(ProtectionLevel.current(endpointMode: "strict", noninteractive: true), .unattended)
     }
 
     func testSyntheticSnapshotIsInternallyConsistentAndClearlySourced() {

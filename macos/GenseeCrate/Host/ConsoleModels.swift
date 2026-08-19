@@ -382,6 +382,11 @@ struct RecordedRequest: Decodable, Identifiable {
     let completedAt: Int64?
     var fileTouches: [FileTouchEvidence] = []
     var ignoredFileTouchPaths: [String] = []
+    var toolCallCount: Int?
+    var alertCount: Int?
+    var highRiskAlertCount: Int?
+    var strongestSeverity: String?
+    var strongestAction: String?
 
     var id: Int64 { requestID }
 
@@ -394,6 +399,11 @@ struct RecordedRequest: Decodable, Identifiable {
         case completedAt = "completed_at"
         case fileTouches = "file_touches"
         case ignoredFileTouchPaths = "ignored_file_touch_paths"
+        case toolCallCount = "tool_call_count"
+        case alertCount = "alert_count"
+        case highRiskAlertCount = "high_risk_alert_count"
+        case strongestSeverity = "strongest_severity"
+        case strongestAction = "strongest_action"
     }
 }
 
@@ -408,6 +418,11 @@ extension RecordedRequest {
         completedAt = try values.decodeIfPresent(Int64.self, forKey: .completedAt)
         fileTouches = try values.decodeIfPresent([FileTouchEvidence].self, forKey: .fileTouches) ?? []
         ignoredFileTouchPaths = try values.decodeIfPresent([String].self, forKey: .ignoredFileTouchPaths) ?? []
+        toolCallCount = try values.decodeIfPresent(Int.self, forKey: .toolCallCount)
+        alertCount = try values.decodeIfPresent(Int.self, forKey: .alertCount)
+        highRiskAlertCount = try values.decodeIfPresent(Int.self, forKey: .highRiskAlertCount)
+        strongestSeverity = try values.decodeIfPresent(String.self, forKey: .strongestSeverity)
+        strongestAction = try values.decodeIfPresent(String.self, forKey: .strongestAction)
     }
 }
 

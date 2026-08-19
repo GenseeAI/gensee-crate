@@ -2,6 +2,13 @@ import AppKit
 import Foundation
 import UserNotifications
 
+struct AlertNotificationDigest: Equatable {
+    let title: String
+    let body: String
+    let highestAlertID: Int64
+    let highestSeverity: String
+}
+
 @MainActor
 final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
@@ -125,30 +132,40 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     }
 
     private func sendAlertDigest(_ alerts: [SecurityAlert]) async {
+        guard let digest = Self.alertDigest(for: alerts) else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = digest.title
+        content.body = digest.body
+        content.sound = NotificationSeverity.rank(for: digest.highestSeverity) >= NotificationSeverity.rank(for: "high")
+            ? .default
+            : nil
+        content.userInfo = ["alert_id": digest.highestAlertID]
+        let request = UNNotificationRequest(
+            identifier: "gensee-alerts-\(digest.highestAlertID)",
+            content: content,
+            trigger: nil
+        )
+        try? await center.add(request)
+    }
+
+    static func alertDigest(for alerts: [SecurityAlert]) -> AlertNotificationDigest? {
         let ordered = alerts.sorted {
             let left = NotificationSeverity.rank(for: $0.severity)
             let right = NotificationSeverity.rank(for: $1.severity)
             return left == right ? $0.createdAt > $1.createdAt : left > right
         }
-        guard let highest = ordered.first else { return }
-
-        let content = UNMutableNotificationContent()
-        content.title = ordered.count == 1
-            ? "(highest.severity.capitalized) finding needs review"
-            : "(ordered.count) new findings need review"
-        content.body = ordered.count == 1
-            ? highest.message
-            : "(highest.message) · (ordered.count - 1) more"
-        content.sound = NotificationSeverity.rank(for: highest.severity) >= NotificationSeverity.rank(for: "high")
-            ? .default
-            : nil
-        content.userInfo = ["alert_id": highest.alertID]
-        let request = UNNotificationRequest(
-            identifier: "gensee-alerts-\(highest.alertID)",
-            content: content,
-            trigger: nil
+        guard let highest = ordered.first else { return nil }
+        return AlertNotificationDigest(
+            title: ordered.count == 1
+                ? "\(highest.severity.capitalized) finding needs review"
+                : "\(ordered.count) new findings need review",
+            body: ordered.count == 1
+                ? highest.message
+                : "\(highest.message) · \(ordered.count - 1) more",
+            highestAlertID: highest.alertID,
+            highestSeverity: highest.severity
         )
-        try? await center.add(request)
     }
 
     private func sendDailyBriefingIfNeeded(snapshot: SecuritySnapshot, now: Date) async {

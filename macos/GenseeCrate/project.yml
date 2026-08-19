@@ -146,6 +146,7 @@ targets:
       - Host/AlertSeverityBreakdown.swift
       - Host/TimelineModels.swift
       - Host/AgentCompletionModels.swift
+      - Host/CompletionNotificationCoordinator.swift
       - Host/ProgressiveTrust.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
@@ -156,6 +157,7 @@ targets:
       - Tests/AlertSeverityBreakdownTests.swift
       - Tests/TimelineModelsTests.swift
       - Tests/AgentCompletionModelsTests.swift
+      - Tests/CompletionNotificationCoordinatorTests.swift
       - Tests/ConfigAuditModelsTests.swift
       - Tests/ArtifactFactTests.swift
       - Tests/ProgressiveTrustTests.swift
