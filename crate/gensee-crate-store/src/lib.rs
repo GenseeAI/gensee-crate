@@ -1723,7 +1723,12 @@ impl EventStore {
                 )?;
             }
             record_system_event_artifacts(db, request_id, event_id, event, ts, matched)?;
-            if !matched && event.source != "macos-endpoint-security" {
+            if !matched
+                && !matches!(
+                    event.source.as_str(),
+                    "macos-endpoint-security" | "linux-falco"
+                )
+            {
                 record_unmatched_system_event_alert(db, request_id, event_id, event, ts)?;
             }
 
@@ -4896,6 +4901,40 @@ mod tests {
             .unwrap()
             .is_none());
         drop(db);
+        assert!(store
+            .list_alerts()
+            .unwrap()
+            .iter()
+            .all(|alert| alert.rule_id != "unmatched_system_effect"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unattributed_falco_events_are_capture_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-falco-capture-only-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_system_event(&SystemEvent {
+                source: "linux-falco".to_string(),
+                event_type: "openat".to_string(),
+                event_kind: "FileWrite".to_string(),
+                observed_at_ms: 130,
+                pid: Some(42),
+                ppid: Some(1),
+                process_name: Some("sh".to_string()),
+                executable_path: Some("/bin/sh".to_string()),
+                file_path: Some("/workspace/result.txt".to_string()),
+                command_line: Some("sh -c echo".to_string()),
+                raw_json: r#"{"event":"openat"}"#.to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(store.list_system_events().unwrap().len(), 1);
         assert!(store
             .list_alerts()
             .unwrap()
