@@ -15,8 +15,6 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var configAudit: ConfigAuditBundle?
     @Published private(set) var auditedIntegrationIDs: Set<String> = []
     @Published private(set) var verifiedIntegrationIDs: Set<String> = []
-    @Published private(set) var checkpoints: [WorkspaceCheckpointRecord] = []
-    @Published private(set) var checkpointWorkspace: String?
     @Published private(set) var recoveryPointSettings = RecoveryPointSettings()
     @Published private(set) var recoveryPointsByRequest: [Int64: WorkspaceCheckpointRecord] = [:]
     @Published private(set) var pendingRecoveryRequest: PendingRecoveryRequest?
@@ -39,6 +37,7 @@ final class ConsoleModel: ObservableObject {
     private var harnessVerificationBaselines: [String: Int64] = [:]
     private var hasLoadedDashboardSnapshot = false
     private var snapshotBeforeDemo = SecuritySnapshot()
+    private var dismissedPendingRecoveryIDs: Set<String> = []
 
     init() {
         let environmentHome = ProcessInfo.processInfo.environment["GENSEE_HOME"]
@@ -173,21 +172,24 @@ final class ConsoleModel: ObservableObject {
             next.noninteractive = try await policyBool("enforcement.noninteractive") ?? next.noninteractive
             next.requireProxy = try await policyBool("egress.require_proxy") ?? next.requireProxy
             next.maxRuntimeSeconds = try await policyInt("runtime.max_runtime_seconds")
-            var recovery = recoveryPointSettings
-            for provider in ["codex", "claude-code", "antigravity", "cursor", "vscode"] {
-                if let value = try? await policyString("recovery.harnesses.\(provider)"),
-                   let mode = RecoveryPointMode(rawValue: value) {
-                    recovery.harnessModes[provider] = mode
+            if let recoveryJSON = try await policyJSON("recovery") as? [String: Any] {
+                var recovery = recoveryPointSettings
+                if let harnesses = recoveryJSON["harnesses"] as? [String: String] {
+                    for (provider, value) in harnesses {
+                        if let mode = RecoveryPointMode(rawValue: value) {
+                            recovery.harnessModes[provider] = mode
+                        }
+                    }
                 }
+                if let hours = recoveryJSON["retention_hours"] as? NSNumber {
+                    recovery.retentionHours = hours.intValue
+                }
+                if let value = recoveryJSON["failure_behavior"] as? String,
+                   let behavior = RecoveryFailureBehavior(rawValue: value) {
+                    recovery.failureBehavior = behavior
+                }
+                recoveryPointSettings = recovery
             }
-            if let hours = try? await policyInt("recovery.retention_hours") {
-                recovery.retentionHours = hours
-            }
-            if let value = try? await policyString("recovery.failure_behavior"),
-               let behavior = RecoveryFailureBehavior(rawValue: value) {
-                recovery.failureBehavior = behavior
-            }
-            recoveryPointSettings = recovery
             policy = next
             policyDocument = try await loadPolicyDocument()
             configureEndpointSensor()
@@ -206,11 +208,11 @@ final class ConsoleModel: ObservableObject {
             let refreshedSnapshot = try await cli.decode(
                 SecuritySnapshot.self,
                 arguments: ["dashboard-state"],
-                // Large experimental stores can legitimately take more than
-                // twelve seconds to summarize. Keep a finite deadline so a
-                // wedged backend is terminated and retried, while leaving
-                // enough headroom above the observed healthy query time.
-                timeout: 20
+                // A cold projection of a large encrypted experimental store can
+                // take about a minute; warm refreshes are faster. Preserve a
+                // finite deadline and retry behavior without making first launch
+                // permanently look empty on stores that are still healthy.
+                timeout: hasLoadedDashboardSnapshot ? 45 : 75
             )
             hasLoadedDashboardSnapshot = true
             reconcileReadAlertState(alertCount: refreshedSnapshot.summary.alertsCount)
@@ -321,11 +323,28 @@ final class ConsoleModel: ObservableObject {
                 arguments: ["checkpoint", "pending", "--json"],
                 timeout: 3
             )
-            pendingRecoveryRequest = requests.first
+            let availableIDs = Set(requests.map(\.id))
+            dismissedPendingRecoveryIDs.formIntersection(availableIDs)
+            pendingRecoveryRequest = requests.first {
+                !dismissedPendingRecoveryIDs.contains($0.id)
+            }
         } catch {
             // Approval polling must never replace a healthy dashboard with an
             // error dialog. The blocked hook already carries fallback guidance.
         }
+    }
+
+    var pendingRecoveryPollingSeconds: Double {
+        if pendingRecoveryRequest != nil { return 1 }
+        if recoveryPointSettings.harnessModes.values.contains(.ask) { return 5 }
+        return 30
+    }
+
+    func dismissPendingRecoveryRequest() {
+        if let id = pendingRecoveryRequest?.id {
+            dismissedPendingRecoveryIDs.insert(id)
+        }
+        pendingRecoveryRequest = nil
     }
 
     func resolvePendingRecoveryRequest(
@@ -335,7 +354,11 @@ final class ConsoleModel: ObservableObject {
     ) async {
         guard !isDemoMode else { return }
         if alwaysCreate {
-            guard await updateRecoveryPointMode(.auto, for: request.provider, showNotice: false) else { return }
+            guard await updateRecoveryPointMode(.auto, for: request.provider, showNotice: false) else {
+                dismissedPendingRecoveryIDs.insert(request.id)
+                pendingRecoveryRequest = nil
+                return
+            }
         }
         runningCommand = create ? "Creating recovery point" : "Continuing without recovery point"
         defer { runningCommand = nil }
@@ -349,10 +372,13 @@ final class ConsoleModel: ObservableObject {
                 timeout: 60
             )
             pendingRecoveryRequest = nil
+            dismissedPendingRecoveryIDs.remove(request.id)
             noticeMessage = create
                 ? "Recovery point created. The waiting agent operation can continue."
                 : "This request will continue without a recovery point."
         } catch {
+            dismissedPendingRecoveryIDs.insert(request.id)
+            pendingRecoveryRequest = nil
             errorMessage = error.localizedDescription
         }
     }
@@ -429,58 +455,6 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
-    func loadCheckpoints(workspace: String, reportErrors: Bool = true) async {
-        guard !isDemoMode else { return }
-        guard backendAvailable else {
-            if reportErrors { errorMessage = GenseeCLIError.executableNotFound.localizedDescription }
-            return
-        }
-        guard let workspaceURL = existingWorkspaceURL(workspace) else {
-            checkpoints = []
-            checkpointWorkspace = nil
-            if reportErrors { errorMessage = "Choose an existing Git workspace to view recovery checkpoints." }
-            return
-        }
-        do {
-            let response = try await cli.decode(
-                CheckpointListResponse.self,
-                arguments: ["checkpoint", "list", "--workspace", workspaceURL.path, "--json"]
-            )
-            checkpoints = response.checkpoints
-            checkpointWorkspace = response.workspace
-        } catch {
-            checkpoints = []
-            checkpointWorkspace = nil
-            if reportErrors { errorMessage = error.localizedDescription }
-        }
-    }
-
-    func createCheckpoint(workspace: String, label: String) async {
-        guard !isDemoMode else { return }
-        guard let workspaceURL = existingWorkspaceURL(workspace) else {
-            errorMessage = "Choose an existing Git workspace before creating a checkpoint."
-            return
-        }
-        runningCommand = "Creating a local recovery checkpoint"
-        defer { runningCommand = nil }
-        var arguments = ["checkpoint", "create", "--workspace", workspaceURL.path, "--json"]
-        let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedLabel.isEmpty {
-            arguments += ["--label", trimmedLabel]
-        }
-        do {
-            let checkpoint = try await cli.decode(
-                WorkspaceCheckpointRecord.self,
-                arguments: arguments,
-                timeout: 60
-            )
-            noticeMessage = "Checkpoint \(checkpoint.id) is ready."
-            await loadCheckpoints(workspace: workspaceURL.path, reportErrors: false)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
     func restoreCheckpoint(_ checkpoint: WorkspaceCheckpointRecord, workspace: String) async {
         guard !isDemoMode else { return }
         guard let workspaceURL = existingWorkspaceURL(workspace) else {
@@ -500,49 +474,21 @@ final class ConsoleModel: ObservableObject {
                 timeout: 300
             )
             noticeMessage = "Restored \(response.restored.label ?? response.restored.id). Rescue checkpoint: \(response.rescue.id)."
-            await loadCheckpoints(workspace: workspaceURL.path, reportErrors: false)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    func deleteCheckpoint(_ checkpoint: WorkspaceCheckpointRecord, workspace: String) async {
-        guard !isDemoMode else { return }
-        guard let workspaceURL = existingWorkspaceURL(workspace) else {
-            errorMessage = "Choose the checkpoint's Git workspace before deleting it."
-            return
-        }
-        runningCommand = "Deleting recovery checkpoint"
-        defer { runningCommand = nil }
-        do {
-            _ = try await cli.run(
-                [
-                    "checkpoint", "delete", checkpoint.id,
-                    "--workspace", workspaceURL.path,
-                    "--yes", "--json",
-                ],
-                timeout: 60
-            )
-            noticeMessage = "Deleted checkpoint \(checkpoint.label ?? checkpoint.id)."
-            await loadCheckpoints(workspace: workspaceURL.path, reportErrors: false)
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
     private func loadRecoveryPoint(for payload: RequestReviewPayload) async {
-        let workspace = payload.agentEvents
-            .lazy
-            .map(\.cwd)
-            .first(where: { !$0.isEmpty })
-        guard let workspace, let workspaceURL = existingWorkspaceURL(workspace) else {
-            recoveryPointsByRequest.removeValue(forKey: payload.request.requestID)
-            return
-        }
         do {
             let response = try await cli.decode(
                 CheckpointListResponse.self,
-                arguments: ["checkpoint", "list", "--workspace", workspaceURL.path, "--json"],
+                arguments: [
+                    "checkpoint", "list",
+                    "--request-id", String(payload.request.requestID),
+                    "--session-id", payload.request.sessionID,
+                    "--json",
+                ],
                 timeout: 5
             )
             recoveryPointsByRequest[payload.request.requestID] = response.checkpoints.first {

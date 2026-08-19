@@ -408,7 +408,28 @@ fn recovery_trigger_detects_mutating_file_intent() {
 }
 
 #[test]
-fn recovery_trigger_detects_large_refactor_prompt_before_first_write() {
+fn recovery_trigger_detects_large_refactor_prompt_on_first_mutating_command() {
+    let event = test_hook_event(PROVIDER_CODEX, "PreToolUse");
+    let decision = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+
+    assert_eq!(
+        recovery_trigger(
+            &event,
+            Some("printf 'updated' > src/auth.rs"),
+            &[],
+            &decision,
+            Some("Please perform a large refactor of the authentication layer")
+        )
+        .as_deref(),
+        Some("Request indicates a migration, rewrite, rename, or large refactor")
+    );
+}
+
+#[test]
+fn recovery_trigger_does_not_checkpoint_a_read_for_a_future_refactor() {
     let event = test_hook_event(PROVIDER_CODEX, "PreToolUse");
     let decision = PolicyDecision {
         action: PolicyAction::Allow,
@@ -422,9 +443,8 @@ fn recovery_trigger_detects_large_refactor_prompt_before_first_write() {
             &[],
             &decision,
             Some("Please perform a large refactor of the authentication layer")
-        )
-        .as_deref(),
-        Some("Request indicates a migration, rewrite, rename, or large refactor")
+        ),
+        None
     );
 }
 
@@ -445,6 +465,32 @@ fn recovery_trigger_ignores_benign_read_only_tool_call() {
         path: "/repo/README.md".to_string(),
         source_command: "read".to_string(),
         sensitive: false,
+        confidence: "high".to_string(),
+    }];
+
+    assert_eq!(
+        recovery_trigger(&event, None, &intents, &decision, None),
+        None
+    );
+}
+
+#[test]
+fn recovery_trigger_does_not_checkpoint_a_policy_ask_that_cannot_mutate() {
+    let mut event = test_hook_event(PROVIDER_CLAUDE_CODE, "PreToolUse");
+    event.tool_name = Some("Read".to_string());
+    let decision = PolicyDecision {
+        action: PolicyAction::Ask,
+        findings: Vec::new(),
+    };
+    let intents = vec![FileIntent {
+        provider: PROVIDER_CLAUDE_CODE.to_string(),
+        session_id: event.session_id.clone(),
+        tool_use_id: Some("tool-1".to_string()),
+        observed_at_ms: 1,
+        operation: "read".to_string(),
+        path: "/repo/.env".to_string(),
+        source_command: "read".to_string(),
+        sensitive: true,
         confidence: "high".to_string(),
     }];
 

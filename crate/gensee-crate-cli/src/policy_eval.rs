@@ -77,12 +77,22 @@ pub(crate) fn evaluate_pretool_policy(
     evaluate_pretool_policy_with_store(event, file_intents, None)
 }
 
+#[cfg(any(test, feature = "bench"))]
 pub(crate) fn evaluate_pretool_policy_with_store(
     event: &AgentHookEvent,
     file_intents: &[FileIntent],
     store: Option<&EventStore>,
 ) -> PolicyDecision {
     let policy = Policy::load_current();
+    evaluate_pretool_policy_with_policy(event, file_intents, store, &policy)
+}
+
+pub(crate) fn evaluate_pretool_policy_with_policy(
+    event: &AgentHookEvent,
+    file_intents: &[FileIntent],
+    store: Option<&EventStore>,
+    policy: &Policy,
+) -> PolicyDecision {
     let mut findings = Vec::new();
     let cwd = event.cwd.as_deref();
 
@@ -95,7 +105,7 @@ pub(crate) fn evaluate_pretool_policy_with_store(
 
     let subjects = policy_subjects(event, file_intents);
     for subject in &subjects {
-        findings.extend(policy_findings_for_subject(subject, cwd, &policy));
+        findings.extend(policy_findings_for_subject(subject, cwd, policy));
     }
     if let Some(finding) = unparsed_permission_request_finding(event) {
         findings.push(finding);
@@ -129,14 +139,14 @@ pub(crate) fn evaluate_pretool_policy_with_store(
                 findings.extend(dynamic_control_plane_findings(subject, store));
             } else if subject.operation == "read" {
                 findings.extend(registered_artifact_read_fact_findings(
-                    event, subject, store, &policy,
+                    event, subject, store, policy,
                 ));
             }
         }
         // Memory/skill-integrity (write-side + read-detection) and the
         // in-session trigger-side escalation. See "Memory and skill poisoning
         // defense" in docs/policy.md.
-        findings.extend(memory_artifact_findings(event, &subjects, &policy));
+        findings.extend(memory_artifact_findings(event, &subjects, policy));
         findings.extend(memory_triggered_findings(event, store));
         // Sensitive-read -> egress chain trigger. Markers are appended only
         // after the full decision is known, because a tool call denied by any
@@ -171,7 +181,7 @@ pub(crate) fn evaluate_pretool_policy_with_store(
     // BEFORE aggregating so the overall decision and the `sensitive_read_findings`
     // gate below both see the hardened action (a now-blocked call must not seed a
     // sensitive-read exfil chain).
-    if noninteractive_fail_closed_enabled(&policy) {
+    if noninteractive_fail_closed_enabled(policy) {
         escalate_asks_to_blocks(&mut findings);
     }
 
@@ -181,7 +191,7 @@ pub(crate) fn evaluate_pretool_policy_with_store(
         .max()
         .unwrap_or(PolicyAction::Allow);
     if store.is_some() && !matches!(action, PolicyAction::Block) {
-        findings.extend(sensitive_read_findings(&subjects, &policy));
+        findings.extend(sensitive_read_findings(&subjects, policy));
     }
     if store.is_some() && matches!(action, PolicyAction::Allow) {
         if let Some(finding) = network_egress_marker_finding(event) {

@@ -4459,14 +4459,16 @@ fn process_hook_event_inner(
         for intent in &file_intents {
             store.append_file_intent(intent)?;
         }
+        let policy = Policy::load_current();
         let original_decision =
-            evaluate_pretool_policy_with_store(event, &file_intents, Some(store));
+            evaluate_pretool_policy_with_policy(event, &file_intents, Some(store), &policy);
         let recovery_gate = prepare_recovery_point_before_tool(
             event,
             original_command.as_deref(),
             &file_intents,
             &original_decision,
             store,
+            &policy,
         );
         let mut decision = adapt_decision_for_provider(original_decision, &event.provider);
         match recovery_gate {
@@ -4606,8 +4608,8 @@ fn prepare_recovery_point_before_tool(
     file_intents: &[FileIntent],
     decision: &PolicyDecision,
     store: &EventStore,
+    policy: &Policy,
 ) -> RecoveryGate {
-    let policy = Policy::load_current();
     let recovery = &policy.document().recovery;
     let mode = recovery.mode_for(&event.provider);
     if mode == policy::RecoveryMode::Off {
@@ -4617,12 +4619,6 @@ fn prepare_recovery_point_before_tool(
         return recovery_failure_gate(
             recovery.failure_behavior,
             "Gensee could not correlate this tool call to an agent session.",
-        );
-    };
-    let Some(workspace) = recovery_git_workspace(event, original_command, file_intents) else {
-        return recovery_failure_gate(
-            recovery.failure_behavior,
-            "Gensee could not find a Git workspace for this tool call. Recovery points require an existing Git repository.",
         );
     };
     let request = match store.active_request_context(session_id) {
@@ -4649,6 +4645,12 @@ fn prepare_recovery_point_before_tool(
     ) else {
         return RecoveryGate::Continue;
     };
+    let Some(workspace) = recovery_git_workspace(event, original_command, file_intents) else {
+        return recovery_failure_gate(
+            recovery.failure_behavior,
+            "Gensee could not find a Git workspace for this tool call. Recovery points require an existing Git repository.",
+        );
+    };
     let context = RecoveryPointContext {
         request_id: request.request_id,
         session_id,
@@ -4657,18 +4659,18 @@ fn prepare_recovery_point_before_tool(
     };
 
     match mode {
-        policy::RecoveryMode::Auto => {
-            ensure_request_recovery_point(&workspace, &context, recovery.retention_hours)
-                .map(|_| RecoveryGate::Continue)
-                .unwrap_or_else(|error| {
-                    recovery_failure_gate(
-                        recovery.failure_behavior,
-                        &format!(
-                            "Gensee could not create a recovery point before changes: {error}"
-                        ),
-                    )
-                })
-        }
+        policy::RecoveryMode::Auto => ensure_request_recovery_point_in_repository(
+            &workspace,
+            &context,
+            recovery.retention_hours,
+        )
+        .map(|_| RecoveryGate::Continue)
+        .unwrap_or_else(|error| {
+            recovery_failure_gate(
+                recovery.failure_behavior,
+                &format!("Gensee could not create a recovery point before changes: {error}"),
+            )
+        }),
         policy::RecoveryMode::Ask => {
             let mut pending = match request_recovery_approval(&workspace, &context) {
                 Ok(pending) => pending,
@@ -4766,32 +4768,19 @@ fn recovery_trigger(
     decision: &PolicyDecision,
     prompt: Option<&str>,
 ) -> Option<String> {
-    if decision.action >= PolicyAction::Ask {
-        return Some("Policy identified a risky operation".to_string());
-    }
-    if file_intents
+    let has_file_mutation = file_intents
         .iter()
-        .any(|intent| !matches!(intent.operation.as_str(), "read" | "open" | "stat" | "list"))
-    {
-        return Some(if file_intents.len() >= 3 {
-            "Broad multi-file change".to_string()
-        } else {
-            "File mutation".to_string()
-        });
-    }
+        .any(|intent| !matches!(intent.operation.as_str(), "read" | "open" | "stat" | "list"));
     let tool = event
         .tool_name
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if ["edit", "write", "delete", "patch", "move", "rename"]
+    let mutating_tool = ["edit", "write", "delete", "patch", "move", "rename"]
         .iter()
-        .any(|needle| tool.contains(needle))
-    {
-        return Some("Mutating tool call".to_string());
-    }
+        .any(|needle| tool.contains(needle));
     let command = original_command.unwrap_or_default().to_ascii_lowercase();
-    if [
+    let risky_command = [
         "sudo ",
         "git reset",
         "git clean",
@@ -4806,22 +4795,55 @@ fn recovery_trigger(
         "db:migrate",
     ]
     .iter()
-    .any(|needle| command.contains(needle))
+    .any(|needle| command.contains(needle));
+    let shell_may_mutate = [
+        " > ",
+        " >> ",
+        "rm ",
+        "mv ",
+        "cp ",
+        "mkdir ",
+        "touch ",
+        "sed -i",
+        "git add",
+        "git commit",
+        "git merge",
+        "git rebase",
+        "apply_patch",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle));
+    if decision.action >= PolicyAction::Ask
+        && (has_file_mutation || mutating_tool || risky_command || shell_may_mutate)
     {
+        return Some("Policy identified a risky operation".to_string());
+    }
+    if has_file_mutation {
+        return Some(if file_intents.len() >= 3 {
+            "Broad multi-file change".to_string()
+        } else {
+            "File mutation".to_string()
+        });
+    }
+    if mutating_tool {
+        return Some("Mutating tool call".to_string());
+    }
+    if risky_command {
         return Some("Destructive, elevated, dependency, or migration command".to_string());
     }
     let prompt = prompt.unwrap_or_default().to_ascii_lowercase();
-    if [
-        "large refactor",
-        "big refactor",
-        "rewrite",
-        "migration",
-        "migrate",
-        "rename across",
-        "upgrade dependencies",
-    ]
-    .iter()
-    .any(|needle| prompt.contains(needle))
+    if shell_may_mutate
+        && [
+            "large refactor",
+            "big refactor",
+            "rewrite",
+            "migration",
+            "migrate",
+            "rename across",
+            "upgrade dependencies",
+        ]
+        .iter()
+        .any(|needle| prompt.contains(needle))
     {
         return Some(
             "Request indicates a migration, rewrite, rename, or large refactor".to_string(),

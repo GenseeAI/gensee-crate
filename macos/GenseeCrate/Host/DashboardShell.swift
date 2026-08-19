@@ -84,7 +84,7 @@ struct DashboardShell: View {
         .task {
             while !Task.isCancelled {
                 await model.refreshPendingRecoveryRequest()
-                try? await Task.sleep(for: .seconds(1))
+                try? await Task.sleep(for: .seconds(model.pendingRecoveryPollingSeconds))
             }
         }
         .alert("Gensee needs attention", isPresented: errorPresented) {
@@ -112,6 +112,9 @@ struct DashboardShell: View {
                         alwaysCreate: true
                     )
                 }
+            }
+            Button("Keep Blocked", role: .cancel) {
+                model.dismissPendingRecoveryRequest()
             }
         } message: { request in
             Text("\(HarnessDisplayName.from(request.provider)) is about to make changes to \(abbreviatedPath(request.workspace)). \(request.reason). Recovery points cover Git-workspace files only; they cannot undo database, network, remote repository, process, or ignored-file changes.")
@@ -259,7 +262,7 @@ struct DashboardShell: View {
     private var pendingRecoveryPresented: Binding<Bool> {
         Binding(
             get: { model.pendingRecoveryRequest != nil },
-            set: { _ in }
+            set: { if !$0 { model.dismissPendingRecoveryRequest() } }
         )
     }
 }
