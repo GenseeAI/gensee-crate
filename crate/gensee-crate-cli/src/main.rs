@@ -281,6 +281,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             args.remove(0);
             dashboard_state()
         }
+        Some("dashboard-request") => {
+            args.remove(0);
+            dashboard_request(args)
+        }
         Some("dashboard-day") => {
             args.remove(0);
             dashboard_day(args)
@@ -3775,6 +3779,34 @@ fn feedback_list(args: Vec<OsString>) -> io::Result<()> {
 fn dashboard_state() -> io::Result<()> {
     let store = EventStore::default_local()?;
     println!("{}", serde_json::to_string(&store.dashboard_state()?)?);
+    Ok(())
+}
+
+fn dashboard_request(args: Vec<OsString>) -> io::Result<()> {
+    let [request_id] = args.as_slice() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee dashboard-request <request-id>",
+        ));
+    };
+    let request_id = request_id
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request ID must be UTF-8"))?
+        .parse::<i64>()
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "request ID must be an integer")
+        })?;
+    if request_id <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "request ID must be positive",
+        ));
+    }
+    let store = EventStore::default_local()?;
+    println!(
+        "{}",
+        serde_json::to_string(&store.dashboard_request(request_id)?)?
+    );
     Ok(())
 }
 

@@ -10,6 +10,8 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var integrations: [IntegrationDescriptor] = []
     @Published private(set) var dailyDetail: DailyDetail?
     @Published private(set) var dailyDetailLoadState = DailyDetailLoadState.idle
+    @Published private(set) var requestReviewPayload: RequestReviewPayload?
+    @Published private(set) var requestReviewLoadState = RequestReviewLoadState.idle
     @Published private(set) var configAudit: ConfigAuditBundle?
     @Published private(set) var auditedIntegrationIDs: Set<String> = []
     @Published private(set) var verifiedIntegrationIDs: Set<String> = []
@@ -259,6 +261,55 @@ final class ConsoleModel: ObservableObject {
             guard !Task.isCancelled else { return }
             dashboardRefreshIssue = error.localizedDescription
             dailyDetailLoadState = .unavailable(day: day, message: error.localizedDescription)
+        }
+    }
+
+    func loadRequestReview(requestID: Int64) async {
+        if isDemoMode {
+            guard let request = snapshot.requests.first(where: { $0.requestID == requestID }) else {
+                requestReviewPayload = nil
+                requestReviewLoadState = .unavailable(
+                    requestID: requestID,
+                    message: "This synthetic request is no longer available."
+                )
+                return
+            }
+            requestReviewPayload = RequestReviewPayload(
+                request: request,
+                agentEvents: snapshot.agentEvents.filter { $0.requestID == requestID },
+                systemEvents: snapshot.systemEvents.filter { $0.requestID == requestID },
+                alerts: snapshot.alerts.filter { $0.requestID == requestID }
+            )
+            requestReviewLoadState = .loaded(requestID)
+            return
+        }
+        guard backendAvailable else {
+            requestReviewPayload = nil
+            requestReviewLoadState = .unavailable(
+                requestID: requestID,
+                message: "The Gensee backend is unavailable. Repair the app backend, then try again."
+            )
+            return
+        }
+
+        requestReviewPayload = nil
+        requestReviewLoadState = .loading(requestID)
+        do {
+            let payload = try await cli.decode(
+                RequestReviewPayload.self,
+                arguments: ["dashboard-request", String(requestID)],
+                timeout: 12
+            )
+            guard requestReviewLoadState == .loading(requestID) else { return }
+            requestReviewPayload = payload
+            requestReviewLoadState = .loaded(requestID)
+        } catch {
+            guard requestReviewLoadState == .loading(requestID) else { return }
+            requestReviewPayload = nil
+            requestReviewLoadState = .unavailable(
+                requestID: requestID,
+                message: error.localizedDescription
+            )
         }
     }
 

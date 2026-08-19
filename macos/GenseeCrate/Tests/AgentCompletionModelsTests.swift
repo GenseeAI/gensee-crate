@@ -52,6 +52,79 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertTrue(AgentCompletionDerivation.summaries(from: snapshot).isEmpty)
     }
 
+    func testHarnessDisplayNameCollapsesBinaryPaths() {
+        XCTAssertEqual(
+            HarnessDisplayName.from("/Applications/Codex.app/Contents/MacOS/Codex"),
+            "Codex"
+        )
+        XCTAssertEqual(
+            HarnessDisplayName.from("/Users/test/Library/Application Support/Claude/Claude.app/Contents/MacOS/Claude"),
+            "Claude"
+        )
+        XCTAssertEqual(
+            HarnessDisplayName.from("/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+            "GitHub Copilot"
+        )
+    }
+
+    func testRequestTitleStripsAmbientBrowserContext() {
+        let prompt = """
+        <in-app-browser-context source="ambient-ui-state">
+        This block is automatically supplied ambient UI state.
+        </in-app-browser-context>
+
+        ## My request:
+        Fix the request timeline
+        """
+
+        XCTAssertEqual(
+            RequestPromptDisplay.title(from: prompt),
+            "Fix the request timeline"
+        )
+    }
+
+    func testAnswerOnlyRequestStillBuildsReviewSummary() throws {
+        var snapshot = SecuritySnapshot()
+        snapshot.requests = [request(id: 9, started: 1_000, completed: 4_000)]
+
+        let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
+
+        XCTAssertEqual(summary.toolCallCount, 0)
+        XCTAssertEqual(summary.durationMS, 3_000)
+        XCTAssertEqual(summary.reviewState, .verified)
+    }
+
+    func testBuildsSessionSummaryAcrossCompletedRequests() throws {
+        var snapshot = SecuritySnapshot()
+        snapshot.sessions = [RecordedSession(
+            sessionID: "session-1",
+            agentID: "/Applications/Claude.app/Contents/MacOS/Claude",
+            firstEventAt: 1_000,
+            lastEventAt: 8_000,
+            flagged: 0,
+            requestCount: 2,
+            eventCount: 0
+        )]
+        snapshot.requests = [
+            RecordedRequest(requestID: 1, sessionID: "session-1", originalUserPrompt: "First", finalResponse: nil, createdAt: 1_000, completedAt: 3_000),
+            RecordedRequest(requestID: 2, sessionID: "session-1", originalUserPrompt: "Second", finalResponse: nil, createdAt: 4_000, completedAt: 8_000),
+        ]
+
+        let session = try XCTUnwrap(AgentCompletionDerivation.sessionSummaries(from: snapshot).first)
+        XCTAssertEqual(session.harness, "Claude")
+        XCTAssertEqual(session.requestCount, 2)
+        XCTAssertEqual(session.durationMS, 7_000)
+        XCTAssertEqual(session.requests.map(\.requestID), [2, 1])
+    }
+
+    func testNotificationSeverityThresholdIncludesOnlySelectedLevelAndAbove() {
+        XCTAssertTrue(NotificationSeverity.high.includes("critical"))
+        XCTAssertTrue(NotificationSeverity.high.includes("HIGH"))
+        XCTAssertFalse(NotificationSeverity.high.includes("medium"))
+        XCTAssertTrue(NotificationSeverity.info.includes("info"))
+        XCTAssertTrue(NotificationSeverity.info.includes("unknown"))
+    }
+
     private func request(id: Int64, started: Int64, completed: Int64) -> RecordedRequest {
         RecordedRequest(
             requestID: id, sessionID: "session-1", originalUserPrompt: "Implement the feature",

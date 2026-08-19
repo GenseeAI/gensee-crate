@@ -71,16 +71,16 @@ The console includes:
   repair action when needed. A hook configuration becomes **Protected** only
   after a real event from that harness reaches the active local store.
 - Endpoint Security installation, removal, and Full Disk Access navigation.
-- A **Recovery** page for explicit, Git-backed local checkpoints before large
+- A **Checkpoints** page for explicit, Git-backed local states before large
   agent tasks, with a rescue checkpoint created before every restore.
 
 Token totals are captured from compatible Claude Code and Codex transcript
 usage metadata when a turn completes. Only the numeric per-turn total is stored;
 historical turns and harnesses without compatible usage metadata remain zero.
 
-## Workspace recovery
+## Workspace checkpoints
 
-The **Recovery** page provides a practical macOS undo point without committing
+The **Checkpoints** page provides a practical macOS undo point without committing
 to the user's branch or changing the real Git staging index. A checkpoint
 captures tracked files and untracked, non-ignored files in the repository's
 local Git object database. Restoring one requires an explicit confirmation and

@@ -696,6 +696,7 @@ struct DashboardSettingsPage: View {
     @ObservedObject var model: ConsoleModel
     @ObservedObject var extensionManager: EndpointSecurityExtensionManager
     @ObservedObject var sensor: EndpointSecuritySensor
+    @ObservedObject var notifications: CompletionNotificationCoordinator
     @Binding var darkMode: Bool
     let onRunSetupAssistant: () -> Void
     @State private var confirmRemoval = false
@@ -761,6 +762,10 @@ struct DashboardSettingsPage: View {
                     }
                 }
 
+                DashboardCard("Notifications") {
+                    notificationSettings
+                }
+
                 HStack(alignment: .top, spacing: 16) {
                     DashboardCard("Endpoint Security") { endpointSecurity }.frame(maxWidth: .infinity)
                     DashboardCard("Local Store") { localStore }.frame(maxWidth: .infinity)
@@ -793,6 +798,64 @@ struct DashboardSettingsPage: View {
             Button("Cancel", role: .cancel) {}
             Button("Remove Extension", role: .destructive) { extensionManager.deactivate() }
         } message: { Text("Crate will stop receiving operating-system process and file events until the extension is installed again.") }
+    }
+
+    private var notificationSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: notifications.isAuthorized ? "bell.badge.fill" : "bell.slash")
+                    .font(.system(size: 17))
+                    .foregroundStyle(notifications.isAuthorized ? Color.dashboardBlue : Color.secondary)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(notifications.isAuthorized ? "Notifications are allowed" : "Notifications need macOS permission")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("Choose which local events may interrupt you. New findings discovered in the same refresh are combined into one notification.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if !notifications.isAuthorized {
+                    if notifications.authorizationStatus == .denied {
+                        Button("Open System Settings") { notifications.openSystemNotificationSettings() }
+                    } else {
+                        Button("Allow Notifications") {
+                            Task { await notifications.requestAuthorization() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.dashboardBlue)
+                    }
+                }
+            }
+
+            Divider()
+
+            HStack(spacing: 24) {
+                Toggle("Security findings", isOn: $notifications.alertNotificationsEnabled)
+                    .toggleStyle(.switch)
+                    .disabled(!notifications.isAuthorized)
+                Picker("Minimum severity", selection: $notifications.minimumAlertSeverity) {
+                    ForEach(NotificationSeverity.allCases) { level in
+                        Text(level.title).tag(level)
+                    }
+                }
+                .frame(width: 260)
+                .disabled(!notifications.isAuthorized || !notifications.alertNotificationsEnabled)
+                Spacer()
+            }
+
+            HStack(spacing: 24) {
+                Toggle("Substantial task completions", isOn: $notifications.completionNotificationsEnabled)
+                    .toggleStyle(.switch)
+                    .disabled(!notifications.isAuthorized)
+                Toggle("Daily briefing after 5 PM", isOn: $notifications.dailyBriefingEnabled)
+                    .toggleStyle(.switch)
+                    .disabled(!notifications.isAuthorized)
+                Spacer()
+            }
+            .font(.system(size: 11))
+        }
+        .controlSize(.small)
     }
 
     private var endpointSecurity: some View {

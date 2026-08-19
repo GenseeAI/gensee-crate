@@ -53,6 +53,7 @@ const MAX_STORED_TOOL_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_TRANSACTION_TEXT_CHARS: usize = 2 * 1024;
 const MAX_TRANSACTION_METADATA_BYTES: usize = 16 * 1024;
 const MAX_TOKEN_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DASHBOARD_PROMPT_CHARS: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
@@ -489,7 +490,7 @@ impl EventStore {
                 alerts.severity, alerts.action, alerts.rule_id, alerts.message,
                 alerts.path, alerts.evidence, alerts.created_at,
                 requests.session_id,
-                substr(requests.original_user_prompt, 1, 1024),
+                requests.original_user_prompt,
                 trigger_event.source, trigger_event.type, trigger_event.tool_name,
                 trigger_event.tool_input, trigger_event.tool_use_id,
                 feedback.human_verdict, feedback.label, feedback.created_at
@@ -554,7 +555,9 @@ impl EventStore {
                 "evidence": row.get::<_, Option<String>>(9)?,
                 "created_at": row.get::<_, i64>(10)?,
                 "session_id": row.get::<_, Option<String>>(11)?,
-                "original_user_prompt": row.get::<_, Option<String>>(12)?,
+                "original_user_prompt": dashboard_request_prompt(
+                    row.get::<_, Option<String>>(12)?.as_deref()
+                ),
                 "event_source": row.get::<_, Option<String>>(13)?,
                 "event_type": row.get::<_, Option<String>>(14)?,
                 "tool_name": row.get::<_, Option<String>>(15)?,
@@ -642,7 +645,7 @@ impl EventStore {
         let requests = query_json_rows(
             conn,
             "SELECT request_id, session_id,
-                substr(original_user_prompt, 1, 1024), created_at, completed_at
+                original_user_prompt, created_at, completed_at
              FROM requests
              ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
              LIMIT 500",
@@ -650,7 +653,9 @@ impl EventStore {
                 Ok(json!({
                     "request_id": row.get::<_, i64>(0)?,
                     "session_id": row.get::<_, String>(1)?,
-                    "original_user_prompt": row.get::<_, Option<String>>(2)?,
+                    "original_user_prompt": dashboard_request_prompt(
+                        row.get::<_, Option<String>>(2)?.as_deref()
+                    ),
                     "created_at": row.get::<_, Option<i64>>(3)?,
                     "completed_at": row.get::<_, Option<i64>>(4)?,
                 }))
@@ -855,6 +860,166 @@ impl EventStore {
             "humanFeedback": human_feedback,
             "dailyActivity": daily_activity,
             "jsonSessions": self.list_sessions()?,
+        }))
+    }
+
+    /// Return complete, request-scoped evidence for Work Review. The periodic
+    /// dashboard payload intentionally bounds its global event arrays; detail
+    /// views must not infer that an older request had no tools merely because
+    /// its events fell outside those windows.
+    pub fn dashboard_request(&self, request_id: i64) -> io::Result<Value> {
+        let db = self.sqlite_store()?;
+        let conn = db.connection();
+
+        let request = conn
+            .query_row(
+                "SELECT request_id, session_id, original_user_prompt, created_at, completed_at
+                 FROM requests
+                 WHERE request_id = ?1",
+                [request_id],
+                |row| {
+                    Ok(json!({
+                        "request_id": row.get::<_, i64>(0)?,
+                        "session_id": row.get::<_, String>(1)?,
+                        "original_user_prompt": dashboard_request_prompt(
+                            row.get::<_, Option<String>>(2)?.as_deref()
+                        ),
+                        "created_at": row.get::<_, Option<i64>>(3)?,
+                        "completed_at": row.get::<_, Option<i64>>(4)?,
+                    }))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error_from_rusqlite)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("request {request_id} was not found"),
+                )
+            })?;
+
+        let agent_events = query_json_rows_with_i64(
+            conn,
+            "SELECT event_id, pid, request_id, ts, source, type, cwd,
+                    permission_mode, tool_name, tool_input, tool_response, tool_use_id
+             FROM agent_events
+             WHERE request_id = ?1
+             ORDER BY ts, event_id",
+            request_id,
+            |row| {
+                Ok(json!({
+                    "event_id": row.get::<_, i64>(0)?,
+                    "pid": row.get::<_, i64>(1)?,
+                    "request_id": row.get::<_, i64>(2)?,
+                    "ts": row.get::<_, i64>(3)?,
+                    "source": row.get::<_, String>(4)?,
+                    "type": row.get::<_, String>(5)?,
+                    "cwd": row.get::<_, String>(6)?,
+                    "permission_mode": row.get::<_, Option<String>>(7)?,
+                    "tool_name": row.get::<_, Option<String>>(8)?,
+                    "tool_input": row.get::<_, Option<String>>(9)?,
+                    "tool_response": row.get::<_, Option<String>>(10)?,
+                    "duration_ms": row.get::<_, Option<String>>(10)?
+                        .and_then(|response| serde_json::from_str::<Value>(&response).ok())
+                        .and_then(|response| response.get("duration_ms").and_then(Value::as_i64)),
+                    "tool_use_id": row.get::<_, Option<String>>(11)?,
+                }))
+            },
+        )?;
+
+        let system_events = query_json_rows_with_i64(
+            conn,
+            "SELECT event_id, pid, request_id, ts, source, type, cwd, args
+             FROM system_events
+             WHERE request_id = ?1
+             ORDER BY ts, event_id",
+            request_id,
+            |row| {
+                Ok(json!({
+                    "event_id": row.get::<_, i64>(0)?,
+                    "pid": row.get::<_, i64>(1)?,
+                    "request_id": row.get::<_, i64>(2)?,
+                    "ts": row.get::<_, i64>(3)?,
+                    "source": row.get::<_, String>(4)?,
+                    "type": row.get::<_, String>(5)?,
+                    "cwd": row.get::<_, String>(6)?,
+                    "args": row.get::<_, Option<String>>(7)?,
+                }))
+            },
+        )?;
+
+        let visible_alerts_cte = dashboard_visible_alerts_cte();
+        let alerts_sql = format!(
+            "WITH {visible_alerts_cte}
+             SELECT alerts.alert_id, alerts.request_id, alerts.severity, alerts.action,
+                    alerts.rule_id, alerts.message, alerts.path, alerts.evidence,
+                    alerts.created_at, requests.session_id,
+                    trigger_event.source, trigger_event.type, trigger_event.tool_name,
+                    trigger_event.tool_input, trigger_event.tool_use_id,
+                    feedback.human_verdict, feedback.label, feedback.created_at
+             FROM visible_alerts AS alerts
+             LEFT JOIN requests ON requests.request_id = alerts.request_id
+             LEFT JOIN agent_events AS trigger_event
+               ON trigger_event.event_id = COALESCE(
+                 CASE WHEN alerts.entity_kind = 'agent_event' THEN alerts.entity_id END,
+                 (
+                   SELECT candidate.event_id FROM agent_events AS candidate
+                   WHERE candidate.request_id = alerts.request_id
+                     AND candidate.tool_use_id = json_extract(alerts.evidence, '$.tool_use_id')
+                   ORDER BY candidate.type = 'PreToolUse' DESC,
+                            candidate.ts DESC, candidate.event_id DESC
+                   LIMIT 1
+                 ),
+                 (
+                   SELECT candidate.event_id FROM agent_events AS candidate
+                   WHERE candidate.request_id = alerts.request_id
+                     AND candidate.type = 'PreToolUse'
+                     AND candidate.ts <= alerts.created_at
+                   ORDER BY candidate.ts DESC, candidate.event_id DESC
+                   LIMIT 1
+                 )
+               )
+             LEFT JOIN human_feedback AS feedback
+               ON feedback.feedback_id = (
+                 SELECT candidate_feedback.feedback_id
+                 FROM human_feedback AS candidate_feedback
+                 WHERE candidate_feedback.event_key = 'alert:' || alerts.alert_id
+                 ORDER BY candidate_feedback.created_at DESC,
+                          candidate_feedback.feedback_id DESC
+                 LIMIT 1
+               )
+             WHERE alerts.request_id = ?1
+             ORDER BY alerts.created_at DESC, alerts.alert_id DESC"
+        );
+        let alerts = query_json_rows_with_i64(conn, &alerts_sql, request_id, |row| {
+            Ok(json!({
+                "alert_id": row.get::<_, i64>(0)?,
+                "request_id": row.get::<_, Option<i64>>(1)?,
+                "severity": row.get::<_, String>(2)?,
+                "action": row.get::<_, String>(3)?,
+                "rule_id": row.get::<_, String>(4)?,
+                "message": row.get::<_, String>(5)?,
+                "path": row.get::<_, Option<String>>(6)?,
+                "evidence": row.get::<_, Option<String>>(7)?,
+                "created_at": row.get::<_, i64>(8)?,
+                "session_id": row.get::<_, Option<String>>(9)?,
+                "original_user_prompt": request["original_user_prompt"].clone(),
+                "event_source": row.get::<_, Option<String>>(10)?,
+                "event_type": row.get::<_, Option<String>>(11)?,
+                "tool_name": row.get::<_, Option<String>>(12)?,
+                "tool_input": row.get::<_, Option<String>>(13)?,
+                "tool_use_id": row.get::<_, Option<String>>(14)?,
+                "human_verdict": row.get::<_, Option<String>>(15)?,
+                "feedback_label": row.get::<_, Option<String>>(16)?,
+                "feedback_created_at": row.get::<_, Option<i64>>(17)?,
+            }))
+        })?;
+
+        Ok(json!({
+            "request": request,
+            "agentEvents": agent_events,
+            "systemEvents": system_events,
+            "alerts": alerts,
         }))
     }
 
@@ -3403,6 +3568,35 @@ fn bounded_transaction_text(value: &str) -> String {
     bounded
 }
 
+fn dashboard_request_prompt(value: Option<&str>) -> Option<String> {
+    let mut prompt = value?.to_string();
+    const OPEN: &str = "<in-app-browser-context";
+    const CLOSE: &str = "</in-app-browser-context>";
+
+    while let Some(start) = prompt.find(OPEN) {
+        let Some(relative_end) = prompt[start..].find(CLOSE) else {
+            prompt.truncate(start);
+            break;
+        };
+        let end = start + relative_end + CLOSE.len();
+        prompt.replace_range(start..end, "");
+    }
+
+    if let Some((_, request)) = prompt.split_once("## My request:") {
+        prompt = request.to_string();
+    }
+
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    let bounded = prompt
+        .chars()
+        .take(MAX_DASHBOARD_PROMPT_CHARS)
+        .collect::<String>();
+    Some(bounded)
+}
+
 fn bounded_transaction_metadata(value: &Value) -> io::Result<String> {
     let encoded = serde_json::to_string(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -3484,6 +3678,28 @@ where
         .map_err(|error| sqlite_error(SqliteError::Database(error)))?;
     let rows = stmt
         .query_map([], |row| mapper(row))
+        .map_err(|error| sqlite_error(SqliteError::Database(error)))?;
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row.map_err(|error| sqlite_error(SqliteError::Database(error)))?);
+    }
+    Ok(values)
+}
+
+fn query_json_rows_with_i64<F>(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    parameter: i64,
+    mut mapper: F,
+) -> io::Result<Vec<Value>>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<Value>,
+{
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|error| sqlite_error(SqliteError::Database(error)))?;
+    let rows = stmt
+        .query_map([parameter], |row| mapper(row))
         .map_err(|error| sqlite_error(SqliteError::Database(error)))?;
     let mut values = Vec::new();
     for row in rows {
@@ -4010,6 +4226,74 @@ mod tests {
         assert!(store.dashboard_day("2026-02-30").is_err());
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_request_returns_complete_request_scoped_events() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-dashboard-request-test-{}-{now}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"Review this request"}"#,
+                now,
+            ))
+            .unwrap();
+        let mut tool = hook_event(
+            "PreToolUse",
+            r#"{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Read","tool_use_id":"read-1"}"#,
+            now + 1,
+        );
+        tool.tool_name = Some("Read".to_string());
+        tool.tool_use_id = Some("read-1".to_string());
+        store.append_hook_event(&tool).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "Stop",
+                r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
+                now + 2,
+            ))
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        let request_id = dashboard["requests"][0]["request_id"].as_i64().unwrap();
+        let detail = store.dashboard_request(request_id).unwrap();
+        assert_eq!(detail["request"]["request_id"], request_id);
+        assert_eq!(
+            detail["request"]["original_user_prompt"],
+            "Review this request"
+        );
+        assert_eq!(detail["agentEvents"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["agentEvents"][0]["type"], "PreToolUse");
+        assert!(detail["agentEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["request_id"] == request_id));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_prompt_strips_ambient_browser_context_before_bounding() {
+        let prompt = concat!(
+            "<in-app-browser-context source=\"ambient-ui-state\">\n",
+            "This block is automatically supplied ambient UI state.\n",
+            "</in-app-browser-context>\n\n",
+            "## My request:\n",
+            "Fix the request timeline"
+        );
+        assert_eq!(
+            dashboard_request_prompt(Some(prompt)).as_deref(),
+            Some("Fix the request timeline")
+        );
     }
 
     #[test]

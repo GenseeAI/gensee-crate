@@ -1,12 +1,12 @@
 import SwiftUI
 
 enum DashboardDestination: String, CaseIterable, Identifiable {
-    case dashboard = "Control Center"
+    case overview = "Overview"
+    case reviews = "Work Review"
     case today = "Daily Highlight"
-    case timeline = "Timeline"
     case alerts = "Alerts"
     case lineage = "Lineage Graph"
-    case recovery = "Recovery"
+    case checkpoints = "Checkpoints"
     case harnesses = "Harnesses"
     case policy = "Policy"
     case settings = "Settings"
@@ -15,12 +15,12 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
-        case .dashboard: "gauge.with.dots.needle.33percent"
+        case .overview: "gauge.with.dots.needle.33percent"
+        case .reviews: "checklist.checked"
         case .today: "star"
-        case .timeline: "clock"
         case .alerts: "exclamationmark.triangle"
         case .lineage: "point.3.connected.trianglepath.dotted"
-        case .recovery: "arrow.uturn.backward.circle"
+        case .checkpoints: "arrow.uturn.backward.circle"
         case .harnesses: "switch.2"
         case .policy: "checkmark.shield"
         case .settings: "gearshape"
@@ -32,7 +32,7 @@ struct DashboardShell: View {
     @ObservedObject var extensionManager: EndpointSecurityExtensionManager
     @ObservedObject var model: ConsoleModel
     @Binding var showsSetupAssistant: Bool
-    @State private var selection: DashboardDestination = .dashboard
+    @State private var selection: DashboardDestination = .overview
     @State private var searchText = ""
     @StateObject private var notifications = CompletionNotificationCoordinator()
     @AppStorage("gensee.dashboard.darkMode") private var darkMode = false
@@ -122,7 +122,7 @@ struct DashboardShell: View {
             if !model.isDemoMode {
                 Button {
                     model.enterDemoMode()
-                    selection = .dashboard
+                    selection = .overview
                 } label: {
                     Label("Try Demo", systemImage: "play.rectangle")
                 }
@@ -174,30 +174,28 @@ struct DashboardShell: View {
 
     @ViewBuilder
     private var destinationView: some View {
-        if model.isDemoMode && [.harnesses, .policy, .recovery, .settings].contains(selection) {
+        if model.isDemoMode && [.harnesses, .policy, .checkpoints, .settings].contains(selection) {
             DemoConfigurationPage(destination: selection) {
                 Task { await model.exitDemoMode() }
             }
         } else {
             switch selection {
-            case .dashboard: DashboardOverviewPage(
+            case .overview: DashboardOverviewPage(model: model, sensor: model.endpointSensor)
+            case .reviews: DashboardWorkReviewPage(
                 model: model,
-                sensor: model.endpointSensor,
-                notifications: notifications,
-                onOpenTimeline: { selection = .timeline },
-                onOpenAlerts: { selection = .alerts }
+                searchText: searchText
             )
             case .today: TodayHighlightPage(model: model)
-            case .timeline: TimelinePage(model: model, searchText: searchText)
             case .alerts: DashboardAlertsPage(model: model, searchText: searchText)
             case .lineage: LineagePage(model: model, searchText: searchText)
-            case .recovery: DashboardRecoveryPage(model: model)
+            case .checkpoints: DashboardRecoveryPage(model: model)
             case .harnesses: DashboardHarnessesPage(model: model)
             case .policy: DashboardPolicyPage(model: model)
             case .settings: DashboardSettingsPage(
                 model: model,
                 extensionManager: extensionManager,
                 sensor: model.endpointSensor,
+                notifications: notifications,
                 darkMode: $darkMode,
                 onRunSetupAssistant: { showsSetupAssistant = true }
             )
@@ -251,13 +249,13 @@ private struct DashboardSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            navGroup("OVERVIEW", [.dashboard])
+            navGroup("OVERVIEW", [.overview])
             separator
-            navGroup("ACTIVITY", [.today, .timeline])
+            navGroup("ACTIVITY", [.reviews, .today, .checkpoints])
             separator
             navGroup("SECURITY", [.alerts, .lineage])
             separator
-            navGroup("CONFIGURATION", [.harnesses, .policy, .recovery, .settings])
+            navGroup("CONFIGURATION", [.harnesses, .policy, .settings])
             Spacer()
         }
         .padding(.top, 8)

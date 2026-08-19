@@ -11,15 +11,26 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     @Published var dailyBriefingEnabled: Bool {
         didSet { defaults.set(dailyBriefingEnabled, forKey: Self.dailyEnabledKey) }
     }
+    @Published var alertNotificationsEnabled: Bool {
+        didSet { defaults.set(alertNotificationsEnabled, forKey: Self.alertEnabledKey) }
+    }
+    @Published var minimumAlertSeverity: NotificationSeverity {
+        didSet { defaults.set(minimumAlertSeverity.rawValue, forKey: Self.minimumAlertSeverityKey) }
+    }
 
     private let center = UNUserNotificationCenter.current()
     private let defaults = UserDefaults.standard
     private var hasSeededCurrentStore = false
     private var notifiedRequestIDs: Set<Int64>
+    private var notifiedAlertIDs: Set<Int64>
 
     override init() {
         completionNotificationsEnabled = UserDefaults.standard.object(forKey: Self.completionEnabledKey) as? Bool ?? true
         dailyBriefingEnabled = UserDefaults.standard.bool(forKey: Self.dailyEnabledKey)
+        alertNotificationsEnabled = UserDefaults.standard.bool(forKey: Self.alertEnabledKey)
+        minimumAlertSeverity = NotificationSeverity(
+            rawValue: UserDefaults.standard.string(forKey: Self.minimumAlertSeverityKey) ?? "high"
+        ) ?? .high
         notifiedRequestIDs = Set(
             (UserDefaults.standard.array(forKey: Self.notifiedRequestsKey) ?? []).compactMap { value in
                 if let number = value as? NSNumber {
@@ -28,6 +39,13 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
                 if let string = value as? String {
                     return Int64(string)
                 }
+                return nil
+            }
+        )
+        notifiedAlertIDs = Set(
+            (UserDefaults.standard.array(forKey: Self.notifiedAlertsKey) ?? []).compactMap { value in
+                if let number = value as? NSNumber { return number.int64Value }
+                if let string = value as? String { return Int64(string) }
                 return nil
             }
         )
@@ -52,12 +70,19 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         }
     }
 
+    func openSystemNotificationSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     func process(snapshot: SecuritySnapshot, now: Date = Date()) async {
         let summaries = AgentCompletionDerivation.summaries(from: snapshot)
         guard hasSeededCurrentStore else {
             // The first refresh is history, not a burst of newly completed work.
             notifiedRequestIDs.formUnion(summaries.map(\.requestID))
+            notifiedAlertIDs.formUnion(snapshot.alerts.map(\.alertID))
             persistNotifiedRequests()
+            persistNotifiedAlerts()
             hasSeededCurrentStore = true
             await sendDailyBriefingIfNeeded(snapshot: snapshot, now: now)
             return
@@ -69,8 +94,18 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
                 await sendCompletion(summary)
             }
         }
+        if alertNotificationsEnabled, isAuthorized {
+            let newAlerts = snapshot.alerts.filter {
+                !notifiedAlertIDs.contains($0.alertID) && minimumAlertSeverity.includes($0.severity)
+            }
+            if !newAlerts.isEmpty {
+                await sendAlertDigest(newAlerts)
+            }
+        }
         notifiedRequestIDs.formUnion(summaries.map(\.requestID))
+        notifiedAlertIDs.formUnion(snapshot.alerts.map(\.alertID))
         persistNotifiedRequests()
+        persistNotifiedAlerts()
         await sendDailyBriefingIfNeeded(snapshot: snapshot, now: now)
     }
 
@@ -83,6 +118,33 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         content.userInfo = ["request_id": summary.requestID]
         let request = UNNotificationRequest(
             identifier: "gensee-completion-\(summary.requestID)",
+            content: content,
+            trigger: nil
+        )
+        try? await center.add(request)
+    }
+
+    private func sendAlertDigest(_ alerts: [SecurityAlert]) async {
+        let ordered = alerts.sorted {
+            let left = NotificationSeverity.rank(for: $0.severity)
+            let right = NotificationSeverity.rank(for: $1.severity)
+            return left == right ? $0.createdAt > $1.createdAt : left > right
+        }
+        guard let highest = ordered.first else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = ordered.count == 1
+            ? "(highest.severity.capitalized) finding needs review"
+            : "(ordered.count) new findings need review"
+        content.body = ordered.count == 1
+            ? highest.message
+            : "(highest.message) · (ordered.count - 1) more"
+        content.sound = NotificationSeverity.rank(for: highest.severity) >= NotificationSeverity.rank(for: "high")
+            ? .default
+            : nil
+        content.userInfo = ["alert_id": highest.alertID]
+        let request = UNNotificationRequest(
+            identifier: "gensee-alerts-\(highest.alertID)",
             content: content,
             trigger: nil
         )
@@ -115,9 +177,18 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         defaults.set(Array(recent), forKey: Self.notifiedRequestsKey)
     }
 
+    private func persistNotifiedAlerts() {
+        let recent = notifiedAlertIDs.sorted(by: >).prefix(2_000)
+        notifiedAlertIDs = Set(recent)
+        defaults.set(Array(recent), forKey: Self.notifiedAlertsKey)
+    }
+
     private static let completionEnabledKey = "gensee.notifications.completions.enabled"
     private static let dailyEnabledKey = "gensee.notifications.daily.enabled"
+    private static let alertEnabledKey = "gensee.notifications.alerts.enabled"
+    private static let minimumAlertSeverityKey = "gensee.notifications.alerts.minimum-severity"
     private static let notifiedRequestsKey = "gensee.notifications.completed-request-ids"
+    private static let notifiedAlertsKey = "gensee.notifications.alert-ids"
     private static let lastDailyBriefingKey = "gensee.notifications.last-daily-briefing"
     private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()

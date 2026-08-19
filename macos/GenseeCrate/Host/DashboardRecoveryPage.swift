@@ -10,8 +10,8 @@ struct DashboardRecoveryPage: View {
     var body: some View {
         DashboardPage {
             DashboardPageHeader(
-                "Recovery",
-                description: "Create a local safety point before an agent makes substantial changes."
+                "Checkpoints",
+                description: "Save a local workspace state before risky agent work, then restore it if the result goes wrong."
             ) {
                 Button {
                     Task { await model.loadCheckpoints(workspace: workspacePath) }
@@ -55,9 +55,9 @@ struct DashboardRecoveryPage: View {
                             .foregroundStyle(Color.dashboardBlue)
                     )
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("A practical undo point for agent work")
+                    Text("An undo point before substantial agent work")
                         .font(.system(size: 15, weight: .semibold))
-                    Text("Gensee stores the workspace in Git's local object database without committing to your branch or changing what you staged. Every restore creates another checkpoint first, so it is reversible.")
+                    Text("Choose a Git project, create a checkpoint before starting the task, and return here to restore it if needed. Gensee stores the files in Git's local object database without committing to your branch or changing what you staged. Every restore first saves the current state as a rescue checkpoint.")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -69,7 +69,7 @@ struct DashboardRecoveryPage: View {
     }
 
     private var checkpointControls: some View {
-        DashboardCard("Workspace checkpoint") {
+        DashboardCard("1. Create a checkpoint") {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .bottom, spacing: 10) {
                     VStack(alignment: .leading, spacing: 5) {
@@ -115,7 +115,7 @@ struct DashboardRecoveryPage: View {
 
     @ViewBuilder
     private var checkpointList: some View {
-        DashboardCard("Available checkpoints") {
+        DashboardCard("2. Restore when needed") {
             if model.checkpoints.isEmpty {
                 DashboardEmpty(
                     text: workspacePath.isEmpty

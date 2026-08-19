@@ -33,7 +33,7 @@ console.
 - Per-harness Config Audit actions backed by the shared OSS Rust audit library
   for static, read-only review of Codex and VS Code/Copilot configuration.
 - Local workspace checkpoints and explicitly confirmed restore from the
-  **Recovery** page.
+  **Checkpoints** page.
 
 ## First-launch setup
 
@@ -129,9 +129,9 @@ count. It does not copy transcript content into the activity aggregate. Token
 history begins after this version is installed; prior turns remain at zero,
 and harnesses that do not expose compatible usage metadata also report zero.
 
-## Recovery checkpoints
+## Workspace checkpoints
 
-Before handing an agent a substantial change, open **Recovery**, select its Git
+Before handing an agent a substantial change, open **Checkpoints**, select its Git
 workspace, and create a labeled checkpoint. Gensee writes a private commit to
 `refs/gensee/checkpoints/*`; it does not move the current branch, create a
 normal commit, or alter the user's staging index. Tracked and untracked

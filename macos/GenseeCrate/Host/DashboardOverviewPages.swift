@@ -4,27 +4,13 @@ import SwiftUI
 struct DashboardOverviewPage: View {
     @ObservedObject var model: ConsoleModel
     @ObservedObject var sensor: EndpointSecuritySensor
-    @ObservedObject var notifications: CompletionNotificationCoordinator
-    let onOpenTimeline: () -> Void
-    let onOpenAlerts: () -> Void
-
-    @State private var selectedRequestID: Int64?
-
-    private var completionSummaries: [AgentCompletionSummary] {
-        AgentCompletionDerivation.summaries(from: model.snapshot)
-    }
-
-    private var selectedSummary: AgentCompletionSummary? {
-        completionSummaries.first(where: { $0.requestID == selectedRequestID })
-            ?? completionSummaries.first
-    }
 
     var body: some View {
         DashboardPage {
             VStack(alignment: .leading, spacing: 16) {
                 DashboardPageHeader(
-                    "Control Center",
-                    description: "Let agents work. Return to a concise, verified account of what changed."
+                    "Overview",
+                    description: "Protection health and recent security activity on this Mac."
                 ) {
                     if let updated = model.lastUpdated {
                         Text("Updated \(updated.formatted(.relative(presentation: .named)))")
@@ -32,28 +18,6 @@ struct DashboardOverviewPage: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-
-                if let selectedSummary {
-                    CompletionReviewCard(
-                        summary: selectedSummary,
-                        onOpenTimeline: onOpenTimeline,
-                        onOpenAlerts: onOpenAlerts
-                    )
-                } else {
-                    EmptyControlCenterCard(activeRunCount: model.activeRunCount)
-                }
-
-                if completionSummaries.count > 1 {
-                    RecentCompletionStrip(
-                        summaries: Array(completionSummaries.prefix(6)),
-                        selectedRequestID: Binding(
-                            get: { selectedSummary?.requestID },
-                            set: { selectedRequestID = $0 }
-                        )
-                    )
-                }
-
-                NotificationPreferenceCard(notifications: notifications)
 
                 HStack(spacing: 10) {
                     if model.isDemoMode {
@@ -87,9 +51,9 @@ struct DashboardOverviewPage: View {
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.dashboardLine))
 
                 HStack(spacing: 16) {
-                    DashboardStatCard(title: "Recent completions", value: completionSummaries.count, symbol: "checkmark.circle", color: .dashboardBlue)
-                    DashboardStatCard(title: "Agent turns", value: model.snapshot.summary.requestsCount, symbol: "arrow.triangle.turn.up.right.diamond", color: .dashboardGreen)
-                    DashboardStatCard(title: "Tool calls", value: model.snapshot.dailyActivity.last?.toolCalls ?? 0, symbol: "hammer", color: .dashboardGold)
+                    DashboardStatCard(title: "Sessions", value: model.snapshot.summary.sessionsCount, symbol: "person.2", color: .dashboardBlue)
+                    DashboardStatCard(title: "Requests", value: model.snapshot.summary.requestsCount, symbol: "arrow.triangle.turn.up.right.diamond", color: .dashboardGreen)
+                    DashboardStatCard(title: "Agent events", value: model.snapshot.summary.agentEventsCount, symbol: "bolt", color: .dashboardGold)
                     DashboardStatCard(title: "High-risk findings (24 h)", value: model.snapshot.summary.recentHighAlerts, symbol: "exclamationmark.triangle", color: .dashboardRed)
                         .help("High and critical describe potential impact. The alert action separately shows whether Gensee warned, asked, or blocked.")
                 }
@@ -114,6 +78,669 @@ struct DashboardOverviewPage: View {
                 }
             }
         }
+    }
+}
+
+private enum WorkReviewSelection: Hashable {
+    case session(String)
+    case request(Int64)
+}
+
+private enum WorkReviewSection: String, CaseIterable, Identifiable {
+    case summary = "Summary"
+    case timeline = "Timeline"
+    case findings = "Findings"
+
+    var id: String { rawValue }
+}
+
+private enum WorkReviewFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case attention = "Needs attention"
+    case findings = "Has findings"
+
+    var id: String { rawValue }
+}
+
+struct DashboardWorkReviewPage: View {
+    @ObservedObject var model: ConsoleModel
+    let searchText: String
+
+    @State private var selection: WorkReviewSelection?
+    @State private var section: WorkReviewSection = .summary
+    @State private var filter: WorkReviewFilter = .all
+
+    private var sessions: [AgentSessionSummary] {
+        AgentCompletionDerivation.sessionSummaries(from: model.snapshot).compactMap { session in
+            let requests = session.requests.filter(matches)
+            guard !requests.isEmpty else { return nil }
+            return AgentSessionSummary(
+                sessionID: session.sessionID,
+                harness: session.harness,
+                startedAt: requests.map(\.startedAt).min() ?? session.startedAt,
+                completedAt: requests.map(\.completedAt).max() ?? session.completedAt,
+                requests: requests
+            )
+        }
+    }
+
+    private var resolvedSelection: WorkReviewSelection? {
+        if let selection, selectionExists(selection) { return selection }
+        return sessions.first?.requests.first.map { .request($0.requestID) }
+    }
+
+    private var selectedRequestID: Int64? {
+        guard case let .request(requestID) = resolvedSelection else { return nil }
+        return requestID
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            DashboardPageHeader(
+                "Work Review",
+                description: "Review completed agent sessions and requests with their evidence in context."
+            ) {
+                if let updated = model.lastUpdated {
+                    Text("Updated \(updated.formatted(.relative(presentation: .named)))")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 24)
+
+            Divider()
+
+            if sessions.isEmpty {
+                EmptyControlCenterCard(activeRunCount: model.activeRunCount)
+                    .padding(24)
+                Spacer()
+            } else {
+                HStack(spacing: 0) {
+                    workBrowser
+                        .frame(width: 340)
+                    Divider()
+                    ScrollView {
+                        reviewDetail
+                            .padding(22)
+                            .frame(maxWidth: 960, alignment: .leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onAppear { establishSelection() }
+        .onChange(of: sessions.map(\.id)) { _ in establishSelection() }
+        .task(id: selectedRequestID) {
+            guard let selectedRequestID else { return }
+            await model.loadRequestReview(requestID: selectedRequestID)
+        }
+    }
+
+    private var workBrowser: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("SESSIONS & REQUESTS")
+                        .font(.system(size: 9, weight: .bold))
+                        .tracking(0.9)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(sessions.reduce(0) { $0 + $1.requestCount }) requests")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+                Picker("Filter", selection: $filter) {
+                    ForEach(WorkReviewFilter.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+            }
+            .padding(14)
+            .background(Color.dashboardMutedFill.opacity(0.55))
+
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
+                        WorkReviewSessionGroup(
+                            session: session,
+                            selection: Binding(
+                                get: { resolvedSelection },
+                                set: {
+                                    selection = $0
+                                    section = .summary
+                                }
+                            ),
+                            initiallyExpanded: index == 0
+                        )
+                    }
+                }
+                .padding(10)
+            }
+        }
+        .background(Color.dashboardPanel)
+    }
+
+    @ViewBuilder
+    private var reviewDetail: some View {
+        switch resolvedSelection {
+        case let .request(requestID):
+            if let summary = sessions.flatMap(\.requests).first(where: { $0.requestID == requestID }) {
+                RequestReviewDetail(
+                    summary: summary,
+                    model: model,
+                    section: $section
+                )
+            }
+        case let .session(sessionID):
+            if let session = sessions.first(where: { $0.sessionID == sessionID }) {
+                SessionReviewDetail(
+                    session: session,
+                    snapshot: model.snapshot,
+                    model: model,
+                    section: $section,
+                    onSelectRequest: {
+                        selection = .request($0)
+                        section = .summary
+                    }
+                )
+            }
+        case nil:
+            DashboardEmpty(text: "Select a session or request to review.", symbol: "checklist")
+        }
+    }
+
+    private func matches(_ request: AgentCompletionSummary) -> Bool {
+        let matchesFilter: Bool
+        switch filter {
+        case .all: matchesFilter = true
+        case .attention: matchesFilter = request.reviewState == .attention
+        case .findings: matchesFilter = request.alertCount > 0
+        }
+        return matchesFilter && containsSearch(
+            searchText,
+            fields: request.prompt, request.harness, request.sessionID,
+            request.affectedFiles.joined(separator: " ")
+        )
+    }
+
+    private func selectionExists(_ selection: WorkReviewSelection) -> Bool {
+        switch selection {
+        case let .session(id): sessions.contains { $0.sessionID == id }
+        case let .request(id): sessions.contains { session in session.requests.contains { $0.requestID == id } }
+        }
+    }
+
+    private func establishSelection() {
+        guard resolvedSelection == nil, let request = sessions.first?.requests.first else { return }
+        selection = .request(request.requestID)
+    }
+}
+
+private struct WorkReviewSessionGroup: View {
+    let session: AgentSessionSummary
+    @Binding var selection: WorkReviewSelection?
+    @State private var expanded: Bool
+
+    init(session: AgentSessionSummary, selection: Binding<WorkReviewSelection?>, initiallyExpanded: Bool) {
+        self.session = session
+        _selection = selection
+        _expanded = State(initialValue: initiallyExpanded)
+    }
+
+    var body: some View {
+        VStack(spacing: 2) {
+            HStack(spacing: 7) {
+                Button { expanded.toggle() } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .frame(width: 14)
+                }
+                .buttonStyle(.plain)
+                Button { selection = .session(session.sessionID) } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Circle().fill(reviewStateColor(session.reviewState)).frame(width: 7, height: 7)
+                            Text(session.harness).font(.system(size: 11, weight: .semibold))
+                            Spacer()
+                            Text("\(session.requestCount)").font(.system(size: 10, weight: .semibold))
+                            Text("req").font(.system(size: 9)).foregroundStyle(.secondary)
+                        }
+                        Text("\(relativeTimestamp(session.completedAt)) · \(formattedDuration(session.durationMS))")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(9)
+            .background(selection == .session(session.sessionID) ? Color.dashboardBlue.opacity(0.10) : Color.dashboardMutedFill)
+            .overlay(RoundedRectangle(cornerRadius: 5).stroke(selection == .session(session.sessionID) ? Color.dashboardBlue : Color.clear))
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+
+            if expanded {
+                VStack(spacing: 2) {
+                    ForEach(session.requests) { request in
+                        Button { selection = .request(request.requestID) } label: {
+                            HStack(alignment: .top, spacing: 8) {
+                                Circle().fill(reviewStateColor(request.reviewState)).frame(width: 6, height: 6).padding(.top, 4)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(request.prompt)
+                                        .font(.system(size: 10, weight: selection == .request(request.requestID) ? .semibold : .regular))
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.leading)
+                                    HStack(spacing: 7) {
+                                        Text(relativeTimestamp(request.completedAt))
+                                        Text("\(request.toolCallCount) tools")
+                                        if request.alertCount > 0 { Text("\(request.alertCount) findings") }
+                                    }
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.vertical, 7)
+                            .padding(.horizontal, 9)
+                            .contentShape(Rectangle())
+                            .background(selection == .request(request.requestID) ? Color.dashboardBlue.opacity(0.08) : Color.clear)
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.leading, 18)
+            }
+        }
+    }
+}
+
+private struct RequestReviewDetail: View {
+    let summary: AgentCompletionSummary
+    @ObservedObject var model: ConsoleModel
+    @Binding var section: WorkReviewSection
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            CompletionReviewCard(
+                summary: effectiveSummary,
+                onOpenTimeline: { section = .timeline },
+                onOpenAlerts: { section = .findings }
+            )
+            ReviewSectionPicker(section: $section, findingCount: effectiveFindingCount)
+            switch section {
+            case .summary:
+                RequestEvidenceSummary(summary: effectiveSummary)
+            case .timeline:
+                requestEvidenceContent {
+                    ReviewTimelinePanel(
+                        requests: [effectiveSummary],
+                        agentEvents: payload?.agentEvents ?? [],
+                        alerts: payload?.alerts ?? []
+                    )
+                }
+            case .findings:
+                requestEvidenceContent {
+                    ReviewFindingsPanel(alerts: payload?.alerts ?? [], model: model)
+                }
+            }
+        }
+    }
+
+    private var payload: RequestReviewPayload? {
+        guard model.requestReviewPayload?.request.requestID == summary.requestID else { return nil }
+        return model.requestReviewPayload
+    }
+
+    private var effectiveSummary: AgentCompletionSummary {
+        guard let payload else { return summary }
+        var scoped = SecuritySnapshot()
+        scoped.requests = [payload.request]
+        scoped.agentEvents = payload.agentEvents
+        scoped.systemEvents = payload.systemEvents
+        scoped.alerts = payload.alerts
+        scoped.sessions = model.snapshot.sessions.filter { $0.sessionID == payload.request.sessionID }
+        return AgentCompletionDerivation.summaries(from: scoped).first ?? summary
+    }
+
+    private var effectiveFindingCount: Int {
+        payload?.alerts.count ?? summary.alertCount
+    }
+
+    @ViewBuilder
+    private func requestEvidenceContent<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        switch model.requestReviewLoadState {
+        case let .loaded(requestID) where requestID == summary.requestID:
+            content()
+        case let .loading(requestID) where requestID == summary.requestID:
+            DashboardCard {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading complete request evidence…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(6)
+            }
+        case .idle:
+            DashboardCard {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading complete request evidence…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(6)
+            }
+        case let .unavailable(requestID, message) where requestID == summary.requestID:
+            DashboardCard {
+                DashboardEmpty(text: "Request evidence could not be loaded: \(message)", symbol: "exclamationmark.triangle")
+            }
+        default:
+            DashboardCard {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading complete request evidence…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(6)
+            }
+        }
+    }
+}
+
+private struct SessionReviewDetail: View {
+    let session: AgentSessionSummary
+    let snapshot: SecuritySnapshot
+    @ObservedObject var model: ConsoleModel
+    @Binding var section: WorkReviewSection
+    let onSelectRequest: (Int64) -> Void
+
+    private var findings: [SecurityAlert] {
+        let requestIDs = Set(session.requests.map(\.requestID))
+        return snapshot.alerts.filter { requestIDs.contains($0.requestID ?? -1) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            SessionReviewCard(session: session, section: $section)
+            ReviewSectionPicker(section: $section, findingCount: findings.count)
+            switch section {
+            case .summary:
+                DashboardCard("Requests in this session") {
+                    VStack(spacing: 0) {
+                        ForEach(session.requests) { request in
+                            Button { onSelectRequest(request.requestID) } label: {
+                                HStack(spacing: 10) {
+                                    Circle().fill(reviewStateColor(request.reviewState)).frame(width: 7, height: 7)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(request.prompt).font(.system(size: 11, weight: .medium)).lineLimit(2)
+                                        Text("\(request.toolCallCount) tool calls · \(request.affectedFiles.count) files · \(request.alertCount) findings")
+                                            .font(.system(size: 9)).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Text(formattedDuration(request.durationMS)).font(.system(size: 10, weight: .semibold))
+                                    Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(.tertiary)
+                                }
+                                .padding(.vertical, 9)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            if request.id != session.requests.last?.id { Divider() }
+                        }
+                    }
+                }
+            case .timeline:
+                ReviewTimelinePanel(
+                    requests: Array(session.requests.reversed()),
+                    agentEvents: snapshot.agentEvents,
+                    alerts: snapshot.alerts
+                )
+            case .findings:
+                ReviewFindingsPanel(alerts: findings, model: model)
+            }
+        }
+    }
+}
+
+private struct SessionReviewCard: View {
+    let session: AgentSessionSummary
+    @Binding var section: WorkReviewSection
+
+    var body: some View {
+        DashboardCard {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .top, spacing: 14) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 9).fill(reviewStateColor(session.reviewState).opacity(0.12))
+                        Image(systemName: "rectangle.stack.badge.person.crop")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundStyle(reviewStateColor(session.reviewState))
+                    }
+                    .frame(width: 48, height: 48)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Text("Session summary").font(.system(size: 18, weight: .semibold))
+                            DashboardTag(text: session.harness, color: .dashboardBlue)
+                        }
+                        Text("\(session.requestCount) completed request\(session.requestCount == 1 ? "" : "s") · \(relativeTimestamp(session.completedAt))")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(formattedDuration(session.durationMS)).font(.system(size: 17, weight: .semibold, design: .rounded))
+                        Text("session span").font(.system(size: 9)).foregroundStyle(.secondary)
+                    }
+                }
+                HStack(spacing: 0) {
+                    ReviewMetric(value: session.requestCount, label: "requests", symbol: "text.bubble")
+                    reviewMetricDivider
+                    ReviewMetric(value: session.toolCallCount, label: "tool calls", symbol: "hammer")
+                    reviewMetricDivider
+                    ReviewMetric(value: session.affectedFiles.count, label: "files changed", symbol: "doc.badge.ellipsis")
+                    reviewMetricDivider
+                    ReviewMetric(value: session.alertCount, label: "findings", symbol: "exclamationmark.triangle")
+                }
+                .padding(.vertical, 12)
+                .background(Color.dashboardMutedFill.opacity(0.72), in: RoundedRectangle(cornerRadius: 7))
+                HStack(spacing: 10) {
+                    Button { section = .timeline } label: { Label("Review session timeline", systemImage: "clock.arrow.circlepath") }
+                        .buttonStyle(.borderedProminent)
+                    Button { section = .findings } label: { Label("View findings", systemImage: "exclamationmark.triangle") }
+                        .buttonStyle(.bordered)
+                    Spacer()
+                }
+            }
+            .padding(4)
+        }
+        .overlay(alignment: .leading) { Rectangle().fill(reviewStateColor(session.reviewState)).frame(width: 3).padding(.vertical, 1) }
+    }
+
+    private var reviewMetricDivider: some View {
+        Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 34)
+    }
+}
+
+private struct ReviewSectionPicker: View {
+    @Binding var section: WorkReviewSection
+    let findingCount: Int
+
+    var body: some View {
+        Picker("Review detail", selection: $section) {
+            ForEach(WorkReviewSection.allCases) { item in
+                Text(item == .findings ? "Findings (\(findingCount))" : item.rawValue).tag(item)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(maxWidth: 420)
+    }
+}
+
+private struct RequestEvidenceSummary: View {
+    let summary: AgentCompletionSummary
+
+    var body: some View {
+        DashboardCard("Evidence captured") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 28) {
+                    Label("\(summary.commandCount) commands", systemImage: "terminal")
+                    Label("\(summary.testCommandCount) test runs observed", systemImage: "checkmark.diamond")
+                    Label("\(summary.alertCount) findings", systemImage: "exclamationmark.triangle")
+                }
+                .font(.system(size: 11, weight: .medium))
+                Divider()
+                Text("Affected files").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                if summary.affectedFiles.isEmpty {
+                    Text("No file mutation was attributed to this request.").font(.system(size: 11)).foregroundStyle(.secondary)
+                } else {
+                    ForEach(summary.affectedFiles.prefix(12), id: \.self) { path in
+                        Label(abbreviatedPath(path), systemImage: "doc")
+                            .font(.system(size: 10, design: .monospaced))
+                            .help(path)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ReviewTimelinePanel: View {
+    let requests: [AgentCompletionSummary]
+    let agentEvents: [AgentEvent]
+    let alerts: [SecurityAlert]
+
+    var body: some View {
+        DashboardCard("Execution timeline") {
+            VStack(alignment: .leading, spacing: 14) {
+                ForEach(requests) { request in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(request.prompt).font(.system(size: 11, weight: .semibold)).lineLimit(2)
+                            Spacer()
+                            Text("\(calls(for: request).count) tool calls").font(.system(size: 9)).foregroundStyle(.secondary)
+                        }
+                        if calls(for: request).isEmpty {
+                            AnswerOnlyLifecycle(request: request)
+                        } else {
+                            TimelineToolCallGraph(calls: calls(for: request), outcomes: outcomes(for: request))
+                        }
+                    }
+                    if request.id != requests.last?.id { Divider() }
+                }
+            }
+        }
+    }
+
+    private func calls(for request: AgentCompletionSummary) -> [TimelineToolCall] {
+        TimelineDerivation.toolCalls(from: agentEvents.filter { $0.requestID == request.requestID })
+    }
+
+    private func outcomes(for request: AgentCompletionSummary) -> [String: TimelinePolicyOutcome] {
+        TimelineDerivation.policyOutcomes(from: alerts.filter { $0.requestID == request.requestID })
+    }
+}
+
+private struct AnswerOnlyLifecycle: View {
+    let request: AgentCompletionSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 7) {
+                Image(systemName: "text.bubble")
+                    .foregroundStyle(Color.dashboardGreen)
+                Text("No tools called")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("The agent answered directly.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 0) {
+                LifecycleStop(
+                    symbol: "arrow.right.circle.fill",
+                    title: "Request started",
+                    timestamp: request.startedAt,
+                    color: .dashboardBlue
+                )
+                Rectangle()
+                    .fill(Color.dashboardLine)
+                    .frame(maxWidth: .infinity, minHeight: 1, maxHeight: 1)
+                    .overlay {
+                        Text(formattedDuration(request.durationMS))
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .background(Color.dashboardPanel)
+                    }
+                LifecycleStop(
+                    symbol: "checkmark.circle.fill",
+                    title: "Answer completed",
+                    timestamp: request.completedAt,
+                    color: .dashboardGreen
+                )
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Request started at \(dashboardTime(request.startedAt)) and completed at \(dashboardTime(request.completedAt)) after \(formattedDuration(request.durationMS)). No tools were called.")
+        }
+        .padding(12)
+        .background(Color.dashboardMutedFill.opacity(0.48), in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+private struct LifecycleStop: View {
+    let symbol: String
+    let title: String
+    let timestamp: Int64
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 10, weight: .semibold))
+                Text(dashboardTime(timestamp)).font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+        }
+        .fixedSize()
+    }
+}
+
+private struct ReviewFindingsPanel: View {
+    let alerts: [SecurityAlert]
+    @ObservedObject var model: ConsoleModel
+
+    var body: some View {
+        DashboardCard("Findings in this review") {
+            if alerts.isEmpty {
+                DashboardEmpty(text: "No findings were correlated with this selection.", symbol: "checkmark.shield")
+            } else {
+                VStack(spacing: 0) {
+                    AlertListHeader()
+                    ForEach(alerts) { alert in
+                        Divider()
+                        ExpandableAlertRow(alert: alert, model: model)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private func reviewStateColor(_ state: AgentReviewState) -> Color {
+    switch state {
+    case .verified: .dashboardGreen
+    case .review: .dashboardGold
+    case .attention: .dashboardRed
     }
 }
 
@@ -277,54 +904,6 @@ private struct VerificationLine: View {
     }
 }
 
-private struct RecentCompletionStrip: View {
-    let summaries: [AgentCompletionSummary]
-    @Binding var selectedRequestID: Int64?
-
-    var body: some View {
-        DashboardCard("Recent completed tasks") {
-            HStack(spacing: 8) {
-                ForEach(summaries) { summary in
-                    Button {
-                        selectedRequestID = summary.requestID
-                    } label: {
-                        VStack(alignment: .leading, spacing: 5) {
-                            HStack {
-                                Circle().fill(stateColor(summary.reviewState)).frame(width: 7, height: 7)
-                                Text(summary.harness).font(.system(size: 10, weight: .semibold))
-                                Spacer()
-                                Text(relativeTimestamp(summary.completedAt)).font(.system(size: 9)).foregroundStyle(.secondary)
-                            }
-                            Text(summary.prompt)
-                                .font(.system(size: 10))
-                                .lineLimit(2)
-                                .multilineTextAlignment(.leading)
-                        }
-                        .padding(9)
-                        .frame(maxWidth: .infinity, minHeight: 62, alignment: .topLeading)
-                        .background(
-                            selectedRequestID == summary.requestID ? Color.dashboardBlue.opacity(0.10) : Color.dashboardMutedFill,
-                            in: RoundedRectangle(cornerRadius: 6)
-                        )
-                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(
-                            selectedRequestID == summary.requestID ? Color.dashboardBlue : Color.dashboardLine
-                        ))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-    }
-
-    private func stateColor(_ state: AgentReviewState) -> Color {
-        switch state {
-        case .verified: .dashboardGreen
-        case .review: .dashboardGold
-        case .attention: .dashboardRed
-        }
-    }
-}
-
 private struct EmptyControlCenterCard: View {
     let activeRunCount: Int
 
@@ -346,44 +925,6 @@ private struct EmptyControlCenterCard: View {
                 }
                 Spacer()
             }.padding(8)
-        }
-    }
-}
-
-private struct NotificationPreferenceCard: View {
-    @ObservedObject var notifications: CompletionNotificationCoordinator
-
-    var body: some View {
-        DashboardCard {
-            HStack(spacing: 14) {
-                Image(systemName: "bell.badge")
-                    .font(.system(size: 18))
-                    .foregroundStyle(Color.dashboardBlue)
-                    .frame(width: 30)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Know when substantial work is ready")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text("One quiet notification for large completed tasks—never for every tool call. Optional daily briefing after 5 PM.")
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if notifications.isAuthorized {
-                    Toggle("Task completions", isOn: $notifications.completionNotificationsEnabled)
-                        .toggleStyle(.switch).controlSize(.small)
-                    Toggle("Daily briefing", isOn: $notifications.dailyBriefingEnabled)
-                        .toggleStyle(.switch).controlSize(.small)
-                } else {
-                    Button("Enable notifications") {
-                        Task { await notifications.requestAuthorization() }
-                    }
-                    .controlSize(.small)
-                    .disabled(notifications.authorizationStatus == .denied)
-                    if notifications.authorizationStatus == .denied {
-                        Text("Enable in System Settings")
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
-                    }
-                }
-            }
         }
     }
 }

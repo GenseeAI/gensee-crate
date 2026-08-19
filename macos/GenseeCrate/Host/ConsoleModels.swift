@@ -44,6 +44,37 @@ struct SecuritySnapshot: Decodable {
     }
 }
 
+struct RequestReviewPayload: Decodable {
+    let request: RecordedRequest
+    let agentEvents: [AgentEvent]
+    let systemEvents: [SystemEvent]
+    let alerts: [SecurityAlert]
+
+    enum CodingKeys: String, CodingKey {
+        case request, alerts
+        case agentEvents, systemEvents
+    }
+
+    init(
+        request: RecordedRequest,
+        agentEvents: [AgentEvent],
+        systemEvents: [SystemEvent],
+        alerts: [SecurityAlert]
+    ) {
+        self.request = request
+        self.agentEvents = agentEvents
+        self.systemEvents = systemEvents
+        self.alerts = alerts
+    }
+}
+
+enum RequestReviewLoadState: Equatable {
+    case idle
+    case loading(Int64)
+    case loaded(Int64)
+    case unavailable(requestID: Int64, message: String)
+}
+
 struct DailyActivity: Decodable, Identifiable {
     let date: String
     let requests: Int
