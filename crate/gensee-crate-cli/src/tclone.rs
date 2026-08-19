@@ -51,7 +51,9 @@ const TCLONE_HOST_TMUX_RUN_OPTION: &str = "@gensee_run_id";
 const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
 const TCLONE_WAIT_QUIET_FOR_FORK_ENV: &str = "GENSEE_TCLONE_WAIT_QUIET_FOR_FORK";
 const TCLONE_FORK_TIMING_ENV: &str = "GENSEE_TCLONE_FORK_TIMING";
-const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
+// Keep the init outside /usr/local. Machine images commonly bind-mount a host
+// Node installation at /usr/local, which would hide a seeded init there.
+const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/libexec/gensee-tclone-init";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
 const TCLONE_SOURCE_FORK_HANDOFF_FILE: &str = "source-fork-handoff.json";
@@ -12334,7 +12336,7 @@ mod tests {
         let init = TcloneQuietProcess {
             pid: 1,
             stat: "Ss".to_string(),
-            command: "/usr/bin/env bash /usr/local/bin/gensee-tclone-init idle".to_string(),
+            command: format!("/usr/bin/env bash {TCLONE_CONTAINER_INIT_PATH} idle"),
         };
         let sleeper = TcloneQuietProcess {
             pid: 12,
@@ -13810,7 +13812,7 @@ gensee async job job_1: exited status=0
 
         prepare_tclone_seed(&seed, &workspace, None, None, "/workspace", "/home/gensee").unwrap();
 
-        let init = seed.join("usr/local/bin/gensee-tclone-init");
+        let init = seed.join(container_relative_path(TCLONE_CONTAINER_INIT_PATH).unwrap());
         let contents = fs::read_to_string(&init).unwrap();
         assert!(contents.starts_with("#!/bin/sh\n"));
         assert!(contents.contains("kill -TERM -1"));
@@ -13819,6 +13821,7 @@ gensee async job job_1: exited status=0
             fs::metadata(&init).unwrap().permissions().mode() & 0o111,
             0o111
         );
+        assert!(!Path::new(TCLONE_CONTAINER_INIT_PATH).starts_with("/usr/local"));
         let _ = fs::remove_dir_all(root);
     }
 
