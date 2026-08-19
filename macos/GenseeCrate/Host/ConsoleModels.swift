@@ -353,8 +353,10 @@ struct RecordedRequest: Decodable, Identifiable {
     let completedAt: Int64?
     var fileTouches: [FileTouchEvidence] = []
     var summaryFileTouchPaths: [String] = []
+    var summaryFileTouches: [FileTouchEvidence] = []
     var ignoredFileTouchPaths: [String] = []
     var ignoredFileTouchEventsOmitted: Int = 0
+    var ignoredFileTouchPathsTruncated = false
     var toolCallCount: Int?
     var alertCount: Int?
     var highRiskAlertCount: Int?
@@ -372,8 +374,10 @@ struct RecordedRequest: Decodable, Identifiable {
         case completedAt = "completed_at"
         case fileTouches = "file_touches"
         case summaryFileTouchPaths = "summary_file_touch_paths"
+        case summaryFileTouches = "summary_file_touches"
         case ignoredFileTouchPaths = "ignored_file_touch_paths"
         case ignoredFileTouchEventsOmitted = "ignored_file_touch_events_omitted"
+        case ignoredFileTouchPathsTruncated = "ignored_file_touch_paths_truncated"
         case toolCallCount = "tool_call_count"
         case alertCount = "alert_count"
         case highRiskAlertCount = "high_risk_alert_count"
@@ -393,8 +397,10 @@ extension RecordedRequest {
         completedAt = try values.decodeIfPresent(Int64.self, forKey: .completedAt)
         fileTouches = try values.decodeIfPresent([FileTouchEvidence].self, forKey: .fileTouches) ?? []
         summaryFileTouchPaths = try values.decodeIfPresent([String].self, forKey: .summaryFileTouchPaths) ?? []
+        summaryFileTouches = try values.decodeIfPresent([FileTouchEvidence].self, forKey: .summaryFileTouches) ?? []
         ignoredFileTouchPaths = try values.decodeIfPresent([String].self, forKey: .ignoredFileTouchPaths) ?? []
         ignoredFileTouchEventsOmitted = try values.decodeIfPresent(Int.self, forKey: .ignoredFileTouchEventsOmitted) ?? 0
+        ignoredFileTouchPathsTruncated = try values.decodeIfPresent(Bool.self, forKey: .ignoredFileTouchPathsTruncated) ?? false
         toolCallCount = try values.decodeIfPresent(Int.self, forKey: .toolCallCount)
         alertCount = try values.decodeIfPresent(Int.self, forKey: .alertCount)
         highRiskAlertCount = try values.decodeIfPresent(Int.self, forKey: .highRiskAlertCount)

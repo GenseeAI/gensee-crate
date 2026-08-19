@@ -117,11 +117,17 @@ final class AgentCompletionModelsTests: XCTestCase {
         var snapshot = SecuritySnapshot()
         var recordedRequest = request(id: 9, started: 1_000, completed: 4_000)
         recordedRequest.summaryFileTouchPaths = ["/repo/A.swift", "/repo/B.swift"]
+        recordedRequest.summaryFileTouches = [
+            FileTouchEvidence(path: "/repo/A.swift", intendedAndVerified: true),
+            FileTouchEvidence(path: "/repo/B.swift", intendedAndVerified: false),
+        ]
         snapshot.requests = [recordedRequest]
 
         let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
 
         XCTAssertEqual(summary.affectedFiles, ["/repo/A.swift", "/repo/B.swift"])
+        XCTAssertEqual(summary.verifiedFiles, ["/repo/A.swift"])
+        XCTAssertEqual(summary.unmatchedFiles, ["/repo/B.swift"])
         XCTAssertTrue(summary.isLargeTask)
     }
 

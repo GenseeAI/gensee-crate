@@ -63,6 +63,7 @@ struct AgentCompletionSummary: Identifiable, Equatable {
     let unmatchedFiles: [String]
     let ignoredFiles: [String]
     let ignoredFileTouchEventsOmitted: Int
+    let ignoredFileTouchPathsTruncated: Bool
     let testCommandCount: Int
     let alertCount: Int
     let highRiskAlertCount: Int
@@ -114,6 +115,9 @@ struct AgentSessionSummary: Identifiable, Equatable {
     }
     var ignoredFileTouchEventsOmitted: Int {
         requests.reduce(0) { $0 + $1.ignoredFileTouchEventsOmitted }
+    }
+    var ignoredFileTouchPathsTruncated: Bool {
+        requests.contains(where: \.ignoredFileTouchPathsTruncated)
     }
     var reviewState: AgentReviewState {
         if requests.contains(where: { $0.reviewState == .attention }) { return .attention }
@@ -182,13 +186,16 @@ enum AgentCompletionDerivation {
             let events = snapshot.agentEvents.filter { $0.requestID == request.requestID }
             let calls = TimelineDerivation.toolCalls(from: events)
             let alerts = snapshot.alerts.filter { $0.requestID == request.requestID }
-            let affectedFiles = request.fileTouches.isEmpty
+            let classifiedTouches = request.fileTouches.isEmpty
+                ? request.summaryFileTouches
+                : request.fileTouches
+            let affectedFiles = classifiedTouches.isEmpty
                 ? request.summaryFileTouchPaths
-                : request.fileTouches.map(\.path)
-            let verifiedFiles = request.fileTouches
+                : classifiedTouches.map(\.path)
+            let verifiedFiles = classifiedTouches
                 .filter(\.intendedAndVerified)
                 .map(\.path)
-            let unmatchedFiles = request.fileTouches
+            let unmatchedFiles = classifiedTouches
                 .filter { !$0.intendedAndVerified }
                 .map(\.path)
             let strongestAction = request.strongestAction
@@ -230,6 +237,7 @@ enum AgentCompletionDerivation {
                 unmatchedFiles: unmatchedFiles,
                 ignoredFiles: request.ignoredFileTouchPaths,
                 ignoredFileTouchEventsOmitted: request.ignoredFileTouchEventsOmitted,
+                ignoredFileTouchPathsTruncated: request.ignoredFileTouchPathsTruncated,
                 testCommandCount: calls.filter(isTestCall).count,
                 alertCount: alertCount,
                 highRiskAlertCount: highRiskCount,

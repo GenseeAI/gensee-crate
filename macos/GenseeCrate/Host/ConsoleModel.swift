@@ -36,6 +36,7 @@ final class ConsoleModel: ObservableObject {
     private var readThroughAlertID: Int64 = 0
     private var harnessVerificationBaselines: [String: Int64] = [:]
     private var hasLoadedDashboardSnapshot = false
+    private var lastDashboardRefreshDuration: TimeInterval = 0
     private var snapshotBeforeDemo = SecuritySnapshot()
     private var dismissedPendingRecoveryIDs: Set<String> = []
 
@@ -203,7 +204,11 @@ final class ConsoleModel: ObservableObject {
         guard backendAvailable else { return }
         guard !dashboardRefreshInProgress else { return }
         dashboardRefreshInProgress = true
-        defer { dashboardRefreshInProgress = false }
+        let refreshStartedAt = Date()
+        defer {
+            lastDashboardRefreshDuration = Date().timeIntervalSince(refreshStartedAt)
+            dashboardRefreshInProgress = false
+        }
         do {
             let refreshedSnapshot = try await cli.decode(
                 SecuritySnapshot.self,
@@ -340,6 +345,12 @@ final class ConsoleModel: ObservableObject {
         return 30
     }
 
+    var dashboardPollingSeconds: Double {
+        // Give ingestion proportionally more quiet time after an expensive
+        // projection. Fast stores retain the existing ten-second cadence.
+        min(120, max(10, lastDashboardRefreshDuration * 2))
+    }
+
     func dismissPendingRecoveryRequest() {
         if let id = pendingRecoveryRequest?.id {
             dismissedPendingRecoveryIDs.insert(id)
@@ -353,10 +364,10 @@ final class ConsoleModel: ObservableObject {
         alwaysCreate: Bool = false
     ) async {
         guard !isDemoMode else { return }
+        pendingRecoveryRequest = nil
         if alwaysCreate {
             guard await updateRecoveryPointMode(.auto, for: request.provider, showNotice: false) else {
-                dismissedPendingRecoveryIDs.insert(request.id)
-                pendingRecoveryRequest = nil
+                pendingRecoveryRequest = request
                 return
             }
         }
@@ -377,9 +388,34 @@ final class ConsoleModel: ObservableObject {
                 ? "Recovery point created. The waiting agent operation can continue."
                 : "This request will continue without a recovery point."
         } catch {
-            dismissedPendingRecoveryIDs.insert(request.id)
-            pendingRecoveryRequest = nil
+            // Leave the approval retryable after a transient CLI or database
+            // failure. Only the explicit Keep Blocked action suppresses it.
+            dismissedPendingRecoveryIDs.remove(request.id)
+            pendingRecoveryRequest = request
             errorMessage = error.localizedDescription
+        }
+    }
+
+    func removeAllRecoveryPoints() async {
+        guard !isDemoMode else { return }
+        runningCommand = "Removing retained recovery points"
+        defer { runningCommand = nil }
+        do {
+            let output = try await cli.run(
+                [
+                    "checkpoint", "prune", "--all-workspaces", "--all-ages",
+                    "--yes", "--json",
+                ],
+                timeout: 120
+            )
+            let response = try JSONDecoder().decode(
+                CheckpointDeleteResponse.self,
+                from: Data(output.stdout.utf8)
+            )
+            recoveryPointsByRequest.removeAll()
+            noticeMessage = "Removed \(response.deleted.count) retained recovery point\(response.deleted.count == 1 ? "" : "s")."
+        } catch {
+            errorMessage = "Could not remove retained recovery points: \(error.localizedDescription)"
         }
     }
 

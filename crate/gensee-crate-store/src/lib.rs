@@ -631,16 +631,22 @@ impl EventStore {
                 "strongest_action": row.get::<_, String>(9)?,
                 "file_touches": [],
                 "summary_file_touch_paths": [],
+                "summary_file_touches": [],
                 "ignored_file_touch_paths": [],
             }))
         })?;
-        let request_file_touch_paths = dashboard_request_file_touch_paths(conn)?;
+        let request_file_touches = dashboard_request_file_touches(conn)?;
         for request in &mut requests {
             let request_id = request["request_id"].as_i64().unwrap_or_default();
-            request["summary_file_touch_paths"] = json!(request_file_touch_paths
+            let touches = request_file_touches
                 .get(&request_id)
                 .cloned()
-                .unwrap_or_default());
+                .unwrap_or_default();
+            request["summary_file_touch_paths"] = json!(touches
+                .iter()
+                .filter_map(|touch| touch["path"].as_str())
+                .collect::<Vec<_>>());
+            request["summary_file_touches"] = json!(touches);
         }
         let artifact_query = "SELECT kind, uri, current_digest, last_seen_at,
                     last_modified_at, last_modified_source,
@@ -871,6 +877,7 @@ impl EventStore {
         request["ignored_file_touch_paths"] = json!(ignored_file_touches.paths);
         request["ignored_file_touch_events_omitted"] =
             json!(ignored_file_touches.omitted_event_count);
+        request["ignored_file_touch_paths_truncated"] = json!(ignored_file_touches.paths_truncated);
 
         let agent_events = query_json_rows_with_i64(
             conn,
@@ -2997,9 +3004,9 @@ fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::R
 /// Return a small path-only projection for the Work Review request list. The
 /// complete intended/verified classification remains request-scoped, but file
 /// search and large-task detection must not depend on the global event window.
-fn dashboard_request_file_touch_paths(
+fn dashboard_request_file_touches(
     conn: &rusqlite::Connection,
-) -> io::Result<HashMap<i64, Vec<String>>> {
+) -> io::Result<HashMap<i64, Vec<Value>>> {
     let sql = format!(
         "WITH recent_requests AS MATERIALIZED (
             SELECT request_id
@@ -3007,17 +3014,24 @@ fn dashboard_request_file_touch_paths(
             ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
             LIMIT 100
          ),
-         candidate_touches AS (
+         raw_touches AS (
             SELECT request_relation.src_id AS request_id,
                    CASE
                      WHEN artifacts.uri LIKE 'file://%' THEN substr(artifacts.uri, 8)
                      WHEN artifacts.uri LIKE 'file:%' THEN substr(artifacts.uri, 6)
                      ELSE artifacts.uri
                    END AS path,
-                   ROW_NUMBER() OVER (
-                     PARTITION BY request_relation.src_id
-                     ORDER BY artifacts.uri
-                   ) AS touch_rank
+                   EXISTS (
+                     SELECT 1
+                     FROM relations AS declared_relation
+                     JOIN agent_events AS declaring_event
+                       ON declaring_event.event_id = declared_relation.src_id
+                     WHERE declared_relation.src_kind = 'agent_event'
+                       AND declared_relation.dst_kind = 'artifact'
+                       AND declared_relation.dst_id = artifacts.artifact_id
+                       AND declared_relation.relation_type IN ('produced', 'modified', 'deleted')
+                       AND declaring_event.request_id = request_relation.src_id
+                   ) AS intended_and_verified
             FROM recent_requests
             JOIN relations AS request_relation INDEXED BY idx_relations_src
               ON request_relation.src_kind = 'request'
@@ -3038,8 +3052,34 @@ fn dashboard_request_file_touch_paths(
                 AND observed_relation.relation_type IN ('wrote', 'modified', 'deleted')
             )
             GROUP BY request_relation.src_id, artifacts.artifact_id, artifacts.uri
+         ),
+         candidate_touches AS (
+            SELECT request_id, path, intended_and_verified,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY request_id
+                     ORDER BY CASE
+                       WHEN lower(path) LIKE '/dev/%'
+                         OR lower(path) LIKE '/tmp/%'
+                         OR lower(path) LIKE '/private/tmp/%'
+                         OR lower(path) LIKE '%/.gensee/%'
+                         OR lower(path) LIKE '%/.claude/sessions/%'
+                         OR lower(path) LIKE '%/.claude/projects/%'
+                         OR lower(path) LIKE '%/.claude/shell-snapshots/%'
+                         OR lower(path) LIKE '%/.claude/file-history/%'
+                         OR lower(path) LIKE '%/.codex/sessions/%'
+                         OR lower(path) LIKE '%/.codex/node_repl/active_execs/%'
+                         OR lower(path) LIKE '%/library/application support/codex/%'
+                         OR lower(path) LIKE '%/library/application support/claude/%'
+                         OR lower(path) LIKE '%/library/caches/%'
+                         OR lower(path) LIKE '%/library/httpstorages/%'
+                         OR lower(path) LIKE '%/crashpad/%'
+                         OR lower(path) LIKE '%/diagnosticreports/%'
+                       THEN 1 ELSE 0 END,
+                       path
+                   ) AS touch_rank
+            FROM raw_touches
          )
-         SELECT request_id, path
+         SELECT request_id, path, intended_and_verified
          FROM candidate_touches
          WHERE touch_rank <= {MAX_DASHBOARD_FILE_TOUCH_CANDIDATES}
          ORDER BY request_id, path"
@@ -3047,23 +3087,30 @@ fn dashboard_request_file_touch_paths(
     let mut statement = conn.prepare(&sql).map_err(sqlite_error_from_rusqlite)?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
         })
         .map_err(sqlite_error_from_rusqlite)?;
-    let mut paths: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut touches: HashMap<i64, Vec<Value>> = HashMap::new();
     for row in rows {
-        let (request_id, path) = row.map_err(sqlite_error_from_rusqlite)?;
+        let (request_id, path, intended_and_verified) = row.map_err(sqlite_error_from_rusqlite)?;
         if dashboard_file_touch_is_background(&path) {
             continue;
         }
-        let request_paths = paths.entry(request_id).or_default();
-        if request_paths.len() < MAX_DASHBOARD_REQUEST_FILE_TOUCHES
-            && !request_paths.contains(&path)
+        let request_touches = touches.entry(request_id).or_default();
+        if request_touches.len() < MAX_DASHBOARD_REQUEST_FILE_TOUCHES
+            && !request_touches.iter().any(|touch| touch["path"] == path)
         {
-            request_paths.push(path);
+            request_touches.push(json!({
+                "path": path,
+                "intended_and_verified": intended_and_verified,
+            }));
         }
     }
-    Ok(paths)
+    Ok(touches)
 }
 
 fn dashboard_file_touch_is_background(path: &str) -> bool {
@@ -3078,6 +3125,7 @@ fn dashboard_file_touch_is_background(path: &str) -> bool {
 struct DashboardIgnoredFileTouches {
     paths: Vec<String>,
     omitted_event_count: usize,
+    paths_truncated: bool,
 }
 
 fn dashboard_ignored_file_touch_paths(
@@ -3135,7 +3183,8 @@ fn dashboard_ignored_file_touch_paths_with_limits(
         )
         .map_err(sqlite_error_from_rusqlite)?;
     let mut ignored = BTreeSet::new();
-    for row in rows {
+    let mut paths_truncated = false;
+    'events: for row in rows {
         let (pid, ts, source, event_type, args) = row.map_err(sqlite_error_from_rusqlite)?;
         let Some(raw_json) = args.as_deref() else {
             continue;
@@ -3180,16 +3229,18 @@ fn dashboard_ignored_file_touch_paths_with_limits(
                 && (dashboard_file_touch_is_background(&path)
                     || !should_materialize_system_artifact(&event, &path, Some(&raw_event)))
             {
-                ignored.insert(path);
-                if ignored.len() >= path_limit {
-                    break;
+                if !ignored.contains(&path) && ignored.len() >= path_limit {
+                    paths_truncated = true;
+                    break 'events;
                 }
+                ignored.insert(path);
             }
         }
     }
     Ok(DashboardIgnoredFileTouches {
         paths: ignored.into_iter().collect(),
         omitted_event_count: total_event_count.saturating_sub(event_limit),
+        paths_truncated,
     })
 }
 
@@ -4769,6 +4820,13 @@ mod tests {
             request["summary_file_touch_paths"],
             json!(["/repo/App.swift", "/repo/Outside.swift"])
         );
+        assert_eq!(
+            request["summary_file_touches"],
+            json!([
+                {"path": "/repo/App.swift", "intended_and_verified": true},
+                {"path": "/repo/Outside.swift", "intended_and_verified": false}
+            ])
+        );
         let request_id = request["request_id"].as_i64().unwrap();
         let detail = store.dashboard_request(request_id).unwrap();
         let touches = detail["request"]["file_touches"].as_array().unwrap();
@@ -4788,6 +4846,10 @@ mod tests {
             ])
         );
         assert_eq!(detail["request"]["ignored_file_touch_events_omitted"], 0);
+        assert_eq!(
+            detail["request"]["ignored_file_touch_paths_truncated"],
+            false
+        );
         assert!(detail.get("systemEvents").is_none());
         let db = store.sqlite_store().unwrap();
         let bounded = dashboard_ignored_file_touch_paths_with_limits(
@@ -4798,6 +4860,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bounded.omitted_event_count, 3);
+        assert!(!bounded.paths_truncated);
+        let path_bounded = dashboard_ignored_file_touch_paths_with_limits(
+            db.connection(),
+            request_id,
+            MAX_DASHBOARD_IGNORED_FILE_TOUCH_EVENTS,
+            2,
+        )
+        .unwrap();
+        assert_eq!(path_bounded.paths.len(), 2);
+        assert!(path_bounded.paths_truncated);
         drop(db);
 
         fs::remove_dir_all(&dir).ok();
@@ -4817,6 +4889,78 @@ mod tests {
         assert!(!dashboard_file_touch_is_background(
             "/Users/test/project/Sources/App.swift"
         ));
+    }
+
+    #[test]
+    fn dashboard_summary_prioritizes_project_paths_before_background_candidate_cap() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-dashboard-file-touch-priority-test-{}-{now}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"Edit the source"}"#,
+                now,
+            ))
+            .unwrap();
+        let endpoint_event = |path: String, observed_at_ms: u64| {
+            SystemEvent {
+            source: "macos-endpoint-security".to_string(),
+            event_type: "write".to_string(),
+            event_kind: "file_mutation".to_string(),
+            observed_at_ms,
+            pid: Some(42),
+            ppid: Some(1),
+            process_name: Some("codex".to_string()),
+            executable_path: Some("/Applications/Codex.app/Contents/MacOS/Codex".to_string()),
+            file_path: Some(path.clone()),
+            command_line: None,
+            raw_json: json!({
+                "action": "notify",
+                "event_type": "write",
+                "observed_at_ms": observed_at_ms,
+                "actor": {"pid": 42, "ppid": 1, "executable_path": "/Applications/Codex.app/Contents/MacOS/Codex"},
+                "file": {"path": path, "mode": 0o100644},
+                "attribution": {"session_id": "s1", "workspace_root": "/repo"}
+            })
+            .to_string(),
+        }
+        };
+        for index in 0..(MAX_DASHBOARD_FILE_TOUCH_CANDIDATES + 20) {
+            store
+                .append_system_event(&endpoint_event(
+                    format!("/Users/test/Library/Caches/tool/{index:04}.cache"),
+                    now + 1 + u64::try_from(index).unwrap(),
+                ))
+                .unwrap();
+        }
+        let source_path = "/repo/Sources/App.swift";
+        store
+            .append_system_event(&endpoint_event(
+                source_path.to_string(),
+                now + 1 + u64::try_from(MAX_DASHBOARD_FILE_TOUCH_CANDIDATES + 20).unwrap(),
+            ))
+            .unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "Stop",
+                r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
+                now + 200,
+            ))
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(
+            dashboard["requests"][0]["summary_file_touch_paths"],
+            json!([source_path])
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

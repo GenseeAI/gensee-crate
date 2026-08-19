@@ -700,6 +700,7 @@ struct DashboardSettingsPage: View {
     @Binding var darkMode: Bool
     let onRunSetupAssistant: () -> Void
     @State private var confirmRemoval = false
+    @State private var confirmRecoveryCleanup = false
     @State private var pendingProtectionLevel: ProtectionLevel?
 
     var body: some View {
@@ -808,6 +809,14 @@ struct DashboardSettingsPage: View {
             Button("Cancel", role: .cancel) {}
             Button("Remove Extension", role: .destructive) { extensionManager.deactivate() }
         } message: { Text("Crate will stop receiving operating-system process and file events until the extension is installed again.") }
+        .alert("Remove all recovery points?", isPresented: $confirmRecoveryCleanup) {
+            Button("Cancel", role: .cancel) {}
+            Button("Remove All", role: .destructive) {
+                Task { await model.removeAllRecoveryPoints() }
+            }
+        } message: {
+            Text("This removes automatic, manually-created, and restore-rescue recovery points across local Git workspaces. It does not change workspace files.")
+        }
         .alert("Lower protection?", isPresented: loweringProtectionPresented, presenting: pendingProtectionLevel) { level in
             Button("Cancel", role: .cancel) { pendingProtectionLevel = nil }
             Button("Use \(level.title)", role: .destructive) {
@@ -931,6 +940,22 @@ struct DashboardSettingsPage: View {
                 Spacer()
             }
             .controlSize(.small)
+            Divider()
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Retained and rescue points")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("Manual and restore-rescue points are preserved by automatic retention until you remove them here.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Remove All…", role: .destructive) {
+                    confirmRecoveryCleanup = true
+                }
+                .controlSize(.small)
+                .disabled(model.runningCommand != nil)
+            }
             Divider()
             Label(
                 "Recovery points restore Git-workspace files. They cannot undo database changes, network requests, remote repository actions, running processes, or ignored files.",

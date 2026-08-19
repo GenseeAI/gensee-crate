@@ -501,6 +501,28 @@ fn recovery_trigger_does_not_checkpoint_a_policy_ask_that_cannot_mutate() {
 }
 
 #[test]
+fn recovery_trigger_checkpoints_an_uncertain_shell_command_when_policy_asks() {
+    let mut event = test_hook_event(PROVIDER_CLAUDE_CODE, "PreToolUse");
+    event.tool_name = Some("Bash".to_string());
+    let decision = PolicyDecision {
+        action: PolicyAction::Ask,
+        findings: Vec::new(),
+    };
+
+    assert_eq!(
+        recovery_trigger(
+            &event,
+            Some("python manage.py migrate"),
+            &[],
+            &decision,
+            None,
+        )
+        .as_deref(),
+        Some("Policy identified a risky operation")
+    );
+}
+
+#[test]
 fn recovery_workspace_follows_leading_cd_into_git_repository() {
     let root = env::temp_dir().join(format!(
         "gensee-recovery-workspace-test-{}-{}",

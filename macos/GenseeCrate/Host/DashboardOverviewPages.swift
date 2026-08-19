@@ -396,7 +396,8 @@ private struct RequestReviewDetail: View {
                         verifiedFiles: effectiveSummary.verifiedFiles,
                         unmatchedFiles: effectiveSummary.unmatchedFiles,
                         ignoredFileCount: effectiveSummary.ignoredFiles.count,
-                        ignoredEventCountOmitted: effectiveSummary.ignoredFileTouchEventsOmitted
+                        ignoredEventCountOmitted: effectiveSummary.ignoredFileTouchEventsOmitted,
+                        ignoredPathsTruncated: effectiveSummary.ignoredFileTouchPathsTruncated
                     )
                 }
             }
@@ -552,7 +553,8 @@ private struct SessionReviewDetail: View {
                     verifiedFiles: session.verifiedFiles,
                     unmatchedFiles: session.unmatchedFiles,
                     ignoredFileCount: session.ignoredFiles.count,
-                    ignoredEventCountOmitted: session.ignoredFileTouchEventsOmitted
+                    ignoredEventCountOmitted: session.ignoredFileTouchEventsOmitted,
+                    ignoredPathsTruncated: session.ignoredFileTouchPathsTruncated
                 )
             }
         }
@@ -640,6 +642,7 @@ private struct ReviewFilesPanel: View {
     let unmatchedFiles: [String]
     let ignoredFileCount: Int
     let ignoredEventCountOmitted: Int
+    let ignoredPathsTruncated: Bool
 
     var body: some View {
         DashboardCard("Files touched") {
@@ -659,6 +662,15 @@ private struct ReviewFilesPanel: View {
                     .foregroundStyle(.secondary)
                     .help("The detailed ignored-event scan is bounded to keep Work Review responsive.")
                 }
+                if ignoredPathsTruncated {
+                    Label(
+                        "Additional temporary/background paths were omitted from this view.",
+                        systemImage: "ellipsis.circle"
+                    )
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .help("The ignored-path list is bounded to keep Work Review responsive.")
+                }
                 Divider()
                 if affectedFiles.isEmpty {
                     Text("No non-ignored file mutation was observed.")
@@ -668,13 +680,22 @@ private struct ReviewFilesPanel: View {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(affectedFiles, id: \.self) { path in
                             let verified = verifiedFiles.contains(path)
+                            let unmatched = unmatchedFiles.contains(path)
                             Label(
                                 abbreviatedPath(path),
-                                systemImage: verified ? "checkmark.shield" : "exclamationmark.triangle"
+                                systemImage: verified
+                                    ? "checkmark.shield"
+                                    : (unmatched ? "exclamationmark.triangle" : "doc")
                             )
                             .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(verified ? Color.primary : Color.dashboardGold)
-                            .help(verified ? "Declared by the tool and verified by Endpoint Security: \(path)" : "Observed by Endpoint Security outside declared file intent: \(path)")
+                            .foregroundStyle(unmatched ? Color.dashboardGold : Color.primary)
+                            .help(
+                                verified
+                                    ? "Declared by the tool and verified by Endpoint Security: \(path)"
+                                    : (unmatched
+                                        ? "Observed by Endpoint Security outside declared file intent: \(path)"
+                                        : "Observed file touch; intent classification is not available in this summary: \(path)")
+                            )
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }

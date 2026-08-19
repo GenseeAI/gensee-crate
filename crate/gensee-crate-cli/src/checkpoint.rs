@@ -187,16 +187,29 @@ pub(crate) fn handle_checkpoint(args: Vec<OsString>) -> io::Result<()> {
         }
         "prune" => {
             require_checkpoint_confirmation(&parsed, "prune")?;
-            let repository = git_repository_root(&workspace)?;
             let older_than_hours = parsed
                 .older_than_hours
                 .unwrap_or(DEFAULT_CHECKPOINT_PRUNE_HOURS);
             let cutoff = now_ms()?.saturating_sub(older_than_hours.saturating_mul(3_600_000));
             let mut deleted = Vec::new();
-            for checkpoint in list_checkpoints_at(&repository, &storage_root)? {
-                if checkpoint.created_at_ms < cutoff {
-                    delete_checkpoint_at(&repository, &storage_root, &checkpoint.id)?;
-                    deleted.push(checkpoint.id);
+            if parsed.all_workspaces {
+                for checkpoint in list_all_checkpoints_at(&storage_root)? {
+                    if parsed.all_ages || checkpoint.created_at_ms < cutoff {
+                        delete_checkpoint_at(
+                            Path::new(&checkpoint.workspace),
+                            &storage_root,
+                            &checkpoint.id,
+                        )?;
+                        deleted.push(checkpoint.id);
+                    }
+                }
+            } else {
+                let repository = git_repository_root(&workspace)?;
+                for checkpoint in list_checkpoints_at(&repository, &storage_root)? {
+                    if parsed.all_ages || checkpoint.created_at_ms < cutoff {
+                        delete_checkpoint_at(&repository, &storage_root, &checkpoint.id)?;
+                        deleted.push(checkpoint.id);
+                    }
                 }
             }
             if parsed.json {
@@ -262,6 +275,8 @@ struct CheckpointArgs {
     json: bool,
     yes: bool,
     older_than_hours: Option<u64>,
+    all_workspaces: bool,
+    all_ages: bool,
     action: Option<String>,
     positionals: Vec<String>,
 }
@@ -325,6 +340,8 @@ impl CheckpointArgs {
                         ));
                     }
                 }
+                Some("--all-workspaces") => parsed.all_workspaces = true,
+                Some("--all-ages") => parsed.all_ages = true,
                 Some("--action") => {
                     index += 1;
                     parsed.action = Some(required_value(args, index, "--action")?.to_string());
@@ -344,6 +361,18 @@ impl CheckpointArgs {
                 }
             }
             index += 1;
+        }
+        if parsed.all_workspaces && parsed.workspace.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--all-workspaces cannot be combined with --workspace",
+            ));
+        }
+        if parsed.all_ages && parsed.older_than_hours.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--all-ages cannot be combined with --older-than-hours",
+            ));
         }
         Ok(parsed)
     }
@@ -464,8 +493,46 @@ fn list_checkpoints_at(
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let checkpoint: WorkspaceCheckpoint = serde_json::from_slice(&fs::read(path)?)?;
+        let Ok(bytes) = fs::read(path) else {
+            continue;
+        };
+        let Ok(checkpoint) = serde_json::from_slice::<WorkspaceCheckpoint>(&bytes) else {
+            continue;
+        };
         if checkpoint.workspace == repository.to_string_lossy() {
+            checkpoints.push(checkpoint);
+        }
+    }
+    checkpoints.sort_by_key(|checkpoint| std::cmp::Reverse(checkpoint.created_at_ms));
+    Ok(checkpoints)
+}
+
+fn list_all_checkpoints_at(storage_root: &Path) -> io::Result<Vec<WorkspaceCheckpoint>> {
+    let mut checkpoints = Vec::new();
+    let repositories = match fs::read_dir(storage_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(checkpoints),
+        Err(error) => return Err(error),
+    };
+    for repository in repositories {
+        let repository = repository?;
+        if !repository.file_type()?.is_dir() {
+            continue;
+        }
+        let entries = match fs::read_dir(repository.path()) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(path) else { continue };
+            let Ok(checkpoint) = serde_json::from_slice::<WorkspaceCheckpoint>(&bytes) else {
+                continue;
+            };
             checkpoints.push(checkpoint);
         }
     }
@@ -479,32 +546,16 @@ fn list_request_recovery_points_at(
     session_id: Option<&str>,
 ) -> io::Result<Vec<WorkspaceCheckpoint>> {
     let mut checkpoints = Vec::new();
-    let repositories = match fs::read_dir(storage_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(checkpoints),
-        Err(error) => return Err(error),
-    };
-    for repository in repositories {
-        let repository = repository?;
-        if !repository.file_type()?.is_dir() {
+    for checkpoint in list_all_checkpoints_at(storage_root)? {
+        if checkpoint.request_id != Some(request_id) || checkpoint.rescue_of.is_some() {
             continue;
         }
-        for entry in fs::read_dir(repository.path())? {
-            let path = entry?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        if let Some(session_id) = session_id {
+            if checkpoint.session_id.as_deref() != Some(session_id) {
                 continue;
             }
-            let checkpoint: WorkspaceCheckpoint = serde_json::from_slice(&fs::read(path)?)?;
-            if checkpoint.request_id != Some(request_id) || checkpoint.rescue_of.is_some() {
-                continue;
-            }
-            if let Some(session_id) = session_id {
-                if checkpoint.session_id.as_deref() != Some(session_id) {
-                    continue;
-                }
-            }
-            checkpoints.push(checkpoint);
         }
+        checkpoints.push(checkpoint);
     }
     checkpoints.sort_by_key(|checkpoint| std::cmp::Reverse(checkpoint.created_at_ms));
     Ok(checkpoints)
@@ -1296,6 +1347,46 @@ mod tests {
             fs::canonicalize(&second_repository)
                 .unwrap()
                 .to_string_lossy()
+        );
+        fs::remove_dir_all(sandbox).expect("cleanup");
+    }
+
+    #[test]
+    fn checkpoint_listing_skips_corrupt_metadata_in_any_repository() {
+        let sandbox = test_directory("corrupt-metadata");
+        let repository = sandbox.join("repo");
+        let other_repository = sandbox.join("other");
+        let storage = sandbox.join("storage");
+        for path in [&repository, &other_repository] {
+            fs::create_dir_all(path).expect("create repository");
+            run_git(path, &["init"]);
+            fs::write(path.join("file.txt"), "before").expect("write file");
+        }
+        let context = RecoveryPointContext {
+            request_id: 42,
+            session_id: "session-42",
+            provider: "codex",
+            trigger: "File mutation",
+        };
+        let checkpoint = ensure_request_recovery_point_at(&repository, &storage, &context, 168)
+            .expect("create recovery point");
+        let other_directory = repository_checkpoint_directory(
+            &storage,
+            &fs::canonicalize(&other_repository).expect("canonical other repository"),
+        );
+        fs::create_dir_all(&other_directory).expect("create other metadata directory");
+        fs::write(other_directory.join("foreign.json"), b"not-json")
+            .expect("write corrupt metadata");
+
+        let found = list_request_recovery_points_at(&storage, 42, Some("session-42"))
+            .expect("corrupt metadata must not abort lookup");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, checkpoint.id);
+        assert_eq!(
+            list_checkpoints_at(&other_repository, &storage)
+                .expect("repository listing")
+                .len(),
+            0
         );
         fs::remove_dir_all(sandbox).expect("cleanup");
     }

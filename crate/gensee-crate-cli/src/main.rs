@@ -4771,6 +4771,10 @@ fn recovery_trigger(
     let has_file_mutation = file_intents
         .iter()
         .any(|intent| !matches!(intent.operation.as_str(), "read" | "open" | "stat" | "list"));
+    let all_parsed_subjects_are_reads = !file_intents.is_empty()
+        && file_intents
+            .iter()
+            .all(|intent| matches!(intent.operation.as_str(), "read" | "open" | "stat" | "list"));
     let tool = event
         .tool_name
         .as_deref()
@@ -4813,9 +4817,11 @@ fn recovery_trigger(
     ]
     .iter()
     .any(|needle| command.contains(needle));
-    if decision.action >= PolicyAction::Ask
-        && (has_file_mutation || mutating_tool || risky_command || shell_may_mutate)
-    {
+    // Ask and Block are authoritative policy outcomes. Unless parsing proved
+    // that every subject is read-only, preserve the workspace before allowing
+    // a potentially mutating operation to proceed. In particular, do not make
+    // Bash safety depend on an inevitably incomplete command-substring list.
+    if decision.action >= PolicyAction::Ask && !all_parsed_subjects_are_reads {
         return Some("Policy identified a risky operation".to_string());
     }
     if has_file_mutation {
@@ -4962,7 +4968,7 @@ pub(crate) fn print_usage() {
         "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--approach <description>]... [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container> [--json]\n  gensee run summary <fork-id> [--json]\n  gensee run compare <parallel-fork-id> [--json]\n  gensee run choose <parallel-fork-id> <--merge|--promote|--discard-all>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee managed <create-source|delete-source|fork|merge|promote|discard|diff|status|list|reconcile>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list [--json]\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run fork run_123 --copies 2 --name try-upgrade --approach 'minimal compatible upgrade' --approach 'aggressive latest-version upgrade' --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
     );
     println!(
-        "RECOVERY:\n  gensee checkpoint create [--workspace <path>] [--label <text>] [--json]\n  gensee checkpoint list [--workspace <path>] [--json]\n  gensee checkpoint restore <id> [--workspace <path>] --yes [--json]\n  gensee checkpoint delete <id> [--workspace <path>] --yes [--json]\n  gensee checkpoint prune [--workspace <path>] [--older-than-hours <hours>] --yes [--json]\n  gensee checkpoint pending [--json]\n  gensee checkpoint resolve <id> --action <create|continue> [--json]\n"
+        "RECOVERY:\n  gensee checkpoint create [--workspace <path>] [--label <text>] [--json]\n  gensee checkpoint list [--workspace <path>] [--json]\n  gensee checkpoint restore <id> [--workspace <path>] --yes [--json]\n  gensee checkpoint delete <id> [--workspace <path>] --yes [--json]\n  gensee checkpoint prune [--workspace <path> | --all-workspaces] [--older-than-hours <hours> | --all-ages] --yes [--json]\n  gensee checkpoint pending [--json]\n  gensee checkpoint resolve <id> --action <create|continue> [--json]\n"
     );
     println!(
         "AUDIT:\n  gensee audit codex [--workspace <path>] [--json] [--fail-on <level>]\n  gensee audit vscode [--workspace <path>] [--vscode-profile <id>] [--json] [--fail-on <level>]\n  gensee audit <codex-cli|github-copilot-vscode|vscode-agent-host> [OPTIONS]\n"

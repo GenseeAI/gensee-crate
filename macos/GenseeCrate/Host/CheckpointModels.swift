@@ -84,3 +84,7 @@ struct CheckpointRestoreResponse: Decodable, Equatable {
     let restored: WorkspaceCheckpointRecord
     let rescue: WorkspaceCheckpointRecord
 }
+
+struct CheckpointDeleteResponse: Decodable, Equatable {
+    let deleted: [String]
+}

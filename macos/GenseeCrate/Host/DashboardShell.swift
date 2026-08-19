@@ -74,7 +74,7 @@ struct DashboardShell: View {
                 // Dashboard queries intentionally run less frequently than the
                 // sensor poll. This keeps UI projection work from competing
                 // with durable Endpoint Security ingestion under load.
-                try? await Task.sleep(for: .seconds(10))
+                try? await Task.sleep(for: .seconds(model.dashboardPollingSeconds))
                 await model.refreshDashboard(reportErrors: false)
                 if !model.isDemoMode {
                     await notifications.process(snapshot: model.snapshot)
@@ -262,7 +262,10 @@ struct DashboardShell: View {
     private var pendingRecoveryPresented: Binding<Bool> {
         Binding(
             get: { model.pendingRecoveryRequest != nil },
-            set: { if !$0 { model.dismissPendingRecoveryRequest() } }
+            // Every dismissal path is an explicit alert button. A competing
+            // error alert may temporarily drive this binding false; treating
+            // that as Keep Blocked would strand a retryable approval.
+            set: { _ in }
         )
     }
 }
