@@ -22,6 +22,16 @@ integration changes are submitted through the existing `gensee policy` and
 
 The console includes:
 
+- A local **Control Center** that turns completed agent requests into concise,
+  evidence-backed reviews. It connects the original request to elapsed time,
+  tool calls, commands, mutation paths, observed test commands, and policy
+  findings without storing or displaying full model responses or tool output.
+  A test command is reported as observed, never as passed unless a future
+  evidence source can verify its result.
+- Optional quiet macOS notifications for substantial completed tasks and an
+  opt-in end-of-day briefing. The first refresh establishes a historical
+  baseline, so enabling notifications never floods Notification Center with
+  old work.
 - A first-launch setup assistant that installs the bundled backend at
   `~/.gensee/bin/gensee`, initializes the encrypted event store and default
   policy, guides Apple approvals, scans all six harnesses, and offers one-click

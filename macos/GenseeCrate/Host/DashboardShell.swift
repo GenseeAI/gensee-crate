@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum DashboardDestination: String, CaseIterable, Identifiable {
-    case dashboard = "Dashboard"
+    case dashboard = "Control Center"
     case today = "Daily Highlight"
     case timeline = "Timeline"
     case alerts = "Alerts"
@@ -32,6 +32,7 @@ struct DashboardShell: View {
     @Binding var showsSetupAssistant: Bool
     @State private var selection: DashboardDestination = .dashboard
     @State private var searchText = ""
+    @StateObject private var notifications = CompletionNotificationCoordinator()
     @AppStorage("gensee.dashboard.darkMode") private var darkMode = false
 
     var body: some View {
@@ -60,13 +61,16 @@ struct DashboardShell: View {
         .task {
             extensionManager.refreshStatus()
             model.endpointSensor.start()
+            await notifications.refreshAuthorizationStatus()
             await model.refreshAll()
+            await notifications.process(snapshot: model.snapshot)
             while !Task.isCancelled {
                 // Dashboard queries intentionally run less frequently than the
                 // sensor poll. This keeps UI projection work from competing
                 // with durable Endpoint Security ingestion under load.
                 try? await Task.sleep(for: .seconds(10))
                 await model.refreshDashboard(reportErrors: false)
+                await notifications.process(snapshot: model.snapshot)
             }
         }
         .alert("Gensee needs attention", isPresented: errorPresented) {
@@ -132,7 +136,13 @@ struct DashboardShell: View {
     @ViewBuilder
     private var destinationView: some View {
         switch selection {
-        case .dashboard: DashboardOverviewPage(model: model, sensor: model.endpointSensor)
+        case .dashboard: DashboardOverviewPage(
+            model: model,
+            sensor: model.endpointSensor,
+            notifications: notifications,
+            onOpenTimeline: { selection = .timeline },
+            onOpenAlerts: { selection = .alerts }
+        )
         case .today: TodayHighlightPage(model: model)
         case .timeline: TimelinePage(model: model, searchText: searchText)
         case .alerts: DashboardAlertsPage(model: model, searchText: searchText)
