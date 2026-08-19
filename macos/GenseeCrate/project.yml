@@ -32,6 +32,7 @@ targets:
       - Host/DashboardHarnessesPage.swift
       - Host/DashboardConfigAuditPage.swift
       - Host/DashboardConfigPages.swift
+      - Host/DashboardRecoveryPage.swift
       - Host/EndpointSecurityExtensionManager.swift
       - Host/EndpointSecuritySensor.swift
       - Host/EndpointIngestAcknowledgementIO.swift
@@ -47,6 +48,7 @@ targets:
       - Host/ProgressiveTrust.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
+      - Host/CheckpointModels.swift
       - Host/ConsoleModel.swift
       - Host/Brand.swift
       - Host/Assets.xcassets
@@ -147,6 +149,7 @@ targets:
       - Host/ProgressiveTrust.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
+      - Host/CheckpointModels.swift
       - Tests/HarnessConfigurationHealthTests.swift
       - Tests/EndpointIngestAcknowledgementIOTests.swift
       - Tests/HarnessActivationGuidanceTests.swift
@@ -156,6 +159,7 @@ targets:
       - Tests/ConfigAuditModelsTests.swift
       - Tests/ArtifactFactTests.swift
       - Tests/ProgressiveTrustTests.swift
+      - Tests/CheckpointModelsTests.swift
     settings:
       base:
         CODE_SIGNING_ALLOWED: NO
