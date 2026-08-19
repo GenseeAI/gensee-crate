@@ -36,7 +36,6 @@
 		6F1EFE76386D67BDF9581E7B /* DashboardOverviewPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E5F6044F8B4D45BBBC38D88 /* DashboardOverviewPages.swift */; };
 		70FCB6B396339C7CE0DF1B79 /* DashboardShell.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F9083239FB55EA68146A81F /* DashboardShell.swift */; };
 		7931867F15D1E07955D3F193 /* EndpointIngestAcknowledgementIO.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18415BCF8F97E3CDBF1D9A21 /* EndpointIngestAcknowledgementIO.swift */; };
-		80200C2E55A9BCB9B006893A /* DashboardRecoveryPage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72E1263942F8D5014008EF95 /* DashboardRecoveryPage.swift */; };
 		83F8664AFB2123015E35C5CA /* DashboardConfigPages.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF1B808391332D1FC13CD1D0 /* DashboardConfigPages.swift */; };
 		8ABF7A89C5FD85514EAAC0DC /* TimelineModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B81B0DF2C0A3C05A62D73211 /* TimelineModels.swift */; };
 		8DC557F61F6BE8CA39728CE2 /* HarnessActivationGuidance.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A26DF6DC7DD3F0CAA81BD6 /* HarnessActivationGuidance.swift */; };
@@ -112,7 +111,6 @@
 		6FBE05DBB986CBCE7BE09ED0 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		710E9EC4A241B8850EB0EB60 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
 		7294E1EB1AB2BC3775FC1E9D /* ConfigAuditModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigAuditModelsTests.swift; sourceTree = "<group>"; };
-		72E1263942F8D5014008EF95 /* DashboardRecoveryPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardRecoveryPage.swift; sourceTree = "<group>"; };
 		757B3C5FC8B9C600B17829C8 /* ConfigAuditModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigAuditModels.swift; sourceTree = "<group>"; };
 		7E4A8A78340952674B35776F /* GenseeCrate.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GenseeCrate.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		805C2FF6EE4D2777B55AD043 /* CheckpointModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheckpointModelsTests.swift; sourceTree = "<group>"; };
@@ -182,7 +180,6 @@
 				FF1B808391332D1FC13CD1D0 /* DashboardConfigPages.swift */,
 				35C4F935221A10F547647F54 /* DashboardHarnessesPage.swift */,
 				8E5F6044F8B4D45BBBC38D88 /* DashboardOverviewPages.swift */,
-				72E1263942F8D5014008EF95 /* DashboardRecoveryPage.swift */,
 				23D1D4F2FC41CDD9893C88C2 /* DashboardSecurityPages.swift */,
 				6F9083239FB55EA68146A81F /* DashboardShell.swift */,
 				18415BCF8F97E3CDBF1D9A21 /* EndpointIngestAcknowledgementIO.swift */,
@@ -423,7 +420,6 @@
 				83F8664AFB2123015E35C5CA /* DashboardConfigPages.swift in Sources */,
 				CEBB5434E3FFBD87829EB8C0 /* DashboardHarnessesPage.swift in Sources */,
 				6F1EFE76386D67BDF9581E7B /* DashboardOverviewPages.swift in Sources */,
-				80200C2E55A9BCB9B006893A /* DashboardRecoveryPage.swift in Sources */,
 				04161812076C359D9D1DA56D /* DashboardSecurityPages.swift in Sources */,
 				70FCB6B396339C7CE0DF1B79 /* DashboardShell.swift in Sources */,
 				7931867F15D1E07955D3F193 /* EndpointIngestAcknowledgementIO.swift in Sources */,

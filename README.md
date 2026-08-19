@@ -415,9 +415,12 @@ turns, tool calls, alerts, and supported transcript token totals. On the
 **Harnesses** page, **Audit Config** on Codex and GitHub Copilot runs the shared
 OSS auditor and presents findings, evidence, inventory, source provenance, and
 manual checks inline; unsupported harness auditors are marked **Coming soon**.
-The **Checkpoints** page creates Git-backed local workspace states before
-large agent changes and creates a rescue checkpoint before every restore. It
-preserves the real staging index and ignored files; it is a recovery aid rather
+Each hook-capable harness includes **Smart recovery points** with **Auto**,
+**Ask**, and **Off** modes. The default **Auto** mode creates one Git-backed
+recovery point before the first risky or mutating tool call in a request.
+Created recovery points and their **Restore** action appear in **Work Review**;
+every restore first creates a rescue point. Recovery points preserve the real
+staging index and ignored files, but they are a workspace recovery aid rather
 than the process, database, and remote-side-effect isolation provided by Linux
 tclone.
 

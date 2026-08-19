@@ -3379,6 +3379,15 @@ const SETTABLE_POLICY_KEYS: &[&str] = &[
     "endpoint_security.raw_event_retention_hours",
     "endpoint_security.max_raw_events",
     "endpoint_security.low_severity_retention_hours",
+    "recovery.default_mode",
+    "recovery.harnesses.codex",
+    "recovery.harnesses.claude-code",
+    "recovery.harnesses.antigravity",
+    "recovery.harnesses.cursor",
+    "recovery.harnesses.vscode",
+    "recovery.retention_hours",
+    "recovery.failure_behavior",
+    "recovery.ask_timeout_seconds",
     "watch.system_events",
     "allow_path_prefixes",
 ];
@@ -3437,6 +3446,15 @@ pub(crate) fn telemetry_policy_key_bucket(key: &str) -> &'static str {
         "endpoint_security.low_severity_retention_hours" => {
             "endpoint_security.low_severity_retention_hours"
         }
+        "recovery.default_mode" => "recovery.default_mode",
+        "recovery.harnesses.codex" => "recovery.harnesses.codex",
+        "recovery.harnesses.claude-code" => "recovery.harnesses.claude-code",
+        "recovery.harnesses.antigravity" => "recovery.harnesses.antigravity",
+        "recovery.harnesses.cursor" => "recovery.harnesses.cursor",
+        "recovery.harnesses.vscode" => "recovery.harnesses.vscode",
+        "recovery.retention_hours" => "recovery.retention_hours",
+        "recovery.failure_behavior" => "recovery.failure_behavior",
+        "recovery.ask_timeout_seconds" => "recovery.ask_timeout_seconds",
         "watch.system_events" => "watch.system_events",
         "allow_path_prefixes" => "allow_path_prefixes",
         _ => "custom",
@@ -4441,10 +4459,37 @@ fn process_hook_event_inner(
         for intent in &file_intents {
             store.append_file_intent(intent)?;
         }
-        let decision = adapt_decision_for_provider(
-            evaluate_pretool_policy_with_store(event, &file_intents, Some(store)),
-            &event.provider,
+        let original_decision =
+            evaluate_pretool_policy_with_store(event, &file_intents, Some(store));
+        let recovery_gate = prepare_recovery_point_before_tool(
+            event,
+            original_command.as_deref(),
+            &file_intents,
+            &original_decision,
+            store,
         );
+        let mut decision = adapt_decision_for_provider(original_decision, &event.provider);
+        match recovery_gate {
+            RecoveryGate::Continue => {}
+            RecoveryGate::ContinueWithWarning(message) => {
+                decision.action = decision.action.max(PolicyAction::Warn);
+                decision.findings.push(recovery_policy_finding(
+                    PolicyAction::Warn,
+                    "medium",
+                    message,
+                    event.cwd.clone(),
+                ));
+            }
+            RecoveryGate::Block(message) => {
+                decision.action = PolicyAction::Block;
+                decision.findings.push(recovery_policy_finding(
+                    PolicyAction::Block,
+                    "high",
+                    message,
+                    event.cwd.clone(),
+                ));
+            }
+        }
         telemetry_record_policy_event(event, &decision, &file_intents);
         for finding in &decision.findings {
             store.append_policy_alert(&finding.to_policy_alert(event))?;
@@ -4548,6 +4593,268 @@ fn process_hook_event_inner(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryGate {
+    Continue,
+    ContinueWithWarning(String),
+    Block(String),
+}
+
+fn prepare_recovery_point_before_tool(
+    event: &AgentHookEvent,
+    original_command: Option<&str>,
+    file_intents: &[FileIntent],
+    decision: &PolicyDecision,
+    store: &EventStore,
+) -> RecoveryGate {
+    let policy = Policy::load_current();
+    let recovery = &policy.document().recovery;
+    let mode = recovery.mode_for(&event.provider);
+    if mode == policy::RecoveryMode::Off {
+        return RecoveryGate::Continue;
+    }
+    let Some(session_id) = event.session_id.as_deref() else {
+        return recovery_failure_gate(
+            recovery.failure_behavior,
+            "Gensee could not correlate this tool call to an agent session.",
+        );
+    };
+    let Some(workspace) = recovery_git_workspace(event, original_command, file_intents) else {
+        return recovery_failure_gate(
+            recovery.failure_behavior,
+            "Gensee could not find a Git workspace for this tool call. Recovery points require an existing Git repository.",
+        );
+    };
+    let request = match store.active_request_context(session_id) {
+        Ok(Some(request)) => request,
+        Ok(None) => {
+            return recovery_failure_gate(
+                recovery.failure_behavior,
+                "Gensee could not correlate this tool call to an active request.",
+            );
+        }
+        Err(error) => {
+            return recovery_failure_gate(
+                recovery.failure_behavior,
+                &format!("Gensee could not load the active request: {error}"),
+            );
+        }
+    };
+    let Some(reason) = recovery_trigger(
+        event,
+        original_command,
+        file_intents,
+        decision,
+        request.original_user_prompt.as_deref(),
+    ) else {
+        return RecoveryGate::Continue;
+    };
+    let context = RecoveryPointContext {
+        request_id: request.request_id,
+        session_id,
+        provider: &event.provider,
+        trigger: &reason,
+    };
+
+    match mode {
+        policy::RecoveryMode::Auto => {
+            ensure_request_recovery_point(&workspace, &context, recovery.retention_hours)
+                .map(|_| RecoveryGate::Continue)
+                .unwrap_or_else(|error| {
+                    recovery_failure_gate(
+                        recovery.failure_behavior,
+                        &format!(
+                            "Gensee could not create a recovery point before changes: {error}"
+                        ),
+                    )
+                })
+        }
+        policy::RecoveryMode::Ask => {
+            let mut pending = match request_recovery_approval(&workspace, &context) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    return recovery_failure_gate(
+                        recovery.failure_behavior,
+                        &format!("Gensee could not request recovery approval: {error}"),
+                    );
+                }
+            };
+            if event.provider != PROVIDER_CODEX && pending.status == "pending" {
+                let deadline =
+                    Instant::now() + Duration::from_secs(recovery.ask_timeout_seconds.clamp(1, 25));
+                while Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(200));
+                    match request_recovery_approval(&workspace, &context) {
+                        Ok(updated) if updated.status != "pending" => {
+                            pending = updated;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            match pending.status.as_str() {
+                "created" | "continue" => {
+                    clear_pending_recovery_request(&pending.id);
+                    RecoveryGate::Continue
+                }
+                _ if event.provider == PROVIDER_CODEX => RecoveryGate::Block(format!(
+                    "{} is about to make changes. Choose Create & Continue or Continue Without in Gensee Crate, then retry this tool call.",
+                    event.provider
+                )),
+                _ => {
+                    let gate = recovery_failure_gate(
+                        recovery.failure_behavior,
+                        "Recovery-point approval timed out before the tool call began.",
+                    );
+                    // A fail-open timeout must not leave a stale approval in the
+                    // app after the operation has already continued. Keep the
+                    // request only when the configured fallback blocks, so the
+                    // user can approve it and retry the tool call.
+                    if matches!(gate, RecoveryGate::ContinueWithWarning(_)) {
+                        clear_pending_recovery_request(&pending.id);
+                    }
+                    gate
+                }
+            }
+        }
+        policy::RecoveryMode::Off => RecoveryGate::Continue,
+    }
+}
+
+fn recovery_git_workspace(
+    event: &AgentHookEvent,
+    original_command: Option<&str>,
+    file_intents: &[FileIntent],
+) -> Option<PathBuf> {
+    let base_cwd = event.cwd.as_deref().unwrap_or(".");
+    let mut candidates = Vec::new();
+
+    if let Some(command) = original_command {
+        candidates.push(PathBuf::from(leading_bash_effective_cwd(command, base_cwd)));
+    }
+
+    for intent in file_intents
+        .iter()
+        .filter(|intent| policy_subject_is_mutating(&intent.operation))
+    {
+        let path = PathBuf::from(&intent.path);
+        let candidate = if path.is_dir() {
+            path
+        } else {
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            parent.to_path_buf()
+        };
+        candidates.push(candidate);
+    }
+
+    candidates.push(PathBuf::from(base_cwd));
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .find_map(|candidate| git_repository_root(&candidate).ok())
+}
+
+fn recovery_trigger(
+    event: &AgentHookEvent,
+    original_command: Option<&str>,
+    file_intents: &[FileIntent],
+    decision: &PolicyDecision,
+    prompt: Option<&str>,
+) -> Option<String> {
+    if decision.action >= PolicyAction::Ask {
+        return Some("Policy identified a risky operation".to_string());
+    }
+    if file_intents
+        .iter()
+        .any(|intent| !matches!(intent.operation.as_str(), "read" | "open" | "stat" | "list"))
+    {
+        return Some(if file_intents.len() >= 3 {
+            "Broad multi-file change".to_string()
+        } else {
+            "File mutation".to_string()
+        });
+    }
+    let tool = event
+        .tool_name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ["edit", "write", "delete", "patch", "move", "rename"]
+        .iter()
+        .any(|needle| tool.contains(needle))
+    {
+        return Some("Mutating tool call".to_string());
+    }
+    let command = original_command.unwrap_or_default().to_ascii_lowercase();
+    if [
+        "sudo ",
+        "git reset",
+        "git clean",
+        "git checkout --",
+        "npm install",
+        "pnpm install",
+        "yarn install",
+        "cargo update",
+        "pip install",
+        "alembic ",
+        "prisma migrate",
+        "db:migrate",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle))
+    {
+        return Some("Destructive, elevated, dependency, or migration command".to_string());
+    }
+    let prompt = prompt.unwrap_or_default().to_ascii_lowercase();
+    if [
+        "large refactor",
+        "big refactor",
+        "rewrite",
+        "migration",
+        "migrate",
+        "rename across",
+        "upgrade dependencies",
+    ]
+    .iter()
+    .any(|needle| prompt.contains(needle))
+    {
+        return Some(
+            "Request indicates a migration, rewrite, rename, or large refactor".to_string(),
+        );
+    }
+    None
+}
+
+fn recovery_failure_gate(behavior: policy::RecoveryFailureBehavior, message: &str) -> RecoveryGate {
+    match behavior {
+        policy::RecoveryFailureBehavior::ContinueWithWarning => {
+            RecoveryGate::ContinueWithWarning(message.to_string())
+        }
+        policy::RecoveryFailureBehavior::Block => RecoveryGate::Block(message.to_string()),
+    }
+}
+
+fn recovery_policy_finding(
+    action: PolicyAction,
+    severity: &str,
+    message: String,
+    path: Option<String>,
+) -> PolicyFinding {
+    PolicyFinding {
+        action,
+        severity: severity.to_string(),
+        rule_id: "smart_recovery_point".to_string(),
+        message,
+        path,
+        evidence: json!({"feature": "recovery-point", "source": "harness-hook"}),
+    }
+}
+
 pub(crate) fn required_arg_value(args: &[OsString], name: &str) -> io::Result<String> {
     arg_value(args, name).ok_or_else(|| {
         io::Error::new(
@@ -4633,7 +4940,7 @@ pub(crate) fn print_usage() {
         "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--approach <description>]... [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container> [--json]\n  gensee run summary <fork-id> [--json]\n  gensee run compare <parallel-fork-id> [--json]\n  gensee run choose <parallel-fork-id> <--merge|--promote|--discard-all>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee managed <create-source|delete-source|fork|merge|promote|discard|diff|status|list|reconcile>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list [--json]\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run fork run_123 --copies 2 --name try-upgrade --approach 'minimal compatible upgrade' --approach 'aggressive latest-version upgrade' --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
     );
     println!(
-        "RECOVERY:\n  gensee checkpoint create [--workspace <path>] [--label <text>] [--json]\n  gensee checkpoint list [--workspace <path>] [--json]\n  gensee checkpoint restore <id> [--workspace <path>] --yes [--json]\n  gensee checkpoint delete <id> [--workspace <path>] --yes [--json]\n  gensee checkpoint prune [--workspace <path>] [--older-than-hours <hours>] --yes [--json]\n"
+        "RECOVERY:\n  gensee checkpoint create [--workspace <path>] [--label <text>] [--json]\n  gensee checkpoint list [--workspace <path>] [--json]\n  gensee checkpoint restore <id> [--workspace <path>] --yes [--json]\n  gensee checkpoint delete <id> [--workspace <path>] --yes [--json]\n  gensee checkpoint prune [--workspace <path>] [--older-than-hours <hours>] --yes [--json]\n  gensee checkpoint pending [--json]\n  gensee checkpoint resolve <id> --action <create|continue> [--json]\n"
     );
     println!(
         "AUDIT:\n  gensee audit codex [--workspace <path>] [--json] [--fail-on <level>]\n  gensee audit vscode [--workspace <path>] [--vscode-profile <id>] [--json] [--fail-on <level>]\n  gensee audit <codex-cli|github-copilot-vscode|vscode-agent-host> [OPTIONS]\n"

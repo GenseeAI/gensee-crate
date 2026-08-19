@@ -115,6 +115,12 @@ pub struct ActiveToolCall {
     pub cwd: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveRequestContext {
+    pub request_id: i64,
+    pub original_user_prompt: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ArtifactObservationInput {
     pub session_id: Option<String>,
@@ -282,6 +288,21 @@ impl EventStore {
     pub fn append_hook_event(&self, event: &AgentHookEvent) -> io::Result<()> {
         self.append_hook_event_database(event)?;
         append_jsonl(&self.hooks_path(), event, self.encryption_key.as_ref())
+    }
+
+    pub fn active_request_context(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<ActiveRequestContext>> {
+        self.sqlite_store()?
+            .latest_request_for_session(session_id)
+            .map(|request| {
+                request.map(|request| ActiveRequestContext {
+                    request_id: request.request_id,
+                    original_user_prompt: request.original_user_prompt,
+                })
+            })
+            .map_err(sqlite_error)
     }
 
     pub fn append_process_observation(&self, observation: &ProcessObservation) -> io::Result<()> {

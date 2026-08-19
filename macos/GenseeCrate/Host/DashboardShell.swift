@@ -6,7 +6,6 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
     case today = "Daily Highlight"
     case alerts = "Alerts"
     case lineage = "Lineage Graph"
-    case checkpoints = "Checkpoints"
     case harnesses = "Harnesses"
     case policy = "Policy"
     case settings = "Settings"
@@ -15,14 +14,13 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
-        case .overview: "gauge.with.dots.needle.33percent"
-        case .reviews: "checklist.checked"
-        case .today: "star"
+        case .overview: "rectangle.grid.2x2"
+        case .reviews: "doc.text.magnifyingglass"
+        case .today: "calendar"
         case .alerts: "exclamationmark.triangle"
         case .lineage: "point.3.connected.trianglepath.dotted"
-        case .checkpoints: "arrow.uturn.backward.circle"
-        case .harnesses: "switch.2"
-        case .policy: "checkmark.shield"
+        case .harnesses: "slider.horizontal.3"
+        case .policy: "shield"
         case .settings: "gearshape"
         }
     }
@@ -68,6 +66,7 @@ struct DashboardShell: View {
             model.endpointSensor.start()
             await notifications.refreshAuthorizationStatus()
             await model.refreshAll()
+            await model.refreshPendingRecoveryRequest()
             if !model.isDemoMode {
                 await notifications.process(snapshot: model.snapshot)
             }
@@ -82,12 +81,41 @@ struct DashboardShell: View {
                 }
             }
         }
+        .task {
+            while !Task.isCancelled {
+                await model.refreshPendingRecoveryRequest()
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
         .alert("Gensee needs attention", isPresented: errorPresented) {
             Button("Dismiss", role: .cancel) { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "Unknown error") }
         .alert("Gensee updated", isPresented: noticePresented) {
             Button("OK", role: .cancel) { model.noticeMessage = nil }
         } message: { Text(model.noticeMessage ?? "") }
+        .alert(
+            "Create a recovery point?",
+            isPresented: pendingRecoveryPresented,
+            presenting: model.pendingRecoveryRequest
+        ) { request in
+            Button("Create & Continue") {
+                Task { await model.resolvePendingRecoveryRequest(request, create: true) }
+            }
+            Button("Continue Without") {
+                Task { await model.resolvePendingRecoveryRequest(request, create: false) }
+            }
+            Button("Always create for \(HarnessDisplayName.from(request.provider))") {
+                Task {
+                    await model.resolvePendingRecoveryRequest(
+                        request,
+                        create: true,
+                        alwaysCreate: true
+                    )
+                }
+            }
+        } message: { request in
+            Text("\(HarnessDisplayName.from(request.provider)) is about to make changes to \(abbreviatedPath(request.workspace)). \(request.reason). Recovery points cover Git-workspace files only; they cannot undo database, network, remote repository, process, or ignored-file changes.")
+        }
     }
 
     private var topBar: some View {
@@ -140,17 +168,31 @@ struct DashboardShell: View {
                     .foregroundStyle(Color.dashboardGold)
                     .help(issue)
             }
-            Button { selection = .alerts } label: { Image(systemName: "bell") }
-                .buttonStyle(.plain).help("Alerts")
-            Button { selection = .settings } label: { Image(systemName: "questionmark.circle") }
-                .buttonStyle(.plain).help("Help and settings")
-            Button { darkMode.toggle() } label: { Image(systemName: darkMode ? "sun.max" : "moon") }
-                .buttonStyle(.plain).help(darkMode ? "Switch to light mode" : "Switch to dark mode")
+            toolbarIconButton(symbol: "bell", help: "Alerts") { selection = .alerts }
+            toolbarIconButton(symbol: "questionmark.circle", help: "Help and settings") { selection = .settings }
+            toolbarIconButton(
+                symbol: darkMode ? "sun.max" : "moon",
+                help: darkMode ? "Switch to light mode" : "Switch to dark mode"
+            ) { darkMode.toggle() }
         }
         .padding(.horizontal, 16)
         .frame(height: 56)
         .background(Color.dashboardPanel)
         .overlay(alignment: .bottom) { Rectangle().fill(Color.dashboardLine).frame(height: 1) }
+    }
+
+    private func toolbarIconButton(
+        symbol: String,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            DashboardSymbol(symbol, color: .secondary, size: 13, weight: .regular)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 
     private var demoBanner: some View {
@@ -178,7 +220,7 @@ struct DashboardShell: View {
 
     @ViewBuilder
     private var destinationView: some View {
-        if model.isDemoMode && [.harnesses, .policy, .checkpoints, .settings].contains(selection) {
+        if model.isDemoMode && [.harnesses, .policy, .settings].contains(selection) {
             DemoConfigurationPage(destination: selection) {
                 Task { await model.exitDemoMode() }
             }
@@ -192,7 +234,6 @@ struct DashboardShell: View {
             case .today: TodayHighlightPage(model: model)
             case .alerts: DashboardAlertsPage(model: model, searchText: searchText)
             case .lineage: LineagePage(model: model, searchText: searchText)
-            case .checkpoints: DashboardRecoveryPage(model: model)
             case .harnesses: DashboardHarnessesPage(model: model)
             case .policy: DashboardPolicyPage(model: model)
             case .settings: DashboardSettingsPage(
@@ -213,6 +254,13 @@ struct DashboardShell: View {
 
     private var noticePresented: Binding<Bool> {
         Binding(get: { model.noticeMessage != nil }, set: { if !$0 { model.noticeMessage = nil } })
+    }
+
+    private var pendingRecoveryPresented: Binding<Bool> {
+        Binding(
+            get: { model.pendingRecoveryRequest != nil },
+            set: { _ in }
+        )
     }
 }
 
@@ -255,7 +303,7 @@ private struct DashboardSidebar: View {
         VStack(alignment: .leading, spacing: 0) {
             navGroup("OVERVIEW", [.overview])
             separator
-            navGroup("ACTIVITY", [.reviews, .today, .checkpoints])
+            navGroup("ACTIVITY", [.reviews, .today])
             separator
             navGroup("SECURITY", [.alerts, .lineage])
             separator
@@ -277,7 +325,13 @@ private struct DashboardSidebar: View {
             ForEach(destinations) { destination in
                 Button { selection = destination } label: {
                     HStack(spacing: 10) {
-                        Image(systemName: destination.symbol).frame(width: 16)
+                        DashboardSymbol(
+                            destination.symbol,
+                            color: selection == destination ? .dashboardRed : .secondary,
+                            size: 13,
+                            weight: selection == destination ? .semibold : .regular
+                        )
+                        .frame(width: 16)
                         Text(destination.rawValue)
                         Spacer()
                         if destination == .alerts, alertCount > 0 {

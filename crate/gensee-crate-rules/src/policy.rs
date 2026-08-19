@@ -11,6 +11,7 @@
 //! the JSON document. Exempt trusted path prefixes (colon-separated) with
 //! `GENSEE_POLICY_ALLOW_PATH_PREFIXES`.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -97,6 +98,8 @@ pub struct PolicyDocument {
     pub watch: WatchPolicyConfig,
     #[serde(default)]
     pub endpoint_security: EndpointSecurityConfig,
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
     /// Trusted path prefixes exempt from the FP-prone secret/persistence
     /// findings (the JSON form of `GENSEE_POLICY_ALLOW_PATH_PREFIXES`).
     #[serde(default)]
@@ -263,6 +266,65 @@ impl Default for EndpointSecurityConfig {
             low_severity_retention_hours: Some(48),
         }
     }
+}
+
+/// Git-backed recovery points created by harness hooks before agent changes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecoveryConfig {
+    pub default_mode: RecoveryMode,
+    pub harnesses: BTreeMap<String, RecoveryMode>,
+    pub retention_hours: u64,
+    pub failure_behavior: RecoveryFailureBehavior,
+    pub ask_timeout_seconds: u64,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: RecoveryMode::Auto,
+            harnesses: BTreeMap::new(),
+            retention_hours: 24 * 7,
+            failure_behavior: RecoveryFailureBehavior::ContinueWithWarning,
+            ask_timeout_seconds: 25,
+        }
+    }
+}
+
+impl RecoveryConfig {
+    pub fn mode_for(&self, provider: &str) -> RecoveryMode {
+        self.harnesses
+            .get(provider)
+            .copied()
+            .unwrap_or(self.default_mode)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecoveryMode {
+    #[default]
+    Auto,
+    Ask,
+    Off,
+}
+
+impl RecoveryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ask => "ask",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryFailureBehavior {
+    #[default]
+    ContinueWithWarning,
+    Block,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
@@ -656,6 +718,12 @@ impl Policy {
                 "endpoint_security.low_severity_retention_hours must be null or between 1 and 8760"
                     .to_string(),
             );
+        }
+        if !(1..=24 * 365).contains(&doc.recovery.retention_hours) {
+            return Err("recovery.retention_hours must be between 1 and 8760".to_string());
+        }
+        if !(1..=25).contains(&doc.recovery.ask_timeout_seconds) {
+            return Err("recovery.ask_timeout_seconds must be between 1 and 25".to_string());
         }
         Ok(Self {
             doc,
@@ -1554,6 +1622,13 @@ mod tests {
         assert_eq!(endpoint.raw_event_retention_hours, 24);
         assert_eq!(endpoint.max_raw_events, 100_000);
         assert_eq!(endpoint.low_severity_retention_hours, Some(48));
+        let recovery = &policy.document().recovery;
+        assert_eq!(recovery.mode_for("codex"), RecoveryMode::Auto);
+        assert_eq!(recovery.retention_hours, 168);
+        assert_eq!(
+            recovery.failure_behavior,
+            RecoveryFailureBehavior::ContinueWithWarning
+        );
     }
 
     #[test]
@@ -1604,6 +1679,7 @@ mod tests {
             "enforcement",
             "watch",
             "endpoint_security",
+            "recovery",
             "allow_path_prefixes",
         ] {
             doc.as_object_mut().unwrap().remove(key);

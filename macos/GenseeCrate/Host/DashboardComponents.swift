@@ -53,11 +53,9 @@ struct DashboardStatCard: View {
 
     var body: some View {
         DashboardCard {
-            HStack(spacing: 12) {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(color.opacity(0.12))
-                    .frame(width: 38, height: 38)
-                    .overlay(Image(systemName: symbol).foregroundStyle(color))
+            HStack(spacing: 10) {
+                DashboardSymbol(symbol, color: color, size: 15)
+                    .frame(width: 22, height: 38)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
                     Text(value.formatted()).font(.system(size: 23, weight: .semibold))
@@ -68,13 +66,42 @@ struct DashboardStatCard: View {
     }
 }
 
+/// A restrained SF Symbol treatment shared by the native console. Keeping the
+/// glyph monochrome and optically sized avoids the mixed filled/tinted tiles
+/// that made otherwise-native symbols feel decorative rather than macOS-like.
+struct DashboardSymbol: View {
+    let name: String
+    let color: Color
+    let size: CGFloat
+    let weight: Font.Weight
+
+    init(
+        _ name: String,
+        color: Color = .secondary,
+        size: CGFloat = 14,
+        weight: Font.Weight = .medium
+    ) {
+        self.name = name
+        self.color = color
+        self.size = size
+        self.weight = weight
+    }
+
+    var body: some View {
+        Image(systemName: name)
+            .symbolRenderingMode(.monochrome)
+            .font(.system(size: size, weight: weight))
+            .foregroundStyle(color)
+    }
+}
+
 struct DashboardEmpty: View {
     let text: String
     var symbol = "tray"
 
     var body: some View {
         VStack(spacing: 9) {
-            Image(systemName: symbol).font(.title2).foregroundStyle(.tertiary)
+            DashboardSymbol(symbol, color: Color.secondary.opacity(0.55), size: 18, weight: .regular)
             Text(text).font(.system(size: 12)).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, minHeight: 120)

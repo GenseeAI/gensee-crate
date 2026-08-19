@@ -17,6 +17,9 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var verifiedIntegrationIDs: Set<String> = []
     @Published private(set) var checkpoints: [WorkspaceCheckpointRecord] = []
     @Published private(set) var checkpointWorkspace: String?
+    @Published private(set) var recoveryPointSettings = RecoveryPointSettings()
+    @Published private(set) var recoveryPointsByRequest: [Int64: WorkspaceCheckpointRecord] = [:]
+    @Published private(set) var pendingRecoveryRequest: PendingRecoveryRequest?
     @Published private(set) var isRefreshing = false
     @Published private(set) var runningCommand: String?
     @Published private(set) var feedbackAlertID: Int64?
@@ -194,6 +197,21 @@ final class ConsoleModel: ObservableObject {
             next.noninteractive = try await policyBool("enforcement.noninteractive") ?? next.noninteractive
             next.requireProxy = try await policyBool("egress.require_proxy") ?? next.requireProxy
             next.maxRuntimeSeconds = try await policyInt("runtime.max_runtime_seconds")
+            var recovery = recoveryPointSettings
+            for provider in ["codex", "claude-code", "antigravity", "cursor", "vscode"] {
+                if let value = try? await policyString("recovery.harnesses.\(provider)"),
+                   let mode = RecoveryPointMode(rawValue: value) {
+                    recovery.harnessModes[provider] = mode
+                }
+            }
+            if let hours = try? await policyInt("recovery.retention_hours") {
+                recovery.retentionHours = hours
+            }
+            if let value = try? await policyString("recovery.failure_behavior"),
+               let behavior = RecoveryFailureBehavior(rawValue: value) {
+                recovery.failureBehavior = behavior
+            }
+            recoveryPointSettings = recovery
             policy = next
             policyDocument = try await loadPolicyDocument()
             configureEndpointSensor()
@@ -309,6 +327,7 @@ final class ConsoleModel: ObservableObject {
             guard requestReviewLoadState == .loading(requestID) else { return }
             requestReviewPayload = payload
             requestReviewLoadState = .loaded(requestID)
+            await loadRecoveryPoint(for: payload)
         } catch {
             guard requestReviewLoadState == .loading(requestID) else { return }
             requestReviewPayload = nil
@@ -317,6 +336,82 @@ final class ConsoleModel: ObservableObject {
                 message: error.localizedDescription
             )
         }
+    }
+
+    func refreshPendingRecoveryRequest() async {
+        guard !isDemoMode, backendAvailable else { return }
+        do {
+            let requests = try await cli.decode(
+                [PendingRecoveryRequest].self,
+                arguments: ["checkpoint", "pending", "--json"],
+                timeout: 3
+            )
+            pendingRecoveryRequest = requests.first
+        } catch {
+            // Approval polling must never replace a healthy dashboard with an
+            // error dialog. The blocked hook already carries fallback guidance.
+        }
+    }
+
+    func resolvePendingRecoveryRequest(
+        _ request: PendingRecoveryRequest,
+        create: Bool,
+        alwaysCreate: Bool = false
+    ) async {
+        guard !isDemoMode else { return }
+        if alwaysCreate {
+            guard await updateRecoveryPointMode(.auto, for: request.provider, showNotice: false) else { return }
+        }
+        runningCommand = create ? "Creating recovery point" : "Continuing without recovery point"
+        defer { runningCommand = nil }
+        do {
+            _ = try await cli.run(
+                [
+                    "checkpoint", "resolve", request.id,
+                    "--action", create ? "create" : "continue",
+                    "--json",
+                ],
+                timeout: 60
+            )
+            pendingRecoveryRequest = nil
+            noticeMessage = create
+                ? "Recovery point created. The waiting agent operation can continue."
+                : "This request will continue without a recovery point."
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func updateRecoveryPointMode(
+        _ mode: RecoveryPointMode,
+        for provider: String,
+        showNotice: Bool = true
+    ) async -> Bool {
+        await updateRecoverySetting(
+            key: "recovery.harnesses.\(provider)",
+            value: mode.rawValue,
+            command: "Updating smart recovery for \(HarnessDisplayName.from(provider))",
+            notice: showNotice ? "Smart recovery for \(HarnessDisplayName.from(provider)) is now \(mode.title)." : nil
+        )
+    }
+
+    func updateRecoveryRetentionHours(_ hours: Int) async {
+        _ = await updateRecoverySetting(
+            key: "recovery.retention_hours",
+            value: String(hours),
+            command: "Updating recovery-point retention",
+            notice: "Recovery points will be retained for \(hours) hours."
+        )
+    }
+
+    func updateRecoveryFailureBehavior(_ behavior: RecoveryFailureBehavior) async {
+        _ = await updateRecoverySetting(
+            key: "recovery.failure_behavior",
+            value: behavior.rawValue,
+            command: "Updating recovery fallback",
+            notice: "Recovery fallback set to \(behavior.title)."
+        )
     }
 
     func runConfigAudit(target: String, workspace: String) async {
@@ -457,6 +552,53 @@ final class ConsoleModel: ObservableObject {
             await loadCheckpoints(workspace: workspaceURL.path, reportErrors: false)
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func loadRecoveryPoint(for payload: RequestReviewPayload) async {
+        let workspace = payload.agentEvents
+            .lazy
+            .map(\.cwd)
+            .first(where: { !$0.isEmpty })
+        guard let workspace, let workspaceURL = existingWorkspaceURL(workspace) else {
+            recoveryPointsByRequest.removeValue(forKey: payload.request.requestID)
+            return
+        }
+        do {
+            let response = try await cli.decode(
+                CheckpointListResponse.self,
+                arguments: ["checkpoint", "list", "--workspace", workspaceURL.path, "--json"],
+                timeout: 5
+            )
+            recoveryPointsByRequest[payload.request.requestID] = response.checkpoints.first {
+                $0.requestID == payload.request.requestID && $0.rescueOf == nil
+            }
+        } catch {
+            recoveryPointsByRequest.removeValue(forKey: payload.request.requestID)
+        }
+    }
+
+    private func updateRecoverySetting(
+        key: String,
+        value: String,
+        command: String,
+        notice: String?
+    ) async -> Bool {
+        guard !isDemoMode else { return false }
+        guard backendAvailable else {
+            errorMessage = GenseeCLIError.executableNotFound.localizedDescription
+            return false
+        }
+        runningCommand = command
+        defer { runningCommand = nil }
+        do {
+            _ = try await cli.run(["policy", "set", key, value], timeout: 12)
+            await refreshPolicy()
+            if let notice { noticeMessage = notice }
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
         }
     }
 
@@ -747,6 +889,8 @@ final class ConsoleModel: ObservableObject {
         dailyDetailLoadState = .idle
         requestReviewPayload = nil
         requestReviewLoadState = .idle
+        recoveryPointsByRequest.removeAll()
+        pendingRecoveryRequest = nil
         errorMessage = nil
         lastUpdated = Date()
     }
@@ -759,6 +903,8 @@ final class ConsoleModel: ObservableObject {
         dailyDetailLoadState = .idle
         requestReviewPayload = nil
         requestReviewLoadState = .idle
+        recoveryPointsByRequest.removeAll()
+        pendingRecoveryRequest = nil
         await refreshAll()
     }
 

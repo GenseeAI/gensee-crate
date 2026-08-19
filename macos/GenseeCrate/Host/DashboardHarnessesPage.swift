@@ -156,14 +156,13 @@ struct DashboardHarnessesPage: View {
 
     private func harnessRow(_ integration: IntegrationDescriptor) -> some View {
         HStack(alignment: .center, spacing: 14) {
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(rowAccent(integration).opacity(integration.installed ? 0.12 : 0.07))
-                .frame(width: 40, height: 40)
-                .overlay(
-                    Image(systemName: integration.symbolName)
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(integration.installed ? rowAccent(integration) : Color.secondary)
-                )
+            DashboardSymbol(
+                integration.symbolName,
+                color: integration.installed ? .secondary : Color.secondary.opacity(0.45),
+                size: 15,
+                weight: .regular
+            )
+            .frame(width: 40, height: 40)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
@@ -196,11 +195,62 @@ struct DashboardHarnessesPage: View {
 
             auditButton(integration)
             protectionButton(integration)
+            recoveryPointControl(integration)
         }
         .padding(.vertical, 13)
         .contentShape(Rectangle())
         .opacity(integration.installed ? 1 : 0.42)
         .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private func recoveryPointControl(_ integration: IntegrationDescriptor) -> some View {
+        if integration.supportsDirectHooks {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.counterclockwise.circle")
+                    Text("Smart recovery points")
+                }
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+                Picker(
+                    "Smart recovery points",
+                    selection: Binding(
+                        get: { model.recoveryPointSettings.mode(for: integration.id) },
+                        set: { mode in
+                            Task { await model.updateRecoveryPointMode(mode, for: integration.id) }
+                        }
+                    )
+                ) {
+                    ForEach(RecoveryPointMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 178)
+                Text(recoveryModeHelp(integration))
+                    .font(.system(size: 8))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .frame(width: 178, alignment: .leading)
+            }
+            .disabled(!integration.installed || !model.backendAvailable || model.runningCommand != nil)
+            .help(recoveryModeHelp(integration))
+        }
+    }
+
+    private func recoveryModeHelp(_ integration: IntegrationDescriptor) -> String {
+        switch model.recoveryPointSettings.mode(for: integration.id) {
+        case .auto:
+            return "Creates once before the first risky change."
+        case .ask where integration.id == "codex":
+            return "Codex may require approval, then a retry."
+        case .ask:
+            return "Pauses briefly for approval in Gensee."
+        case .off:
+            return "No automatic Git recovery point."
+        }
     }
 
     private func auditButton(_ integration: IntegrationDescriptor) -> some View {
@@ -301,13 +351,6 @@ struct DashboardHarnessesPage: View {
         return integration.configured
             ? "Remove Gensee hooks while preserving unrelated harness settings."
             : "Install Gensee monitoring and policy hooks."
-    }
-
-    private func rowAccent(_ integration: IntegrationDescriptor) -> Color {
-        if integration.configurationIssue != nil { return .dashboardGold }
-        if integration.isHealthy { return .dashboardGreen }
-        if integration.awaitingVerification { return .dashboardGold }
-        return .dashboardBlue
     }
 
     private func statusColor(_ integration: IntegrationDescriptor) -> Color {

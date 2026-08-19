@@ -15,6 +15,14 @@ pub(crate) struct WorkspaceCheckpoint {
     base_head: Option<String>,
     label: Option<String>,
     rescue_of: Option<String>,
+    #[serde(default)]
+    request_id: Option<i64>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    trigger: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,11 +42,32 @@ struct CheckpointDeleteResponse {
     deleted: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct PendingRecoveryRequest {
+    schema_version: u32,
+    pub(crate) id: String,
+    pub(crate) request_id: i64,
+    pub(crate) session_id: String,
+    pub(crate) provider: String,
+    pub(crate) workspace: String,
+    pub(crate) reason: String,
+    pub(crate) created_at_ms: u64,
+    pub(crate) status: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RecoveryPointContext<'a> {
+    pub(crate) request_id: i64,
+    pub(crate) session_id: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) trigger: &'a str,
+}
+
 pub(crate) fn handle_checkpoint(args: Vec<OsString>) -> io::Result<()> {
     let command = args.first().and_then(|arg| arg.to_str()).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "checkpoint requires create, list, restore, delete, or prune",
+            "checkpoint requires create, list, restore, delete, prune, pending, or resolve",
         )
     })?;
     let parsed = CheckpointArgs::parse(&args[1..])?;
@@ -154,6 +183,43 @@ pub(crate) fn handle_checkpoint(args: Vec<OsString>) -> io::Result<()> {
             }
             Ok(())
         }
+        "pending" => {
+            let pending = list_pending_recovery_requests()?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&pending)?);
+            } else if pending.is_empty() {
+                println!("No pending recovery-point approvals");
+            } else {
+                for request in pending {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        request.id, request.provider, request.workspace, request.reason
+                    );
+                }
+            }
+            Ok(())
+        }
+        "resolve" => {
+            let id = parsed.positionals.first().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "checkpoint resolve requires a pending approval id",
+                )
+            })?;
+            let action = parsed.action.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "checkpoint resolve requires --action create|continue",
+                )
+            })?;
+            let resolved = resolve_pending_recovery_request(id, action)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&resolved)?);
+            } else {
+                println!("Resolved {} with {}", resolved.id, resolved.status);
+            }
+            Ok(())
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unknown checkpoint command: {other}"),
@@ -168,6 +234,7 @@ struct CheckpointArgs {
     json: bool,
     yes: bool,
     older_than_hours: Option<u64>,
+    action: Option<String>,
     positionals: Vec<String>,
 }
 
@@ -206,6 +273,10 @@ impl CheckpointArgs {
                             "--older-than-hours must be greater than zero",
                         ));
                     }
+                }
+                Some("--action") => {
+                    index += 1;
+                    parsed.action = Some(required_value(args, index, "--action")?.to_string());
                 }
                 Some(value) if value.starts_with('-') => {
                     return Err(io::Error::new(
@@ -258,6 +329,16 @@ fn create_checkpoint_at(
     label: Option<&str>,
     rescue_of: Option<&str>,
 ) -> io::Result<WorkspaceCheckpoint> {
+    create_checkpoint_with_context(workspace, storage_root, label, rescue_of, None)
+}
+
+fn create_checkpoint_with_context(
+    workspace: &Path,
+    storage_root: &Path,
+    label: Option<&str>,
+    rescue_of: Option<&str>,
+    context: Option<&RecoveryPointContext<'_>>,
+) -> io::Result<WorkspaceCheckpoint> {
     let repository = git_repository_root(workspace)?;
     let base_head = git_optional(&repository, &["rev-parse", "--verify", "HEAD"])?;
     let temporary_index = TemporaryGitIndex::new()?;
@@ -306,6 +387,10 @@ fn create_checkpoint_at(
         base_head,
         label: label.map(str::to_string),
         rescue_of: rescue_of.map(str::to_string),
+        request_id: context.map(|context| context.request_id),
+        session_id: context.map(|context| context.session_id.to_string()),
+        provider: context.map(|context| context.provider.to_string()),
+        trigger: context.map(|context| context.trigger.to_string()),
     };
     write_checkpoint_metadata(storage_root, &repository, &checkpoint)?;
     Ok(checkpoint)
@@ -335,6 +420,230 @@ fn list_checkpoints_at(
     }
     checkpoints.sort_by_key(|checkpoint| std::cmp::Reverse(checkpoint.created_at_ms));
     Ok(checkpoints)
+}
+
+pub(crate) fn ensure_request_recovery_point(
+    workspace: &Path,
+    context: &RecoveryPointContext<'_>,
+    retention_hours: u64,
+) -> io::Result<WorkspaceCheckpoint> {
+    let storage_root = checkpoint_storage_root()?;
+    ensure_request_recovery_point_at(workspace, &storage_root, context, retention_hours)
+}
+
+fn ensure_request_recovery_point_at(
+    workspace: &Path,
+    storage_root: &Path,
+    context: &RecoveryPointContext<'_>,
+    retention_hours: u64,
+) -> io::Result<WorkspaceCheckpoint> {
+    let repository = git_repository_root(workspace)?;
+    if let Some(existing) =
+        recovery_point_for_request(&repository, storage_root, context.request_id)?
+    {
+        return Ok(existing);
+    }
+
+    let directory = repository_checkpoint_directory(storage_root, &repository);
+    fs::create_dir_all(&directory)?;
+    let lock = directory.join(format!(".request-{}.lock", context.request_id));
+    match fs::create_dir(&lock) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Some(existing) =
+                    recovery_point_for_request(&repository, storage_root, context.request_id)?
+                {
+                    return Ok(existing);
+                }
+                if !lock.exists() {
+                    break;
+                }
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another hook is creating this request's recovery point",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    let _guard = RecoveryCreationLock(lock);
+
+    if let Some(existing) =
+        recovery_point_for_request(&repository, storage_root, context.request_id)?
+    {
+        return Ok(existing);
+    }
+    let label = format!("Before {} request {}", context.provider, context.request_id);
+    let checkpoint = create_checkpoint_with_context(
+        &repository,
+        storage_root,
+        Some(&label),
+        None,
+        Some(context),
+    )?;
+    prune_recovery_points(
+        &repository,
+        storage_root,
+        retention_hours,
+        checkpoint.created_at_ms,
+    )?;
+    Ok(checkpoint)
+}
+
+fn recovery_point_for_request(
+    repository: &Path,
+    storage_root: &Path,
+    request_id: i64,
+) -> io::Result<Option<WorkspaceCheckpoint>> {
+    Ok(list_checkpoints_at(repository, storage_root)?
+        .into_iter()
+        .find(|checkpoint| {
+            checkpoint.request_id == Some(request_id) && checkpoint.rescue_of.is_none()
+        }))
+}
+
+fn prune_recovery_points(
+    repository: &Path,
+    storage_root: &Path,
+    retention_hours: u64,
+    now: u64,
+) -> io::Result<()> {
+    let cutoff = now.saturating_sub(retention_hours.max(1).saturating_mul(3_600_000));
+    for checkpoint in list_checkpoints_at(repository, storage_root)? {
+        if checkpoint.created_at_ms < cutoff {
+            delete_checkpoint_at(repository, storage_root, &checkpoint.id)?;
+        }
+    }
+    Ok(())
+}
+
+struct RecoveryCreationLock(PathBuf);
+
+impl Drop for RecoveryCreationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
+pub(crate) fn request_recovery_approval(
+    workspace: &Path,
+    context: &RecoveryPointContext<'_>,
+) -> io::Result<PendingRecoveryRequest> {
+    let repository = git_repository_root(workspace)?;
+    let id = pending_recovery_id(&repository, context);
+    let path = pending_recovery_directory()?.join(format!("{id}.json"));
+    if let Ok(bytes) = fs::read(&path) {
+        return serde_json::from_slice(&bytes).map_err(Into::into);
+    }
+    let request = PendingRecoveryRequest {
+        schema_version: CHECKPOINT_SCHEMA_VERSION,
+        id,
+        request_id: context.request_id,
+        session_id: context.session_id.to_string(),
+        provider: context.provider.to_string(),
+        workspace: repository.to_string_lossy().into_owned(),
+        reason: context.trigger.to_string(),
+        created_at_ms: now_ms()?,
+        status: "pending".to_string(),
+    };
+    write_pending_recovery_request(&path, &request)?;
+    Ok(request)
+}
+
+pub(crate) fn clear_pending_recovery_request(id: &str) {
+    if validate_pending_recovery_id(id).is_err() {
+        return;
+    }
+    if let Ok(directory) = pending_recovery_directory() {
+        let _ = fs::remove_file(directory.join(format!("{id}.json")));
+    }
+}
+
+fn resolve_pending_recovery_request(id: &str, action: &str) -> io::Result<PendingRecoveryRequest> {
+    validate_pending_recovery_id(id)?;
+    if !matches!(action, "create" | "continue") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--action must be create or continue",
+        ));
+    }
+    let path = pending_recovery_directory()?.join(format!("{id}.json"));
+    let mut request: PendingRecoveryRequest = serde_json::from_slice(&fs::read(&path)?)?;
+    if action == "create" {
+        let context = RecoveryPointContext {
+            request_id: request.request_id,
+            session_id: &request.session_id,
+            provider: &request.provider,
+            trigger: &request.reason,
+        };
+        let retention = Policy::load_current().document().recovery.retention_hours;
+        ensure_request_recovery_point(Path::new(&request.workspace), &context, retention)?;
+        request.status = "created".to_string();
+    } else {
+        request.status = "continue".to_string();
+    }
+    write_pending_recovery_request(&path, &request)?;
+    Ok(request)
+}
+
+fn list_pending_recovery_requests() -> io::Result<Vec<PendingRecoveryRequest>> {
+    let directory = pending_recovery_directory()?;
+    let mut requests = Vec::new();
+    let now = now_ms()?;
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let request: PendingRecoveryRequest = match serde_json::from_slice(&fs::read(&path)?) {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        if now.saturating_sub(request.created_at_ms) > 60 * 60 * 1_000 {
+            let _ = fs::remove_file(path);
+        } else if request.status == "pending" {
+            requests.push(request);
+        }
+    }
+    requests.sort_by_key(|request| request.created_at_ms);
+    Ok(requests)
+}
+
+fn pending_recovery_directory() -> io::Result<PathBuf> {
+    let directory = default_root()?.join("recovery-approvals");
+    fs::create_dir_all(&directory)?;
+    Ok(directory)
+}
+
+fn pending_recovery_id(repository: &Path, context: &RecoveryPointContext<'_>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(repository.as_os_str().as_encoded_bytes());
+    digest.update(context.session_id.as_bytes());
+    digest.update(context.request_id.to_le_bytes());
+    format!("rp-{}-{:.12x}", context.request_id, digest.finalize())
+}
+
+fn validate_pending_recovery_id(id: &str) -> io::Result<()> {
+    if id.starts_with("rp-")
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid pending recovery approval id",
+        ))
+    }
+}
+
+fn write_pending_recovery_request(path: &Path, request: &PendingRecoveryRequest) -> io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(request)?)?;
+    fs::rename(temporary, path)
 }
 
 fn restore_checkpoint_at(
@@ -449,7 +758,7 @@ fn validate_checkpoint_id(id: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn git_repository_root(workspace: &Path) -> io::Result<PathBuf> {
+pub(crate) fn git_repository_root(workspace: &Path) -> io::Result<PathBuf> {
     let root = git(workspace, None, &["rev-parse", "--show-toplevel"])?;
     fs::canonicalize(root)
 }
@@ -700,6 +1009,41 @@ mod tests {
         )
         .expect("check reference")
         .is_none());
+        fs::remove_dir_all(sandbox).expect("cleanup");
+    }
+
+    #[test]
+    fn request_recovery_point_is_created_once_with_request_context() {
+        let sandbox = test_directory("request-dedup");
+        let repository = sandbox.join("repo");
+        let storage = sandbox.join("storage");
+        fs::create_dir_all(&repository).expect("create repository");
+        run_git(&repository, &["init"]);
+        fs::write(repository.join("file.txt"), "before").expect("write file");
+        let context = RecoveryPointContext {
+            request_id: 42,
+            session_id: "session-1",
+            provider: "codex",
+            trigger: "File mutation",
+        };
+
+        let first = ensure_request_recovery_point_at(&repository, &storage, &context, 168)
+            .expect("first recovery point");
+        fs::write(repository.join("file.txt"), "after").expect("edit after checkpoint");
+        let second = ensure_request_recovery_point_at(&repository, &storage, &context, 168)
+            .expect("deduplicated recovery point");
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.request_id, Some(42));
+        assert_eq!(first.session_id.as_deref(), Some("session-1"));
+        assert_eq!(first.provider.as_deref(), Some("codex"));
+        assert_eq!(first.trigger.as_deref(), Some("File mutation"));
+        assert_eq!(
+            list_checkpoints_at(&repository, &storage)
+                .expect("list checkpoints")
+                .len(),
+            1
+        );
         fs::remove_dir_all(sandbox).expect("cleanup");
     }
 }

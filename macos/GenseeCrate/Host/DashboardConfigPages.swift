@@ -772,6 +772,10 @@ struct DashboardSettingsPage: View {
                     notificationSettings
                 }
 
+                DashboardCard("Recovery Points") {
+                    recoveryPointSettings
+                }
+
                 HStack(alignment: .top, spacing: 16) {
                     DashboardCard("Endpoint Security") { endpointSecurity }.frame(maxWidth: .infinity)
                     DashboardCard("Local Store") { localStore }.frame(maxWidth: .infinity)
@@ -878,6 +882,64 @@ struct DashboardSettingsPage: View {
             .font(.system(size: 11))
         }
         .controlSize(.small)
+    }
+
+    private var recoveryPointSettings: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "arrow.counterclockwise.circle.fill")
+                    .font(.system(size: 17))
+                    .foregroundStyle(Color.dashboardBlue)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Git-backed safety before agent changes")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("Choose Auto, Ask, or Off per harness in Harnesses. Auto creates at most one recovery point per request and workspace.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            Divider()
+            HStack(spacing: 28) {
+                Picker(
+                    "Retention",
+                    selection: Binding(
+                        get: { model.recoveryPointSettings.retentionHours },
+                        set: { hours in Task { await model.updateRecoveryRetentionHours(hours) } }
+                    )
+                ) {
+                    Text("24 hours").tag(24)
+                    Text("48 hours").tag(48)
+                    Text("7 days").tag(168)
+                    Text("30 days").tag(720)
+                }
+                .frame(width: 230)
+
+                Picker(
+                    "If creation fails",
+                    selection: Binding(
+                        get: { model.recoveryPointSettings.failureBehavior },
+                        set: { behavior in Task { await model.updateRecoveryFailureBehavior(behavior) } }
+                    )
+                ) {
+                    ForEach(RecoveryFailureBehavior.allCases) { behavior in
+                        Text(behavior.title).tag(behavior)
+                    }
+                }
+                .frame(width: 300)
+                Spacer()
+            }
+            .controlSize(.small)
+            Divider()
+            Label(
+                "Recovery points restore Git-workspace files. They cannot undo database changes, network requests, remote repository actions, running processes, or ignored files.",
+                systemImage: "info.circle"
+            )
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var endpointSecurity: some View {

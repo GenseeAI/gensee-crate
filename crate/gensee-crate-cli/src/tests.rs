@@ -382,6 +382,113 @@ fn test_hook_event(provider: &str, hook_event_name: &str) -> AgentHookEvent {
     }
 }
 
+#[test]
+fn recovery_trigger_detects_mutating_file_intent() {
+    let event = test_hook_event(PROVIDER_CLAUDE_CODE, "PreToolUse");
+    let decision = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+    let intents = vec![FileIntent {
+        provider: PROVIDER_CLAUDE_CODE.to_string(),
+        session_id: event.session_id.clone(),
+        tool_use_id: Some("tool-1".to_string()),
+        observed_at_ms: 1,
+        operation: "write".to_string(),
+        path: "/repo/src/main.rs".to_string(),
+        source_command: "apply_patch".to_string(),
+        sensitive: false,
+        confidence: "high".to_string(),
+    }];
+
+    assert_eq!(
+        recovery_trigger(&event, None, &intents, &decision, None).as_deref(),
+        Some("File mutation")
+    );
+}
+
+#[test]
+fn recovery_trigger_detects_large_refactor_prompt_before_first_write() {
+    let event = test_hook_event(PROVIDER_CODEX, "PreToolUse");
+    let decision = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+
+    assert_eq!(
+        recovery_trigger(
+            &event,
+            Some("rg --files"),
+            &[],
+            &decision,
+            Some("Please perform a large refactor of the authentication layer")
+        )
+        .as_deref(),
+        Some("Request indicates a migration, rewrite, rename, or large refactor")
+    );
+}
+
+#[test]
+fn recovery_trigger_ignores_benign_read_only_tool_call() {
+    let mut event = test_hook_event(PROVIDER_CLAUDE_CODE, "PreToolUse");
+    event.tool_name = Some("Read".to_string());
+    let decision = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+    let intents = vec![FileIntent {
+        provider: PROVIDER_CLAUDE_CODE.to_string(),
+        session_id: event.session_id.clone(),
+        tool_use_id: Some("tool-1".to_string()),
+        observed_at_ms: 1,
+        operation: "read".to_string(),
+        path: "/repo/README.md".to_string(),
+        source_command: "read".to_string(),
+        sensitive: false,
+        confidence: "high".to_string(),
+    }];
+
+    assert_eq!(
+        recovery_trigger(&event, None, &intents, &decision, None),
+        None
+    );
+}
+
+#[test]
+fn recovery_workspace_follows_leading_cd_into_git_repository() {
+    let root = env::temp_dir().join(format!(
+        "gensee-recovery-workspace-test-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let repository = root.join("repository");
+    fs::create_dir_all(&repository).unwrap();
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&repository)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut event = test_hook_event(PROVIDER_CLAUDE_CODE, "PreToolUse");
+    event.cwd = Some(root.to_string_lossy().to_string());
+    event.tool_name = Some("Bash".to_string());
+    let command = format!("cd {} && cat > note.txt", repository.display());
+    let intents = file_intents_from_hook(&event, Some(&command));
+
+    assert_eq!(
+        recovery_git_workspace(&event, Some(&command), &intents),
+        Some(fs::canonicalize(&repository).unwrap())
+    );
+    let expected_path = repository.join("note.txt");
+    assert!(intents.iter().any(
+        |intent| intent.operation == "write" && intent.path == expected_path.to_string_lossy()
+    ));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn daemon_request(payload: &str, provider: &str) -> String {
     json!({
         "gensee_daemon_protocol": 1,
@@ -2951,6 +3058,28 @@ fn parses_sensitive_read_and_mutations() {
     assert!(intents
         .iter()
         .any(|(operation, path)| operation == "delete" && path == "/repo/.git/test"));
+}
+
+#[test]
+fn bash_file_intents_follow_leading_cd() {
+    let intents = parse_bash_file_intents(
+        "cd /private/tmp/gensee-recovery-test && cat > note.txt; touch alpha.txt",
+        "/Users/example/project",
+    );
+
+    assert!(intents.iter().any(|(operation, path)| {
+        operation == "write" && path == "/private/tmp/gensee-recovery-test/note.txt"
+    }));
+    assert!(intents.iter().any(|(operation, path)| {
+        operation == "create" && path == "/private/tmp/gensee-recovery-test/alpha.txt"
+    }));
+    assert_eq!(
+        leading_bash_effective_cwd(
+            "cd /private/tmp/gensee-recovery-test && cat > note.txt",
+            "/Users/example/project"
+        ),
+        "/private/tmp/gensee-recovery-test"
+    );
 }
 
 #[test]

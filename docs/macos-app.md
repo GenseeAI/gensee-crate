@@ -17,7 +17,7 @@ console.
 - A **Daily Highlight** view with today's summary and rolling 53-week heatmaps
   for agent turns, tool calls, alerts, and captured token usage. Selecting a
   day in any heatmap updates the summary above it.
-- A nested **Timeline** that expands sessions into user requests and paired
+- A nested **Work Review** that expands sessions into user requests and paired
   tool calls, with parallel/sequential grouping, execution durations, affected
   files, policy outcomes, and expandable inputs and results.
 - Installation, status, and removal of the signed Endpoint Security system
@@ -32,8 +32,8 @@ console.
   Copilot, and Omnigent.
 - Per-harness Config Audit actions backed by the shared OSS Rust audit library
   for static, read-only review of Codex and VS Code/Copilot configuration.
-- Local workspace checkpoints and explicitly confirmed restore from the
-  **Checkpoints** page.
+- Per-harness smart recovery points, created automatically or with approval
+  before risky changes and restored from the relevant Work Review.
 
 ## First-launch setup
 
@@ -129,19 +129,30 @@ count. It does not copy transcript content into the activity aggregate. Token
 history begins after this version is installed; prior turns remain at zero,
 and harnesses that do not expose compatible usage metadata also report zero.
 
-## Workspace checkpoints
+## Smart recovery points
 
-Before handing an agent a substantial change, open **Checkpoints**, select its Git
-workspace, and create a labeled checkpoint. Gensee writes a private commit to
+Each hook-capable row on **Harnesses** has a **Smart recovery points** mode:
+
+- **Auto** (default) creates one point before the first risky or mutating tool
+  call in each request and Git workspace.
+- **Ask** prompts in Gensee Crate first. Hooks that can wait do so briefly;
+  Codex blocks the operation and asks the user to approve it in the app and
+  retry the tool call.
+- **Off** never creates a point automatically.
+
+Gensee reuses policy findings, file intent, command risk, and broad-refactor
+prompt signals to decide when a point is needed. It writes a private commit to
 `refs/gensee/checkpoints/*`; it does not move the current branch, create a
 normal commit, or alter the user's staging index. Tracked and untracked
-non-ignored files are included.
+non-ignored files are included. Retention and failure fallback are configured
+under **Settings**.
 
-Restore is intentionally two-step. The app explains the affected scope and
-requires **Create Rescue & Restore**; the backend also requires `--yes`. Before
-changing the workspace, Gensee creates a rescue checkpoint of its current
-state. Ignored files remain untouched, while non-ignored files created after
-the selected checkpoint may be removed.
+Work Review displays **Recovery point created before changes** on the matching
+request. Restore is intentionally two-step: the app explains the affected
+scope and requires **Create Rescue & Restore**; the backend also requires
+`--yes`. Before changing the workspace, Gensee creates a rescue checkpoint of
+its current state. Ignored files remain untouched, while non-ignored files
+created after the selected point may be removed.
 
 These checkpoints do not capture ignored files, nested repository contents,
 files outside the workspace, processes, databases, credentials, or remote side

@@ -55,9 +55,9 @@ The console includes:
 - A Daily Highlight page with today's summary and four rolling-year activity
   heatmaps for agent turns, tool calls, alerts, and token usage. Heatmap days
   are selectable and update the detailed summary.
-- A Timeline page that expands sessions into their original requests and paired
-  tool calls, including parallel/sequential relationships, duration bars,
-  affected files, policy outcomes, and expandable event evidence.
+- A Work Review page that expands sessions into their original requests and
+  paired tool calls, including parallel/sequential relationships, duration
+  bars, affected files, policy outcomes, and expandable event evidence.
 - Policy controls backed by `gensee policy get/set/path`.
 - A Harnesses page that detects Codex, Claude Code, Antigravity, Cursor,
   GitHub Copilot, and Omnigent. Installed direct-hook integrations can be
@@ -71,19 +71,27 @@ The console includes:
   repair action when needed. A hook configuration becomes **Protected** only
   after a real event from that harness reaches the active local store.
 - Endpoint Security installation, removal, and Full Disk Access navigation.
-- A **Checkpoints** page for explicit, Git-backed local states before large
-  agent tasks, with a rescue checkpoint created before every restore.
+- Per-harness **Smart recovery points** in **Auto**, **Ask**, or **Off** mode.
+  Auto creates one Git-backed point before the first risky or mutating tool
+  call in a request; Work Review surfaces the point and its Restore action.
 
 Token totals are captured from compatible Claude Code and Codex transcript
 usage metadata when a turn completes. Only the numeric per-turn total is stored;
 historical turns and harnesses without compatible usage metadata remain zero.
 
-## Workspace checkpoints
+## Smart recovery points
 
-The **Checkpoints** page provides a practical macOS undo point without committing
-to the user's branch or changing the real Git staging index. A checkpoint
-captures tracked files and untracked, non-ignored files in the repository's
-local Git object database. Restoring one requires an explicit confirmation and
+The **Harnesses** page gives each hook-capable integration a **Smart recovery
+points** control. **Auto** is the default and creates one point per request and
+Git workspace before the first risky or mutating tool call. **Ask** pauses
+supported hook flows for approval in Gensee Crate; Codex blocks the operation
+and asks the user to approve and retry because it has no equally reliable
+generic interactive pre-tool response. **Off** skips automatic creation.
+
+A recovery point captures tracked files and untracked, non-ignored files in
+the repository's local Git object database without committing to the user's
+branch or changing the real Git staging index. Work Review shows when a point
+was created and provides the explicitly confirmed Restore action. Restoring
 first captures the current state as a rescue checkpoint.
 
 This is recovery, not isolation. Ignored files, nested repository contents,
@@ -92,7 +100,8 @@ side effects are outside the checkpoint. Restoring may remove non-ignored files
 created after the checkpoint. Linux tclone remains the stronger transactional
 runtime when an agent needs a fully cloneable environment.
 
-The same primitive is available from the embedded OSS CLI:
+Retention and failure fallback are configured in **Settings**. The same
+primitive remains available from the embedded OSS CLI:
 
 ```bash
 gensee checkpoint create --workspace . --label "Before agent refactor"
