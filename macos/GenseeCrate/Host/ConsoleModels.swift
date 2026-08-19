@@ -363,6 +363,16 @@ struct RecordedSession: Decodable, Identifiable {
     }
 }
 
+struct FileTouchEvidence: Decodable, Equatable, Hashable {
+    let path: String
+    let intendedAndVerified: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case path
+        case intendedAndVerified = "intended_and_verified"
+    }
+}
+
 struct RecordedRequest: Decodable, Identifiable {
     let requestID: Int64
     let sessionID: String
@@ -370,6 +380,8 @@ struct RecordedRequest: Decodable, Identifiable {
     let finalResponse: String?
     let createdAt: Int64?
     let completedAt: Int64?
+    var fileTouches: [FileTouchEvidence] = []
+    var ignoredFileTouchPaths: [String] = []
 
     var id: Int64 { requestID }
 
@@ -380,6 +392,22 @@ struct RecordedRequest: Decodable, Identifiable {
         case finalResponse = "final_response"
         case createdAt = "created_at"
         case completedAt = "completed_at"
+        case fileTouches = "file_touches"
+        case ignoredFileTouchPaths = "ignored_file_touch_paths"
+    }
+}
+
+extension RecordedRequest {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        requestID = try values.decode(Int64.self, forKey: .requestID)
+        sessionID = try values.decode(String.self, forKey: .sessionID)
+        originalUserPrompt = try values.decodeIfPresent(String.self, forKey: .originalUserPrompt)
+        finalResponse = try values.decodeIfPresent(String.self, forKey: .finalResponse)
+        createdAt = try values.decodeIfPresent(Int64.self, forKey: .createdAt)
+        completedAt = try values.decodeIfPresent(Int64.self, forKey: .completedAt)
+        fileTouches = try values.decodeIfPresent([FileTouchEvidence].self, forKey: .fileTouches) ?? []
+        ignoredFileTouchPaths = try values.decodeIfPresent([String].self, forKey: .ignoredFileTouchPaths) ?? []
     }
 }
 

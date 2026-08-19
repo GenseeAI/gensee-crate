@@ -482,7 +482,7 @@ private struct SessionReviewDetail: View {
                                     Circle().fill(reviewStateColor(request.reviewState)).frame(width: 7, height: 7)
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(request.prompt).font(.system(size: 11, weight: .medium)).lineLimit(2)
-                                        Text("\(request.toolCallCount) tool calls · \(request.affectedFiles.count) files · \(request.alertCount) findings")
+                                        Text("\(request.toolCallCount) tool calls · \(request.affectedFiles.count) files touched · \(request.alertCount) findings")
                                             .font(.system(size: 9)).foregroundStyle(.secondary)
                                     }
                                     Spacer()
@@ -544,7 +544,7 @@ private struct SessionReviewCard: View {
                     reviewMetricDivider
                     ReviewMetric(value: session.toolCallCount, label: "tool calls", symbol: "hammer")
                     reviewMetricDivider
-                    ReviewMetric(value: session.affectedFiles.count, label: "files changed", symbol: "doc.badge.ellipsis")
+                    ReviewMetric(value: session.affectedFiles.count, label: "files touched", symbol: "doc.badge.ellipsis")
                     reviewMetricDivider
                     ReviewMetric(value: session.alertCount, label: "findings", symbol: "exclamationmark.triangle")
                 }
@@ -597,17 +597,82 @@ private struct RequestEvidenceSummary: View {
                 }
                 .font(.system(size: 11, weight: .medium))
                 Divider()
-                Text("Affected files").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                FileTouchBreakdown(summary: summary)
+                Text("Endpoint Security file touches")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
                 if summary.affectedFiles.isEmpty {
-                    Text("No file mutation was attributed to this request.").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text("No non-ignored file mutation was observed for this request.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 } else {
-                    ForEach(summary.affectedFiles.prefix(12), id: \.self) { path in
-                        Label(abbreviatedPath(path), systemImage: "doc")
-                            .font(.system(size: 10, design: .monospaced))
-                            .help(path)
+                    ScrollView(.vertical) {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(summary.affectedFiles, id: \.self) { path in
+                                let verified = summary.verifiedFiles.contains(path)
+                                Label(
+                                    abbreviatedPath(path),
+                                    systemImage: verified ? "checkmark.shield" : "exclamationmark.triangle"
+                                )
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(verified ? Color.primary : Color.dashboardGold)
+                                .help(verified ? "Declared by the tool and verified by Endpoint Security: \(path)" : "Observed by Endpoint Security outside declared file intent: \(path)")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(.trailing, 8)
                     }
+                    .frame(height: min(CGFloat(summary.affectedFiles.count) * 24, 220))
                 }
             }
+        }
+    }
+}
+
+private struct FileTouchBreakdown: View {
+    let summary: AgentCompletionSummary
+
+    var body: some View {
+        HStack(spacing: 18) {
+            breakdown(
+                value: summary.affectedFiles.count,
+                label: "files touched",
+                symbol: "doc.badge.ellipsis",
+                color: .dashboardBlue
+            )
+            breakdown(
+                value: summary.verifiedFiles.count,
+                label: "intended & OS-verified",
+                symbol: "checkmark.shield",
+                color: .dashboardGreen
+            )
+            breakdown(
+                value: summary.unmatchedFiles.count,
+                label: "outside declared intent",
+                symbol: "exclamationmark.triangle",
+                color: summary.unmatchedFiles.isEmpty ? .secondary : .dashboardGold
+            )
+            breakdown(
+                value: summary.ignoredFiles.count,
+                label: "temporary/background ignored",
+                symbol: "eye.slash",
+                color: .secondary
+            )
+        }
+        .font(.system(size: 10, weight: .medium))
+        .accessibilityElement(children: .combine)
+    }
+
+    private func breakdown(
+        value: Int,
+        label: String,
+        symbol: String,
+        color: Color
+    ) -> some View {
+        Label {
+            Text("\(value) \(label)")
+        } icon: {
+            Image(systemName: symbol).foregroundStyle(color)
         }
     }
 }
@@ -791,12 +856,14 @@ private struct CompletionReviewCard: View {
                     reviewDivider
                     ReviewMetric(value: summary.commandCount, label: "commands", symbol: "terminal")
                     reviewDivider
-                    ReviewMetric(value: summary.affectedFiles.count, label: "files changed", symbol: "doc.badge.ellipsis")
+                    ReviewMetric(value: summary.affectedFiles.count, label: "files touched", symbol: "doc.badge.ellipsis")
                     reviewDivider
                     ReviewMetric(value: summary.testCommandCount, label: "test runs observed", symbol: "checkmark.diamond")
                 }
                 .padding(.vertical, 12)
                 .background(Color.dashboardMutedFill.opacity(0.72), in: RoundedRectangle(cornerRadius: 7))
+
+                FileTouchBreakdown(summary: summary)
 
                 HStack(alignment: .top, spacing: 14) {
                     VerificationLine(

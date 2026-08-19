@@ -595,31 +595,12 @@ impl EventStore {
                 }))
             },
         )?;
-        let system_events = query_json_rows(
-            conn,
-            "SELECT event_id, pid, request_id, ts, source, type, cwd, args
-             FROM system_events
-             WHERE NOT (
-                source = 'macos-endpoint-security'
-                AND request_id IN (
-                    SELECT request_id FROM requests WHERE session_id = 'system'
-                )
-             )
-             ORDER BY ts DESC, event_id DESC
-             LIMIT 200",
-            |row| {
-                Ok(json!({
-                    "event_id": row.get::<_, i64>(0)?,
-                    "pid": row.get::<_, i64>(1)?,
-                    "request_id": row.get::<_, i64>(2)?,
-                    "ts": row.get::<_, i64>(3)?,
-                    "source": row.get::<_, String>(4)?,
-                    "type": row.get::<_, String>(5)?,
-                    "cwd": row.get::<_, String>(6)?,
-                    "args": row.get::<_, Option<String>>(7)?,
-                }))
-            },
-        )?;
+        // The Live Feed was removed, so the periodic dashboard no longer needs
+        // a global raw Endpoint Security sample. On a multi-gigabyte audit
+        // store, ordering that stream dominated every refresh. Work Review
+        // loads complete OS evidence by request through dashboard_request(),
+        // while request summaries carry their bounded file-touch projection.
+        let system_events: Vec<Value> = Vec::new();
         let sessions = query_json_rows(
             conn,
             "SELECT s.session_id, s.agent_id, s.first_event_at, s.last_event_at, s.flagged,
@@ -644,11 +625,10 @@ impl EventStore {
         )?;
         let requests = query_json_rows(
             conn,
-            "SELECT request_id, session_id,
-                original_user_prompt, created_at, completed_at
+            "SELECT request_id, session_id, original_user_prompt, created_at, completed_at
              FROM requests
              ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
-             LIMIT 500",
+             LIMIT 100",
             |row| {
                 Ok(json!({
                     "request_id": row.get::<_, i64>(0)?,
@@ -658,6 +638,8 @@ impl EventStore {
                     ),
                     "created_at": row.get::<_, Option<i64>>(3)?,
                     "completed_at": row.get::<_, Option<i64>>(4)?,
+                    "file_touches": [],
+                    "ignored_file_touch_paths": [],
                 }))
             },
         )?;
@@ -749,13 +731,7 @@ impl EventStore {
                 (SELECT COUNT(*) FROM sessions),
                 (SELECT COUNT(*) FROM requests),
                 (SELECT COUNT(*) FROM agent_events),
-                (SELECT COUNT(*) FROM system_events
-                  WHERE NOT (
-                    source = 'macos-endpoint-security'
-                    AND request_id IN (
-                        SELECT request_id FROM requests WHERE session_id = 'system'
-                    )
-                  )),
+                0,
                 (SELECT COUNT(*) FROM visible_alerts),
                 (SELECT COUNT(*) FROM visible_alerts
                   WHERE severity IN ('high', 'critical')
@@ -847,6 +823,7 @@ impl EventStore {
                 "tokens": row.get::<_, i64>(4)?,
             }))
         })?;
+        let json_sessions = self.list_sessions()?;
         Ok(json!({
             "source": "gensee",
             "summary": dashboard_summary,
@@ -859,7 +836,7 @@ impl EventStore {
             "relations": relations,
             "humanFeedback": human_feedback,
             "dailyActivity": daily_activity,
-            "jsonSessions": self.list_sessions()?,
+            "jsonSessions": json_sessions,
         }))
     }
 
@@ -871,7 +848,7 @@ impl EventStore {
         let db = self.sqlite_store()?;
         let conn = db.connection();
 
-        let request = conn
+        let mut request = conn
             .query_row(
                 "SELECT request_id, session_id, original_user_prompt, created_at, completed_at
                  FROM requests
@@ -897,6 +874,10 @@ impl EventStore {
                     format!("request {request_id} was not found"),
                 )
             })?;
+
+        request["file_touches"] = Value::Array(dashboard_file_touches(conn, request_id)?);
+        let ignored_file_touch_paths = dashboard_ignored_file_touch_paths(&db, request_id)?;
+        request["ignored_file_touch_paths"] = json!(ignored_file_touch_paths);
 
         let agent_events = query_json_rows_with_i64(
             conn,
@@ -3049,6 +3030,152 @@ fn record_file_operation_alerts(
     Ok(())
 }
 
+fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::Result<Vec<Value>> {
+    let touches = query_json_rows_with_i64(
+        conn,
+        "SELECT CASE
+                    WHEN artifacts.uri LIKE 'file://%' THEN substr(artifacts.uri, 8)
+                    WHEN artifacts.uri LIKE 'file:%' THEN substr(artifacts.uri, 6)
+                    ELSE artifacts.uri
+                END AS path,
+                EXISTS (
+                    SELECT 1
+                    FROM relations AS declared_relation
+                    JOIN agent_events AS declaring_event
+                      ON declaring_event.event_id = declared_relation.src_id
+                    WHERE declared_relation.src_kind = 'agent_event'
+                      AND declared_relation.dst_kind = 'artifact'
+                      AND declared_relation.dst_id = artifacts.artifact_id
+                      AND declared_relation.relation_type IN
+                          ('produced', 'modified', 'deleted')
+                      AND declaring_event.request_id = ?1
+                ) AS intended_and_verified
+         FROM relations AS request_relation INDEXED BY idx_relations_src
+         JOIN artifacts ON artifacts.artifact_id = request_relation.dst_id
+         WHERE request_relation.src_kind = 'request'
+           AND request_relation.src_id = ?1
+           AND request_relation.dst_kind = 'artifact'
+           AND request_relation.relation_type IN ('produced', 'modified', 'deleted')
+           AND EXISTS (
+               SELECT 1
+               FROM relations AS observed_relation INDEXED BY idx_relations_dst
+               JOIN system_events
+                 ON system_events.event_id = observed_relation.src_id
+                AND system_events.request_id = ?1
+                AND system_events.source = 'macos-endpoint-security'
+               WHERE observed_relation.src_kind = 'system_event'
+                 AND observed_relation.dst_kind = 'artifact'
+                 AND observed_relation.dst_id = artifacts.artifact_id
+                 AND observed_relation.relation_type IN ('wrote', 'modified', 'deleted')
+           )
+         GROUP BY artifacts.artifact_id, artifacts.uri
+         ORDER BY path",
+        request_id,
+        |row| {
+            Ok(json!({
+                "path": row.get::<_, String>(0)?,
+                "intended_and_verified": row.get::<_, i64>(1)? != 0,
+            }))
+        },
+    )?;
+    Ok(touches
+        .into_iter()
+        .filter(|touch| {
+            touch["path"]
+                .as_str()
+                .is_some_and(|path| !dashboard_file_touch_is_background(path))
+        })
+        .collect())
+}
+
+fn dashboard_file_touch_is_background(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lineage_path_is_harness_runtime_noise(path)
+        || lower.starts_with("/tmp/")
+        || lower.starts_with("/private/tmp/")
+        || lower.contains("/library/caches/")
+        || lower.contains("/library/httpstorages/")
+}
+
+fn dashboard_ignored_file_touch_paths(
+    db: &SqliteStore,
+    request_id: i64,
+) -> io::Result<Vec<String>> {
+    let mut ignored = BTreeSet::new();
+    for record in db
+        .system_events_for_request(request_id)
+        .map_err(sqlite_error)?
+    {
+        if record.source != "macos-endpoint-security" {
+            continue;
+        }
+        let Some(raw_json) = record.args.as_deref() else {
+            continue;
+        };
+        let Ok(raw_event) = serde_json::from_str::<Value>(raw_json) else {
+            continue;
+        };
+        if !dashboard_endpoint_event_is_file_mutation(&record.event_type, &raw_event) {
+            continue;
+        }
+
+        let executable_path = raw_event
+            .pointer("/actor/executable_path")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let file_path = raw_event
+            .pointer("/file/path")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let process_name = executable_path
+            .as_deref()
+            .and_then(|path| path.rsplit('/').next())
+            .map(str::to_string);
+        let event = SystemEvent {
+            source: record.source,
+            event_type: record.event_type,
+            event_kind: "file_mutation".to_string(),
+            observed_at_ms: u64::try_from(record.ts).unwrap_or_default(),
+            pid: u32::try_from(record.pid).ok(),
+            ppid: raw_event
+                .pointer("/actor/ppid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok()),
+            process_name,
+            executable_path,
+            file_path,
+            command_line: None,
+            raw_json: raw_json.to_string(),
+        };
+        for path in system_event_paths(&event) {
+            if artifact_path_is_concrete(&path)
+                && (dashboard_file_touch_is_background(&path)
+                    || !should_materialize_system_artifact(&event, &path, Some(&raw_event)))
+            {
+                ignored.insert(path);
+            }
+        }
+    }
+    Ok(ignored.into_iter().collect())
+}
+
+fn dashboard_endpoint_event_is_file_mutation(event_type: &str, raw_event: &Value) -> bool {
+    if event_type.starts_with("auth_")
+        || raw_event.get("action").and_then(Value::as_str) == Some("auth")
+    {
+        return false;
+    }
+    match event_type {
+        "create" | "write" | "rename" | "unlink" | "truncate" => true,
+        "close" => raw_event.get("modified").and_then(Value::as_bool) == Some(true),
+        "open" => raw_event
+            .get("open_flags")
+            .and_then(Value::as_i64)
+            .is_some_and(|flags| flags & 2 != 0),
+        _ => false,
+    }
+}
+
 fn record_unmatched_system_event_alert(
     db: &SqliteStore,
     request_id: i64,
@@ -3467,17 +3594,16 @@ fn resolve_tool_path(path: &str, cwd: Option<&str>) -> String {
 }
 
 fn tool_input_json(event: &AgentHookEvent) -> Option<String> {
-    if event.tool_input_command.is_some() || event.tool_input_description.is_some() {
-        return store_tool_input(json!({
-            "tool_use_id": event.tool_use_id.as_deref(),
-            "command": event.tool_input_command.as_deref(),
-            "description": event.tool_input_description.as_deref(),
-        }));
-    }
-
     let tools = native_file_tools(event);
     match tools.as_slice() {
         [] => {
+            if event.tool_input_command.is_some() || event.tool_input_description.is_some() {
+                return store_tool_input(json!({
+                    "tool_use_id": event.tool_use_id.as_deref(),
+                    "command": event.tool_input_command.as_deref(),
+                    "description": event.tool_input_description.as_deref(),
+                }));
+            }
             // Preserve query/URL metadata for the discovery tools displayed by
             // Timeline. Do not generically persist arbitrary tool payloads:
             // they can include prompts, command arguments, or secret material.
@@ -4279,6 +4405,132 @@ mod tests {
             .all(|event| event["request_id"] == request_id));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_request_reports_endpoint_file_touch_evidence() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-dashboard-file-touch-test-{}-{now}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"Edit the app"}"#,
+                now,
+            ))
+            .unwrap();
+        store
+            .append_file_intent(&FileIntent {
+                provider: "codex".to_string(),
+                session_id: Some("s1".to_string()),
+                tool_use_id: Some("edit-1".to_string()),
+                observed_at_ms: now + 1,
+                operation: "write".to_string(),
+                path: "/repo/App.swift".to_string(),
+                source_command: "apply_patch".to_string(),
+                sensitive: false,
+                confidence: "high".to_string(),
+            })
+            .unwrap();
+
+        let endpoint_event = |path: &str, observed_at_ms: u64| SystemEvent {
+            source: "macos-endpoint-security".to_string(),
+            event_type: "write".to_string(),
+            event_kind: "file_mutation".to_string(),
+            observed_at_ms,
+            pid: Some(42),
+            ppid: Some(1),
+            process_name: Some("codex".to_string()),
+            executable_path: Some("/Applications/Codex.app/Contents/MacOS/Codex".to_string()),
+            file_path: Some(path.to_string()),
+            command_line: None,
+            raw_json: json!({
+                "action": "notify",
+                "event_type": "write",
+                "observed_at_ms": observed_at_ms,
+                "actor": {
+                    "pid": 42,
+                    "ppid": 1,
+                    "executable_path": "/Applications/Codex.app/Contents/MacOS/Codex"
+                },
+                "file": { "path": path, "mode": 0o100644 },
+                "attribution": { "session_id": "s1", "workspace_root": "/repo" }
+            })
+            .to_string(),
+        };
+        store
+            .append_system_event(&endpoint_event("/repo/App.swift", now + 2))
+            .unwrap();
+        store
+            .append_system_event(&endpoint_event("/repo/Outside.swift", now + 3))
+            .unwrap();
+        store
+            .append_system_event(&endpoint_event("/dev/null", now + 4))
+            .unwrap();
+        store
+            .append_system_event(&endpoint_event(
+                "/Users/test/.codex/state_5.sqlite",
+                now + 5,
+            ))
+            .unwrap();
+        store
+            .append_system_event(&endpoint_event("/Users/test/.gensee/gensee.db", now + 6))
+            .unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "Stop",
+                r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
+                now + 7,
+            ))
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        let request = &dashboard["requests"][0];
+        // The periodic overview is deliberately lightweight. Complete
+        // Endpoint Security evidence is loaded only for the selected request.
+        assert!(request["file_touches"].as_array().unwrap().is_empty());
+        let request_id = request["request_id"].as_i64().unwrap();
+        let detail = store.dashboard_request(request_id).unwrap();
+        let touches = detail["request"]["file_touches"].as_array().unwrap();
+        assert_eq!(touches.len(), 2);
+        assert!(touches.iter().any(|touch| {
+            touch["path"] == "/repo/App.swift" && touch["intended_and_verified"] == true
+        }));
+        assert!(touches.iter().any(|touch| {
+            touch["path"] == "/repo/Outside.swift" && touch["intended_and_verified"] == false
+        }));
+        assert_eq!(
+            detail["request"]["ignored_file_touch_paths"],
+            json!([
+                "/Users/test/.codex/state_5.sqlite",
+                "/Users/test/.gensee/gensee.db",
+                "/dev/null"
+            ])
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_file_touches_hide_temporary_and_application_cache_paths() {
+        for path in [
+            "/private/tmp/render-output.svg",
+            "/tmp/agent-scratch.txt",
+            "/Users/test/Library/Caches/tool/cache.db",
+            "/Users/test/Library/HTTPStorages/tool/httpstorages.sqlite",
+            "/Users/test/.gensee/gensee.db",
+        ] {
+            assert!(dashboard_file_touch_is_background(path), "{path}");
+        }
+        assert!(!dashboard_file_touch_is_background(
+            "/Users/test/project/Sources/App.swift"
+        ));
     }
 
     #[test]
@@ -5434,7 +5686,7 @@ mod tests {
             .is_none());
 
         let dashboard = store.dashboard_state().unwrap();
-        assert_eq!(dashboard["systemEvents"].as_array().unwrap().len(), 8);
+        assert_eq!(dashboard["systemEvents"].as_array().unwrap().len(), 0);
         assert_eq!(dashboard["summary"]["artifacts_count"], 2);
         let artifact_paths = dashboard["artifacts"]
             .as_array()
@@ -6246,14 +6498,17 @@ mod tests {
                 100,
             ))
             .unwrap();
-        store
-            .append_hook_event(&native_tool_event(
-                "apply_patch",
-                "patch_1",
-                &json!({ "input": patch }).to_string(),
-                110,
-            ))
-            .unwrap();
+        let mut patch_event = native_tool_event(
+            "apply_patch",
+            "patch_1",
+            &json!({ "input": patch }).to_string(),
+            110,
+        );
+        // Codex also promotes the patch text into the generic command field.
+        // Native file-tool normalization must win so the changed paths remain
+        // available for intent/Endpoint Security correlation.
+        patch_event.tool_input_command = Some(patch.to_string());
+        store.append_hook_event(&patch_event).unwrap();
 
         let db = store.sqlite_store().unwrap();
         let request = db.latest_request_for_session("s1").unwrap().unwrap();

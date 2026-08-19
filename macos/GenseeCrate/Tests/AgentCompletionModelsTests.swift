@@ -3,7 +3,13 @@ import XCTest
 final class AgentCompletionModelsTests: XCTestCase {
     func testBuildsEvidenceBasedCompletionSummary() throws {
         var snapshot = SecuritySnapshot()
-        snapshot.requests = [request(id: 7, started: 1_000, completed: 131_000)]
+        var recordedRequest = request(id: 7, started: 1_000, completed: 131_000)
+        recordedRequest.fileTouches = [
+            FileTouchEvidence(path: "/repo/App.swift", intendedAndVerified: true),
+            FileTouchEvidence(path: "/repo/Unexpected.txt", intendedAndVerified: false),
+        ]
+        recordedRequest.ignoredFileTouchPaths = ["/repo/.build/cache"]
+        snapshot.requests = [recordedRequest]
         snapshot.sessions = [RecordedSession(
             sessionID: "session-1", agentID: "codex", firstEventAt: 1_000,
             lastEventAt: 131_000, flagged: 0, requestCount: 1, eventCount: 4
@@ -21,7 +27,10 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertEqual(summary.toolCallCount, 2)
         XCTAssertEqual(summary.commandCount, 1)
         XCTAssertEqual(summary.testCommandCount, 1)
-        XCTAssertEqual(summary.affectedFiles, ["/repo/App.swift"])
+        XCTAssertEqual(summary.affectedFiles, ["/repo/App.swift", "/repo/Unexpected.txt"])
+        XCTAssertEqual(summary.verifiedFiles, ["/repo/App.swift"])
+        XCTAssertEqual(summary.unmatchedFiles, ["/repo/Unexpected.txt"])
+        XCTAssertEqual(summary.ignoredFiles, ["/repo/.build/cache"])
         XCTAssertEqual(summary.reviewState, .verified)
         XCTAssertTrue(summary.isLargeTask)
     }

@@ -59,6 +59,9 @@ struct AgentCompletionSummary: Identifiable, Equatable {
     let toolCallCount: Int
     let commandCount: Int
     let affectedFiles: [String]
+    let verifiedFiles: [String]
+    let unmatchedFiles: [String]
+    let ignoredFiles: [String]
     let testCommandCount: Int
     let alertCount: Int
     let highRiskAlertCount: Int
@@ -95,6 +98,18 @@ struct AgentSessionSummary: Identifiable, Equatable {
     var affectedFiles: [String] {
         var seen = Set<String>()
         return requests.flatMap(\.affectedFiles).filter { seen.insert($0).inserted }
+    }
+    var verifiedFiles: [String] {
+        var seen = Set<String>()
+        return requests.flatMap(\.verifiedFiles).filter { seen.insert($0).inserted }
+    }
+    var unmatchedFiles: [String] {
+        var seen = Set<String>()
+        return requests.flatMap(\.unmatchedFiles).filter { seen.insert($0).inserted }
+    }
+    var ignoredFiles: [String] {
+        var seen = Set<String>()
+        return requests.flatMap(\.ignoredFiles).filter { seen.insert($0).inserted }
     }
     var reviewState: AgentReviewState {
         if requests.contains(where: { $0.reviewState == .attention }) { return .attention }
@@ -179,7 +194,13 @@ enum AgentCompletionDerivation {
             let events = snapshot.agentEvents.filter { $0.requestID == request.requestID }
             let calls = TimelineDerivation.toolCalls(from: events)
             let alerts = snapshot.alerts.filter { $0.requestID == request.requestID }
-            let affectedFiles = uniqueMutationPaths(from: calls)
+            let affectedFiles = request.fileTouches.map(\.path)
+            let verifiedFiles = request.fileTouches
+                .filter(\.intendedAndVerified)
+                .map(\.path)
+            let unmatchedFiles = request.fileTouches
+                .filter { !$0.intendedAndVerified }
+                .map(\.path)
             let strongestAction = alerts.map(\.action).max(by: { actionRank($0) < actionRank($1) }) ?? "allow"
             let strongestSeverity = alerts.map(\.severity).max(by: { severityRank($0) < severityRank($1) }) ?? "info"
             let highRiskCount = alerts.filter {
@@ -210,6 +231,9 @@ enum AgentCompletionDerivation {
                 toolCallCount: calls.count,
                 commandCount: calls.filter { isCommandTool($0.toolName) }.count,
                 affectedFiles: affectedFiles,
+                verifiedFiles: verifiedFiles,
+                unmatchedFiles: unmatchedFiles,
+                ignoredFiles: request.ignoredFileTouchPaths,
                 testCommandCount: calls.filter(isTestCall).count,
                 alertCount: alerts.count,
                 highRiskAlertCount: highRiskCount,
@@ -250,7 +274,7 @@ enum AgentCompletionDerivation {
     static func notificationBody(for summary: AgentCompletionSummary) -> String {
         var parts = ["\(summary.toolCallCount) tool call\(summary.toolCallCount == 1 ? "" : "s")"]
         if !summary.affectedFiles.isEmpty {
-            parts.append("\(summary.affectedFiles.count) file\(summary.affectedFiles.count == 1 ? "" : "s") changed")
+            parts.append("\(summary.affectedFiles.count) file\(summary.affectedFiles.count == 1 ? "" : "s") touched")
         }
         if summary.highRiskAlertCount > 0 {
             parts.append("\(summary.highRiskAlertCount) high-risk finding\(summary.highRiskAlertCount == 1 ? "" : "s")")
@@ -258,20 +282,6 @@ enum AgentCompletionDerivation {
             parts.append("no high-risk findings")
         }
         return parts.joined(separator: " · ")
-    }
-
-    private static func uniqueMutationPaths(from calls: [TimelineToolCall]) -> [String] {
-        var seen = Set<String>()
-        return calls
-            .filter { isMutationTool($0.toolName) }
-            .flatMap(\.affectedFiles)
-            .filter { seen.insert($0).inserted }
-    }
-
-    private static func isMutationTool(_ tool: String) -> Bool {
-        let normalized = tool.lowercased()
-        return ["write", "edit", "multiedit", "notebookedit", "apply_patch", "create"]
-            .contains { normalized.contains($0) }
     }
 
     private static func isCommandTool(_ tool: String) -> Bool {
