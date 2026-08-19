@@ -62,6 +62,7 @@ struct AgentCompletionSummary: Identifiable, Equatable {
     let verifiedFiles: [String]
     let unmatchedFiles: [String]
     let ignoredFiles: [String]
+    let ignoredFileTouchEventsOmitted: Int
     let testCommandCount: Int
     let alertCount: Int
     let highRiskAlertCount: Int
@@ -111,6 +112,9 @@ struct AgentSessionSummary: Identifiable, Equatable {
         var seen = Set<String>()
         return requests.flatMap(\.ignoredFiles).filter { seen.insert($0).inserted }
     }
+    var ignoredFileTouchEventsOmitted: Int {
+        requests.reduce(0) { $0 + $1.ignoredFileTouchEventsOmitted }
+    }
     var reviewState: AgentReviewState {
         if requests.contains(where: { $0.reviewState == .attention }) { return .attention }
         if requests.contains(where: { $0.reviewState == .review }) { return .review }
@@ -154,29 +158,13 @@ enum HarnessDisplayName {
 
 enum RequestPromptDisplay {
     static func title(from value: String?) -> String {
-        guard var prompt = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+        // Ambient UI context is stripped and bounded by the backend so every
+        // client sees the same canonical request. The app only owns display
+        // whitespace and the empty-state fallback.
+        guard let prompt = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               !prompt.isEmpty
         else { return "Completed agent request" }
-
-        let open = "<in-app-browser-context"
-        let close = "</in-app-browser-context>"
-        while let start = prompt.range(of: open, options: [.caseInsensitive]) {
-            guard let end = prompt.range(
-                of: close,
-                options: [.caseInsensitive],
-                range: start.lowerBound..<prompt.endIndex
-            ) else {
-                prompt.removeSubrange(start.lowerBound..<prompt.endIndex)
-                break
-            }
-            prompt.removeSubrange(start.lowerBound..<end.upperBound)
-        }
-
-        if let marker = prompt.range(of: "## My request:", options: [.caseInsensitive]) {
-            prompt = String(prompt[marker.upperBound...])
-        }
-        let cleaned = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.isEmpty ? "Completed agent request" : cleaned
+        return prompt
     }
 }
 
@@ -194,7 +182,9 @@ enum AgentCompletionDerivation {
             let events = snapshot.agentEvents.filter { $0.requestID == request.requestID }
             let calls = TimelineDerivation.toolCalls(from: events)
             let alerts = snapshot.alerts.filter { $0.requestID == request.requestID }
-            let affectedFiles = request.fileTouches.map(\.path)
+            let affectedFiles = request.fileTouches.isEmpty
+                ? request.summaryFileTouchPaths
+                : request.fileTouches.map(\.path)
             let verifiedFiles = request.fileTouches
                 .filter(\.intendedAndVerified)
                 .map(\.path)
@@ -239,6 +229,7 @@ enum AgentCompletionDerivation {
                 verifiedFiles: verifiedFiles,
                 unmatchedFiles: unmatchedFiles,
                 ignoredFiles: request.ignoredFileTouchPaths,
+                ignoredFileTouchEventsOmitted: request.ignoredFileTouchEventsOmitted,
                 testCommandCount: calls.filter(isTestCall).count,
                 alertCount: alertCount,
                 highRiskAlertCount: highRiskCount,

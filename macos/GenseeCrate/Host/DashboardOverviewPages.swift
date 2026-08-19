@@ -395,7 +395,8 @@ private struct RequestReviewDetail: View {
                         affectedFiles: effectiveSummary.affectedFiles,
                         verifiedFiles: effectiveSummary.verifiedFiles,
                         unmatchedFiles: effectiveSummary.unmatchedFiles,
-                        ignoredFileCount: effectiveSummary.ignoredFiles.count
+                        ignoredFileCount: effectiveSummary.ignoredFiles.count,
+                        ignoredEventCountOmitted: effectiveSummary.ignoredFileTouchEventsOmitted
                     )
                 }
             }
@@ -421,7 +422,6 @@ private struct RequestReviewDetail: View {
         var scoped = SecuritySnapshot()
         scoped.requests = [payload.request]
         scoped.agentEvents = payload.agentEvents
-        scoped.systemEvents = payload.systemEvents
         scoped.alerts = payload.alerts
         scoped.sessions = model.snapshot.sessions.filter { $0.sessionID == payload.request.sessionID }
         return AgentCompletionDerivation.summaries(from: scoped).first ?? summary
@@ -551,7 +551,8 @@ private struct SessionReviewDetail: View {
                     affectedFiles: session.affectedFiles,
                     verifiedFiles: session.verifiedFiles,
                     unmatchedFiles: session.unmatchedFiles,
-                    ignoredFileCount: session.ignoredFiles.count
+                    ignoredFileCount: session.ignoredFiles.count,
+                    ignoredEventCountOmitted: session.ignoredFileTouchEventsOmitted
                 )
             }
         }
@@ -638,6 +639,7 @@ private struct ReviewFilesPanel: View {
     let verifiedFiles: [String]
     let unmatchedFiles: [String]
     let ignoredFileCount: Int
+    let ignoredEventCountOmitted: Int
 
     var body: some View {
         DashboardCard("Files touched") {
@@ -648,6 +650,15 @@ private struct ReviewFilesPanel: View {
                     unmatchedFileCount: unmatchedFiles.count,
                     ignoredFileCount: ignoredFileCount
                 )
+                if ignoredEventCountOmitted > 0 {
+                    Label(
+                        "\(ignoredEventCountOmitted.formatted()) additional Endpoint Security events omitted from this view.",
+                        systemImage: "ellipsis.circle"
+                    )
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .help("The detailed ignored-event scan is bounded to keep Work Review responsive.")
+                }
                 Divider()
                 if affectedFiles.isEmpty {
                     Text("No non-ignored file mutation was observed.")

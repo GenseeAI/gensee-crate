@@ -31,6 +31,7 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertEqual(summary.verifiedFiles, ["/repo/App.swift"])
         XCTAssertEqual(summary.unmatchedFiles, ["/repo/Unexpected.txt"])
         XCTAssertEqual(summary.ignoredFiles, ["/repo/.build/cache"])
+        XCTAssertEqual(summary.ignoredFileTouchEventsOmitted, 0)
         XCTAssertEqual(summary.reviewState, .verified)
         XCTAssertTrue(summary.isLargeTask)
     }
@@ -76,20 +77,9 @@ final class AgentCompletionModelsTests: XCTestCase {
         )
     }
 
-    func testRequestTitleStripsAmbientBrowserContext() {
-        let prompt = """
-        <in-app-browser-context source="ambient-ui-state">
-        This block is automatically supplied ambient UI state.
-        </in-app-browser-context>
-
-        ## My request:
-        Fix the request timeline
-        """
-
-        XCTAssertEqual(
-            RequestPromptDisplay.title(from: prompt),
-            "Fix the request timeline"
-        )
+    func testRequestTitleOnlyAppliesDisplayWhitespaceAndFallback() {
+        XCTAssertEqual(RequestPromptDisplay.title(from: "  Fix the request timeline\n"), "Fix the request timeline")
+        XCTAssertEqual(RequestPromptDisplay.title(from: " \n "), "Completed agent request")
     }
 
     func testAnswerOnlyRequestStillBuildsReviewSummary() throws {
@@ -121,6 +111,18 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertEqual(summary.strongestSeverity, "critical")
         XCTAssertEqual(summary.strongestAction, "block")
         XCTAssertEqual(summary.reviewState, .attention)
+    }
+
+    func testBoundedFileSummarySupportsSearchAndLargeTaskDetection() throws {
+        var snapshot = SecuritySnapshot()
+        var recordedRequest = request(id: 9, started: 1_000, completed: 4_000)
+        recordedRequest.summaryFileTouchPaths = ["/repo/A.swift", "/repo/B.swift"]
+        snapshot.requests = [recordedRequest]
+
+        let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
+
+        XCTAssertEqual(summary.affectedFiles, ["/repo/A.swift", "/repo/B.swift"])
+        XCTAssertTrue(summary.isLargeTask)
     }
 
     func testTestDetectionDoesNotMatchWordsContainingTest() throws {

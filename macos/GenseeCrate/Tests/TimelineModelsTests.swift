@@ -53,6 +53,20 @@ final class TimelineModelsTests: XCTestCase {
         XCTAssertEqual(groups[1].calls.map(\.id), ["c"])
     }
 
+    func testPostFailureDoesNotCreateAStandaloneToolCall() {
+        let events = [
+            event(
+                id: 1,
+                type: "PostToolUseFailure",
+                timestamp: 1_000,
+                tool: "Bash",
+                useID: "post-only"
+            ),
+        ]
+
+        XCTAssertTrue(TimelineDerivation.toolCalls(from: events).isEmpty)
+    }
+
     private func event(
         id: Int64,
         type: String,

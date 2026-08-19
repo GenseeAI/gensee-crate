@@ -47,7 +47,7 @@ enum TimelineDerivation {
             var pair = pairs[key] ?? EventPair()
             switch event.type {
             case "PreToolUse": pair.pre = event
-            case "PostToolUse": pair.post = event
+            case "PostToolUse", "PostToolUseFailure": pair.post = event
             default: pair.pre = pair.pre ?? event
             }
             pairs[key] = pair

@@ -133,30 +133,6 @@ final class ConsoleModel: ObservableObject {
         persistReadAlertState()
     }
 
-    var recentActivity: [ActivityItem] {
-        let agent = snapshot.agentEvents.map {
-            ActivityItem(
-                id: $0.id,
-                kind: .agent,
-                timestamp: $0.timestamp,
-                title: $0.toolName ?? $0.type.replacingOccurrences(of: "_", with: " ").capitalized,
-                detail: $0.cwd,
-                source: $0.source
-            )
-        }
-        let system = snapshot.systemEvents.map {
-            ActivityItem(
-                id: $0.id,
-                kind: .system,
-                timestamp: $0.timestamp,
-                title: $0.type.replacingOccurrences(of: "_", with: " ").capitalized,
-                detail: Self.eventDetail(args: $0.args, fallback: $0.cwd),
-                source: "PID \($0.pid)"
-            )
-        }
-        return (agent + system).sorted { $0.timestamp > $1.timestamp }
-    }
-
     func refreshAll() async {
         guard !isDemoMode else {
             snapshot = DemoSnapshotFactory.make()
@@ -301,7 +277,6 @@ final class ConsoleModel: ObservableObject {
             requestReviewPayload = RequestReviewPayload(
                 request: request,
                 agentEvents: snapshot.agentEvents.filter { $0.requestID == requestID },
-                systemEvents: snapshot.systemEvents.filter { $0.requestID == requestID },
                 alerts: snapshot.alerts.filter { $0.requestID == requestID }
             )
             requestReviewLoadState = .loaded(requestID)

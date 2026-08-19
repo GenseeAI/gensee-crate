@@ -10,7 +10,6 @@ struct SecuritySnapshot: Decodable {
     var summary = DashboardSummary()
     var alerts: [SecurityAlert] = []
     var agentEvents: [AgentEvent] = []
-    var systemEvents: [SystemEvent] = []
     var sessions: [RecordedSession] = []
     var requests: [RecordedRequest] = []
     var artifacts: [ArtifactFact] = []
@@ -21,7 +20,7 @@ struct SecuritySnapshot: Decodable {
     var dailyActivity: [DailyActivity] = []
 
     enum CodingKeys: String, CodingKey {
-        case summary, alerts, agentEvents, systemEvents, sessions, requests, artifacts
+        case summary, alerts, agentEvents, sessions, requests, artifacts
         case relations, humanFeedback, workspaceEffects, jsonSessions, dailyActivity
     }
 
@@ -32,7 +31,6 @@ struct SecuritySnapshot: Decodable {
         summary = try values.decodeIfPresent(DashboardSummary.self, forKey: .summary) ?? DashboardSummary()
         alerts = try values.decodeIfPresent([SecurityAlert].self, forKey: .alerts) ?? []
         agentEvents = try values.decodeIfPresent([AgentEvent].self, forKey: .agentEvents) ?? []
-        systemEvents = try values.decodeIfPresent([SystemEvent].self, forKey: .systemEvents) ?? []
         sessions = try values.decodeIfPresent([RecordedSession].self, forKey: .sessions) ?? []
         requests = try values.decodeIfPresent([RecordedRequest].self, forKey: .requests) ?? []
         artifacts = try values.decodeIfPresent([ArtifactFact].self, forKey: .artifacts) ?? []
@@ -47,23 +45,20 @@ struct SecuritySnapshot: Decodable {
 struct RequestReviewPayload: Decodable {
     let request: RecordedRequest
     let agentEvents: [AgentEvent]
-    let systemEvents: [SystemEvent]
     let alerts: [SecurityAlert]
 
     enum CodingKeys: String, CodingKey {
         case request, alerts
-        case agentEvents, systemEvents
+        case agentEvents
     }
 
     init(
         request: RecordedRequest,
         agentEvents: [AgentEvent],
-        systemEvents: [SystemEvent],
         alerts: [SecurityAlert]
     ) {
         self.request = request
         self.agentEvents = agentEvents
-        self.systemEvents = systemEvents
         self.alerts = alerts
     }
 }
@@ -189,7 +184,6 @@ struct DashboardSummary: Decodable {
     var sessionsCount: Int = 0
     var requestsCount: Int = 0
     var agentEventsCount: Int = 0
-    var systemEventsCount: Int = 0
     var alertsCount: Int = 0
     var recentHighAlerts: Int = 0
     var artifactsCount: Int = 0
@@ -213,7 +207,6 @@ struct DashboardSummary: Decodable {
         case sessionsCount = "sessions_count"
         case requestsCount = "requests_count"
         case agentEventsCount = "agent_events_count"
-        case systemEventsCount = "system_events_count"
         case alertsCount = "alerts_count"
         case recentHighAlerts = "recent_high_alerts"
         case artifactsCount = "artifacts_count"
@@ -231,7 +224,6 @@ struct DashboardSummary: Decodable {
         sessionsCount = try values.decodeIfPresent(Int.self, forKey: .sessionsCount) ?? 0
         requestsCount = try values.decodeIfPresent(Int.self, forKey: .requestsCount) ?? 0
         agentEventsCount = try values.decodeIfPresent(Int.self, forKey: .agentEventsCount) ?? 0
-        systemEventsCount = try values.decodeIfPresent(Int.self, forKey: .systemEventsCount) ?? 0
         alertsCount = try values.decodeIfPresent(Int.self, forKey: .alertsCount) ?? 0
         recentHighAlerts = try values.decodeIfPresent(Int.self, forKey: .recentHighAlerts) ?? 0
         artifactsCount = try values.decodeIfPresent(Int.self, forKey: .artifactsCount) ?? 0
@@ -320,27 +312,6 @@ struct AgentEvent: Decodable, Identifiable {
     }
 }
 
-struct SystemEvent: Decodable, Identifiable {
-    let eventID: Int64
-    let pid: Int64
-    let requestID: Int64
-    let timestamp: Int64
-    let source: String
-    let type: String
-    let cwd: String
-    let args: String?
-
-    var id: String { "system-\(eventID)" }
-
-    enum CodingKeys: String, CodingKey {
-        case eventID = "event_id"
-        case pid
-        case requestID = "request_id"
-        case timestamp = "ts"
-        case source, type, cwd, args
-    }
-}
-
 struct RecordedSession: Decodable, Identifiable {
     let sessionID: String
     let agentID: String
@@ -381,7 +352,9 @@ struct RecordedRequest: Decodable, Identifiable {
     let createdAt: Int64?
     let completedAt: Int64?
     var fileTouches: [FileTouchEvidence] = []
+    var summaryFileTouchPaths: [String] = []
     var ignoredFileTouchPaths: [String] = []
+    var ignoredFileTouchEventsOmitted: Int = 0
     var toolCallCount: Int?
     var alertCount: Int?
     var highRiskAlertCount: Int?
@@ -398,7 +371,9 @@ struct RecordedRequest: Decodable, Identifiable {
         case createdAt = "created_at"
         case completedAt = "completed_at"
         case fileTouches = "file_touches"
+        case summaryFileTouchPaths = "summary_file_touch_paths"
         case ignoredFileTouchPaths = "ignored_file_touch_paths"
+        case ignoredFileTouchEventsOmitted = "ignored_file_touch_events_omitted"
         case toolCallCount = "tool_call_count"
         case alertCount = "alert_count"
         case highRiskAlertCount = "high_risk_alert_count"
@@ -417,7 +392,9 @@ extension RecordedRequest {
         createdAt = try values.decodeIfPresent(Int64.self, forKey: .createdAt)
         completedAt = try values.decodeIfPresent(Int64.self, forKey: .completedAt)
         fileTouches = try values.decodeIfPresent([FileTouchEvidence].self, forKey: .fileTouches) ?? []
+        summaryFileTouchPaths = try values.decodeIfPresent([String].self, forKey: .summaryFileTouchPaths) ?? []
         ignoredFileTouchPaths = try values.decodeIfPresent([String].self, forKey: .ignoredFileTouchPaths) ?? []
+        ignoredFileTouchEventsOmitted = try values.decodeIfPresent(Int.self, forKey: .ignoredFileTouchEventsOmitted) ?? 0
         toolCallCount = try values.decodeIfPresent(Int.self, forKey: .toolCallCount)
         alertCount = try values.decodeIfPresent(Int.self, forKey: .alertCount)
         highRiskAlertCount = try values.decodeIfPresent(Int.self, forKey: .highRiskAlertCount)
@@ -649,17 +626,4 @@ struct IntegrationDescriptor: Identifiable, Equatable {
         if !configured { return "Ready to enable" }
         return verified ? "Protected" : "Restart & test"
     }
-}
-
-struct ActivityItem: Identifiable {
-    enum Kind {
-        case agent, system
-    }
-
-    let id: String
-    let kind: Kind
-    let timestamp: Int64
-    let title: String
-    let detail: String
-    let source: String
 }

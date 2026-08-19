@@ -54,6 +54,10 @@ const MAX_TRANSACTION_TEXT_CHARS: usize = 2 * 1024;
 const MAX_TRANSACTION_METADATA_BYTES: usize = 16 * 1024;
 const MAX_TOKEN_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DASHBOARD_PROMPT_CHARS: usize = 1024;
+const MAX_DASHBOARD_REQUEST_FILE_TOUCHES: usize = 32;
+const MAX_DASHBOARD_FILE_TOUCH_CANDIDATES: usize = 128;
+const MAX_DASHBOARD_IGNORED_FILE_TOUCH_EVENTS: usize = 5_000;
+const MAX_DASHBOARD_IGNORED_FILE_TOUCH_PATHS: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
@@ -504,8 +508,14 @@ impl EventStore {
         }
         let db = self.sqlite_store()?;
         let conn = db.connection();
-        let visible_alerts_cte = dashboard_visible_alerts_cte();
-        let alerts = dashboard_alerts(conn, None, Some(200))?;
+        materialize_dashboard_visible_alerts(conn)?;
+        let alerts = dashboard_alerts_from_relation(
+            conn,
+            "dashboard_visible_alerts",
+            None,
+            Some(200),
+            None,
+        )?;
         let agent_events = query_json_rows(
             conn,
             "SELECT event_id, pid, agent_events.request_id, requests.session_id, ts,
@@ -533,12 +543,6 @@ impl EventStore {
                 }))
             },
         )?;
-        // The Live Feed was removed, so the periodic dashboard no longer needs
-        // a global raw Endpoint Security sample. On a multi-gigabyte audit
-        // store, ordering that stream dominated every refresh. Work Review
-        // loads complete OS evidence by request through dashboard_request(),
-        // while request summaries carry their bounded file-touch projection.
-        let system_events: Vec<Value> = Vec::new();
         let sessions = query_json_rows(
             conn,
             "SELECT s.session_id, s.agent_id, s.first_event_at, s.last_event_at, s.flagged,
@@ -561,9 +565,8 @@ impl EventStore {
                 }))
             },
         )?;
-        let requests_sql = format!(
-            "WITH {visible_alerts_cte},
-             recent_requests AS MATERIALIZED (
+        let requests_sql =
+            "WITH recent_requests AS MATERIALIZED (
                SELECT request_id, session_id,
                       substr(original_user_prompt, 1, 16384) AS original_user_prompt,
                       created_at, completed_at
@@ -573,7 +576,10 @@ impl EventStore {
              ),
              event_rollups AS (
                SELECT agent_events.request_id,
-                      SUM(CASE WHEN agent_events.type = 'PreToolUse' THEN 1 ELSE 0 END) AS tool_call_count
+                      COUNT(DISTINCT CASE
+                        WHEN agent_events.type NOT IN ('PostToolUse', 'PostToolUseFailure')
+                        THEN COALESCE(agent_events.tool_use_id, 'event-' || agent_events.event_id)
+                      END) AS tool_call_count
                FROM agent_events
                JOIN recent_requests ON recent_requests.request_id = agent_events.request_id
                GROUP BY agent_events.request_id
@@ -588,11 +594,11 @@ impl EventStore {
                         WHEN 5 THEN 'critical' WHEN 4 THEN 'high' WHEN 3 THEN 'medium'
                         WHEN 2 THEN 'low' ELSE 'info' END AS strongest_severity,
                       CASE MAX(CASE lower(visible_alerts.action)
-                        WHEN 'deny' THEN 4 WHEN 'block' THEN 4 WHEN 'ask' THEN 3
+                        WHEN 'deny' THEN 5 WHEN 'block' THEN 4 WHEN 'ask' THEN 3
                         WHEN 'warn' THEN 2 ELSE 1 END)
-                        WHEN 4 THEN 'block' WHEN 3 THEN 'ask' WHEN 2 THEN 'warn'
+                        WHEN 5 THEN 'deny' WHEN 4 THEN 'block' WHEN 3 THEN 'ask' WHEN 2 THEN 'warn'
                         ELSE 'allow' END AS strongest_action
-               FROM visible_alerts
+               FROM dashboard_visible_alerts AS visible_alerts
                JOIN recent_requests ON recent_requests.request_id = visible_alerts.request_id
                GROUP BY visible_alerts.request_id
              )
@@ -608,9 +614,8 @@ impl EventStore {
              LEFT JOIN event_rollups ON event_rollups.request_id = recent_requests.request_id
              LEFT JOIN alert_rollups ON alert_rollups.request_id = recent_requests.request_id
              ORDER BY COALESCE(recent_requests.completed_at, recent_requests.created_at, recent_requests.request_id) DESC,
-                      recent_requests.request_id DESC"
-        );
-        let requests = query_json_rows(conn, &requests_sql, |row| {
+                      recent_requests.request_id DESC";
+        let mut requests = query_json_rows(conn, requests_sql, |row| {
             Ok(json!({
                 "request_id": row.get::<_, i64>(0)?,
                 "session_id": row.get::<_, String>(1)?,
@@ -625,9 +630,18 @@ impl EventStore {
                 "strongest_severity": row.get::<_, String>(8)?,
                 "strongest_action": row.get::<_, String>(9)?,
                 "file_touches": [],
+                "summary_file_touch_paths": [],
                 "ignored_file_touch_paths": [],
             }))
         })?;
+        let request_file_touch_paths = dashboard_request_file_touch_paths(conn)?;
+        for request in &mut requests {
+            let request_id = request["request_id"].as_i64().unwrap_or_default();
+            request["summary_file_touch_paths"] = json!(request_file_touch_paths
+                .get(&request_id)
+                .cloned()
+                .unwrap_or_default());
+        }
         let artifact_query = "SELECT kind, uri, current_digest, last_seen_at,
                     last_modified_at, last_modified_source,
                     last_modified_session_id, risk_level, risk_rule_id,
@@ -710,47 +724,41 @@ impl EventStore {
                 }))
             },
         )?;
-        let dashboard_summary_sql = format!(
-            "WITH {visible_alerts_cte}
-             SELECT
+        let dashboard_summary_sql = "SELECT
                 (SELECT COUNT(*) FROM sessions),
                 (SELECT COUNT(*) FROM requests),
                 (SELECT COUNT(*) FROM agent_events),
-                0,
-                (SELECT COUNT(*) FROM visible_alerts),
-                (SELECT COUNT(*) FROM visible_alerts
+                (SELECT COUNT(*) FROM dashboard_visible_alerts),
+                (SELECT COUNT(*) FROM dashboard_visible_alerts
                   WHERE severity IN ('high', 'critical')
                     AND created_at >= (unixepoch('now') - 86400) * 1000),
                 (SELECT COUNT(*) FROM artifact_facts),
-                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'critical'),
-                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'high'),
-                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'medium'),
-                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'low'),
-                (SELECT COUNT(*) FROM visible_alerts WHERE severity = 'info')"
-        );
-        let mut dashboard_summary = query_json_rows(conn, &dashboard_summary_sql, |row| {
+                (SELECT COUNT(*) FROM dashboard_visible_alerts WHERE severity = 'critical'),
+                (SELECT COUNT(*) FROM dashboard_visible_alerts WHERE severity = 'high'),
+                (SELECT COUNT(*) FROM dashboard_visible_alerts WHERE severity = 'medium'),
+                (SELECT COUNT(*) FROM dashboard_visible_alerts WHERE severity = 'low'),
+                (SELECT COUNT(*) FROM dashboard_visible_alerts WHERE severity = 'info')";
+        let mut dashboard_summary = query_json_rows(conn, dashboard_summary_sql, |row| {
             Ok(json!({
                 "sessions_count": row.get::<_, i64>(0)?,
                 "requests_count": row.get::<_, i64>(1)?,
                 "agent_events_count": row.get::<_, i64>(2)?,
-                "system_events_count": row.get::<_, i64>(3)?,
-                "alerts_count": row.get::<_, i64>(4)?,
-                "recent_high_alerts": row.get::<_, i64>(5)?,
-                "artifacts_count": row.get::<_, i64>(6)?,
-                "critical_alerts_count": row.get::<_, i64>(7)?,
-                "high_alerts_count": row.get::<_, i64>(8)?,
-                "medium_alerts_count": row.get::<_, i64>(9)?,
-                "low_alerts_count": row.get::<_, i64>(10)?,
-                "info_alerts_count": row.get::<_, i64>(11)?,
+                "alerts_count": row.get::<_, i64>(3)?,
+                "recent_high_alerts": row.get::<_, i64>(4)?,
+                "artifacts_count": row.get::<_, i64>(5)?,
+                "critical_alerts_count": row.get::<_, i64>(6)?,
+                "high_alerts_count": row.get::<_, i64>(7)?,
+                "medium_alerts_count": row.get::<_, i64>(8)?,
+                "low_alerts_count": row.get::<_, i64>(9)?,
+                "info_alerts_count": row.get::<_, i64>(10)?,
             }))
         })?
         .into_iter()
         .next()
         .unwrap_or_else(|| json!({}));
         dashboard_summary["artifacts_count"] = json!(visible_artifact_count);
-        let daily_activity_sql = format!(
-            "WITH {visible_alerts_cte},
-             daily_requests AS (
+        let daily_activity_sql =
+            "WITH daily_requests AS (
                 SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
                        COUNT(*) AS count,
                        COALESCE(SUM(total_tokens), 0) AS tokens
@@ -779,7 +787,7 @@ impl EventStore {
              daily_alerts AS (
                 SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
                        COUNT(*) AS count
-                FROM visible_alerts
+                FROM dashboard_visible_alerts AS visible_alerts
                 WHERE date(created_at / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-371 days')
                 GROUP BY day
              ),
@@ -797,9 +805,8 @@ impl EventStore {
              LEFT JOIN daily_requests ON daily_requests.day = days.day
              LEFT JOIN daily_tools ON daily_tools.day = days.day
              LEFT JOIN daily_alerts ON daily_alerts.day = days.day
-             ORDER BY days.day"
-        );
-        let daily_activity = query_json_rows(conn, &daily_activity_sql, |row| {
+             ORDER BY days.day";
+        let daily_activity = query_json_rows(conn, daily_activity_sql, |row| {
             Ok(json!({
                 "date": row.get::<_, String>(0)?,
                 "requests": row.get::<_, i64>(1)?,
@@ -814,7 +821,6 @@ impl EventStore {
             "summary": dashboard_summary,
             "alerts": alerts,
             "agentEvents": agent_events,
-            "systemEvents": system_events,
             "sessions": sessions,
             "requests": requests,
             "artifacts": artifacts,
@@ -861,8 +867,10 @@ impl EventStore {
             })?;
 
         request["file_touches"] = Value::Array(dashboard_file_touches(conn, request_id)?);
-        let ignored_file_touch_paths = dashboard_ignored_file_touch_paths(&db, request_id)?;
-        request["ignored_file_touch_paths"] = json!(ignored_file_touch_paths);
+        let ignored_file_touches = dashboard_ignored_file_touch_paths(conn, request_id)?;
+        request["ignored_file_touch_paths"] = json!(ignored_file_touches.paths);
+        request["ignored_file_touch_events_omitted"] =
+            json!(ignored_file_touches.omitted_event_count);
 
         let agent_events = query_json_rows_with_i64(
             conn,
@@ -893,33 +901,11 @@ impl EventStore {
             },
         )?;
 
-        let system_events = query_json_rows_with_i64(
-            conn,
-            "SELECT event_id, pid, request_id, ts, source, type, cwd, args
-             FROM system_events
-             WHERE request_id = ?1
-             ORDER BY ts, event_id",
-            request_id,
-            |row| {
-                Ok(json!({
-                    "event_id": row.get::<_, i64>(0)?,
-                    "pid": row.get::<_, i64>(1)?,
-                    "request_id": row.get::<_, i64>(2)?,
-                    "ts": row.get::<_, i64>(3)?,
-                    "source": row.get::<_, String>(4)?,
-                    "type": row.get::<_, String>(5)?,
-                    "cwd": row.get::<_, String>(6)?,
-                    "args": row.get::<_, Option<String>>(7)?,
-                }))
-            },
-        )?;
-
         let alerts = dashboard_alerts(conn, Some(request_id), None)?;
 
         Ok(json!({
             "request": request,
             "agentEvents": agent_events,
-            "systemEvents": system_events,
             "alerts": alerts,
         }))
     }
@@ -3008,6 +2994,78 @@ fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::R
         .collect())
 }
 
+/// Return a small path-only projection for the Work Review request list. The
+/// complete intended/verified classification remains request-scoped, but file
+/// search and large-task detection must not depend on the global event window.
+fn dashboard_request_file_touch_paths(
+    conn: &rusqlite::Connection,
+) -> io::Result<HashMap<i64, Vec<String>>> {
+    let sql = format!(
+        "WITH recent_requests AS MATERIALIZED (
+            SELECT request_id
+            FROM requests
+            ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
+            LIMIT 100
+         ),
+         candidate_touches AS (
+            SELECT request_relation.src_id AS request_id,
+                   CASE
+                     WHEN artifacts.uri LIKE 'file://%' THEN substr(artifacts.uri, 8)
+                     WHEN artifacts.uri LIKE 'file:%' THEN substr(artifacts.uri, 6)
+                     ELSE artifacts.uri
+                   END AS path,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY request_relation.src_id
+                     ORDER BY artifacts.uri
+                   ) AS touch_rank
+            FROM recent_requests
+            JOIN relations AS request_relation INDEXED BY idx_relations_src
+              ON request_relation.src_kind = 'request'
+             AND request_relation.src_id = recent_requests.request_id
+             AND request_relation.dst_kind = 'artifact'
+             AND request_relation.relation_type IN ('produced', 'modified', 'deleted')
+            JOIN artifacts ON artifacts.artifact_id = request_relation.dst_id
+            WHERE EXISTS (
+              SELECT 1
+              FROM relations AS observed_relation INDEXED BY idx_relations_dst
+              JOIN system_events
+                ON system_events.event_id = observed_relation.src_id
+               AND system_events.request_id = recent_requests.request_id
+               AND system_events.source = 'macos-endpoint-security'
+              WHERE observed_relation.src_kind = 'system_event'
+                AND observed_relation.dst_kind = 'artifact'
+                AND observed_relation.dst_id = artifacts.artifact_id
+                AND observed_relation.relation_type IN ('wrote', 'modified', 'deleted')
+            )
+            GROUP BY request_relation.src_id, artifacts.artifact_id, artifacts.uri
+         )
+         SELECT request_id, path
+         FROM candidate_touches
+         WHERE touch_rank <= {MAX_DASHBOARD_FILE_TOUCH_CANDIDATES}
+         ORDER BY request_id, path"
+    );
+    let mut statement = conn.prepare(&sql).map_err(sqlite_error_from_rusqlite)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sqlite_error_from_rusqlite)?;
+    let mut paths: HashMap<i64, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (request_id, path) = row.map_err(sqlite_error_from_rusqlite)?;
+        if dashboard_file_touch_is_background(&path) {
+            continue;
+        }
+        let request_paths = paths.entry(request_id).or_default();
+        if request_paths.len() < MAX_DASHBOARD_REQUEST_FILE_TOUCHES
+            && !request_paths.contains(&path)
+        {
+            request_paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
 fn dashboard_file_touch_is_background(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lineage_path_is_harness_runtime_noise(path)
@@ -3017,25 +3075,75 @@ fn dashboard_file_touch_is_background(path: &str) -> bool {
         || lower.contains("/library/httpstorages/")
 }
 
+struct DashboardIgnoredFileTouches {
+    paths: Vec<String>,
+    omitted_event_count: usize,
+}
+
 fn dashboard_ignored_file_touch_paths(
-    db: &SqliteStore,
+    conn: &rusqlite::Connection,
     request_id: i64,
-) -> io::Result<Vec<String>> {
+) -> io::Result<DashboardIgnoredFileTouches> {
+    dashboard_ignored_file_touch_paths_with_limits(
+        conn,
+        request_id,
+        MAX_DASHBOARD_IGNORED_FILE_TOUCH_EVENTS,
+        MAX_DASHBOARD_IGNORED_FILE_TOUCH_PATHS,
+    )
+}
+
+fn dashboard_ignored_file_touch_paths_with_limits(
+    conn: &rusqlite::Connection,
+    request_id: i64,
+    event_limit: usize,
+    path_limit: usize,
+) -> io::Result<DashboardIgnoredFileTouches> {
+    let total_event_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM system_events
+             WHERE request_id = ?1 AND source = 'macos-endpoint-security'",
+            [request_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(sqlite_error_from_rusqlite)
+        .and_then(|count| {
+            usize::try_from(count).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "negative system event count")
+            })
+        })?;
+    let mut statement = conn
+        .prepare(
+            "SELECT pid, ts, source, type, args
+             FROM system_events
+             WHERE request_id = ?1 AND source = 'macos-endpoint-security'
+             ORDER BY ts, event_id
+             LIMIT ?2",
+        )
+        .map_err(sqlite_error_from_rusqlite)?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![request_id, i64::try_from(event_limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .map_err(sqlite_error_from_rusqlite)?;
     let mut ignored = BTreeSet::new();
-    for record in db
-        .system_events_for_request(request_id)
-        .map_err(sqlite_error)?
-    {
-        if record.source != "macos-endpoint-security" {
-            continue;
-        }
-        let Some(raw_json) = record.args.as_deref() else {
+    for row in rows {
+        let (pid, ts, source, event_type, args) = row.map_err(sqlite_error_from_rusqlite)?;
+        let Some(raw_json) = args.as_deref() else {
             continue;
         };
         let Ok(raw_event) = serde_json::from_str::<Value>(raw_json) else {
             continue;
         };
-        if !dashboard_endpoint_event_is_file_mutation(&record.event_type, &raw_event) {
+        if !dashboard_endpoint_event_is_file_mutation(&event_type, &raw_event) {
             continue;
         }
 
@@ -3052,11 +3160,11 @@ fn dashboard_ignored_file_touch_paths(
             .and_then(|path| path.rsplit('/').next())
             .map(str::to_string);
         let event = SystemEvent {
-            source: record.source,
-            event_type: record.event_type,
+            source,
+            event_type,
             event_kind: "file_mutation".to_string(),
-            observed_at_ms: u64::try_from(record.ts).unwrap_or_default(),
-            pid: u32::try_from(record.pid).ok(),
+            observed_at_ms: u64::try_from(ts).unwrap_or_default(),
+            pid: u32::try_from(pid).ok(),
             ppid: raw_event
                 .pointer("/actor/ppid")
                 .and_then(Value::as_u64)
@@ -3073,10 +3181,16 @@ fn dashboard_ignored_file_touch_paths(
                     || !should_materialize_system_artifact(&event, &path, Some(&raw_event)))
             {
                 ignored.insert(path);
+                if ignored.len() >= path_limit {
+                    break;
+                }
             }
         }
     }
-    Ok(ignored.into_iter().collect())
+    Ok(DashboardIgnoredFileTouches {
+        paths: ignored.into_iter().collect(),
+        omitted_event_count: total_event_count.saturating_sub(event_limit),
+    })
 }
 
 fn dashboard_endpoint_event_is_file_mutation(event_type: &str, raw_event: &Value) -> bool {
@@ -3371,20 +3485,54 @@ fn dashboard_visible_alerts_cte() -> String {
     )
 }
 
+fn materialize_dashboard_visible_alerts(conn: &rusqlite::Connection) -> io::Result<()> {
+    let visible_alerts_cte = dashboard_visible_alerts_cte();
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS temp.dashboard_visible_alerts;
+         CREATE TEMP TABLE dashboard_visible_alerts AS
+         WITH {visible_alerts_cte}
+         SELECT * FROM visible_alerts;
+         CREATE INDEX temp.dashboard_visible_alerts_request
+           ON dashboard_visible_alerts(request_id);
+         CREATE INDEX temp.dashboard_visible_alerts_severity
+           ON dashboard_visible_alerts(severity, created_at);"
+    ))
+    .map_err(sqlite_error_from_rusqlite)
+}
+
 fn dashboard_alerts(
     conn: &rusqlite::Connection,
     request_id: Option<i64>,
     limit: Option<usize>,
 ) -> io::Result<Vec<Value>> {
     let visible_alerts_cte = dashboard_visible_alerts_cte();
+    dashboard_alerts_from_relation(
+        conn,
+        "visible_alerts",
+        request_id,
+        limit,
+        Some(&visible_alerts_cte),
+    )
+}
+
+fn dashboard_alerts_from_relation(
+    conn: &rusqlite::Connection,
+    alert_relation: &str,
+    request_id: Option<i64>,
+    limit: Option<usize>,
+    visible_alerts_cte: Option<&str>,
+) -> io::Result<Vec<Value>> {
     let where_clause = request_id
         .map(|_| "WHERE alerts.request_id = ?1")
         .unwrap_or_default();
     let limit_clause = limit
         .map(|value| format!("LIMIT {value}"))
         .unwrap_or_default();
+    let with_clause = visible_alerts_cte
+        .map(|cte| format!("WITH {cte}"))
+        .unwrap_or_default();
     let sql = format!(
-        "WITH {visible_alerts_cte}
+        "{with_clause}
          SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
                 alerts.severity, alerts.action, alerts.rule_id, alerts.message,
                 alerts.path, alerts.evidence, alerts.created_at,
@@ -3392,7 +3540,7 @@ fn dashboard_alerts(
                 trigger_event.source, trigger_event.type, trigger_event.tool_name,
                 trigger_event.tool_input, trigger_event.tool_use_id,
                 feedback.human_verdict, feedback.label, feedback.created_at
-         FROM visible_alerts AS alerts
+         FROM {alert_relation} AS alerts
          LEFT JOIN requests ON requests.request_id = alerts.request_id
          LEFT JOIN agent_events AS trigger_event
            ON trigger_event.event_id = COALESCE(
@@ -3715,8 +3863,8 @@ fn dashboard_request_prompt(value: Option<&str>) -> Option<String> {
     const OPEN: &str = "<in-app-browser-context";
     const CLOSE: &str = "</in-app-browser-context>";
 
-    while let Some(start) = prompt.find(OPEN) {
-        let Some(relative_end) = prompt[start..].find(CLOSE) else {
+    while let Some(start) = find_ascii_case_insensitive(&prompt, OPEN) {
+        let Some(relative_end) = find_ascii_case_insensitive(&prompt[start..], CLOSE) else {
             prompt.truncate(start);
             break;
         };
@@ -3724,8 +3872,9 @@ fn dashboard_request_prompt(value: Option<&str>) -> Option<String> {
         prompt.replace_range(start..end, "");
     }
 
-    if let Some((_, request)) = prompt.split_once("## My request:") {
-        prompt = request.to_string();
+    const REQUEST_MARKER: &str = "## My request:";
+    if let Some(marker) = find_ascii_case_insensitive(&prompt, REQUEST_MARKER) {
+        prompt = prompt[marker + REQUEST_MARKER.len()..].to_string();
     }
 
     let prompt = prompt.trim();
@@ -3737,6 +3886,16 @@ fn dashboard_request_prompt(value: Option<&str>) -> Option<String> {
         .take(MAX_DASHBOARD_PROMPT_CHARS)
         .collect::<String>();
     Some(bounded)
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn bounded_transaction_metadata(value: &Value) -> io::Result<String> {
@@ -4442,6 +4601,83 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_rollups_count_permission_only_calls_and_preserve_deny() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-dashboard-permission-rollup-test-{}-{now}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event(&hook_event(
+                "UserPromptSubmit",
+                r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"Do the task"}"#,
+                now,
+            ))
+            .unwrap();
+        let mut permission = hook_event(
+            "PermissionRequest",
+            r#"{"session_id":"s1","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_use_id":"denied-1"}"#,
+            now + 1,
+        );
+        permission.tool_name = Some("Bash".to_string());
+        permission.tool_use_id = Some("denied-1".to_string());
+        store.append_hook_event(&permission).unwrap();
+        let mut post_only = hook_event(
+            "PostToolUseFailure",
+            r#"{"session_id":"s1","hook_event_name":"PostToolUseFailure","tool_name":"Read","tool_use_id":"post-only"}"#,
+            now + 2,
+        );
+        post_only.tool_name = Some("Read".to_string());
+        post_only.tool_use_id = Some("post-only".to_string());
+        store.append_hook_event(&post_only).unwrap();
+        store
+            .append_policy_alert(&PolicyAlert {
+                session_id: Some("s1".to_string()),
+                tool_use_id: Some("denied-1".to_string()),
+                severity: "high".to_string(),
+                action: "block".to_string(),
+                rule_id: "permission_denied".to_string(),
+                message: "Denied before execution".to_string(),
+                path: None,
+                evidence: None,
+                observed_at_ms: now + 3,
+            })
+            .unwrap();
+        // Existing stores constrain active policy actions to `block`, but the
+        // dashboard must preserve imported/forward-compatible `deny` values
+        // rather than silently relabeling them as block.
+        {
+            let db = store.sqlite_store().unwrap();
+            db.connection()
+                .pragma_update(None, "ignore_check_constraints", "ON")
+                .unwrap();
+            db.connection()
+                .execute(
+                    "UPDATE alerts SET action = 'deny' WHERE rule_id = 'permission_denied'",
+                    [],
+                )
+                .unwrap();
+        }
+        store
+            .append_hook_event(&hook_event(
+                "Stop",
+                r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
+                now + 4,
+            ))
+            .unwrap();
+
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["requests"][0]["tool_call_count"], 1);
+        assert_eq!(dashboard["requests"][0]["strongest_action"], "deny");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn dashboard_request_reports_endpoint_file_touch_evidence() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4529,6 +4765,10 @@ mod tests {
         // The periodic overview is deliberately lightweight. Complete
         // Endpoint Security evidence is loaded only for the selected request.
         assert!(request["file_touches"].as_array().unwrap().is_empty());
+        assert_eq!(
+            request["summary_file_touch_paths"],
+            json!(["/repo/App.swift", "/repo/Outside.swift"])
+        );
         let request_id = request["request_id"].as_i64().unwrap();
         let detail = store.dashboard_request(request_id).unwrap();
         let touches = detail["request"]["file_touches"].as_array().unwrap();
@@ -4547,6 +4787,18 @@ mod tests {
                 "/dev/null"
             ])
         );
+        assert_eq!(detail["request"]["ignored_file_touch_events_omitted"], 0);
+        assert!(detail.get("systemEvents").is_none());
+        let db = store.sqlite_store().unwrap();
+        let bounded = dashboard_ignored_file_touch_paths_with_limits(
+            db.connection(),
+            request_id,
+            2,
+            MAX_DASHBOARD_IGNORED_FILE_TOUCH_PATHS,
+        )
+        .unwrap();
+        assert_eq!(bounded.omitted_event_count, 3);
+        drop(db);
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -4570,10 +4822,10 @@ mod tests {
     #[test]
     fn dashboard_prompt_strips_ambient_browser_context_before_bounding() {
         let prompt = concat!(
-            "<in-app-browser-context source=\"ambient-ui-state\">\n",
+            "<IN-APP-BROWSER-CONTEXT source=\"ambient-ui-state\">\n",
             "This block is automatically supplied ambient UI state.\n",
-            "</in-app-browser-context>\n\n",
-            "## My request:\n",
+            "</IN-APP-BROWSER-CONTEXT>\n\n",
+            "## MY REQUEST:\n",
             "Fix the request timeline"
         );
         assert_eq!(
@@ -5460,8 +5712,8 @@ mod tests {
             .iter()
             .all(|alert| alert.rule_id != "unmatched_system_effect"));
         let dashboard = store.dashboard_state().unwrap();
-        assert_eq!(dashboard["systemEvents"].as_array().unwrap().len(), 0);
-        assert_eq!(dashboard["summary"]["system_events_count"], 0);
+        assert!(dashboard.get("systemEvents").is_none());
+        assert!(dashboard["summary"].get("system_events_count").is_none());
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -5720,7 +5972,7 @@ mod tests {
             .is_none());
 
         let dashboard = store.dashboard_state().unwrap();
-        assert_eq!(dashboard["systemEvents"].as_array().unwrap().len(), 0);
+        assert!(dashboard.get("systemEvents").is_none());
         assert_eq!(dashboard["summary"]["artifacts_count"], 2);
         let artifact_paths = dashboard["artifacts"]
             .as_array()
