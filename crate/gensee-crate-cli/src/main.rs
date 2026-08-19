@@ -90,6 +90,8 @@ mod telemetry;
 pub(crate) use telemetry::*;
 mod hook_compatibility;
 pub(crate) use hook_compatibility::*;
+mod falco;
+pub(crate) use falco::*;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -3496,9 +3498,10 @@ pub(crate) fn handle_ingest(args: Vec<OsString>) -> io::Result<()> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("eslogger") => ingest_eslogger(),
         Some("endpoint-security") => ingest_endpoint_security(),
+        Some("falco") => ingest_falco(args[1..].to_vec()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee ingest eslogger|endpoint-security",
+            "usage: gensee ingest eslogger|endpoint-security|falco [--host <name>]",
         )),
     }
 }
@@ -4596,4 +4599,5 @@ pub(crate) fn print_usage() {
     println!(
         "AUDIT:\n  gensee audit codex [--workspace <path>] [--json] [--fail-on <level>]\n  gensee audit vscode [--workspace <path>] [--vscode-profile <id>] [--json] [--fail-on <level>]\n  gensee audit <codex-cli|github-copilot-vscode|vscode-agent-host> [OPTIONS]\n"
     );
+    println!("SYSTEM EVENT INGEST:\n  gensee ingest falco [--host <name>] < falco.jsonl\n");
 }

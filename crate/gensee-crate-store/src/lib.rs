@@ -1669,14 +1669,9 @@ impl EventStore {
         self.with_sqlite_transaction(|db| {
             let ts = to_i64(event.observed_at_ms)?;
             let matched_agent_event = agent_event_for_system_event(db, event, ts)?;
-            let endpoint_session_id = endpoint_security_session_id(event);
-            let request_id = if let Some(session_id) = endpoint_session_id.as_deref() {
-                ensure_session(
-                    db,
-                    session_id,
-                    "macos-endpoint-security",
-                    event.observed_at_ms,
-                )?;
+            let attributed_session_id = system_event_session_id(event);
+            let request_id = if let Some(session_id) = attributed_session_id.as_deref() {
+                ensure_session(db, session_id, &event.source, event.observed_at_ms)?;
                 latest_or_create_request(db, session_id)?
             } else if let Some(agent_event) = &matched_agent_event {
                 agent_event.request_id
@@ -1695,7 +1690,7 @@ impl EventStore {
                     args: Some(event.raw_json.clone()),
                 })
                 .map_err(sqlite_error)?;
-            let process_tree_matched = endpoint_session_id.is_some();
+            let process_tree_matched = attributed_session_id.is_some();
             let matched = matched_agent_event.is_some() || process_tree_matched;
             if let Some(agent_event) = matched_agent_event {
                 insert_entity_relation(
@@ -1720,8 +1715,8 @@ impl EventStore {
                     "observed",
                     1.0,
                     Some(json!({
-                        "matched_by": "endpoint_security_process_tree",
-                        "session_id": endpoint_session_id,
+                        "matched_by": "system_event_session_attribution",
+                        "session_id": attributed_session_id,
                         "system_event_type": event.event_type,
                     })),
                     ts,
@@ -2966,15 +2961,17 @@ fn text_from_raw_json(raw_json: &str, keys: &[&str]) -> Option<String> {
         .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
-fn endpoint_security_session_id(event: &SystemEvent) -> Option<String> {
-    if event.source != "macos-endpoint-security" {
-        return None;
-    }
-    serde_json::from_str::<Value>(&event.raw_json)
-        .ok()?
-        .get("attribution")?
-        .get("session_id")?
-        .as_str()
+fn system_event_session_id(event: &SystemEvent) -> Option<String> {
+    let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+    let session_id = match event.source.as_str() {
+        "linux" | "linux-falco" => value.get("session_id").and_then(Value::as_str),
+        "macos-endpoint-security" => value
+            .get("attribution")
+            .and_then(|value| value.get("session_id"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    session_id
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
 }
@@ -4856,6 +4853,54 @@ mod tests {
                 .len(),
             0
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn attributed_linux_system_events_attach_to_the_tclone_request() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-linux-attribution-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_system_event(&SystemEvent {
+                source: "linux-falco".to_string(),
+                event_type: "connect".to_string(),
+                event_kind: "NetworkConnect".to_string(),
+                observed_at_ms: 130,
+                pid: Some(42),
+                ppid: Some(1),
+                process_name: Some("curl".to_string()),
+                executable_path: Some("/usr/bin/curl".to_string()),
+                file_path: None,
+                command_line: Some("curl http://artifactory:8082".to_string()),
+                raw_json: r#"{"session_id":"run_test","event":"connect"}"#.to_string(),
+            })
+            .unwrap();
+
+        let db = store.sqlite_store().unwrap();
+        let request = db.latest_request_for_session("run_test").unwrap().unwrap();
+        let system_events = db.system_events_for_request(request.request_id).unwrap();
+        assert_eq!(system_events.len(), 1);
+        assert_eq!(system_events[0].source, "linux-falco");
+        assert_eq!(system_events[0].event_type, "connect");
+        assert_eq!(
+            db.relations_for_request(request.request_id).unwrap().len(),
+            1
+        );
+        assert!(db
+            .latest_request_for_session(SYSTEM_SESSION_ID)
+            .unwrap()
+            .is_none());
+        drop(db);
+        assert!(store
+            .list_alerts()
+            .unwrap()
+            .iter()
+            .all(|alert| alert.rule_id != "unmatched_system_effect"));
 
         fs::remove_dir_all(&dir).ok();
     }

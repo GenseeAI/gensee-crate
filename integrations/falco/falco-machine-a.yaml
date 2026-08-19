@@ -1,0 +1,26 @@
+rules_files: []
+
+engine:
+  kind: kmod
+
+load_plugins: []
+plugins: []
+
+json_output: true
+json_include_output_property: true
+json_include_tags_property: true
+time_format_iso_8601: true
+priority: informational
+
+stdout_output:
+  enabled: false
+syslog_output:
+  enabled: false
+file_output:
+  enabled: false
+program_output:
+  enabled: true
+  keep_alive: true
+  program: "/usr/local/bin/gensee ingest falco --host machine-a-sandbox"
+http_output:
+  enabled: false
