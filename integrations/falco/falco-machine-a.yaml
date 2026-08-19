@@ -21,6 +21,6 @@ file_output:
 program_output:
   enabled: true
   keep_alive: true
-  program: "/usr/local/bin/gensee ingest falco --host machine-a-sandbox"
+  program: "/usr/sbin/runuser -u yiying_gensee_ai -- env GENSEE_HOME=/home/yiying_gensee_ai/.gensee /usr/local/bin/gensee ingest falco --host machine-a-sandbox"
 http_output:
   enabled: false
