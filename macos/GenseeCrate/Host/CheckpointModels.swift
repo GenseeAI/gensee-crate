@@ -87,4 +87,17 @@ struct CheckpointRestoreResponse: Decodable, Equatable {
 
 struct CheckpointDeleteResponse: Decodable, Equatable {
     let deleted: [String]
+    let failed: [CheckpointDeleteFailure]?
+}
+
+struct CheckpointDeleteFailure: Decodable, Equatable {
+    let id: String
+    let workspace: String
+    let error: String
+    let orphanedMetadataRemoved: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, workspace, error
+        case orphanedMetadataRemoved = "orphaned_metadata_removed"
+    }
 }

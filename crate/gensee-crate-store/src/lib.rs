@@ -21,7 +21,7 @@ pub use gensee_crate_db::sqlite::{
     ChainVerification, HumanFeedbackRecord,
 };
 use gensee_crate_rules::policy::Policy;
-use rusqlite::OptionalExtension;
+use rusqlite::{functions::FunctionFlags, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3007,6 +3007,18 @@ fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::R
 fn dashboard_request_file_touches(
     conn: &rusqlite::Connection,
 ) -> io::Result<HashMap<i64, Vec<Value>>> {
+    conn.create_scalar_function(
+        "gensee_dashboard_file_touch_is_background",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |context| {
+            let path = context.get::<String>(0)?;
+            Ok(i64::from(dashboard_file_touch_is_background(&path)))
+        },
+    )
+    .map_err(sqlite_error_from_rusqlite)?;
     let sql = format!(
         "WITH recent_requests AS MATERIALIZED (
             SELECT request_id
@@ -3057,27 +3069,10 @@ fn dashboard_request_file_touches(
             SELECT request_id, path, intended_and_verified,
                    ROW_NUMBER() OVER (
                      PARTITION BY request_id
-                     ORDER BY CASE
-                       WHEN lower(path) LIKE '/dev/%'
-                         OR lower(path) LIKE '/tmp/%'
-                         OR lower(path) LIKE '/private/tmp/%'
-                         OR lower(path) LIKE '%/.gensee/%'
-                         OR lower(path) LIKE '%/.claude/sessions/%'
-                         OR lower(path) LIKE '%/.claude/projects/%'
-                         OR lower(path) LIKE '%/.claude/shell-snapshots/%'
-                         OR lower(path) LIKE '%/.claude/file-history/%'
-                         OR lower(path) LIKE '%/.codex/sessions/%'
-                         OR lower(path) LIKE '%/.codex/node_repl/active_execs/%'
-                         OR lower(path) LIKE '%/library/application support/codex/%'
-                         OR lower(path) LIKE '%/library/application support/claude/%'
-                         OR lower(path) LIKE '%/library/caches/%'
-                         OR lower(path) LIKE '%/library/httpstorages/%'
-                         OR lower(path) LIKE '%/crashpad/%'
-                         OR lower(path) LIKE '%/diagnosticreports/%'
-                       THEN 1 ELSE 0 END,
-                       path
+                     ORDER BY path
                    ) AS touch_rank
             FROM raw_touches
+            WHERE gensee_dashboard_file_touch_is_background(path) = 0
          )
          SELECT request_id, path, intended_and_verified
          FROM candidate_touches
@@ -3097,9 +3092,6 @@ fn dashboard_request_file_touches(
     let mut touches: HashMap<i64, Vec<Value>> = HashMap::new();
     for row in rows {
         let (request_id, path, intended_and_verified) = row.map_err(sqlite_error_from_rusqlite)?;
-        if dashboard_file_touch_is_background(&path) {
-            continue;
-        }
         let request_touches = touches.entry(request_id).or_default();
         if request_touches.len() < MAX_DASHBOARD_REQUEST_FILE_TOUCHES
             && !request_touches.iter().any(|touch| touch["path"] == path)
@@ -4935,7 +4927,7 @@ mod tests {
         for index in 0..(MAX_DASHBOARD_FILE_TOUCH_CANDIDATES + 20) {
             store
                 .append_system_event(&endpoint_event(
-                    format!("/Users/test/Library/Caches/tool/{index:04}.cache"),
+                    format!("/Users/test/.codex/state_{index:04}.sqlite"),
                     now + 1 + u64::try_from(index).unwrap(),
                 ))
                 .unwrap();

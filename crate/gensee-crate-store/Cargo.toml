@@ -10,6 +10,6 @@ chacha20poly1305 = "0.10"
 gensee-crate-core = { path = "../gensee-crate-core" }
 gensee-crate-db = { path = "../../db" }
 gensee-crate-rules = { path = "../gensee-crate-rules" }
-rusqlite = "0.40"
+rusqlite = { version = "0.40", features = ["functions"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

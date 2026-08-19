@@ -412,8 +412,20 @@ final class ConsoleModel: ObservableObject {
                 CheckpointDeleteResponse.self,
                 from: Data(output.stdout.utf8)
             )
-            recoveryPointsByRequest.removeAll()
+            let failures = response.failed ?? []
+            let removedIDs = Set(
+                response.deleted
+                    + failures.filter(\.orphanedMetadataRemoved).map(\.id)
+            )
+            for requestID in Array(recoveryPointsByRequest.keys) {
+                recoveryPointsByRequest[requestID]?.removeAll {
+                    removedIDs.contains($0.id)
+                }
+            }
             noticeMessage = "Removed \(response.deleted.count) retained recovery point\(response.deleted.count == 1 ? "" : "s")."
+            if let firstFailure = failures.first {
+                errorMessage = "\(failures.count) recovery point\(failures.count == 1 ? "" : "s") could not be fully removed. \(firstFailure.workspace): \(firstFailure.error)"
+            }
         } catch {
             errorMessage = "Could not remove retained recovery points: \(error.localizedDescription)"
         }

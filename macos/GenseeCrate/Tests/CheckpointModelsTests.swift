@@ -27,4 +27,21 @@ final class CheckpointModelsTests: XCTestCase {
         XCTAssertEqual(settings.retentionHours, 168)
         XCTAssertEqual(settings.failureBehavior, .continueWithWarning)
     }
+
+    func testDecodesPartialCheckpointCleanupFailures() throws {
+        let response = try JSONDecoder().decode(
+            CheckpointDeleteResponse.self,
+            from: Data(#"{"deleted":["cp-valid"],"failed":[{"id":"cp-orphan","workspace":"/tmp/missing","error":"workspace not found","orphaned_metadata_removed":true}]}"#.utf8)
+        )
+        XCTAssertEqual(response.deleted, ["cp-valid"])
+        XCTAssertEqual(response.failed?.first?.id, "cp-orphan")
+        XCTAssertEqual(response.failed?.first?.workspace, "/tmp/missing")
+        XCTAssertEqual(response.failed?.first?.orphanedMetadataRemoved, true)
+
+        let legacy = try JSONDecoder().decode(
+            CheckpointDeleteResponse.self,
+            from: Data(#"{"deleted":["cp-old"]}"#.utf8)
+        )
+        XCTAssertNil(legacy.failed)
+    }
 }
