@@ -29,6 +29,8 @@ const TCLONE_STATE_LOCK_STALE_SECS: u64 = 30;
 const TCLONE_HOST_CONTROL_SOCKET_ENV: &str = "GENSEE_TCLONE_HOST_SOCKET";
 const TCLONE_HOST_CONTROL_DIR_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DIR";
 const TCLONE_HOST_CONTROL_DISABLE_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DISABLE";
+pub(crate) const TCLONE_HOST_DAEMON_SOCKET_ENV: &str = "GENSEE_TCLONE_HOST_DAEMON_SOCKET";
+const TCLONE_CONTAINER_HOST_DAEMON_SOCKET: &str = "/run/gensee-host-observer.sock";
 const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
 const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
 const TCLONE_HOST_CONTROL_COMMAND_TIMEOUT_SECS: u64 = 300;
@@ -570,6 +572,10 @@ fn read_tclone_run_context() -> io::Result<Value> {
 
 pub(crate) fn current_tclone_context_run_id() -> Option<String> {
     let context = read_tclone_run_context().ok()?;
+    tclone_context_run_id(&context)
+}
+
+fn tclone_context_run_id(context: &Value) -> Option<String> {
     let role = context.get("role").and_then(Value::as_str)?;
     let run_id = context.get("run_id").and_then(Value::as_str)?.trim();
     let role_matches_run_id = match role {
@@ -578,6 +584,49 @@ pub(crate) fn current_tclone_context_run_id() -> Option<String> {
         _ => false,
     };
     (role_matches_run_id && tclone_is_safe_token(run_id)).then(|| run_id.to_string())
+}
+
+pub(crate) fn current_tclone_observation_credentials() -> io::Result<Option<(String, String)>> {
+    let context = match read_tclone_run_context() {
+        Ok(context) => context,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    tclone_observation_credentials_from_context(&context).map(Some)
+}
+
+fn tclone_observation_credentials_from_context(context: &Value) -> io::Result<(String, String)> {
+    let run_id = tclone_context_run_id(context).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "invalid tclone run context id")
+    })?;
+    let capability = context
+        .get("host_control_capability")
+        .and_then(Value::as_str)
+        .filter(|value| tclone_is_safe_token(value))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid tclone observation capability",
+            )
+        })?;
+    Ok((run_id, capability.to_string()))
+}
+
+pub(crate) fn authenticate_tclone_observation(run_id: &str, capability: &str) -> io::Result<()> {
+    if !tclone_is_safe_token(run_id) || !tclone_is_safe_token(capability) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid tclone observation credentials",
+        ));
+    }
+    let expected = read_tclone_host_control_capability(run_id)?;
+    if !constant_time_bytes_eq(expected.as_bytes(), capability.as_bytes()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid tclone observation capability",
+        ));
+    }
+    Ok(())
 }
 
 fn tclone_fork_result_path() -> PathBuf {
@@ -3928,6 +3977,7 @@ fn run_tclone_agent_inner(
     let node_mount = tclone_node_mount();
     let container_agent_cmd = remap_tclone_agent_command(&config.agent_cmd, node_mount.as_ref());
     let gensee_home = default_root().ok().filter(|path| path.exists());
+    let host_daemon_socket = gensee_home.as_deref().and_then(tclone_host_daemon_socket);
     prepare_tclone_seed(
         &seed_root,
         &original_workspace,
@@ -3992,6 +4042,17 @@ fn run_tclone_agent_inner(
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
+    if let Some(host_daemon_socket) = host_daemon_socket {
+        create_args.push(OsString::from("-v"));
+        create_args.push(OsString::from(format!(
+            "{}:{TCLONE_CONTAINER_HOST_DAEMON_SOCKET}:rw",
+            host_daemon_socket.display()
+        )));
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!(
+            "{TCLONE_HOST_DAEMON_SOCKET_ENV}={TCLONE_CONTAINER_HOST_DAEMON_SOCKET}"
+        )));
+    }
     if env_flag_default_on("GENSEE_TCLONE_BIND_HOST_CONTROL") {
         create_args.push(OsString::from("-v"));
         create_args.push(OsString::from(format!(
@@ -10441,6 +10502,14 @@ fn tclone_podman() -> OsString {
         .unwrap_or_else(|| OsString::from("podman"))
 }
 
+fn tclone_host_daemon_socket(gensee_home: &Path) -> Option<PathBuf> {
+    let socket = daemon_socket_path(gensee_home);
+    fs::symlink_metadata(&socket)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_socket())
+        .map(|_| socket)
+}
+
 fn env_flag(name: &str) -> bool {
     env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
@@ -14441,6 +14510,27 @@ gensee async job job_1: exited status=0
         assert!(validate_tclone_merge_pair(&unrelated, &source, false).is_err());
         assert!(validate_tclone_merge_pair(&unrelated, &source, true).is_ok());
         assert!(validate_tclone_merge_pair(&source_as_fork, &source, false).is_err());
+    }
+
+    #[test]
+    fn tclone_observation_credentials_require_run_and_capability() {
+        assert_eq!(
+            tclone_observation_credentials_from_context(&json!({
+                "run_id": "run_1",
+                "host_control_capability": "capability-1",
+            }))
+            .unwrap(),
+            ("run_1".to_string(), "capability-1".to_string())
+        );
+        assert!(tclone_observation_credentials_from_context(&json!({
+            "run_id": "../other-run",
+            "host_control_capability": "capability-1",
+        }))
+        .is_err());
+        assert!(tclone_observation_credentials_from_context(&json!({
+            "run_id": "run_1",
+        }))
+        .is_err());
     }
 
     #[test]
