@@ -364,7 +364,14 @@ pub(crate) fn fork_suggestion_finding(
     let reason = fork_suggestion_reason(command, subjects)?;
     let capability_request = reason.capability_request();
     let name_hint = reason.name_hint();
-    let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
+    let requires_broker =
+        capability_request.execution_boundary == ExecutionBoundary::BrokeredCommit;
+    let message = if requires_broker {
+        format!(
+            "This operation has external effects ({reason}) and requires a brokered commit. It is blocked in both source and fork containers until a broker can enforce the declared target, identity, and effect scope; a workspace fork alone cannot roll back an external effect.",
+            reason = reason.label()
+        )
+    } else if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
             "This looks suitable for a forked run ({reason}); do not run it in the source container. Ask the user to approve a forked run. When two materially different approaches are useful, propose both approaches in chat first, then after approval run one grouped command: gensee run fork {run_id} --copies 2 --name {name_hint} --approach '<approach A>' --approach '<approach B>' --attach tmux:right --json. Otherwise run: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If the fork command returns scheduled=true, do not run fork again, do not poll fork-status, and do not perform the task locally. End this source turn normally so Gensee can clone the idle Codex session. Gensee will submit the saved original request to each fork automatically, adding a distinct assigned approach to each parallel copy. Parallel forks summarize only their own changed files and tests. When all copies finish, Gensee returns control to the source Codex; the source runs compare, recommends a winner, and waits for explicit user approval before choosing merge, promote, or discard-all. Do not auto-merge, do not resend the prompt with `gensee run send`, and do not ask the user to type Gensee lifecycle commands.",
             reason = reason.label()
@@ -376,8 +383,16 @@ pub(crate) fn fork_suggestion_finding(
         )
     };
     Some(PolicyFinding {
-        action: fork_suggestion_action(event, current_run_id),
-        severity: fork_suggestion_severity(event, current_run_id).to_string(),
+        action: if requires_broker {
+            PolicyAction::Block
+        } else {
+            fork_suggestion_action(event, current_run_id)
+        },
+        severity: if requires_broker {
+            "high".to_string()
+        } else {
+            fork_suggestion_severity(event, current_run_id).to_string()
+        },
         rule_id: "policy_capability_delegation_required".to_string(),
         message,
         path: event.cwd.clone(),
@@ -439,7 +454,12 @@ pub(crate) fn fork_suggestion_prompt_finding(
     let reason = fork_suggestion_reason_for_prompt(&prompt)?;
     let capability_request = reason.capability_request();
     let name_hint = reason.name_hint();
-    let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
+    let message = if capability_request.execution_boundary == ExecutionBoundary::BrokeredCommit {
+        format!(
+            "This request has external effects ({reason}) and needs a brokered commit rather than a workspace fork. Explain that execution remains blocked until a broker can enforce the declared target, identity, and effect scope.",
+            reason = reason.label()
+        )
+    } else if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
             "This request looks suitable for a forked run ({reason}); ask the user to approve a forked run before making changes. When two materially different approaches are useful, propose both approaches in chat first, then after approval run one grouped command: gensee run fork {run_id} --copies 2 --name {name_hint} --approach '<approach A>' --approach '<approach B>' --attach tmux:right --json. Otherwise run: gensee run fork {run_id} --name {name_hint} --attach tmux:right --json. If the fork command returns scheduled=true, do not run fork again, do not poll fork-status, and do not perform the task locally. End this source turn normally so Gensee can clone the idle Codex session. Gensee will submit the saved original request to each fork automatically, adding a distinct assigned approach to each parallel copy. Parallel forks summarize only their own changed files and tests. When all copies finish, Gensee returns control to the source Codex; the source runs compare, recommends a winner, and waits for explicit user approval before choosing merge, promote, or discard-all. Do not auto-merge, do not resend the prompt with `gensee run send`, and do not ask the user to type Gensee lifecycle commands.",
             reason = reason.label()

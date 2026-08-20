@@ -7396,6 +7396,25 @@ fn external_mutation_requires_brokered_commit_capabilities() {
         .as_array()
         .unwrap()
         .contains(&json!("external_mutation")));
+    assert_eq!(finding.action, PolicyAction::Block);
+    assert_eq!(finding.severity, "high");
+    assert!(finding
+        .message
+        .contains("workspace fork alone cannot roll back"));
+}
+
+#[test]
+fn external_mutation_remains_blocked_inside_a_fork() {
+    let payload = pretool_bash_payload("s1", "/repo", "psql -c 'DROP TABLE users'");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let finding = fork_suggestion_finding(&event, &[], Some("run_123_fork_456_0")).unwrap();
+
+    assert_eq!(finding.action, PolicyAction::Block);
+    assert_eq!(
+        finding.evidence["capability_request"]["effect_scope"],
+        "external"
+    );
 }
 
 #[test]

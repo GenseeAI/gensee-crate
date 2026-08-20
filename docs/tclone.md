@@ -153,7 +153,9 @@ runs, matching user prompts add fork guidance before planning; matching source
 commands are blocked as a backstop so Codex can ask for a fork and continue the
 work there. The live-cloned Codex turn continues the original approved task
 automatically; the source does not resend the prompt. Forked Codex runs are
-allowed to execute the command.
+allowed to execute reversible local commands. Requests classified as external
+mutations remain blocked inside forks because a workspace fork cannot roll back
+an external effect; those require a brokered commit path.
 Use the same `gensee-tclone` wrapper for `run list`, `run fork`, `run shell`,
 `run attach`, `run send`, `run exec`, `run merge`, `run switch`, and cleanup;
 otherwise Gensee may read the source record but look in a different Podman store
