@@ -1001,7 +1001,16 @@ final class ConsoleModel: ObservableObject {
             beginHarnessVerification(provider)
         }
         runningCommand = "\(enabled ? "Enabling" : "Disabling") \(integration.name) protection"
-        defer { runningCommand = nil }
+        var shouldOpenHookApproval = false
+        defer {
+            runningCommand = nil
+            if shouldOpenHookApproval {
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    self?.openCodexHookReview()
+                }
+            }
+        }
         do {
             var arguments = ["setup", provider]
             if enabled {
@@ -1021,6 +1030,8 @@ final class ConsoleModel: ObservableObject {
             noticeMessage = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
             await refreshIntegrationsWithCurrentBackend()
             configureEndpointSensor()
+            shouldOpenHookApproval = enabled
+                && HarnessActivationGuidance.requiresInteractiveHookApproval(provider: provider)
         } catch {
             if let currentIndex = integrations.firstIndex(where: { $0.id == provider }) {
                 integrations[currentIndex].configured = previousValue
@@ -1049,7 +1060,16 @@ final class ConsoleModel: ObservableObject {
         }
 
         runningCommand = "Repairing \(integration.name) protection"
-        defer { runningCommand = nil }
+        var shouldOpenHookApproval = false
+        defer {
+            runningCommand = nil
+            if shouldOpenHookApproval {
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    self?.openCodexHookReview()
+                }
+            }
+        }
         let previousVerified = verifiedIntegrationIDs.contains(provider)
         let previousBaseline = harnessVerificationBaselines[provider]
         do {
@@ -1079,6 +1099,8 @@ final class ConsoleModel: ObservableObject {
                 noticeMessage = detail.isEmpty
                     ? "\(integration.name) protection was repaired."
                     : detail
+                shouldOpenHookApproval = HarnessActivationGuidance
+                    .requiresInteractiveHookApproval(provider: provider)
             }
         } catch {
             restoreHarnessVerification(
@@ -1140,9 +1162,11 @@ final class ConsoleModel: ObservableObject {
 
     func enableAllInstalledIntegrations() async {
         guard !isDemoMode else { return }
-        let providers = integrations
-            .filter { $0.installed && $0.supportsDirectHooks && !$0.isHealthy }
-            .map(\.id)
+        let providers = HarnessActivationGuidance.setupOrder(
+            integrations
+                .filter { $0.installed && $0.supportsDirectHooks && !$0.isHealthy }
+                .map(\.id)
+        )
         for provider in providers {
             guard let integration = integrations.first(where: { $0.id == provider }) else { continue }
             if integration.requiresRepair {

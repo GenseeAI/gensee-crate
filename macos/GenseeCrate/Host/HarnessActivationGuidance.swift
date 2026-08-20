@@ -8,6 +8,15 @@ struct HarnessActivationInstruction: Equatable {
 }
 
 enum HarnessActivationGuidance {
+    static func requiresInteractiveHookApproval(provider: String) -> Bool {
+        provider == "codex"
+    }
+
+    static func setupOrder(_ providers: [String]) -> [String] {
+        providers.filter { !requiresInteractiveHookApproval(provider: $0) }
+            + providers.filter { requiresInteractiveHookApproval(provider: $0) }
+    }
+
     static func instruction(for provider: String) -> HarnessActivationInstruction {
         switch provider {
         case "codex":

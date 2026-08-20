@@ -39,6 +39,24 @@ final class HarnessActivationGuidanceTests: XCTestCase {
         XCTAssertEqual(instruction.actionTitle, "Open Codex Hook Review")
     }
 
+    func testOnlyCodexRequiresInteractiveHookApproval() {
+        XCTAssertTrue(
+            HarnessActivationGuidance.requiresInteractiveHookApproval(provider: "codex")
+        )
+        for provider in ["claude-code", "antigravity", "cursor", "vscode", "omnigent"] {
+            XCTAssertFalse(
+                HarnessActivationGuidance.requiresInteractiveHookApproval(provider: provider)
+            )
+        }
+    }
+
+    func testBulkSetupRunsInteractiveApprovalHarnessLast() {
+        XCTAssertEqual(
+            HarnessActivationGuidance.setupOrder(["codex", "claude-code", "cursor"]),
+            ["claude-code", "cursor", "codex"]
+        )
+    }
+
     func testOmnigentExplainsManagedLaunch() {
         let instruction = HarnessActivationGuidance.instruction(for: "omnigent")
         XCTAssertTrue(instruction.detail.contains("gensee run"))
