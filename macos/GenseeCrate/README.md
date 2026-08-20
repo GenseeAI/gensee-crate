@@ -271,7 +271,7 @@ release script from the repository root with the version declared as
 `MARKETING_VERSION` in `project.yml`:
 
 ```bash
-NOTARYTOOL_PROFILE=gensee-crate ./scripts/release_macos_app.sh 0.2.4
+NOTARYTOOL_PROFILE=gensee-crate ./scripts/release_macos_app.sh 0.3.0
 ```
 
 The script builds the host, system extension, and embedded Rust CLI for both

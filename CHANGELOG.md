@@ -11,6 +11,41 @@ changes.
 Use this section for user-visible changes after the initial open-source
 release.
 
+## 0.3.0 - 2026-08-20
+
+### Added
+
+- Added a developer-focused Review Queue that groups completed agent work by
+  harness, session, and request, with request-scoped timelines, findings, file
+  touches, test evidence, elapsed time, and decisions in one place.
+- Added smart Git-backed recovery points with per-harness Auto, Ask, and Off
+  modes, one recovery point before the first risky mutation, safe restore with
+  a rescue point, and configurable retention and failure behavior.
+- Added actionable native and menu-bar notifications for work that needs
+  attention across Codex, Claude Code, Cursor, and other supported harnesses.
+- Added a realistic, read-only product demo that stays active while navigating
+  the app and does not modify the Mac.
+
+### Changed
+
+- Reworked the macOS app around outcomes that require a developer decision:
+  scope drift, stale verification, blocked actions, and high-risk activity.
+- Request details now load complete evidence by request ID instead of relying
+  on bounded dashboard snapshots; answer-only turns show a clear lifecycle
+  rather than an empty timeline.
+- File activity now distinguishes declared and OS-verified mutations,
+  undeclared effects, and ignored harness or temporary bookkeeping.
+- Simplified navigation, review actions, findings grouping, search, loading
+  feedback, configuration-audit presentation, and harness readiness states.
+
+### Fixed
+
+- Hardened recovery-point locking, cleanup, relocation, retention, and restore
+  behavior while preserving the active branch, index, and ignored files.
+- Fixed stale or missing request details, duplicate audit findings, file-touch
+  attribution gaps, notification delivery, menu-bar deep links, dashboard
+  refresh recovery, and Rust stable-channel lint compatibility.
+
 ## 0.2.0 - 2026-07-21
 
 ### Added
