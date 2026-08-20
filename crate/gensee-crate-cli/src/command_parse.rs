@@ -370,8 +370,8 @@ pub(crate) fn build_hook_event(payload: &str, provider: &str) -> io::Result<Agen
             raw_json: redact_text(payload),
         });
     };
-    let run_id = env::var("GENSEE_RUN_ID")
-        .ok()
+    let run_id = tclone_context_run_id()
+        .or_else(|| env::var("GENSEE_RUN_ID").ok())
         .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok());
     record_hook_run_id(&mut value, run_id.as_deref());
 

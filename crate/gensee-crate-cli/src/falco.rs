@@ -3,7 +3,7 @@ use std::fmt;
 
 const FALCO_SOURCE: &str = "linux-falco";
 const MIN_CONTAINER_ID_PREFIX_LEN: usize = 12;
-const FALCO_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const FALCO_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct TcloneRunRegistryCache {
@@ -41,6 +41,7 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
         .or_else(|| env::var("HOSTNAME").ok())
         .filter(|value| !value.trim().is_empty());
     let store = EventStore::default_local()?;
+    start_falco_retention_worker(store.clone());
     let stdin = io::stdin();
     let mut count = 0_u64;
     let mut rejected = 0_u64;
@@ -49,8 +50,6 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
     let mut input_error_active = false;
     let mut registry_error_active = false;
     let mut store_error_active = false;
-    let mut retention_error_active = false;
-    let mut last_retention_check = None;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -96,26 +95,6 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
                     Ok(()) => {
                         store_error_active = false;
                         count += 1;
-                        if last_retention_check.is_none_or(|last: Instant| {
-                            last.elapsed() >= FALCO_RETENTION_CHECK_INTERVAL
-                        }) {
-                            let recording =
-                                Policy::load_current().document().endpoint_security.clone();
-                            match store.prune_endpoint_retention_if_due(
-                                ingested_at_ms,
-                                FALCO_RETENTION_CHECK_INTERVAL.as_millis() as u64,
-                                recording.raw_event_retention_hours,
-                                recording.max_raw_events,
-                                recording.low_severity_retention_hours,
-                            ) {
-                                Ok(_) => retention_error_active = false,
-                                Err(error) => log_falco_error_once(
-                                    &mut retention_error_active,
-                                    format_args!("retention maintenance failed: {error}"),
-                                ),
-                            }
-                            last_retention_check = Some(Instant::now());
-                        }
                     }
                     Err(error) => {
                         rejected += 1;
@@ -137,6 +116,36 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
         "gensee: ingested {count} Falco event(s), rejected {rejected}, attribution failures {attribution_failures}"
     );
     Ok(())
+}
+
+fn start_falco_retention_worker(store: EventStore) {
+    let _ = thread::spawn(move || {
+        let mut error_active = false;
+        loop {
+            match unix_millis() {
+                Ok(now_ms) => {
+                    let recording = Policy::load_current().document().endpoint_security.clone();
+                    match store.prune_falco_retention_if_due(
+                        now_ms,
+                        FALCO_RETENTION_CHECK_INTERVAL.as_millis() as u64,
+                        recording.raw_event_retention_hours,
+                        recording.max_raw_events,
+                    ) {
+                        Ok(_) => error_active = false,
+                        Err(error) => log_falco_error_once(
+                            &mut error_active,
+                            format_args!("retention maintenance failed: {error}"),
+                        ),
+                    }
+                }
+                Err(error) => log_falco_error_once(
+                    &mut error_active,
+                    format_args!("retention clock failed: {error}"),
+                ),
+            }
+            thread::sleep(FALCO_RETENTION_CHECK_INTERVAL);
+        }
+    });
 }
 
 fn log_falco_error_once(active: &mut bool, message: fmt::Arguments<'_>) {
@@ -457,6 +466,7 @@ mod tests {
             container_workspace: "/workspace".to_string(),
             container_home: "/home/gensee".to_string(),
             agent_cmd: vec!["codex".to_string()],
+            path_prefixes: Vec::new(),
             fork_base_git_head: None,
             fork_base_overlay_lowerdir: None,
             fork_overlay_upperdir: None,

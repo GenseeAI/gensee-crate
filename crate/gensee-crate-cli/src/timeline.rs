@@ -87,8 +87,10 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
         .raw_event_retention_hours;
     let now_ms = unix_millis()?;
     let native_min_ms = now_ms.saturating_sub(native_retention.saturating_mul(60 * 60 * 1_000));
+    let native_session_id = timeline_native_session_id(&filter, &sessions, &hooks);
     let mut system_events = timeline_system_events(
         &store,
+        native_session_id.as_deref(),
         i64::try_from(native_min_ms).unwrap_or(i64::MAX),
         i64::try_from(now_ms).unwrap_or(i64::MAX),
         TIMELINE_NATIVE_SYSTEM_EVENT_LIMIT,
@@ -448,6 +450,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
 
 pub(crate) fn timeline_system_events(
     store: &EventStore,
+    session_id: Option<&str>,
     min_observed_at_ms: i64,
     max_observed_at_ms: i64,
     limit: usize,
@@ -455,11 +458,24 @@ pub(crate) fn timeline_system_events(
     let mut events = store.list_system_events()?;
     let mut keys = events
         .iter()
-        .map(system_event_dedup_key)
+        .filter_map(|event| system_event_dedup_key(event, None))
         .collect::<HashSet<_>>();
-    for stored in store.list_native_system_events(min_observed_at_ms, max_observed_at_ms, limit)? {
+    for stored in store.list_native_system_events(
+        session_id,
+        min_observed_at_ms,
+        max_observed_at_ms,
+        limit,
+    )? {
+        let sqlite_event_id = stored.event_id;
         match stored_system_event_for_timeline(stored) {
-            Ok(event) if keys.insert(system_event_dedup_key(&event)) => events.push(event),
+            Ok(event)
+                if keys.insert(
+                    system_event_dedup_key(&event, Some(sqlite_event_id))
+                        .expect("SQLite system events always have a row id"),
+                ) =>
+            {
+                events.push(event)
+            }
             Ok(_) => {}
             Err(error) => {
                 eprintln!("gensee: skipping unreadable SQLite system event: {error}");
@@ -495,13 +511,25 @@ pub(crate) fn stored_system_event_for_timeline(
     Ok(event)
 }
 
-fn system_event_dedup_key(event: &SystemEvent) -> (String, u64, Option<u32>, Option<String>) {
-    (
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SystemEventDedupId {
+    Collector(String),
+    Sqlite(i64),
+}
+
+fn system_event_dedup_key(
+    event: &SystemEvent,
+    sqlite_event_id: Option<i64>,
+) -> Option<(String, u64, Option<u32>, SystemEventDedupId)> {
+    let event_id = system_event_id(event)
+        .map(SystemEventDedupId::Collector)
+        .or_else(|| sqlite_event_id.map(SystemEventDedupId::Sqlite))?;
+    Some((
         event.source.clone(),
         event.observed_at_ms,
         event.pid,
-        system_event_id(event),
-    )
+        event_id,
+    ))
 }
 
 fn system_event_id(event: &SystemEvent) -> Option<String> {
@@ -586,6 +614,7 @@ mod native_system_event_tests {
         })
         .to_string();
         let stored = StoredSystemEvent {
+            event_id: 1,
             source: "linux-falco".to_string(),
             event_type: "connect".to_string(),
             observed_at_ms: 123,
@@ -623,7 +652,7 @@ mod native_system_event_tests {
         store.append_system_event(&event).unwrap();
 
         assert!(store.list_system_events().unwrap().is_empty());
-        let events = timeline_system_events(&store, i64::MIN, i64::MAX, 100).unwrap();
+        let events = timeline_system_events(&store, None, i64::MIN, i64::MAX, 100).unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source, "linux-falco");
@@ -633,6 +662,31 @@ mod native_system_event_tests {
             Some("10.20.0.2:8082")
         );
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn session_query_filters_before_native_event_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "gensee-timeline-native-session-limit-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let store = EventStore::new(&root).unwrap();
+        let first = attributed_event("run_1");
+        let mut newer = attributed_event("run_2");
+        newer.observed_at_ms = 200;
+        newer.raw_json = json!({"session_id": "run_2", "event_id": "falco-2"}).to_string();
+        store.append_system_event(&first).unwrap();
+        store.append_system_event(&newer).unwrap();
+
+        let events = timeline_system_events(&store, Some("run_1"), i64::MIN, i64::MAX, 1).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            system_event_session_id(&events[0]).as_deref(),
+            Some("run_1")
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -655,6 +709,7 @@ mod native_system_event_tests {
         })
         .to_string();
         let stored = StoredSystemEvent {
+            event_id: 1,
             source: "macos-endpoint-security".to_string(),
             event_type: "write".to_string(),
             observed_at_ms: 123,
@@ -676,8 +731,20 @@ mod native_system_event_tests {
             json!({"session_id": "run_1", "event_id": "falco-1", "extra": true}).to_string();
 
         assert_eq!(
-            system_event_dedup_key(&first),
-            system_event_dedup_key(&second)
+            system_event_dedup_key(&first, None),
+            system_event_dedup_key(&second, None)
+        );
+    }
+
+    #[test]
+    fn sqlite_row_id_keeps_pre_event_id_falco_events_distinct() {
+        let mut first = attributed_event("run_1");
+        first.raw_json = json!({"session_id": "run_1"}).to_string();
+        let second = first.clone();
+
+        assert_ne!(
+            system_event_dedup_key(&first, Some(10)),
+            system_event_dedup_key(&second, Some(11))
         );
     }
 
@@ -722,6 +789,33 @@ struct TimelineCollections<'a> {
     alerts: &'a mut Vec<AlertRecord>,
 }
 
+fn timeline_native_session_id(
+    filter: &TimelineFilter,
+    sessions: &[AgentSession],
+    hooks: &[AgentHookEvent],
+) -> Option<String> {
+    match filter {
+        TimelineFilter::Session(session_id) => Some(session_id.clone()),
+        TimelineFilter::Latest => {
+            let session_candidates = sessions.iter().map(|session| {
+                (
+                    session.ended_at_ms.unwrap_or(session.started_at_ms),
+                    session.session_id.clone(),
+                )
+            });
+            let hook_candidates = hooks.iter().filter_map(|hook| {
+                let run_id = hook_run_id(hook).or_else(|| hook.session_id.clone())?;
+                Some((hook.observed_at_ms, run_id))
+            });
+            session_candidates
+                .chain(hook_candidates)
+                .max_by_key(|(observed_at_ms, _)| *observed_at_ms)
+                .map(|(_, session_id)| session_id)
+        }
+        TimelineFilter::All | TimelineFilter::Path(_) => None,
+    }
+}
+
 impl TimelineFilter {
     pub(crate) fn parse(args: &[OsString]) -> io::Result<Self> {
         if args.is_empty() {
@@ -756,13 +850,21 @@ impl TimelineFilter {
                 ) else {
                     return;
                 };
+                let system_event_session_id = collections
+                    .tool_calls
+                    .iter()
+                    .filter(|call| call.session_id.as_deref() == Some(session_id.as_str()))
+                    .filter_map(|call| Some((call.last_observed_at_ms()?, call.run_id.clone()?)))
+                    .max_by_key(|(observed_at_ms, _)| *observed_at_ms)
+                    .map(|(_, run_id)| run_id)
+                    .unwrap_or_else(|| session_id.clone());
                 keep_prompt_session(collections.user_prompts, &session_id);
                 keep_response_session(collections.assistant_responses, &session_id);
                 keep_session(collections.tool_calls, &session_id);
                 collections
                     .sessions
                     .retain(|session| session.session_id == session_id);
-                keep_system_event_session(collections.system_events, &session_id);
+                keep_system_event_session(collections.system_events, &system_event_session_id);
                 collections
                     .workspace_effects
                     .retain(|effect| effect.session_id.as_deref() == Some(session_id.as_str()));
@@ -855,7 +957,9 @@ pub(crate) fn keep_response_session(
 }
 
 pub(crate) fn keep_session(tool_calls: &mut Vec<AgentToolCall>, session_id: &str) {
-    tool_calls.retain(|call| call.session_id.as_deref() == Some(session_id));
+    tool_calls.retain(|call| {
+        call.session_id.as_deref() == Some(session_id) || call.run_id.as_deref() == Some(session_id)
+    });
 }
 
 pub(crate) fn keep_alert_sessions(alerts: &mut Vec<AlertRecord>, session_id: &str) {
