@@ -31,6 +31,7 @@
     gensee file mutation evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
     proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
     file_path=%fd.name path=%evt.arg.path name=%evt.arg.name oldpath=%evt.arg.oldpath
+    filename=%evt.arg.filename pathname=%evt.arg.pathname target=%evt.arg.target linkpath=%evt.arg.linkpath
     cgroups=%thread.cgroups evt_args=%evt.args
   priority: INFORMATIONAL
   tags: [gensee, trajectory, file, mutation]
