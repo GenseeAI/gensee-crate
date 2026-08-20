@@ -10,28 +10,28 @@ enum ProtectionLevel: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .observe: "Observe"
-        case .guarded: "Guarded"
-        case .unattended: "Unattended"
+        case .observe: "Fast"
+        case .guarded: "Review"
+        case .unattended: "Sensitive"
         }
     }
 
     var tagline: String {
         switch self {
-        case .observe: "See what agents do before adding OS enforcement."
-        case .guarded: "Stop configured high-confidence risks; keep asks interactive."
-        case .unattended: "Fail closed instead of waiting for you to approve an ask."
+        case .observe: "Let agents work; interrupt only through your existing high-confidence hook rules."
+        case .guarded: "Ask before broad or sensitive changes and enforce protected targets at the OS layer."
+        case .unattended: "Tightly control reads, writes, and execution; stop risky work instead of waiting."
         }
     }
 
     var detail: String {
         switch self {
         case .observe:
-            "Endpoint Security records managed-agent activity but does not deny it. Harness hooks still apply the decision rules in your policy, including any existing ask or block actions."
+            "Harness hooks continue to stop configured dangerous actions. Endpoint Security independently records managed-agent activity but does not add OS authorization prompts."
         case .guarded:
-            "Endpoint Security authorizes configured protected paths and executables. Ambiguous hook decisions can still ask you before the harness continues."
+            "Endpoint Security enforces configured protected paths and executables. Recovery points default to Auto, and ambiguous hook decisions can ask before the harness continues."
         case .unattended:
-            "Strict OS protection is enabled and medium-or-higher ask decisions become deny. This removes approval waits by stopping the risky operation instead."
+            "Strict OS protection is enabled and medium-or-higher ask decisions become deny. This is intended for sensitive repositories and unattended work."
         }
     }
 

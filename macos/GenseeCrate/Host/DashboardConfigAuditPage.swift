@@ -131,6 +131,33 @@ struct HarnessConfigAuditPanel: View {
 
     private func summary(_ bundle: ConfigAuditBundle) -> some View {
         VStack(alignment: .leading, spacing: 10) {
+            if let drift = model.configAuditDrift {
+                HStack(spacing: 10) {
+                    DashboardSymbol(
+                        drift.hasChanges ? "arrow.triangle.2.circlepath" : "checkmark.circle",
+                        color: drift.hasChanges ? .dashboardGold : .dashboardGreen,
+                        size: 13
+                    )
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(drift.hasChanges ? "Configuration drift detected" : "No changes since the previous audit")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("\(drift.addedFindingCount) new findings · \(drift.resolvedFindingCount) resolved · \(drift.changedSourceCount) configuration sources changed")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text("Compared with the last \(targetName) audit")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(11)
+                .background((drift.hasChanges ? Color.dashboardGold : Color.dashboardGreen).opacity(0.07), in: RoundedRectangle(cornerRadius: 6))
+            } else {
+                Label("Baseline saved. The next audit will highlight new findings, resolved findings, and changed configuration sources.", systemImage: "bookmark")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4), spacing: 12) {
                 DashboardStatCard(
                     title: "Findings",

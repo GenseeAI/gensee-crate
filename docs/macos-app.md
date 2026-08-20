@@ -12,14 +12,21 @@ console.
 
 ## What the app manages
 
-- Dashboard, activity, alerts, lineage, and policy backed by the existing
-  Rust CLI and local store.
+- A decision-first **Status** page and **Review Queue** backed by the existing
+  Rust CLI and local store. Requests are classified as Verified, Review
+  recommended, Needs attention, or Incomplete evidence.
 - A **Daily Highlight** view with today's summary and rolling 53-week heatmaps
   for agent turns, tool calls, alerts, and captured token usage. Selecting a
   day in any heatmap updates the summary above it.
-- A nested **Work Review** that expands sessions into user requests and paired
+- A nested **Review Queue** that expands sessions into user requests and paired
   tool calls, with parallel/sequential grouping, execution durations, affected
-  files, policy outcomes, and expandable inputs and results.
+  files, grouped policy decisions, and expandable inputs and evidence. It
+  promotes undeclared or sensitive changes and flags verification evidence that
+  predates a later file mutation.
+- A cross-session **Watchlist** for control-plane, agent-memory, and persistent
+  targets, with the full relationship graph retained as a provenance drill-down.
+- A menu-bar status window for sensor health, pending reviews, and the latest
+  request.
 - Installation, status, and removal of the signed Endpoint Security system
   extension.
 - A replayable first-launch setup assistant that prepares the embedded backend,
@@ -31,9 +38,10 @@ console.
 - Harness protection for Codex, Claude Code, Antigravity, Cursor, GitHub
   Copilot, and Omnigent.
 - Per-harness Config Audit actions backed by the shared OSS Rust audit library
-  for static, read-only review of Codex and VS Code/Copilot configuration.
+  for static, read-only review of Codex and VS Code/Copilot configuration,
+  including a saved local baseline and drift from the previous audit.
 - Per-harness smart recovery points, created automatically or with approval
-  before risky changes and restored from the relevant Work Review.
+  before risky changes and restored from the relevant Review Queue item.
 
 ## First-launch setup
 
@@ -44,14 +52,16 @@ On first launch, the setup assistant:
    hook files.
 2. Initializes the encrypted local event store and writes an editable default
    policy to `~/.gensee/policy.json`.
-3. Guides the user through Endpoint Security approval and Full Disk Access.
-   These are Apple-controlled approvals and cannot be silently granted by the
-   app.
-4. Scans Codex, Claude Code, Antigravity, Cursor, GitHub Copilot for VS Code,
+3. Establishes smart-recovery behavior and a read-only Config Audit baseline,
+   so the app demonstrates value before requesting broad Apple permissions.
+4. Guides the user through optional Endpoint Security approval and Full Disk
+   Access. These are Apple-controlled approvals and cannot be silently granted
+   by the app.
+5. Scans Codex, Claude Code, Antigravity, Cursor, GitHub Copilot for VS Code,
    and Omnigent, leaving unavailable harnesses visible but disabled.
-5. Offers individual setup or **Enable All Installed** for direct-hook
+6. Offers individual setup or **Enable All Installed** for direct-hook
    harnesses and provides the required reload step for each provider.
-6. Waits for a real post-setup harness event before showing that integration as
+7. Waits for a real post-setup harness event before showing that integration as
    **Protected**.
 
 Codex requires separate review for non-managed command hooks. **Open Codex Hook
@@ -73,6 +83,10 @@ expandable with file-level evidence and remediation; Inventory, Sources, and
 Manual Checks retain the same versioned report content as `gensee audit --json`.
 Harnesses without a static audit adapter show a disabled **Audit
 Config** action marked **Coming soon**.
+
+Each completed audit becomes the local baseline for that target. The next run
+shows new and resolved findings plus configuration sources that changed, so the
+developer reviews drift instead of rereading the entire report.
 
 The app invokes its embedded `gensee` backend. The audit bounds file size and
 directory depth and never launches agents, extensions, hooks, skills, MCP
@@ -147,7 +161,7 @@ normal commit, or alter the user's staging index. Tracked and untracked
 non-ignored files are included. Retention and failure fallback are configured
 under **Settings**.
 
-Work Review displays **Recovery point created before changes** on the matching
+Review Queue displays **Recovery point created before changes** on the matching
 request. Restore is intentionally two-step: the app explains the affected
 scope and requires **Create Rescue & Restore**; the backend also requires
 `--yes`. Before changing the workspace, Gensee creates a rescue checkpoint of

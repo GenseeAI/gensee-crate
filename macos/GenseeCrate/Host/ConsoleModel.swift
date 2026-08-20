@@ -13,6 +13,8 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var requestReviewPayload: RequestReviewPayload?
     @Published private(set) var requestReviewLoadState = RequestReviewLoadState.idle
     @Published private(set) var configAudit: ConfigAuditBundle?
+    @Published private(set) var configAuditDrift: ConfigAuditDrift?
+    @Published private(set) var configAuditHistory: [ConfigAuditHistoryEntry] = []
     @Published private(set) var auditedIntegrationIDs: Set<String> = []
     @Published private(set) var verifiedIntegrationIDs: Set<String> = []
     @Published private(set) var recoveryPointSettings = RecoveryPointSettings()
@@ -22,11 +24,14 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var runningCommand: String?
     @Published private(set) var feedbackAlertID: Int64?
     @Published private(set) var readAlertIDs: Set<Int64> = []
+    @Published private(set) var acknowledgedReviewSignals: [Int64: String] = [:]
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var dashboardRefreshIssue: String?
     @Published private(set) var isDemoMode = false
     @Published var errorMessage: String?
     @Published var noticeMessage: String?
+    @Published var requestedDashboardDestination: DashboardDestination?
+    @Published var requestedReviewRequestID: Int64?
 
     let homeURL: URL
     let endpointSensor: EndpointSecuritySensor
@@ -39,6 +44,13 @@ final class ConsoleModel: ObservableObject {
     private var lastDashboardRefreshDuration: TimeInterval = 0
     private var snapshotBeforeDemo = SecuritySnapshot()
     private var dismissedPendingRecoveryIDs: Set<String> = []
+    private var endpointSessionRecords: [AgentSessionRecord] = []
+    private var hasLoadedEndpointSessionRecords = false
+    private var endpointRootsRefreshInProgress = false
+    private var lastEndpointSessionsModificationDate: Date?
+    private var completionRefreshInProgress = false
+    private var lastCompletionSignalModificationDate: Date?
+    private var lastCompletionRequestID: Int64 = 0
 
     init() {
         let environmentHome = ProcessInfo.processInfo.environment["GENSEE_HOME"]
@@ -51,12 +63,14 @@ final class ConsoleModel: ObservableObject {
         verifiedIntegrationIDs = Self.loadVerifiedIntegrationIDs(homeURL: resolvedHome)
         harnessVerificationBaselines = Self.loadHarnessVerificationBaselines(homeURL: resolvedHome)
         readAlertIDs = Self.loadReadAlertIDs(homeURL: resolvedHome)
+        acknowledgedReviewSignals = Self.loadAcknowledgedReviewSignals(homeURL: resolvedHome)
         readAlertBaselineCount = UserDefaults.standard.integer(
             forKey: Self.readAlertsBaselineKey(homeURL: resolvedHome)
         )
         readThroughAlertID = Int64(UserDefaults.standard.integer(
             forKey: Self.readAlertsWatermarkKey(homeURL: resolvedHome)
         ))
+        configAuditHistory = Self.loadConfigAuditHistory(homeURL: resolvedHome)
         refreshIntegrations()
         Task { [weak self] in await self?.refreshIntegrationsWithCurrentBackend() }
     }
@@ -92,6 +106,19 @@ final class ConsoleModel: ObservableObject {
         return header != Data("SQLite format 3\0".utf8)
     }
 
+    /// Keep the stable hook executable in ~/.gensee/bin synchronized with the
+    /// backend bundled in the currently running app. Existing harness hook
+    /// files deliberately point at that stable path, so an app update must
+    /// refresh it before new hook events arrive.
+    func refreshStableHookBackendIfNeeded() async {
+        guard !isDemoMode, backendAvailable else { return }
+        do {
+            _ = try await cli.stableHookExecutableURL()
+        } catch {
+            dashboardRefreshIssue = "The bundled Gensee backend could not update the harness runtime: \(error.localizedDescription)"
+        }
+    }
+
     var activeRunCount: Int {
         runs.sessions.filter(\.isActive).count
             + runs.tcloneRuns.filter { $0.status == "running" || $0.status == "active" }.count
@@ -122,6 +149,27 @@ final class ConsoleModel: ObservableObject {
         guard updated.insert(alertID).inserted else { return }
         readAlertIDs = updated
         persistReadAlertState()
+    }
+
+    func reviewNeedsAttention(_ summary: AgentCompletionSummary) -> Bool {
+        guard let fingerprint = summary.attentionFingerprint else { return false }
+        return acknowledgedReviewSignals[summary.requestID] != fingerprint
+    }
+
+    func markReviewHandled(_ summary: AgentCompletionSummary) {
+        guard let fingerprint = summary.attentionFingerprint else { return }
+        acknowledgedReviewSignals[summary.requestID] = fingerprint
+        persistAcknowledgedReviewSignals()
+    }
+
+    func returnReviewToNeedsYou(_ summary: AgentCompletionSummary) {
+        guard acknowledgedReviewSignals.removeValue(forKey: summary.requestID) != nil else { return }
+        persistAcknowledgedReviewSignals()
+    }
+
+    func isReviewHandled(_ summary: AgentCompletionSummary) -> Bool {
+        guard let fingerprint = summary.attentionFingerprint else { return false }
+        return acknowledgedReviewSignals[summary.requestID] == fingerprint
     }
 
     func markAllAlertsRead() {
@@ -173,7 +221,7 @@ final class ConsoleModel: ObservableObject {
             next.noninteractive = try await policyBool("enforcement.noninteractive") ?? next.noninteractive
             next.requireProxy = try await policyBool("egress.require_proxy") ?? next.requireProxy
             next.maxRuntimeSeconds = try await policyInt("runtime.max_runtime_seconds")
-            if let recoveryJSON = try await policyJSON("recovery") as? [String: Any] {
+            if let recoveryJSON = try await optionalPolicyJSON("recovery") as? [String: Any] {
                 var recovery = recoveryPointSettings
                 if let harnesses = recoveryJSON["harnesses"] as? [String: String] {
                     for (provider, value) in harnesses {
@@ -351,6 +399,108 @@ final class ConsoleModel: ObservableObject {
         min(120, max(10, lastDashboardRefreshDuration * 2))
     }
 
+    /// Session lifecycle writes are tiny and happen before harness tool calls.
+    /// Watch their modification time separately from the expensive dashboard
+    /// projection so the system extension receives a new managed root in time
+    /// to observe the request's very first (and sometimes only) command.
+    func refreshEndpointSessionRootsIfNeeded(force: Bool = false) async {
+        guard !isDemoMode, backendAvailable, !endpointRootsRefreshInProgress else { return }
+        let sessionsURL = homeURL.appendingPathComponent("sessions.jsonl")
+        let modificationDate = try? sessionsURL.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        ).contentModificationDate
+        guard force || modificationDate != lastEndpointSessionsModificationDate else { return }
+
+        endpointRootsRefreshInProgress = true
+        defer { endpointRootsRefreshInProgress = false }
+        do {
+            let sessions = try await cli.decode(
+                [AgentSessionRecord].self,
+                arguments: ["endpoint-roots"],
+                timeout: 3
+            )
+            endpointSessionRecords = sessions
+            hasLoadedEndpointSessionRecords = true
+            lastEndpointSessionsModificationDate = modificationDate
+            configureEndpointSensor()
+        } catch {
+            // Keep the last valid roots and retry on the next watch tick. A
+            // transient encrypted-store lock must never clear active roots.
+        }
+    }
+
+    /// Establish a high-water mark after the first full snapshot. Existing
+    /// history must not appear as a burst of new menu items or notifications.
+    func prepareCompletionWatcher() {
+        lastCompletionRequestID = snapshot.requests.map(\.requestID).max() ?? 0
+        let signalURL = homeURL.appendingPathComponent("completion.signal")
+        lastCompletionSignalModificationDate = try? signalURL.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        ).contentModificationDate
+    }
+
+    /// Refresh only request-scoped data after a hook writes completion.signal.
+    /// This avoids the expensive full dashboard projection on the latency-
+    /// sensitive notification and menu-bar path.
+    func refreshRecentCompletionsIfNeeded() async -> Bool {
+        guard !isDemoMode, backendAvailable, !completionRefreshInProgress else { return false }
+        let signalURL = homeURL.appendingPathComponent("completion.signal")
+        let modificationDate = try? signalURL.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        ).contentModificationDate
+        guard let modificationDate,
+              modificationDate != lastCompletionSignalModificationDate
+        else { return false }
+
+        completionRefreshInProgress = true
+        defer { completionRefreshInProgress = false }
+        do {
+            // Give the 500 ms Endpoint Security ingestion loop time to persist
+            // trailing file events before projecting the completed request.
+            try await Task.sleep(for: .milliseconds(1_100))
+            let requestIDs = try await cli.decode(
+                [Int64].self,
+                arguments: ["dashboard-completions", String(lastCompletionRequestID)],
+                timeout: 3
+            )
+            var updated = false
+            for requestID in requestIDs {
+                let payload = try await cli.decode(
+                    RequestReviewPayload.self,
+                    arguments: ["dashboard-request", String(requestID)],
+                    timeout: 5
+                )
+                mergeCompletionPayload(payload)
+                lastCompletionRequestID = max(lastCompletionRequestID, requestID)
+                updated = true
+            }
+            lastCompletionSignalModificationDate = modificationDate
+            if updated {
+                lastUpdated = Date()
+            }
+            return updated
+        } catch {
+            // Retain the old signal date so a transient store lock retries on
+            // the next watch tick instead of losing the completion edge.
+            return false
+        }
+    }
+
+    private func mergeCompletionPayload(_ payload: RequestReviewPayload) {
+        let requestID = payload.request.requestID
+        snapshot.requests.removeAll { $0.requestID == requestID }
+        snapshot.requests.insert(payload.request, at: 0)
+        snapshot.agentEvents.removeAll { $0.requestID == requestID }
+        snapshot.agentEvents.append(contentsOf: payload.agentEvents)
+        snapshot.alerts.removeAll { $0.requestID == requestID }
+        snapshot.alerts.append(contentsOf: payload.alerts)
+
+        if requestReviewPayload?.request.requestID == requestID {
+            requestReviewPayload = payload
+            requestReviewLoadState = .loaded(requestID)
+        }
+    }
+
     func dismissPendingRecoveryRequest() {
         if let id = pendingRecoveryRequest?.id {
             dismissedPendingRecoveryIDs.insert(id)
@@ -496,6 +646,25 @@ final class ConsoleModel: ObservableObject {
                 acceptingExitCodes: [0, 2]
             )
             configAudit = audit
+            let entry = audit.historyEntry()
+            let previous = configAuditHistory.first { $0.target == entry.target }
+            if let previous {
+                let before = Set(previous.findingFingerprints)
+                let after = Set(entry.findingFingerprints)
+                let changedSources = Set(previous.sourceDigests.keys).union(entry.sourceDigests.keys).filter {
+                    previous.sourceDigests[$0] != entry.sourceDigests[$0]
+                }.count
+                configAuditDrift = ConfigAuditDrift(
+                    addedFindingCount: after.subtracting(before).count,
+                    resolvedFindingCount: before.subtracting(after).count,
+                    changedSourceCount: changedSources
+                )
+            } else {
+                configAuditDrift = nil
+            }
+            configAuditHistory.insert(entry, at: 0)
+            configAuditHistory = Array(configAuditHistory.prefix(20))
+            persistConfigAuditHistory()
             if let harnessID = audit.auditedHarnessID {
                 auditedIntegrationIDs.insert(harnessID)
                 persistAuditedIntegrationIDs()
@@ -503,6 +672,21 @@ final class ConsoleModel: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private static func loadConfigAuditHistory(homeURL: URL) -> [ConfigAuditHistoryEntry] {
+        let url = homeURL.appendingPathComponent("config-audit-history.json")
+        guard let data = try? Data(contentsOf: url),
+              let history = try? JSONDecoder().decode([ConfigAuditHistoryEntry].self, from: data)
+        else { return [] }
+        return history.sorted { $0.auditedAt > $1.auditedAt }
+    }
+
+    private func persistConfigAuditHistory() {
+        let url = homeURL.appendingPathComponent("config-audit-history.json")
+        guard let data = try? JSONEncoder().encode(configAuditHistory) else { return }
+        try? FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
     }
 
     func restoreCheckpoint(_ checkpoint: WorkspaceCheckpointRecord, workspace: String) async {
@@ -989,8 +1173,26 @@ final class ConsoleModel: ObservableObject {
         return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
     }
 
+    private func optionalPolicyJSON(_ key: String) async throws -> Any? {
+        // Older policy documents legitimately omit newer optional sections;
+        // Missing data is a compatibility case, not a load failure.
+        do {
+            return try await policyJSON(key)
+        } catch let GenseeCLIError.commandFailed(arguments, output, exitCode) {
+            guard arguments == ["policy", "get", key],
+                  output.localizedCaseInsensitiveContains("key not set") else {
+                throw GenseeCLIError.commandFailed(arguments: arguments, output: output, exitCode: exitCode)
+            }
+            return nil
+        }
+    }
+
     private static func readAlertsKey(homeURL: URL) -> String {
         "gensee.alerts.read.\(homeURL.path)"
+    }
+
+    private static func acknowledgedReviewSignalsKey(homeURL: URL) -> String {
+        "gensee.agent-inbox.handled-signals.\(homeURL.path)"
     }
 
     private static func auditedIntegrationsKey(homeURL: URL) -> String {
@@ -1131,6 +1333,16 @@ final class ConsoleModel: ObservableObject {
         return Set(values.map(\.int64Value))
     }
 
+    private static func loadAcknowledgedReviewSignals(homeURL: URL) -> [Int64: String] {
+        let values = UserDefaults.standard.dictionary(
+            forKey: acknowledgedReviewSignalsKey(homeURL: homeURL)
+        ) ?? [:]
+        return values.reduce(into: [:]) { result, item in
+            guard let requestID = Int64(item.key), let fingerprint = item.value as? String else { return }
+            result[requestID] = fingerprint
+        }
+    }
+
     private func reconcileReadAlertState(alertCount: Int) {
         guard AlertReadState.storeWasReset(
             alertCount: alertCount,
@@ -1156,6 +1368,19 @@ final class ConsoleModel: ObservableObject {
         UserDefaults.standard.set(
             readThroughAlertID,
             forKey: Self.readAlertsWatermarkKey(homeURL: homeURL)
+        )
+    }
+
+    private func persistAcknowledgedReviewSignals() {
+        let retained = acknowledgedReviewSignals
+            .sorted { $0.key > $1.key }
+            .prefix(1_000)
+        acknowledgedReviewSignals = retained.reduce(into: [:]) { result, item in
+            result[item.key] = item.value
+        }
+        UserDefaults.standard.set(
+            Dictionary(uniqueKeysWithValues: retained.map { (String($0.key), $0.value) }),
+            forKey: Self.acknowledgedReviewSignalsKey(homeURL: homeURL)
         )
     }
 
@@ -1423,7 +1648,10 @@ final class ConsoleModel: ObservableObject {
             maxAuthorizationLatencyMS = (endpoint["max_auth_latency_ms"] as? NSNumber)?.uint64Value ?? 10
         }
         let enabledHarnesses = Set(integrations.lazy.filter(\.configured).map(\.id))
-        let roots = snapshot.jsonSessions
+        let sessions = hasLoadedEndpointSessionRecords
+            ? endpointSessionRecords
+            : snapshot.jsonSessions
+        let roots = sessions
             .filter {
                 $0.isActive
                     && $0.rootPID != 0

@@ -11,7 +11,7 @@ struct SetupAssistantView: View {
     @State private var isEnablingAll = false
     @State private var selectedLevel: ProtectionLevel = .observe
 
-    private let stepTitles = ["Start here", "Local runtime", "Mac protection", "Harnesses", "Verify"]
+    private let stepTitles = ["Start here", "Local runtime", "Safety baseline", "Harnesses", "Mac protection", "Verify"]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,8 +25,9 @@ struct SetupAssistantView: View {
                         switch step {
                         case 0: startingPointStep
                         case 1: runtimeStep
-                        case 2: macProtectionStep
+                        case 2: safetyBaselineStep
                         case 3: harnessStep
+                        case 4: macProtectionStep
                         default: verificationStep
                         }
                     }
@@ -54,7 +55,7 @@ struct SetupAssistantView: View {
                 if newStep == 1 {
                     await prepareRuntimeIfNeeded()
                 }
-                if newStep >= 2 {
+                if newStep >= 4 {
                     sensor.start()
                 }
             }
@@ -83,8 +84,8 @@ struct SetupAssistantView: View {
     private var startingPointStep: some View {
         VStack(alignment: .leading, spacing: 20) {
             setupHeading(
-                "Choose how Gensee starts",
-                detail: "Nothing on this page changes your Mac. Explore with synthetic data, or choose a real protection level and continue through the exact permissions it requires."
+                "Start with value, add deeper protection later",
+                detail: "Explore safely, or set up Git-backed recovery and audit your agent configuration before deciding whether to grant Apple security permissions."
             )
 
             Button {
@@ -285,6 +286,81 @@ struct SetupAssistantView: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(Color.dashboardGold)
             }
+        }
+    }
+
+    private var safetyBaselineStep: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            setupHeading(
+                "Get value before granting system access",
+                detail: "Recovery points and configuration audit work without Full Disk Access. They give you an immediate safety net and show what can influence your agents."
+            )
+
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Smart recovery points", systemImage: "arrow.counterclockwise.circle")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("Auto creates one Git-backed recovery point before the first risky or mutating tool call in each request. It does not cover databases, network calls, remote actions, processes, ignored files, or files outside Git.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                ForEach(model.integrations.filter { $0.installed && $0.supportsDirectHooks }) { integration in
+                    HStack {
+                        Text(integration.name).font(.system(size: 11, weight: .medium))
+                        Spacer()
+                        Picker(
+                            "Recovery mode",
+                            selection: Binding(
+                                get: { model.recoveryPointSettings.mode(for: integration.id) },
+                                set: { mode in Task { await model.updateRecoveryPointMode(mode, for: integration.id, showNotice: false) } }
+                            )
+                        ) {
+                            ForEach(RecoveryPointMode.allCases) { Text($0.title).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 190)
+                    }
+                }
+            }
+            .padding(15)
+            .background(Color.dashboardCanvas, in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.dashboardLine))
+
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Configuration audit", systemImage: "checklist.checked")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("Review instructions, skills, MCP servers, hooks, permissions, plugins, and other configuration that can change agent behavior. Audits are read-only.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    if model.integrations.contains(where: { $0.id == "codex" && $0.installed }) {
+                        Button("Audit Codex") {
+                            Task { await model.runConfigAudit(target: "codex", workspace: FileManager.default.homeDirectoryForCurrentUser.path) }
+                        }
+                    }
+                    if model.integrations.contains(where: { $0.id == "vscode" && $0.installed }) {
+                        Button("Audit GitHub Copilot") {
+                            Task { await model.runConfigAudit(target: "vscode", workspace: FileManager.default.homeDirectoryForCurrentUser.path) }
+                        }
+                    }
+                    if let audit = model.configAudit {
+                        DashboardTag(
+                            text: audit.summary.findingCount == 0 ? "No findings" : "\(audit.summary.findingCount) findings",
+                            color: audit.summary.findingCount == 0 ? .dashboardGreen : .dashboardGold
+                        )
+                    }
+                }
+                .controlSize(.small)
+            }
+            .padding(15)
+            .background(Color.dashboardCanvas, in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.dashboardLine))
+
+            Label(
+                "Endpoint Security remains optional on the next protection step. Enable it when you want independent verification of process and file activity.",
+                systemImage: "lock.shield"
+            )
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
         }
     }
 

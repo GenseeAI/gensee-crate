@@ -337,10 +337,79 @@ struct RecordedSession: Decodable, Identifiable {
 struct FileTouchEvidence: Decodable, Equatable, Hashable {
     let path: String
     let intendedAndVerified: Bool
+    let declaredByHarness: Bool
+    let osVerified: Bool
+    let lastObservedAt: Int64?
+    let riskLevel: String?
+    let riskRuleID: String?
+    let isMemoryArtifact: Bool
+    let isPersistentTarget: Bool
+    let isControlPlane: Bool
+
+    var riskLabels: [String] {
+        var labels: [String] = []
+        if isControlPlane { labels.append("Control plane") }
+        if isMemoryArtifact { labels.append("Agent memory") }
+        if isPersistentTarget { labels.append("Persistent target") }
+        if labels.isEmpty, let riskLevel { labels.append(riskLevel.capitalized) }
+        return labels
+    }
+
+    init(
+        path: String,
+        intendedAndVerified: Bool,
+        declaredByHarness: Bool? = nil,
+        osVerified: Bool = true,
+        lastObservedAt: Int64? = nil,
+        riskLevel: String? = nil,
+        riskRuleID: String? = nil,
+        isMemoryArtifact: Bool = false,
+        isPersistentTarget: Bool = false,
+        isControlPlane: Bool = false
+    ) {
+        self.path = path
+        self.intendedAndVerified = intendedAndVerified
+        self.declaredByHarness = declaredByHarness ?? intendedAndVerified
+        self.osVerified = osVerified
+        self.lastObservedAt = lastObservedAt
+        self.riskLevel = riskLevel
+        self.riskRuleID = riskRuleID
+        self.isMemoryArtifact = isMemoryArtifact
+        self.isPersistentTarget = isPersistentTarget
+        self.isControlPlane = isControlPlane
+    }
 
     enum CodingKeys: String, CodingKey {
         case path
         case intendedAndVerified = "intended_and_verified"
+        case declaredByHarness = "declared_by_harness"
+        case osVerified = "os_verified"
+        case lastObservedAt = "last_observed_at"
+        case riskLevel = "risk_level"
+        case riskRuleID = "risk_rule_id"
+        case isMemoryArtifact = "is_memory_artifact"
+        case isPersistentTarget = "is_persistent_target"
+        case isControlPlane = "is_control_plane"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        func decodeFlag(_ key: CodingKeys) -> Bool {
+            if let value = try? values.decode(Bool.self, forKey: key) { return value }
+            if let value = try? values.decode(Int.self, forKey: key) { return value != 0 }
+            return false
+        }
+        path = try values.decode(String.self, forKey: .path)
+        intendedAndVerified = try values.decodeIfPresent(Bool.self, forKey: .intendedAndVerified) ?? false
+        declaredByHarness = try values.decodeIfPresent(Bool.self, forKey: .declaredByHarness)
+            ?? intendedAndVerified
+        osVerified = try values.decodeIfPresent(Bool.self, forKey: .osVerified) ?? true
+        lastObservedAt = try values.decodeIfPresent(Int64.self, forKey: .lastObservedAt)
+        riskLevel = try values.decodeIfPresent(String.self, forKey: .riskLevel)
+        riskRuleID = try values.decodeIfPresent(String.self, forKey: .riskRuleID)
+        isMemoryArtifact = decodeFlag(.isMemoryArtifact)
+        isPersistentTarget = decodeFlag(.isPersistentTarget)
+        isControlPlane = decodeFlag(.isControlPlane)
     }
 }
 
@@ -359,6 +428,7 @@ struct RecordedRequest: Decodable, Identifiable {
     var ignoredFileTouchPathsTruncated = false
     var toolCallCount: Int?
     var alertCount: Int?
+    var decisionCount: Int?
     var highRiskAlertCount: Int?
     var strongestSeverity: String?
     var strongestAction: String?
@@ -380,6 +450,7 @@ struct RecordedRequest: Decodable, Identifiable {
         case ignoredFileTouchPathsTruncated = "ignored_file_touch_paths_truncated"
         case toolCallCount = "tool_call_count"
         case alertCount = "alert_count"
+        case decisionCount = "decision_count"
         case highRiskAlertCount = "high_risk_alert_count"
         case strongestSeverity = "strongest_severity"
         case strongestAction = "strongest_action"
@@ -403,6 +474,7 @@ extension RecordedRequest {
         ignoredFileTouchPathsTruncated = try values.decodeIfPresent(Bool.self, forKey: .ignoredFileTouchPathsTruncated) ?? false
         toolCallCount = try values.decodeIfPresent(Int.self, forKey: .toolCallCount)
         alertCount = try values.decodeIfPresent(Int.self, forKey: .alertCount)
+        decisionCount = try values.decodeIfPresent(Int.self, forKey: .decisionCount)
         highRiskAlertCount = try values.decodeIfPresent(Int.self, forKey: .highRiskAlertCount)
         strongestSeverity = try values.decodeIfPresent(String.self, forKey: .strongestSeverity)
         strongestAction = try values.decodeIfPresent(String.self, forKey: .strongestAction)
@@ -424,6 +496,44 @@ struct ArtifactFact: Decodable, Identifiable {
     let isMemoryArtifact: Int
     let isPersistentTarget: Int
     let isControlPlane: Int
+    let recentUnmatchedEffectCount: Int?
+    let recentCrossSessionWriteCount: Int?
+
+    init(
+        kind: String,
+        uri: String,
+        currentDigest: String?,
+        lastSeenAt: Int64,
+        lastModifiedAt: Int64?,
+        lastModifiedSource: String?,
+        lastModifiedSessionID: String?,
+        riskLevel: String?,
+        riskRuleID: String?,
+        isAgentAuthored: Int,
+        isUnmatchedModified: Int,
+        isMemoryArtifact: Int,
+        isPersistentTarget: Int,
+        isControlPlane: Int,
+        recentUnmatchedEffectCount: Int? = nil,
+        recentCrossSessionWriteCount: Int? = nil
+    ) {
+        self.kind = kind
+        self.uri = uri
+        self.currentDigest = currentDigest
+        self.lastSeenAt = lastSeenAt
+        self.lastModifiedAt = lastModifiedAt
+        self.lastModifiedSource = lastModifiedSource
+        self.lastModifiedSessionID = lastModifiedSessionID
+        self.riskLevel = riskLevel
+        self.riskRuleID = riskRuleID
+        self.isAgentAuthored = isAgentAuthored
+        self.isUnmatchedModified = isUnmatchedModified
+        self.isMemoryArtifact = isMemoryArtifact
+        self.isPersistentTarget = isPersistentTarget
+        self.isControlPlane = isControlPlane
+        self.recentUnmatchedEffectCount = recentUnmatchedEffectCount
+        self.recentCrossSessionWriteCount = recentCrossSessionWriteCount
+    }
 
     var id: String { "\(kind):\(uri)" }
 
@@ -469,6 +579,8 @@ struct ArtifactFact: Decodable, Identifiable {
         case isMemoryArtifact = "is_memory_artifact"
         case isPersistentTarget = "is_persistent_target"
         case isControlPlane = "is_control_plane"
+        case recentUnmatchedEffectCount = "recent_unmatched_effect_count"
+        case recentCrossSessionWriteCount = "recent_cross_session_write_count"
     }
 }
 

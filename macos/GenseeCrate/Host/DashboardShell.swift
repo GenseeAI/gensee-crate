@@ -1,11 +1,11 @@
 import SwiftUI
 
 enum DashboardDestination: String, CaseIterable, Identifiable {
-    case overview = "Overview"
-    case reviews = "Work Review"
+    case overview = "Status"
+    case reviews = "Agent Inbox"
     case today = "Daily Highlight"
     case alerts = "Alerts"
-    case lineage = "Lineage Graph"
+    case lineage = "Watchlist"
     case harnesses = "Harnesses"
     case policy = "Policy"
     case settings = "Settings"
@@ -18,7 +18,7 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
         case .reviews: "doc.text.magnifyingglass"
         case .today: "calendar"
         case .alerts: "exclamationmark.triangle"
-        case .lineage: "point.3.connected.trianglepath.dotted"
+        case .lineage: "eye"
         case .harnesses: "slider.horizontal.3"
         case .policy: "shield"
         case .settings: "gearshape"
@@ -29,10 +29,10 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
 struct DashboardShell: View {
     @ObservedObject var extensionManager: EndpointSecurityExtensionManager
     @ObservedObject var model: ConsoleModel
+    @ObservedObject var notifications: CompletionNotificationCoordinator
     @Binding var showsSetupAssistant: Bool
     @State private var selection: DashboardDestination = .overview
     @State private var searchText = ""
-    @StateObject private var notifications = CompletionNotificationCoordinator()
     @AppStorage("gensee.dashboard.darkMode") private var darkMode = false
 
     var body: some View {
@@ -61,8 +61,19 @@ struct DashboardShell: View {
             }
         }
         .preferredColorScheme(darkMode ? .dark : .light)
+        .onReceive(NotificationCenter.default.publisher(for: .genseeOpenAgentReview)) { notification in
+            guard let requestID = (notification.userInfo?["request_id"] as? NSNumber)?.int64Value else { return }
+            model.requestedReviewRequestID = requestID
+            selection = .reviews
+        }
+        .onChange(of: model.requestedDashboardDestination) { destination in
+            guard let destination else { return }
+            selection = destination
+            model.requestedDashboardDestination = nil
+        }
         .task {
             extensionManager.refreshStatus()
+            await model.refreshStableHookBackendIfNeeded()
             model.endpointSensor.start()
             await notifications.refreshAuthorizationStatus()
             await model.refreshAll()
@@ -85,6 +96,32 @@ struct DashboardShell: View {
             while !Task.isCancelled {
                 await model.refreshPendingRecoveryRequest()
                 try? await Task.sleep(for: .seconds(model.pendingRecoveryPollingSeconds))
+            }
+        }
+        .task {
+            await model.refreshEndpointSessionRootsIfNeeded(force: true)
+            while !Task.isCancelled {
+                // This loop stats one small local file. It launches the
+                // lightweight roots query only when a hook appends a session
+                // lifecycle record, keeping first-tool registration prompt
+                // without repeatedly rebuilding the dashboard snapshot.
+                try? await Task.sleep(for: .milliseconds(200))
+                await model.refreshEndpointSessionRootsIfNeeded()
+            }
+        }
+        .task {
+            // Wait for the initial snapshot so stored history becomes the
+            // completion watermark rather than triggering old notifications.
+            while model.lastUpdated == nil, !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard !Task.isCancelled else { return }
+            model.prepareCompletionWatcher()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(200))
+                if await model.refreshRecentCompletionsIfNeeded(), !model.isDemoMode {
+                    await notifications.process(snapshot: model.snapshot)
+                }
             }
         }
         .alert("Gensee needs attention", isPresented: errorPresented) {
@@ -307,11 +344,11 @@ private struct DashboardSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            navGroup("OVERVIEW", [.overview])
+            navGroup("NOW", [.overview, .reviews])
             separator
-            navGroup("ACTIVITY", [.reviews, .today])
+            navGroup("INSIGHTS", [.today, .lineage])
             separator
-            navGroup("SECURITY", [.alerts, .lineage])
+            navGroup("SECURITY", [.alerts])
             separator
             navGroup("CONFIGURATION", [.harnesses, .policy, .settings])
             Spacer()

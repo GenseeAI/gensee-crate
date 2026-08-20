@@ -1,3 +1,4 @@
+import AppKit
 import Charts
 import SwiftUI
 
@@ -5,12 +6,20 @@ struct DashboardOverviewPage: View {
     @ObservedObject var model: ConsoleModel
     @ObservedObject var sensor: EndpointSecuritySensor
 
+    private var reviews: [AgentCompletionSummary] {
+        AgentCompletionDerivation.summaries(from: model.snapshot)
+    }
+
+    private func issueCount(_ kind: AgentAttentionKind) -> Int {
+        reviews.filter { $0.attentionSignal?.kind == kind && model.reviewNeedsAttention($0) }.count
+    }
+
     var body: some View {
         DashboardPage {
             VStack(alignment: .leading, spacing: 16) {
                 DashboardPageHeader(
-                    "Overview",
-                    description: "Protection health and recent security activity on this Mac."
+                    "Status",
+                    description: "What needs your decision, what is independently verified, and whether protection is healthy."
                 ) {
                     if let updated = model.lastUpdated {
                         Text("Updated \(updated.formatted(.relative(presentation: .named)))")
@@ -54,11 +63,10 @@ struct DashboardOverviewPage: View {
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.dashboardLine))
 
                 HStack(spacing: 16) {
-                    DashboardStatCard(title: "Sessions", value: model.snapshot.summary.sessionsCount, symbol: "rectangle.stack", color: .dashboardBlue)
-                    DashboardStatCard(title: "Requests", value: model.snapshot.summary.requestsCount, symbol: "bubble.left.and.bubble.right", color: .dashboardGreen)
-                    DashboardStatCard(title: "Agent events", value: model.snapshot.summary.agentEventsCount, symbol: "terminal", color: .dashboardGold)
-                    DashboardStatCard(title: "High-risk findings (24 h)", value: model.snapshot.summary.recentHighAlerts, symbol: "exclamationmark.triangle", color: .dashboardRed)
-                        .help("High and critical describe potential impact. The alert action separately shows whether Gensee warned, asked, or blocked.")
+                    DashboardStatCard(title: "Needs you", value: reviews.filter { model.reviewNeedsAttention($0) }.count, symbol: "bell.badge", color: .dashboardRed)
+                    DashboardStatCard(title: "Scope drift", value: issueCount(.scopeDrift), symbol: "arrow.triangle.branch", color: .dashboardGold)
+                    DashboardStatCard(title: "Blocked actions", value: issueCount(.blockedAction), symbol: "hand.raised", color: .dashboardRed)
+                    DashboardStatCard(title: "Clean history", value: reviews.filter { !$0.needsIntervention }.count, symbol: "checkmark.circle", color: .dashboardGreen)
                 }
 
                 HStack(alignment: .top, spacing: 16) {
@@ -66,7 +74,7 @@ struct DashboardOverviewPage: View {
                     SeverityBreakdownCard(summary: model.snapshot.summary).frame(width: 360)
                 }
 
-                DashboardCard("Recent Alerts") {
+                DashboardCard("Recent security findings") {
                     if model.snapshot.alerts.isEmpty {
                         DashboardEmpty(text: "No recent alerts — all clear.", symbol: "checkmark.shield")
                     } else {
@@ -98,11 +106,18 @@ private enum WorkReviewSection: String, CaseIterable, Identifiable {
 }
 
 private enum WorkReviewFilter: String, CaseIterable, Identifiable {
-    case all = "All"
-    case attention = "Needs attention"
-    case findings = "Has findings"
+    case actionNeeded = "Needs you"
+    case all = "All history"
+    case verified = "Clean"
+    case incomplete = "Incomplete evidence"
 
     var id: String { rawValue }
+}
+
+private struct HarnessAttentionCount: Identifiable {
+    let harness: String
+    let count: Int
+    var id: String { harness }
 }
 
 struct DashboardWorkReviewPage: View {
@@ -111,7 +126,19 @@ struct DashboardWorkReviewPage: View {
 
     @State private var selection: WorkReviewSelection?
     @State private var section: WorkReviewSection = .files
-    @State private var filter: WorkReviewFilter = .all
+    @State private var filter: WorkReviewFilter = .actionNeeded
+
+    private var allSummaries: [AgentCompletionSummary] {
+        AgentCompletionDerivation.summaries(from: model.snapshot)
+    }
+
+    private var attentionByHarness: [HarnessAttentionCount] {
+        Dictionary(grouping: allSummaries.filter { model.reviewNeedsAttention($0) }, by: \.harness)
+            .map { HarnessAttentionCount(harness: $0.key, count: $0.value.count) }
+            .sorted { lhs, rhs in
+                lhs.count == rhs.count ? lhs.harness < rhs.harness : lhs.count > rhs.count
+            }
+    }
 
     private var sessions: [AgentSessionSummary] {
         AgentCompletionDerivation.sessionSummaries(from: model.snapshot).compactMap { session in
@@ -140,8 +167,8 @@ struct DashboardWorkReviewPage: View {
     var body: some View {
         VStack(spacing: 0) {
             DashboardPageHeader(
-                "Work Review",
-                description: "Review completed agent sessions and requests with their evidence in context."
+                "Agent Inbox",
+                description: "One place for work that needs you across Codex, Claude, Cursor, and other agents. Clean completions stay in history."
             ) {
                 if let updated = model.lastUpdated {
                     Text("Updated \(updated.formatted(.relative(presentation: .named)))")
@@ -152,11 +179,22 @@ struct DashboardWorkReviewPage: View {
             .padding(.horizontal, 24)
             .padding(.top, 24)
 
+            AgentInboxAttentionBar(counts: attentionByHarness)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+
             Divider()
 
             if sessions.isEmpty {
-                EmptyControlCenterCard(activeRunCount: model.activeRunCount)
+                if filter == .actionNeeded {
+                    AgentInboxClearCard {
+                        filter = .all
+                    }
                     .padding(24)
+                } else {
+                    EmptyControlCenterCard(activeRunCount: model.activeRunCount)
+                        .padding(24)
+                }
                 Spacer()
             } else {
                 HStack(spacing: 0) {
@@ -175,6 +213,14 @@ struct DashboardWorkReviewPage: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear { establishSelection() }
         .onChange(of: sessions.map(\.id)) { _ in establishSelection() }
+        .onChange(of: model.requestedReviewRequestID) { requestID in
+            guard let requestID,
+                  sessions.contains(where: { $0.requests.contains(where: { $0.requestID == requestID }) })
+            else { return }
+            selection = .request(requestID)
+            section = .files
+            model.requestedReviewRequestID = nil
+        }
         .task(id: selectedRequestID) {
             guard let selectedRequestID else { return }
             await model.loadRequestReview(requestID: selectedRequestID)
@@ -185,7 +231,7 @@ struct DashboardWorkReviewPage: View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text("SESSIONS & REQUESTS")
+                    Text("TASKS BY HARNESS")
                         .font(.system(size: 9, weight: .bold))
                         .tracking(0.9)
                         .foregroundStyle(.secondary)
@@ -255,8 +301,9 @@ struct DashboardWorkReviewPage: View {
         let matchesFilter: Bool
         switch filter {
         case .all: matchesFilter = true
-        case .attention: matchesFilter = request.reviewState == .attention
-        case .findings: matchesFilter = request.alertCount > 0
+        case .actionNeeded: matchesFilter = model.reviewNeedsAttention(request)
+        case .verified: matchesFilter = request.reviewState == .verified
+        case .incomplete: matchesFilter = request.reviewState == .incomplete
         }
         return matchesFilter && containsSearch(
             searchText,
@@ -275,6 +322,70 @@ struct DashboardWorkReviewPage: View {
     private func establishSelection() {
         guard resolvedSelection == nil, let request = sessions.first?.requests.first else { return }
         selection = .request(request.requestID)
+    }
+}
+
+private struct AgentInboxAttentionBar: View {
+    let counts: [HarnessAttentionCount]
+
+    var body: some View {
+        HStack(spacing: 10) {
+            DashboardSymbol(
+                counts.isEmpty ? "checkmark.circle.fill" : "bell.badge.fill",
+                color: counts.isEmpty ? .dashboardGreen : .dashboardGold,
+                size: 13,
+                weight: .regular
+            )
+            Text(counts.isEmpty ? "No agent needs you right now" : "Needs you across harnesses")
+                .font(.system(size: 11, weight: .semibold))
+            if counts.isEmpty {
+                Text("Clean work remains available under All history.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(counts) { item in
+                    HStack(spacing: 4) {
+                        Text(item.harness)
+                        Text(item.count.formatted()).fontWeight(.bold)
+                    }
+                    .font(.system(size: 9))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.dashboardGold.opacity(0.11), in: Capsule())
+                }
+            }
+            Spacer()
+            Text("Notifications stay silent for clean completions")
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 12)
+        .frame(minHeight: 38)
+        .background(Color.dashboardPanel, in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.dashboardLine))
+    }
+}
+
+private struct AgentInboxClearCard: View {
+    let showHistory: () -> Void
+
+    var body: some View {
+        DashboardCard {
+            VStack(spacing: 12) {
+                DashboardSymbol("checkmark.circle.fill", color: .dashboardGreen, size: 28, weight: .regular)
+                Text("No agent needs you")
+                    .font(.system(size: 18, weight: .semibold))
+                Text("Gensee found no scope drift, blocked or high-risk activity, or stale verification in completed work.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 520)
+                Button("Browse clean history", action: showHistory)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+            .frame(maxWidth: .infinity, minHeight: 260)
+        }
     }
 }
 
@@ -302,7 +413,7 @@ private struct WorkReviewSessionGroup: View {
                 Button { selection = .session(session.sessionID) } label: {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 6) {
-                            Circle().fill(reviewStateColor(session.reviewState)).frame(width: 7, height: 7)
+                            Circle().fill(session.needsIntervention ? Color.dashboardRed : reviewStateColor(session.reviewState)).frame(width: 7, height: 7)
                             Text(session.harness).font(.system(size: 11, weight: .semibold))
                             Spacer()
                             Text("\(session.requestCount)").font(.system(size: 10, weight: .semibold))
@@ -326,7 +437,7 @@ private struct WorkReviewSessionGroup: View {
                     ForEach(session.requests) { request in
                         Button { selection = .request(request.requestID) } label: {
                             HStack(alignment: .top, spacing: 8) {
-                                Circle().fill(reviewStateColor(request.reviewState)).frame(width: 6, height: 6).padding(.top, 4)
+                                Circle().fill(request.needsIntervention ? Color.dashboardRed : reviewStateColor(request.reviewState)).frame(width: 6, height: 6).padding(.top, 4)
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(request.prompt)
                                         .font(.system(size: 10, weight: selection == .request(request.requestID) ? .semibold : .regular))
@@ -362,10 +473,25 @@ private struct RequestReviewDetail: View {
     @ObservedObject var model: ConsoleModel
     @Binding var section: WorkReviewSection
     @State private var restoreCandidate: WorkspaceCheckpointRecord?
+    @State private var verificationCommandCopied = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            CompletionReviewCard(summary: effectiveSummary)
+            CompletionReviewCard(
+                summary: effectiveSummary,
+                handled: model.isReviewHandled(effectiveSummary)
+            )
+            if effectiveSummary.attentionSignal != nil {
+                ReviewResolutionRow(
+                    summary: effectiveSummary,
+                    handled: model.isReviewHandled(effectiveSummary),
+                    verificationCommandCopied: verificationCommandCopied,
+                    showEvidence: showRecommendedEvidence,
+                    copyVerificationCommand: latestVerificationCommand == nil ? nil : copyLatestVerificationCommand,
+                    markHandled: { model.markReviewHandled(effectiveSummary) },
+                    returnToNeedsYou: { model.returnReviewToNeedsYou(effectiveSummary) }
+                )
+            }
             if let recoveryPoint {
                 RecoveryPointReviewRow(recoveryPoint: recoveryPoint) {
                     restoreCandidate = recoveryPoint
@@ -394,7 +520,9 @@ private struct RequestReviewDetail: View {
                     ReviewFilesPanel(
                         affectedFiles: effectiveSummary.affectedFiles,
                         verifiedFiles: effectiveSummary.verifiedFiles,
+                        declaredOnlyFiles: effectiveSummary.declaredOnlyFiles,
                         unmatchedFiles: effectiveSummary.unmatchedFiles,
+                        sensitiveFiles: effectiveSummary.sensitiveFiles,
                         ignoredFileCount: effectiveSummary.ignoredFiles.count,
                         ignoredEventCountOmitted: effectiveSummary.ignoredFileTouchEventsOmitted,
                         ignoredPathsTruncated: effectiveSummary.ignoredFileTouchPathsTruncated
@@ -434,6 +562,37 @@ private struct RequestReviewDetail: View {
 
     private var recoveryPoint: WorkspaceCheckpointRecord? {
         model.recoveryPointsByRequest[summary.requestID]
+    }
+
+    private var latestVerificationCommand: String? {
+        guard let payload else { return nil }
+        return TimelineDerivation.toolCalls(from: payload.agentEvents)
+            .compactMap(AgentCompletionDerivation.verificationCommand)
+            .last
+    }
+
+    private func showRecommendedEvidence() {
+        switch effectiveSummary.attentionSignal?.kind {
+        case .scopeDrift:
+            section = .files
+        case .blockedAction, .highRiskActivity:
+            section = .findings
+        case .staleVerification:
+            section = .timeline
+        case nil:
+            break
+        }
+    }
+
+    private func copyLatestVerificationCommand() {
+        guard let command = latestVerificationCommand else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+        verificationCommandCopied = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            verificationCommandCopied = false
+        }
     }
 
     private var restorePresented: Binding<Bool> {
@@ -485,6 +644,97 @@ private struct RequestReviewDetail: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(6)
             }
+        }
+    }
+}
+
+private struct ReviewResolutionRow: View {
+    let summary: AgentCompletionSummary
+    let handled: Bool
+    let verificationCommandCopied: Bool
+    let showEvidence: () -> Void
+    let copyVerificationCommand: (() -> Void)?
+    let markHandled: () -> Void
+    let returnToNeedsYou: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            DashboardSymbol(
+                handled ? "checkmark.circle" : signal.systemImage,
+                color: handled ? .dashboardGreen : .dashboardGold,
+                size: 15,
+                weight: .regular
+            )
+            VStack(alignment: .leading, spacing: 3) {
+                Text(handled ? "Marked as reviewed" : recommendedTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(handled ? "This stays in history. New evidence will return it to Needs You." : recommendedDetail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 16)
+            if handled {
+                Button("Return to Needs You", action: returnToNeedsYou)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            } else {
+                if signal.kind == .staleVerification, let copyVerificationCommand {
+                    Button(verificationCommandCopied ? "Command Copied" : "Copy Verification Command", action: copyVerificationCommand)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(verificationCommandCopied)
+                } else {
+                    Button(evidenceButtonTitle, action: showEvidence)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                }
+                Button("Mark Reviewed", action: markHandled)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background((handled ? Color.dashboardGreen : Color.dashboardGold).opacity(0.07), in: RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke((handled ? Color.dashboardGreen : Color.dashboardGold).opacity(0.28))
+        )
+    }
+
+    private var signal: AgentAttentionSignal {
+        summary.attentionSignal ?? AgentAttentionSignal(
+            kind: .highRiskActivity,
+            title: "Review this request",
+            detail: "Review the captured evidence before continuing.",
+            systemImage: "exclamationmark.triangle"
+        )
+    }
+
+    private var recommendedTitle: String {
+        switch signal.kind {
+        case .scopeDrift: "Decide whether the undeclared files belong in this change"
+        case .blockedAction: "Review why Gensee blocked the action before retrying"
+        case .highRiskActivity: "Review the grouped high-risk decision"
+        case .staleVerification: "Run verification again after the final file change"
+        }
+    }
+
+    private var recommendedDetail: String {
+        switch signal.kind {
+        case .scopeDrift: "Open Files to inspect changes outside the harness-declared intent, then restore or keep the work."
+        case .blockedAction: "Open Findings for the policy reason and evidence. Change policy only if this operation should be allowed."
+        case .highRiskActivity: "Open Findings for the affected path, operation, and evidence before accepting the work."
+        case .staleVerification: "Copy the last observed verification command, run it in the workspace, then mark this item reviewed."
+        }
+    }
+
+    private var evidenceButtonTitle: String {
+        switch signal.kind {
+        case .scopeDrift: "Review Files"
+        case .blockedAction, .highRiskActivity: "Review Findings"
+        case .staleVerification: "Review Timeline"
         }
     }
 }
@@ -551,7 +801,9 @@ private struct SessionReviewDetail: View {
                 ReviewFilesPanel(
                     affectedFiles: session.affectedFiles,
                     verifiedFiles: session.verifiedFiles,
+                    declaredOnlyFiles: session.declaredOnlyFiles,
                     unmatchedFiles: session.unmatchedFiles,
+                    sensitiveFiles: session.sensitiveFiles,
                     ignoredFileCount: session.ignoredFiles.count,
                     ignoredEventCountOmitted: session.ignoredFileTouchEventsOmitted,
                     ignoredPathsTruncated: session.ignoredFileTouchPathsTruncated
@@ -639,7 +891,9 @@ private struct ReviewSectionPicker: View {
 private struct ReviewFilesPanel: View {
     let affectedFiles: [String]
     let verifiedFiles: [String]
+    let declaredOnlyFiles: [String]
     let unmatchedFiles: [String]
+    let sensitiveFiles: [FileTouchEvidence]
     let ignoredFileCount: Int
     let ignoredEventCountOmitted: Int
     let ignoredPathsTruncated: Bool
@@ -660,7 +914,7 @@ private struct ReviewFilesPanel: View {
                     )
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
-                    .help("The detailed ignored-event scan is bounded to keep Work Review responsive.")
+                    .help("The detailed ignored-event scan is bounded to keep Agent Inbox responsive.")
                 }
                 if ignoredPathsTruncated {
                     Label(
@@ -669,7 +923,7 @@ private struct ReviewFilesPanel: View {
                     )
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
-                    .help("The ignored-path list is bounded to keep Work Review responsive.")
+                    .help("The ignored-path list is bounded to keep Agent Inbox responsive.")
                 }
                 Divider()
                 if affectedFiles.isEmpty {
@@ -680,21 +934,39 @@ private struct ReviewFilesPanel: View {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(affectedFiles, id: \.self) { path in
                             let verified = verifiedFiles.contains(path)
+                            let declaredOnly = declaredOnlyFiles.contains(path)
                             let unmatched = unmatchedFiles.contains(path)
-                            Label(
-                                abbreviatedPath(path),
-                                systemImage: verified
-                                    ? "checkmark.shield"
-                                    : (unmatched ? "exclamationmark.triangle" : "doc")
-                            )
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(unmatched ? Color.dashboardGold : Color.primary)
+                            let sensitive = sensitiveFiles.first { $0.path == path }
+                            HStack(spacing: 8) {
+                                Label(
+                                    abbreviatedPath(path),
+                                    systemImage: verified
+                                        ? "checkmark.shield"
+                                        : (unmatched
+                                            ? "exclamationmark.triangle"
+                                            : (declaredOnly ? "doc.badge.ellipsis" : "doc"))
+                                )
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(
+                                    unmatched
+                                        ? Color.dashboardGold
+                                        : (declaredOnly ? Color.dashboardBlue : Color.primary)
+                                )
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                Spacer(minLength: 8)
+                                ForEach(sensitive?.riskLabels ?? [], id: \.self) { label in
+                                    DashboardTag(text: label, color: .dashboardRed)
+                                }
+                            }
                             .help(
                                 verified
                                     ? "Declared by the tool and verified by Endpoint Security: \(path)"
                                     : (unmatched
                                         ? "Observed by Endpoint Security outside declared file intent: \(path)"
-                                        : "Observed file touch; intent classification is not available in this summary: \(path)")
+                                        : (declaredOnly
+                                            ? "Reported as changed by the harness; independent OS verification was unavailable: \(path)"
+                                            : "Observed file touch; intent classification is not available in this summary: \(path)"))
                             )
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
@@ -860,16 +1132,54 @@ private struct ReviewFindingsPanel: View {
     let alerts: [SecurityAlert]
     @ObservedObject var model: ConsoleModel
 
+    private var decisions: [ReviewDecisionGroup] {
+        Dictionary(grouping: alerts) {
+            "\($0.ruleID)|\($0.path ?? "")|\($0.action.lowercased())"
+        }
+        .values
+        .compactMap { grouped in
+            guard let representative = grouped.max(by: {
+                NotificationSeverity.rank(for: $0.severity) < NotificationSeverity.rank(for: $1.severity)
+            }) else { return nil }
+            return ReviewDecisionGroup(representative: representative, rawEventCount: grouped.count)
+        }
+        .sorted {
+            let lhs = NotificationSeverity.rank(for: $0.representative.severity)
+            let rhs = NotificationSeverity.rank(for: $1.representative.severity)
+            return lhs == rhs
+                ? $0.representative.createdAt > $1.representative.createdAt
+                : lhs > rhs
+        }
+    }
+
     var body: some View {
         DashboardCard("Findings in this review") {
-            if alerts.isEmpty {
+            if decisions.isEmpty {
                 DashboardEmpty(text: "No findings were correlated with this selection.", symbol: "checkmark.shield")
             } else {
                 VStack(spacing: 0) {
+                    HStack {
+                        Text("\(decisions.count) actionable decision\(decisions.count == 1 ? "" : "s")")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("aggregated from \(alerts.count) raw finding\(alerts.count == 1 ? "" : "s")")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(.bottom, 8)
                     AlertListHeader()
-                    ForEach(alerts) { alert in
+                    ForEach(decisions) { decision in
                         Divider()
-                        ExpandableAlertRow(alert: alert, model: model)
+                        VStack(alignment: .trailing, spacing: 0) {
+                            ExpandableAlertRow(alert: decision.representative, model: model)
+                            if decision.rawEventCount > 1 {
+                                Text("\(decision.rawEventCount) related low-level findings grouped into this decision")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.trailing, 12)
+                                    .padding(.bottom, 5)
+                            }
+                        }
                     }
                 }
             }
@@ -877,16 +1187,24 @@ private struct ReviewFindingsPanel: View {
     }
 }
 
+private struct ReviewDecisionGroup: Identifiable {
+    let representative: SecurityAlert
+    let rawEventCount: Int
+    var id: String { "\(representative.ruleID)|\(representative.path ?? "")|\(representative.action.lowercased())" }
+}
+
 private func reviewStateColor(_ state: AgentReviewState) -> Color {
     switch state {
     case .verified: .dashboardGreen
     case .review: .dashboardGold
     case .attention: .dashboardRed
+    case .incomplete: .secondary
     }
 }
 
 private struct CompletionReviewCard: View {
     let summary: AgentCompletionSummary
+    let handled: Bool
 
     var body: some View {
         DashboardCard {
@@ -897,7 +1215,7 @@ private struct CompletionReviewCard: View {
 
                     VStack(alignment: .leading, spacing: 5) {
                         HStack(spacing: 8) {
-                            Text(summary.reviewState.title)
+                            Text(handled ? "Reviewed" : summary.attentionSignal?.title ?? summary.reviewState.title)
                                 .font(.system(size: 18, weight: .semibold))
                             DashboardTag(text: summary.harness, color: .dashboardBlue)
                             Text(relativeTimestamp(summary.completedAt))
@@ -922,11 +1240,11 @@ private struct CompletionReviewCard: View {
                 HStack(spacing: 0) {
                     ReviewMetric(value: summary.toolCallCount, label: "tool calls", symbol: "hammer")
                     reviewDivider
-                    ReviewMetric(value: summary.commandCount, label: "commands", symbol: "terminal")
-                    reviewDivider
                     ReviewMetric(value: summary.affectedFiles.count, label: "files touched", symbol: "doc.badge.ellipsis")
                     reviewDivider
-                    ReviewMetric(value: summary.testCommandCount, label: "test runs observed", symbol: "checkmark.diamond")
+                    ReviewMetric(value: summary.unmatchedFiles.count, label: "outside intent", symbol: "exclamationmark.triangle")
+                    reviewDivider
+                    ReviewMetric(value: summary.decisionCount, label: "decisions", symbol: "checklist")
                 }
                 .padding(.vertical, 12)
                 .background(Color.dashboardMutedFill.opacity(0.72), in: RoundedRectangle(cornerRadius: 7))
@@ -939,18 +1257,16 @@ private struct CompletionReviewCard: View {
                         detail: "Gensee observed the request lifecycle finish."
                     )
                     VerificationLine(
-                        symbol: summary.highRiskAlertCount == 0 ? "checkmark.shield" : "exclamationmark.triangle",
-                        color: summary.highRiskAlertCount == 0 ? .dashboardGreen : .dashboardRed,
-                        title: summary.highRiskAlertCount == 0 ? "No high-risk findings" : "\(summary.highRiskAlertCount) high-risk finding\(summary.highRiskAlertCount == 1 ? "" : "s")",
-                        detail: policyDetail
+                        symbol: fileEvidenceSymbol,
+                        color: fileEvidenceColor,
+                        title: fileEvidenceTitle,
+                        detail: undeclaredChangeDetail
                     )
                     VerificationLine(
-                        symbol: summary.testCommandCount > 0 ? "checkmark.diamond" : "minus.circle",
-                        color: summary.testCommandCount > 0 ? .dashboardBlue : .secondary,
-                        title: summary.testCommandCount > 0 ? "Test command observed" : "No test command observed",
-                        detail: summary.testCommandCount > 0
-                            ? "Open Timeline to inspect the command and duration."
-                            : "Gensee will not claim tests passed without evidence."
+                        symbol: testSymbol,
+                        color: testColor,
+                        title: testTitle,
+                        detail: testDetail
                     )
                 }
 
@@ -967,25 +1283,81 @@ private struct CompletionReviewCard: View {
     }
 
     private var stateColor: Color {
+        if handled { return .dashboardGreen }
+        if summary.needsIntervention { return .dashboardRed }
         switch summary.reviewState {
-        case .verified: .dashboardGreen
-        case .review: .dashboardGold
-        case .attention: .dashboardRed
+        case .verified: return .dashboardGreen
+        case .review: return .dashboardGold
+        case .attention: return .dashboardRed
+        case .incomplete: return .secondary
         }
     }
 
     private var stateSymbol: String {
+        if handled { return "checkmark.circle" }
+        if let signal = summary.attentionSignal { return signal.systemImage }
         switch summary.reviewState {
-        case .verified: "checkmark.shield"
-        case .review: "eye"
-        case .attention: "exclamationmark.triangle"
+        case .verified: return "checkmark.shield"
+        case .review: return "eye"
+        case .attention: return "exclamationmark.triangle"
+        case .incomplete: return "questionmark.diamond"
         }
     }
 
-    private var policyDetail: String {
-        if summary.alertCount == 0 { return "Policy checks completed without a surfaced finding." }
-        return "Strongest outcome: \(summary.strongestAction.uppercased()) · \(summary.strongestSeverity.uppercased())."
+    private var undeclaredChangeDetail: String {
+        if let sensitive = summary.sensitiveFiles.first {
+            return "Sensitive target: \(sensitive.riskLabels.joined(separator: ", ")) · \(abbreviatedPath(sensitive.path))."
+        }
+        if let path = summary.unmatchedFiles.first {
+            return "Inspect first: \(abbreviatedPath(path))."
+        }
+        if summary.affectedFiles.isEmpty {
+            return "Endpoint Security did not capture a file mutation for this request."
+        }
+        return "Endpoint Security matched observed mutations to declared tool intent."
     }
+
+    private var fileEvidenceSymbol: String {
+        if summary.affectedFiles.isEmpty { return "minus.circle" }
+        return summary.unmatchedFiles.isEmpty ? "checkmark.shield" : "exclamationmark.triangle"
+    }
+
+    private var fileEvidenceColor: Color {
+        if summary.affectedFiles.isEmpty { return .secondary }
+        return summary.unmatchedFiles.isEmpty ? .dashboardGreen : .dashboardGold
+    }
+
+    private var fileEvidenceTitle: String {
+        if summary.affectedFiles.isEmpty { return "No file mutation observed" }
+        if summary.unmatchedFiles.isEmpty { return "No undeclared file changes" }
+        return "\(summary.unmatchedFiles.count) change\(summary.unmatchedFiles.count == 1 ? "" : "s") outside declared intent"
+    }
+
+    private var testSymbol: String {
+        if summary.testEvidenceIsStale { return "clock.badge.exclamationmark" }
+        return summary.testCommandCount > 0 ? "checkmark.diamond" : "minus.circle"
+    }
+
+    private var testColor: Color {
+        if summary.testEvidenceIsStale { return .dashboardGold }
+        return summary.testCommandCount > 0 ? .dashboardBlue : .secondary
+    }
+
+    private var testTitle: String {
+        if summary.testEvidenceIsStale { return "Verification may be stale" }
+        return summary.testCommandCount > 0 ? "Verification command observed" : "No verification command observed"
+    }
+
+    private var testDetail: String {
+        if summary.testEvidenceIsStale {
+            return "A file changed after the last test, build, lint, or type-check command."
+        }
+        if summary.testCommandCount > 0 {
+            return "Gensee records independent timing; inspect Timeline for the harness-reported result."
+        }
+        return "Gensee will not claim this work is verified without evidence."
+    }
+
 }
 
 private struct ReviewMetric: View {

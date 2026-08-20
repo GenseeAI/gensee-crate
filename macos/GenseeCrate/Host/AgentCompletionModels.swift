@@ -38,14 +38,30 @@ enum AgentReviewState: String, Equatable {
     case verified
     case review
     case attention
+    case incomplete
 
     var title: String {
         switch self {
-        case .verified: "Ready for review"
+        case .verified: "Verified"
         case .review: "Review recommended"
         case .attention: "Needs attention"
+        case .incomplete: "Incomplete evidence"
         }
     }
+}
+
+enum AgentAttentionKind: String, Equatable {
+    case scopeDrift
+    case blockedAction
+    case highRiskActivity
+    case staleVerification
+}
+
+struct AgentAttentionSignal: Equatable {
+    let kind: AgentAttentionKind
+    let title: String
+    let detail: String
+    let systemImage: String
 }
 
 struct AgentCompletionSummary: Identifiable, Equatable {
@@ -60,15 +76,20 @@ struct AgentCompletionSummary: Identifiable, Equatable {
     let commandCount: Int
     let affectedFiles: [String]
     let verifiedFiles: [String]
+    let declaredOnlyFiles: [String]
     let unmatchedFiles: [String]
     let ignoredFiles: [String]
     let ignoredFileTouchEventsOmitted: Int
     let ignoredFileTouchPathsTruncated: Bool
     let testCommandCount: Int
     let alertCount: Int
+    let decisionCount: Int
     let highRiskAlertCount: Int
     let strongestAction: String
     let strongestSeverity: String
+    let lastTestAt: Int64?
+    let lastMutationAt: Int64?
+    let sensitiveFiles: [FileTouchEvidence]
     let reviewState: AgentReviewState
 
     var id: Int64 { requestID }
@@ -79,6 +100,69 @@ struct AgentCompletionSummary: Identifiable, Equatable {
             || affectedFiles.count >= 2
             || highRiskAlertCount > 0
             || ["ask", "block", "deny"].contains(strongestAction.lowercased())
+    }
+
+    var testEvidenceIsStale: Bool {
+        guard let lastTestAt, let lastMutationAt else { return false }
+        return lastMutationAt > lastTestAt
+    }
+
+    /// The deliberately narrow signal shared by the Agent Inbox, menu bar,
+    /// and native notifications. Routine warnings and clean completions stay
+    /// in history instead of interrupting the developer.
+    var attentionSignal: AgentAttentionSignal? {
+        let action = strongestAction.lowercased()
+        if ["block", "deny"].contains(action) {
+            return AgentAttentionSignal(
+                kind: .blockedAction,
+                title: "Action blocked",
+                detail: "Gensee stopped a \(strongestSeverity.lowercased())-risk action. Review the finding before retrying.",
+                systemImage: "hand.raised.fill"
+            )
+        }
+        if !unmatchedFiles.isEmpty {
+            let first = URL(fileURLWithPath: unmatchedFiles[0]).lastPathComponent
+            return AgentAttentionSignal(
+                kind: .scopeDrift,
+                title: "Scope drift detected",
+                detail: "\(unmatchedFiles.count) file\(unmatchedFiles.count == 1 ? "" : "s") changed outside declared tool intent, including \(first).",
+                systemImage: "arrow.triangle.branch"
+            )
+        }
+        if testEvidenceIsStale {
+            return AgentAttentionSignal(
+                kind: .staleVerification,
+                title: "Verification is stale",
+                detail: "Files changed after the last observed test, build, lint, or type-check command.",
+                systemImage: "checkmark.diamond"
+            )
+        }
+        if highRiskAlertCount > 0 {
+            return AgentAttentionSignal(
+                kind: .highRiskActivity,
+                title: "High-risk activity needs review",
+                detail: "Gensee grouped \(highRiskAlertCount) high-risk finding\(highRiskAlertCount == 1 ? "" : "s") from this request.",
+                systemImage: "exclamationmark.shield.fill"
+            )
+        }
+        return nil
+    }
+
+    var needsIntervention: Bool { attentionSignal != nil }
+
+    /// Changes whenever the actionable evidence for a request changes. A
+    /// dismissed item therefore stays out of Needs You until new evidence
+    /// materially changes the decision, instead of hiding the request forever.
+    var attentionFingerprint: String? {
+        guard let signal = attentionSignal else { return nil }
+        return [
+            signal.kind.rawValue,
+            strongestAction.lowercased(),
+            strongestSeverity.lowercased(),
+            String(lastMutationAt ?? 0),
+            String(highRiskAlertCount),
+            unmatchedFiles.sorted().joined(separator: "\u{1F}"),
+        ].joined(separator: "|")
     }
 }
 
@@ -109,9 +193,17 @@ struct AgentSessionSummary: Identifiable, Equatable {
         var seen = Set<String>()
         return requests.flatMap(\.unmatchedFiles).filter { seen.insert($0).inserted }
     }
+    var declaredOnlyFiles: [String] {
+        var seen = Set<String>()
+        return requests.flatMap(\.declaredOnlyFiles).filter { seen.insert($0).inserted }
+    }
     var ignoredFiles: [String] {
         var seen = Set<String>()
         return requests.flatMap(\.ignoredFiles).filter { seen.insert($0).inserted }
+    }
+    var sensitiveFiles: [FileTouchEvidence] {
+        var seen = Set<String>()
+        return requests.flatMap(\.sensitiveFiles).filter { seen.insert($0.path).inserted }
     }
     var ignoredFileTouchEventsOmitted: Int {
         requests.reduce(0) { $0 + $1.ignoredFileTouchEventsOmitted }
@@ -122,8 +214,11 @@ struct AgentSessionSummary: Identifiable, Equatable {
     var reviewState: AgentReviewState {
         if requests.contains(where: { $0.reviewState == .attention }) { return .attention }
         if requests.contains(where: { $0.reviewState == .review }) { return .review }
+        if requests.contains(where: { $0.reviewState == .incomplete }) { return .incomplete }
         return .verified
     }
+    var needsIntervention: Bool { requests.contains(where: \.needsIntervention) }
+    var interventionCount: Int { requests.filter(\.needsIntervention).count }
 }
 
 enum HarnessDisplayName {
@@ -195,8 +290,11 @@ enum AgentCompletionDerivation {
             let verifiedFiles = classifiedTouches
                 .filter(\.intendedAndVerified)
                 .map(\.path)
+            let declaredOnlyFiles = classifiedTouches
+                .filter { $0.declaredByHarness && !$0.osVerified }
+                .map(\.path)
             let unmatchedFiles = classifiedTouches
-                .filter { !$0.intendedAndVerified }
+                .filter { $0.osVerified && !$0.declaredByHarness }
                 .map(\.path)
             let strongestAction = request.strongestAction
                 ?? alerts.map(\.action).max(by: { actionRank($0) < actionRank($1) })
@@ -208,11 +306,20 @@ enum AgentCompletionDerivation {
                 ["high", "critical"].contains($0.severity.lowercased())
             }.count
             let alertCount = request.alertCount ?? alerts.count
+            let decisionCount = request.decisionCount ?? Set(alerts.map {
+                "\($0.ruleID)|\($0.path ?? "")|\($0.action.lowercased())"
+            }).count
+            let incompleteToolEvidence = calls.contains { $0.endTimestamp == nil }
+            let lastTestAt = calls.filter(isTestCall).map(\.startTimestamp).max()
+            let lastMutationAt = classifiedTouches.compactMap(\.lastObservedAt).max()
+            let staleVerification = lastTestAt != nil && lastMutationAt != nil && lastMutationAt! > lastTestAt!
             let reviewState: AgentReviewState
             if highRiskCount > 0 || ["block", "deny"].contains(strongestAction.lowercased()) {
                 reviewState = .attention
-            } else if alertCount > 0 || ["warn", "ask"].contains(strongestAction.lowercased()) {
+            } else if decisionCount > 0 || staleVerification || !unmatchedFiles.isEmpty || ["warn", "ask"].contains(strongestAction.lowercased()) {
                 reviewState = .review
+            } else if incompleteToolEvidence {
+                reviewState = .incomplete
             } else {
                 reviewState = .verified
             }
@@ -234,15 +341,20 @@ enum AgentCompletionDerivation {
                 commandCount: calls.filter { isCommandTool($0.toolName) }.count,
                 affectedFiles: affectedFiles,
                 verifiedFiles: verifiedFiles,
+                declaredOnlyFiles: declaredOnlyFiles,
                 unmatchedFiles: unmatchedFiles,
                 ignoredFiles: request.ignoredFileTouchPaths,
                 ignoredFileTouchEventsOmitted: request.ignoredFileTouchEventsOmitted,
                 ignoredFileTouchPathsTruncated: request.ignoredFileTouchPathsTruncated,
                 testCommandCount: calls.filter(isTestCall).count,
                 alertCount: alertCount,
+                decisionCount: decisionCount,
                 highRiskAlertCount: highRiskCount,
                 strongestAction: strongestAction,
                 strongestSeverity: strongestSeverity,
+                lastTestAt: lastTestAt,
+                lastMutationAt: lastMutationAt,
+                sensitiveFiles: classifiedTouches.filter { !$0.riskLabels.isEmpty },
                 reviewState: reviewState
             )
         }
@@ -276,6 +388,9 @@ enum AgentCompletionDerivation {
     }
 
     static func notificationBody(for summary: AgentCompletionSummary) -> String {
+        if let signal = summary.attentionSignal {
+            return signal.detail
+        }
         var parts = ["\(summary.toolCallCount) tool call\(summary.toolCallCount == 1 ? "" : "s")"]
         if !summary.affectedFiles.isEmpty {
             parts.append("\(summary.affectedFiles.count) file\(summary.affectedFiles.count == 1 ? "" : "s") touched")
@@ -295,9 +410,43 @@ enum AgentCompletionDerivation {
         }
     }
 
+    static func verificationCommand(for call: TimelineToolCall) -> String? {
+        guard isCommandTool(call.toolName), let command = shellCommand(from: call) else { return nil }
+        let patterns = [
+            #"(?im)(?:^|[;&|]\s*)(?:env\s+(?:\w+=\S+\s+)+)?cargo\s+(?:test|check|clippy|build|nextest\s+run)\b"#,
+            #"(?im)(?:^|[;&|]\s*)swift\s+(?:test|build)\b"#,
+            #"(?im)(?:^|[;&|]\s*)go\s+(?:test|build)\b"#,
+            #"(?im)(?:^|[;&|]\s*)(?:python(?:3(?:\.\d+)?)?\s+-m\s+pytest|pytest)\b"#,
+            #"(?im)(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:(?:run|run-script)\s+)?(?:test|build|lint|typecheck|type-check|check)\b"#,
+            #"(?im)(?:^|[;&|]\s*)(?:make|gradle|gradlew|\.\/gradlew)\s+(?:test|check|build|lint)\b"#,
+            #"(?im)(?:^|[;&|]\s*)mvn\s+(?:test|verify|package)\b"#,
+            #"(?im)(?:^|[;&|]\s*)dotnet\s+(?:test|build)\b"#,
+            #"(?im)(?:^|[;&|]\s*)xcodebuild\b[^;&|\n]*\btest\b"#,
+            #"(?im)(?:^|[;&|]\s*)(?:tsc|eslint|mypy|pyright)\b"#,
+            #"(?im)(?:^|[;&|]\s*)ruff\s+check\b"#,
+        ]
+        return patterns.contains { command.range(of: $0, options: .regularExpression) != nil }
+            ? command
+            : nil
+    }
+
     private static func isTestCall(_ call: TimelineToolCall) -> Bool {
-        guard isCommandTool(call.toolName), let input = call.input?.lowercased() else { return false }
-        return input.range(of: #"\b(?:test|tests|pytest)\b"#, options: .regularExpression) != nil
+        verificationCommand(for: call) != nil
+    }
+
+    private static func shellCommand(from call: TimelineToolCall) -> String? {
+        if let input = call.input,
+           let data = input.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let command = object["command"] as? String,
+           !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return command
+        }
+        if let detail = call.detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return detail
+        }
+        return nil
     }
 
     private static func actionRank(_ action: String) -> Int {

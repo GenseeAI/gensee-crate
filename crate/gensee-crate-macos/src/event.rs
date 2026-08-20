@@ -177,7 +177,14 @@ impl EndpointSecurityEvent {
     }
 
     pub fn primary_path(&self) -> Option<&str> {
-        self.file.as_ref().map(|file| file.path.as_str())
+        if self.event_type == "rename" {
+            self.destination
+                .as_ref()
+                .map(|file| file.path.as_str())
+                .or_else(|| self.file.as_ref().map(|file| file.path.as_str()))
+        } else {
+            self.file.as_ref().map(|file| file.path.as_str())
+        }
     }
 
     pub fn is_read_open(&self) -> bool {
@@ -754,6 +761,30 @@ mod tests {
         assert_eq!(
             post_exec.attribution.session_id.as_deref(),
             Some("session-1")
+        );
+    }
+
+    #[test]
+    fn rename_uses_destination_as_primary_and_persisted_path() {
+        let mut rename = event("rename", process(11, 1, Some(10), Some(1)));
+        rename.file = Some(EndpointSecurityFile {
+            path: "/repo/.source.swift.tmp".to_string(),
+            ..EndpointSecurityFile::default()
+        });
+        rename.destination = Some(EndpointSecurityFile {
+            path: "/repo/Source.swift".to_string(),
+            ..EndpointSecurityFile::default()
+        });
+
+        assert_eq!(rename.primary_path(), Some("/repo/Source.swift"));
+        assert_eq!(
+            rename
+                .clone()
+                .into_system_event()
+                .unwrap()
+                .file_path
+                .as_deref(),
+            Some("/repo/Source.swift")
         );
     }
 

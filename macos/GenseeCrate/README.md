@@ -38,16 +38,17 @@ The console includes:
   data as synthetic. Entering the demo does not initialize a database, install
   hooks, request Apple permissions, change policy, or touch harness settings.
   Real configuration pages remain locked until the user exits the demo.
-- A progressive protection ladder. **Observe** keeps Endpoint Security
+- A developer-oriented autonomy ladder. **Fast** keeps Endpoint Security
   notification-only while existing hook decision rules still apply;
-  **Guarded** enables configured OS authorization while keeping ask decisions
-  interactive; **Unattended** selects strict OS authorization and escalates
+  **Review** enables configured OS authorization while keeping ask decisions
+  interactive; **Sensitive** selects strict OS authorization and escalates
   medium-or-higher asks to deny so an agent stops instead of waiting for an
   approval. The ladder changes these two policy controls atomically and never
   rewrites the user's decision rules.
 - A first-launch setup assistant that installs the bundled backend at
   `~/.gensee/bin/gensee`, initializes the encrypted event store and default
-  policy, guides Apple approvals, scans all six harnesses, and offers one-click
+  policy, establishes smart recovery and a read-only configuration-audit
+  baseline before requesting Apple approvals, scans all six harnesses, and offers one-click
   setup for every installed direct-hook integration. It does not require a
   separate SQLite install, Homebrew, Rust, jq, or Xcode Command Line Tools.
 - Overview, activity, alerts, and run inventory backed by `gensee dashboard-state`
@@ -55,15 +56,21 @@ The console includes:
 - A Daily Highlight page with today's summary and four rolling-year activity
   heatmaps for agent turns, tool calls, alerts, and token usage. Heatmap days
   are selectable and update the detailed summary.
-- A Work Review page that expands sessions into their original requests and
-  paired tool calls, including parallel/sequential relationships, duration
-  bars, affected files, policy outcomes, and expandable event evidence.
+- A decision-first Review Queue that classifies completed requests as
+  **Verified**, **Review recommended**, **Needs attention**, or **Incomplete
+  evidence**. It promotes undeclared and sensitive changes, flags verification
+  that predates a later file mutation, groups low-level findings into decisions,
+  and retains request-scoped timeline, file, recovery, and evidence drill-downs.
+- A cross-session Watchlist for control-plane, agent-memory, and persistent
+  targets. It ranks undeclared and cross-session effects first and keeps the
+  relationship graph as a provenance drill-down.
 - Policy controls backed by `gensee policy get/set/path`.
 - A Harnesses page that detects Codex, Claude Code, Antigravity, Cursor,
   GitHub Copilot, and Omnigent. Installed direct-hook integrations can be
   enabled or disabled through `gensee setup`; unavailable harnesses remain
   visible but disabled. Codex and GitHub Copilot rows also open the native
-  Config Audit workflow backed by `gensee audit --json`, with findings,
+  Config Audit workflow backed by `gensee audit --json`, with saved baselines,
+  drift since the previous audit, findings,
   evidence, remediation, inventory, source provenance, and manual checks.
   Other audit actions are visibly marked **Coming soon**. Enabled integrations
   are checked for complete hook coverage, the active event-store path, the
@@ -73,7 +80,9 @@ The console includes:
 - Endpoint Security installation, removal, and Full Disk Access navigation.
 - Per-harness **Smart recovery points** in **Auto**, **Ask**, or **Off** mode.
   Auto creates one Git-backed point before the first risky or mutating tool
-  call in a request; Work Review surfaces the point and its Restore action.
+  call in a request; Review Queue surfaces the point and its Restore action.
+- A menu-bar status window for independent sensor health, pending reviews, and
+  the latest request, with a direct jump into Review Queue.
 
 Token totals are captured from compatible Claude Code and Codex transcript
 usage metadata when a turn completes. Only the numeric per-turn total is stored;
@@ -90,7 +99,7 @@ generic interactive pre-tool response. **Off** skips automatic creation.
 
 A recovery point captures tracked files and untracked, non-ignored files in
 the repository's local Git object database without committing to the user's
-branch or changing the real Git staging index. Work Review shows when a point
+branch or changing the real Git staging index. Review Queue shows when a point
 was created and provides the explicitly confirmed Restore action. Restoring
 first captures the current state as a rescue checkpoint.
 
@@ -126,8 +135,7 @@ After setup, follow the provider-specific restart or reload instruction and
 start a new agent turn. Codex additionally requires trust review for
 non-managed hooks: use **Open Codex Hook Review**, enter the copied `/hooks`,
 and trust the Gensee commands. The one-time Terminal review closes automatically
-after Codex records approval.
-command in the opened CLI, and trust Gensee. The assistant can use the Codex
+after Codex records approval. The assistant can use the Codex
 binary bundled with the ChatGPT app, so the user does not need a separately
 installed command on `PATH`. Until the first real event arrives, the harness is
 shown as **Restart & test** rather than **Protected**. Rerun the assistant from
@@ -142,8 +150,8 @@ Omnigent is shown in the same inventory, but it currently uses managed-launch
 protection instead of a direct hook toggle. Launch it through `gensee run` to
 associate its process tree with Gensee policy and Endpoint Security decisions.
 
-Use **Settings → Protection Level** to move between Observe, Guarded, and
-Unattended with a plain-language explanation of the tradeoff. Use **Policy**
+Use **Settings → Protection Level** to move between Fast, Review, and
+Sensitive with a plain-language explanation of the tradeoff. Use **Policy**
 for the underlying Endpoint Security mode, decision rules, protected paths, and
 blocked executables. Use **Settings** to install, inspect, or remove the system
 extension and to open the Full Disk Access pane. Start with Observe, confirm

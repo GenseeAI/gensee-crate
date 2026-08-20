@@ -1,5 +1,73 @@
 use super::*;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn claude_desktop_session_uses_app_root_instead_of_embedded_cli() {
+    let processes = HashMap::from([
+        (
+            30,
+            (
+                20,
+                "/Users/test/Library/Application Support/Claude/claude-code/2.1/claude.app/Contents/MacOS/claude".to_string(),
+            ),
+        ),
+        (
+            20,
+            (
+                10,
+                "/Applications/Claude.app/Contents/Helpers/disclaimer".to_string(),
+            ),
+        ),
+        (
+            10,
+            (
+                1,
+                "/Applications/Claude.app/Contents/MacOS/Claude".to_string(),
+            ),
+        ),
+        (1, (0, "/sbin/launchd".to_string())),
+    ]);
+
+    assert_eq!(
+        select_hook_session_root("claude-code", 30, &processes),
+        Some((
+            10,
+            "/Applications/Claude.app/Contents/MacOS/Claude".to_string()
+        ))
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn standalone_claude_session_keeps_cli_root() {
+    let processes = HashMap::from([
+        (30, (20, "/usr/local/bin/claude".to_string())),
+        (20, (1, "/bin/zsh".to_string())),
+        (1, (0, "/sbin/launchd".to_string())),
+    ]);
+
+    assert_eq!(
+        select_hook_session_root("claude-code", 30, &processes),
+        Some((30, "/usr/local/bin/claude".to_string()))
+    );
+}
+
+#[test]
+fn endpoint_allowed_authorization_is_an_observed_effect() {
+    assert!(endpoint_action_can_produce_observation(
+        "auth",
+        Some("allow")
+    ));
+    assert!(endpoint_action_can_produce_observation(
+        "notify",
+        Some("observed")
+    ));
+    assert!(!endpoint_action_can_produce_observation(
+        "auth",
+        Some("deny")
+    ));
+}
+
 fn telemetry_test_lock() -> std::sync::MutexGuard<'static, ()> {
     cli_test_env_lock()
 }
@@ -3304,6 +3372,19 @@ fn pretool_policy_blocks_sensitive_reads() {
         .findings
         .iter()
         .any(|finding| finding.rule_id == "policy_sensitive_file_access"));
+}
+
+#[test]
+fn codex_apply_patch_emits_high_confidence_file_intent() {
+    let payload = r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"apply_patch","tool_use_id":"patch-1","tool_input":{"operation":"edit","path":"src/main.rs"}}"#;
+    let event = build_agent_hook_event(payload).unwrap();
+    let intents = file_intents_from_hook(&event, None);
+
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].operation, "write");
+    assert_eq!(intents[0].path, "/repo/src/main.rs");
+    assert_eq!(intents[0].confidence, "high");
+    assert_eq!(intents[0].provider, "native-file-tool");
 }
 
 #[test]

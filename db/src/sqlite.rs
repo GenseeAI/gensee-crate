@@ -1160,6 +1160,56 @@ impl SqliteStore {
             .map_err(SqliteError::Database)
     }
 
+    pub fn request_for_mutating_file_intent_path(
+        &self,
+        path: &str,
+        ts: i64,
+        window_ms: i64,
+    ) -> Result<Option<AgentEventRecord>, SqliteError> {
+        self.conn
+            .query_row(
+                "SELECT event_id, pid, request_id, ts, source, type,
+                    cwd, permission_mode, tool_name, tool_input, tool_response
+                 FROM agent_events
+                 WHERE type IN ('file_intent', 'PreToolUse')
+                   AND tool_input IS NOT NULL
+                   AND ts BETWEEN ?2 - ?3 AND ?2 + ?3
+                   AND (
+                       (
+                           json_extract(tool_input, '$.path') IS NOT NULL
+                           AND lower(COALESCE(json_extract(tool_input, '$.operation'), ''))
+                               NOT IN ('read', 'open', 'access', 'stat', 'list')
+                           AND (
+                                json_extract(tool_input, '$.path') = ?1
+                             OR substr(?1, 1, length(json_extract(tool_input, '$.path')) + 1) =
+                                json_extract(tool_input, '$.path') || '/'
+                             OR substr(json_extract(tool_input, '$.path'), 1, length(?1) + 1) =
+                                ?1 || '/'
+                           )
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM json_each(agent_events.tool_input, '$.changes') AS change
+                           WHERE lower(COALESCE(json_extract(change.value, '$.operation'), ''))
+                                     NOT IN ('read', 'open', 'access', 'stat', 'list')
+                             AND (
+                                  json_extract(change.value, '$.path') = ?1
+                               OR substr(?1, 1, length(json_extract(change.value, '$.path')) + 1) =
+                                  json_extract(change.value, '$.path') || '/'
+                               OR substr(json_extract(change.value, '$.path'), 1, length(?1) + 1) =
+                                  ?1 || '/'
+                             )
+                       )
+                   )
+                 ORDER BY ABS(ts - ?2), event_id DESC
+                 LIMIT 1",
+                params![path, ts, window_ms],
+                map_agent_event,
+            )
+            .optional()
+            .map_err(SqliteError::Database)
+    }
+
     pub fn insert_system_event(&self, event: &NewSystemEvent) -> Result<i64, SqliteError> {
         self.conn
             .execute(
@@ -3944,6 +3994,23 @@ mod tests {
             .insert_agent_event(&NewAgentEvent {
                 pid: 1,
                 request_id,
+                ts: 1_003,
+                source: "claude-bash-command-parser".to_string(),
+                event_type: "file_intent".to_string(),
+                cwd: "/repo".to_string(),
+                permission_mode: None,
+                tool_name: Some("Bash".to_string()),
+                tool_input: Some(
+                    r#"{"path":"/repo/read-only.txt","operation":"read"}"#.to_string(),
+                ),
+                tool_response: None,
+                tool_use_id: None,
+            })
+            .unwrap();
+        store
+            .insert_agent_event(&NewAgentEvent {
+                pid: 1,
+                request_id,
                 ts: 1_002,
                 source: "codex".to_string(),
                 event_type: "PreToolUse".to_string(),
@@ -4007,6 +4074,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(literal_wildcards.request_id, request_id);
+        assert!(store
+            .request_for_file_intent_path("/repo/read-only.txt", 1_010, 1_000)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .request_for_mutating_file_intent_path("/repo/read-only.txt", 1_010, 1_000)
+                .unwrap(),
+            None
+        );
+        assert!(store
+            .request_for_mutating_file_intent_path("/repo/out.txt", 1_010, 1_000)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .request_for_mutating_file_intent_path("/repo/src/app.rs", 1_010, 1_000)
+            .unwrap()
+            .is_some());
 
         drop(store);
         remove_sqlite_files(&path);

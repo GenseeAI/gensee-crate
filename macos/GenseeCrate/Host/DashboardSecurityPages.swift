@@ -341,7 +341,14 @@ struct LineagePage: View {
     @State private var selectedURI: String?
 
     private var artifacts: [ArtifactFact] {
-        model.snapshot.artifacts.filter { containsSearch(searchText, fields: $0.uri, $0.kind, $0.lastModifiedSource, $0.riskLevel) }
+        model.snapshot.artifacts
+            .filter { containsSearch(searchText, fields: $0.uri, $0.kind, $0.lastModifiedSource, $0.riskLevel) }
+            .filter { attentionScore($0) > 0 }
+            .sorted {
+                let lhs = attentionScore($0)
+                let rhs = attentionScore($1)
+                return lhs == rhs ? $0.lastSeenAt > $1.lastSeenAt : lhs > rhs
+            }
     }
 
     private var selectedArtifact: ArtifactFact? {
@@ -352,10 +359,10 @@ struct LineagePage: View {
     var body: some View {
         DashboardPage {
             VStack(alignment: .leading, spacing: 16) {
-                DashboardPageHeader("Lineage Graph", description: "Artifact relationships and provenance tracked by Gensee.")
+                DashboardPageHeader("Watchlist", description: "Persistent and sensitive targets that deserve attention across agent sessions.")
                 HStack(alignment: .top, spacing: 16) {
-                    DashboardCard("Artifacts (\(artifacts.count))") {
-                        if artifacts.isEmpty { DashboardEmpty(text: "No artifact facts recorded yet.") }
+                    DashboardCard("Watched targets (\(artifacts.count))") {
+                        if artifacts.isEmpty { DashboardEmpty(text: "No cross-session targets need attention yet.") }
                         else {
                             ScrollView {
                                 VStack(spacing: 2) {
@@ -373,6 +380,12 @@ struct LineagePage: View {
                                                         .truncationMode(.middle)
                                                     Text([artifact.kind, artifact.lastModifiedSource, artifact.riskLevel].compactMap { $0 }.joined(separator: " · "))
                                                         .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                                                    if attentionScore(artifact) > 0 {
+                                                        Text(watchReason(artifact))
+                                                            .font(.system(size: 9, weight: .medium))
+                                                            .foregroundStyle(Color.dashboardGold)
+                                                            .lineLimit(1)
+                                                    }
                                                 }
                                                 Spacer()
                                             }
@@ -388,24 +401,29 @@ struct LineagePage: View {
                         }
                     }.frame(width: 370)
 
-                    DashboardCard("Lineage Graph (\(artifacts.count))") {
+                    DashboardCard(selectedArtifact == nil ? "Select a target" : "Target history") {
                         VStack(alignment: .leading, spacing: 10) {
                             if let selectedArtifact {
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                    Text("Selected path")
-                                        .font(.system(size: 10, weight: .semibold))
-                                        .foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 9) {
                                     Text(abbreviatedPath(selectedArtifact.filePath))
-                                        .font(.system(size: 10, design: .monospaced))
+                                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
                                         .textSelection(.enabled)
-                                        .lineLimit(2)
-                                        .truncationMode(.middle)
-                                        .help(selectedArtifact.filePath)
-                                    Spacer(minLength: 0)
+                                    Text(watchReason(selectedArtifact))
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.secondary)
+                                    HStack(spacing: 8) {
+                                        if selectedArtifact.isControlPlane != 0 { DashboardTag(text: "Control plane", color: .dashboardRed) }
+                                        if selectedArtifact.isMemoryArtifact != 0 { DashboardTag(text: "Agent memory", color: .dashboardGold) }
+                                        if selectedArtifact.isPersistentTarget != 0 { DashboardTag(text: "Persistent", color: .dashboardBlue) }
+                                        if let risk = selectedArtifact.riskLevel { DashboardTag(text: risk, color: severityColor(risk)) }
+                                    }
                                 }
                                 .padding(.horizontal, 4)
                                 Divider()
                             }
+                            Text("Relationship history")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.secondary)
                             ArtifactGraphView(facts: artifacts, edges: model.snapshot.relations, selectedURI: $selectedURI)
                                 .frame(minHeight: 420)
                         }
@@ -413,6 +431,36 @@ struct LineagePage: View {
                 }
             }
         }
+    }
+
+    private func attentionScore(_ artifact: ArtifactFact) -> Int {
+        (artifact.isControlPlane != 0 ? 10 : 0)
+            + (artifact.isMemoryArtifact != 0 ? 7 : 0)
+            + (artifact.isPersistentTarget != 0 ? 5 : 0)
+            + ((artifact.recentUnmatchedEffectCount ?? 0) * 3)
+            + ((artifact.recentCrossSessionWriteCount ?? 0) * 2)
+            + riskAttentionScore(artifact.riskLevel)
+    }
+
+    private func riskAttentionScore(_ riskLevel: String?) -> Int {
+        switch riskLevel?.lowercased() {
+        case "critical": 12
+        case "high": 8
+        case "medium": 4
+        default: 0
+        }
+    }
+
+    private func watchReason(_ artifact: ArtifactFact) -> String {
+        var reasons: [String] = []
+        let unmatched = artifact.recentUnmatchedEffectCount ?? 0
+        let crossSession = artifact.recentCrossSessionWriteCount ?? 0
+        if unmatched > 0 { reasons.append("\(unmatched) undeclared effect\(unmatched == 1 ? "" : "s")") }
+        if crossSession > 0 { reasons.append("written across \(crossSession) recent session\(crossSession == 1 ? "" : "s")") }
+        if artifact.isControlPlane != 0 { reasons.append("changes agent or repository behavior") }
+        if artifact.isMemoryArtifact != 0 { reasons.append("influences future agent context") }
+        if artifact.isPersistentTarget != 0 { reasons.append("persists beyond one request") }
+        return reasons.isEmpty ? "Observed recently; open the relationship history for provenance." : reasons.joined(separator: " · ")
     }
 }
 

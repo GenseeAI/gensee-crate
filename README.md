@@ -88,8 +88,9 @@ with low runtime overhead.
 On macOS, the [signed app download](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)
 includes the Gensee backend and SQLite support. Its first-launch assistant
 first offers an unmistakably synthetic, write-free demo, then lets you start
-with Observe and progress to Guarded or Unattended protection. The real setup
-prepares `~/.gensee`, guides the Apple permissions, scans all six supported
+with Fast and progress to Review or Sensitive protection. The real setup
+prepares `~/.gensee`, establishes smart recovery and a configuration-audit
+baseline before Apple permissions, scans all six supported
 harnesses, and verifies a real hook event before reporting protection. It does
 not require Homebrew, Rust, jq, Xcode Command Line Tools, or a separate SQLite
 installation.
@@ -413,16 +414,27 @@ repair. See the
 Highlight** page combines today's summary with rolling-year heatmaps for agent
 turns, tool calls, alerts, and supported transcript token totals. On the
 **Harnesses** page, **Audit Config** on Codex and GitHub Copilot runs the shared
-OSS auditor and presents findings, evidence, inventory, source provenance, and
-manual checks inline; unsupported harness auditors are marked **Coming soon**.
+OSS auditor and presents a saved baseline, configuration drift, findings,
+evidence, inventory, source provenance, and manual checks inline; unsupported
+harness auditors are marked **Coming soon**.
 Each hook-capable harness includes **Smart recovery points** with **Auto**,
 **Ask**, and **Off** modes. The default **Auto** mode creates one Git-backed
 recovery point before the first risky or mutating tool call in a request.
-Created recovery points and their **Restore** action appear in **Work Review**;
+Created recovery points and their **Restore** action appear in **Review Queue**;
 every restore first creates a rescue point. Recovery points preserve the real
 staging index and ignored files, but they are a workspace recovery aid rather
 than the process, database, and remote-side-effect isolation provided by Linux
 tclone.
+
+The macOS app's default workflow is decision-first: **Review Queue** classifies
+completed requests as Verified, Review recommended, Needs attention, or
+Incomplete evidence; promotes file changes that Endpoint Security observed
+outside declared tool intent; identifies sensitive control-plane and memory
+targets; flags tests or builds that ran before a later mutation; and groups
+related low-level findings into one decision. **Watchlist** carries those
+persistent and cross-session targets forward, while its relationship graph is
+available as provenance detail. A menu-bar status window keeps sensor health,
+pending reviews, and the latest request visible without opening the full app.
 
 **Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
 `sandbox-exec` and can stage workspace writes for review.

@@ -653,6 +653,35 @@ pub(crate) fn file_intents_from_hook(
     event: &AgentHookEvent,
     original_command: Option<&str>,
 ) -> Vec<FileIntent> {
+    if event.tool_name.as_deref() == Some("apply_patch") {
+        let Ok(value) = serde_json::from_str::<Value>(&event.raw_json) else {
+            return Vec::new();
+        };
+        let Some(input) = value.get("tool_input") else {
+            return Vec::new();
+        };
+        let Some(raw_path) = input.get("path").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let operation = match input.get("operation").and_then(Value::as_str) {
+            Some("delete" | "remove") => "delete",
+            _ => "write",
+        };
+        let cwd = event.cwd.as_deref().unwrap_or(".");
+        let path = normalize_intent_path(raw_path, cwd);
+        return vec![FileIntent {
+            provider: "native-file-tool".to_string(),
+            session_id: event.session_id.clone(),
+            tool_use_id: event.tool_use_id.clone(),
+            observed_at_ms: event.observed_at_ms,
+            operation: operation.to_string(),
+            path: path.clone(),
+            source_command: format!("apply_patch {operation} {}", redact_text(&path)),
+            sensitive: Policy::global().classify_path(&path).is_some(),
+            confidence: "high".to_string(),
+        }];
+    }
+
     if !matches!(
         event.tool_name.as_deref(),
         Some("Bash" | "run_command" | "runInTerminal" | "runTerminalCommand" | "Shell")

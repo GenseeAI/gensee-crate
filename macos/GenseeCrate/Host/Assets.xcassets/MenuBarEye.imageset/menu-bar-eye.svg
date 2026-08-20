@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20">
+  <defs>
+    <mask id="pupil-cutout">
+      <rect width="20" height="20" fill="white"/>
+      <circle cx="13.4" cy="6.6" r="2.35" fill="black"/>
+    </mask>
+  </defs>
+  <circle cx="10" cy="10" r="8.25" fill="none" stroke="black" stroke-width="1.9"/>
+  <circle cx="10" cy="10" r="5.7" fill="black" mask="url(#pupil-cutout)"/>
+</svg>

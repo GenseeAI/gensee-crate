@@ -113,7 +113,7 @@ private struct PolicySettingsView: View {
         ),
         PolicySettingGroup(
             title: "Runtime & enforcement",
-            detail: "Guarded-run lifetime and unattended decisions.",
+            detail: "Runtime lifetime and non-interactive decisions.",
             settings: [
                 .integer("runtime.max_runtime_seconds", "Max runtime (seconds)", "Wall-clock cap. Leave blank for no cap.", minimum: 1, nullable: true),
                 .boolean("enforcement.noninteractive", "Non-interactive fail-closed", "Escalate medium+ asks to deny when no human can answer."),
@@ -719,7 +719,7 @@ struct DashboardSettingsPage: View {
 
                 DashboardCard("Protection Level") {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("Start with visibility, then increase enforcement when the evidence earns your trust. Decision rules remain editable in Policy at every level.")
+                        Text("Choose the developer workflow you want: Fast for flow, Review for interactive guardrails, or Sensitive for tightly controlled work. Decision rules remain editable in Policy.")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                         HStack(alignment: .top, spacing: 10) {
@@ -845,12 +845,16 @@ struct DashboardSettingsPage: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(notifications.isAuthorized ? "Notifications are allowed" : "Notifications need macOS permission")
                         .font(.system(size: 12, weight: .semibold))
-                    Text("Choose which local events may interrupt you. New findings discovered in the same refresh are combined into one notification.")
+                    Text("Clean completions stay in Agent Inbox history. Gensee interrupts you only for scope drift, blocked or high-risk activity, or stale verification.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if !notifications.isAuthorized {
+                if notifications.isAuthorized {
+                    Button("Send Test Notification") {
+                        Task { await notifications.sendTestNotification() }
+                    }
+                } else {
                     if notifications.authorizationStatus == .denied {
                         Button("Open System Settings") { notifications.openSystemNotificationSettings() }
                     } else {
@@ -861,6 +865,13 @@ struct DashboardSettingsPage: View {
                         .tint(.dashboardBlue)
                     }
                 }
+            }
+
+            if let deliveryError = notifications.lastDeliveryError {
+                Label("Notification not delivered: \(deliveryError)", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.dashboardGold)
+                    .textSelection(.enabled)
             }
 
             Divider()
@@ -880,7 +891,7 @@ struct DashboardSettingsPage: View {
             }
 
             HStack(spacing: 24) {
-                Toggle("Substantial task completions", isOn: $notifications.completionNotificationsEnabled)
+                Toggle("Agent tasks that need me", isOn: $notifications.completionNotificationsEnabled)
                     .toggleStyle(.switch)
                     .disabled(!notifications.isAuthorized)
                 Toggle("Daily briefing after 5 PM", isOn: $notifications.dailyBriefingEnabled)

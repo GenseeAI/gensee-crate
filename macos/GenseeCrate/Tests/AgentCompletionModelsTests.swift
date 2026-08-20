@@ -1,6 +1,19 @@
 import XCTest
 
 final class AgentCompletionModelsTests: XCTestCase {
+    func testFileTouchEvidenceDecodesSQLiteIntegerRiskFlags() throws {
+        let touch = try JSONDecoder().decode(
+            FileTouchEvidence.self,
+            from: Data(#"{"path":"/repo/AGENTS.md","intended_and_verified":true,"last_observed_at":123,"risk_level":"high","is_memory_artifact":0,"is_persistent_target":1,"is_control_plane":1}"#.utf8)
+        )
+
+        XCTAssertTrue(touch.intendedAndVerified)
+        XCTAssertFalse(touch.isMemoryArtifact)
+        XCTAssertTrue(touch.isPersistentTarget)
+        XCTAssertTrue(touch.isControlPlane)
+        XCTAssertEqual(touch.riskLabels, ["Control plane", "Persistent target"])
+    }
+
     func testBuildsEvidenceBasedCompletionSummary() throws {
         var snapshot = SecuritySnapshot()
         var recordedRequest = request(id: 7, started: 1_000, completed: 131_000)
@@ -32,7 +45,9 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertEqual(summary.unmatchedFiles, ["/repo/Unexpected.txt"])
         XCTAssertEqual(summary.ignoredFiles, ["/repo/.build/cache"])
         XCTAssertEqual(summary.ignoredFileTouchEventsOmitted, 0)
-        XCTAssertEqual(summary.reviewState, .verified)
+        XCTAssertEqual(summary.reviewState, .review)
+        XCTAssertEqual(summary.attentionSignal?.kind, .scopeDrift)
+        XCTAssertTrue(summary.needsIntervention)
         XCTAssertTrue(summary.isLargeTask)
     }
 
@@ -50,7 +65,65 @@ final class AgentCompletionModelsTests: XCTestCase {
         let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
         XCTAssertEqual(summary.reviewState, .attention)
         XCTAssertEqual(summary.highRiskAlertCount, 1)
+        XCTAssertEqual(summary.attentionSignal?.kind, .highRiskActivity)
+        XCTAssertTrue(summary.needsIntervention)
         XCTAssertTrue(AgentCompletionDerivation.notificationBody(for: summary).contains("high-risk finding"))
+    }
+
+    func testRoutineWarningStaysInHistoryWithoutInterrupting() throws {
+        var snapshot = SecuritySnapshot()
+        snapshot.requests = [request(id: 7, started: 1_000, completed: 2_000)]
+        snapshot.alerts = [SecurityAlert(
+            alertID: 1, requestID: 7, sessionID: "session-1", severity: "medium", action: "warn",
+            ruleID: "routine", message: "Routine policy warning", path: nil, evidence: nil,
+            createdAt: 1_500, originalUserPrompt: nil, eventSource: nil, eventType: nil,
+            toolName: nil, toolInput: nil, toolUseID: nil, humanVerdict: nil,
+            feedbackLabel: nil, feedbackCreatedAt: nil
+        )]
+
+        let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
+
+        XCTAssertEqual(summary.reviewState, .review)
+        XCTAssertNil(summary.attentionSignal)
+        XCTAssertFalse(summary.needsIntervention)
+    }
+
+    @MainActor
+    func testDelayedScopeEvidenceRemainsEligibleForNotification() throws {
+        var cleanSnapshot = SecuritySnapshot()
+        cleanSnapshot.requests = [request(id: 7, started: 1_000, completed: 2_000)]
+        let clean = try XCTUnwrap(AgentCompletionDerivation.summaries(from: cleanSnapshot).first)
+
+        var driftSnapshot = cleanSnapshot
+        driftSnapshot.requests[0].fileTouches = [
+            FileTouchEvidence(
+                path: "/repo/surprise.txt",
+                intendedAndVerified: false,
+                declaredByHarness: false,
+                osVerified: true
+            ),
+        ]
+        let drift = try XCTUnwrap(AgentCompletionDerivation.summaries(from: driftSnapshot).first)
+
+        XCTAssertTrue(
+            CompletionNotificationCoordinator.newlyActionableSummaries(
+                [clean],
+                excluding: []
+            ).isEmpty
+        )
+        XCTAssertEqual(
+            CompletionNotificationCoordinator.newlyActionableSummaries(
+                [drift],
+                excluding: []
+            ).map(\.requestID),
+            [7]
+        )
+        XCTAssertTrue(
+            CompletionNotificationCoordinator.newlyActionableSummaries(
+                [drift],
+                excluding: [7]
+            ).isEmpty
+        )
     }
 
     func testIncompleteAndSystemRequestsAreNotReviewCards() {
@@ -91,6 +164,8 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertEqual(summary.toolCallCount, 0)
         XCTAssertEqual(summary.durationMS, 3_000)
         XCTAssertEqual(summary.reviewState, .verified)
+        XCTAssertNil(summary.attentionSignal)
+        XCTAssertFalse(summary.needsIntervention)
     }
 
     func testRequestRollupsSurviveBoundedGlobalEventArrays() throws {
@@ -111,6 +186,7 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertEqual(summary.strongestSeverity, "critical")
         XCTAssertEqual(summary.strongestAction, "block")
         XCTAssertEqual(summary.reviewState, .attention)
+        XCTAssertEqual(summary.attentionSignal?.kind, .blockedAction)
     }
 
     func testBoundedFileSummarySupportsSearchAndLargeTaskDetection() throws {
@@ -141,6 +217,106 @@ final class AgentCompletionModelsTests: XCTestCase {
 
         let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
         XCTAssertEqual(summary.testCommandCount, 1)
+    }
+
+    func testVerificationDetectionDoesNotTreatWorkspaceNameAsTestCommand() throws {
+        var snapshot = SecuritySnapshot()
+        var recordedRequest = request(id: 7, started: 1_000, completed: 4_000)
+        recordedRequest.fileTouches = [
+            FileTouchEvidence(
+                path: "/repo/gensee-poc-test/note.txt",
+                intendedAndVerified: true,
+                lastObservedAt: 3_500
+            ),
+        ]
+        snapshot.requests = [recordedRequest]
+        snapshot.agentEvents = [
+            event(
+                id: 1,
+                type: "PreToolUse",
+                timestamp: 2_000,
+                tool: "Bash",
+                input: #"{"command":"cd /repo/gensee-poc-test && printf updated >> note.txt"}"#,
+                useID: "write"
+            ),
+            event(id: 2, type: "PostToolUse", timestamp: 3_000, tool: "Bash", useID: "write"),
+        ]
+
+        let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
+
+        XCTAssertEqual(summary.testCommandCount, 0)
+        XCTAssertFalse(summary.testEvidenceIsStale)
+        XCTAssertNil(summary.attentionSignal)
+    }
+
+    func testVerificationDetectionRecognizesCommonBuildAndLintRecipes() {
+        let inputs = [
+            #"{"command":"cd /repo && cargo test"}"#,
+            #"{"command":"npm run lint"}"#,
+            #"{"command":"python3 -m pytest tests/unit"}"#,
+            #"{"command":"xcodebuild -scheme App test"}"#,
+        ]
+
+        for (index, input) in inputs.enumerated() {
+            let call = TimelineToolCall(
+                id: String(index),
+                toolName: "Bash",
+                startTimestamp: 1_000,
+                endTimestamp: 2_000,
+                durationMS: 1_000,
+                durationSource: .elapsed,
+                detail: nil,
+                detailFull: nil,
+                affectedFiles: [],
+                input: input,
+                response: nil
+            )
+            XCTAssertNotNil(AgentCompletionDerivation.verificationCommand(for: call), input)
+        }
+    }
+
+    func testLaterEndpointMutationMakesVerificationStale() throws {
+        var snapshot = SecuritySnapshot()
+        var recordedRequest = request(id: 7, started: 1_000, completed: 8_000)
+        recordedRequest.fileTouches = [
+            FileTouchEvidence(
+                path: "/repo/App.swift",
+                intendedAndVerified: true,
+                lastObservedAt: 7_000
+            ),
+        ]
+        snapshot.requests = [recordedRequest]
+        snapshot.agentEvents = [
+            event(id: 1, type: "PreToolUse", timestamp: 2_000, tool: "Bash", input: #"{"command":"swift test"}"#, useID: "test"),
+            event(id: 2, type: "PostToolUse", timestamp: 3_000, tool: "Bash", useID: "test"),
+        ]
+
+        let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
+
+        XCTAssertTrue(summary.testEvidenceIsStale)
+        XCTAssertEqual(summary.reviewState, .review)
+        XCTAssertEqual(summary.attentionSignal?.kind, .staleVerification)
+    }
+
+    func testSensitiveFileTouchCarriesDecisionBadges() throws {
+        var snapshot = SecuritySnapshot()
+        var recordedRequest = request(id: 7, started: 1_000, completed: 8_000)
+        recordedRequest.fileTouches = [
+            FileTouchEvidence(
+                path: "/repo/AGENTS.md",
+                intendedAndVerified: false,
+                riskLevel: "high",
+                isMemoryArtifact: true,
+                isPersistentTarget: true,
+                isControlPlane: true
+            ),
+        ]
+        snapshot.requests = [recordedRequest]
+
+        let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
+
+        XCTAssertEqual(summary.sensitiveFiles.first?.riskLabels, ["Control plane", "Agent memory", "Persistent target"])
+        XCTAssertEqual(summary.reviewState, .review)
     }
 
     func testBuildsSessionSummaryAcrossCompletedRequests() throws {

@@ -27,6 +27,7 @@ __pycache__/
 **/*.mobileprovision
 **/*.provisionprofile
 **/notarytool-profile*
+*.profraw
 
 # latency bench generated artifacts
 bench/results/

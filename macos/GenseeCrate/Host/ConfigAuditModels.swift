@@ -1,5 +1,24 @@
 import Foundation
 
+struct ConfigAuditHistoryEntry: Codable, Identifiable, Equatable {
+    let id: UUID
+    let auditedAt: Date
+    let target: String
+    let findingFingerprints: [String]
+    let sourceDigests: [String: String]
+    let inventorySignature: String
+}
+
+struct ConfigAuditDrift: Equatable {
+    let addedFindingCount: Int
+    let resolvedFindingCount: Int
+    let changedSourceCount: Int
+
+    var hasChanges: Bool {
+        addedFindingCount > 0 || resolvedFindingCount > 0 || changedSourceCount > 0
+    }
+}
+
 struct ConfigAuditBundle: Decodable {
     let requestedTarget: String
     let resolvedTargets: [String]
@@ -23,6 +42,34 @@ struct ConfigAuditBundle: Decodable {
         case "vscode", "github-copilot-vscode", "vscode-agent-host": return "vscode"
         default: return nil
         }
+    }
+
+    func historyEntry(at date: Date = Date()) -> ConfigAuditHistoryEntry {
+        let reports = includedReports
+        let findings = reports.flatMap(\.report.findings).map(\.fingerprint).sorted()
+        var sourceDigests: [String: String] = [:]
+        for source in reports.flatMap(\.report.sources) {
+            sourceDigests[source.path] = source.sha256 ?? "missing"
+        }
+        let inventory = reports.map { report in
+            let value = report.report.inventory
+            return [
+                report.target,
+                String(value.skills.count),
+                String(value.mcpServers.count),
+                String(value.hookCommands),
+                String(value.extensions.count),
+                String(value.instructionFiles),
+            ].joined(separator: ":")
+        }.sorted().joined(separator: "|")
+        return ConfigAuditHistoryEntry(
+            id: UUID(),
+            auditedAt: date,
+            target: requestedTarget,
+            findingFingerprints: findings,
+            sourceDigests: sourceDigests,
+            inventorySignature: inventory
+        )
     }
 }
 
