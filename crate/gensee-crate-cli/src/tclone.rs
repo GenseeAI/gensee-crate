@@ -53,9 +53,10 @@ const TCLONE_WAIT_QUIET_FOR_FORK_ENV: &str = "GENSEE_TCLONE_WAIT_QUIET_FOR_FORK"
 const TCLONE_FORK_TIMING_ENV: &str = "GENSEE_TCLONE_FORK_TIMING";
 const TCLONE_NETWORK_ENV: &str = "GENSEE_TCLONE_NETWORK";
 const TCLONE_FORWARD_ENV_ENV: &str = "GENSEE_TCLONE_FORWARD_ENV";
-// Keep the init outside /usr/local. Machine images commonly bind-mount a host
-// Node installation at /usr/local, which would hide a seeded init there.
+// Keep seeded control binaries outside /usr/local. Machine images commonly
+// bind-mount a host Node installation there, which would hide seeded files.
 const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/libexec/gensee-tclone-init";
+const TCLONE_CONTAINER_GENSEE_PATH: &str = "/usr/libexec/gensee";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
 const TCLONE_SOURCE_FORK_HANDOFF_FILE: &str = "source-fork-handoff.json";
@@ -3919,7 +3920,8 @@ fn run_tclone_agent_inner(
     )?;
     if let Ok(current_exe) = env::current_exe() {
         if current_exe.exists() {
-            let destination = seed_root.join("usr/local/bin/gensee");
+            let destination =
+                seed_root.join(container_relative_path(TCLONE_CONTAINER_GENSEE_PATH)?);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -3938,10 +3940,6 @@ fn run_tclone_agent_inner(
         OsString::from("seccomp=unconfined"),
         OsString::from("--security-opt"),
         OsString::from("apparmor=unconfined"),
-        OsString::from("--label"),
-        OsString::from(format!("io.gensee.run_id={run_id}")),
-        OsString::from("--label"),
-        OsString::from("io.gensee.role=source"),
         OsString::from("--tmpfs"),
         OsString::from("/config:size=512m"),
         OsString::from("--tmpfs"),
@@ -4027,13 +4025,11 @@ fn run_tclone_agent_inner(
             "CARGO_HOME={container_home}/.cargo"
         )));
     }
-    if !path_prefixes.is_empty() {
-        create_args.push(OsString::from("-e"));
-        create_args.push(OsString::from(format!(
-            "PATH={}",
-            tclone_container_path(&path_prefixes)
-        )));
-    }
+    create_args.push(OsString::from("-e"));
+    create_args.push(OsString::from(format!(
+        "PATH={}",
+        tclone_container_path(&path_prefixes)
+    )));
     create_args.push(OsString::from(&image));
     create_args.push(OsString::from("idle"));
     let agent_cmd_strings = config
@@ -4043,7 +4039,11 @@ fn run_tclone_agent_inner(
         .collect::<Vec<_>>();
 
     let output = run_command_capture(&podman, &create_args)?;
-    let container_id = output.lines().next().map(str::trim).map(str::to_string);
+    let container_id = output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.len() >= 12 && line.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_string);
     let cleanup_guard = TcloneContainerCleanup::new(&podman, &source_container);
     let source_record = TcloneRunRecord {
         run_id: run_id.clone(),
@@ -10036,7 +10036,11 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn tclone_container_path(toolchain_paths: &[String]) -> String {
-    let mut entries = vec!["/usr/local/sbin".to_string(), "/usr/local/bin".to_string()];
+    let mut entries = vec![
+        "/usr/libexec".to_string(),
+        "/usr/local/sbin".to_string(),
+        "/usr/local/bin".to_string(),
+    ];
     entries.extend(toolchain_paths.iter().cloned());
     entries.extend(
         ["/usr/sbin", "/usr/bin", "/sbin", "/bin"]
@@ -10154,7 +10158,7 @@ fn rewrite_tclone_codex_hooks(
     };
 
     let gensee_home = PathBuf::from(format!("{container_home}/.gensee"));
-    let command = codex_hook_command(&gensee_home, Path::new("/usr/local/bin/gensee"));
+    let command = codex_hook_command(&gensee_home, Path::new(TCLONE_CONTAINER_GENSEE_PATH));
     apply_codex_hook_settings(&mut root, &command)?;
 
     if let Some(parent) = hooks_path.parent() {
@@ -10193,7 +10197,7 @@ fn install_tclone_host_path_compatibility(
                 ),
             )
         })?)?;
-        symlink_or_copy_marker("/usr/local/bin/gensee", &seed_gensee)?;
+        symlink_or_copy_marker(TCLONE_CONTAINER_GENSEE_PATH, &seed_gensee)?;
     }
     Ok(())
 }
@@ -12405,12 +12409,12 @@ mod tests {
         let hook = TcloneQuietProcess {
             pid: 2171,
             stat: "S".to_string(),
-            command: "/usr/local/bin/gensee hook codex".to_string(),
+            command: format!("{TCLONE_CONTAINER_GENSEE_PATH} hook codex"),
         };
         let status = TcloneQuietProcess {
             pid: 2172,
             stat: "S".to_string(),
-            command: "/usr/local/bin/gensee run fork-status job_1 --json".to_string(),
+            command: format!("{TCLONE_CONTAINER_GENSEE_PATH} run fork-status job_1 --json"),
         };
 
         assert!(!tclone_is_transient_fork_process(&hook));
@@ -13877,10 +13881,11 @@ gensee async job job_1: exited status=0
         ]);
         let entries = path.split(':').collect::<Vec<_>>();
 
-        assert_eq!(entries[0], "/usr/local/sbin");
-        assert_eq!(entries[1], "/usr/local/bin");
+        assert_eq!(entries[0], "/usr/libexec");
+        assert_eq!(entries[1], "/usr/local/sbin");
+        assert_eq!(entries[2], "/usr/local/bin");
         assert!(
-            entries.iter().position(|entry| *entry == "/usr/local/bin")
+            entries.iter().position(|entry| *entry == "/usr/libexec")
                 < entries
                     .iter()
                     .position(|entry| *entry == "/home/yiying/.cargo/bin")
@@ -13946,7 +13951,9 @@ gensee async job job_1: exited status=0
 
         assert!(seed.join("home/gensee/.codex/hooks.json").exists());
         let hooks = fs::read_to_string(seed.join("home/gensee/.codex/hooks.json")).unwrap();
-        assert!(hooks.contains("GENSEE_HOME=/home/gensee/.gensee /usr/local/bin/gensee hook codex"));
+        assert!(hooks.contains(&format!(
+            "GENSEE_HOME=/home/gensee/.gensee {TCLONE_CONTAINER_GENSEE_PATH} hook codex"
+        )));
         assert!(!hooks.contains("/home/yiying/.cargo/bin/gensee hook codex"));
         assert_eq!(
             fs::read_link(seed.join(host_home.strip_prefix("/").unwrap())).unwrap(),
@@ -13964,7 +13971,7 @@ gensee async job job_1: exited status=0
                 )
             )
             .unwrap(),
-            PathBuf::from("/usr/local/bin/gensee")
+            PathBuf::from(TCLONE_CONTAINER_GENSEE_PATH)
         );
         assert_eq!(
             fs::read_link(seed.join(gensee_home.strip_prefix("/").unwrap())).unwrap(),

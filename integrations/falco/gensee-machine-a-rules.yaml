@@ -1,7 +1,7 @@
 - rule: Gensee Tclone Process Execution
   desc: Record process execution inside a container for trajectory reconstruction.
   condition: >
-    evt.type in (execve, execveat) and thread.cgroups contains "libpod"
+    evt.type in (execve, execveat) and evt.dir=< and thread.cgroups contains "libpod"
   output: >
     gensee process exec evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
     proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
@@ -12,7 +12,7 @@
 - rule: Gensee Tclone Workspace File Open
   desc: Record reads and opens under the Tclone workspace.
   condition: >
-    evt.type in (open, openat, openat2, creat) and thread.cgroups contains "libpod" and
+    evt.type in (open, openat, openat2, creat) and evt.dir=< and thread.cgroups contains "libpod" and
     fd.name startswith /workspace
   output: >
     gensee workspace file open evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
@@ -26,18 +26,19 @@
   condition: >
     evt.type in (unlink, unlinkat, rename, renameat, renameat2, mkdir, mkdirat,
     rmdir, link, linkat, symlink, symlinkat, truncate, ftruncate, chmod, fchmod,
-    fchmodat, chown, fchown, fchownat) and thread.cgroups contains "libpod"
+    fchmodat, chown, fchown, fchownat) and evt.dir=< and thread.cgroups contains "libpod"
   output: >
     gensee file mutation evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
     proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
-    file_path=%fd.name cgroups=%thread.cgroups evt_args=%evt.args
+    file_path=%fd.name path=%evt.arg.path name=%evt.arg.name oldpath=%evt.arg.oldpath
+    cgroups=%thread.cgroups evt_args=%evt.args
   priority: INFORMATIONAL
   tags: [gensee, trajectory, file, mutation]
 
 - rule: Gensee Tclone Network Connection
   desc: Record container network connection attempts with socket context.
   condition: >
-    evt.type in (connect, accept, accept4, bind, listen) and thread.cgroups contains "libpod"
+    evt.type in (connect, accept, accept4, bind, listen) and evt.dir=< and thread.cgroups contains "libpod"
   output: >
     gensee network evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
     proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
@@ -51,7 +52,7 @@
   condition: >
     evt.type in (ptrace, process_vm_readv, process_vm_writev, bpf, init_module,
     finit_module, delete_module, mount, umount2, pivot_root, unshare, setns,
-    setuid, setgid, setreuid, setregid, setresuid, setresgid) and
+    setuid, setgid, setreuid, setregid, setresuid, setresgid) and evt.dir=< and
     thread.cgroups contains "libpod"
   output: >
     gensee high risk syscall evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
