@@ -79,7 +79,7 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
     let hooks = store.list_hook_events()?;
     let observations = store.list_process_observations()?;
     let file_intents = store.list_file_intents()?;
-    let mut system_events = store.list_system_events()?;
+    let mut system_events = timeline_system_events(&store)?;
     let mut workspace_effects = store.list_workspace_effects()?;
     let mut alerts = store.list_alerts()?;
     let mut user_prompts = compact_user_prompts(&hooks);
@@ -169,7 +169,6 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
             }
         }
     }
-
     if !workspace_effects.is_empty() {
         println!("Workspace effects");
         for effect in workspace_effects.iter().rev().take(40).rev() {
@@ -434,6 +433,163 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn timeline_system_events(store: &EventStore) -> io::Result<Vec<SystemEvent>> {
+    let mut events = store.list_system_events()?;
+    let mut keys = events
+        .iter()
+        .map(system_event_dedup_key)
+        .collect::<HashSet<_>>();
+    for stored in store.list_native_system_events()? {
+        match stored_system_event_for_timeline(stored) {
+            Ok(event) if keys.insert(system_event_dedup_key(&event)) => events.push(event),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("gensee: skipping unreadable SQLite system event: {error}");
+            }
+        }
+    }
+    events.sort_by_key(|event| event.observed_at_ms);
+    Ok(events)
+}
+
+pub(crate) fn stored_system_event_for_timeline(
+    stored: gensee_crate_store::StoredSystemEvent,
+) -> io::Result<SystemEvent> {
+    let mut event = match stored.source.as_str() {
+        "linux-falco" => {
+            system_event_from_falco_line(&stored.raw_json, stored.observed_at_ms, None)?
+        }
+        "macos-endpoint-security" => {
+            EndpointSecurityEvent::parse(&stored.raw_json)?.into_system_event()?
+        }
+        source => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported native system event source `{source}`"),
+            ));
+        }
+    };
+    event.source = stored.source;
+    event.event_type = stored.event_type;
+    event.observed_at_ms = stored.observed_at_ms;
+    event.pid = stored.pid.or(event.pid);
+    event.raw_json = stored.raw_json;
+    Ok(event)
+}
+
+fn system_event_dedup_key(event: &SystemEvent) -> (String, String, u64, Option<u32>, String) {
+    (
+        event.source.clone(),
+        event.event_type.clone(),
+        event.observed_at_ms,
+        event.pid,
+        event.raw_json.clone(),
+    )
+}
+
+#[cfg(test)]
+mod native_system_event_tests {
+    use super::*;
+    use gensee_crate_store::StoredSystemEvent;
+
+    #[test]
+    fn rehydrates_sqlite_falco_events() {
+        let raw_json = json!({
+            "session_id": "run_1",
+            "output_fields": {
+                "evt.type": "connect",
+                "proc.pid": 42,
+                "proc.name": "curl",
+                "fd.rip": "10.20.0.2",
+                "fd.rport": 8082
+            },
+            "gensee": { "network_dest": "10.20.0.2:8082" }
+        })
+        .to_string();
+        let stored = StoredSystemEvent {
+            source: "linux-falco".to_string(),
+            event_type: "connect".to_string(),
+            observed_at_ms: 123,
+            pid: Some(42),
+            raw_json: raw_json.clone(),
+        };
+
+        let event = stored_system_event_for_timeline(stored).unwrap();
+
+        assert_eq!(event.source, "linux-falco");
+        assert_eq!(event.event_kind, "NetworkConnect");
+        assert_eq!(event.process_name.as_deref(), Some("curl"));
+        assert_eq!(system_event_session_id(&event).as_deref(), Some("run_1"));
+        assert_eq!(
+            system_event_network_dest(&event).as_deref(),
+            Some("10.20.0.2:8082")
+        );
+        assert_eq!(event.raw_json, raw_json);
+    }
+
+    #[test]
+    fn loads_falco_from_sqlite_without_jsonl_mirror() {
+        let root = std::env::temp_dir().join(format!(
+            "gensee-timeline-native-system-events-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let store = EventStore::new(&root).unwrap();
+        let event = system_event_from_falco_line(
+            r#"{"output_fields":{"evt.type":"connect","proc.pid":42,"proc.name":"curl","fd.rip":"10.20.0.2","fd.rport":8082}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        store.append_system_event(&event).unwrap();
+
+        assert!(store.list_system_events().unwrap().is_empty());
+        let events = timeline_system_events(&store).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, "linux-falco");
+        assert_eq!(events[0].event_kind, "NetworkConnect");
+        assert_eq!(
+            system_event_network_dest(&events[0]).as_deref(),
+            Some("10.20.0.2:8082")
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reads_endpoint_security_session_attribution() {
+        let raw_json = json!({
+            "schema_version": 1,
+            "event_id": "event-1",
+            "boot_id": "boot-1",
+            "observed_at_ms": 123,
+            "event_type": "write",
+            "action": "notify",
+            "actor": {
+                "pid": 42,
+                "ppid": 1,
+                "executable_path": "/bin/sh"
+            },
+            "file": { "path": "/workspace/out.txt" },
+            "attribution": { "session_id": "run_1" }
+        })
+        .to_string();
+        let stored = StoredSystemEvent {
+            source: "macos-endpoint-security".to_string(),
+            event_type: "write".to_string(),
+            observed_at_ms: 123,
+            pid: Some(42),
+            raw_json,
+        };
+        let event = stored_system_event_for_timeline(stored).unwrap();
+
+        assert_eq!(event.event_kind, "file_mutation");
+        assert_eq!(event.file_path.as_deref(), Some("/workspace/out.txt"));
+        assert_eq!(system_event_session_id(&event).as_deref(), Some("run_1"));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum TimelineFilter {
     All,
@@ -672,17 +828,19 @@ pub(crate) fn system_event_matches_path(event: &SystemEvent, path: &str) -> bool
 }
 
 pub(crate) fn system_event_session_id(event: &SystemEvent) -> Option<String> {
-    serde_json::from_str::<Value>(&event.raw_json)
-        .ok()?
-        .get("session_id")?
+    let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+    value
+        .get("session_id")
+        .or_else(|| value.pointer("/attribution/session_id"))?
         .as_str()
         .map(str::to_string)
 }
 
 pub(crate) fn system_event_network_dest(event: &SystemEvent) -> Option<String> {
-    serde_json::from_str::<Value>(&event.raw_json)
-        .ok()?
-        .get("network_dest")?
+    let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+    value
+        .get("network_dest")
+        .or_else(|| value.pointer("/gensee/network_dest"))?
         .as_str()
         .map(str::to_string)
 }
@@ -1171,6 +1329,11 @@ pub(crate) fn same_file_intent_tool_call(call: &AgentToolCall, intent: &FileInte
 }
 
 pub(crate) fn same_system_event_tool_call(call: &AgentToolCall, event: &SystemEvent) -> bool {
+    if let Some(event_session_id) = system_event_session_id(event) {
+        if call.session_id.as_deref() != Some(event_session_id.as_str()) {
+            return false;
+        }
+    }
     observed_at_inside_tool_window(call, event.observed_at_ms)
 }
 

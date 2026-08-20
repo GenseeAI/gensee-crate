@@ -1,4 +1,5 @@
 use super::*;
+use std::fmt;
 
 const FALCO_SOURCE: &str = "linux-falco";
 const MIN_CONTAINER_ID_PREFIX_LEN: usize = 12;
@@ -12,7 +13,7 @@ struct TcloneRunRegistryCache {
 
 impl TcloneRunRegistryCache {
     fn records(&mut self) -> io::Result<&[TcloneRunRecord]> {
-        let path = default_root()?.join("tclone-runs.jsonl");
+        let path = tclone_state_path()?;
         let stamp = match fs::metadata(&path) {
             Ok(metadata) => Some((metadata.modified()?, metadata.len())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -44,13 +45,22 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
     let mut rejected = 0_u64;
     let mut attribution_failures = 0_u64;
     let mut registry = TcloneRunRegistryCache::default();
+    let mut input_error_active = false;
+    let mut registry_error_active = false;
+    let mut store_error_active = false;
 
     for line in stdin.lock().lines() {
         let line = match line {
-            Ok(line) => line,
+            Ok(line) => {
+                input_error_active = false;
+                line
+            }
             Err(error) => {
                 rejected += 1;
-                eprintln!("gensee: could not read Falco event: {error}");
+                log_falco_error_once(
+                    &mut input_error_active,
+                    format_args!("could not read Falco event: {error}"),
+                );
                 continue;
             }
         };
@@ -62,6 +72,7 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
             Ok((mut event, mut value)) => {
                 match registry.records() {
                     Ok(records) => {
+                        registry_error_active = false;
                         if let Err(error) =
                             attribute_falco_event_to_tclone(&mut event, &mut value, records)
                         {
@@ -71,14 +82,23 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
                     }
                     Err(error) => {
                         attribution_failures += 1;
-                        eprintln!("gensee: could not refresh Tclone run registry: {error}");
+                        log_falco_error_once(
+                            &mut registry_error_active,
+                            format_args!("could not refresh Tclone run registry: {error}"),
+                        );
                     }
                 }
                 match store.append_system_event(&event) {
-                    Ok(()) => count += 1,
+                    Ok(()) => {
+                        store_error_active = false;
+                        count += 1;
+                    }
                     Err(error) => {
                         rejected += 1;
-                        eprintln!("gensee: could not store Falco event: {error}");
+                        log_falco_error_once(
+                            &mut store_error_active,
+                            format_args!("could not store Falco event: {error}"),
+                        );
                     }
                 }
             }
@@ -93,6 +113,13 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
         "gensee: ingested {count} Falco event(s), rejected {rejected}, attribution failures {attribution_failures}"
     );
     Ok(())
+}
+
+fn log_falco_error_once(active: &mut bool, message: fmt::Arguments<'_>) {
+    if !*active {
+        eprintln!("gensee: {message}; suppressing repeats until recovery");
+        *active = true;
+    }
 }
 
 fn parse_falco_ingest_args(args: &[OsString]) -> io::Result<Option<String>> {
@@ -130,7 +157,6 @@ fn parse_falco_ingest_args(args: &[OsString]) -> io::Result<Option<String>> {
     Ok(host)
 }
 
-#[cfg(test)]
 pub(crate) fn system_event_from_falco_line(
     line: &str,
     observed_at_ms: u64,
@@ -179,6 +205,8 @@ fn system_event_and_value_from_falco_line(
             "evt.arg.pathname",
             "evt.arg.oldpath",
             "evt.arg.newpath",
+            "evt.arg.linkpath",
+            "evt.arg.target",
             "file.path",
         ],
     )
@@ -485,6 +513,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mutation.file_path.as_deref(), Some("/workspace/old.txt"));
+
+        let symlink = system_event_from_falco_line(
+            r#"{"output_fields":{"evt.type":"symlinkat","evt.arg.target":"../target.txt","evt.arg.linkpath":"/workspace/link.txt"}}"#,
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(symlink.file_path.as_deref(), Some("/workspace/link.txt"));
 
         let network = system_event_from_falco_line(
             r#"{"output_fields":{"evt.type":"connect","fd.name":"<NA>","fd.rip":"<NA>","fd.rport":"<NA>"}}"#,

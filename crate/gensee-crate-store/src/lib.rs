@@ -81,6 +81,15 @@ pub struct EventStore {
     encryption_key: Option<[u8; 32]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSystemEvent {
+    pub source: String,
+    pub event_type: String,
+    pub observed_at_ms: u64,
+    pub pid: Option<u32>,
+    pub raw_json: String,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct TranscriptTokenState {
@@ -432,6 +441,28 @@ impl EventStore {
 
     pub fn list_system_events(&self) -> io::Result<Vec<SystemEvent>> {
         read_jsonl(&self.system_events_path(), self.encryption_key.as_ref())
+    }
+
+    pub fn list_native_system_events(&self) -> io::Result<Vec<StoredSystemEvent>> {
+        let db = self.sqlite_store()?;
+        db.system_events_for_sources(&["macos-endpoint-security", "linux-falco"])
+            .map_err(sqlite_error)?
+            .into_iter()
+            .map(|row| {
+                Ok(StoredSystemEvent {
+                    source: row.source,
+                    event_type: row.event_type,
+                    observed_at_ms: u64::try_from(row.ts).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("negative system event timestamp in SQLite: {}", row.ts),
+                        )
+                    })?,
+                    pid: u32::try_from(row.pid).ok().filter(|pid| *pid != 0),
+                    raw_json: row.args.unwrap_or_else(|| "null".to_string()),
+                })
+            })
+            .collect()
     }
 
     pub fn list_workspace_effects(&self) -> io::Result<Vec<WorkspaceEffect>> {
@@ -6908,6 +6939,16 @@ mod tests {
             .unwrap()
             .is_none());
         drop(db);
+        let native_events = store.list_native_system_events().unwrap();
+        assert_eq!(native_events.len(), 1);
+        assert_eq!(native_events[0].source, "linux-falco");
+        assert_eq!(native_events[0].event_type, "connect");
+        assert_eq!(native_events[0].observed_at_ms, 130);
+        assert_eq!(native_events[0].pid, Some(42));
+        assert_eq!(
+            native_events[0].raw_json,
+            r#"{"session_id":"run_test","event":"connect"}"#
+        );
         assert!(store
             .list_alerts()
             .unwrap()

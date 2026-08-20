@@ -1541,6 +1541,36 @@ impl SqliteStore {
         collect_rows(rows)
     }
 
+    pub fn system_events_for_sources(
+        &self,
+        sources: &[&str],
+    ) -> Result<Vec<SystemEventRecord>, SqliteError> {
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=sources.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT event_id, pid, request_id, ts, source, type, cwd, args
+                 FROM system_events
+                 WHERE source IN ({placeholders})
+                 ORDER BY ts, event_id"
+            ))
+            .map_err(SqliteError::Database)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(sources.iter().copied()),
+                map_system_event,
+            )
+            .map_err(SqliteError::Database)?;
+
+        collect_rows(rows)
+    }
+
     pub fn insert_artifact(&self, artifact: &NewArtifact) -> Result<i64, SqliteError> {
         let digest = artifact.digest.as_deref().unwrap_or("");
         self.conn
@@ -3625,6 +3655,18 @@ mod tests {
             .map(|event| event.ts)
             .collect::<Vec<_>>();
         assert_eq!(timestamps, vec![111, 999, 1000, 2000]);
+        let source_timestamps = store
+            .system_events_for_sources(&["macos-eslogger"])
+            .unwrap()
+            .into_iter()
+            .map(|event| event.ts)
+            .collect::<Vec<_>>();
+        assert_eq!(source_timestamps, timestamps);
+        assert!(store
+            .system_events_for_sources(&["linux-falco"])
+            .unwrap()
+            .is_empty());
+        assert!(store.system_events_for_sources(&[]).unwrap().is_empty());
 
         drop(store);
         remove_sqlite_files(&path);
