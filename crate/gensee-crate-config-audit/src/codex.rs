@@ -1438,12 +1438,10 @@ fn inspect_rule_file(path: &Path, text: &str, findings: &mut Vec<AuditFinding>) 
                 | "env"
         );
         if shell_or_interpreter || tokens.len() <= 1 {
-            // Keep the command itself private while retaining a stable, useful identity for
-            // each finding. Without the line locator every redacted rule has identical
-            // evidence, so distinct broad rules collapse to the same fingerprint and look
-            // like duplicate cards in audit consumers.
-            let line = text[..offset].bytes().filter(|byte| *byte == b'\n').count() + 1;
-            let evidence_key = format!("prefix_rule[line {line}]");
+            // Keep the command private while deriving identity from its normalized tokens.
+            // A positional locator would churn persisted drift whenever an earlier rule is
+            // inserted or reordered. Byte-identical rules intentionally share one finding.
+            let evidence_key = redacted_rule_evidence_key(&tokens);
             findings.push(make_finding(
                 "CAX-RUL-001",
                 "autonomy_and_approval",
@@ -2159,6 +2157,16 @@ fn quoted_values(value: &str) -> Vec<String> {
     values
 }
 
+fn redacted_rule_evidence_key(tokens: &[String]) -> String {
+    let mut normalized = Vec::new();
+    for token in tokens {
+        normalized.extend_from_slice(&(token.len() as u64).to_le_bytes());
+        normalized.extend_from_slice(token.as_bytes());
+    }
+    let digest = hash_bytes(&normalized);
+    format!("prefix_rule[sha256:{}]", &digest[..16])
+}
+
 fn skip_discovery_directory(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|value| value.to_str()),
@@ -2724,8 +2732,8 @@ mod tests {
         );
 
         let report = audit_codex(&CodexAuditOptions {
-            workspace,
-            codex_home,
+            workspace: workspace.clone(),
+            codex_home: codex_home.clone(),
             profile: None,
         })
         .unwrap();
@@ -2740,12 +2748,40 @@ mod tests {
         assert!(findings.iter().all(|finding| {
             finding.evidence[0].value.as_deref() == Some("<redacted-allow-rule>")
         }));
-        assert!(findings
+        assert!(findings.iter().all(|finding| {
+            finding.evidence[0]
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("prefix_rule[sha256:") && key.ends_with(']'))
+        }));
+
+        let original_fingerprints: HashSet<_> = findings
             .iter()
-            .any(|finding| { finding.evidence[0].key.as_deref() == Some("prefix_rule[line 1]") }));
-        assert!(findings
+            .map(|finding| finding.fingerprint.clone())
+            .collect();
+        write(
+            &codex_home.join("rules/default.rules"),
+            concat!(
+                "prefix_rule(pattern = [\"sh\"], decision = \"allow\")\n",
+                "prefix_rule(pattern = [\"python3\"], decision = \"allow\")\n",
+                "prefix_rule(pattern = [\"bash\"], decision = \"allow\")\n",
+            ),
+        );
+        let shifted_report = audit_codex(&CodexAuditOptions {
+            workspace,
+            codex_home,
+            profile: None,
+        })
+        .unwrap();
+        let shifted_fingerprints: HashSet<_> = shifted_report
+            .findings
             .iter()
-            .any(|finding| { finding.evidence[0].key.as_deref() == Some("prefix_rule[line 2]") }));
+            .filter(|finding| finding.rule_id == "CAX-RUL-001")
+            .map(|finding| finding.fingerprint.clone())
+            .collect();
+
+        assert_eq!(shifted_fingerprints.len(), 3);
+        assert!(original_fingerprints.is_subset(&shifted_fingerprints));
         let _ = fs::remove_dir_all(root);
     }
 
