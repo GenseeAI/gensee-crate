@@ -114,7 +114,7 @@ enum TimelineDerivation {
                 outcomes[toolUseID] = incoming
                 continue
             }
-            if PolicyValueRank.action(incoming.action) > PolicyValueRank.action(current.action)
+            if PolicyValueRank.actionForOrdering(incoming.action) > PolicyValueRank.actionForOrdering(current.action)
                 || PolicyValueRank.severity(incoming.severity) > PolicyValueRank.severity(current.severity)
             {
                 outcomes[toolUseID] = incoming

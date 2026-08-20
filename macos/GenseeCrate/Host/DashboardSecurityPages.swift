@@ -330,7 +330,7 @@ private struct FindingReviewControl: View {
         let currentSeverity = currentOverride?.severity ?? alert.severity
         let currentAction = currentOverride?.action ?? alert.action
         let weakensSeverity = severity.map { PolicyValueRank.severity($0) < PolicyValueRank.severity(currentSeverity) } ?? false
-        let weakensAction = action.map { PolicyValueRank.action($0) < PolicyValueRank.action(currentAction) } ?? false
+        let weakensAction = action.map { PolicyValueRank.weakensAction(from: currentAction, to: $0) } ?? false
         if weakensSeverity || weakensAction {
             pendingChange = change
         } else {

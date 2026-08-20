@@ -375,8 +375,18 @@ final class AgentCompletionModelsTests: XCTestCase {
 
     func testPolicyValueRankTreatsEndpointDenyAsHardBlock() {
         XCTAssertEqual(PolicyValueRank.action("deny"), PolicyValueRank.action("block"))
-        XCTAssertGreaterThan(PolicyValueRank.action("deny"), PolicyValueRank.action("ask"))
-        XCTAssertLessThan(PolicyValueRank.action("allow"), PolicyValueRank.action("deny"))
+        XCTAssertGreaterThan(PolicyValueRank.action("deny")!, PolicyValueRank.action("ask")!)
+        XCTAssertLessThan(PolicyValueRank.action("allow")!, PolicyValueRank.action("deny")!)
+    }
+
+    func testUnknownPolicyActionFailsTowardConfirmationAndStrongOrdering() {
+        XCTAssertNil(PolicyValueRank.action("future-action"))
+        XCTAssertTrue(PolicyValueRank.weakensAction(from: "future-action", to: "allow"))
+        XCTAssertTrue(PolicyValueRank.weakensAction(from: "block", to: "future-action"))
+        XCTAssertGreaterThan(
+            PolicyValueRank.actionForOrdering("future-action"),
+            PolicyValueRank.actionForOrdering("block")
+        )
     }
 
     func testSearchMatchesMultipleTermsAcrossPromptAndFileFields() {

@@ -14,14 +14,29 @@ func searchTermsMatch(_ search: String, fields: [String?]) -> Bool {
 /// timelines, and rule-tuning confirmation. `deny` is the wire-format alias
 /// for a hard block emitted by Endpoint Security and the SQL rollups.
 enum PolicyValueRank {
-    static func action(_ value: String) -> Int {
+    static func action(_ value: String) -> Int? {
         switch value.lowercased() {
         case "allow": 0
         case "warn", "watch": 1
         case "ask": 2
         case "block", "deny": 3
-        default: 0
+        default: nil
         }
+    }
+
+    /// Unknown wire values sort as strongest so a newly introduced action can
+    /// never be silently replaced by a known, weaker outcome in the UI.
+    static func actionForOrdering(_ value: String) -> Int {
+        action(value) ?? .max
+    }
+
+    /// A rule-tuning safety check must fail toward confirmation when either
+    /// side contains a policy action this app version does not understand.
+    static func weakensAction(from current: String, to proposed: String) -> Bool {
+        guard let currentRank = action(current), let proposedRank = action(proposed) else {
+            return true
+        }
+        return proposedRank < currentRank
     }
 
     static func severity(_ value: String) -> Int {
@@ -333,7 +348,7 @@ enum AgentCompletionDerivation {
                 .filter { $0.osVerified && !$0.declaredByHarness }
                 .map(\.path)
             let strongestAction = request.strongestAction
-                ?? alerts.map(\.action).max(by: { PolicyValueRank.action($0) < PolicyValueRank.action($1) })
+                ?? alerts.map(\.action).max(by: { PolicyValueRank.actionForOrdering($0) < PolicyValueRank.actionForOrdering($1) })
                 ?? "allow"
             let strongestSeverity = request.strongestSeverity
                 ?? alerts.map(\.severity).max(by: { PolicyValueRank.severity($0) < PolicyValueRank.severity($1) })
