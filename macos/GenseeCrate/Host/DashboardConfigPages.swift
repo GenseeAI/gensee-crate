@@ -152,6 +152,51 @@ private struct PolicySettingsView: View {
 
     var body: some View {
         VStack(spacing: 14) {
+            if !reviewOverrides.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Tuned rules")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("\(reviewOverrides.count)")
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(Color.dashboardBlue.opacity(0.14), in: Capsule())
+                            .foregroundStyle(Color.dashboardBlue)
+                        Spacer()
+                        Text("Review changes apply to every future path and session.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(reviewOverrides) { reviewOverride in
+                        HStack(spacing: 10) {
+                            Text(reviewOverride.ruleID)
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .lineLimit(1)
+                                .help(reviewOverride.ruleID)
+                            Spacer()
+                            if let severity = reviewOverride.severity {
+                                Text(severity.uppercased())
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let action = reviewOverride.action {
+                                Text(action.uppercased())
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Button("Reset") { resetReviewOverride(reviewOverride.ruleID) }
+                                .controlSize(.small)
+                        }
+                        Divider()
+                    }
+                    Text("Reset edits remain local until Save & Validate. Strict and non-interactive fail-closed modes always retain the original enforcement floor.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(14)
+                .background(Color.dashboardMutedFill, in: RoundedRectangle(cornerRadius: 5))
+            }
             ForEach(groups) { group in
                 VStack(alignment: .leading, spacing: 0) {
                     HStack(alignment: .firstTextBaseline) {
@@ -184,6 +229,19 @@ private struct PolicySettingsView: View {
     private func updatePolicyValue(_ key: String, to value: Any) {
         var root = document
         setDottedValue(&root, key, value)
+        editorText = formattedPolicyDocument(root) ?? editorText
+    }
+
+    private var reviewOverrides: [RuleReviewOverride] {
+        guard let data = try? JSONSerialization.data(withJSONObject: document) else { return [] }
+        return RuleReviewOverride.parse(policyDocument: String(decoding: data, as: UTF8.self))
+    }
+
+    private func resetReviewOverride(_ ruleID: String) {
+        var root = document
+        var values = root["review_overrides"] as? [[String: Any]] ?? []
+        values.removeAll { ($0["rule_id"] as? String) == ruleID }
+        root["review_overrides"] = values
         editorText = formattedPolicyDocument(root) ?? editorText
     }
 }

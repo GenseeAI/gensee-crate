@@ -65,7 +65,12 @@ The console includes:
 - A cross-session Watchlist for control-plane, agent-memory, and persistent
   targets. It ranks undeclared and cross-session effects first and keeps the
   relationship graph as a provenance drill-down.
-- Policy controls backed by `gensee policy get/set/path`.
+- Policy controls backed by `gensee policy get/set/path`. Finding review can
+  tune a rule for future matches, but weakening a rule requires explicit
+  confirmation because the change applies across every path and session. The
+  Settings page inventories these **Tuned rules** and can reset each one;
+  strict and non-interactive fail-closed modes retain the rule's original
+  enforcement floor.
 - A Harnesses page that detects Codex, Claude Code, Antigravity, Cursor,
   GitHub Copilot, and Omnigent. Installed direct-hook integrations can be
   enabled or disabled through `gensee setup`; unavailable harnesses remain

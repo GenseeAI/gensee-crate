@@ -4549,6 +4549,57 @@ fn noninteractive_escalates_medium_plus_asks_to_blocks() {
 }
 
 #[test]
+fn noninteractive_ignores_review_overrides_that_weaken_the_policy_floor() {
+    let mut findings = vec![
+        PolicyFinding {
+            action: PolicyAction::Allow,
+            severity: "low".to_string(),
+            rule_id: "policy_destructive_file_operation".to_string(),
+            message: String::new(),
+            path: None,
+            evidence: serde_json::json!({
+                "pre_review_action": "block",
+                "pre_review_severity": "critical",
+            }),
+        },
+        PolicyFinding {
+            action: PolicyAction::Ask,
+            severity: "low".to_string(),
+            rule_id: "policy_write_outside_workspace".to_string(),
+            message: String::new(),
+            path: None,
+            evidence: serde_json::json!({
+                "pre_review_action": "ask",
+                "pre_review_severity": "high",
+            }),
+        },
+    ];
+
+    escalate_asks_to_blocks(&mut findings);
+
+    assert_eq!(findings[0].action, PolicyAction::Block);
+    assert_eq!(findings[0].severity, "critical");
+    assert_eq!(findings[1].action, PolicyAction::Block);
+    assert_eq!(findings[1].severity, "high");
+    assert_eq!(
+        findings[1].evidence["noninteractive_escalated_from"],
+        serde_json::json!("review_override")
+    );
+
+    let adapted = adapt_decision_for_provider(
+        PolicyDecision {
+            action: PolicyAction::Block,
+            findings,
+        },
+        PROVIDER_CODEX,
+    );
+    assert!(adapted
+        .findings
+        .iter()
+        .all(|finding| finding.action == PolicyAction::Block));
+}
+
+#[test]
 fn current_session_agent_authored_benign_executable_allows() {
     let (store, workspace) = temp_store_and_workspace("current-session-artifact");
     let script = workspace.join("hello.sh");

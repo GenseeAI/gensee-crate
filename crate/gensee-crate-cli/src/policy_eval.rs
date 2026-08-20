@@ -1051,13 +1051,19 @@ fn finding_is_noninteractive_ask_block(finding: &PolicyFinding) -> bool {
 }
 
 pub(crate) fn policy_finding_from(finding: policy::Finding, source: &str) -> PolicyFinding {
+    let pre_review_action = PolicyAction::from_policy(finding.pre_review_action);
+    let pre_review_severity = finding.pre_review_severity;
     PolicyFinding {
         action: PolicyAction::from_policy(finding.action),
         severity: finding.severity,
         rule_id: finding.rule_id,
         message: finding.message,
         path: finding.path,
-        evidence: json!({ "source": source }),
+        evidence: json!({
+            "source": source,
+            "pre_review_action": pre_review_action.alert_action(),
+            "pre_review_severity": pre_review_severity,
+        }),
     }
 }
 
@@ -2155,14 +2161,73 @@ fn severity_at_least_medium(severity: &str) -> bool {
 /// caller gates it on [`noninteractive_fail_closed_enabled`].
 pub(crate) fn escalate_asks_to_blocks(findings: &mut [PolicyFinding]) {
     for finding in findings.iter_mut() {
+        let pre_review_action = finding
+            .evidence
+            .get("pre_review_action")
+            .and_then(Value::as_str)
+            .and_then(policy_action_from_alert_value);
+        let pre_review_severity = finding
+            .evidence
+            .get("pre_review_severity")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let override_weakened = pre_review_action.is_some_and(|action| action > finding.action)
+            || pre_review_severity
+                .as_deref()
+                .is_some_and(|severity| severity_rank(severity) > severity_rank(&finding.severity));
+
+        if override_weakened {
+            if let Some(action) = pre_review_action {
+                finding.action = finding.action.max(action);
+            }
+            if let Some(severity) = pre_review_severity {
+                if severity_rank(&severity) > severity_rank(&finding.severity) {
+                    finding.severity = severity;
+                }
+            }
+            if let Some(obj) = finding.evidence.as_object_mut() {
+                obj.insert(
+                    "fail_closed_review_override_ignored".to_string(),
+                    json!(true),
+                );
+            }
+        }
+
         if matches!(finding.action, PolicyAction::Ask)
             && severity_at_least_medium(&finding.severity)
         {
             finding.action = PolicyAction::Block;
             if let Some(obj) = finding.evidence.as_object_mut() {
-                obj.insert("noninteractive_escalated_from".to_string(), json!("ask"));
+                obj.insert(
+                    "noninteractive_escalated_from".to_string(),
+                    json!(if override_weakened {
+                        "review_override"
+                    } else {
+                        "ask"
+                    }),
+                );
             }
         }
+    }
+}
+
+fn policy_action_from_alert_value(value: &str) -> Option<PolicyAction> {
+    match value.to_ascii_lowercase().as_str() {
+        "allow" => Some(PolicyAction::Allow),
+        "warn" => Some(PolicyAction::Warn),
+        "ask" => Some(PolicyAction::Ask),
+        "block" => Some(PolicyAction::Block),
+        _ => None,
+    }
+}
+
+fn severity_rank(severity: &str) -> u8 {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
     }
 }
 

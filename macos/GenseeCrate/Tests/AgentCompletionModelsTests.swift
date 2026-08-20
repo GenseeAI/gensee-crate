@@ -384,6 +384,23 @@ final class AgentCompletionModelsTests: XCTestCase {
         ))
     }
 
+    func testRuleReviewOverridesParseForInventoryAndBadges() {
+        let policy = #"""
+        {
+          "review_overrides": [
+            {"rule_id":"policy_z", "action":"warn"},
+            {"rule_id":"policy_a", "severity":"low", "action":"allow"}
+          ]
+        }
+        """#
+
+        let overrides = RuleReviewOverride.parse(policyDocument: policy)
+
+        XCTAssertEqual(overrides.map(\.ruleID), ["policy_a", "policy_z"])
+        XCTAssertEqual(overrides.first?.severity, "low")
+        XCTAssertEqual(overrides.first?.action, "allow")
+    }
+
     private func request(id: Int64, started: Int64, completed: Int64) -> RecordedRequest {
         RecordedRequest(
             requestID: id, sessionID: "session-1", originalUserPrompt: "Implement the feature",

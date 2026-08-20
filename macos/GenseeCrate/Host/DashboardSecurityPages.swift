@@ -257,18 +257,23 @@ struct ExpandableAlertRow: View {
 private struct FindingReviewControl: View {
     let alert: SecurityAlert
     @ObservedObject var model: ConsoleModel
+    @State private var pendingChange: PendingRuleTuning?
 
     private let severities = ["Info", "Low", "Medium", "High", "Critical"]
     private let actions = ["Allow", "Warn", "Ask", "Block"]
+
+    private var currentOverride: RuleReviewOverride? {
+        model.reviewOverride(for: alert.ruleID)
+    }
 
     var body: some View {
         Menu {
             Menu("Set future severity") {
                 ForEach(severities, id: \.self) { severity in
                     Button {
-                        tune(severity: severity)
+                        requestTune(severity: severity)
                     } label: {
-                        if severity.caseInsensitiveCompare(alert.severity) == .orderedSame {
+                        if severity.caseInsensitiveCompare(currentOverride?.severity ?? alert.severity) == .orderedSame {
                             Label(severity, systemImage: "checkmark")
                         } else {
                             Text(severity)
@@ -279,9 +284,9 @@ private struct FindingReviewControl: View {
             Menu("Set future action") {
                 ForEach(actions, id: \.self) { action in
                     Button {
-                        tune(action: action)
+                        requestTune(action: action)
                     } label: {
-                        if action.caseInsensitiveCompare(alert.action) == .orderedSame {
+                        if action.caseInsensitiveCompare(currentOverride?.action ?? alert.action) == .orderedSame {
                             Label(action, systemImage: "checkmark")
                         } else {
                             Text(action)
@@ -293,7 +298,7 @@ private struct FindingReviewControl: View {
             if model.feedbackAlertID == alert.alertID {
                 ProgressView().controlSize(.small)
             } else {
-                Label("Review", systemImage: "slider.horizontal.3")
+                Label(currentOverride == nil ? "Review" : "Tuned", systemImage: "slider.horizontal.3")
                     .font(.system(size: 12, weight: .medium))
             }
         }
@@ -301,11 +306,54 @@ private struct FindingReviewControl: View {
         .controlSize(.small)
         .fixedSize()
         .disabled(model.feedbackAlertID != nil)
-        .help("Adjust this rule's severity or action for this and future findings")
+        .help("Changes this rule for all future paths and sessions. Strict fail-closed keeps the original enforcement floor.")
+        .alert(
+            "Weaken this rule globally?",
+            isPresented: Binding(
+                get: { pendingChange != nil },
+                set: { if !$0 { pendingChange = nil } }
+            ),
+            presenting: pendingChange
+        ) { change in
+            Button("Apply to Future Matches", role: .destructive) {
+                tune(severity: change.severity, action: change.action)
+                pendingChange = nil
+            }
+            Button("Cancel", role: .cancel) { pendingChange = nil }
+        } message: { _ in
+            Text("This affects every future match of \(alert.ruleID), across all paths and sessions. Strict and non-interactive fail-closed modes will retain the rule's original enforcement floor.")
+        }
+    }
+
+    private func requestTune(severity: String? = nil, action: String? = nil) {
+        let change = PendingRuleTuning(severity: severity, action: action)
+        let currentSeverity = currentOverride?.severity ?? alert.severity
+        let currentAction = currentOverride?.action ?? alert.action
+        let weakensSeverity = severity.map { severityRank($0) < severityRank(currentSeverity) } ?? false
+        let weakensAction = action.map { actionRank($0) < actionRank(currentAction) } ?? false
+        if weakensSeverity || weakensAction {
+            pendingChange = change
+        } else {
+            tune(severity: severity, action: action)
+        }
     }
 
     private func tune(severity: String? = nil, action: String? = nil) {
         Task { _ = await model.tuneFinding(alert, severity: severity, action: action) }
+    }
+
+    private func severityRank(_ value: String) -> Int {
+        ["info", "low", "medium", "high", "critical"].firstIndex(of: value.lowercased()) ?? 0
+    }
+
+    private func actionRank(_ value: String) -> Int {
+        ["allow", "warn", "ask", "block"].firstIndex(of: value.lowercased()) ?? 0
+    }
+
+    private struct PendingRuleTuning: Identifiable {
+        let severity: String?
+        let action: String?
+        let id = UUID()
     }
 }
 

@@ -917,6 +917,14 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
+    var reviewOverrides: [RuleReviewOverride] {
+        RuleReviewOverride.parse(policyDocument: policyDocument)
+    }
+
+    func reviewOverride(for ruleID: String) -> RuleReviewOverride? {
+        reviewOverrides.first { $0.ruleID == ruleID }
+    }
+
     func setPolicy(key: String, value: String) async {
         guard !isDemoMode else {
             noticeMessage = "Synthetic demo mode never changes your policy."

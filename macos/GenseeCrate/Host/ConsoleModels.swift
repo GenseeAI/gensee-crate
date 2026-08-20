@@ -296,6 +296,31 @@ struct SecurityAlert: Decodable, Identifiable {
     }
 }
 
+struct RuleReviewOverride: Identifiable, Equatable {
+    let ruleID: String
+    let severity: String?
+    let action: String?
+
+    var id: String { ruleID }
+
+    static func parse(policyDocument: String) -> [RuleReviewOverride] {
+        guard let data = policyDocument.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let values = root["review_overrides"] as? [[String: Any]]
+        else { return [] }
+
+        return values.compactMap { value in
+            guard let ruleID = value["rule_id"] as? String, !ruleID.isEmpty else { return nil }
+            return RuleReviewOverride(
+                ruleID: ruleID,
+                severity: value["severity"] as? String,
+                action: value["action"] as? String
+            )
+        }
+        .sorted { $0.ruleID.localizedStandardCompare($1.ruleID) == .orderedAscending }
+    }
+}
+
 struct AgentEvent: Decodable, Identifiable {
     let eventID: Int64
     let pid: Int64

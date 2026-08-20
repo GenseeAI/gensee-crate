@@ -3675,9 +3675,6 @@ fn dashboard_file_touch_is_background(path: &str) -> bool {
             ".ruff_cache",
             ".tox",
             "htmlcov",
-            "dist",
-            "build",
-            "coverage",
             ".nyc_output",
             ".next",
             ".turbo",
@@ -5624,9 +5621,6 @@ mod tests {
             "/repo/.ruff_cache/0.12/content",
             "/repo/.tox/py313/log/py313-0.log",
             "/repo/htmlcov/index.html",
-            "/repo/dist/app.js",
-            "/repo/build/output.o",
-            "/repo/coverage/lcov.info",
             "/repo/.nyc_output/processinfo/index.json",
             "/repo/.next/cache/webpack/client.pack",
             "/repo/.turbo/turbo-build.log",
@@ -5641,6 +5635,17 @@ mod tests {
         assert!(!dashboard_file_touch_is_background(
             "/Users/test/project/src/build.rs"
         ));
+        for path in [
+            "/repo/src/build/config.ts",
+            "/repo/internal/build/generated.go",
+            "/repo/packages/dist/index.ts",
+            "/repo/app/coverage/report.py",
+        ] {
+            assert!(
+                !dashboard_file_touch_is_background(path),
+                "ordinary source directory must remain visible: {path}"
+            );
+        }
     }
 
     #[test]

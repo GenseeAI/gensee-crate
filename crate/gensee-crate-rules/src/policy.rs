@@ -55,6 +55,11 @@ pub enum PathClass {
 pub struct Finding {
     pub action: Action,
     pub severity: String,
+    /// Classification before a developer review override. Fail-closed callers
+    /// use this floor so a global tuning choice cannot silently weaken strict
+    /// or non-interactive enforcement.
+    pub pre_review_action: Action,
+    pub pre_review_severity: String,
     pub rule_id: String,
     pub message: String,
     pub path: Option<String>,
@@ -947,6 +952,8 @@ impl Policy {
                 Finding {
                     action: secret.protected.action,
                     severity: secret.protected.severity.clone(),
+                    pre_review_action: secret.protected.action,
+                    pre_review_severity: secret.protected.severity.clone(),
                     rule_id: secret.rule_id.clone(),
                     message: render(template, path),
                     path: Some(path.to_string()),
@@ -955,6 +962,8 @@ impl Policy {
             PathClass::CredentialHint => Finding {
                 action: secret.credential_hint.action,
                 severity: secret.credential_hint.severity.clone(),
+                pre_review_action: secret.credential_hint.action,
+                pre_review_severity: secret.credential_hint.severity.clone(),
                 rule_id: secret.rule_id.clone(),
                 message: render(&secret.credential_hint.message, path),
                 path: Some(path.to_string()),
@@ -967,6 +976,8 @@ impl Policy {
         self.tune_finding(Finding {
             action: rule.action,
             severity: rule.severity.clone(),
+            pre_review_action: rule.action,
+            pre_review_severity: rule.severity.clone(),
             rule_id: rule.rule_id.clone(),
             message: render(&rule.message, path),
             path: Some(path.to_string()),
@@ -1064,6 +1075,8 @@ impl Policy {
                 findings.push(self.tune_finding(Finding {
                     action: persistence.action,
                     severity: persistence.severity.clone(),
+                    pre_review_action: persistence.action,
+                    pre_review_severity: persistence.severity.clone(),
                     rule_id: persistence.rule_id.clone(),
                     message: render(&persistence.message, path),
                     path: Some(path.to_string()),
@@ -1116,6 +1129,8 @@ impl Policy {
                 findings.push(self.tune_finding(Finding {
                     action: rule.action,
                     severity: rule.severity.clone(),
+                    pre_review_action: rule.action,
+                    pre_review_severity: rule.severity.clone(),
                     rule_id: rule.rule_id.clone(),
                     message: rule.message.replace("{match}", hit),
                     path: None,
@@ -1147,6 +1162,8 @@ impl Policy {
                 findings.push(self.tune_finding(Finding {
                     action: rule.action,
                     severity: rule.severity.clone(),
+                    pre_review_action: rule.action,
+                    pre_review_severity: rule.severity.clone(),
                     rule_id: rule.rule_id.clone(),
                     message: rule.message.replace("{match}", &rule.id),
                     path: None,
@@ -1189,6 +1206,8 @@ impl Policy {
                 findings.push(self.tune_finding(Finding {
                     action: rule.action,
                     severity: rule.severity.clone(),
+                    pre_review_action: rule.action,
+                    pre_review_severity: rule.severity.clone(),
                     rule_id: rule.rule_id.clone(),
                     message: rule.message.replace("{match}", &name),
                     path: None,
@@ -1219,6 +1238,8 @@ impl Policy {
             findings.push(self.tune_finding(Finding {
                 action: Action::Block,
                 severity: "critical".to_string(),
+                pre_review_action: Action::Block,
+                pre_review_severity: "critical".to_string(),
                 rule_id: "policy_dangerous_executable_content".to_string(),
                 message:
                     "Executable artifact contains a raw disk wipe command: dd if=/dev/zero of=/dev/"
@@ -1247,6 +1268,8 @@ impl Policy {
                 findings.push(self.tune_finding(Finding {
                     action: rule.action,
                     severity: rule.severity.clone(),
+                    pre_review_action: rule.action,
+                    pre_review_severity: rule.severity.clone(),
                     rule_id: rule.rule_id.clone(),
                     message: rule.message.replace("{match}", &label),
                     path: path.map(str::to_string),
@@ -1729,16 +1752,22 @@ mod tests {
         let tuned = policy.tune_finding(Finding {
             action: Action::Block,
             severity: "critical".to_string(),
+            pre_review_action: Action::Block,
+            pre_review_severity: "critical".to_string(),
             rule_id: "policy_destructive_file_operation".to_string(),
             message: "destructive operation".to_string(),
             path: Some("/repo/file".to_string()),
         });
         assert_eq!(tuned.severity, "low");
         assert_eq!(tuned.action, Action::Warn);
+        assert_eq!(tuned.pre_review_severity, "critical");
+        assert_eq!(tuned.pre_review_action, Action::Block);
 
         let untouched = policy.tune_finding(Finding {
             action: Action::Ask,
             severity: "medium".to_string(),
+            pre_review_action: Action::Ask,
+            pre_review_severity: "medium".to_string(),
             rule_id: "another_rule".to_string(),
             message: "other operation".to_string(),
             path: None,
