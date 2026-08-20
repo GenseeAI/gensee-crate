@@ -5,6 +5,9 @@ use gensee_crate_rules::capability::{
     PromotionOutput, PromotionReceipt, TelemetryCoverage, CAPABILITY_REQUEST_SCHEMA_VERSION,
     EFFECT_MANIFEST_SCHEMA_VERSION,
 };
+use gensee_crate_rules::capability_policy::{
+    CapabilityPolicyDecision, CapabilityPolicyEngine, MediationBoundary, PolicyEvaluationContext,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 const CELL_LEASE_SCHEMA_VERSION: u32 = 1;
@@ -258,9 +261,20 @@ fn validate_cell_request(request: &CapabilityRequest) -> io::Result<()> {
         ));
     }
     for unsupported in [
+        Capability::FilesystemMetadata,
         Capability::NetworkEgress,
+        Capability::NetworkListen,
+        Capability::SecretUse,
         Capability::IdentityUse,
+        Capability::WorkloadIdentity,
+        Capability::CloudIam,
+        Capability::Syscall,
+        Capability::LinuxCapability,
         Capability::PrivilegedExecution,
+        Capability::ExternalApplication,
+        Capability::DatabaseAccess,
+        Capability::IrreversibleEffect,
+        Capability::OutputPromotion,
         Capability::ExternalMutation,
     ] {
         if request.capabilities.contains(&unsupported) {
@@ -288,10 +302,40 @@ fn validate_cell_request(request: &CapabilityRequest) -> io::Result<()> {
     if !request.scope.network_hosts.is_empty()
         || !request.scope.identities.is_empty()
         || !request.scope.external_targets.is_empty()
+        || !request.scope.file_operations.is_empty()
+        || !request.scope.network_destinations.is_empty()
+        || !request.scope.secret_identities.is_empty()
+        || !request.scope.cloud_iam.is_empty()
+        || !request.scope.kernel.syscalls.is_empty()
+        || !request.scope.kernel.linux_capabilities.is_empty()
+        || !request.scope.external_applications.is_empty()
+        || !request.scope.databases.is_empty()
+        || !request.scope.output_promotions.is_empty()
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "fresh cells currently accept only filesystem resource selectors",
+            "fresh cells currently accept only legacy filesystem selectors; typed privilege deltas require their mandatory mediators",
+        ));
+    }
+    let decision = CapabilityPolicyEngine::default().evaluate(
+        request,
+        &PolicyEvaluationContext {
+            active_mediators: vec![
+                MediationBoundary::ProcessCgroup,
+                MediationBoundary::FilesystemBoundary,
+            ],
+            locally_authorized_capabilities: Vec::new(),
+            isolated_cell_available: true,
+            approval_staging_available: false,
+        },
+    );
+    if decision.decision != CapabilityPolicyDecision::DelegateToIsolatedCell {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "capability policy denied fresh-cell lease: {}",
+                decision.reason_codes.join(", ")
+            ),
         ));
     }
     Ok(())
@@ -1401,9 +1445,20 @@ mod tests {
     #[test]
     fn cell_request_rejects_unbrokered_authority() {
         for capability in [
+            Capability::FilesystemMetadata,
             Capability::NetworkEgress,
+            Capability::NetworkListen,
+            Capability::SecretUse,
             Capability::IdentityUse,
+            Capability::WorkloadIdentity,
+            Capability::CloudIam,
+            Capability::Syscall,
+            Capability::LinuxCapability,
             Capability::PrivilegedExecution,
+            Capability::ExternalApplication,
+            Capability::DatabaseAccess,
+            Capability::IrreversibleEffect,
+            Capability::OutputPromotion,
             Capability::ExternalMutation,
         ] {
             let mut request = request();
