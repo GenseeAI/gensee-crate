@@ -346,11 +346,14 @@ impl EventStore {
 
     pub fn append_system_event(&self, event: &SystemEvent) -> io::Result<()> {
         self.append_system_event_database(event)?;
-        // Endpoint Security telemetry is already durable in SQLite and can be
-        // pruned transactionally. Duplicating this high-volume stream into an
+        // Native kernel telemetry is already durable in SQLite and can be
+        // pruned transactionally. Duplicating these high-volume streams into an
         // append-only JSONL file made retention ineffective and could consume
         // gigabytes during an event burst. Keep JSONL only for legacy sources.
-        if event.source == "macos-endpoint-security" {
+        if matches!(
+            event.source.as_str(),
+            "macos-endpoint-security" | "linux-falco"
+        ) {
             return Ok(());
         }
         append_jsonl(
@@ -6895,6 +6898,7 @@ mod tests {
         assert_eq!(system_events.len(), 1);
         assert_eq!(system_events[0].source, "linux-falco");
         assert_eq!(system_events[0].event_type, "connect");
+        assert!(store.list_system_events().unwrap().is_empty());
         assert_eq!(
             db.relations_for_request(request.request_id).unwrap().len(),
             1
@@ -6937,7 +6941,19 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(store.list_system_events().unwrap().len(), 1);
+        assert!(store.list_system_events().unwrap().is_empty());
+        let db = store.sqlite_store().unwrap();
+        let request = db
+            .latest_request_for_session(SYSTEM_SESSION_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.system_events_for_request(request.request_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(db);
         assert!(store
             .list_alerts()
             .unwrap()

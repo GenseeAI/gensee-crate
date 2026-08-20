@@ -1,6 +1,31 @@
 use super::*;
 
 const FALCO_SOURCE: &str = "linux-falco";
+const MIN_CONTAINER_ID_PREFIX_LEN: usize = 12;
+
+#[derive(Default)]
+struct TcloneRunRegistryCache {
+    initialized: bool,
+    stamp: Option<(SystemTime, u64)>,
+    records: Vec<TcloneRunRecord>,
+}
+
+impl TcloneRunRegistryCache {
+    fn records(&mut self) -> io::Result<&[TcloneRunRecord]> {
+        let path = default_root()?.join("tclone-runs.jsonl");
+        let stamp = match fs::metadata(&path) {
+            Ok(metadata) => Some((metadata.modified()?, metadata.len())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if !self.initialized || self.stamp != stamp {
+            self.records = list_tclone_runs()?;
+            self.stamp = stamp;
+            self.initialized = true;
+        }
+        Ok(&self.records)
+    }
+}
 
 pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
     if args
@@ -17,18 +42,45 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
     let stdin = io::stdin();
     let mut count = 0_u64;
     let mut rejected = 0_u64;
+    let mut attribution_failures = 0_u64;
+    let mut registry = TcloneRunRegistryCache::default();
 
     for line in stdin.lock().lines() {
-        let line = line?;
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                rejected += 1;
+                eprintln!("gensee: could not read Falco event: {error}");
+                continue;
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        match system_event_from_falco_line(line, unix_millis()?, host.as_deref()) {
-            Ok(mut event) => {
-                attribute_falco_event_to_tclone(&mut event)?;
-                store.append_system_event(&event)?;
-                count += 1;
+        match system_event_and_value_from_falco_line(line, unix_millis()?, host.as_deref()) {
+            Ok((mut event, mut value)) => {
+                match registry.records() {
+                    Ok(records) => {
+                        if let Err(error) =
+                            attribute_falco_event_to_tclone(&mut event, &mut value, records)
+                        {
+                            attribution_failures += 1;
+                            eprintln!("gensee: could not attribute Falco event: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        attribution_failures += 1;
+                        eprintln!("gensee: could not refresh Tclone run registry: {error}");
+                    }
+                }
+                match store.append_system_event(&event) {
+                    Ok(()) => count += 1,
+                    Err(error) => {
+                        rejected += 1;
+                        eprintln!("gensee: could not store Falco event: {error}");
+                    }
+                }
             }
             Err(error) => {
                 rejected += 1;
@@ -37,7 +89,9 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
         }
     }
 
-    eprintln!("gensee: ingested {count} Falco event(s), rejected {rejected}");
+    eprintln!(
+        "gensee: ingested {count} Falco event(s), rejected {rejected}, attribution failures {attribution_failures}"
+    );
     Ok(())
 }
 
@@ -76,11 +130,20 @@ fn parse_falco_ingest_args(args: &[OsString]) -> io::Result<Option<String>> {
     Ok(host)
 }
 
+#[cfg(test)]
 pub(crate) fn system_event_from_falco_line(
     line: &str,
     observed_at_ms: u64,
     host: Option<&str>,
 ) -> io::Result<SystemEvent> {
+    system_event_and_value_from_falco_line(line, observed_at_ms, host).map(|(event, _)| event)
+}
+
+fn system_event_and_value_from_falco_line(
+    line: &str,
+    observed_at_ms: u64,
+    host: Option<&str>,
+) -> io::Result<(SystemEvent, Value)> {
     let mut value = serde_json::from_str::<Value>(line).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -114,6 +177,8 @@ pub(crate) fn system_event_from_falco_line(
             "evt.arg.name",
             "evt.arg.filename",
             "evt.arg.pathname",
+            "evt.arg.oldpath",
+            "evt.arg.newpath",
             "file.path",
         ],
     )
@@ -143,7 +208,7 @@ pub(crate) fn system_event_from_falco_line(
         .expect("object checked above")
         .insert("gensee".to_string(), gensee);
 
-    Ok(SystemEvent {
+    let event = SystemEvent {
         source: FALCO_SOURCE.to_string(),
         event_type,
         event_kind,
@@ -155,7 +220,8 @@ pub(crate) fn system_event_from_falco_line(
         file_path,
         command_line: falco_string(&fields, &["proc.cmdline", "proc.args"]),
         raw_json: serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
-    })
+    };
+    Ok((event, value))
 }
 
 fn container_id_from_cgroups(cgroups: &str) -> Option<String> {
@@ -175,12 +241,29 @@ fn falco_event_time_ms(fields: &Value) -> Option<u64> {
         .filter(|milliseconds| *milliseconds > 0)
 }
 
-fn attribute_falco_event_to_tclone(event: &mut SystemEvent) -> io::Result<()> {
-    let mut value = serde_json::from_str::<Value>(&event.raw_json)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let container_id = find_first_str(&value, &["container.id"]);
-    let container_name = find_first_str(&value, &["container.name"]);
-    let records = list_tclone_runs().unwrap_or_default();
+fn attribute_falco_event_to_tclone(
+    event: &mut SystemEvent,
+    value: &mut Value,
+    records: &[TcloneRunRecord],
+) -> io::Result<()> {
+    let container_id = value
+        .pointer("/gensee/container/id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("output_fields")
+                .and_then(|fields| falco_string(fields, &["container.id"]))
+        });
+    let container_name = value
+        .pointer("/gensee/container/name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("output_fields")
+                .and_then(|fields| falco_string(fields, &["container.name"]))
+        });
     let matched = records.iter().rev().find(|record| {
         container_name
             .as_deref()
@@ -189,7 +272,7 @@ fn attribute_falco_event_to_tclone(event: &mut SystemEvent) -> io::Result<()> {
                 record
                     .container_id
                     .as_deref()
-                    .is_some_and(|known| known.starts_with(id) || id.starts_with(known))
+                    .is_some_and(|known| container_ids_match(id, known))
             })
     });
 
@@ -206,6 +289,14 @@ fn attribute_falco_event_to_tclone(event: &mut SystemEvent) -> io::Result<()> {
         event.raw_json = serde_json::to_string(&value)?;
     }
     Ok(())
+}
+
+fn container_ids_match(observed: &str, known: &str) -> bool {
+    let observed = observed.trim();
+    let known = known.trim();
+    observed.len() >= MIN_CONTAINER_ID_PREFIX_LEN
+        && known.len() >= MIN_CONTAINER_ID_PREFIX_LEN
+        && (known.starts_with(observed) || observed.starts_with(known))
 }
 
 fn classify_falco_event(event_type: &str, fields: &Value) -> String {
@@ -251,11 +342,12 @@ fn falco_network_destination(fields: &Value) -> Option<String> {
 
 fn falco_string(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
-        value.get(*key).and_then(|value| match value {
+        let value = value.get(*key).and_then(|value| match value {
             Value::String(value) => Some(value.clone()),
             Value::Number(value) => Some(value.to_string()),
             _ => None,
-        })
+        })?;
+        (!value.trim().is_empty() && !matches!(value.trim(), "<NA>" | "<N/A>")).then_some(value)
     })
 }
 
@@ -266,6 +358,35 @@ fn falco_u32(value: &Value, keys: &[&str]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tclone_record(container_id: Option<&str>, container_name: &str) -> TcloneRunRecord {
+        TcloneRunRecord {
+            run_id: "run_fork_1".to_string(),
+            parent_run_id: Some("run_source_1".to_string()),
+            role: "fork".to_string(),
+            status: "running".to_string(),
+            container_name: container_name.to_string(),
+            container_id: container_id.map(ToString::to_string),
+            source_container: Some("gensee-tclone-src-run-source-1".to_string()),
+            host_control_owner_run_id: Some("run_source_1".to_string()),
+            fork_prefix: None,
+            fork_group_id: None,
+            fork_index: Some(0),
+            fork_count: Some(1),
+            fork_approach: None,
+            image: "test-image".to_string(),
+            workspace: "/workspace".to_string(),
+            container_workspace: "/workspace".to_string(),
+            container_home: "/home/gensee".to_string(),
+            agent_cmd: vec!["codex".to_string()],
+            fork_base_git_head: None,
+            fork_base_overlay_lowerdir: None,
+            fork_overlay_upperdir: None,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            exit_code: None,
+        }
+    }
 
     #[test]
     fn parses_process_execution() {
@@ -322,5 +443,56 @@ mod tests {
             raw["gensee"]["container"]["id"],
             "8f14e45fceea167a5a36dedd4bea2543"
         );
+    }
+
+    #[test]
+    fn attributes_cgroup_derived_container_id_to_tclone_run() {
+        let (mut event, mut raw) = system_event_and_value_from_falco_line(
+            r#"{"output_fields":{"evt.type":"execve","thread.cgroups":"cpuset=/machine.slice/libpod-8f14e45fceea167a5a36dedd4bea2543.scope"}}"#,
+            1,
+            None,
+        )
+        .unwrap();
+        let records = [tclone_record(
+            Some("8f14e45fceea167a5a36dedd4bea2543d00df00d"),
+            "gensee-tclone-fork-run-fork-1",
+        )];
+
+        attribute_falco_event_to_tclone(&mut event, &mut raw, &records).unwrap();
+
+        let attributed = serde_json::from_str::<Value>(&event.raw_json).unwrap();
+        assert_eq!(attributed["session_id"], "run_fork_1");
+        assert_eq!(attributed["tclone_role"], "fork");
+        assert_eq!(attributed["tclone_parent_run_id"], "run_source_1");
+    }
+
+    #[test]
+    fn container_id_matching_rejects_empty_and_short_prefixes() {
+        assert!(!container_ids_match("", "8f14e45fceea167a"));
+        assert!(!container_ids_match("8f14e45f", "8f14e45fceea167a"));
+        assert!(container_ids_match(
+            "8f14e45fceea",
+            "8f14e45fceea167a5a36dedd4bea2543"
+        ));
+    }
+
+    #[test]
+    fn mutation_paths_and_unresolved_network_fields_are_handled() {
+        let mutation = system_event_from_falco_line(
+            r#"{"output_fields":{"evt.type":"renameat","fd.name":"<NA>","evt.arg.oldpath":"/workspace/old.txt"}}"#,
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mutation.file_path.as_deref(), Some("/workspace/old.txt"));
+
+        let network = system_event_from_falco_line(
+            r#"{"output_fields":{"evt.type":"connect","fd.name":"<NA>","fd.rip":"<NA>","fd.rport":"<NA>"}}"#,
+            1,
+            None,
+        )
+        .unwrap();
+        let raw = serde_json::from_str::<Value>(&network.raw_json).unwrap();
+        assert!(raw["gensee"]["network_dest"].is_null());
     }
 }

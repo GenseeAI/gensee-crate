@@ -38,10 +38,10 @@ sudo falco \
       gensee ingest falco --host machine-a-sandbox
 ```
 
-The Tclone launcher labels new source containers with `io.gensee.run_id` and
-`io.gensee.role`. The ingestor correlates the container id embedded in
-`thread.cgroups` to the authoritative local `tclone-runs.jsonl`, which also
-covers forks whose runtime metadata changes after cloning.
+The ingestor correlates the container id embedded in `thread.cgroups` to the
+authoritative local `tclone-runs.jsonl`. This registry records the distinct run
+identity and role for sources and forks without relying on container labels
+that Podman clones would inherit from their source.
 
 ## Machine B
 
