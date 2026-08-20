@@ -34,10 +34,14 @@ The console includes:
   old work.
 - An explicit, in-memory **synthetic demo** that can be entered before setup or
   from the app toolbar. It uses invented sessions, requests, tool calls,
-  findings, artifacts, and activity history; a persistent banner identifies the
-  data as synthetic. Entering the demo does not initialize a database, install
-  hooks, request Apple permissions, change policy, or touch harness settings.
-  Real configuration pages remain locked until the user exits the demo.
+  findings, artifacts, recovery points, verification results, and a rolling
+  53-week activity history. Its connected AcmeShop scenarios include clean
+  completions, scope drift, a blocked secret read, stale verification, and a
+  migration that needs review, so each screen tells part of the same product
+  story. A persistent banner identifies the data as synthetic. Entering the
+  demo does not initialize a database, install hooks, request Apple permissions,
+  change policy, or touch harness settings. Real configuration pages remain
+  locked until the user exits the demo.
 - A developer-oriented autonomy ladder. **Fast** keeps Endpoint Security
   notification-only while existing hook decision rules still apply;
   **Review** enables configured OS authorization while keeping ask decisions

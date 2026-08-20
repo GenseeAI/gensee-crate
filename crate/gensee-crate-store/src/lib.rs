@@ -1416,13 +1416,12 @@ impl EventStore {
         window_ms: u64,
     ) -> io::Result<bool> {
         let policy = Policy::load_current();
-        let (severity, _) =
-            policy.tuned_alert_values(&alert.rule_id, &alert.severity, &alert.action);
+        let tuned = policy.tuned_alert_values(&alert.rule_id, &alert.severity, &alert.action);
         if !policy
             .document()
             .endpoint_security
             .minimum_recorded_severity
-            .includes(&severity)
+            .includes(&tuned.severity)
         {
             return Ok(false);
         }
@@ -2567,25 +2566,33 @@ fn insert_entity_relation(
 
 fn insert_alert(db: &SqliteStore, input: AlertInput<'_>) -> io::Result<()> {
     let policy = Policy::load_current();
-    let (severity, action) = policy.tuned_alert_values(input.rule_id, input.severity, input.action);
+    let tuned = policy.tuned_alert_values(input.rule_id, input.severity, input.action);
     if !policy
         .document()
         .endpoint_security
         .minimum_recorded_severity
-        .includes(&severity)
+        .includes(&tuned.severity)
     {
         return Ok(());
+    }
+    let mut evidence = input.evidence;
+    if let Some(severity) = tuned.pre_review_severity {
+        evidence =
+            add_alert_evidence_field(evidence, "pre_review_severity", Value::String(severity));
+    }
+    if let Some(action) = tuned.pre_review_action {
+        evidence = add_alert_evidence_field(evidence, "pre_review_action", Value::String(action));
     }
     db.insert_alert(&NewAlert {
         request_id: input.request_id,
         entity_kind: input.entity.map(|entity| entity.kind.to_string()),
         entity_id: input.entity.map(|entity| entity.id),
-        severity,
-        action,
+        severity: tuned.severity,
+        action: tuned.action,
         rule_id: input.rule_id.to_string(),
         message: input.message.to_string(),
         path: input.path.map(str::to_string),
-        evidence: input.evidence.map(|value| value.to_string()),
+        evidence: evidence.map(|value| value.to_string()),
         created_at: input.created_at,
     })
     .map(|_| ())

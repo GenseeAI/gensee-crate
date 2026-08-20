@@ -329,8 +329,8 @@ private struct FindingReviewControl: View {
         let change = PendingRuleTuning(severity: severity, action: action)
         let currentSeverity = currentOverride?.severity ?? alert.severity
         let currentAction = currentOverride?.action ?? alert.action
-        let weakensSeverity = severity.map { severityRank($0) < severityRank(currentSeverity) } ?? false
-        let weakensAction = action.map { actionRank($0) < actionRank(currentAction) } ?? false
+        let weakensSeverity = severity.map { PolicyValueRank.severity($0) < PolicyValueRank.severity(currentSeverity) } ?? false
+        let weakensAction = action.map { PolicyValueRank.action($0) < PolicyValueRank.action(currentAction) } ?? false
         if weakensSeverity || weakensAction {
             pendingChange = change
         } else {
@@ -340,14 +340,6 @@ private struct FindingReviewControl: View {
 
     private func tune(severity: String? = nil, action: String? = nil) {
         Task { _ = await model.tuneFinding(alert, severity: severity, action: action) }
-    }
-
-    private func severityRank(_ value: String) -> Int {
-        ["info", "low", "medium", "high", "critical"].firstIndex(of: value.lowercased()) ?? 0
-    }
-
-    private func actionRank(_ value: String) -> Int {
-        ["allow", "warn", "ask", "block"].firstIndex(of: value.lowercased()) ?? 0
     }
 
     private struct PendingRuleTuning: Identifiable {

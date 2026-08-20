@@ -10,6 +10,32 @@ func searchTermsMatch(_ search: String, fields: [String?]) -> Bool {
     return terms.allSatisfy { searchableText.localizedCaseInsensitiveContains($0) }
 }
 
+/// One canonical ordering for policy values used across completion summaries,
+/// timelines, and rule-tuning confirmation. `deny` is the wire-format alias
+/// for a hard block emitted by Endpoint Security and the SQL rollups.
+enum PolicyValueRank {
+    static func action(_ value: String) -> Int {
+        switch value.lowercased() {
+        case "allow": 0
+        case "warn", "watch": 1
+        case "ask": 2
+        case "block", "deny": 3
+        default: 0
+        }
+    }
+
+    static func severity(_ value: String) -> Int {
+        switch value.lowercased() {
+        case "info": 0
+        case "low": 1
+        case "medium": 2
+        case "high": 3
+        case "critical": 4
+        default: 0
+        }
+    }
+}
+
 enum NotificationSeverity: String, CaseIterable, Identifiable {
     case critical
     case high
@@ -307,10 +333,10 @@ enum AgentCompletionDerivation {
                 .filter { $0.osVerified && !$0.declaredByHarness }
                 .map(\.path)
             let strongestAction = request.strongestAction
-                ?? alerts.map(\.action).max(by: { actionRank($0) < actionRank($1) })
+                ?? alerts.map(\.action).max(by: { PolicyValueRank.action($0) < PolicyValueRank.action($1) })
                 ?? "allow"
             let strongestSeverity = request.strongestSeverity
-                ?? alerts.map(\.severity).max(by: { severityRank($0) < severityRank($1) })
+                ?? alerts.map(\.severity).max(by: { PolicyValueRank.severity($0) < PolicyValueRank.severity($1) })
                 ?? "info"
             let highRiskCount = request.highRiskAlertCount ?? alerts.filter {
                 ["high", "critical"].contains($0.severity.lowercased())
@@ -462,11 +488,4 @@ enum AgentCompletionDerivation {
         return nil
     }
 
-    private static func actionRank(_ action: String) -> Int {
-        ["allow": 0, "warn": 1, "ask": 2, "block": 3, "deny": 3][action.lowercased()] ?? 0
-    }
-
-    private static func severityRank(_ severity: String) -> Int {
-        ["info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4][severity.lowercased()] ?? 0
-    }
 }

@@ -56,6 +56,7 @@ struct DashboardPolicyPage: View {
                             default:
                                 if let document {
                                     PolicySettingsView(
+                                        model: model,
                                         document: document,
                                         editorText: $editorText
                                     )
@@ -85,6 +86,7 @@ struct DashboardPolicyPage: View {
 }
 
 private struct PolicySettingsView: View {
+    @ObservedObject var model: ConsoleModel
     let document: [String: Any]
     @Binding var editorText: String
 
@@ -185,12 +187,14 @@ private struct PolicySettingsView: View {
                                     .font(.system(size: 9, weight: .bold))
                                     .foregroundStyle(.secondary)
                             }
-                            Button("Reset") { resetReviewOverride(reviewOverride.ruleID) }
+                            Button("Reset") {
+                                Task { await resetReviewOverride(reviewOverride.ruleID) }
+                            }
                                 .controlSize(.small)
                         }
                         Divider()
                     }
-                    Text("Reset edits remain local until Save & Validate. Strict and non-interactive fail-closed modes always retain the original enforcement floor.")
+                    Text("Reset validates and saves immediately. Strict and non-interactive fail-closed modes always retain the original enforcement floor.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
@@ -237,12 +241,16 @@ private struct PolicySettingsView: View {
         return RuleReviewOverride.parse(policyDocument: String(decoding: data, as: UTF8.self))
     }
 
-    private func resetReviewOverride(_ ruleID: String) {
+    private func resetReviewOverride(_ ruleID: String) async {
         var root = document
         var values = root["review_overrides"] as? [[String: Any]] ?? []
         values.removeAll { ($0["rule_id"] as? String) == ruleID }
         root["review_overrides"] = values
-        editorText = formattedPolicyDocument(root) ?? editorText
+        guard let updated = formattedPolicyDocument(root) else { return }
+        editorText = updated
+        if await model.savePolicyDocument(updated) {
+            editorText = model.policyDocument
+        }
     }
 }
 

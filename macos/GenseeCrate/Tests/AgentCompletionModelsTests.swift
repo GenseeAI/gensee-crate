@@ -373,6 +373,12 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertTrue(NotificationSeverity.info.includes("unknown"))
     }
 
+    func testPolicyValueRankTreatsEndpointDenyAsHardBlock() {
+        XCTAssertEqual(PolicyValueRank.action("deny"), PolicyValueRank.action("block"))
+        XCTAssertGreaterThan(PolicyValueRank.action("deny"), PolicyValueRank.action("ask"))
+        XCTAssertLessThan(PolicyValueRank.action("allow"), PolicyValueRank.action("deny"))
+    }
+
     func testSearchMatchesMultipleTermsAcrossPromptAndFileFields() {
         XCTAssertTrue(searchTermsMatch(
             "auth migration",

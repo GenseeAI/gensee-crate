@@ -65,6 +65,16 @@ pub struct Finding {
     pub path: Option<String>,
 }
 
+/// Stored values for an alert produced outside the declarative matcher
+/// engine, together with its classification before a review override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunedAlertValues {
+    pub severity: String,
+    pub action: String,
+    pub pre_review_severity: Option<String>,
+    pub pre_review_action: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Serde data model (mirrors policy/default-policy.json)
 // ---------------------------------------------------------------------------
@@ -852,14 +862,18 @@ impl Policy {
 
     /// Tune alert values produced outside the declarative matcher engine (for
     /// example Endpoint Security correlation findings) before they are stored.
-    pub fn tuned_alert_values<'a>(
+    pub fn tuned_alert_values(
         &self,
         rule_id: &str,
-        severity: &'a str,
-        action: &'a str,
-    ) -> (String, String) {
-        let mut severity = severity.to_string();
-        let mut action = action.to_string();
+        severity: &str,
+        action: &str,
+    ) -> TunedAlertValues {
+        let mut values = TunedAlertValues {
+            severity: severity.to_string(),
+            action: action.to_string(),
+            pre_review_severity: None,
+            pre_review_action: None,
+        };
         if let Some(review_override) = self
             .doc
             .review_overrides
@@ -867,14 +881,16 @@ impl Policy {
             .rev()
             .find(|candidate| candidate.rule_id == rule_id)
         {
+            values.pre_review_severity = Some(severity.to_string());
+            values.pre_review_action = Some(action.to_string());
             if let Some(value) = &review_override.severity {
-                severity.clone_from(value);
+                values.severity.clone_from(value);
             }
             if let Some(value) = review_override.action {
-                action = value.as_str().to_string();
+                values.action = value.as_str().to_string();
             }
         }
-        (severity, action)
+        values
     }
 
     // --- operation predicates ------------------------------------------------
@@ -1774,6 +1790,19 @@ mod tests {
         });
         assert_eq!(untouched.severity, "medium");
         assert_eq!(untouched.action, Action::Ask);
+
+        let external =
+            policy.tuned_alert_values("policy_destructive_file_operation", "critical", "deny");
+        assert_eq!(external.severity, "low");
+        assert_eq!(external.action, "warn");
+        assert_eq!(external.pre_review_severity.as_deref(), Some("critical"));
+        assert_eq!(external.pre_review_action.as_deref(), Some("deny"));
+
+        let external_untouched = policy.tuned_alert_values("another_rule", "medium", "ask");
+        assert_eq!(external_untouched.severity, "medium");
+        assert_eq!(external_untouched.action, "ask");
+        assert_eq!(external_untouched.pre_review_severity, None);
+        assert_eq!(external_untouched.pre_review_action, None);
     }
 
     #[test]

@@ -43,6 +43,7 @@ final class ConsoleModel: ObservableObject {
     private var hasLoadedDashboardSnapshot = false
     private var lastDashboardRefreshDuration: TimeInterval = 0
     private var snapshotBeforeDemo = SecuritySnapshot()
+    private var recoveryPointsBeforeDemo: [Int64: WorkspaceCheckpointRecord] = [:]
     private var dismissedPendingRecoveryIDs: Set<String> = []
     private var endpointSessionRecords: [AgentSessionRecord] = []
     private var hasLoadedEndpointSessionRecords = false
@@ -51,6 +52,9 @@ final class ConsoleModel: ObservableObject {
     private var completionRefreshInProgress = false
     private var lastCompletionSignalModificationDate: Date?
     private var lastCompletionRequestID: Int64 = 0
+    /// Invalidates live-data work that was already awaiting the CLI when the
+    /// user switches between this Mac and the synthetic product tour.
+    private var dataSourceGeneration: UInt64 = 0
 
     init() {
         let environmentHome = ProcessInfo.processInfo.environment["GENSEE_HOME"]
@@ -183,15 +187,19 @@ final class ConsoleModel: ObservableObject {
 
     func refreshAll() async {
         guard !isDemoMode else {
-            snapshot = DemoSnapshotFactory.make()
-            lastUpdated = Date()
+            let now = Date()
+            snapshot = DemoSnapshotFactory.make(now: now)
+            recoveryPointsByRequest = DemoSnapshotFactory.recoveryPoints(now: now)
+            lastUpdated = now
             return
         }
         guard !isRefreshing else { return }
+        let liveGeneration = dataSourceGeneration
         isRefreshing = true
         defer { isRefreshing = false }
         cli = GenseeCLI(homeURL: homeURL)
         await refreshIntegrationsWithCurrentBackend()
+        guard acceptsLiveData(generation: liveGeneration) else { return }
 
         guard backendAvailable else {
             errorMessage = GenseeCLIError.executableNotFound.localizedDescription
@@ -199,10 +207,17 @@ final class ConsoleModel: ObservableObject {
         }
 
         await refreshDashboard()
+        guard acceptsLiveData(generation: liveGeneration) else { return }
 
         do {
-            runs = try await cli.decode(RunListResponse.self, arguments: ["run", "list", "--json"])
+            let refreshedRuns = try await cli.decode(
+                RunListResponse.self,
+                arguments: ["run", "list", "--json"]
+            )
+            guard acceptsLiveData(generation: liveGeneration) else { return }
+            runs = refreshedRuns
         } catch {
+            guard acceptsLiveData(generation: liveGeneration) else { return }
             errorMessage = error.localizedDescription
         }
 
@@ -251,6 +266,7 @@ final class ConsoleModel: ObservableObject {
         guard !isDemoMode else { return }
         guard backendAvailable else { return }
         guard !dashboardRefreshInProgress else { return }
+        let liveGeneration = dataSourceGeneration
         dashboardRefreshInProgress = true
         let refreshStartedAt = Date()
         defer {
@@ -267,6 +283,7 @@ final class ConsoleModel: ObservableObject {
                 // permanently look empty on stores that are still healthy.
                 timeout: hasLoadedDashboardSnapshot ? 45 : 75
             )
+            guard acceptsLiveData(generation: liveGeneration) else { return }
             hasLoadedDashboardSnapshot = true
             reconcileReadAlertState(alertCount: refreshedSnapshot.summary.alertsCount)
             snapshot = refreshedSnapshot
@@ -275,6 +292,7 @@ final class ConsoleModel: ObservableObject {
             lastUpdated = Date()
             dashboardRefreshIssue = nil
         } catch {
+            guard acceptsLiveData(generation: liveGeneration) else { return }
             dashboardRefreshIssue = error.localizedDescription
             // Keep the last good snapshot visible, but always release the
             // in-progress guard so the next scheduled refresh can recover.
@@ -299,10 +317,13 @@ final class ConsoleModel: ObservableObject {
             )
             return
         }
+        let liveGeneration = dataSourceGeneration
         dailyDetailLoadState = .loading(day)
         do {
             let detail = try await cli.decode(DailyDetail.self, arguments: ["dashboard-day", day])
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  acceptsLiveData(generation: liveGeneration)
+            else { return }
             guard detail.date == day else {
                 dailyDetailLoadState = .unavailable(
                     day: day,
@@ -313,7 +334,9 @@ final class ConsoleModel: ObservableObject {
             dailyDetail = detail
             dailyDetailLoadState = .loaded(day)
         } catch {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  acceptsLiveData(generation: liveGeneration)
+            else { return }
             dashboardRefreshIssue = error.localizedDescription
             dailyDetailLoadState = .unavailable(day: day, message: error.localizedDescription)
         }
@@ -345,6 +368,7 @@ final class ConsoleModel: ObservableObject {
             )
             return
         }
+        let liveGeneration = dataSourceGeneration
 
         requestReviewPayload = nil
         requestReviewLoadState = .loading(requestID)
@@ -354,12 +378,16 @@ final class ConsoleModel: ObservableObject {
                 arguments: ["dashboard-request", String(requestID)],
                 timeout: 12
             )
-            guard requestReviewLoadState == .loading(requestID) else { return }
+            guard acceptsLiveData(generation: liveGeneration),
+                  requestReviewLoadState == .loading(requestID)
+            else { return }
             requestReviewPayload = payload
             requestReviewLoadState = .loaded(requestID)
             await loadRecoveryPoint(for: payload)
         } catch {
-            guard requestReviewLoadState == .loading(requestID) else { return }
+            guard acceptsLiveData(generation: liveGeneration),
+                  requestReviewLoadState == .loading(requestID)
+            else { return }
             requestReviewPayload = nil
             requestReviewLoadState = .unavailable(
                 requestID: requestID,
@@ -370,12 +398,14 @@ final class ConsoleModel: ObservableObject {
 
     func refreshPendingRecoveryRequest() async {
         guard !isDemoMode, backendAvailable else { return }
+        let liveGeneration = dataSourceGeneration
         do {
             let requests = try await cli.decode(
                 [PendingRecoveryRequest].self,
                 arguments: ["checkpoint", "pending", "--json"],
                 timeout: 3
             )
+            guard acceptsLiveData(generation: liveGeneration) else { return }
             let availableIDs = Set(requests.map(\.id))
             dismissedPendingRecoveryIDs.formIntersection(availableIDs)
             pendingRecoveryRequest = requests.first {
@@ -405,6 +435,7 @@ final class ConsoleModel: ObservableObject {
     /// to observe the request's very first (and sometimes only) command.
     func refreshEndpointSessionRootsIfNeeded(force: Bool = false) async {
         guard !isDemoMode, backendAvailable, !endpointRootsRefreshInProgress else { return }
+        let liveGeneration = dataSourceGeneration
         let sessionsURL = homeURL.appendingPathComponent("sessions.jsonl")
         let modificationDate = try? sessionsURL.resourceValues(
             forKeys: [.contentModificationDateKey]
@@ -419,6 +450,7 @@ final class ConsoleModel: ObservableObject {
                 arguments: ["endpoint-roots"],
                 timeout: 3
             )
+            guard acceptsLiveData(generation: liveGeneration) else { return }
             endpointSessionRecords = sessions
             hasLoadedEndpointSessionRecords = true
             lastEndpointSessionsModificationDate = modificationDate
@@ -444,6 +476,7 @@ final class ConsoleModel: ObservableObject {
     /// sensitive notification and menu-bar path.
     func refreshRecentCompletionsIfNeeded() async -> Bool {
         guard !isDemoMode, backendAvailable, !completionRefreshInProgress else { return false }
+        let liveGeneration = dataSourceGeneration
         let signalURL = homeURL.appendingPathComponent("completion.signal")
         let modificationDate = try? signalURL.resourceValues(
             forKeys: [.contentModificationDateKey]
@@ -458,11 +491,13 @@ final class ConsoleModel: ObservableObject {
             // Give the 500 ms Endpoint Security ingestion loop time to persist
             // trailing file events before projecting the completed request.
             try await Task.sleep(for: .milliseconds(1_100))
+            guard acceptsLiveData(generation: liveGeneration) else { return false }
             let requestIDs = try await cli.decode(
                 [Int64].self,
                 arguments: ["dashboard-completions", String(lastCompletionRequestID)],
                 timeout: 3
             )
+            guard acceptsLiveData(generation: liveGeneration) else { return false }
             var updated = false
             for requestID in requestIDs {
                 let payload = try await cli.decode(
@@ -470,6 +505,7 @@ final class ConsoleModel: ObservableObject {
                     arguments: ["dashboard-request", String(requestID)],
                     timeout: 5
                 )
+                guard acceptsLiveData(generation: liveGeneration) else { return false }
                 mergeCompletionPayload(payload)
                 lastCompletionRequestID = max(lastCompletionRequestID, requestID)
                 updated = true
@@ -696,7 +732,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     func restoreCheckpoint(_ checkpoint: WorkspaceCheckpointRecord, workspace: String) async {
-        guard !isDemoMode else { return }
+        guard !isDemoMode else {
+            noticeMessage = "Restore is a safe preview in synthetic demo mode. With a real Git workspace, Gensee first creates a rescue point, then restores the files captured before this request."
+            return
+        }
         guard let workspaceURL = existingWorkspaceURL(workspace) else {
             errorMessage = "Choose the checkpoint's Git workspace before restoring it."
             return
@@ -1121,15 +1160,18 @@ final class ConsoleModel: ObservableObject {
 
     func enterDemoMode() {
         guard !isDemoMode else { return }
+        let now = Date()
         snapshotBeforeDemo = snapshot
-        snapshot = DemoSnapshotFactory.make()
+        recoveryPointsBeforeDemo = recoveryPointsByRequest
+        dataSourceGeneration &+= 1
         isDemoMode = true
+        snapshot = DemoSnapshotFactory.make(now: now)
         dashboardRefreshIssue = nil
         dailyDetail = nil
         dailyDetailLoadState = .idle
         requestReviewPayload = nil
         requestReviewLoadState = .idle
-        recoveryPointsByRequest.removeAll()
+        recoveryPointsByRequest = DemoSnapshotFactory.recoveryPoints(now: now)
         pendingRecoveryRequest = nil
         errorMessage = nil
         lastUpdated = Date()
@@ -1137,15 +1179,21 @@ final class ConsoleModel: ObservableObject {
 
     func exitDemoMode() async {
         guard isDemoMode else { return }
+        dataSourceGeneration &+= 1
         isDemoMode = false
         snapshot = snapshotBeforeDemo
         dailyDetail = nil
         dailyDetailLoadState = .idle
         requestReviewPayload = nil
         requestReviewLoadState = .idle
-        recoveryPointsByRequest.removeAll()
+        recoveryPointsByRequest = recoveryPointsBeforeDemo
+        recoveryPointsBeforeDemo.removeAll()
         pendingRecoveryRequest = nil
         await refreshAll()
+    }
+
+    private func acceptsLiveData(generation: UInt64) -> Bool {
+        !isDemoMode && generation == dataSourceGeneration
     }
 
     func applyProtectionLevel(_ level: ProtectionLevel) async -> Bool {
