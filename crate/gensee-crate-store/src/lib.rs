@@ -4856,9 +4856,11 @@ fn hex_decode(text: &str) -> io::Result<Vec<u8>> {
     }
     let mut bytes = Vec::with_capacity(text.len() / 2);
     let raw = text.as_bytes();
-    for chunk in raw.chunks_exact(2) {
-        let high = hex_value(chunk[0])?;
-        let low = hex_value(chunk[1])?;
+    let (pairs, remainder) = raw.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for [high_byte, low_byte] in pairs {
+        let high = hex_value(*high_byte)?;
+        let low = hex_value(*low_byte)?;
         bytes.push((high << 4) | low);
     }
     Ok(bytes)
