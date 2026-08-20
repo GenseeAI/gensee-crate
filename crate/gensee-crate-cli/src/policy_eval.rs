@@ -29,6 +29,7 @@ impl PolicyAction {
     fn from_policy(action: policy::Action) -> Self {
         match action {
             policy::Action::Allow => Self::Allow,
+            policy::Action::Warn => Self::Warn,
             policy::Action::Ask => Self::Ask,
             policy::Action::Block => Self::Block,
         }
@@ -77,12 +78,22 @@ pub(crate) fn evaluate_pretool_policy(
     evaluate_pretool_policy_with_store(event, file_intents, None)
 }
 
+#[cfg(any(test, feature = "bench"))]
 pub(crate) fn evaluate_pretool_policy_with_store(
     event: &AgentHookEvent,
     file_intents: &[FileIntent],
     store: Option<&EventStore>,
 ) -> PolicyDecision {
     let policy = Policy::load_current();
+    evaluate_pretool_policy_with_policy(event, file_intents, store, &policy)
+}
+
+pub(crate) fn evaluate_pretool_policy_with_policy(
+    event: &AgentHookEvent,
+    file_intents: &[FileIntent],
+    store: Option<&EventStore>,
+    policy: &Policy,
+) -> PolicyDecision {
     let mut findings = Vec::new();
     let cwd = event.cwd.as_deref();
 
@@ -95,7 +106,7 @@ pub(crate) fn evaluate_pretool_policy_with_store(
 
     let subjects = policy_subjects(event, file_intents);
     for subject in &subjects {
-        findings.extend(policy_findings_for_subject(subject, cwd, &policy));
+        findings.extend(policy_findings_for_subject(subject, cwd, policy));
     }
     if let Some(finding) = unparsed_permission_request_finding(event) {
         findings.push(finding);
@@ -129,14 +140,14 @@ pub(crate) fn evaluate_pretool_policy_with_store(
                 findings.extend(dynamic_control_plane_findings(subject, store));
             } else if subject.operation == "read" {
                 findings.extend(registered_artifact_read_fact_findings(
-                    event, subject, store, &policy,
+                    event, subject, store, policy,
                 ));
             }
         }
         // Memory/skill-integrity (write-side + read-detection) and the
         // in-session trigger-side escalation. See "Memory and skill poisoning
         // defense" in docs/policy.md.
-        findings.extend(memory_artifact_findings(event, &subjects, &policy));
+        findings.extend(memory_artifact_findings(event, &subjects, policy));
         findings.extend(memory_triggered_findings(event, store));
         // Sensitive-read -> egress chain trigger. Markers are appended only
         // after the full decision is known, because a tool call denied by any
@@ -171,7 +182,7 @@ pub(crate) fn evaluate_pretool_policy_with_store(
     // BEFORE aggregating so the overall decision and the `sensitive_read_findings`
     // gate below both see the hardened action (a now-blocked call must not seed a
     // sensitive-read exfil chain).
-    if noninteractive_fail_closed_enabled(&policy) {
+    if noninteractive_fail_closed_enabled(policy) {
         escalate_asks_to_blocks(&mut findings);
     }
 
@@ -181,7 +192,7 @@ pub(crate) fn evaluate_pretool_policy_with_store(
         .max()
         .unwrap_or(PolicyAction::Allow);
     if store.is_some() && !matches!(action, PolicyAction::Block) {
-        findings.extend(sensitive_read_findings(&subjects, &policy));
+        findings.extend(sensitive_read_findings(&subjects, policy));
     }
     if store.is_some() && matches!(action, PolicyAction::Allow) {
         if let Some(finding) = network_egress_marker_finding(event) {
@@ -1040,13 +1051,19 @@ fn finding_is_noninteractive_ask_block(finding: &PolicyFinding) -> bool {
 }
 
 pub(crate) fn policy_finding_from(finding: policy::Finding, source: &str) -> PolicyFinding {
+    let pre_review_action = PolicyAction::from_policy(finding.pre_review_action);
+    let pre_review_severity = finding.pre_review_severity;
     PolicyFinding {
         action: PolicyAction::from_policy(finding.action),
         severity: finding.severity,
         rule_id: finding.rule_id,
         message: finding.message,
         path: finding.path,
-        evidence: json!({ "source": source }),
+        evidence: json!({
+            "source": source,
+            "pre_review_action": pre_review_action.alert_action(),
+            "pre_review_severity": pre_review_severity,
+        }),
     }
 }
 
@@ -2144,14 +2161,73 @@ fn severity_at_least_medium(severity: &str) -> bool {
 /// caller gates it on [`noninteractive_fail_closed_enabled`].
 pub(crate) fn escalate_asks_to_blocks(findings: &mut [PolicyFinding]) {
     for finding in findings.iter_mut() {
+        let pre_review_action = finding
+            .evidence
+            .get("pre_review_action")
+            .and_then(Value::as_str)
+            .and_then(policy_action_from_alert_value);
+        let pre_review_severity = finding
+            .evidence
+            .get("pre_review_severity")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let override_weakened = pre_review_action.is_some_and(|action| action > finding.action)
+            || pre_review_severity
+                .as_deref()
+                .is_some_and(|severity| severity_rank(severity) > severity_rank(&finding.severity));
+
+        if override_weakened {
+            if let Some(action) = pre_review_action {
+                finding.action = finding.action.max(action);
+            }
+            if let Some(severity) = pre_review_severity {
+                if severity_rank(&severity) > severity_rank(&finding.severity) {
+                    finding.severity = severity;
+                }
+            }
+            if let Some(obj) = finding.evidence.as_object_mut() {
+                obj.insert(
+                    "fail_closed_review_override_ignored".to_string(),
+                    json!(true),
+                );
+            }
+        }
+
         if matches!(finding.action, PolicyAction::Ask)
             && severity_at_least_medium(&finding.severity)
         {
             finding.action = PolicyAction::Block;
             if let Some(obj) = finding.evidence.as_object_mut() {
-                obj.insert("noninteractive_escalated_from".to_string(), json!("ask"));
+                obj.insert(
+                    "noninteractive_escalated_from".to_string(),
+                    json!(if override_weakened {
+                        "review_override"
+                    } else {
+                        "ask"
+                    }),
+                );
             }
         }
+    }
+}
+
+fn policy_action_from_alert_value(value: &str) -> Option<PolicyAction> {
+    match value.to_ascii_lowercase().as_str() {
+        "allow" => Some(PolicyAction::Allow),
+        "warn" => Some(PolicyAction::Warn),
+        "ask" => Some(PolicyAction::Ask),
+        "block" => Some(PolicyAction::Block),
+        _ => None,
+    }
+}
+
+fn severity_rank(severity: &str) -> u8 {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
     }
 }
 

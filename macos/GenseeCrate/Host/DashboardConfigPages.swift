@@ -56,6 +56,7 @@ struct DashboardPolicyPage: View {
                             default:
                                 if let document {
                                     PolicySettingsView(
+                                        model: model,
                                         document: document,
                                         editorText: $editorText
                                     )
@@ -85,6 +86,7 @@ struct DashboardPolicyPage: View {
 }
 
 private struct PolicySettingsView: View {
+    @ObservedObject var model: ConsoleModel
     let document: [String: Any]
     @Binding var editorText: String
 
@@ -113,7 +115,7 @@ private struct PolicySettingsView: View {
         ),
         PolicySettingGroup(
             title: "Runtime & enforcement",
-            detail: "Guarded-run lifetime and unattended decisions.",
+            detail: "Runtime lifetime and non-interactive decisions.",
             settings: [
                 .integer("runtime.max_runtime_seconds", "Max runtime (seconds)", "Wall-clock cap. Leave blank for no cap.", minimum: 1, nullable: true),
                 .boolean("enforcement.noninteractive", "Non-interactive fail-closed", "Escalate medium+ asks to deny when no human can answer."),
@@ -152,6 +154,53 @@ private struct PolicySettingsView: View {
 
     var body: some View {
         VStack(spacing: 14) {
+            if !reviewOverrides.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Tuned rules")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("\(reviewOverrides.count)")
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(Color.dashboardBlue.opacity(0.14), in: Capsule())
+                            .foregroundStyle(Color.dashboardBlue)
+                        Spacer()
+                        Text("Review changes apply to every future path and session.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(reviewOverrides) { reviewOverride in
+                        HStack(spacing: 10) {
+                            Text(reviewOverride.ruleID)
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .lineLimit(1)
+                                .help(reviewOverride.ruleID)
+                            Spacer()
+                            if let severity = reviewOverride.severity {
+                                Text(severity.uppercased())
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let action = reviewOverride.action {
+                                Text(action.uppercased())
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Button("Reset") {
+                                Task { await resetReviewOverride(reviewOverride.ruleID) }
+                            }
+                                .controlSize(.small)
+                        }
+                        Divider()
+                    }
+                    Text("Reset validates and saves immediately. Strict and non-interactive fail-closed modes always retain the original enforcement floor.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(14)
+                .background(Color.dashboardMutedFill, in: RoundedRectangle(cornerRadius: 5))
+            }
             ForEach(groups) { group in
                 VStack(alignment: .leading, spacing: 0) {
                     HStack(alignment: .firstTextBaseline) {
@@ -185,6 +234,23 @@ private struct PolicySettingsView: View {
         var root = document
         setDottedValue(&root, key, value)
         editorText = formattedPolicyDocument(root) ?? editorText
+    }
+
+    private var reviewOverrides: [RuleReviewOverride] {
+        guard let data = try? JSONSerialization.data(withJSONObject: document) else { return [] }
+        return RuleReviewOverride.parse(policyDocument: String(decoding: data, as: UTF8.self))
+    }
+
+    private func resetReviewOverride(_ ruleID: String) async {
+        var root = document
+        var values = root["review_overrides"] as? [[String: Any]] ?? []
+        values.removeAll { ($0["rule_id"] as? String) == ruleID }
+        root["review_overrides"] = values
+        guard let updated = formattedPolicyDocument(root) else { return }
+        editorText = updated
+        if await model.savePolicyDocument(updated) {
+            editorText = model.policyDocument
+        }
     }
 }
 
@@ -696,9 +762,12 @@ struct DashboardSettingsPage: View {
     @ObservedObject var model: ConsoleModel
     @ObservedObject var extensionManager: EndpointSecurityExtensionManager
     @ObservedObject var sensor: EndpointSecuritySensor
+    @ObservedObject var notifications: CompletionNotificationCoordinator
     @Binding var darkMode: Bool
     let onRunSetupAssistant: () -> Void
     @State private var confirmRemoval = false
+    @State private var confirmRecoveryCleanup = false
+    @State private var pendingProtectionLevel: ProtectionLevel?
 
     var body: some View {
         DashboardPage {
@@ -712,6 +781,66 @@ struct DashboardSettingsPage: View {
                             Text("Telemetry is not encrypted at rest. Create or migrate to a new Gensee home with encryption enabled; automatic in-place encryption is not offered because it could corrupt the active security store.").font(.system(size: 11)).foregroundStyle(.secondary)
                         }
                     }.padding(12).background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 5)).overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.orange.opacity(0.35)))
+                }
+
+                DashboardCard("Protection Level") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Choose the developer workflow you want: Fast for flow, Review for interactive guardrails, or Sensitive for tightly controlled work. Decision rules remain editable in Policy.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        HStack(alignment: .top, spacing: 10) {
+                            ForEach(ProtectionLevel.allCases) { level in
+                                Button {
+                                    if model.wouldLowerProtection(level) {
+                                        pendingProtectionLevel = level
+                                    } else {
+                                        Task { _ = await model.applyProtectionLevel(level) }
+                                    }
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        HStack {
+                                            Image(systemName: level.symbol)
+                                            Text(level.title).fontWeight(.semibold)
+                                            Spacer()
+                                            if model.protectionLevel == level {
+                                                Image(systemName: "checkmark.circle.fill")
+                                            }
+                                        }
+                                        .foregroundStyle(level.tint)
+                                        Text(level.tagline)
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    .padding(12)
+                                    .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .background(
+                                    model.protectionLevel == level ? level.tint.opacity(0.09) : Color.dashboardMutedFill,
+                                    in: RoundedRectangle(cornerRadius: 7)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .stroke(model.protectionLevel == level ? level.tint.opacity(0.45) : Color.dashboardLine)
+                                )
+                                .disabled(model.runningCommand != nil)
+                            }
+                        }
+                        Text(model.protectionLevel?.detail
+                            ?? "Custom policy: Endpoint Security mode and noninteractive enforcement do not match a preset. Gensee preserves both settings until you explicitly choose a profile.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                DashboardCard("Notifications") {
+                    notificationSettings
+                }
+
+                DashboardCard("Recovery Points") {
+                    recoveryPointSettings
                 }
 
                 HStack(alignment: .top, spacing: 16) {
@@ -746,6 +875,173 @@ struct DashboardSettingsPage: View {
             Button("Cancel", role: .cancel) {}
             Button("Remove Extension", role: .destructive) { extensionManager.deactivate() }
         } message: { Text("Crate will stop receiving operating-system process and file events until the extension is installed again.") }
+        .alert("Remove all recovery points?", isPresented: $confirmRecoveryCleanup) {
+            Button("Cancel", role: .cancel) {}
+            Button("Remove All", role: .destructive) {
+                Task { await model.removeAllRecoveryPoints() }
+            }
+        } message: {
+            Text("This removes automatic, manually-created, and restore-rescue recovery points across local Git workspaces. It does not change workspace files.")
+        }
+        .alert("Lower protection?", isPresented: loweringProtectionPresented, presenting: pendingProtectionLevel) { level in
+            Button("Cancel", role: .cancel) { pendingProtectionLevel = nil }
+            Button("Use \(level.title)", role: .destructive) {
+                pendingProtectionLevel = nil
+                Task { _ = await model.applyProtectionLevel(level) }
+            }
+        } message: { level in
+            Text("This changes both Endpoint Security mode and interactive enforcement. Review the \(level.title) description before continuing.")
+        }
+    }
+
+    private var loweringProtectionPresented: Binding<Bool> {
+        Binding(
+            get: { pendingProtectionLevel != nil },
+            set: { if !$0 { pendingProtectionLevel = nil } }
+        )
+    }
+
+    private var notificationSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: notifications.isAuthorized ? "bell.badge.fill" : "bell.slash")
+                    .font(.system(size: 17))
+                    .foregroundStyle(notifications.isAuthorized ? Color.dashboardBlue : Color.secondary)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(notifications.isAuthorized ? "Notifications are allowed" : "Notifications need macOS permission")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("Clean completions stay in Review Queue history. Gensee interrupts you only for scope drift, blocked or high-risk activity, or stale verification.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if notifications.isAuthorized {
+                    Button("Send Test Notification") {
+                        Task { await notifications.sendTestNotification() }
+                    }
+                } else {
+                    if notifications.authorizationStatus == .denied {
+                        Button("Open System Settings") { notifications.openSystemNotificationSettings() }
+                    } else {
+                        Button("Allow Notifications") {
+                            Task { await notifications.requestAuthorization() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.dashboardBlue)
+                    }
+                }
+            }
+
+            if let deliveryError = notifications.lastDeliveryError {
+                Label("Notification not delivered: \(deliveryError)", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.dashboardGold)
+                    .textSelection(.enabled)
+            }
+
+            Divider()
+
+            HStack(spacing: 24) {
+                Toggle("Security findings", isOn: $notifications.alertNotificationsEnabled)
+                    .toggleStyle(.switch)
+                    .disabled(!notifications.isAuthorized)
+                Picker("Minimum severity", selection: $notifications.minimumAlertSeverity) {
+                    ForEach(NotificationSeverity.allCases) { level in
+                        Text(level.title).tag(level)
+                    }
+                }
+                .frame(width: 260)
+                .disabled(!notifications.isAuthorized || !notifications.alertNotificationsEnabled)
+                Spacer()
+            }
+
+            HStack(spacing: 24) {
+                Toggle("Agent tasks that need me", isOn: $notifications.completionNotificationsEnabled)
+                    .toggleStyle(.switch)
+                    .disabled(!notifications.isAuthorized)
+                Toggle("Daily briefing after 5 PM", isOn: $notifications.dailyBriefingEnabled)
+                    .toggleStyle(.switch)
+                    .disabled(!notifications.isAuthorized)
+                Spacer()
+            }
+            .font(.system(size: 11))
+        }
+        .controlSize(.small)
+    }
+
+    private var recoveryPointSettings: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "arrow.counterclockwise.circle.fill")
+                    .font(.system(size: 17))
+                    .foregroundStyle(Color.dashboardBlue)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Git-backed safety before agent changes")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("Choose Auto, Ask, or Off per harness in Harnesses. Auto creates at most one recovery point per request and workspace.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            Divider()
+            HStack(spacing: 28) {
+                Picker(
+                    "Retention",
+                    selection: Binding(
+                        get: { model.recoveryPointSettings.retentionHours },
+                        set: { hours in Task { await model.updateRecoveryRetentionHours(hours) } }
+                    )
+                ) {
+                    Text("24 hours").tag(24)
+                    Text("48 hours").tag(48)
+                    Text("7 days").tag(168)
+                    Text("30 days").tag(720)
+                }
+                .frame(width: 230)
+
+                Picker(
+                    "If creation fails",
+                    selection: Binding(
+                        get: { model.recoveryPointSettings.failureBehavior },
+                        set: { behavior in Task { await model.updateRecoveryFailureBehavior(behavior) } }
+                    )
+                ) {
+                    ForEach(RecoveryFailureBehavior.allCases) { behavior in
+                        Text(behavior.title).tag(behavior)
+                    }
+                }
+                .frame(width: 300)
+                Spacer()
+            }
+            .controlSize(.small)
+            Divider()
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Retained and rescue points")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("Manual and restore-rescue points are preserved by automatic retention until you remove them here.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Remove All…", role: .destructive) {
+                    confirmRecoveryCleanup = true
+                }
+                .controlSize(.small)
+                .disabled(model.runningCommand != nil)
+            }
+            Divider()
+            Label(
+                "Recovery points restore Git-workspace files. They cannot undo database changes, network requests, remote repository actions, running processes, or ignored files.",
+                systemImage: "info.circle"
+            )
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var endpointSecurity: some View {

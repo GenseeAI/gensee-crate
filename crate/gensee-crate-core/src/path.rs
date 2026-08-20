@@ -65,6 +65,9 @@ pub fn endpoint_security_path_is_known_build_output(
     let path = path.replace('\\', "/").to_ascii_lowercase();
     [
         "target",
+        "dist",
+        "build",
+        "coverage",
         "deriveddata",
         ".build",
         "node_modules/.cache",
@@ -181,5 +184,17 @@ mod tests {
             "/repo/target/output.o",
             Some("/repo"),
         ));
+        for top_level in ["dist", "build", "coverage"] {
+            assert!(endpoint_security_path_is_known_build_output(
+                Some("/opt/homebrew/bin/npm"),
+                &format!("/repo/{top_level}/asset.js"),
+                Some("/repo"),
+            ));
+            assert!(!endpoint_security_path_is_known_build_output(
+                Some("/opt/homebrew/bin/npm"),
+                &format!("/repo/packages/{top_level}/source.ts"),
+                Some("/repo"),
+            ));
+        }
     }
 }

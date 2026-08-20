@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var extensionManager: EndpointSecurityExtensionManager
     @ObservedObject var model: ConsoleModel
+    @ObservedObject var notifications: CompletionNotificationCoordinator
     @AppStorage("gensee.setup-assistant.seen.v1") private var hasSeenSetupAssistant = false
     @State private var showsSetupAssistant = false
 
@@ -10,6 +11,7 @@ struct ContentView: View {
         DashboardShell(
             extensionManager: extensionManager,
             model: model,
+            notifications: notifications,
             showsSetupAssistant: $showsSetupAssistant
         )
         .onAppear {

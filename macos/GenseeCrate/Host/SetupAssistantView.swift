@@ -9,8 +9,9 @@ struct SetupAssistantView: View {
     @State private var step = 0
     @State private var isPreparing = false
     @State private var isEnablingAll = false
+    @State private var selectedLevel: ProtectionLevel = .observe
 
-    private let stepTitles = ["Local runtime", "Mac protection", "Harnesses", "Verify"]
+    private let stepTitles = ["Start here", "Local runtime", "Safety baseline", "Harnesses", "Mac protection", "Verify"]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -22,9 +23,11 @@ struct SetupAssistantView: View {
                 ScrollView {
                     Group {
                         switch step {
-                        case 0: runtimeStep
-                        case 1: macProtectionStep
-                        case 2: harnessStep
+                        case 0: startingPointStep
+                        case 1: runtimeStep
+                        case 2: safetyBaselineStep
+                        case 3: harnessStep
+                        case 4: macProtectionStep
                         default: verificationStep
                         }
                     }
@@ -39,8 +42,23 @@ struct SetupAssistantView: View {
         .background(Color.dashboardPanel)
         .task {
             extensionManager.refreshStatus()
-            sensor.start()
-            await prepareRuntimeIfNeeded()
+            if model.localRuntimePrepared {
+                await model.refreshPolicy()
+                if let currentLevel = model.protectionLevel {
+                    selectedLevel = currentLevel
+                }
+            }
+        }
+        .onChange(of: step) { newStep in
+            guard newStep > 0 else { return }
+            Task {
+                if newStep == 1 {
+                    await prepareRuntimeIfNeeded()
+                }
+                if newStep >= 4 {
+                    sensor.start()
+                }
+            }
         }
     }
 
@@ -50,7 +68,7 @@ struct SetupAssistantView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Set up Gensee Crate")
                     .font(.system(size: 20, weight: .semibold))
-                Text("Reach verified agent protection in about three minutes.")
+                Text("Try the product without access, then add only the protection you want.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -61,6 +79,64 @@ struct SetupAssistantView: View {
         }
         .padding(.horizontal, 24)
         .frame(height: 76)
+    }
+
+    private var startingPointStep: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            setupHeading(
+                "Start with value, add deeper protection later",
+                detail: "Explore safely, or set up Git-backed recovery and audit your agent configuration before deciding whether to grant Apple security permissions."
+            )
+
+            Button {
+                model.enterDemoMode()
+                onFinish()
+            } label: {
+                HStack(alignment: .top, spacing: 14) {
+                    Image(systemName: "play.rectangle")
+                        .font(.system(size: 22))
+                        .foregroundStyle(Color.dashboardBlue)
+                        .frame(width: 34)
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Text("Explore a synthetic demo")
+                                .font(.system(size: 14, weight: .semibold))
+                            DashboardTag(text: "No access", color: .dashboardBlue)
+                        }
+                        Text("Open a realistic dashboard with invented local data. Gensee does not install hooks, initialize a database, request Apple permissions, or change policy.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Image(systemName: "arrow.right")
+                        .foregroundStyle(.secondary)
+                }
+                .padding(16)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .background(Color.dashboardBlue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.dashboardBlue.opacity(0.35)))
+
+            Text("REAL PROTECTION")
+                .font(.system(size: 10, weight: .bold))
+                .tracking(1.1)
+                .foregroundStyle(.secondary)
+
+            VStack(spacing: 10) {
+                ForEach(ProtectionLevel.allCases) { level in
+                    protectionLevelCard(level)
+                }
+            }
+
+            Label(
+                "Changing levels never rewrites your decision rules. It changes Endpoint Security authorization and whether ask decisions may wait for you.",
+                systemImage: "info.circle"
+            )
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+        }
     }
 
     private var stepRail: some View {
@@ -147,8 +223,25 @@ struct SetupAssistantView: View {
         VStack(alignment: .leading, spacing: 22) {
             setupHeading(
                 "Allow operating-system protection",
-                detail: "Apple requires two explicit approvals. Gensee cannot grant either permission for you."
+                detail: "Apple requires two explicit approvals for \(selectedLevel.title). Gensee cannot grant either permission for you."
             )
+
+            HStack(spacing: 10) {
+                Image(systemName: selectedLevel.symbol)
+                    .foregroundStyle(selectedLevel.tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Selected level: \(selectedLevel.title)")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(selectedLevel.tagline)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Change") { step = 0 }
+                    .controlSize(.small)
+            }
+            .padding(12)
+            .background(selectedLevel.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
 
             permissionRow(
                 number: 1,
@@ -193,6 +286,81 @@ struct SetupAssistantView: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(Color.dashboardGold)
             }
+        }
+    }
+
+    private var safetyBaselineStep: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            setupHeading(
+                "Get value before granting system access",
+                detail: "Recovery points and configuration audit work without Full Disk Access. They give you an immediate safety net and show what can influence your agents."
+            )
+
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Smart recovery points", systemImage: "arrow.counterclockwise.circle")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("Auto creates one Git-backed recovery point before the first risky or mutating tool call in each request. It does not cover databases, network calls, remote actions, processes, ignored files, or files outside Git.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                ForEach(model.integrations.filter { $0.installed && $0.supportsDirectHooks }) { integration in
+                    HStack {
+                        Text(integration.name).font(.system(size: 11, weight: .medium))
+                        Spacer()
+                        Picker(
+                            "Recovery mode",
+                            selection: Binding(
+                                get: { model.recoveryPointSettings.mode(for: integration.id) },
+                                set: { mode in Task { await model.updateRecoveryPointMode(mode, for: integration.id, showNotice: false) } }
+                            )
+                        ) {
+                            ForEach(RecoveryPointMode.allCases) { Text($0.title).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 190)
+                    }
+                }
+            }
+            .padding(15)
+            .background(Color.dashboardCanvas, in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.dashboardLine))
+
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Configuration audit", systemImage: "checklist.checked")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("Review instructions, skills, MCP servers, hooks, permissions, plugins, and other configuration that can change agent behavior. Audits are read-only.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    if model.integrations.contains(where: { $0.id == "codex" && $0.installed }) {
+                        Button("Audit Codex") {
+                            Task { await model.runConfigAudit(target: "codex", workspace: FileManager.default.homeDirectoryForCurrentUser.path) }
+                        }
+                    }
+                    if model.integrations.contains(where: { $0.id == "vscode" && $0.installed }) {
+                        Button("Audit GitHub Copilot") {
+                            Task { await model.runConfigAudit(target: "vscode", workspace: FileManager.default.homeDirectoryForCurrentUser.path) }
+                        }
+                    }
+                    if let audit = model.configAudit {
+                        DashboardTag(
+                            text: audit.summary.findingCount == 0 ? "No findings" : "\(audit.summary.findingCount) findings",
+                            color: audit.summary.findingCount == 0 ? .dashboardGreen : .dashboardGold
+                        )
+                    }
+                }
+                .controlSize(.small)
+            }
+            .padding(15)
+            .background(Color.dashboardCanvas, in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.dashboardLine))
+
+            Label(
+                "Endpoint Security remains optional on the next protection step. Enable it when you want independent verification of process and file activity.",
+                systemImage: "lock.shield"
+            )
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
         }
     }
 
@@ -286,9 +454,15 @@ struct SetupAssistantView: View {
                 Button("Continue") { step += 1 }
                     .buttonStyle(.borderedProminent)
                     .tint(.dashboardRed)
-                    .disabled(step == 0 && (isPreparing || !model.localRuntimePrepared))
+                    .disabled(step == 1 && (isPreparing || !model.localRuntimePrepared))
             } else {
-                Button("Finish Setup", action: onFinish)
+                Button("Finish Setup") {
+                    Task {
+                        if await model.applyProtectionLevel(selectedLevel) {
+                            onFinish()
+                        }
+                    }
+                }
                     .buttonStyle(.borderedProminent)
                     .tint(.dashboardRed)
             }
@@ -311,6 +485,46 @@ struct SetupAssistantView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private func protectionLevelCard(_ level: ProtectionLevel) -> some View {
+        Button {
+            selectedLevel = level
+        } label: {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: level.symbol)
+                    .foregroundStyle(level.tint)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(level.title).font(.system(size: 12, weight: .semibold))
+                        if level == .observe {
+                            DashboardTag(text: "Recommended first", color: .dashboardGreen)
+                        }
+                    }
+                    Text(level.tagline)
+                        .font(.system(size: 10, weight: .medium))
+                    Text(level.detail)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Image(systemName: selectedLevel == level ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(selectedLevel == level ? level.tint : Color.secondary)
+            }
+            .padding(13)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(
+            selectedLevel == level ? level.tint.opacity(0.08) : Color.dashboardCanvas,
+            in: RoundedRectangle(cornerRadius: 7)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(selectedLevel == level ? level.tint.opacity(0.55) : Color.dashboardLine)
+        )
     }
 
     private func setupStatusRow(

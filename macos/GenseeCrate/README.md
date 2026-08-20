@@ -22,25 +22,65 @@ integration changes are submitted through the existing `gensee policy` and
 
 The console includes:
 
+- A local **Control Center** that turns completed agent requests into concise,
+  evidence-backed reviews. It connects the original request to elapsed time,
+  tool calls, commands, mutation paths, observed test commands, and policy
+  findings without storing or displaying full model responses or tool output.
+  A test command is reported as observed, never as passed unless a future
+  evidence source can verify its result.
+- Optional quiet macOS notifications for substantial completed tasks and an
+  opt-in end-of-day briefing. The first refresh establishes a historical
+  baseline, so enabling notifications never floods Notification Center with
+  old work.
+- An explicit, in-memory **synthetic demo** that can be entered before setup or
+  from the app toolbar. It uses invented sessions, requests, tool calls,
+  findings, artifacts, recovery points, verification results, and a rolling
+  53-week activity history. Its connected AcmeShop scenarios include clean
+  completions, scope drift, a blocked secret read, stale verification, and a
+  migration that needs review, so each screen tells part of the same product
+  story. A persistent banner identifies the data as synthetic. Entering the
+  demo does not initialize a database, install hooks, request Apple permissions,
+  change policy, or touch harness settings. Real configuration pages remain
+  locked until the user exits the demo.
+- A developer-oriented autonomy ladder. **Fast** keeps Endpoint Security
+  notification-only while existing hook decision rules still apply;
+  **Review** enables configured OS authorization while keeping ask decisions
+  interactive; **Sensitive** selects strict OS authorization and escalates
+  medium-or-higher asks to deny so an agent stops instead of waiting for an
+  approval. The ladder changes these two policy controls atomically and never
+  rewrites the user's decision rules.
 - A first-launch setup assistant that installs the bundled backend at
   `~/.gensee/bin/gensee`, initializes the encrypted event store and default
-  policy, guides Apple approvals, scans all six harnesses, and offers one-click
+  policy, establishes smart recovery and a read-only configuration-audit
+  baseline before requesting Apple approvals, scans all six harnesses, and offers one-click
   setup for every installed direct-hook integration. It does not require a
   separate SQLite install, Homebrew, Rust, jq, or Xcode Command Line Tools.
-- Overview, activity, alerts, and run inventory backed by `gensee dashboard-state`
-  and `gensee run list --json`.
+- An **Overview** of review demand, independently verified activity, protection
+  health, and recent findings backed by `gensee dashboard-state` and
+  `gensee run list --json`.
 - A Daily Highlight page with today's summary and four rolling-year activity
   heatmaps for agent turns, tool calls, alerts, and token usage. Heatmap days
   are selectable and update the detailed summary.
-- A Timeline page that expands sessions into their original requests and paired
-  tool calls, including parallel/sequential relationships, duration bars,
-  affected files, policy outcomes, and expandable event evidence.
-- Policy controls backed by `gensee policy get/set/path`.
+- A decision-first Review Queue that classifies completed requests as
+  **Verified**, **Review recommended**, **Needs attention**, or **Incomplete
+  evidence**. It promotes undeclared and sensitive changes, flags verification
+  that predates a later file mutation, groups low-level findings into decisions,
+  and retains request-scoped timeline, file, recovery, and evidence drill-downs.
+- A cross-session Watchlist for control-plane, agent-memory, and persistent
+  targets. It ranks undeclared and cross-session effects first and keeps the
+  relationship graph as a provenance drill-down.
+- Policy controls backed by `gensee policy get/set/path`. Finding review can
+  tune a rule for future matches, but weakening a rule requires explicit
+  confirmation because the change applies across every path and session. The
+  Settings page inventories these **Tuned rules** and can reset each one;
+  strict and non-interactive fail-closed modes retain the rule's original
+  enforcement floor.
 - A Harnesses page that detects Codex, Claude Code, Antigravity, Cursor,
   GitHub Copilot, and Omnigent. Installed direct-hook integrations can be
   enabled or disabled through `gensee setup`; unavailable harnesses remain
   visible but disabled. Codex and GitHub Copilot rows also open the native
-  Config Audit workflow backed by `gensee audit --json`, with findings,
+  Config Audit workflow backed by `gensee audit --json`, with saved baselines,
+  drift since the previous audit, findings,
   evidence, remediation, inventory, source provenance, and manual checks.
   Other audit actions are visibly marked **Coming soon**. Enabled integrations
   are checked for complete hook coverage, the active event-store path, the
@@ -48,10 +88,45 @@ The console includes:
   repair action when needed. A hook configuration becomes **Protected** only
   after a real event from that harness reaches the active local store.
 - Endpoint Security installation, removal, and Full Disk Access navigation.
+- Per-harness **Smart recovery points** in **Auto**, **Ask**, or **Off** mode.
+  Auto creates one Git-backed point before the first risky or mutating tool
+  call in a request; Review Queue surfaces the point and its Restore action.
+- A menu-bar status window for independent sensor health, pending reviews, and
+  the latest request, with a direct jump into Review Queue.
 
 Token totals are captured from compatible Claude Code and Codex transcript
 usage metadata when a turn completes. Only the numeric per-turn total is stored;
 historical turns and harnesses without compatible usage metadata remain zero.
+
+## Smart recovery points
+
+The **Harnesses** page gives each hook-capable integration a **Smart recovery
+points** control. **Auto** is the default and creates one point per request and
+Git workspace before the first risky or mutating tool call. **Ask** pauses
+supported hook flows for approval in Gensee Crate; Codex blocks the operation
+and asks the user to approve and retry because it has no equally reliable
+generic interactive pre-tool response. **Off** skips automatic creation.
+
+A recovery point captures tracked files and untracked, non-ignored files in
+the repository's local Git object database without committing to the user's
+branch or changing the real Git staging index. Review Queue shows when a point
+was created and provides the explicitly confirmed Restore action. Restoring
+first captures the current state as a rescue checkpoint.
+
+This is recovery, not isolation. Ignored files, nested repository contents,
+files outside the selected workspace, running processes, databases, and remote
+side effects are outside the checkpoint. Restoring may remove non-ignored files
+created after the checkpoint. Linux tclone remains the stronger transactional
+runtime when an agent needs a fully cloneable environment.
+
+Retention and failure fallback are configured in **Settings**. The same
+primitive remains available from the embedded OSS CLI:
+
+```bash
+gensee checkpoint create --workspace . --label "Before agent refactor"
+gensee checkpoint list --workspace . --json
+gensee checkpoint restore cp-123-deadbeef --workspace . --yes
+```
 
 ## Use the security console
 
@@ -70,8 +145,7 @@ After setup, follow the provider-specific restart or reload instruction and
 start a new agent turn. Codex additionally requires trust review for
 non-managed hooks: use **Open Codex Hook Review**, enter the copied `/hooks`,
 and trust the Gensee commands. The one-time Terminal review closes automatically
-after Codex records approval.
-command in the opened CLI, and trust Gensee. The assistant can use the Codex
+after Codex records approval. The assistant can use the Codex
 binary bundled with the ChatGPT app, so the user does not need a separately
 installed command on `PATH`. Until the first real event arrives, the harness is
 shown as **Restart & test** rather than **Protected**. Rerun the assistant from
@@ -86,11 +160,13 @@ Omnigent is shown in the same inventory, but it currently uses managed-launch
 protection instead of a direct hook toggle. Launch it through `gensee run` to
 associate its process tree with Gensee policy and Endpoint Security decisions.
 
-Use **Policy** to choose the Endpoint Security mode and configure protected
-paths or blocked executables. Use **Settings** to install, inspect, or remove
-the system extension and to open the Full Disk Access pane. Start with
-`observe`, confirm event delivery, and review the local evidence before moving
-to an enforcement mode.
+Use **Settings → Protection Level** to move between Fast, Review, and
+Sensitive with a plain-language explanation of the tradeoff. Use **Policy**
+for the underlying Endpoint Security mode, decision rules, protected paths, and
+blocked executables. Use **Settings** to install, inspect, or remove the system
+extension and to open the Full Disk Access pane. Start with Observe, confirm
+event delivery, and review the local evidence before moving to an enforcement
+level.
 
 Disabling a direct-hook integration removes only Gensee-owned hook entries and
 preserves unrelated harness settings and hooks. It also removes that harness's

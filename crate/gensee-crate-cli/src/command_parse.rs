@@ -653,6 +653,35 @@ pub(crate) fn file_intents_from_hook(
     event: &AgentHookEvent,
     original_command: Option<&str>,
 ) -> Vec<FileIntent> {
+    if event.tool_name.as_deref() == Some("apply_patch") {
+        let Ok(value) = serde_json::from_str::<Value>(&event.raw_json) else {
+            return Vec::new();
+        };
+        let Some(input) = value.get("tool_input") else {
+            return Vec::new();
+        };
+        let Some(raw_path) = input.get("path").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let operation = match input.get("operation").and_then(Value::as_str) {
+            Some("delete" | "remove") => "delete",
+            _ => "write",
+        };
+        let cwd = event.cwd.as_deref().unwrap_or(".");
+        let path = normalize_intent_path(raw_path, cwd);
+        return vec![FileIntent {
+            provider: "native-file-tool".to_string(),
+            session_id: event.session_id.clone(),
+            tool_use_id: event.tool_use_id.clone(),
+            observed_at_ms: event.observed_at_ms,
+            operation: operation.to_string(),
+            path: path.clone(),
+            source_command: format!("apply_patch {operation} {}", redact_text(&path)),
+            sensitive: Policy::global().classify_path(&path).is_some(),
+            confidence: "high".to_string(),
+        }];
+    }
+
     if !matches!(
         event.tool_name.as_deref(),
         Some("Bash" | "run_command" | "runInTerminal" | "runTerminalCommand" | "Shell")
@@ -723,6 +752,7 @@ pub(crate) fn original_bash_command(payload: &str) -> Option<String> {
 pub(crate) fn parse_bash_file_intents(command: &str, cwd: &str) -> Vec<(String, String)> {
     let mut intents = Vec::new();
     let command = strip_heredoc_bodies(command);
+    let mut effective_cwd = cwd.to_string();
 
     for segment in split_shell_segments(&command) {
         let tokens = shell_words(&segment);
@@ -730,7 +760,8 @@ pub(crate) fn parse_bash_file_intents(command: &str, cwd: &str) -> Vec<(String, 
             continue;
         }
 
-        collect_redirection_intents(&tokens, cwd, &mut intents);
+        let segment_cwd = effective_cwd.clone();
+        collect_redirection_intents(&tokens, &segment_cwd, &mut intents);
 
         // Skip leading `VAR=value` environment assignments so the real program
         // is recognized (e.g. `AWS_PROFILE=x cat ~/.aws/credentials`).
@@ -739,24 +770,30 @@ pub(crate) fn parse_bash_file_intents(command: &str, cwd: &str) -> Vec<(String, 
             continue;
         };
         let args = &command_tokens[1..];
+        if program == "cd" {
+            if let Some(target) = shell_cd_target(args) {
+                effective_cwd = normalize_intent_path(target, &segment_cwd);
+            }
+            continue;
+        }
         match program {
             "cat" | "less" | "more" | "head" | "tail" | "open" => {
                 for path in command_paths(args) {
-                    push_file_intent(&mut intents, "read", &path, cwd);
+                    push_file_intent(&mut intents, "read", &path, &segment_cwd);
                 }
             }
             "rm" | "unlink" => {
                 for path in command_paths(args) {
-                    push_file_intent(&mut intents, "delete", &path, cwd);
+                    push_file_intent(&mut intents, "delete", &path, &segment_cwd);
                 }
             }
             "mv" => {
                 let paths = command_paths(args);
                 if let Some(path) = paths.first() {
-                    push_file_intent(&mut intents, "rename", path, cwd);
+                    push_file_intent(&mut intents, "rename", path, &segment_cwd);
                 }
                 if let Some(path) = paths.last().filter(|_| paths.len() > 1) {
-                    push_file_intent(&mut intents, "create", path, cwd);
+                    push_file_intent(&mut intents, "create", path, &segment_cwd);
                 }
             }
             "cp" => {
@@ -765,31 +802,31 @@ pub(crate) fn parse_bash_file_intents(command: &str, cwd: &str) -> Vec<(String, 
                     let destination = paths.last().expect("paths has at least two entries");
                     let destination_is_dir = is_directory_like_copy_dest(destination);
                     for source in &paths[..paths.len() - 1] {
-                        push_file_intent(&mut intents, "copy_source", source, cwd);
+                        push_file_intent(&mut intents, "copy_source", source, &segment_cwd);
                         if destination_is_dir {
                             if let Some(path) = copy_destination_file_path(source, destination) {
-                                push_file_intent(&mut intents, "copy_dest", &path, cwd);
+                                push_file_intent(&mut intents, "copy_dest", &path, &segment_cwd);
                             }
                         }
                     }
                     if !destination_is_dir {
-                        push_file_intent(&mut intents, "copy_dest", destination, cwd);
+                        push_file_intent(&mut intents, "copy_dest", destination, &segment_cwd);
                     }
                 }
             }
             "touch" | "mkdir" => {
                 for path in command_paths(args) {
-                    push_file_intent(&mut intents, "create", &path, cwd);
+                    push_file_intent(&mut intents, "create", &path, &segment_cwd);
                 }
             }
             "chmod" | "chown" | "chgrp" => {
                 for path in command_paths_after_leading_value(args) {
-                    push_file_intent(&mut intents, "metadata", &path, cwd);
+                    push_file_intent(&mut intents, "metadata", &path, &segment_cwd);
                 }
             }
             "tee" => {
                 for path in command_paths(args) {
-                    push_file_intent(&mut intents, "write", &path, cwd);
+                    push_file_intent(&mut intents, "write", &path, &segment_cwd);
                 }
             }
             "sed" => {
@@ -803,7 +840,7 @@ pub(crate) fn parse_bash_file_intents(command: &str, cwd: &str) -> Vec<(String, 
                         .filter(|a| !a.starts_with('-'))
                         .collect();
                     for path in operands.iter().skip(1) {
-                        push_file_intent(&mut intents, "write", path, cwd);
+                        push_file_intent(&mut intents, "write", path, &segment_cwd);
                     }
                 }
             }
@@ -814,7 +851,7 @@ pub(crate) fn parse_bash_file_intents(command: &str, cwd: &str) -> Vec<(String, 
                 // per-file rule never saw before. Over-inclusion is safe:
                 // classify_path only blocks actual secret paths.
                 for path in grep_read_paths(args) {
-                    push_file_intent(&mut intents, "read", &path, cwd);
+                    push_file_intent(&mut intents, "read", &path, &segment_cwd);
                 }
             }
             "tar" => {
@@ -823,7 +860,7 @@ pub(crate) fn parse_bash_file_intents(command: &str, cwd: &str) -> Vec<(String, 
                 // (e.g. `loot.tgz`, `-`) classifies as nothing and is ignored.
                 if tar_is_create(args) {
                     for path in command_paths(args) {
-                        push_file_intent(&mut intents, "read", &path, cwd);
+                        push_file_intent(&mut intents, "read", &path, &segment_cwd);
                     }
                 }
             }
@@ -834,18 +871,57 @@ pub(crate) fn parse_bash_file_intents(command: &str, cwd: &str) -> Vec<(String, 
                 // not over-trigger.
                 if find_reads_content(args) {
                     for path in find_roots(args) {
-                        push_file_intent(&mut intents, "read", &path, cwd);
+                        push_file_intent(&mut intents, "read", &path, &segment_cwd);
                     }
                 }
             }
             p if is_python_interpreter(p) => {
-                parse_python_intents(args, cwd, &mut intents);
+                parse_python_intents(args, &segment_cwd, &mut intents);
             }
             _ => {}
         }
     }
 
     dedupe_file_intents(intents)
+}
+
+/// Resolve the working directory established by leading shell `cd` commands.
+/// Harnesses report the directory where the agent process started, but a tool
+/// call commonly begins with `cd /workspace && ...`; recovery and attribution
+/// must use the directory where the following operation will actually run.
+pub(crate) fn leading_bash_effective_cwd(command: &str, cwd: &str) -> String {
+    let command = strip_heredoc_bodies(command);
+    let mut effective_cwd = cwd.to_string();
+
+    for segment in split_shell_segments(&command) {
+        let tokens = shell_words(&segment);
+        let command_tokens = strip_leading_env_assignments(&tokens);
+        let Some(program) = command_tokens.first().map(String::as_str) else {
+            continue;
+        };
+        if program != "cd" {
+            break;
+        }
+        let Some(target) = shell_cd_target(&command_tokens[1..]) else {
+            break;
+        };
+        effective_cwd = normalize_intent_path(target, &effective_cwd);
+    }
+
+    effective_cwd
+}
+
+fn shell_cd_target(args: &[String]) -> Option<&str> {
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            "-" => return None,
+            "--" => return args.next().or(Some("$HOME")),
+            option if option.starts_with('-') => continue,
+            target => return Some(target),
+        }
+    }
+    Some("$HOME")
 }
 
 /// File/dir operands a grep-family command reads. The first non-flag operand is

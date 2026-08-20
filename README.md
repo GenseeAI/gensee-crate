@@ -4,12 +4,11 @@
 </h1>
 
 <p align="center">
-  <strong>Approve outcomes, not commands.</strong>
+  <strong>Let your coding agents run unattended. Review the result in 60 seconds.</strong>
 </p>
 
 <p align="center">
-  Gensee Crate lets AI harness like Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a> do real work inside a disposable full-workspace fork.
-  With Gensee, you can let the harness install packages, edit files, run tests, and crash in isolation; then review the diff and test summary, merge the result, keep exploring, or throw the runtime away. Essentially, Gensee gives agents room to move without letting untrusted work land in your main workspace unreviewed. Behind the scenes, Gensee ties prompts, tool calls, commands, files, packages, network activity, system events, and policy decisions into a protected transaction runtime.
+  Gensee Crate is a local control center for Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>. It lets agents keep moving within your boundaries, catches risky behavior while they work, and turns each completed task into a concise, evidence-backed review: what ran, what changed, which tests were attempted, and what needs attention. On Linux, agents can also work inside a disposable full-workspace fork that you merge, keep, or discard after review.
 </p>
 
 <p align="center">
@@ -45,6 +44,13 @@
 
 Gensee Crate helps you:
 
+- **Come back to an answer, not a transcript.** The macOS Control Center turns a
+  completed agent task into a short review of commands, mutation paths,
+  observed test runs, duration, and policy findings. Optional quiet
+  notifications tell you when substantial work is ready.
+- **Spend less time supervising agents.** Deterministic boundaries run before
+  supported tools and OS operations, so you can step away without approving
+  every low-risk command and focus your attention on exceptions and outcomes.
 - **Run risky agent work transactionally.** Launch an agent in a disposable
   runtime, fork the full workspace for speculative changes, then merge, keep
   working, or discard the fork after review.
@@ -81,7 +87,10 @@ with low runtime overhead.
 
 On macOS, the [signed app download](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)
 includes the Gensee backend and SQLite support. Its first-launch assistant
-prepares `~/.gensee`, guides the Apple permissions, scans all six supported
+first offers an unmistakably synthetic, write-free demo, then lets you start
+with Fast and progress to Review or Sensitive protection. The real setup
+prepares `~/.gensee`, establishes smart recovery and a configuration-audit
+baseline before Apple permissions, scans all six supported
 harnesses, and verifies a real hook event before reporting protection. It does
 not require Homebrew, Rust, jq, Xcode Command Line Tools, or a separate SQLite
 installation.
@@ -405,8 +414,27 @@ repair. See the
 Highlight** page combines today's summary with rolling-year heatmaps for agent
 turns, tool calls, alerts, and supported transcript token totals. On the
 **Harnesses** page, **Audit Config** on Codex and GitHub Copilot runs the shared
-OSS auditor and presents findings, evidence, inventory, source provenance, and
-manual checks inline; unsupported harness auditors are marked **Coming soon**.
+OSS auditor and presents a saved baseline, configuration drift, findings,
+evidence, inventory, source provenance, and manual checks inline; unsupported
+harness auditors are marked **Coming soon**.
+Each hook-capable harness includes **Smart recovery points** with **Auto**,
+**Ask**, and **Off** modes. The default **Auto** mode creates one Git-backed
+recovery point before the first risky or mutating tool call in a request.
+Created recovery points and their **Restore** action appear in **Review Queue**;
+every restore first creates a rescue point. Recovery points preserve the real
+staging index and ignored files, but they are a workspace recovery aid rather
+than the process, database, and remote-side-effect isolation provided by Linux
+tclone.
+
+The macOS app's default workflow is decision-first: **Review Queue** classifies
+completed requests as Verified, Review recommended, Needs attention, or
+Incomplete evidence; promotes file changes that Endpoint Security observed
+outside declared tool intent; identifies sensitive control-plane and memory
+targets; flags tests or builds that ran before a later mutation; and groups
+related low-level findings into one decision. **Watchlist** carries those
+persistent and cross-session targets forward, while its relationship graph is
+available as provenance detail. A menu-bar status window keeps sensor health,
+pending reviews, and the latest request visible without opening the full app.
 
 **Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
 `sandbox-exec` and can stage workspace writes for review.

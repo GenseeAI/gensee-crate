@@ -1,5 +1,73 @@
 use super::*;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn claude_desktop_session_uses_app_root_instead_of_embedded_cli() {
+    let processes = HashMap::from([
+        (
+            30,
+            (
+                20,
+                "/Users/test/Library/Application Support/Claude/claude-code/2.1/claude.app/Contents/MacOS/claude".to_string(),
+            ),
+        ),
+        (
+            20,
+            (
+                10,
+                "/Applications/Claude.app/Contents/Helpers/disclaimer".to_string(),
+            ),
+        ),
+        (
+            10,
+            (
+                1,
+                "/Applications/Claude.app/Contents/MacOS/Claude".to_string(),
+            ),
+        ),
+        (1, (0, "/sbin/launchd".to_string())),
+    ]);
+
+    assert_eq!(
+        select_hook_session_root("claude-code", 30, &processes),
+        Some((
+            10,
+            "/Applications/Claude.app/Contents/MacOS/Claude".to_string()
+        ))
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn standalone_claude_session_keeps_cli_root() {
+    let processes = HashMap::from([
+        (30, (20, "/usr/local/bin/claude".to_string())),
+        (20, (1, "/bin/zsh".to_string())),
+        (1, (0, "/sbin/launchd".to_string())),
+    ]);
+
+    assert_eq!(
+        select_hook_session_root("claude-code", 30, &processes),
+        Some((30, "/usr/local/bin/claude".to_string()))
+    );
+}
+
+#[test]
+fn endpoint_allowed_authorization_is_an_observed_effect() {
+    assert!(endpoint_action_can_produce_observation(
+        "auth",
+        Some("allow")
+    ));
+    assert!(endpoint_action_can_produce_observation(
+        "notify",
+        Some("observed")
+    ));
+    assert!(!endpoint_action_can_produce_observation(
+        "auth",
+        Some("deny")
+    ));
+}
+
 fn telemetry_test_lock() -> std::sync::MutexGuard<'static, ()> {
     cli_test_env_lock()
 }
@@ -380,6 +448,181 @@ fn test_hook_event(provider: &str, hook_event_name: &str) -> AgentHookEvent {
         observed_at_ms: 1,
         raw_json: "{}".to_string(),
     }
+}
+
+#[test]
+fn recovery_trigger_detects_mutating_file_intent() {
+    let event = test_hook_event(PROVIDER_CLAUDE_CODE, "PreToolUse");
+    let decision = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+    let intents = vec![FileIntent {
+        provider: PROVIDER_CLAUDE_CODE.to_string(),
+        session_id: event.session_id.clone(),
+        tool_use_id: Some("tool-1".to_string()),
+        observed_at_ms: 1,
+        operation: "write".to_string(),
+        path: "/repo/src/main.rs".to_string(),
+        source_command: "apply_patch".to_string(),
+        sensitive: false,
+        confidence: "high".to_string(),
+    }];
+
+    assert_eq!(
+        recovery_trigger(&event, None, &intents, &decision, None).as_deref(),
+        Some("File mutation")
+    );
+}
+
+#[test]
+fn recovery_trigger_detects_large_refactor_prompt_on_first_mutating_command() {
+    let event = test_hook_event(PROVIDER_CODEX, "PreToolUse");
+    let decision = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+
+    assert_eq!(
+        recovery_trigger(
+            &event,
+            Some("printf 'updated' > src/auth.rs"),
+            &[],
+            &decision,
+            Some("Please perform a large refactor of the authentication layer")
+        )
+        .as_deref(),
+        Some("Request indicates a migration, rewrite, rename, or large refactor")
+    );
+}
+
+#[test]
+fn recovery_trigger_does_not_checkpoint_a_read_for_a_future_refactor() {
+    let event = test_hook_event(PROVIDER_CODEX, "PreToolUse");
+    let decision = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+
+    assert_eq!(
+        recovery_trigger(
+            &event,
+            Some("rg --files"),
+            &[],
+            &decision,
+            Some("Please perform a large refactor of the authentication layer")
+        ),
+        None
+    );
+}
+
+#[test]
+fn recovery_trigger_ignores_benign_read_only_tool_call() {
+    let mut event = test_hook_event(PROVIDER_CLAUDE_CODE, "PreToolUse");
+    event.tool_name = Some("Read".to_string());
+    let decision = PolicyDecision {
+        action: PolicyAction::Allow,
+        findings: Vec::new(),
+    };
+    let intents = vec![FileIntent {
+        provider: PROVIDER_CLAUDE_CODE.to_string(),
+        session_id: event.session_id.clone(),
+        tool_use_id: Some("tool-1".to_string()),
+        observed_at_ms: 1,
+        operation: "read".to_string(),
+        path: "/repo/README.md".to_string(),
+        source_command: "read".to_string(),
+        sensitive: false,
+        confidence: "high".to_string(),
+    }];
+
+    assert_eq!(
+        recovery_trigger(&event, None, &intents, &decision, None),
+        None
+    );
+}
+
+#[test]
+fn recovery_trigger_does_not_checkpoint_a_policy_ask_that_cannot_mutate() {
+    let mut event = test_hook_event(PROVIDER_CLAUDE_CODE, "PreToolUse");
+    event.tool_name = Some("Read".to_string());
+    let decision = PolicyDecision {
+        action: PolicyAction::Ask,
+        findings: Vec::new(),
+    };
+    let intents = vec![FileIntent {
+        provider: PROVIDER_CLAUDE_CODE.to_string(),
+        session_id: event.session_id.clone(),
+        tool_use_id: Some("tool-1".to_string()),
+        observed_at_ms: 1,
+        operation: "read".to_string(),
+        path: "/repo/.env".to_string(),
+        source_command: "read".to_string(),
+        sensitive: true,
+        confidence: "high".to_string(),
+    }];
+
+    assert_eq!(
+        recovery_trigger(&event, None, &intents, &decision, None),
+        None
+    );
+}
+
+#[test]
+fn recovery_trigger_checkpoints_an_uncertain_shell_command_when_policy_asks() {
+    let mut event = test_hook_event(PROVIDER_CLAUDE_CODE, "PreToolUse");
+    event.tool_name = Some("Bash".to_string());
+    let decision = PolicyDecision {
+        action: PolicyAction::Ask,
+        findings: Vec::new(),
+    };
+
+    assert_eq!(
+        recovery_trigger(
+            &event,
+            Some("python manage.py migrate"),
+            &[],
+            &decision,
+            None,
+        )
+        .as_deref(),
+        Some("Policy identified a risky operation")
+    );
+}
+
+#[test]
+fn recovery_workspace_follows_leading_cd_into_git_repository() {
+    let root = env::temp_dir().join(format!(
+        "gensee-recovery-workspace-test-{}-{}",
+        std::process::id(),
+        unix_millis().unwrap()
+    ));
+    let repository = root.join("repository");
+    fs::create_dir_all(&repository).unwrap();
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&repository)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let mut event = test_hook_event(PROVIDER_CLAUDE_CODE, "PreToolUse");
+    event.cwd = Some(root.to_string_lossy().to_string());
+    event.tool_name = Some("Bash".to_string());
+    let command = format!("cd {} && cat > note.txt", repository.display());
+    let intents = file_intents_from_hook(&event, Some(&command));
+
+    assert_eq!(
+        recovery_git_workspace(&event, Some(&command), &intents),
+        Some(fs::canonicalize(&repository).unwrap())
+    );
+    let expected_path = repository.join("note.txt");
+    assert!(intents.iter().any(
+        |intent| intent.operation == "write" && intent.path == expected_path.to_string_lossy()
+    ));
+
+    let _ = fs::remove_dir_all(root);
 }
 
 fn daemon_request(payload: &str, provider: &str) -> String {
@@ -2954,6 +3197,28 @@ fn parses_sensitive_read_and_mutations() {
 }
 
 #[test]
+fn bash_file_intents_follow_leading_cd() {
+    let intents = parse_bash_file_intents(
+        "cd /private/tmp/gensee-recovery-test && cat > note.txt; touch alpha.txt",
+        "/Users/example/project",
+    );
+
+    assert!(intents.iter().any(|(operation, path)| {
+        operation == "write" && path == "/private/tmp/gensee-recovery-test/note.txt"
+    }));
+    assert!(intents.iter().any(|(operation, path)| {
+        operation == "create" && path == "/private/tmp/gensee-recovery-test/alpha.txt"
+    }));
+    assert_eq!(
+        leading_bash_effective_cwd(
+            "cd /private/tmp/gensee-recovery-test && cat > note.txt",
+            "/Users/example/project"
+        ),
+        "/private/tmp/gensee-recovery-test"
+    );
+}
+
+#[test]
 fn parses_copy_rename_and_metadata() {
     let intents = parse_bash_file_intents(
             "cp src.txt dst.txt; cp src-a.txt src-b.txt out-dir/; mv old.txt new.txt; chmod 600 secret.txt",
@@ -3107,6 +3372,19 @@ fn pretool_policy_blocks_sensitive_reads() {
         .findings
         .iter()
         .any(|finding| finding.rule_id == "policy_sensitive_file_access"));
+}
+
+#[test]
+fn codex_apply_patch_emits_high_confidence_file_intent() {
+    let payload = r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"apply_patch","tool_use_id":"patch-1","tool_input":{"operation":"edit","path":"src/main.rs"}}"#;
+    let event = build_agent_hook_event(payload).unwrap();
+    let intents = file_intents_from_hook(&event, None);
+
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].operation, "write");
+    assert_eq!(intents[0].path, "/repo/src/main.rs");
+    assert_eq!(intents[0].confidence, "high");
+    assert_eq!(intents[0].provider, "native-file-tool");
 }
 
 #[test]
@@ -4268,6 +4546,57 @@ fn noninteractive_escalates_medium_plus_asks_to_blocks() {
         PolicyAction::Allow,
         "non-ask is left alone"
     );
+}
+
+#[test]
+fn noninteractive_ignores_review_overrides_that_weaken_the_policy_floor() {
+    let mut findings = vec![
+        PolicyFinding {
+            action: PolicyAction::Allow,
+            severity: "low".to_string(),
+            rule_id: "policy_destructive_file_operation".to_string(),
+            message: String::new(),
+            path: None,
+            evidence: serde_json::json!({
+                "pre_review_action": "block",
+                "pre_review_severity": "critical",
+            }),
+        },
+        PolicyFinding {
+            action: PolicyAction::Ask,
+            severity: "low".to_string(),
+            rule_id: "policy_write_outside_workspace".to_string(),
+            message: String::new(),
+            path: None,
+            evidence: serde_json::json!({
+                "pre_review_action": "ask",
+                "pre_review_severity": "high",
+            }),
+        },
+    ];
+
+    escalate_asks_to_blocks(&mut findings);
+
+    assert_eq!(findings[0].action, PolicyAction::Block);
+    assert_eq!(findings[0].severity, "critical");
+    assert_eq!(findings[1].action, PolicyAction::Block);
+    assert_eq!(findings[1].severity, "high");
+    assert_eq!(
+        findings[1].evidence["noninteractive_escalated_from"],
+        serde_json::json!("review_override")
+    );
+
+    let adapted = adapt_decision_for_provider(
+        PolicyDecision {
+            action: PolicyAction::Block,
+            findings,
+        },
+        PROVIDER_CODEX,
+    );
+    assert!(adapted
+        .findings
+        .iter()
+        .all(|finding| finding.action == PolicyAction::Block));
 }
 
 #[test]

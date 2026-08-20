@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct DashboardAlertsPage: View {
@@ -5,6 +6,7 @@ struct DashboardAlertsPage: View {
     let searchText: String
     @State private var severity = "All"
     @State private var action = "All"
+    @StateObject private var columns = AlertColumnLayout()
 
     private var alerts: [SecurityAlert] {
         model.snapshot.alerts.filter {
@@ -40,10 +42,10 @@ struct DashboardAlertsPage: View {
                     if alerts.isEmpty { DashboardEmpty(text: "No alerts found.", symbol: "checkmark.shield") }
                     else {
                         VStack(spacing: 0) {
-                            AlertListHeader()
+                            AlertListHeader(layout: columns)
                             ForEach(alerts) { alert in
                                 Divider()
-                                ExpandableAlertRow(alert: alert, model: model)
+                                ExpandableAlertRow(alert: alert, model: model, layout: columns)
                             }
                         }
                     }
@@ -53,15 +55,29 @@ struct DashboardAlertsPage: View {
     }
 }
 
+@MainActor
+final class AlertColumnLayout: ObservableObject {
+    @Published var severity: CGFloat = 74
+    @Published var action: CGFloat = 68
+    @Published var finding: CGFloat = 280
+    @Published var path: CGFloat = 176
+    @Published var time: CGFloat = 112
+    @Published var review: CGFloat = 92
+}
+
 struct AlertListHeader: View {
+    @ObservedObject var layout: AlertColumnLayout
+
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Color.clear.frame(width: 14)
-            Text("Severity").frame(width: 72, alignment: .leading)
-            Text("Action").frame(width: 66, alignment: .leading)
-            Text("Alert").frame(maxWidth: .infinity, alignment: .leading)
-            Text("Path").frame(width: 210, alignment: .leading)
-            Text("Time").frame(width: 128, alignment: .leading)
+            ResizableAlertHeaderCell(title: "Severity", width: $layout.severity, range: 62...120)
+            ResizableAlertHeaderCell(title: "Action", width: $layout.action, range: 58...110)
+            ResizableAlertHeaderCell(title: "Finding", width: $layout.finding, range: 180...520)
+            ResizableAlertHeaderCell(title: "Path", width: $layout.path, range: 110...420)
+            ResizableAlertHeaderCell(title: "Time", width: $layout.time, range: 92...190)
+            ResizableAlertHeaderCell(title: "Review", width: $layout.review, range: 82...140)
+            Spacer(minLength: 0)
         }
         .font(.system(size: 11, weight: .semibold))
         .foregroundStyle(.secondary)
@@ -71,26 +87,56 @@ struct AlertListHeader: View {
     }
 }
 
+private struct ResizableAlertHeaderCell: View {
+    let title: String
+    @Binding var width: CGFloat
+    let range: ClosedRange<CGFloat>
+    @State private var dragStart: CGFloat?
+
+    var body: some View {
+        Text(title)
+            .frame(width: width, alignment: .leading)
+            .help("Drag the divider to resize the \(title.lowercased()) column")
+            .overlay(alignment: .trailing) {
+                Rectangle()
+                    .fill(Color.clear)
+                    .frame(width: 9)
+                    .contentShape(Rectangle())
+                    .overlay {
+                        Rectangle()
+                            .fill(Color.dashboardLine)
+                            .frame(width: 1, height: 15)
+                    }
+                    .onHover { hovering in
+                        if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 1)
+                            .onChanged { value in
+                                let start = dragStart ?? width
+                                dragStart = start
+                                width = min(range.upperBound, max(range.lowerBound, start + value.translation.width))
+                            }
+                            .onEnded { _ in dragStart = nil }
+                    )
+            }
+    }
+}
+
 struct ExpandableAlertRow: View {
     let alert: SecurityAlert
     @ObservedObject var model: ConsoleModel
+    @ObservedObject var layout: AlertColumnLayout
     @State private var expanded = false
 
-    private var feedbackPending: Bool { model.feedbackAlertID == alert.alertID }
     private var unread: Bool { !model.isAlertRead(alert.alertID) }
-    private var helpfulSelected: Bool { alert.humanVerdict == "agree" }
-    private var inaccurateSelected: Bool {
-        guard let verdict = alert.humanVerdict else { return false }
-        return verdict == "allow" || verdict == "deny"
-    }
 
     var body: some View {
         VStack(spacing: 0) {
-            Button {
-                model.markAlertRead(alert.alertID)
-                expanded.toggle()
-            } label: {
-                HStack(spacing: 12) {
+            HStack(spacing: 10) {
+                Button {
+                    toggleDetails()
+                } label: {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.secondary)
@@ -105,44 +151,42 @@ struct ExpandableAlertRow: View {
                                     .accessibilityHidden(true)
                             }
                         }
+                }
+                .buttonStyle(.plain)
+                .help(expanded ? "Hide finding evidence" : "Show finding evidence")
+
                     DashboardTag(text: alert.severity, color: severityColor(alert.severity))
-                        .frame(width: 72, alignment: .leading)
+                        .frame(width: layout.severity, alignment: .leading)
+                        .help("Severity: \(alert.severity.uppercased())")
                     DashboardTag(text: alert.action, color: actionColor(alert.action))
-                        .frame(width: 66, alignment: .leading)
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 6) {
-                            Text(alert.message)
-                                .font(.system(size: 12, weight: unread ? .semibold : .medium))
-                                .lineLimit(expanded ? 2 : 1)
-                            if alert.humanVerdict != nil {
-                                Image(systemName: helpfulSelected ? "hand.thumbsup.fill" : "hand.thumbsdown.fill")
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(helpfulSelected ? Color.dashboardGreen : Color.dashboardGold)
-                                    .help(helpfulSelected ? "You marked this alert helpful" : "You marked this alert inaccurate")
-                            }
-                        }
-                        Text(alert.ruleID)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(width: layout.action, alignment: .leading)
+                        .help("Action: \(alert.action.uppercased())")
+                    Text(alert.message)
+                        .font(.system(size: 12, weight: unread ? .semibold : .medium))
+                        .lineLimit(expanded ? 2 : 1)
+                    .frame(width: layout.finding, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: toggleDetails)
+                    .help("\(alert.message)\nRule: \(alert.ruleID)")
                     Text(alert.path.map(abbreviatedPath) ?? "—")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(alert.path == nil ? .tertiary : .secondary)
-                        .frame(width: 210, alignment: .leading)
+                        .frame(width: layout.path, alignment: .leading)
                         .lineLimit(1)
+                        .help(alert.path ?? "No path was associated with this finding")
                     Text(dashboardDate(alert.createdAt))
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
-                        .frame(width: 128, alignment: .leading)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 9)
-                .contentShape(Rectangle())
-                .background(unread ? Color.dashboardRed.opacity(0.035) : .clear)
+                        .frame(width: layout.time, alignment: .leading)
+                        .help(Date(timeIntervalSince1970: TimeInterval(alert.createdAt) / 1_000).formatted(date: .complete, time: .complete))
+                    FindingReviewControl(alert: alert, model: model)
+                        .frame(width: layout.review, alignment: .leading)
+                    Spacer(minLength: 0)
             }
-            .buttonStyle(.plain)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .contentShape(Rectangle())
+            .background(unread ? Color.dashboardRed.opacity(0.035) : .clear)
             .accessibilityLabel("\(unread ? "Unread, " : "")\(alert.severity) severity, \(alert.action), \(alert.message)")
             .accessibilityHint(expanded ? "Collapse alert details" : "Expand alert details")
 
@@ -197,32 +241,6 @@ struct ExpandableAlertRow: View {
             }
 
             AlertMetadata(alert: alert)
-
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Was this alert useful?").font(.system(size: 12, weight: .semibold))
-                    Text(feedbackStatus)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if feedbackPending { ProgressView().controlSize(.small) }
-                feedbackButton(
-                    title: "Helpful",
-                    symbol: helpfulSelected ? "hand.thumbsup.fill" : "hand.thumbsup",
-                    selected: helpfulSelected,
-                    color: .dashboardGreen,
-                    agrees: true
-                )
-                feedbackButton(
-                    title: "Inaccurate",
-                    symbol: inaccurateSelected ? "hand.thumbsdown.fill" : "hand.thumbsdown",
-                    selected: inaccurateSelected,
-                    color: .dashboardGold,
-                    agrees: false
-                )
-            }
-            .padding(.top, 2)
         }
         .padding(.leading, 36)
         .padding(.trailing, 10)
@@ -230,34 +248,104 @@ struct ExpandableAlertRow: View {
         .background(Color.dashboardMutedFill.opacity(0.45))
     }
 
-    private var feedbackStatus: String {
-        switch alert.feedbackLabel {
-        case "confirmed": "Your feedback confirms this decision."
-        case "false_positive": "You marked this alert as a false positive."
-        case "false_negative": "You marked this alert as a false negative."
-        case .some: "Your latest feedback is recorded."
-        case nil: "Your choice is stored with this alert for policy tuning."
+    private func toggleDetails() {
+        model.markAlertRead(alert.alertID)
+        expanded.toggle()
+    }
+}
+
+private struct FindingReviewControl: View {
+    let alert: SecurityAlert
+    @ObservedObject var model: ConsoleModel
+    @State private var pendingChange: PendingRuleTuning?
+
+    private let severities = ["Info", "Low", "Medium", "High", "Critical"]
+    private let actions = ["Allow", "Warn", "Ask", "Block"]
+
+    private var currentOverride: RuleReviewOverride? {
+        model.reviewOverride(for: alert.ruleID)
+    }
+
+    var body: some View {
+        Menu {
+            Menu("Set future severity") {
+                ForEach(severities, id: \.self) { severity in
+                    Button {
+                        requestTune(severity: severity)
+                    } label: {
+                        if severity.caseInsensitiveCompare(currentOverride?.severity ?? alert.severity) == .orderedSame {
+                            Label(severity, systemImage: "checkmark")
+                        } else {
+                            Text(severity)
+                        }
+                    }
+                }
+            }
+            Menu("Set future action") {
+                ForEach(actions, id: \.self) { action in
+                    Button {
+                        requestTune(action: action)
+                    } label: {
+                        if action.caseInsensitiveCompare(currentOverride?.action ?? alert.action) == .orderedSame {
+                            Label(action, systemImage: "checkmark")
+                        } else {
+                            Text(action)
+                        }
+                    }
+                }
+            }
+        } label: {
+            if model.feedbackAlertID == alert.alertID {
+                ProgressView().controlSize(.small)
+            } else {
+                Label(currentOverride == nil ? "Review" : "Tuned", systemImage: "slider.horizontal.3")
+                    .font(.system(size: 12, weight: .medium))
+            }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .fixedSize()
+        .disabled(model.feedbackAlertID != nil)
+        .help("Changes this rule for all future paths and sessions. Strict fail-closed keeps the original enforcement floor.")
+        .alert(
+            "Weaken this rule globally?",
+            isPresented: Binding(
+                get: { pendingChange != nil },
+                set: { if !$0 { pendingChange = nil } }
+            ),
+            presenting: pendingChange
+        ) { change in
+            Button("Apply to Future Matches", role: .destructive) {
+                tune(severity: change.severity, action: change.action)
+                pendingChange = nil
+            }
+            Button("Cancel", role: .cancel) { pendingChange = nil }
+        } message: { _ in
+            Text("This affects every future match of \(alert.ruleID), across all paths and sessions. Strict and non-interactive fail-closed modes will retain the rule's original enforcement floor.")
         }
     }
 
-    private func feedbackButton(
-        title: String,
-        symbol: String,
-        selected: Bool,
-        color: Color,
-        agrees: Bool
-    ) -> some View {
-        Button {
-            Task { _ = await model.recordFeedback(for: alert, agrees: agrees) }
-        } label: {
-            Label(title, systemImage: symbol)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(selected ? color : .primary)
+    private func requestTune(severity: String? = nil, action: String? = nil) {
+        let change = PendingRuleTuning(severity: severity, action: action)
+        let currentSeverity = currentOverride?.severity ?? alert.severity
+        let currentAction = currentOverride?.action ?? alert.action
+        let weakensSeverity = severity.map { PolicyValueRank.severity($0) < PolicyValueRank.severity(currentSeverity) } ?? false
+        let weakensAction = action.map { PolicyValueRank.weakensAction(from: currentAction, to: $0) } ?? false
+        if weakensSeverity || weakensAction {
+            pendingChange = change
+        } else {
+            tune(severity: severity, action: action)
         }
-        .buttonStyle(.bordered)
-        .tint(selected ? color : .secondary)
-        .disabled(feedbackPending || selected || (model.feedbackAlertID != nil && !feedbackPending))
-        .accessibilityLabel("Mark alert as \(title.lowercased())")
+    }
+
+    private func tune(severity: String? = nil, action: String? = nil) {
+        Task { _ = await model.tuneFinding(alert, severity: severity, action: action) }
+    }
+
+    private struct PendingRuleTuning: Identifiable {
+        let severity: String?
+        let action: String?
+        let id = UUID()
     }
 }
 
@@ -341,7 +429,14 @@ struct LineagePage: View {
     @State private var selectedURI: String?
 
     private var artifacts: [ArtifactFact] {
-        model.snapshot.artifacts.filter { containsSearch(searchText, fields: $0.uri, $0.kind, $0.lastModifiedSource, $0.riskLevel) }
+        model.snapshot.artifacts
+            .filter { containsSearch(searchText, fields: $0.uri, $0.kind, $0.lastModifiedSource, $0.riskLevel) }
+            .filter { attentionScore($0) > 0 }
+            .sorted {
+                let lhs = attentionScore($0)
+                let rhs = attentionScore($1)
+                return lhs == rhs ? $0.lastSeenAt > $1.lastSeenAt : lhs > rhs
+            }
     }
 
     private var selectedArtifact: ArtifactFact? {
@@ -352,10 +447,10 @@ struct LineagePage: View {
     var body: some View {
         DashboardPage {
             VStack(alignment: .leading, spacing: 16) {
-                DashboardPageHeader("Lineage Graph", description: "Artifact relationships and provenance tracked by Gensee.")
+                DashboardPageHeader("Watchlist", description: "Persistent and sensitive targets that deserve attention across agent sessions.")
                 HStack(alignment: .top, spacing: 16) {
-                    DashboardCard("Artifacts (\(artifacts.count))") {
-                        if artifacts.isEmpty { DashboardEmpty(text: "No artifact facts recorded yet.") }
+                    DashboardCard("Watched targets (\(artifacts.count))") {
+                        if artifacts.isEmpty { DashboardEmpty(text: "No cross-session targets need attention yet.") }
                         else {
                             ScrollView {
                                 VStack(spacing: 2) {
@@ -367,14 +462,21 @@ struct LineagePage: View {
                                                     Text(artifact.displayName)
                                                         .font(.system(size: 12, weight: selectedURI == artifact.uri ? .semibold : .regular)).lineLimit(1)
                                                     Text(abbreviatedPath(artifact.filePath))
-                                                        .font(.system(size: 9, design: .monospaced))
+                                                        .font(.system(size: 11, design: .monospaced))
                                                         .foregroundStyle(.secondary)
                                                         .lineLimit(1)
                                                         .truncationMode(.middle)
                                                     Text([artifact.kind, artifact.lastModifiedSource, artifact.riskLevel].compactMap { $0 }.joined(separator: " · "))
                                                         .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                                                    if attentionScore(artifact) > 0 {
+                                                        Text(watchReason(artifact))
+                                                            .font(.system(size: 11, weight: .medium))
+                                                            .foregroundStyle(Color.dashboardGold)
+                                                            .lineLimit(1)
+                                                    }
                                                 }
                                                 Spacer()
+                                                DashboardPathMenu(path: artifact.filePath)
                                             }
                                             .padding(.vertical, 6).padding(.horizontal, 4)
                                             .background(selectedURI == artifact.uri ? Color.dashboardBlue.opacity(0.09) : .clear, in: RoundedRectangle(cornerRadius: 4))
@@ -382,30 +484,39 @@ struct LineagePage: View {
                                         }
                                         .buttonStyle(.plain)
                                         .help(artifact.filePath)
+                                        .contextMenu {
+                                            DashboardPathContextActions(path: artifact.filePath)
+                                        }
                                     }
                                 }
                             }.frame(maxHeight: 520)
                         }
                     }.frame(width: 370)
 
-                    DashboardCard("Lineage Graph (\(artifacts.count))") {
+                    DashboardCard(selectedArtifact == nil ? "Select a target" : "Target history") {
                         VStack(alignment: .leading, spacing: 10) {
                             if let selectedArtifact {
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                    Text("Selected path")
-                                        .font(.system(size: 10, weight: .semibold))
-                                        .foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 9) {
                                     Text(abbreviatedPath(selectedArtifact.filePath))
-                                        .font(.system(size: 10, design: .monospaced))
+                                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
                                         .textSelection(.enabled)
-                                        .lineLimit(2)
-                                        .truncationMode(.middle)
-                                        .help(selectedArtifact.filePath)
-                                    Spacer(minLength: 0)
+                                    Text(watchReason(selectedArtifact))
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.secondary)
+                                    HStack(spacing: 8) {
+                                        if selectedArtifact.isControlPlane != 0 { DashboardTag(text: "Control plane", color: .dashboardRed) }
+                                        if selectedArtifact.isMemoryArtifact != 0 { DashboardTag(text: "Agent memory", color: .dashboardGold) }
+                                        if selectedArtifact.isPersistentTarget != 0 { DashboardTag(text: "Persistent", color: .dashboardBlue) }
+                                        if let risk = selectedArtifact.riskLevel { DashboardTag(text: risk, color: severityColor(risk)) }
+                                    }
+                                    DashboardPathActions(path: selectedArtifact.filePath)
                                 }
                                 .padding(.horizontal, 4)
                                 Divider()
                             }
+                            Text("Relationship history")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.secondary)
                             ArtifactGraphView(facts: artifacts, edges: model.snapshot.relations, selectedURI: $selectedURI)
                                 .frame(minHeight: 420)
                         }
@@ -413,6 +524,36 @@ struct LineagePage: View {
                 }
             }
         }
+    }
+
+    private func attentionScore(_ artifact: ArtifactFact) -> Int {
+        (artifact.isControlPlane != 0 ? 10 : 0)
+            + (artifact.isMemoryArtifact != 0 ? 7 : 0)
+            + (artifact.isPersistentTarget != 0 ? 5 : 0)
+            + ((artifact.recentUnmatchedEffectCount ?? 0) * 3)
+            + ((artifact.recentCrossSessionWriteCount ?? 0) * 2)
+            + riskAttentionScore(artifact.riskLevel)
+    }
+
+    private func riskAttentionScore(_ riskLevel: String?) -> Int {
+        switch riskLevel?.lowercased() {
+        case "critical": 12
+        case "high": 8
+        case "medium": 4
+        default: 0
+        }
+    }
+
+    private func watchReason(_ artifact: ArtifactFact) -> String {
+        var reasons: [String] = []
+        let unmatched = artifact.recentUnmatchedEffectCount ?? 0
+        let crossSession = artifact.recentCrossSessionWriteCount ?? 0
+        if unmatched > 0 { reasons.append("\(unmatched) undeclared effect\(unmatched == 1 ? "" : "s")") }
+        if crossSession > 0 { reasons.append("written across \(crossSession) recent session\(crossSession == 1 ? "" : "s")") }
+        if artifact.isControlPlane != 0 { reasons.append("changes agent or repository behavior") }
+        if artifact.isMemoryArtifact != 0 { reasons.append("influences future agent context") }
+        if artifact.isPersistentTarget != 0 { reasons.append("persists beyond one request") }
+        return reasons.isEmpty ? "Observed recently; open the relationship history for provenance." : reasons.joined(separator: " · ")
     }
 }
 
@@ -458,7 +599,7 @@ private struct ArtifactGraphView: View {
                                             Text(fact.displayName)
                                                 .font(.system(size: 12, weight: .semibold)).lineLimit(1)
                                             Text(abbreviatedPath(fact.filePath))
-                                                .font(.system(size: 9, design: .monospaced))
+                                                .font(.system(size: 11, design: .monospaced))
                                                 .foregroundStyle(.secondary)
                                                 .lineLimit(1)
                                                 .truncationMode(.middle)
@@ -471,6 +612,9 @@ private struct ArtifactGraphView: View {
                                     }
                                     .buttonStyle(.plain)
                                     .help(fact.filePath)
+                                    .contextMenu {
+                                        DashboardPathContextActions(path: fact.filePath)
+                                    }
                                     .position(position)
                                     .id(fact.id)
                                 }

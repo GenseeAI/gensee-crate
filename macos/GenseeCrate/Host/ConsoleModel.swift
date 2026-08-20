@@ -10,17 +10,28 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var integrations: [IntegrationDescriptor] = []
     @Published private(set) var dailyDetail: DailyDetail?
     @Published private(set) var dailyDetailLoadState = DailyDetailLoadState.idle
+    @Published private(set) var requestReviewPayload: RequestReviewPayload?
+    @Published private(set) var requestReviewLoadState = RequestReviewLoadState.idle
     @Published private(set) var configAudit: ConfigAuditBundle?
+    @Published private(set) var configAuditDrift: ConfigAuditDrift?
+    @Published private(set) var configAuditHistory: [ConfigAuditHistoryEntry] = []
     @Published private(set) var auditedIntegrationIDs: Set<String> = []
     @Published private(set) var verifiedIntegrationIDs: Set<String> = []
+    @Published private(set) var recoveryPointSettings = RecoveryPointSettings()
+    @Published private(set) var recoveryPointsByRequest: [Int64: WorkspaceCheckpointRecord] = [:]
+    @Published private(set) var pendingRecoveryRequest: PendingRecoveryRequest?
     @Published private(set) var isRefreshing = false
     @Published private(set) var runningCommand: String?
     @Published private(set) var feedbackAlertID: Int64?
     @Published private(set) var readAlertIDs: Set<Int64> = []
+    @Published private(set) var acknowledgedReviewSignals: [Int64: String] = [:]
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var dashboardRefreshIssue: String?
+    @Published private(set) var isDemoMode = false
     @Published var errorMessage: String?
     @Published var noticeMessage: String?
+    @Published var requestedDashboardDestination: DashboardDestination?
+    @Published var requestedReviewRequestID: Int64?
 
     let homeURL: URL
     let endpointSensor: EndpointSecuritySensor
@@ -30,6 +41,20 @@ final class ConsoleModel: ObservableObject {
     private var readThroughAlertID: Int64 = 0
     private var harnessVerificationBaselines: [String: Int64] = [:]
     private var hasLoadedDashboardSnapshot = false
+    private var lastDashboardRefreshDuration: TimeInterval = 0
+    private var snapshotBeforeDemo = SecuritySnapshot()
+    private var recoveryPointsBeforeDemo: [Int64: WorkspaceCheckpointRecord] = [:]
+    private var dismissedPendingRecoveryIDs: Set<String> = []
+    private var endpointSessionRecords: [AgentSessionRecord] = []
+    private var hasLoadedEndpointSessionRecords = false
+    private var endpointRootsRefreshInProgress = false
+    private var lastEndpointSessionsModificationDate: Date?
+    private var completionRefreshInProgress = false
+    private var lastCompletionSignalModificationDate: Date?
+    private var lastCompletionRequestID: Int64 = 0
+    /// Invalidates live-data work that was already awaiting the CLI when the
+    /// user switches between this Mac and the synthetic product tour.
+    private var dataSourceGeneration: UInt64 = 0
 
     init() {
         let environmentHome = ProcessInfo.processInfo.environment["GENSEE_HOME"]
@@ -42,12 +67,14 @@ final class ConsoleModel: ObservableObject {
         verifiedIntegrationIDs = Self.loadVerifiedIntegrationIDs(homeURL: resolvedHome)
         harnessVerificationBaselines = Self.loadHarnessVerificationBaselines(homeURL: resolvedHome)
         readAlertIDs = Self.loadReadAlertIDs(homeURL: resolvedHome)
+        acknowledgedReviewSignals = Self.loadAcknowledgedReviewSignals(homeURL: resolvedHome)
         readAlertBaselineCount = UserDefaults.standard.integer(
             forKey: Self.readAlertsBaselineKey(homeURL: resolvedHome)
         )
         readThroughAlertID = Int64(UserDefaults.standard.integer(
             forKey: Self.readAlertsWatermarkKey(homeURL: resolvedHome)
         ))
+        configAuditHistory = Self.loadConfigAuditHistory(homeURL: resolvedHome)
         refreshIntegrations()
         Task { [weak self] in await self?.refreshIntegrationsWithCurrentBackend() }
     }
@@ -64,11 +91,36 @@ final class ConsoleModel: ObservableObject {
         )
     }
     var localRuntimePrepared: Bool { stableBackendInstalled && databaseExists && policyExists }
+    var protectionLevel: ProtectionLevel? {
+        ProtectionLevel.current(
+            endpointMode: policy.endpointSecurityMode,
+            noninteractive: policy.noninteractive
+        )
+    }
+
+    func wouldLowerProtection(_ level: ProtectionLevel) -> Bool {
+        let rank = ["observe": 0, "protect": 1, "strict": 2]
+        return (rank[level.endpointMode] ?? 0) < (rank[policy.endpointSecurityMode] ?? 0)
+            || (policy.noninteractive && !level.noninteractive)
+    }
     var databaseEncrypted: Bool {
         guard let handle = try? FileHandle(forReadingFrom: databaseURL) else { return false }
         defer { try? handle.close() }
         let header = try? handle.read(upToCount: 16)
         return header != Data("SQLite format 3\0".utf8)
+    }
+
+    /// Keep the stable hook executable in ~/.gensee/bin synchronized with the
+    /// backend bundled in the currently running app. Existing harness hook
+    /// files deliberately point at that stable path, so an app update must
+    /// refresh it before new hook events arrive.
+    func refreshStableHookBackendIfNeeded() async {
+        guard !isDemoMode, backendAvailable else { return }
+        do {
+            _ = try await cli.stableHookExecutableURL()
+        } catch {
+            dashboardRefreshIssue = "The bundled Gensee backend could not update the harness runtime: \(error.localizedDescription)"
+        }
     }
 
     var activeRunCount: Int {
@@ -95,6 +147,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func markAlertRead(_ alertID: Int64) {
+        guard !isDemoMode else { return }
         guard !isAlertRead(alertID) else { return }
         var updated = readAlertIDs
         guard updated.insert(alertID).inserted else { return }
@@ -102,7 +155,29 @@ final class ConsoleModel: ObservableObject {
         persistReadAlertState()
     }
 
+    func reviewNeedsAttention(_ summary: AgentCompletionSummary) -> Bool {
+        guard let fingerprint = summary.attentionFingerprint else { return false }
+        return acknowledgedReviewSignals[summary.requestID] != fingerprint
+    }
+
+    func markReviewHandled(_ summary: AgentCompletionSummary) {
+        guard let fingerprint = summary.attentionFingerprint else { return }
+        acknowledgedReviewSignals[summary.requestID] = fingerprint
+        persistAcknowledgedReviewSignals()
+    }
+
+    func returnReviewToNeedsYou(_ summary: AgentCompletionSummary) {
+        guard acknowledgedReviewSignals.removeValue(forKey: summary.requestID) != nil else { return }
+        persistAcknowledgedReviewSignals()
+    }
+
+    func isReviewHandled(_ summary: AgentCompletionSummary) -> Bool {
+        guard let fingerprint = summary.attentionFingerprint else { return false }
+        return acknowledgedReviewSignals[summary.requestID] == fingerprint
+    }
+
     func markAllAlertsRead() {
+        guard !isDemoMode else { return }
         guard unreadAlertCount > 0 else { return }
         readAlertBaselineCount = snapshot.summary.alertsCount
         readThroughAlertID = max(readThroughAlertID, snapshot.alerts.map(\.alertID).max() ?? 0)
@@ -110,36 +185,21 @@ final class ConsoleModel: ObservableObject {
         persistReadAlertState()
     }
 
-    var recentActivity: [ActivityItem] {
-        let agent = snapshot.agentEvents.map {
-            ActivityItem(
-                id: $0.id,
-                kind: .agent,
-                timestamp: $0.timestamp,
-                title: $0.toolName ?? $0.type.replacingOccurrences(of: "_", with: " ").capitalized,
-                detail: $0.cwd,
-                source: $0.source
-            )
-        }
-        let system = snapshot.systemEvents.map {
-            ActivityItem(
-                id: $0.id,
-                kind: .system,
-                timestamp: $0.timestamp,
-                title: $0.type.replacingOccurrences(of: "_", with: " ").capitalized,
-                detail: Self.eventDetail(args: $0.args, fallback: $0.cwd),
-                source: "PID \($0.pid)"
-            )
-        }
-        return (agent + system).sorted { $0.timestamp > $1.timestamp }
-    }
-
     func refreshAll() async {
+        guard !isDemoMode else {
+            let now = Date()
+            snapshot = DemoSnapshotFactory.make(now: now)
+            recoveryPointsByRequest = DemoSnapshotFactory.recoveryPoints(now: now)
+            lastUpdated = now
+            return
+        }
         guard !isRefreshing else { return }
+        let liveGeneration = dataSourceGeneration
         isRefreshing = true
         defer { isRefreshing = false }
         cli = GenseeCLI(homeURL: homeURL)
         await refreshIntegrationsWithCurrentBackend()
+        guard acceptsLiveData(generation: liveGeneration) else { return }
 
         guard backendAvailable else {
             errorMessage = GenseeCLIError.executableNotFound.localizedDescription
@@ -147,10 +207,17 @@ final class ConsoleModel: ObservableObject {
         }
 
         await refreshDashboard()
+        guard acceptsLiveData(generation: liveGeneration) else { return }
 
         do {
-            runs = try await cli.decode(RunListResponse.self, arguments: ["run", "list", "--json"])
+            let refreshedRuns = try await cli.decode(
+                RunListResponse.self,
+                arguments: ["run", "list", "--json"]
+            )
+            guard acceptsLiveData(generation: liveGeneration) else { return }
+            runs = refreshedRuns
         } catch {
+            guard acceptsLiveData(generation: liveGeneration) else { return }
             errorMessage = error.localizedDescription
         }
 
@@ -158,6 +225,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshPolicy() async {
+        guard !isDemoMode else { return }
         guard backendAvailable else { return }
         var next = policy
         do {
@@ -168,6 +236,24 @@ final class ConsoleModel: ObservableObject {
             next.noninteractive = try await policyBool("enforcement.noninteractive") ?? next.noninteractive
             next.requireProxy = try await policyBool("egress.require_proxy") ?? next.requireProxy
             next.maxRuntimeSeconds = try await policyInt("runtime.max_runtime_seconds")
+            if let recoveryJSON = try await optionalPolicyJSON("recovery") as? [String: Any] {
+                var recovery = recoveryPointSettings
+                if let harnesses = recoveryJSON["harnesses"] as? [String: String] {
+                    for (provider, value) in harnesses {
+                        if let mode = RecoveryPointMode(rawValue: value) {
+                            recovery.harnessModes[provider] = mode
+                        }
+                    }
+                }
+                if let hours = recoveryJSON["retention_hours"] as? NSNumber {
+                    recovery.retentionHours = hours.intValue
+                }
+                if let value = recoveryJSON["failure_behavior"] as? String,
+                   let behavior = RecoveryFailureBehavior(rawValue: value) {
+                    recovery.failureBehavior = behavior
+                }
+                recoveryPointSettings = recovery
+            }
             policy = next
             policyDocument = try await loadPolicyDocument()
             configureEndpointSensor()
@@ -177,20 +263,27 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshDashboard(reportErrors: Bool = true) async {
+        guard !isDemoMode else { return }
         guard backendAvailable else { return }
         guard !dashboardRefreshInProgress else { return }
+        let liveGeneration = dataSourceGeneration
         dashboardRefreshInProgress = true
-        defer { dashboardRefreshInProgress = false }
+        let refreshStartedAt = Date()
+        defer {
+            lastDashboardRefreshDuration = Date().timeIntervalSince(refreshStartedAt)
+            dashboardRefreshInProgress = false
+        }
         do {
             let refreshedSnapshot = try await cli.decode(
                 SecuritySnapshot.self,
                 arguments: ["dashboard-state"],
-                // Large experimental stores can legitimately take more than
-                // twelve seconds to summarize. Keep a finite deadline so a
-                // wedged backend is terminated and retried, while leaving
-                // enough headroom above the observed healthy query time.
-                timeout: 20
+                // A cold projection of a large encrypted experimental store can
+                // take about a minute; warm refreshes are faster. Preserve a
+                // finite deadline and retry behavior without making first launch
+                // permanently look empty on stores that are still healthy.
+                timeout: hasLoadedDashboardSnapshot ? 45 : 75
             )
+            guard acceptsLiveData(generation: liveGeneration) else { return }
             hasLoadedDashboardSnapshot = true
             reconcileReadAlertState(alertCount: refreshedSnapshot.summary.alertsCount)
             snapshot = refreshedSnapshot
@@ -199,6 +292,7 @@ final class ConsoleModel: ObservableObject {
             lastUpdated = Date()
             dashboardRefreshIssue = nil
         } catch {
+            guard acceptsLiveData(generation: liveGeneration) else { return }
             dashboardRefreshIssue = error.localizedDescription
             // Keep the last good snapshot visible, but always release the
             // in-progress guard so the next scheduled refresh can recover.
@@ -209,6 +303,13 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshDailyDetail(day: String) async {
+        if isDemoMode {
+            dailyDetail = DemoSnapshotFactory.dailyDetail(for: day, snapshot: snapshot)
+            dailyDetailLoadState = dailyDetail == nil
+                ? .unavailable(day: day, message: "No synthetic activity is available for this day.")
+                : .loaded(day)
+            return
+        }
         guard backendAvailable else {
             dailyDetailLoadState = .unavailable(
                 day: day,
@@ -216,10 +317,13 @@ final class ConsoleModel: ObservableObject {
             )
             return
         }
+        let liveGeneration = dataSourceGeneration
         dailyDetailLoadState = .loading(day)
         do {
             let detail = try await cli.decode(DailyDetail.self, arguments: ["dashboard-day", day])
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  acceptsLiveData(generation: liveGeneration)
+            else { return }
             guard detail.date == day else {
                 dailyDetailLoadState = .unavailable(
                     day: day,
@@ -230,13 +334,334 @@ final class ConsoleModel: ObservableObject {
             dailyDetail = detail
             dailyDetailLoadState = .loaded(day)
         } catch {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  acceptsLiveData(generation: liveGeneration)
+            else { return }
             dashboardRefreshIssue = error.localizedDescription
             dailyDetailLoadState = .unavailable(day: day, message: error.localizedDescription)
         }
     }
 
+    func loadRequestReview(requestID: Int64) async {
+        if isDemoMode {
+            guard let request = snapshot.requests.first(where: { $0.requestID == requestID }) else {
+                requestReviewPayload = nil
+                requestReviewLoadState = .unavailable(
+                    requestID: requestID,
+                    message: "This synthetic request is no longer available."
+                )
+                return
+            }
+            requestReviewPayload = RequestReviewPayload(
+                request: request,
+                agentEvents: snapshot.agentEvents.filter { $0.requestID == requestID },
+                alerts: snapshot.alerts.filter { $0.requestID == requestID }
+            )
+            requestReviewLoadState = .loaded(requestID)
+            return
+        }
+        guard backendAvailable else {
+            requestReviewPayload = nil
+            requestReviewLoadState = .unavailable(
+                requestID: requestID,
+                message: "The Gensee backend is unavailable. Repair the app backend, then try again."
+            )
+            return
+        }
+        let liveGeneration = dataSourceGeneration
+
+        requestReviewPayload = nil
+        requestReviewLoadState = .loading(requestID)
+        do {
+            let payload = try await cli.decode(
+                RequestReviewPayload.self,
+                arguments: ["dashboard-request", String(requestID)],
+                timeout: 12
+            )
+            guard acceptsLiveData(generation: liveGeneration),
+                  requestReviewLoadState == .loading(requestID)
+            else { return }
+            requestReviewPayload = payload
+            requestReviewLoadState = .loaded(requestID)
+            await loadRecoveryPoint(for: payload)
+        } catch {
+            guard acceptsLiveData(generation: liveGeneration),
+                  requestReviewLoadState == .loading(requestID)
+            else { return }
+            requestReviewPayload = nil
+            requestReviewLoadState = .unavailable(
+                requestID: requestID,
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    func refreshPendingRecoveryRequest() async {
+        guard !isDemoMode, backendAvailable else { return }
+        let liveGeneration = dataSourceGeneration
+        do {
+            let requests = try await cli.decode(
+                [PendingRecoveryRequest].self,
+                arguments: ["checkpoint", "pending", "--json"],
+                timeout: 3
+            )
+            guard acceptsLiveData(generation: liveGeneration) else { return }
+            let availableIDs = Set(requests.map(\.id))
+            dismissedPendingRecoveryIDs.formIntersection(availableIDs)
+            pendingRecoveryRequest = requests.first {
+                !dismissedPendingRecoveryIDs.contains($0.id)
+            }
+        } catch {
+            // Approval polling must never replace a healthy dashboard with an
+            // error dialog. The blocked hook already carries fallback guidance.
+        }
+    }
+
+    var pendingRecoveryPollingSeconds: Double {
+        if pendingRecoveryRequest != nil { return 1 }
+        if recoveryPointSettings.harnessModes.values.contains(.ask) { return 5 }
+        return 30
+    }
+
+    var dashboardPollingSeconds: Double {
+        // Give ingestion proportionally more quiet time after an expensive
+        // projection. Fast stores retain the existing ten-second cadence.
+        min(120, max(10, lastDashboardRefreshDuration * 2))
+    }
+
+    /// Session lifecycle writes are tiny and happen before harness tool calls.
+    /// Watch their modification time separately from the expensive dashboard
+    /// projection so the system extension receives a new managed root in time
+    /// to observe the request's very first (and sometimes only) command.
+    func refreshEndpointSessionRootsIfNeeded(force: Bool = false) async {
+        guard !isDemoMode, backendAvailable, !endpointRootsRefreshInProgress else { return }
+        let liveGeneration = dataSourceGeneration
+        let sessionsURL = homeURL.appendingPathComponent("sessions.jsonl")
+        let modificationDate = try? sessionsURL.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        ).contentModificationDate
+        guard force || modificationDate != lastEndpointSessionsModificationDate else { return }
+
+        endpointRootsRefreshInProgress = true
+        defer { endpointRootsRefreshInProgress = false }
+        do {
+            let sessions = try await cli.decode(
+                [AgentSessionRecord].self,
+                arguments: ["endpoint-roots"],
+                timeout: 3
+            )
+            guard acceptsLiveData(generation: liveGeneration) else { return }
+            endpointSessionRecords = sessions
+            hasLoadedEndpointSessionRecords = true
+            lastEndpointSessionsModificationDate = modificationDate
+            configureEndpointSensor()
+        } catch {
+            // Keep the last valid roots and retry on the next watch tick. A
+            // transient encrypted-store lock must never clear active roots.
+        }
+    }
+
+    /// Establish a high-water mark after the first full snapshot. Existing
+    /// history must not appear as a burst of new menu items or notifications.
+    func prepareCompletionWatcher() {
+        lastCompletionRequestID = snapshot.requests.map(\.requestID).max() ?? 0
+        let signalURL = homeURL.appendingPathComponent("completion.signal")
+        lastCompletionSignalModificationDate = try? signalURL.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        ).contentModificationDate
+    }
+
+    /// Refresh only request-scoped data after a hook writes completion.signal.
+    /// This avoids the expensive full dashboard projection on the latency-
+    /// sensitive notification and menu-bar path.
+    func refreshRecentCompletionsIfNeeded() async -> Bool {
+        guard !isDemoMode, backendAvailable, !completionRefreshInProgress else { return false }
+        let liveGeneration = dataSourceGeneration
+        let signalURL = homeURL.appendingPathComponent("completion.signal")
+        let modificationDate = try? signalURL.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        ).contentModificationDate
+        guard let modificationDate,
+              modificationDate != lastCompletionSignalModificationDate
+        else { return false }
+
+        completionRefreshInProgress = true
+        defer { completionRefreshInProgress = false }
+        do {
+            // Give the 500 ms Endpoint Security ingestion loop time to persist
+            // trailing file events before projecting the completed request.
+            try await Task.sleep(for: .milliseconds(1_100))
+            guard acceptsLiveData(generation: liveGeneration) else { return false }
+            let requestIDs = try await cli.decode(
+                [Int64].self,
+                arguments: ["dashboard-completions", String(lastCompletionRequestID)],
+                timeout: 3
+            )
+            guard acceptsLiveData(generation: liveGeneration) else { return false }
+            var updated = false
+            for requestID in requestIDs {
+                let payload = try await cli.decode(
+                    RequestReviewPayload.self,
+                    arguments: ["dashboard-request", String(requestID)],
+                    timeout: 5
+                )
+                guard acceptsLiveData(generation: liveGeneration) else { return false }
+                mergeCompletionPayload(payload)
+                lastCompletionRequestID = max(lastCompletionRequestID, requestID)
+                updated = true
+            }
+            lastCompletionSignalModificationDate = modificationDate
+            if updated {
+                lastUpdated = Date()
+            }
+            return updated
+        } catch {
+            // Retain the old signal date so a transient store lock retries on
+            // the next watch tick instead of losing the completion edge.
+            return false
+        }
+    }
+
+    private func mergeCompletionPayload(_ payload: RequestReviewPayload) {
+        let requestID = payload.request.requestID
+        snapshot.requests.removeAll { $0.requestID == requestID }
+        snapshot.requests.insert(payload.request, at: 0)
+        snapshot.agentEvents.removeAll { $0.requestID == requestID }
+        snapshot.agentEvents.append(contentsOf: payload.agentEvents)
+        snapshot.alerts.removeAll { $0.requestID == requestID }
+        snapshot.alerts.append(contentsOf: payload.alerts)
+
+        if requestReviewPayload?.request.requestID == requestID {
+            requestReviewPayload = payload
+            requestReviewLoadState = .loaded(requestID)
+        }
+    }
+
+    func dismissPendingRecoveryRequest() {
+        if let id = pendingRecoveryRequest?.id {
+            dismissedPendingRecoveryIDs.insert(id)
+        }
+        pendingRecoveryRequest = nil
+    }
+
+    func resolvePendingRecoveryRequest(
+        _ request: PendingRecoveryRequest,
+        create: Bool,
+        alwaysCreate: Bool = false
+    ) async {
+        guard !isDemoMode else { return }
+        pendingRecoveryRequest = nil
+        if alwaysCreate {
+            guard await updateRecoveryPointMode(.auto, for: request.provider, showNotice: false) else {
+                pendingRecoveryRequest = request
+                return
+            }
+        }
+        runningCommand = create ? "Creating recovery point" : "Continuing without recovery point"
+        defer { runningCommand = nil }
+        do {
+            _ = try await cli.run(
+                [
+                    "checkpoint", "resolve", request.id,
+                    "--action", create ? "create" : "continue",
+                    "--json",
+                ],
+                timeout: 60
+            )
+            pendingRecoveryRequest = nil
+            dismissedPendingRecoveryIDs.remove(request.id)
+            noticeMessage = create
+                ? "Recovery point created. The waiting agent operation can continue."
+                : "This request will continue without a recovery point."
+        } catch {
+            // Leave the approval retryable after a transient CLI or database
+            // failure. Only the explicit Keep Blocked action suppresses it.
+            dismissedPendingRecoveryIDs.remove(request.id)
+            pendingRecoveryRequest = request
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func removeAllRecoveryPoints() async {
+        guard !isDemoMode else { return }
+        runningCommand = "Removing retained recovery points"
+        defer { runningCommand = nil }
+        do {
+            let output = try await cli.run(
+                [
+                    "checkpoint", "prune", "--all-workspaces", "--all-ages",
+                    "--yes", "--json",
+                ],
+                timeout: 120
+            )
+            let response = try JSONDecoder().decode(
+                CheckpointDeleteResponse.self,
+                from: Data(output.stdout.utf8)
+            )
+            let orphaned = response.orphaned ?? []
+            let failures = response.failed ?? []
+            let removedIDs = Set(
+                response.deleted
+                    + orphaned.map(\.id)
+                    + failures.filter(\.orphanedMetadataRemoved).map(\.id)
+            )
+            recoveryPointsByRequest = recoveryPointsByRequest.filter {
+                !removedIDs.contains($0.value.id)
+            }
+            let removedCount = response.deleted.count + orphaned.count
+            var removedMessage = "Removed \(removedCount) retained recovery point\(removedCount == 1 ? "" : "s")."
+            if !orphaned.isEmpty {
+                removedMessage += " \(orphaned.count) orphaned record\(orphaned.count == 1 ? " was" : "s were") cleaned up."
+            }
+            if let firstFailure = failures.first {
+                noticeMessage = nil
+                errorMessage = "\(removedMessage) \(failures.count) recovery point\(failures.count == 1 ? "" : "s") could not be fully removed. \(firstFailure.workspace): \(firstFailure.error)"
+            } else {
+                errorMessage = nil
+                noticeMessage = removedMessage
+            }
+        } catch {
+            errorMessage = "Could not remove retained recovery points: \(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    func updateRecoveryPointMode(
+        _ mode: RecoveryPointMode,
+        for provider: String,
+        showNotice: Bool = true
+    ) async -> Bool {
+        await updateRecoverySetting(
+            key: "recovery.harnesses.\(provider)",
+            value: mode.rawValue,
+            command: "Updating smart recovery for \(HarnessDisplayName.from(provider))",
+            notice: showNotice ? "Smart recovery for \(HarnessDisplayName.from(provider)) is now \(mode.title)." : nil
+        )
+    }
+
+    func updateRecoveryRetentionHours(_ hours: Int) async {
+        _ = await updateRecoverySetting(
+            key: "recovery.retention_hours",
+            value: String(hours),
+            command: "Updating recovery-point retention",
+            notice: "Recovery points will be retained for \(hours) hours."
+        )
+    }
+
+    func updateRecoveryFailureBehavior(_ behavior: RecoveryFailureBehavior) async {
+        _ = await updateRecoverySetting(
+            key: "recovery.failure_behavior",
+            value: behavior.rawValue,
+            command: "Updating recovery fallback",
+            notice: "Recovery fallback set to \(behavior.title)."
+        )
+    }
+
     func runConfigAudit(target: String, workspace: String) async {
+        guard !isDemoMode else {
+            noticeMessage = "Config Audit is read-only in the synthetic demo. Exit demo mode to audit this Mac."
+            return
+        }
         guard backendAvailable else {
             errorMessage = GenseeCLIError.executableNotFound.localizedDescription
             return
@@ -263,6 +688,25 @@ final class ConsoleModel: ObservableObject {
                 acceptingExitCodes: [0, 2]
             )
             configAudit = audit
+            let entry = audit.historyEntry()
+            let previous = configAuditHistory.first { $0.target == entry.target }
+            if let previous {
+                let before = Set(previous.findingFingerprints)
+                let after = Set(entry.findingFingerprints)
+                let changedSources = Set(previous.sourceDigests.keys).union(entry.sourceDigests.keys).filter {
+                    previous.sourceDigests[$0] != entry.sourceDigests[$0]
+                }.count
+                configAuditDrift = ConfigAuditDrift(
+                    addedFindingCount: after.subtracting(before).count,
+                    resolvedFindingCount: before.subtracting(after).count,
+                    changedSourceCount: changedSources
+                )
+            } else {
+                configAuditDrift = nil
+            }
+            configAuditHistory.insert(entry, at: 0)
+            configAuditHistory = Array(configAuditHistory.prefix(20))
+            persistConfigAuditHistory()
             if let harnessID = audit.auditedHarnessID {
                 auditedIntegrationIDs.insert(harnessID)
                 persistAuditedIntegrationIDs()
@@ -272,7 +716,109 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
+    private static func loadConfigAuditHistory(homeURL: URL) -> [ConfigAuditHistoryEntry] {
+        let url = homeURL.appendingPathComponent("config-audit-history.json")
+        guard let data = try? Data(contentsOf: url),
+              let history = try? JSONDecoder().decode([ConfigAuditHistoryEntry].self, from: data)
+        else { return [] }
+        return history.sorted { $0.auditedAt > $1.auditedAt }
+    }
+
+    private func persistConfigAuditHistory() {
+        let url = homeURL.appendingPathComponent("config-audit-history.json")
+        guard let data = try? JSONEncoder().encode(configAuditHistory) else { return }
+        try? FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
+    }
+
+    func restoreCheckpoint(_ checkpoint: WorkspaceCheckpointRecord, workspace: String) async {
+        guard !isDemoMode else {
+            noticeMessage = "Restore is a safe preview in synthetic demo mode. With a real Git workspace, Gensee first creates a rescue point, then restores the files captured before this request."
+            return
+        }
+        guard let workspaceURL = existingWorkspaceURL(workspace) else {
+            errorMessage = "Choose the checkpoint's Git workspace before restoring it."
+            return
+        }
+        runningCommand = "Restoring checkpoint and creating a rescue point"
+        defer { runningCommand = nil }
+        do {
+            let response = try await cli.decode(
+                CheckpointRestoreResponse.self,
+                arguments: [
+                    "checkpoint", "restore", checkpoint.id,
+                    "--workspace", workspaceURL.path,
+                    "--yes", "--json",
+                ],
+                timeout: 300
+            )
+            noticeMessage = "Restored \(response.restored.label ?? response.restored.id). Rescue checkpoint: \(response.rescue.id)."
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func loadRecoveryPoint(for payload: RequestReviewPayload) async {
+        do {
+            let response = try await cli.decode(
+                CheckpointListResponse.self,
+                arguments: [
+                    "checkpoint", "list",
+                    "--request-id", String(payload.request.requestID),
+                    "--session-id", payload.request.sessionID,
+                    "--json",
+                ],
+                timeout: 5
+            )
+            recoveryPointsByRequest[payload.request.requestID] = response.checkpoints.first {
+                $0.requestID == payload.request.requestID && $0.rescueOf == nil
+            }
+        } catch {
+            recoveryPointsByRequest.removeValue(forKey: payload.request.requestID)
+        }
+    }
+
+    private func updateRecoverySetting(
+        key: String,
+        value: String,
+        command: String,
+        notice: String?
+    ) async -> Bool {
+        guard !isDemoMode else { return false }
+        guard backendAvailable else {
+            errorMessage = GenseeCLIError.executableNotFound.localizedDescription
+            return false
+        }
+        runningCommand = command
+        defer { runningCommand = nil }
+        do {
+            _ = try await cli.run(["policy", "set", key, value], timeout: 12)
+            await refreshPolicy()
+            if let notice { noticeMessage = notice }
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    private func existingWorkspaceURL(_ workspace: String) -> URL? {
+        let expanded = (workspace as NSString).expandingTildeInPath
+        let url = URL(fileURLWithPath: expanded)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else { return nil }
+        return url
+    }
+
     func savePolicyDocument(_ text: String) async -> Bool {
+        guard !isDemoMode else {
+            noticeMessage = "Synthetic demo mode never changes your policy."
+            return false
+        }
         runningCommand = "Validating policy"
         defer { runningCommand = nil }
         do {
@@ -301,6 +847,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     func recordFeedback(for alert: SecurityAlert, agrees: Bool) async -> Bool {
+        guard !isDemoMode else {
+            noticeMessage = "Feedback is not stored for synthetic demo findings."
+            return false
+        }
         guard feedbackAlertID == nil else { return false }
         feedbackAlertID = alert.alertID
         defer { feedbackAlertID = nil }
@@ -335,7 +885,90 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
+    /// Persist a rule-scoped review adjustment in the active policy. Unlike
+    /// thumbs feedback, this changes how the same rule is classified and
+    /// enforced for future findings while preserving the immutable alert log.
+    func tuneFinding(
+        _ alert: SecurityAlert,
+        severity: String? = nil,
+        action: String? = nil
+    ) async -> Bool {
+        guard !isDemoMode else {
+            noticeMessage = "Synthetic demo mode never changes your policy."
+            return false
+        }
+        guard feedbackAlertID == nil else { return false }
+        feedbackAlertID = alert.alertID
+        defer { feedbackAlertID = nil }
+
+        do {
+            guard var root = try JSONSerialization.jsonObject(
+                with: Data(policyDocument.utf8)
+            ) as? [String: Any] else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+            var overrides = root["review_overrides"] as? [[String: Any]] ?? []
+            var reviewOverride = overrides.first {
+                ($0["rule_id"] as? String) == alert.ruleID
+            } ?? ["rule_id": alert.ruleID]
+            overrides.removeAll { ($0["rule_id"] as? String) == alert.ruleID }
+            if let severity { reviewOverride["severity"] = severity.lowercased() }
+            if let action { reviewOverride["action"] = action.lowercased() }
+            overrides.append(reviewOverride)
+            root["review_overrides"] = overrides
+            let data = try JSONSerialization.data(
+                withJSONObject: root,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+            let saved = await savePolicyDocument(String(decoding: data, as: UTF8.self))
+            guard saved else { return false }
+
+            let effectiveSeverity = (reviewOverride["severity"] as? String) ?? alert.severity.lowercased()
+            let effectiveAction = (reviewOverride["action"] as? String) ?? alert.action.lowercased()
+
+            var feedbackArguments = [
+                "feedback", "record",
+                "--verdict", "agree",
+                "--event-key", "alert:\(alert.alertID)",
+                "--gensee", alert.action,
+                "--label", "rule_tuning",
+                "--rule", alert.ruleID,
+                "--note", "future severity=\(effectiveSeverity); future action=\(effectiveAction)",
+            ]
+            if let sessionID = alert.sessionID, !sessionID.isEmpty {
+                feedbackArguments += ["--session", sessionID]
+            }
+            if let path = alert.path, !path.isEmpty {
+                feedbackArguments += ["--path", path]
+            }
+            var auditNote = ""
+            do {
+                _ = try await cli.run(feedbackArguments)
+            } catch {
+                auditNote = " The policy was saved, but its local audit note could not be recorded."
+            }
+            noticeMessage = "Future \(alert.ruleID) findings will use \(effectiveSeverity.uppercased()) · \(effectiveAction.uppercased()).\(auditNote)"
+            await refreshDashboard(reportErrors: false)
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    var reviewOverrides: [RuleReviewOverride] {
+        RuleReviewOverride.parse(policyDocument: policyDocument)
+    }
+
+    func reviewOverride(for ruleID: String) -> RuleReviewOverride? {
+        reviewOverrides.first { $0.ruleID == ruleID }
+    }
+
     func setPolicy(key: String, value: String) async {
+        guard !isDemoMode else {
+            noticeMessage = "Synthetic demo mode never changes your policy."
+            return
+        }
         runningCommand = "Updating policy"
         defer { runningCommand = nil }
         do {
@@ -348,6 +981,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     func setIntegrationEnabled(_ provider: String, enabled: Bool) async {
+        guard !isDemoMode else {
+            noticeMessage = "Synthetic demo mode never installs or removes harness hooks."
+            return
+        }
         guard let index = integrations.firstIndex(where: { $0.id == provider }) else { return }
         let integration = integrations[index]
         guard integration.canToggle else { return }
@@ -398,6 +1035,10 @@ final class ConsoleModel: ObservableObject {
     }
 
     func repairIntegration(_ provider: String) async {
+        guard !isDemoMode else {
+            noticeMessage = "Synthetic demo mode never changes harness configuration."
+            return
+        }
         guard let integration = integrations.first(where: { $0.id == provider }),
               integration.canToggle,
               integration.requiresRepair
@@ -451,6 +1092,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func prepareLocalRuntime() async -> Bool {
+        guard !isDemoMode else { return true }
         guard backendAvailable else {
             errorMessage = GenseeCLIError.executableNotFound.localizedDescription
             return false
@@ -497,6 +1139,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     func enableAllInstalledIntegrations() async {
+        guard !isDemoMode else { return }
         let providers = integrations
             .filter { $0.installed && $0.supportsDirectHooks && !$0.isHealthy }
             .map(\.id)
@@ -511,7 +1154,79 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshHarnesses() async {
+        guard !isDemoMode else { return }
         await refreshIntegrationsWithCurrentBackend()
+    }
+
+    func enterDemoMode() {
+        guard !isDemoMode else { return }
+        let now = Date()
+        snapshotBeforeDemo = snapshot
+        recoveryPointsBeforeDemo = recoveryPointsByRequest
+        dataSourceGeneration &+= 1
+        isDemoMode = true
+        snapshot = DemoSnapshotFactory.make(now: now)
+        dashboardRefreshIssue = nil
+        dailyDetail = nil
+        dailyDetailLoadState = .idle
+        requestReviewPayload = nil
+        requestReviewLoadState = .idle
+        recoveryPointsByRequest = DemoSnapshotFactory.recoveryPoints(now: now)
+        pendingRecoveryRequest = nil
+        errorMessage = nil
+        lastUpdated = Date()
+    }
+
+    func exitDemoMode() async {
+        guard isDemoMode else { return }
+        dataSourceGeneration &+= 1
+        isDemoMode = false
+        snapshot = snapshotBeforeDemo
+        dailyDetail = nil
+        dailyDetailLoadState = .idle
+        requestReviewPayload = nil
+        requestReviewLoadState = .idle
+        recoveryPointsByRequest = recoveryPointsBeforeDemo
+        recoveryPointsBeforeDemo.removeAll()
+        pendingRecoveryRequest = nil
+        await refreshAll()
+    }
+
+    private func acceptsLiveData(generation: UInt64) -> Bool {
+        !isDemoMode && generation == dataSourceGeneration
+    }
+
+    func applyProtectionLevel(_ level: ProtectionLevel) async -> Bool {
+        guard !isDemoMode else {
+            noticeMessage = "Exit synthetic demo mode before changing protection."
+            return false
+        }
+        if policyDocument.isEmpty {
+            await refreshPolicy()
+        }
+        do {
+            guard var root = try JSONSerialization.jsonObject(with: Data(policyDocument.utf8)) as? [String: Any] else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+            var endpoint = root["endpoint_security"] as? [String: Any] ?? [:]
+            endpoint["mode"] = level.endpointMode
+            root["endpoint_security"] = endpoint
+            var enforcement = root["enforcement"] as? [String: Any] ?? [:]
+            enforcement["noninteractive"] = level.noninteractive
+            root["enforcement"] = enforcement
+            let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw CocoaError(.fileReadInapplicableStringEncoding)
+            }
+            let saved = await savePolicyDocument(text)
+            if saved {
+                noticeMessage = "Protection level set to \(level.title)."
+            }
+            return saved
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
     }
 
     func openFullDiskAccess() {
@@ -591,8 +1306,26 @@ final class ConsoleModel: ObservableObject {
         return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
     }
 
+    private func optionalPolicyJSON(_ key: String) async throws -> Any? {
+        // Older policy documents legitimately omit newer optional sections;
+        // Missing data is a compatibility case, not a load failure.
+        do {
+            return try await policyJSON(key)
+        } catch let GenseeCLIError.commandFailed(arguments, output, exitCode) {
+            guard arguments == ["policy", "get", key],
+                  output.localizedCaseInsensitiveContains("key not set") else {
+                throw GenseeCLIError.commandFailed(arguments: arguments, output: output, exitCode: exitCode)
+            }
+            return nil
+        }
+    }
+
     private static func readAlertsKey(homeURL: URL) -> String {
         "gensee.alerts.read.\(homeURL.path)"
+    }
+
+    private static func acknowledgedReviewSignalsKey(homeURL: URL) -> String {
+        "gensee.agent-inbox.handled-signals.\(homeURL.path)"
     }
 
     private static func auditedIntegrationsKey(homeURL: URL) -> String {
@@ -733,6 +1466,16 @@ final class ConsoleModel: ObservableObject {
         return Set(values.map(\.int64Value))
     }
 
+    private static func loadAcknowledgedReviewSignals(homeURL: URL) -> [Int64: String] {
+        let values = UserDefaults.standard.dictionary(
+            forKey: acknowledgedReviewSignalsKey(homeURL: homeURL)
+        ) ?? [:]
+        return values.reduce(into: [:]) { result, item in
+            guard let requestID = Int64(item.key), let fingerprint = item.value as? String else { return }
+            result[requestID] = fingerprint
+        }
+    }
+
     private func reconcileReadAlertState(alertCount: Int) {
         guard AlertReadState.storeWasReset(
             alertCount: alertCount,
@@ -758,6 +1501,19 @@ final class ConsoleModel: ObservableObject {
         UserDefaults.standard.set(
             readThroughAlertID,
             forKey: Self.readAlertsWatermarkKey(homeURL: homeURL)
+        )
+    }
+
+    private func persistAcknowledgedReviewSignals() {
+        let retained = acknowledgedReviewSignals
+            .sorted { $0.key > $1.key }
+            .prefix(1_000)
+        acknowledgedReviewSignals = retained.reduce(into: [:]) { result, item in
+            result[item.key] = item.value
+        }
+        UserDefaults.standard.set(
+            Dictionary(uniqueKeysWithValues: retained.map { (String($0.key), $0.value) }),
+            forKey: Self.acknowledgedReviewSignalsKey(homeURL: homeURL)
         )
     }
 
@@ -1025,7 +1781,10 @@ final class ConsoleModel: ObservableObject {
             maxAuthorizationLatencyMS = (endpoint["max_auth_latency_ms"] as? NSNumber)?.uint64Value ?? 10
         }
         let enabledHarnesses = Set(integrations.lazy.filter(\.configured).map(\.id))
-        let roots = snapshot.jsonSessions
+        let sessions = hasLoadedEndpointSessionRecords
+            ? endpointSessionRecords
+            : snapshot.jsonSessions
+        let roots = sessions
             .filter {
                 $0.isActive
                     && $0.rootPID != 0

@@ -47,7 +47,7 @@ enum TimelineDerivation {
             var pair = pairs[key] ?? EventPair()
             switch event.type {
             case "PreToolUse": pair.pre = event
-            case "PostToolUse": pair.post = event
+            case "PostToolUse", "PostToolUseFailure": pair.post = event
             default: pair.pre = pair.pre ?? event
             }
             pairs[key] = pair
@@ -114,8 +114,8 @@ enum TimelineDerivation {
                 outcomes[toolUseID] = incoming
                 continue
             }
-            if actionRank(incoming.action) > actionRank(current.action)
-                || severityRank(incoming.severity) > severityRank(current.severity)
+            if PolicyValueRank.actionForOrdering(incoming.action) > PolicyValueRank.actionForOrdering(current.action)
+                || PolicyValueRank.severity(incoming.severity) > PolicyValueRank.severity(current.severity)
             {
                 outcomes[toolUseID] = incoming
             }
@@ -175,11 +175,4 @@ enum TimelineDerivation {
         return files.filter { seen.insert($0).inserted }
     }
 
-    private static func actionRank(_ action: String) -> Int {
-        ["allow": 0, "warn": 1, "ask": 2, "block": 3][action.lowercased()] ?? 0
-    }
-
-    private static func severityRank(_ severity: String) -> Int {
-        ["info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4][severity.lowercased()] ?? 0
-    }
 }

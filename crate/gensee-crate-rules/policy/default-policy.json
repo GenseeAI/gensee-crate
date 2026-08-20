@@ -8,6 +8,7 @@
     "kt", "m", "mm", "py", "rb", "rs", "scss", "sh", "swift", "ts", "tsx"
   ],
   "wildcard_chars": ["*", "?", "["],
+  "review_overrides": [],
 
   "operations": {
     "read": ["read", "copy_source"],
@@ -515,6 +516,19 @@
     "raw_event_retention_hours": 24,
     "max_raw_events": 100000,
     "low_severity_retention_hours": 48
+  },
+  "recovery": {
+    "default_mode": "auto",
+    "harnesses": {
+      "codex": "auto",
+      "claude-code": "auto",
+      "antigravity": "auto",
+      "cursor": "auto",
+      "vscode": "auto"
+    },
+    "retention_hours": 168,
+    "failure_behavior": "continue-with-warning",
+    "ask_timeout_seconds": 25
   },
   "watch": {
     "system_events": "endpoint-security"

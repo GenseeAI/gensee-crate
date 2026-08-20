@@ -7,10 +7,20 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// Bump this whenever schema.sql or one of the inline migrations changes. An
+// already-initialized store must not rerun CREATE/ALTER statements on every
+// short-lived hook or dashboard process: schema DDL needs a writer lock and can
+// otherwise starve behind the long-lived Endpoint Security ingester.
+const SCHEMA_VERSION: i64 = 2;
+// This checksum intentionally names the schema version. If schema.sql changes,
+// bump SCHEMA_VERSION and replace this with the checksum for the new version.
+#[cfg(test)]
+const SCHEMA_V2_SQL_SHA256: &str =
+    "708e9f5ce79743ba025dfc76373c7bedb38cfafebde933e7e8e842f0a7eb26fb";
 // Increment whenever dashboard artifact visibility rules change. Existing
 // stores are reclassified by bounded background maintenance before this
 // version is stamped on their cached count.
-const DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION: i64 = 3;
+const DASHBOARD_ARTIFACT_VISIBILITY_RULES_VERSION: i64 = 4;
 
 /// Lineage represents concrete filesystem objects. Shell globs and brace
 /// expansions describe possible path sets, while square brackets are also
@@ -24,17 +34,29 @@ pub fn artifact_path_is_concrete(path: &str) -> bool {
 
 pub fn lineage_path_is_harness_runtime_noise(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    path.starts_with("/dev/")
-        || path.starts_with("/private/tmp/cc-socks/")
-        || path.starts_with("/tmp/cc-socks/")
-        || path.starts_with("/private/tmp/claude-")
-        || path.starts_with("/tmp/claude-")
-        || path.starts_with("/private/var/tmp/sh-thd-")
-        || path.contains("/.claude/sessions/")
-        || path.contains("/.claude/projects/")
-        || path.contains("/.claude/shell-snapshots/")
-        || (path.contains("/.claude/plugins/cache/")
-            && (path.ends_with("/.in_use") || path.contains("/.in_use/")))
+    lower.starts_with("/dev/")
+        || lower.starts_with("/private/tmp/cc-socks/")
+        || lower.starts_with("/tmp/cc-socks/")
+        || lower.starts_with("/private/tmp/claude-")
+        || lower.starts_with("/tmp/claude-")
+        || lower.starts_with("/private/var/tmp/sh-thd-")
+        || lower.contains("/.gensee/")
+        || lower.ends_with("/.gensee")
+        || lower.contains("/.claude/sessions/")
+        || lower.contains("/.claude/projects/")
+        || lower.contains("/.claude/shell-snapshots/")
+        || lower.contains("/.claude/file-history/")
+        || lower.contains("/.claude/todos/")
+        || lower.contains("/.claude/debug/")
+        || lower.contains("/.claude/statsig/")
+        || lower.ends_with("/.claude/history.jsonl")
+        || (lower.contains("/.claude/plugins/cache/")
+            && (lower.ends_with("/.in_use") || lower.contains("/.in_use/")))
+        || lower.contains("/.codex/sessions/")
+        || lower.contains("/.codex/node_repl/active_execs/")
+        || lower.ends_with("/.codex/models_cache.json")
+        || (lower.contains("/.codex/logs_") && lower.ends_with(".sqlite"))
+        || (lower.contains("/.codex/state_") && lower.ends_with(".sqlite"))
         || lower.contains("/library/application support/codex/")
         || lower.contains("/library/application support/claude/")
         || lower.contains("/crashpad/")
@@ -674,24 +696,32 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
     conn.pragma_update(None, "auto_vacuum", auto_vacuum)
         .map_err(SqliteError::Pragma)?;
 
-    migrate_legacy_ownership(&conn).map_err(SqliteError::Schema)?;
-    migrate_legacy_relations(&conn).map_err(SqliteError::Schema)?;
-    migrate_alert_hash_chain(&conn).map_err(SqliteError::Schema)?;
-    migrate_agent_event_tool_use_id(&conn).map_err(SqliteError::Schema)?;
-    migrate_request_activity_fields(&conn).map_err(SqliteError::Schema)?;
-    migrate_session_root_pid(&conn).map_err(SqliteError::Schema)?;
-    migrate_session_token_usage(&conn).map_err(SqliteError::Schema)?;
-    migrate_transcript_token_state(&conn).map_err(SqliteError::Schema)?;
-    ensure_artifact_dashboard_visibility_column(&conn).map_err(SqliteError::Schema)?;
-    ensure_dashboard_artifact_count_rules_version_column(&conn).map_err(SqliteError::Schema)?;
+    let schema_version = conn
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(SqliteError::Pragma)?;
+    if schema_version < SCHEMA_VERSION {
+        migrate_legacy_ownership(&conn).map_err(SqliteError::Schema)?;
+        migrate_legacy_relations(&conn).map_err(SqliteError::Schema)?;
+        migrate_alert_hash_chain(&conn).map_err(SqliteError::Schema)?;
+        migrate_agent_event_tool_use_id(&conn).map_err(SqliteError::Schema)?;
+        migrate_request_activity_fields(&conn).map_err(SqliteError::Schema)?;
+        migrate_session_root_pid(&conn).map_err(SqliteError::Schema)?;
+        migrate_session_token_usage(&conn).map_err(SqliteError::Schema)?;
+        migrate_transcript_token_state(&conn).map_err(SqliteError::Schema)?;
+        ensure_artifact_dashboard_visibility_column(&conn).map_err(SqliteError::Schema)?;
+        ensure_dashboard_artifact_count_rules_version_column(&conn).map_err(SqliteError::Schema)?;
 
-    conn.execute_batch(include_str!("../schema.sql"))
-        .map_err(SqliteError::Schema)?;
+        conn.execute_batch(include_str!("../schema.sql"))
+            .map_err(SqliteError::Schema)?;
 
-    // Must run AFTER schema.sql creates `alert_chain_head`: a DB upgraded from a
-    // chain-without-anchor version already has chained alerts but an empty
-    // anchor; seed it from those rows so the next insert doesn't reset count to 1.
-    backfill_alert_chain_head(&conn).map_err(SqliteError::Schema)?;
+        // Must run AFTER schema.sql creates `alert_chain_head`: a DB upgraded
+        // from a chain-without-anchor version already has chained alerts but an
+        // empty anchor; seed it from those rows so the next insert doesn't reset
+        // count to 1.
+        backfill_alert_chain_head(&conn).map_err(SqliteError::Schema)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(SqliteError::Schema)?;
+    }
 
     Ok(conn)
 }
@@ -1097,16 +1127,80 @@ impl SqliteStore {
                 "SELECT event_id, pid, request_id, ts, source, type,
                     cwd, permission_mode, tool_name, tool_input, tool_response
                  FROM agent_events
-                 WHERE type = 'file_intent'
+                 WHERE type IN ('file_intent', 'PreToolUse')
                    AND tool_input IS NOT NULL
-                   AND json_extract(tool_input, '$.path') IS NOT NULL
                    AND ts BETWEEN ?2 - ?3 AND ?2 + ?3
                    AND (
-                        json_extract(tool_input, '$.path') = ?1
-                     OR substr(?1, 1, length(json_extract(tool_input, '$.path')) + 1) =
-                        json_extract(tool_input, '$.path') || '/'
-                     OR substr(json_extract(tool_input, '$.path'), 1, length(?1) + 1) = ?1 || '/'
-                 )
+                       (
+                           json_extract(tool_input, '$.path') IS NOT NULL
+                           AND (
+                                json_extract(tool_input, '$.path') = ?1
+                             OR substr(?1, 1, length(json_extract(tool_input, '$.path')) + 1) =
+                                json_extract(tool_input, '$.path') || '/'
+                             OR substr(json_extract(tool_input, '$.path'), 1, length(?1) + 1) =
+                                ?1 || '/'
+                           )
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM json_each(agent_events.tool_input, '$.changes') AS change
+                           WHERE json_extract(change.value, '$.path') = ?1
+                              OR substr(?1, 1, length(json_extract(change.value, '$.path')) + 1) =
+                                 json_extract(change.value, '$.path') || '/'
+                              OR substr(json_extract(change.value, '$.path'), 1, length(?1) + 1) =
+                                 ?1 || '/'
+                       )
+                   )
+                 ORDER BY ABS(ts - ?2), event_id DESC
+                 LIMIT 1",
+                params![path, ts, window_ms],
+                map_agent_event,
+            )
+            .optional()
+            .map_err(SqliteError::Database)
+    }
+
+    pub fn request_for_mutating_file_intent_path(
+        &self,
+        path: &str,
+        ts: i64,
+        window_ms: i64,
+    ) -> Result<Option<AgentEventRecord>, SqliteError> {
+        self.conn
+            .query_row(
+                "SELECT event_id, pid, request_id, ts, source, type,
+                    cwd, permission_mode, tool_name, tool_input, tool_response
+                 FROM agent_events
+                 WHERE type IN ('file_intent', 'PreToolUse')
+                   AND tool_input IS NOT NULL
+                   AND ts BETWEEN ?2 - ?3 AND ?2 + ?3
+                   AND (
+                       (
+                           json_extract(tool_input, '$.path') IS NOT NULL
+                           AND lower(COALESCE(json_extract(tool_input, '$.operation'), ''))
+                               NOT IN ('read', 'open', 'access', 'stat', 'list')
+                           AND (
+                                json_extract(tool_input, '$.path') = ?1
+                             OR substr(?1, 1, length(json_extract(tool_input, '$.path')) + 1) =
+                                json_extract(tool_input, '$.path') || '/'
+                             OR substr(json_extract(tool_input, '$.path'), 1, length(?1) + 1) =
+                                ?1 || '/'
+                           )
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM json_each(agent_events.tool_input, '$.changes') AS change
+                           WHERE lower(COALESCE(json_extract(change.value, '$.operation'), ''))
+                                     NOT IN ('read', 'open', 'access', 'stat', 'list')
+                             AND (
+                                  json_extract(change.value, '$.path') = ?1
+                               OR substr(?1, 1, length(json_extract(change.value, '$.path')) + 1) =
+                                  json_extract(change.value, '$.path') || '/'
+                               OR substr(json_extract(change.value, '$.path'), 1, length(?1) + 1) =
+                                  ?1 || '/'
+                             )
+                       )
+                   )
                  ORDER BY ABS(ts - ?2), event_id DESC
                  LIMIT 1",
                 params![path, ts, window_ms],
@@ -2947,6 +3041,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn schema_checksum_is_tied_to_schema_version() {
+        assert_eq!(SCHEMA_VERSION, 2);
+        let actual = format!("{:x}", Sha256::digest(include_bytes!("../schema.sql")));
+        assert_eq!(
+            actual, SCHEMA_V2_SQL_SHA256,
+            "schema.sql changed: bump SCHEMA_VERSION and replace the versioned checksum"
+        );
+    }
+
+    #[test]
+    fn harness_runtime_noise_excludes_bookkeeping_but_keeps_user_configuration() {
+        for path in [
+            "/Users/test/.gensee/gensee.db",
+            "/Users/test/.codex/logs_2.sqlite",
+            "/Users/test/.codex/models_cache.json",
+            "/Users/test/.codex/node_repl/active_execs/run.json",
+            "/Users/test/.codex/sessions/2026/08/19/rollout.jsonl",
+            "/Users/test/.claude/projects/repo/session.jsonl",
+            "/Users/test/.claude/history.jsonl",
+        ] {
+            assert!(lineage_path_is_harness_runtime_noise(path), "{path}");
+        }
+        for path in [
+            "/Users/test/.codex/skills/review/SKILL.md",
+            "/Users/test/.claude/settings.json",
+            "/Users/test/project/Sources/App.swift",
+        ] {
+            assert!(!lineage_path_is_harness_runtime_noise(path), "{path}");
+        }
+    }
+
+    #[test]
     fn open_creates_all_tables() {
         let path = std::env::temp_dir().join(format!("gensee-db-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -2986,6 +3112,10 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "table {table} should exist");
         }
+        let schema_version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, SCHEMA_VERSION);
 
         drop(conn);
         let db_name = path.file_name().expect("path should have a file name");
@@ -2994,6 +3124,32 @@ mod tests {
             std::fs::remove_file(path.with_file_name(format!("{}-wal", db_name.to_string_lossy())));
         let _ =
             std::fs::remove_file(path.with_file_name(format!("{}-shm", db_name.to_string_lossy())));
+    }
+
+    #[test]
+    fn reopening_initialized_store_does_not_require_the_writer_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-read-during-ingest-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let config = test_config(&path);
+        let writer = open_store(&config).expect("writer store should open");
+        writer
+            .connection()
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("writer lock should be acquired");
+
+        let reader = open(&config).expect("initialized store should reopen while ingestion writes");
+        let schema_version: i64 = reader
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, SCHEMA_VERSION);
+
+        writer.connection().execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        drop(writer);
+        remove_sqlite_files(&path);
     }
 
     #[test]
@@ -3693,7 +3849,8 @@ mod tests {
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     count INTEGER NOT NULL CHECK (count >= 0)
                  );
-                 INSERT INTO dashboard_artifact_count(id, count) VALUES (1, 2);",
+                 INSERT INTO dashboard_artifact_count(id, count) VALUES (1, 2);
+                 PRAGMA user_version = 0;",
             )
             .unwrap();
         drop(store);
@@ -3837,6 +3994,40 @@ mod tests {
             .insert_agent_event(&NewAgentEvent {
                 pid: 1,
                 request_id,
+                ts: 1_003,
+                source: "claude-bash-command-parser".to_string(),
+                event_type: "file_intent".to_string(),
+                cwd: "/repo".to_string(),
+                permission_mode: None,
+                tool_name: Some("Bash".to_string()),
+                tool_input: Some(
+                    r#"{"path":"/repo/read-only.txt","operation":"read"}"#.to_string(),
+                ),
+                tool_response: None,
+                tool_use_id: None,
+            })
+            .unwrap();
+        store
+            .insert_agent_event(&NewAgentEvent {
+                pid: 1,
+                request_id,
+                ts: 1_002,
+                source: "codex".to_string(),
+                event_type: "PreToolUse".to_string(),
+                cwd: "/repo".to_string(),
+                permission_mode: None,
+                tool_name: Some("apply_patch".to_string()),
+                tool_input: Some(
+                    r#"{"changes":[{"operation":"edit","path":"/repo/src/app.rs"}]}"#.to_string(),
+                ),
+                tool_response: None,
+                tool_use_id: Some("patch-1".to_string()),
+            })
+            .unwrap();
+        store
+            .insert_agent_event(&NewAgentEvent {
+                pid: 1,
+                request_id,
                 ts: 1_001,
                 source: "claude-bash-command-parser".to_string(),
                 event_type: "file_intent".to_string(),
@@ -3872,11 +4063,35 @@ mod tests {
                 .unwrap(),
             None
         );
+        let native_match = store
+            .request_for_file_intent_path("/repo/src/app.rs", 1_010, 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(native_match.event_type, "PreToolUse");
+        assert_eq!(native_match.tool_name.as_deref(), Some("apply_patch"));
         let literal_wildcards = store
             .request_for_file_intent_path("/repo/a_b/p%q.txt", 1_010, 1_000)
             .unwrap()
             .unwrap();
         assert_eq!(literal_wildcards.request_id, request_id);
+        assert!(store
+            .request_for_file_intent_path("/repo/read-only.txt", 1_010, 1_000)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .request_for_mutating_file_intent_path("/repo/read-only.txt", 1_010, 1_000)
+                .unwrap(),
+            None
+        );
+        assert!(store
+            .request_for_mutating_file_intent_path("/repo/out.txt", 1_010, 1_000)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .request_for_mutating_file_intent_path("/repo/src/app.rs", 1_010, 1_000)
+            .unwrap()
+            .is_some());
 
         drop(store);
         remove_sqlite_files(&path);
@@ -4041,6 +4256,10 @@ mod tests {
             store
                 .connection()
                 .execute("DELETE FROM alert_chain_head", [])
+                .unwrap();
+            store
+                .connection()
+                .pragma_update(None, "user_version", 0)
                 .unwrap();
         }
 

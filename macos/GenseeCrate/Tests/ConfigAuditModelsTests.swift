@@ -60,5 +60,9 @@ final class ConfigAuditModelsTests: XCTestCase {
         XCTAssertEqual(bundle.reports[0].report.findings[0].evidence.count, 0)
         XCTAssertEqual(bundle.reports[0].report.sources[0].errors.count, 0)
         XCTAssertEqual(bundle.reports[0].report.manualChecks[0].references.count, 0)
+        let history = bundle.historyEntry(at: Date(timeIntervalSince1970: 10))
+        XCTAssertEqual(history.target, "codex")
+        XCTAssertEqual(history.findingFingerprints, ["abc"])
+        XCTAssertEqual(history.sourceDigests["/tmp/config.toml"], "missing")
     }
 }

@@ -42,8 +42,12 @@ targets:
       - Host/HarnessActivationGuidance.swift
       - Host/AlertSeverityBreakdown.swift
       - Host/TimelineModels.swift
+      - Host/AgentCompletionModels.swift
+      - Host/CompletionNotificationCoordinator.swift
+      - Host/ProgressiveTrust.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
+      - Host/CheckpointModels.swift
       - Host/ConsoleModel.swift
       - Host/Brand.swift
       - Host/Assets.xcassets
@@ -140,15 +144,23 @@ targets:
       - Host/HarnessActivationGuidance.swift
       - Host/AlertSeverityBreakdown.swift
       - Host/TimelineModels.swift
+      - Host/AgentCompletionModels.swift
+      - Host/CompletionNotificationCoordinator.swift
+      - Host/ProgressiveTrust.swift
       - Host/ConsoleModels.swift
       - Host/ConfigAuditModels.swift
+      - Host/CheckpointModels.swift
       - Tests/HarnessConfigurationHealthTests.swift
       - Tests/EndpointIngestAcknowledgementIOTests.swift
       - Tests/HarnessActivationGuidanceTests.swift
       - Tests/AlertSeverityBreakdownTests.swift
       - Tests/TimelineModelsTests.swift
+      - Tests/AgentCompletionModelsTests.swift
+      - Tests/CompletionNotificationCoordinatorTests.swift
       - Tests/ConfigAuditModelsTests.swift
       - Tests/ArtifactFactTests.swift
+      - Tests/ProgressiveTrustTests.swift
+      - Tests/CheckpointModelsTests.swift
     settings:
       base:
         CODE_SIGNING_ALLOWED: NO
