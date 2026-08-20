@@ -5,6 +5,7 @@ use gensee_crate_rules::capability::{
     PromotionOutput, PromotionReceipt, TelemetryCoverage, CAPABILITY_REQUEST_SCHEMA_VERSION,
     EFFECT_MANIFEST_SCHEMA_VERSION,
 };
+use gensee_crate_rules::capability_broker::BrokerResourceKind;
 use gensee_crate_rules::capability_policy::{
     CapabilityPolicyDecision, CapabilityPolicyEngine, MediationBoundary, PolicyEvaluationContext,
 };
@@ -21,6 +22,7 @@ struct CapabilityCellLease {
     schema_version: u32,
     lease_id: String,
     operation_id: String,
+    cell_id: String,
     source_run_id: String,
     request: CapabilityRequest,
     command: Vec<String>,
@@ -28,6 +30,8 @@ struct CapabilityCellLease {
     expires_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     consumed_at_ms: Option<u64>,
+    #[serde(default)]
+    broker_lease_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -39,6 +43,8 @@ struct CapabilityCellRecord {
     source_run_id: String,
     request: CapabilityRequest,
     command: Vec<String>,
+    #[serde(default)]
+    broker_lease_ids: Vec<String>,
     container_name: String,
     input_snapshot: String,
     workspace_snapshot: String,
@@ -131,22 +137,30 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
 
     let issued_at_ms = unix_millis()?;
     let lease_id = format!("lease_{}", Uuid::new_v4().simple());
+    let cell_id = format!("cell_{}", Uuid::new_v4().simple());
     let lease = CapabilityCellLease {
         schema_version: CELL_LEASE_SCHEMA_VERSION,
         lease_id: lease_id.clone(),
         operation_id: format!("op_{}", Uuid::new_v4().simple()),
+        cell_id: cell_id.clone(),
         source_run_id,
         request,
         command,
         issued_at_ms,
         expires_at_ms: issued_at_ms.saturating_add(ttl_seconds.saturating_mul(1_000)),
         consumed_at_ms: None,
+        broker_lease_ids: Vec::new(),
     };
     let path = capability_lease_path(&lease_id)?;
     if let Some(parent) = path.parent() {
         create_restrictive_dir_all(parent)?;
     }
     write_atomic_nofollow(&path, &serde_json::to_vec_pretty(&lease)?, 0o600)?;
+    write_atomic_nofollow(
+        &capability_cell_binding_path(&cell_id)?,
+        format!("{lease_id}\n").as_bytes(),
+        0o600,
+    )?;
 
     if options.iter().any(|arg| arg == "--json") {
         println!(
@@ -154,6 +168,7 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
             serde_json::to_string_pretty(&json!({
                 "lease_id": lease.lease_id,
                 "operation_id": lease.operation_id,
+                "cell_id": lease.cell_id,
                 "source_run_id": lease.source_run_id,
                 "expires_at_ms": lease.expires_at_ms,
                 "execution_boundary": lease.request.execution_boundary,
@@ -161,6 +176,7 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
         );
     } else {
         println!("issued one-use capability lease {lease_id}");
+        println!("reserved capability cell {cell_id}");
         println!(
             "execute with: gensee run cell {} --lease {lease_id}",
             lease.source_run_id
@@ -452,7 +468,8 @@ fn execute_capability_cell(
     source: &TcloneRunRecord,
     lease: &CapabilityCellLease,
 ) -> io::Result<CapabilityCellRecord> {
-    let cell_id = format!("cell_{}", Uuid::new_v4().simple());
+    let mut broker_cleanup = AttachedBrokerLeaseCleanup::new(&lease.broker_lease_ids);
+    let cell_id = lease.cell_id.clone();
     let container_name = format!("gensee-tclone-{cell_id}");
     let cell_root = capability_cell_path(&cell_id)?;
     let input_snapshot = cell_root.join("input");
@@ -491,7 +508,7 @@ fn execute_capability_cell(
     };
     drop(cleanup);
     let finished_at_ms = unix_millis()?;
-    let manifest = build_effect_manifest(
+    let mut manifest = build_effect_manifest(
         source,
         lease,
         &cell_id,
@@ -502,6 +519,14 @@ fn execute_capability_cell(
         status.code(),
         timed_out,
     )?;
+    if let Err(error) = broker_cleanup.revoke() {
+        manifest.violations.push(EffectViolation {
+            kind: "broker_lease_revocation_failed".to_string(),
+            resource: lease.broker_lease_ids.join(","),
+            detail: error.to_string(),
+            observed_at_ms: finished_at_ms,
+        });
+    }
     let manifest_path = cell_root.join("effect-manifest.json");
     write_atomic_nofollow(
         &manifest_path,
@@ -516,6 +541,7 @@ fn execute_capability_cell(
         source_run_id: source.run_id.clone(),
         request: lease.request.clone(),
         command: lease.command.clone(),
+        broker_lease_ids: lease.broker_lease_ids.clone(),
         container_name,
         input_snapshot: input_snapshot.to_string_lossy().to_string(),
         workspace_snapshot: snapshot.to_string_lossy().to_string(),
@@ -531,6 +557,39 @@ fn execute_capability_cell(
         0o600,
     )?;
     Ok(record)
+}
+
+struct AttachedBrokerLeaseCleanup {
+    lease_ids: Vec<String>,
+    armed: bool,
+}
+
+impl AttachedBrokerLeaseCleanup {
+    fn new(lease_ids: &[String]) -> Self {
+        Self {
+            lease_ids: lease_ids.to_vec(),
+            armed: !lease_ids.is_empty(),
+        }
+    }
+
+    fn revoke(&mut self) -> io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        let result = super::capability_broker::revoke_attached_broker_leases(&self.lease_ids);
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+impl Drop for AttachedBrokerLeaseCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = super::capability_broker::revoke_attached_broker_leases(&self.lease_ids);
+        }
+    }
 }
 
 fn capability_cell_run_args(
@@ -579,9 +638,16 @@ fn capability_cell_run_args(
         OsString::from("HOME=/tmp"),
         OsString::from("-e"),
         OsString::from(format!("GENSEE_CAPABILITY_LEASE_ID={}", lease.lease_id)),
-        OsString::from("--entrypoint"),
-        OsString::from(&lease.command[0]),
     ];
+    if !lease.broker_lease_ids.is_empty() {
+        args.push(OsString::from("-e"));
+        args.push(OsString::from(format!(
+            "GENSEE_BROKER_LEASE_IDS={}",
+            lease.broker_lease_ids.join(",")
+        )));
+    }
+    args.push(OsString::from("--entrypoint"));
+    args.push(OsString::from(&lease.command[0]));
     for path in effective_read_paths(&lease.request) {
         add_scope_mount(
             &mut args,
@@ -1431,6 +1497,140 @@ fn capability_cell_path(cell_id: &str) -> io::Result<PathBuf> {
         .join(cell_id))
 }
 
+fn capability_cell_binding_path(cell_id: &str) -> io::Result<PathBuf> {
+    if !tclone_is_safe_token(cell_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid cell id",
+        ));
+    }
+    Ok(default_root()?
+        .join("tclone-capability-cell-bindings")
+        .join(format!("{cell_id}.lease")))
+}
+
+pub(super) fn validate_broker_cell_binding(
+    cell_id: &str,
+    source_run_id: &str,
+    operation_id: &str,
+    now_ms: u64,
+) -> io::Result<u64> {
+    let lease_id = read_nofollow_to_string(&capability_cell_binding_path(cell_id)?)?
+        .trim()
+        .to_string();
+    let path = capability_lease_path(&lease_id)?;
+    let _lock = TcloneStateLock::acquire(&path)?;
+    let lease: CapabilityCellLease = serde_json::from_str(&read_nofollow_to_string(&path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if lease.cell_id != cell_id
+        || lease.source_run_id != source_run_id
+        || lease.operation_id != operation_id
+        || lease.consumed_at_ms.is_some()
+        || now_ms < lease.issued_at_ms
+        || now_ms >= lease.expires_at_ms
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "broker lease does not match an unconsumed live capability cell lease",
+        ));
+    }
+    Ok(lease.expires_at_ms)
+}
+
+pub(super) fn attach_broker_lease_to_cell(
+    cell_id: &str,
+    source_run_id: &str,
+    operation_id: &str,
+    broker_lease_id: &str,
+    resource_kind: BrokerResourceKind,
+    now_ms: u64,
+) -> io::Result<()> {
+    if !tclone_is_safe_token(broker_lease_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid broker lease id",
+        ));
+    }
+    let lease_id = read_nofollow_to_string(&capability_cell_binding_path(cell_id)?)?
+        .trim()
+        .to_string();
+    let path = capability_lease_path(&lease_id)?;
+    let _lock = TcloneStateLock::acquire(&path)?;
+    let mut lease: CapabilityCellLease = serde_json::from_str(&read_nofollow_to_string(&path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if lease.cell_id != cell_id
+        || lease.source_run_id != source_run_id
+        || lease.operation_id != operation_id
+        || lease.consumed_at_ms.is_some()
+        || now_ms < lease.issued_at_ms
+        || now_ms >= lease.expires_at_ms
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "capability cell lease changed before broker attachment",
+        ));
+    }
+    let requested = match resource_kind {
+        BrokerResourceKind::RepositoryToken | BrokerResourceKind::ApiToken => {
+            lease.request.capabilities.iter().any(|capability| {
+                matches!(capability, Capability::SecretUse | Capability::IdentityUse)
+            })
+        }
+        BrokerResourceKind::WorkloadIdentity => lease
+            .request
+            .capabilities
+            .contains(&Capability::WorkloadIdentity),
+        BrokerResourceKind::MtlsCertificate => lease
+            .request
+            .capabilities
+            .contains(&Capability::IdentityUse),
+        BrokerResourceKind::FilesystemHandle => {
+            lease.request.capabilities.iter().any(|capability| {
+                matches!(
+                    capability,
+                    Capability::FilesystemRead | Capability::FilesystemWrite
+                )
+            })
+        }
+        BrokerResourceKind::NetworkLease => lease.request.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::NetworkEgress | Capability::NetworkListen
+            )
+        }),
+        BrokerResourceKind::DatabaseRole => lease
+            .request
+            .capabilities
+            .contains(&Capability::DatabaseAccess),
+        BrokerResourceKind::ExternalActionCommitToken => {
+            lease.request.capabilities.iter().any(|capability| {
+                matches!(
+                    capability,
+                    Capability::ExternalMutation
+                        | Capability::IrreversibleEffect
+                        | Capability::OutputPromotion
+                )
+            })
+        }
+    };
+    if !requested {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "broker resource kind was not declared by the capability cell request",
+        ));
+    }
+    if !lease
+        .broker_lease_ids
+        .iter()
+        .any(|lease_id| lease_id == broker_lease_id)
+    {
+        lease.broker_lease_ids.push(broker_lease_id.to_string());
+        lease.broker_lease_ids.sort();
+        write_atomic_nofollow(&path, &serde_json::to_vec_pretty(&lease)?, 0o600)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1608,12 +1808,14 @@ mod tests {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_one".to_string(),
             operation_id: "op_one".to_string(),
+            cell_id: "cell_one".to_string(),
             source_run_id: "run_one".to_string(),
             request: request(),
             command: vec!["true".to_string()],
             issued_at_ms: 100,
             expires_at_ms: 200,
             consumed_at_ms: None,
+            broker_lease_ids: Vec::new(),
         };
         let path = capability_lease_path(&lease.lease_id).unwrap();
         create_restrictive_dir_all(path.parent().unwrap()).unwrap();
@@ -1633,6 +1835,68 @@ mod tests {
     }
 
     #[test]
+    fn broker_attachment_is_cell_bound_and_capability_matched() {
+        let _guard = crate::cli_test_env_lock();
+        let root = env::temp_dir().join(format!("gensee-cell-broker-{}", Uuid::new_v4()));
+        env::set_var("GENSEE_HOME", &root);
+        let lease = CapabilityCellLease {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            lease_id: "lease_one".to_string(),
+            operation_id: "op_one".to_string(),
+            cell_id: "cell_one".to_string(),
+            source_run_id: "run_one".to_string(),
+            request: request(),
+            command: vec!["true".to_string()],
+            issued_at_ms: 100,
+            expires_at_ms: 200,
+            consumed_at_ms: None,
+            broker_lease_ids: Vec::new(),
+        };
+        let path = capability_lease_path(&lease.lease_id).unwrap();
+        create_restrictive_dir_all(path.parent().unwrap()).unwrap();
+        write_atomic_nofollow(&path, &serde_json::to_vec(&lease).unwrap(), 0o600).unwrap();
+        write_atomic_nofollow(
+            &capability_cell_binding_path(&lease.cell_id).unwrap(),
+            b"lease_one\n",
+            0o600,
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_broker_cell_binding("cell_one", "run_one", "op_one", 150).unwrap(),
+            200
+        );
+        attach_broker_lease_to_cell(
+            "cell_one",
+            "run_one",
+            "op_one",
+            "broker_lease_one",
+            BrokerResourceKind::FilesystemHandle,
+            150,
+        )
+        .unwrap();
+        let attached: CapabilityCellLease =
+            serde_json::from_str(&read_nofollow_to_string(&path).unwrap()).unwrap();
+        assert_eq!(attached.broker_lease_ids, vec!["broker_lease_one"]);
+        assert_eq!(
+            attach_broker_lease_to_cell(
+                "cell_one",
+                "run_one",
+                "op_one",
+                "broker_lease_network",
+                BrokerResourceKind::NetworkLease,
+                151,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn cell_plan_is_fresh_confined_and_scope_mounted() {
         let root = env::temp_dir().join(format!("gensee-cell-plan-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -1643,12 +1907,14 @@ mod tests {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_1".to_string(),
             operation_id: "op_1".to_string(),
+            cell_id: "cell_1".to_string(),
             source_run_id: "run_1".to_string(),
             request,
             command: vec!["cargo".to_string(), "check".to_string()],
             issued_at_ms: 1,
             expires_at_ms: 2,
             consumed_at_ms: Some(1),
+            broker_lease_ids: Vec::new(),
         };
         let source = source_record();
 
@@ -1734,12 +2000,14 @@ mod tests {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_1".to_string(),
             operation_id: "op_1".to_string(),
+            cell_id: "cell_1".to_string(),
             source_run_id: "run_1".to_string(),
             request: manifest_request,
             command: vec!["cargo".to_string(), "check".to_string()],
             issued_at_ms: 1,
             expires_at_ms: 2,
             consumed_at_ms: Some(1),
+            broker_lease_ids: Vec::new(),
         };
 
         let manifest = build_effect_manifest(
@@ -1794,12 +2062,14 @@ mod tests {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_1".to_string(),
             operation_id: "op_1".to_string(),
+            cell_id: "cell_1".to_string(),
             source_run_id: "run_1".to_string(),
             request: request(),
             command: vec!["cargo".to_string(), "check".to_string()],
             issued_at_ms: 1,
             expires_at_ms: 2,
             consumed_at_ms: Some(1),
+            broker_lease_ids: Vec::new(),
         };
         let manifest = build_effect_manifest(
             &source_record(),
@@ -1821,6 +2091,7 @@ mod tests {
             source_run_id: "run_1".to_string(),
             request: lease.request,
             command: lease.command,
+            broker_lease_ids: Vec::new(),
             container_name: "cell".to_string(),
             input_snapshot: input.to_string_lossy().to_string(),
             workspace_snapshot: output.to_string_lossy().to_string(),
@@ -1871,12 +2142,14 @@ mod tests {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_1".to_string(),
             operation_id: "op_1".to_string(),
+            cell_id: "cell_1".to_string(),
             source_run_id: "run_1".to_string(),
             request: cell_request,
             command: vec!["true".to_string()],
             issued_at_ms: 1,
             expires_at_ms: 2,
             consumed_at_ms: Some(1),
+            broker_lease_ids: Vec::new(),
         };
         let manifest = build_effect_manifest(
             &source_record(),

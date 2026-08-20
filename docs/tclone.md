@@ -244,6 +244,9 @@ restores the approval requirement.
 
 ### Capability cells
 
+The host-side mint/revoke protocol and secret-free adapter contract are
+documented in [Capability broker](capability-broker.md).
+
 For a bounded authority-expanding operation, a trusted host operator can issue a
 one-use lease bound to a source run, an exact command, scoped workspace paths,
 and an expiry:
