@@ -34,9 +34,12 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 pub const ENDPOINT_RETENTION_PRUNE_BATCH: u64 = 500;
+const FALCO_RETENTION_PRUNE_BATCH: u64 = 50_000;
+const FALCO_RETENTION_TIME_BUDGET: Duration = Duration::from_millis(250);
 pub const ARTIFACT_VISIBILITY_MIGRATION_BATCH: u64 = 1_000;
 pub const ARTIFACT_VISIBILITY_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
 const STORE_KEY_FILE: &str = "gensee.key";
@@ -83,6 +86,7 @@ pub struct EventStore {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSystemEvent {
+    pub event_id: i64,
     pub source: String,
     pub event_type: String,
     pub observed_at_ms: u64,
@@ -445,6 +449,7 @@ impl EventStore {
 
     pub fn list_native_system_events(
         &self,
+        session_id: Option<&str>,
         min_observed_at_ms: i64,
         max_observed_at_ms: i64,
         limit: usize,
@@ -453,6 +458,7 @@ impl EventStore {
         let rows = db
             .system_events_for_sources(
                 &["macos-endpoint-security", "linux-falco"],
+                session_id,
                 min_observed_at_ms,
                 max_observed_at_ms,
                 i64::try_from(limit).unwrap_or(i64::MAX),
@@ -472,6 +478,7 @@ impl EventStore {
                     }
                 };
                 Some(StoredSystemEvent {
+                    event_id: row.event_id,
                     source: row.source,
                     event_type: row.event_type,
                     observed_at_ms,
@@ -1587,6 +1594,67 @@ impl EventStore {
             low_severity_retention_hours,
         )
         .map(Some)
+    }
+
+    /// Drain expired or over-cap Falco rows on a collector-specific cadence.
+    /// Multiple bounded transactions may run within a short time budget so a
+    /// burst can catch up without monopolizing the shared SQLite connection.
+    pub fn prune_falco_retention_if_due(
+        &self,
+        now_ms: u64,
+        interval_ms: u64,
+        raw_retention_hours: u64,
+        max_raw_events: u64,
+    ) -> io::Result<Option<u64>> {
+        let db = self.sqlite_store()?;
+        if !db
+            .claim_maintenance("falco-retention", to_i64(now_ms)?, to_i64(interval_ms)?)
+            .map_err(sqlite_error)?
+        {
+            return Ok(None);
+        }
+        drop(db);
+        self.prune_falco_retention_with_budget(
+            now_ms,
+            raw_retention_hours,
+            max_raw_events,
+            FALCO_RETENTION_PRUNE_BATCH,
+            FALCO_RETENTION_TIME_BUDGET,
+        )
+        .map(Some)
+    }
+
+    fn prune_falco_retention_with_budget(
+        &self,
+        now_ms: u64,
+        raw_retention_hours: u64,
+        max_raw_events: u64,
+        batch_limit: u64,
+        time_budget: Duration,
+    ) -> io::Result<u64> {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        if batch_limit == 0 {
+            return Ok(0);
+        }
+        let raw_cutoff = now_ms.saturating_sub(raw_retention_hours.saturating_mul(HOUR_MS));
+        let started = Instant::now();
+        let mut total = 0_u64;
+        loop {
+            let pruned = self
+                .sqlite_store()?
+                .prune_system_event_source_retention(
+                    "linux-falco",
+                    to_i64(raw_cutoff)?,
+                    i64::try_from(max_raw_events).unwrap_or(i64::MAX),
+                    i64::try_from(batch_limit).unwrap_or(i64::MAX),
+                )
+                .map_err(sqlite_error)?;
+            total = total.saturating_add(pruned);
+            if pruned < batch_limit || started.elapsed() >= time_budget {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     /// Advance one bounded artifact-visibility rules batch at most once per
@@ -6957,7 +7025,7 @@ mod tests {
             .is_none());
         drop(db);
         let native_events = store
-            .list_native_system_events(i64::MIN, i64::MAX, 100)
+            .list_native_system_events(None, i64::MIN, i64::MAX, 100)
             .unwrap();
         assert_eq!(native_events.len(), 1);
         assert_eq!(native_events[0].source, "linux-falco");
@@ -7010,11 +7078,56 @@ mod tests {
             .unwrap();
 
         let events = store
-            .list_native_system_events(i64::MIN, i64::MAX, 100)
+            .list_native_system_events(None, i64::MIN, i64::MAX, 100)
             .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].observed_at_ms, 140);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn falco_retention_drains_multiple_batches_within_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-falco-retention-budget-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        for observed_at_ms in 1..=8 {
+            store
+                .append_system_event(&SystemEvent {
+                    source: "linux-falco".to_string(),
+                    event_type: "execve".to_string(),
+                    event_kind: "ProcessExec".to_string(),
+                    observed_at_ms,
+                    pid: Some(42),
+                    ppid: Some(1),
+                    process_name: Some("sh".to_string()),
+                    executable_path: Some("/bin/sh".to_string()),
+                    file_path: None,
+                    command_line: Some("sh -c true".to_string()),
+                    raw_json: format!(r#"{{"event_id":"event-{observed_at_ms}"}}"#),
+                })
+                .unwrap();
+        }
+
+        let pruned = store
+            .prune_falco_retention_with_budget(100, 1, 2, 3, Duration::from_secs(1))
+            .unwrap();
+        let events = store
+            .list_native_system_events(None, i64::MIN, i64::MAX, 100)
+            .unwrap();
+
+        assert_eq!(pruned, 6);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .into_iter()
+                .map(|event| event.observed_at_ms)
+                .collect::<Vec<_>>(),
+            vec![7, 8]
+        );
         fs::remove_dir_all(dir).ok();
     }
 

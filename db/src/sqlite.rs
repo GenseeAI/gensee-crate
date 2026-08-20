@@ -1476,6 +1476,92 @@ impl SqliteStore {
         }
     }
 
+    /// Remove one bounded batch for a single native system-event source. This
+    /// is used by high-volume collectors that need an independent maintenance
+    /// cadence instead of sharing Endpoint Security's alert-retention job.
+    pub fn prune_system_event_source_retention(
+        &self,
+        source: &str,
+        raw_cutoff_ms: i64,
+        max_raw_events: i64,
+        batch_limit: i64,
+    ) -> Result<u64, SqliteError> {
+        if batch_limit <= 0 {
+            return Ok(0);
+        }
+        self.conn
+            .execute_batch("SAVEPOINT gensee_source_retention_prune")
+            .map_err(SqliteError::Database)?;
+        let result = (|| -> rusqlite::Result<u64> {
+            self.conn.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS gensee_pruned_source_events (
+                    event_id INTEGER PRIMARY KEY
+                 );
+                 DELETE FROM gensee_pruned_source_events;",
+            )?;
+            self.conn.execute(
+                "INSERT INTO gensee_pruned_source_events(event_id)
+                 SELECT event_id
+                 FROM system_events
+                 WHERE source = ?1
+                   AND (
+                       ts < ?2 OR event_id <= COALESCE((
+                           SELECT event_id
+                           FROM system_events
+                           WHERE source = ?1
+                           ORDER BY event_id DESC
+                           LIMIT 1 OFFSET ?3
+                       ), -1)
+                   )
+                 ORDER BY event_id
+                 LIMIT ?4",
+                params![source, raw_cutoff_ms, max_raw_events, batch_limit],
+            )?;
+            let system_events = self.conn.query_row(
+                "SELECT COUNT(*) FROM gensee_pruned_source_events",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            self.conn.execute(
+                "DELETE FROM relations
+                 WHERE (src_kind = 'system_event' AND src_id IN (
+                     SELECT event_id FROM gensee_pruned_source_events
+                 )) OR (dst_kind = 'system_event' AND dst_id IN (
+                     SELECT event_id FROM gensee_pruned_source_events
+                 ))",
+                [],
+            )?;
+            self.conn.execute(
+                "UPDATE artifact_facts SET last_system_event_id = NULL
+                 WHERE last_system_event_id IN (
+                     SELECT event_id FROM gensee_pruned_source_events
+                 )",
+                [],
+            )?;
+            self.conn.execute(
+                "DELETE FROM system_events WHERE event_id IN (
+                    SELECT event_id FROM gensee_pruned_source_events
+                 )",
+                [],
+            )?;
+            Ok(system_events as u64)
+        })();
+        match result {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("RELEASE gensee_source_retention_prune")
+                    .map_err(SqliteError::Database)?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO gensee_source_retention_prune; RELEASE gensee_source_retention_prune",
+                );
+                Err(SqliteError::Database(error))
+            }
+        }
+    }
+
     fn rebuild_alert_chain(&self, root_hash: &str) -> rusqlite::Result<()> {
         let alerts = {
             let mut statement = self.conn.prepare(
@@ -1544,6 +1630,7 @@ impl SqliteStore {
     pub fn system_events_for_sources(
         &self,
         sources: &[&str],
+        session_id: Option<&str>,
         min_ts: i64,
         max_ts: i64,
         limit: i64,
@@ -1559,6 +1646,14 @@ impl SqliteStore {
             .iter()
             .map(|source| rusqlite::types::Value::Text((*source).to_string()))
             .collect::<Vec<_>>();
+        let session_predicate = if let Some(session_id) = session_id {
+            parameters.push(rusqlite::types::Value::Text(session_id.to_string()));
+            "AND request_id IN (
+                 SELECT request_id FROM requests WHERE session_id = ?
+             )"
+        } else {
+            ""
+        };
         parameters.extend([
             rusqlite::types::Value::Integer(min_ts),
             rusqlite::types::Value::Integer(max_ts),
@@ -1572,6 +1667,7 @@ impl SqliteStore {
                      SELECT event_id, pid, request_id, ts, source, type, cwd, args
                      FROM system_events
                      WHERE source IN ({placeholders})
+                       {session_predicate}
                        AND ts BETWEEN ? AND ?
                      ORDER BY ts DESC, event_id DESC
                      LIMIT ?
@@ -3671,24 +3767,24 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(timestamps, vec![111, 999, 1000, 2000]);
         let source_timestamps = store
-            .system_events_for_sources(&["macos-eslogger"], i64::MIN, i64::MAX, 100)
+            .system_events_for_sources(&["macos-eslogger"], None, i64::MIN, i64::MAX, 100)
             .unwrap()
             .into_iter()
             .map(|event| event.ts)
             .collect::<Vec<_>>();
         assert_eq!(source_timestamps, timestamps);
         assert!(store
-            .system_events_for_sources(&["linux-falco"], i64::MIN, i64::MAX, 100)
+            .system_events_for_sources(&["linux-falco"], None, i64::MIN, i64::MAX, 100)
             .unwrap()
             .is_empty());
         assert!(store
-            .system_events_for_sources(&[], i64::MIN, i64::MAX, 100)
+            .system_events_for_sources(&[], None, i64::MIN, i64::MAX, 100)
             .unwrap()
             .is_empty());
 
         assert_eq!(
             store
-                .system_events_for_sources(&["macos-eslogger"], 900, 1500, 2)
+                .system_events_for_sources(&["macos-eslogger"], None, 900, 1500, 2)
                 .unwrap()
                 .into_iter()
                 .map(|event| event.ts)
@@ -3697,7 +3793,54 @@ mod tests {
         );
         assert_eq!(
             store
-                .system_events_for_sources(&["macos-eslogger"], i64::MIN, i64::MAX, 2)
+                .system_events_for_sources(&["macos-eslogger"], None, i64::MIN, i64::MAX, 2,)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.ts)
+                .collect::<Vec<_>>(),
+            vec![1000, 2000]
+        );
+
+        store
+            .insert_session(&NewSession {
+                session_id: "sess_2".to_string(),
+                agent_id: "agent_b".to_string(),
+                root_pid: 0,
+                first_event_at: 3000,
+                last_event_at: None,
+                flagged: false,
+            })
+            .unwrap();
+        let other_request_id = store
+            .insert_request(&NewRequest {
+                session_id: "sess_2".to_string(),
+                original_user_prompt: None,
+                final_response: None,
+                events: None,
+                file_accessed_rate: 0.0,
+                network_rate: 0.0,
+            })
+            .unwrap();
+        store
+            .insert_system_event(&NewSystemEvent {
+                pid: 2,
+                request_id: other_request_id,
+                ts: 3000,
+                source: "macos-eslogger".to_string(),
+                event_type: "open".to_string(),
+                cwd: "/other".to_string(),
+                args: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .system_events_for_sources(
+                    &["macos-eslogger"],
+                    Some("sess_1"),
+                    i64::MIN,
+                    i64::MAX,
+                    2,
+                )
                 .unwrap()
                 .into_iter()
                 .map(|event| event.ts)
@@ -3844,7 +3987,7 @@ mod tests {
         assert_eq!(pruned.system_events, 3);
         assert_eq!(
             store
-                .system_events_for_sources(&["linux-falco"], i64::MIN, i64::MAX, 100)
+                .system_events_for_sources(&["linux-falco"], None, i64::MIN, i64::MAX, 100)
                 .unwrap()
                 .into_iter()
                 .map(|event| event.ts)

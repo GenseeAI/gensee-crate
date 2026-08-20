@@ -183,6 +183,8 @@ pub(crate) struct TcloneRunRecord {
     pub(crate) container_home: String,
     pub(crate) agent_cmd: Vec<String>,
     #[serde(default)]
+    pub(crate) path_prefixes: Vec<String>,
+    #[serde(default)]
     pub(crate) fork_base_git_head: Option<String>,
     #[serde(default)]
     pub(crate) fork_base_overlay_lowerdir: Option<String>,
@@ -4184,6 +4186,7 @@ fn run_tclone_agent_inner(
         container_workspace: container_workspace.clone(),
         container_home: container_home.clone(),
         agent_cmd: agent_cmd_strings.clone(),
+        path_prefixes: path_prefixes.clone(),
         fork_base_git_head: None,
         fork_base_overlay_lowerdir: None,
         fork_overlay_upperdir: None,
@@ -4534,6 +4537,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                     container_workspace: source.container_workspace.clone(),
                     container_home: source.container_home.clone(),
                     agent_cmd: source.agent_cmd.clone(),
+                    path_prefixes: source.path_prefixes.clone(),
                     fork_base_git_head: fork_base_git_head.clone(),
                     fork_base_overlay_lowerdir: overlay_layers
                         .as_ref()
@@ -5669,7 +5673,7 @@ pub(crate) fn tclone_run_exec(args: Vec<OsString>) -> io::Result<()> {
         .arg(&record.container_workspace)
         .args(tclone_run_exec_env_args(&record))
         .arg(&record.container_name)
-        .args(tclone_run_exec_command_args(command_args));
+        .args(tclone_run_exec_command_args(&record, command_args));
     if exec_json {
         let output = command.output()?;
         println!(
@@ -5791,11 +5795,17 @@ fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
     .collect()
 }
 
-fn tclone_run_exec_command_args(command_args: &[OsString]) -> Vec<OsString> {
+fn tclone_run_exec_command_args(
+    record: &TcloneRunRecord,
+    command_args: &[OsString],
+) -> Vec<OsString> {
     let mut wrapped = vec![
         OsString::from("sh"),
         OsString::from("-c"),
-        OsString::from(format!("{}; exec \"$@\"", tclone_path_export(&[]))),
+        OsString::from(format!(
+            "{}; exec \"$@\"",
+            tclone_path_export(&record.path_prefixes)
+        )),
         OsString::from("gensee-run-exec"),
     ];
     wrapped.extend_from_slice(command_args);
@@ -11086,6 +11096,7 @@ mod tests {
             container_workspace: "/workspace".to_string(),
             container_home: "/home/gensee".to_string(),
             agent_cmd: vec!["codex".to_string()],
+            path_prefixes: Vec::new(),
             fork_base_git_head: None,
             fork_base_overlay_lowerdir: None,
             fork_overlay_upperdir: None,
@@ -12553,13 +12564,29 @@ mod tests {
         let context_path = root.join("context.json");
         fs::write(&context_path, r#"{"run_id":"override-run"}"#).unwrap();
         let old_context = env::var_os("GENSEE_TCLONE_CONTEXT_PATH");
+        let old_run_id = env::var_os("GENSEE_RUN_ID");
         env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+        env::set_var("GENSEE_RUN_ID", "stale-source-run");
 
         assert_eq!(read_tclone_run_context().unwrap()["run_id"], "override-run");
+        assert_eq!(tclone_context_run_id().as_deref(), Some("override-run"));
+        let hook = build_hook_event(
+            r#"{"session_id":"agent-session","hook_event_name":"PreToolUse"}"#,
+            PROVIDER_CODEX,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&hook.raw_json).unwrap()["gensee"]["run_id"],
+            "override-run"
+        );
 
         match old_context {
             Some(value) => env::set_var("GENSEE_TCLONE_CONTEXT_PATH", value),
             None => env::remove_var("GENSEE_TCLONE_CONTEXT_PATH"),
+        }
+        match old_run_id {
+            Some(value) => env::set_var("GENSEE_RUN_ID", value),
+            None => env::remove_var("GENSEE_RUN_ID"),
         }
         fs::remove_dir_all(root).ok();
     }
@@ -13851,18 +13878,25 @@ gensee async job job_1: exited status=0
 
     #[test]
     fn tclone_run_exec_prepends_gensee_without_clobbering_image_path() {
+        let mut record = test_record("run_1", "running");
+        record.path_prefixes = vec![
+            "/opt/host-node/bin".to_string(),
+            "/opt/host-cargo/bin".to_string(),
+        ];
         let command_args = vec![
             OsString::from("gensee"),
             OsString::from("run"),
             OsString::from("summary"),
         ];
 
-        let wrapped = tclone_run_exec_command_args(&command_args);
+        let wrapped = tclone_run_exec_command_args(&record, &command_args);
 
         assert_eq!(wrapped[0], "sh");
         assert_eq!(wrapped[1], "-c");
         let script = wrapped[2].to_string_lossy();
-        assert!(script.contains("export PATH='/usr/libexec':\"${PATH:-"));
+        assert!(script.contains(
+            "export PATH='/usr/libexec:/opt/host-node/bin:/opt/host-cargo/bin':\"${PATH:-"
+        ));
         assert!(script.contains("exec \"$@\""));
         assert_eq!(&wrapped[4..], command_args.as_slice());
     }
