@@ -3,7 +3,7 @@
   condition: >
     evt.type in (execve, execveat) and evt.dir=< and thread.cgroups contains "libpod"
   output: >
-    gensee process exec evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
+    gensee process exec evt_num=%evt.num evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
     proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
     user_uid=%user.uid cgroups=%thread.cgroups evt_args=%evt.args
   priority: NOTICE
@@ -15,7 +15,7 @@
     evt.type in (open, openat, openat2, creat) and evt.dir=< and thread.cgroups contains "libpod" and
     fd.name startswith /workspace
   output: >
-    gensee workspace file open evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
+    gensee workspace file open evt_num=%evt.num evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
     proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
     file_path=%fd.name open_flags=%evt.arg.flags cgroups=%thread.cgroups evt_args=%evt.args
   priority: INFORMATIONAL
@@ -28,7 +28,7 @@
     rmdir, link, linkat, symlink, symlinkat, truncate, ftruncate, chmod, fchmod,
     fchmodat, chown, fchown, fchownat) and evt.dir=< and thread.cgroups contains "libpod"
   output: >
-    gensee file mutation evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
+    gensee file mutation evt_num=%evt.num evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
     proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
     file_path=%fd.name path=%evt.arg.path name=%evt.arg.name oldpath=%evt.arg.oldpath
     filename=%evt.arg.filename pathname=%evt.arg.pathname target=%evt.arg.target linkpath=%evt.arg.linkpath
@@ -41,7 +41,7 @@
   condition: >
     evt.type in (connect, accept, accept4, bind, listen) and evt.dir=< and thread.cgroups contains "libpod"
   output: >
-    gensee network evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
+    gensee network evt_num=%evt.num evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
     proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
     fd_name=%fd.name source_ip=%fd.sip source_port=%fd.sport remote_ip=%fd.rip
     remote_port=%fd.rport cgroups=%thread.cgroups evt_args=%evt.args
@@ -56,7 +56,7 @@
     setuid, setgid, setreuid, setregid, setresuid, setresgid) and evt.dir=< and
     thread.cgroups contains "libpod"
   output: >
-    gensee high risk syscall evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
+    gensee high risk syscall evt_num=%evt.num evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
     proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
     user_uid=%user.uid cgroups=%thread.cgroups evt_args=%evt.args
   priority: WARNING
