@@ -1,6 +1,30 @@
 import XCTest
 
 final class HarnessActivationGuidanceTests: XCTestCase {
+    func testUnverifiedHarnessStatusExplainsTheNextAction() {
+        func integration(id: String) -> IntegrationDescriptor {
+            IntegrationDescriptor(
+                id: id,
+                name: id,
+                detail: "",
+                configPath: "",
+                symbolName: "terminal",
+                installed: true,
+                supportsDirectHooks: true,
+                installationDetail: "",
+                configurationIssue: nil,
+                configurationNote: nil,
+                canRepair: true,
+                configuredBackendPath: nil,
+                configured: true,
+                verified: false
+            )
+        }
+
+        XCTAssertEqual(integration(id: "codex").statusLabel, "Review hook & test")
+        XCTAssertEqual(integration(id: "claude-code").statusLabel, "Restart & test")
+    }
+
     func testProviderEventsMatchTheirHarness() {
         XCTAssertTrue(HarnessActivationGuidance.eventMatches(provider: "codex", source: "codex"))
         XCTAssertTrue(HarnessActivationGuidance.eventMatches(provider: "claude-code", source: "claude"))

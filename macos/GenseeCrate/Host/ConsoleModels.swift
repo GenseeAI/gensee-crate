@@ -785,6 +785,11 @@ struct IntegrationDescriptor: Identifiable, Equatable {
         if !supportsDirectHooks { return "Managed launch only" }
         if configurationIssue != nil { return canRepair ? "Needs repair" : "Manual fix needed" }
         if !configured { return "Ready to enable" }
-        return verified ? "Protected" : "Waiting for first event"
+        if verified { return "Protected" }
+        switch id {
+        case "codex": return "Review hook & test"
+        case "claude-code", "antigravity", "cursor", "vscode": return "Restart & test"
+        default: return "Test required"
+        }
     }
 }

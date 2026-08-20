@@ -189,6 +189,19 @@ struct DashboardHarnessesPage: View {
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if integration.awaitingVerification,
+                       let actionTitle = HarnessActivationGuidance.instruction(for: integration.id).actionTitle {
+                        Button(actionTitle) {
+                            if integration.id == "codex" {
+                                model.openCodexHookReview()
+                            } else if integration.id == "omnigent" {
+                                model.copyOmnigentManagedLaunch()
+                            }
+                        }
+                        .buttonStyle(.link)
+                        .font(.system(size: 10, weight: .medium))
+                        .accessibilityIdentifier("harness.\(integration.id).activationAction")
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
