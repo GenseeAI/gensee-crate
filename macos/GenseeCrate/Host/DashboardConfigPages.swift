@@ -769,6 +769,11 @@ struct DashboardSettingsPage: View {
     @State private var confirmRecoveryCleanup = false
     @State private var pendingProtectionLevel: ProtectionLevel?
 
+    private var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "Unknown"
+    }
+
     var body: some View {
         DashboardPage {
             VStack(alignment: .leading, spacing: 16) {
@@ -857,7 +862,7 @@ struct DashboardSettingsPage: View {
                     }.frame(maxWidth: .infinity)
                     DashboardCard("About") {
                         VStack(alignment: .leading, spacing: 12) {
-                            Text("Gensee Crate v0.2.4\nNative macOS security console\n\nGensee backend: \(model.backendAvailable ? "Connected" : "Unavailable")")
+                            Text("Gensee Crate v\(appVersion)\nNative macOS security console\n\nGensee backend: \(model.backendAvailable ? "Connected" : "Unavailable")")
                                 .font(.system(size: 11)).foregroundStyle(.secondary)
                             Divider()
                             Button {
