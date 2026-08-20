@@ -41,7 +41,7 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
         .or_else(|| env::var("HOSTNAME").ok())
         .filter(|value| !value.trim().is_empty());
     let store = EventStore::default_local()?;
-    start_falco_retention_worker(store.clone());
+    let _retention_worker = start_falco_retention_worker(store.clone())?;
     let stdin = io::stdin();
     let mut count = 0_u64;
     let mut rejected = 0_u64;
@@ -118,34 +118,48 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
-fn start_falco_retention_worker(store: EventStore) {
-    let _ = thread::spawn(move || {
-        let mut error_active = false;
-        loop {
-            match unix_millis() {
-                Ok(now_ms) => {
-                    let recording = Policy::load_current().document().endpoint_security.clone();
-                    match store.prune_falco_retention_if_due(
-                        now_ms,
-                        FALCO_RETENTION_CHECK_INTERVAL.as_millis() as u64,
-                        recording.raw_event_retention_hours,
-                        recording.max_raw_events,
-                    ) {
-                        Ok(_) => error_active = false,
-                        Err(error) => log_falco_error_once(
-                            &mut error_active,
-                            format_args!("retention maintenance failed: {error}"),
-                        ),
+fn start_falco_retention_worker(store: EventStore) -> io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("gensee-falco-retention".to_string())
+        .spawn(move || {
+            let mut error_active = false;
+            loop {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_falco_retention_once(&store)
+                }));
+                match result {
+                    Ok(Ok(())) => error_active = false,
+                    Ok(Err(error)) => log_falco_error_once(
+                        &mut error_active,
+                        format_args!("retention maintenance failed: {error}"),
+                    ),
+                    Err(payload) => {
+                        let message = payload
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("unknown panic");
+                        eprintln!(
+                            "gensee: Falco retention worker panicked ({message}); restarting after the maintenance interval"
+                        );
+                        error_active = true;
                     }
                 }
-                Err(error) => log_falco_error_once(
-                    &mut error_active,
-                    format_args!("retention clock failed: {error}"),
-                ),
+                thread::sleep(FALCO_RETENTION_CHECK_INTERVAL);
             }
-            thread::sleep(FALCO_RETENTION_CHECK_INTERVAL);
-        }
-    });
+        })
+}
+
+fn run_falco_retention_once(store: &EventStore) -> io::Result<()> {
+    let now_ms = unix_millis()?;
+    let recording = Policy::load_current().document().endpoint_security.clone();
+    store.prune_falco_retention_if_due(
+        now_ms,
+        FALCO_RETENTION_CHECK_INTERVAL.as_millis() as u64,
+        recording.raw_event_retention_hours,
+        recording.max_raw_events,
+    )?;
+    Ok(())
 }
 
 fn log_falco_error_once(active: &mut bool, message: fmt::Arguments<'_>) {
