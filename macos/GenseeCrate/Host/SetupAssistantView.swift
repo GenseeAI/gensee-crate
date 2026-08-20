@@ -10,6 +10,7 @@ struct SetupAssistantView: View {
     @State private var isPreparing = false
     @State private var isEnablingAll = false
     @State private var selectedLevel: ProtectionLevel = .observe
+    @State private var showsConfigAuditResults = false
 
     private let stepTitles = ["Start here", "Local runtime", "Safety baseline", "Harnesses", "Mac protection", "Verify"]
 
@@ -58,6 +59,22 @@ struct SetupAssistantView: View {
                 if newStep >= 4 {
                     sensor.start()
                 }
+            }
+        }
+        .sheet(isPresented: $showsConfigAuditResults) {
+            if let audit = model.configAudit {
+                ScrollView {
+                    HarnessConfigAuditPanel(
+                        model: model,
+                        target: audit.requestedTarget,
+                        initialWorkspacePath: audit.includedReports.first?.report.target.workspace
+                            ?? FileManager.default.homeDirectoryForCurrentUser.path,
+                        onClose: { showsConfigAuditResults = false }
+                    )
+                    .padding(24)
+                }
+                .frame(width: 900, height: 650)
+                .background(Color.dashboardPanel)
             }
         }
     }
@@ -343,10 +360,24 @@ struct SetupAssistantView: View {
                         }
                     }
                     if let audit = model.configAudit {
-                        DashboardTag(
-                            text: audit.summary.findingCount == 0 ? "No findings" : "\(audit.summary.findingCount) findings",
-                            color: audit.summary.findingCount == 0 ? .dashboardGreen : .dashboardGold
-                        )
+                        if audit.summary.findingCount == 0 {
+                            DashboardTag(text: "No findings", color: .dashboardGreen)
+                        } else {
+                            Button {
+                                showsConfigAuditResults = true
+                            } label: {
+                                Label(
+                                    audit.summary.findingCount == 1
+                                        ? "Review 1 finding"
+                                        : "Review \(audit.summary.findingCount) findings",
+                                    systemImage: "arrow.right.circle.fill"
+                                )
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.dashboardGold)
+                            .accessibilityIdentifier("setup.configAudit.reviewFindings")
+                            .help("Open the complete configuration audit report")
+                        }
                     }
                 }
                 .controlSize(.small)

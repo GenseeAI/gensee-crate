@@ -12,6 +12,18 @@ struct HarnessConfigAuditPanel: View {
         ProcessInfo.processInfo.environment["GENSEE_WORKSPACE"] ?? ""
     }
 
+    init(
+        model: ConsoleModel,
+        target: String,
+        initialWorkspacePath: String? = nil,
+        onClose: @escaping () -> Void
+    ) {
+        self.model = model
+        self.target = target
+        self.onClose = onClose
+        _workspacePath = State(initialValue: initialWorkspacePath ?? Self.defaultWorkspace)
+    }
+
     private var bundle: ConfigAuditBundle? {
         guard !workspacePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let bundle = model.configAudit,
