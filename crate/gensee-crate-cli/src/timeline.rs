@@ -1,5 +1,7 @@
 use crate::*;
 
+const TIMELINE_NATIVE_SYSTEM_EVENT_LIMIT: usize = 5_000;
+
 pub(crate) fn list_runs(args: Vec<OsString>) -> io::Result<()> {
     let store = EventStore::default_local()?;
     let mut sessions = compact_sessions(store.list_sessions()?);
@@ -79,7 +81,18 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
     let hooks = store.list_hook_events()?;
     let observations = store.list_process_observations()?;
     let file_intents = store.list_file_intents()?;
-    let mut system_events = timeline_system_events(&store)?;
+    let native_retention = Policy::load_current()
+        .document()
+        .endpoint_security
+        .raw_event_retention_hours;
+    let now_ms = unix_millis()?;
+    let native_min_ms = now_ms.saturating_sub(native_retention.saturating_mul(60 * 60 * 1_000));
+    let mut system_events = timeline_system_events(
+        &store,
+        i64::try_from(native_min_ms).unwrap_or(i64::MAX),
+        i64::try_from(now_ms).unwrap_or(i64::MAX),
+        TIMELINE_NATIVE_SYSTEM_EVENT_LIMIT,
+    )?;
     let mut workspace_effects = store.list_workspace_effects()?;
     let mut alerts = store.list_alerts()?;
     let mut user_prompts = compact_user_prompts(&hooks);
@@ -433,13 +446,18 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn timeline_system_events(store: &EventStore) -> io::Result<Vec<SystemEvent>> {
+pub(crate) fn timeline_system_events(
+    store: &EventStore,
+    min_observed_at_ms: i64,
+    max_observed_at_ms: i64,
+    limit: usize,
+) -> io::Result<Vec<SystemEvent>> {
     let mut events = store.list_system_events()?;
     let mut keys = events
         .iter()
         .map(system_event_dedup_key)
         .collect::<HashSet<_>>();
-    for stored in store.list_native_system_events()? {
+    for stored in store.list_native_system_events(min_observed_at_ms, max_observed_at_ms, limit)? {
         match stored_system_event_for_timeline(stored) {
             Ok(event) if keys.insert(system_event_dedup_key(&event)) => events.push(event),
             Ok(_) => {}
@@ -457,7 +475,7 @@ pub(crate) fn stored_system_event_for_timeline(
 ) -> io::Result<SystemEvent> {
     let mut event = match stored.source.as_str() {
         "linux-falco" => {
-            system_event_from_falco_line(&stored.raw_json, stored.observed_at_ms, None)?
+            system_event_from_persisted_falco_line(&stored.raw_json, stored.observed_at_ms)?
         }
         "macos-endpoint-security" => {
             EndpointSecurityEvent::parse(&stored.raw_json)?.into_system_event()?
@@ -477,20 +495,81 @@ pub(crate) fn stored_system_event_for_timeline(
     Ok(event)
 }
 
-fn system_event_dedup_key(event: &SystemEvent) -> (String, String, u64, Option<u32>, String) {
+fn system_event_dedup_key(event: &SystemEvent) -> (String, u64, Option<u32>, Option<String>) {
     (
         event.source.clone(),
-        event.event_type.clone(),
         event.observed_at_ms,
         event.pid,
-        event.raw_json.clone(),
+        system_event_id(event),
     )
+}
+
+fn system_event_id(event: &SystemEvent) -> Option<String> {
+    let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+    let event_id = [
+        value.get("event_id"),
+        value.pointer("/gensee/event_id"),
+        value.pointer("/output_fields/evt.num"),
+        value.pointer("/output_fields/evt_num"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|event_id| match event_id {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    });
+    event_id
 }
 
 #[cfg(test)]
 mod native_system_event_tests {
     use super::*;
     use gensee_crate_store::StoredSystemEvent;
+
+    fn tool_call(session_id: Option<&str>, run_id: Option<&str>) -> AgentToolCall {
+        let raw_json = run_id
+            .map(|run_id| json!({"gensee": {"run_id": run_id}}).to_string())
+            .unwrap_or_else(|| "{}".to_string());
+        let hook = AgentHookEvent {
+            provider: "codex".to_string(),
+            session_id: session_id.map(ToString::to_string),
+            hook_event_name: Some("PreToolUse".to_string()),
+            cwd: Some("/workspace".to_string()),
+            transcript_path: None,
+            tool_name: Some("Bash".to_string()),
+            tool_use_id: Some("tool-1".to_string()),
+            tool_input_command: Some("true".to_string()),
+            tool_input_description: None,
+            tool_response_stdout: None,
+            tool_response_stderr: None,
+            tool_response_interrupted: None,
+            duration_ms: None,
+            permission_mode: None,
+            effort_level: None,
+            observed_at_ms: 100,
+            raw_json,
+        };
+        let mut call = AgentToolCall::from_hook(&hook);
+        call.post_observed_at_ms = Some(200);
+        call
+    }
+
+    fn attributed_event(run_id: &str) -> SystemEvent {
+        SystemEvent {
+            source: "linux-falco".to_string(),
+            event_type: "execve".to_string(),
+            event_kind: "ProcessExec".to_string(),
+            observed_at_ms: 150,
+            pid: Some(42),
+            ppid: Some(1),
+            process_name: Some("sh".to_string()),
+            executable_path: Some("/bin/sh".to_string()),
+            file_path: None,
+            command_line: Some("sh -c true".to_string()),
+            raw_json: json!({"session_id": run_id, "event_id": "falco-1"}).to_string(),
+        }
+    }
 
     #[test]
     fn rehydrates_sqlite_falco_events() {
@@ -544,7 +623,7 @@ mod native_system_event_tests {
         store.append_system_event(&event).unwrap();
 
         assert!(store.list_system_events().unwrap().is_empty());
-        let events = timeline_system_events(&store).unwrap();
+        let events = timeline_system_events(&store, i64::MIN, i64::MAX, 100).unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source, "linux-falco");
@@ -587,6 +666,41 @@ mod native_system_event_tests {
         assert_eq!(event.event_kind, "file_mutation");
         assert_eq!(event.file_path.as_deref(), Some("/workspace/out.txt"));
         assert_eq!(system_event_session_id(&event).as_deref(), Some("run_1"));
+    }
+
+    #[test]
+    fn dedup_uses_compact_event_identity_instead_of_raw_payload() {
+        let first = attributed_event("run_1");
+        let mut second = first.clone();
+        second.raw_json =
+            json!({"session_id": "run_1", "event_id": "falco-1", "extra": true}).to_string();
+
+        assert_eq!(
+            system_event_dedup_key(&first),
+            system_event_dedup_key(&second)
+        );
+    }
+
+    #[test]
+    fn correlation_falls_back_to_time_without_a_recorded_run_id() {
+        let call = tool_call(None, None);
+        assert!(same_system_event_tool_call(
+            &call,
+            &attributed_event("run_1")
+        ));
+    }
+
+    #[test]
+    fn correlation_uses_tclone_run_id_instead_of_agent_session_uuid() {
+        let call = tool_call(Some("agent-session-uuid"), Some("run_1"));
+        assert!(same_system_event_tool_call(
+            &call,
+            &attributed_event("run_1")
+        ));
+        assert!(!same_system_event_tool_call(
+            &call,
+            &attributed_event("run_2")
+        ));
     }
 }
 
@@ -1044,6 +1158,7 @@ pub(crate) fn looks_like_agent_refusal(response: &str) -> bool {
 #[derive(Debug, Clone)]
 pub(crate) struct AgentToolCall {
     pub(crate) session_id: Option<String>,
+    pub(crate) run_id: Option<String>,
     pub(crate) tool_use_id: Option<String>,
     pub(crate) tool_name: Option<String>,
     pub(crate) cwd: Option<String>,
@@ -1069,6 +1184,7 @@ impl AgentToolCall {
     fn from_hook(hook: &AgentHookEvent) -> Self {
         let mut call = Self {
             session_id: hook.session_id.clone(),
+            run_id: hook_run_id(hook),
             tool_use_id: hook.tool_use_id.clone(),
             tool_name: hook.tool_name.clone(),
             cwd: hook.cwd.clone(),
@@ -1095,6 +1211,7 @@ impl AgentToolCall {
 
     fn merge_hook(&mut self, hook: &AgentHookEvent) {
         fill_missing(&mut self.session_id, &hook.session_id);
+        fill_missing(&mut self.run_id, &hook_run_id(hook));
         fill_missing(&mut self.tool_use_id, &hook.tool_use_id);
         fill_missing(&mut self.tool_name, &hook.tool_name);
         fill_missing(&mut self.cwd, &hook.cwd);
@@ -1329,12 +1446,23 @@ pub(crate) fn same_file_intent_tool_call(call: &AgentToolCall, intent: &FileInte
 }
 
 pub(crate) fn same_system_event_tool_call(call: &AgentToolCall, event: &SystemEvent) -> bool {
-    if let Some(event_session_id) = system_event_session_id(event) {
-        if call.session_id.as_deref() != Some(event_session_id.as_str()) {
+    if let (Some(event_run_id), Some(call_run_id)) =
+        (system_event_session_id(event), call.run_id.as_deref())
+    {
+        if call_run_id != event_run_id.as_str() {
             return false;
         }
     }
     observed_at_inside_tool_window(call, event.observed_at_ms)
+}
+
+fn hook_run_id(hook: &AgentHookEvent) -> Option<String> {
+    let value = serde_json::from_str::<Value>(&hook.raw_json).ok()?;
+    value
+        .pointer("/gensee/run_id")
+        .or_else(|| value.get("gensee_run_id"))?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 pub(crate) fn same_workspace_effect_tool_call(

@@ -1180,11 +1180,11 @@ impl SqliteStore {
             .map_err(SqliteError::Database)
     }
 
-    /// Permanently remove bounded batches of expired Endpoint Security
-    /// telemetry. The row cap is enforced independently from the time limit so
-    /// a burst cannot grow the local database without bound. Intentional alert
-    /// deletion is committed to an append-only retention checkpoint before the
-    /// surviving chain is re-rooted.
+    /// Permanently remove bounded batches of expired native system telemetry.
+    /// The row cap is enforced independently from the time limit so an Endpoint
+    /// Security or Falco burst cannot grow the local database without bound.
+    /// Intentional alert deletion is committed to an append-only retention
+    /// checkpoint before the surviving chain is re-rooted.
     pub fn prune_endpoint_retention(
         &self,
         raw_cutoff_ms: i64,
@@ -1220,12 +1220,12 @@ impl SqliteStore {
                 "INSERT INTO gensee_pruned_system_events(event_id)
                  SELECT event_id
                  FROM system_events
-                 WHERE source = 'macos-endpoint-security'
+                 WHERE source IN ('macos-endpoint-security', 'linux-falco')
                    AND (
                        ts < ?1 OR event_id <= COALESCE((
                            SELECT event_id
                            FROM system_events
-                           WHERE source = 'macos-endpoint-security'
+                           WHERE source IN ('macos-endpoint-security', 'linux-falco')
                            ORDER BY event_id DESC
                            LIMIT 1 OFFSET ?2
                        ), -1)
@@ -1450,28 +1450,43 @@ impl SqliteStore {
     pub fn system_events_for_sources(
         &self,
         sources: &[&str],
+        min_ts: i64,
+        max_ts: i64,
+        limit: i64,
     ) -> Result<Vec<SystemEventRecord>, SqliteError> {
-        if sources.is_empty() {
+        if sources.is_empty() || limit <= 0 || min_ts > max_ts {
             return Ok(Vec::new());
         }
-        let placeholders = (1..=sources.len())
-            .map(|index| format!("?{index}"))
+        let placeholders = (0..sources.len())
+            .map(|_| "?")
             .collect::<Vec<_>>()
             .join(", ");
+        let mut parameters = sources
+            .iter()
+            .map(|source| rusqlite::types::Value::Text((*source).to_string()))
+            .collect::<Vec<_>>();
+        parameters.extend([
+            rusqlite::types::Value::Integer(min_ts),
+            rusqlite::types::Value::Integer(max_ts),
+            rusqlite::types::Value::Integer(limit),
+        ]);
         let mut stmt = self
             .conn
             .prepare(&format!(
                 "SELECT event_id, pid, request_id, ts, source, type, cwd, args
-                 FROM system_events
-                 WHERE source IN ({placeholders})
+                 FROM (
+                     SELECT event_id, pid, request_id, ts, source, type, cwd, args
+                     FROM system_events
+                     WHERE source IN ({placeholders})
+                       AND ts BETWEEN ? AND ?
+                     ORDER BY ts DESC, event_id DESC
+                     LIMIT ?
+                 )
                  ORDER BY ts, event_id"
             ))
             .map_err(SqliteError::Database)?;
         let rows = stmt
-            .query_map(
-                rusqlite::params_from_iter(sources.iter().copied()),
-                map_system_event,
-            )
+            .query_map(rusqlite::params_from_iter(parameters), map_system_event)
             .map_err(SqliteError::Database)?;
 
         collect_rows(rows)
@@ -3500,17 +3515,39 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(timestamps, vec![111, 999, 1000, 2000]);
         let source_timestamps = store
-            .system_events_for_sources(&["macos-eslogger"])
+            .system_events_for_sources(&["macos-eslogger"], i64::MIN, i64::MAX, 100)
             .unwrap()
             .into_iter()
             .map(|event| event.ts)
             .collect::<Vec<_>>();
         assert_eq!(source_timestamps, timestamps);
         assert!(store
-            .system_events_for_sources(&["linux-falco"])
+            .system_events_for_sources(&["linux-falco"], i64::MIN, i64::MAX, 100)
             .unwrap()
             .is_empty());
-        assert!(store.system_events_for_sources(&[]).unwrap().is_empty());
+        assert!(store
+            .system_events_for_sources(&[], i64::MIN, i64::MAX, 100)
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(
+            store
+                .system_events_for_sources(&["macos-eslogger"], 900, 1500, 2)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.ts)
+                .collect::<Vec<_>>(),
+            vec![999, 1000]
+        );
+        assert_eq!(
+            store
+                .system_events_for_sources(&["macos-eslogger"], i64::MIN, i64::MAX, 2)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.ts)
+                .collect::<Vec<_>>(),
+            vec![1000, 2000]
+        );
 
         drop(store);
         remove_sqlite_files(&path);
@@ -3598,6 +3635,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(checkpoint, (1, 1, 100));
+
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn retention_caps_falco_system_events() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-falco-retention-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).expect("store should open");
+        store
+            .insert_session(&NewSession {
+                session_id: "falco_retention_session".to_string(),
+                agent_id: "codex".to_string(),
+                root_pid: 0,
+                first_event_at: 1,
+                last_event_at: None,
+                flagged: false,
+            })
+            .unwrap();
+        let request_id = store
+            .insert_request(&NewRequest {
+                session_id: "falco_retention_session".to_string(),
+                original_user_prompt: None,
+                final_response: None,
+                events: None,
+                file_accessed_rate: 0.0,
+                network_rate: 0.0,
+            })
+            .unwrap();
+        for ts in 1..=5 {
+            store
+                .insert_system_event(&NewSystemEvent {
+                    pid: 1,
+                    request_id,
+                    ts,
+                    source: "linux-falco".to_string(),
+                    event_type: "execve".to_string(),
+                    cwd: String::new(),
+                    args: None,
+                })
+                .unwrap();
+        }
+
+        let pruned = store
+            .prune_endpoint_retention(0, 2, None, 100, 250)
+            .unwrap();
+        assert_eq!(pruned.system_events, 3);
+        assert_eq!(
+            store
+                .system_events_for_sources(&["linux-falco"], i64::MIN, i64::MAX, 100)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.ts)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
 
         drop(store);
         remove_sqlite_files(&path);

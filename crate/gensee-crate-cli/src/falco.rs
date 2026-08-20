@@ -3,6 +3,7 @@ use std::fmt;
 
 const FALCO_SOURCE: &str = "linux-falco";
 const MIN_CONTAINER_ID_PREFIX_LEN: usize = 12;
+const FALCO_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct TcloneRunRegistryCache {
@@ -48,6 +49,8 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
     let mut input_error_active = false;
     let mut registry_error_active = false;
     let mut store_error_active = false;
+    let mut retention_error_active = false;
+    let mut last_retention_check = None;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -68,7 +71,8 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
         if line.is_empty() {
             continue;
         }
-        match system_event_and_value_from_falco_line(line, unix_millis()?, host.as_deref()) {
+        let ingested_at_ms = unix_millis()?;
+        match system_event_and_value_from_falco_line(line, ingested_at_ms, host.as_deref()) {
             Ok((mut event, mut value)) => {
                 match registry.records() {
                     Ok(records) => {
@@ -92,6 +96,26 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
                     Ok(()) => {
                         store_error_active = false;
                         count += 1;
+                        if last_retention_check.is_none_or(|last: Instant| {
+                            last.elapsed() >= FALCO_RETENTION_CHECK_INTERVAL
+                        }) {
+                            let recording =
+                                Policy::load_current().document().endpoint_security.clone();
+                            match store.prune_endpoint_retention_if_due(
+                                ingested_at_ms,
+                                FALCO_RETENTION_CHECK_INTERVAL.as_millis() as u64,
+                                recording.raw_event_retention_hours,
+                                recording.max_raw_events,
+                                recording.low_severity_retention_hours,
+                            ) {
+                                Ok(_) => retention_error_active = false,
+                                Err(error) => log_falco_error_once(
+                                    &mut retention_error_active,
+                                    format_args!("retention maintenance failed: {error}"),
+                                ),
+                            }
+                            last_retention_check = Some(Instant::now());
+                        }
                     }
                     Err(error) => {
                         rejected += 1;
@@ -157,6 +181,7 @@ fn parse_falco_ingest_args(args: &[OsString]) -> io::Result<Option<String>> {
     Ok(host)
 }
 
+#[cfg(test)]
 pub(crate) fn system_event_from_falco_line(
     line: &str,
     observed_at_ms: u64,
@@ -165,12 +190,30 @@ pub(crate) fn system_event_from_falco_line(
     system_event_and_value_from_falco_line(line, observed_at_ms, host).map(|(event, _)| event)
 }
 
+pub(crate) fn system_event_from_persisted_falco_line(
+    line: &str,
+    observed_at_ms: u64,
+) -> io::Result<SystemEvent> {
+    let value = parse_falco_value(line)?;
+    falco_system_event_from_value(value, observed_at_ms, None, false).map(|(event, _)| event)
+}
+
 fn system_event_and_value_from_falco_line(
     line: &str,
     observed_at_ms: u64,
     host: Option<&str>,
 ) -> io::Result<(SystemEvent, Value)> {
-    let mut value = serde_json::from_str::<Value>(line).map_err(|error| {
+    let mut value = parse_falco_value(line)?;
+
+    // Falco output may include command arguments and environment-derived data.
+    // Apply the same redaction floor as native agent and Endpoint Security input
+    // before extracting any structured field for persistence.
+    redact_value(&mut value);
+    falco_system_event_from_value(value, observed_at_ms, host, true)
+}
+
+fn parse_falco_value(line: &str) -> io::Result<Value> {
+    let value = serde_json::from_str::<Value>(line).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid Falco JSON: {error}"),
@@ -182,11 +225,15 @@ fn system_event_and_value_from_falco_line(
             "Falco event must be a JSON object",
         ));
     }
+    Ok(value)
+}
 
-    // Falco output may include command arguments and environment-derived data.
-    // Apply the same redaction floor as native agent and Endpoint Security input
-    // before extracting any structured field for persistence.
-    redact_value(&mut value);
+fn falco_system_event_from_value(
+    mut value: Value,
+    observed_at_ms: u64,
+    host: Option<&str>,
+    enrich: bool,
+) -> io::Result<(SystemEvent, Value)> {
     let fields = value
         .get("output_fields")
         .cloned()
@@ -217,6 +264,7 @@ fn system_event_and_value_from_falco_line(
     let gensee = json!({
         "schema_version": 1,
         "collector": "falco",
+        "event_id": falco_string(&fields, &["evt.num", "evt_num"]),
         "rule": value.get("rule").cloned().unwrap_or(Value::Null),
         "priority": value.get("priority").cloned().unwrap_or(Value::Null),
         "host": host,
@@ -231,10 +279,12 @@ fn system_event_and_value_from_falco_line(
         "cgroups": cgroups,
         "network_dest": network_dest,
     });
-    value
-        .as_object_mut()
-        .expect("object checked above")
-        .insert("gensee".to_string(), gensee);
+    if enrich {
+        value
+            .as_object_mut()
+            .expect("object checked above")
+            .insert("gensee".to_string(), gensee);
+    }
 
     let event = SystemEvent {
         source: FALCO_SOURCE.to_string(),
@@ -419,7 +469,7 @@ mod tests {
     #[test]
     fn parses_process_execution() {
         let event = system_event_from_falco_line(
-            r#"{"rule":"Gensee process execution","priority":"Notice","output_fields":{"evt.rawtime":"1712345678123456789","evt.type":"execve","proc.pid":42,"proc.ppid":7,"proc.name":"pip","proc.exepath":"/usr/bin/pip","proc.cmdline":"pip install demo","container.id":"abc","container.name":"gensee-tclone-src-run-1"}}"#,
+            r#"{"rule":"Gensee process execution","priority":"Notice","output_fields":{"evt.num":99,"evt.rawtime":"1712345678123456789","evt.type":"execve","proc.pid":42,"proc.ppid":7,"proc.name":"pip","proc.exepath":"/usr/bin/pip","proc.cmdline":"pip install demo","container.id":"abc","container.name":"gensee-tclone-src-run-1"}}"#,
             123,
             Some("machine-a"),
         )
@@ -430,6 +480,10 @@ mod tests {
         assert_eq!(event.observed_at_ms, 1_712_345_678_123);
         assert_eq!(event.command_line.as_deref(), Some("pip install demo"));
         assert!(event.raw_json.contains("machine-a"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&event.raw_json).unwrap()["gensee"]["event_id"],
+            "99"
+        );
     }
 
     #[test]

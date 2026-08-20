@@ -400,26 +400,43 @@ impl EventStore {
         read_jsonl(&self.system_events_path(), self.encryption_key.as_ref())
     }
 
-    pub fn list_native_system_events(&self) -> io::Result<Vec<StoredSystemEvent>> {
+    pub fn list_native_system_events(
+        &self,
+        min_observed_at_ms: i64,
+        max_observed_at_ms: i64,
+        limit: usize,
+    ) -> io::Result<Vec<StoredSystemEvent>> {
         let db = self.sqlite_store()?;
-        db.system_events_for_sources(&["macos-endpoint-security", "linux-falco"])
-            .map_err(sqlite_error)?
+        let rows = db
+            .system_events_for_sources(
+                &["macos-endpoint-security", "linux-falco"],
+                min_observed_at_ms,
+                max_observed_at_ms,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            )
+            .map_err(sqlite_error)?;
+        Ok(rows
             .into_iter()
-            .map(|row| {
-                Ok(StoredSystemEvent {
+            .filter_map(|row| {
+                let observed_at_ms = match u64::try_from(row.ts) {
+                    Ok(timestamp) => timestamp,
+                    Err(_) => {
+                        eprintln!(
+                            "gensee: skipping SQLite system event {} with negative timestamp {}",
+                            row.event_id, row.ts
+                        );
+                        return None;
+                    }
+                };
+                Some(StoredSystemEvent {
                     source: row.source,
                     event_type: row.event_type,
-                    observed_at_ms: u64::try_from(row.ts).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("negative system event timestamp in SQLite: {}", row.ts),
-                        )
-                    })?,
+                    observed_at_ms,
                     pid: u32::try_from(row.pid).ok().filter(|pid| *pid != 0),
                     raw_json: row.args.unwrap_or_else(|| "null".to_string()),
                 })
             })
-            .collect()
+            .collect::<Vec<_>>())
     }
 
     pub fn list_workspace_effects(&self) -> io::Result<Vec<WorkspaceEffect>> {
@@ -4936,7 +4953,9 @@ mod tests {
             .unwrap()
             .is_none());
         drop(db);
-        let native_events = store.list_native_system_events().unwrap();
+        let native_events = store
+            .list_native_system_events(i64::MIN, i64::MAX, 100)
+            .unwrap();
         assert_eq!(native_events.len(), 1);
         assert_eq!(native_events[0].source, "linux-falco");
         assert_eq!(native_events[0].event_type, "connect");
@@ -4953,6 +4972,47 @@ mod tests {
             .all(|alert| alert.rule_id != "unmatched_system_effect"));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn native_system_event_listing_skips_negative_timestamps() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-native-negative-ts-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        for observed_at_ms in [130, 140] {
+            store
+                .append_system_event(&SystemEvent {
+                    source: "linux-falco".to_string(),
+                    event_type: "execve".to_string(),
+                    event_kind: "ProcessExec".to_string(),
+                    observed_at_ms,
+                    pid: Some(42),
+                    ppid: Some(1),
+                    process_name: Some("sh".to_string()),
+                    executable_path: Some("/bin/sh".to_string()),
+                    file_path: None,
+                    command_line: Some("sh -c true".to_string()),
+                    raw_json: format!(r#"{{"event_id":"event-{observed_at_ms}"}}"#),
+                })
+                .unwrap();
+        }
+        store
+            .sqlite_store()
+            .unwrap()
+            .connection()
+            .execute("UPDATE system_events SET ts = -1 WHERE ts = 130", [])
+            .unwrap();
+
+        let events = store
+            .list_native_system_events(i64::MIN, i64::MAX, 100)
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].observed_at_ms, 140);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

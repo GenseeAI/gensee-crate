@@ -5513,7 +5513,7 @@ pub(crate) fn tclone_run_exec(args: Vec<OsString>) -> io::Result<()> {
         .arg(&record.container_workspace)
         .args(tclone_run_exec_env_args(&record))
         .arg(&record.container_name)
-        .args(command_args);
+        .args(tclone_run_exec_command_args(command_args));
     if exec_json {
         let output = command.output()?;
         println!(
@@ -5633,6 +5633,17 @@ fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
         ]
     })
     .collect()
+}
+
+fn tclone_run_exec_command_args(command_args: &[OsString]) -> Vec<OsString> {
+    let mut wrapped = vec![
+        OsString::from("sh"),
+        OsString::from("-c"),
+        OsString::from(format!("{}; exec \"$@\"", tclone_path_export(&[]))),
+        OsString::from("gensee-run-exec"),
+    ];
+    wrapped.extend_from_slice(command_args);
+    wrapped
 }
 
 fn tclone_run_context_payload(record: &TcloneRunRecord, capability: &str) -> Value {
@@ -9983,21 +9994,28 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
 
 fn tclone_agent_start_script(agent_cmd: &[OsString], path_prefixes: &[String]) -> String {
     let command = shell_join(agent_cmd);
-    let path_prefix = tclone_container_path_prefix(path_prefixes);
+    let path_export = tclone_path_export(path_prefixes);
+    let pane_command = format!("{path_export}; exec {command}");
     format!(
-        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nexport PATH={}:\"${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\nagent_pid=$!\nsleep 2\nif ! kill -0 \"$agent_pid\" 2>/dev/null; then\n  printf 'gensee agent exited during startup\\n' >> \"$log\"\n  cat \"$log\" >&2\n  exit 127\nfi\nprintf 'gensee agent started without tmux pid=%s\\n' \"$agent_pid\" >> \"$log\"\n",
-        shell_quote(&path_prefix),
+        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\n{path_export}\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\nagent_pid=$!\nsleep 2\nif ! kill -0 \"$agent_pid\" 2>/dev/null; then\n  printf 'gensee agent exited during startup\\n' >> \"$log\"\n  cat \"$log\" >&2\n  exit 127\nfi\nprintf 'gensee agent started without tmux pid=%s\\n' \"$agent_pid\" >> \"$log\" 2>&1\n",
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
-        shell_quote(&format!("exec {command}")),
+        shell_quote(&pane_command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
-        shell_quote(&format!("exec {command}"))
+        shell_quote(&pane_command)
+    )
+}
+
+fn tclone_path_export(toolchain_paths: &[String]) -> String {
+    format!(
+        "export PATH={}:\"${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}\"",
+        shell_quote(&tclone_container_path_prefix(toolchain_paths))
     )
 }
 
@@ -13512,6 +13530,27 @@ gensee async job job_1: exited status=0
         assert!(env_args.contains(&OsString::from("GENSEE_RUN_ID=run_1_fork_0")));
         assert!(env_args.contains(&OsString::from("AGENT_SHIELD_SESSION_ID=run_1_fork_0")));
         assert!(env_args.contains(&OsString::from("GENSEE_WORKSPACE=/workspace")));
+        assert!(!env_args
+            .iter()
+            .any(|arg| { arg.to_str().is_some_and(|value| value.starts_with("PATH=")) }));
+    }
+
+    #[test]
+    fn tclone_run_exec_prepends_gensee_without_clobbering_image_path() {
+        let command_args = vec![
+            OsString::from("gensee"),
+            OsString::from("run"),
+            OsString::from("summary"),
+        ];
+
+        let wrapped = tclone_run_exec_command_args(&command_args);
+
+        assert_eq!(wrapped[0], "sh");
+        assert_eq!(wrapped[1], "-c");
+        let script = wrapped[2].to_string_lossy();
+        assert!(script.contains("export PATH='/usr/libexec':\"${PATH:-"));
+        assert!(script.contains("exec \"$@\""));
+        assert_eq!(&wrapped[4..], command_args.as_slice());
     }
 
     #[test]
@@ -13867,6 +13906,7 @@ gensee async job job_1: exited status=0
         assert!(script.contains("panic"));
         assert!(script
             .contains("export PATH='/usr/libexec:/opt/host-node/bin':\"${PATH:-/usr/local/sbin"));
+        assert!(script.matches("/usr/libexec:/opt/host-node/bin").count() >= 2);
         assert!(script.contains("exit 0"));
         assert!(!script.contains("exec sleep infinity"));
         assert!(!script.contains("while :; do"));
