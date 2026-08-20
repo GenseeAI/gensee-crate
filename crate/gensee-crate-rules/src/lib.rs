@@ -1,5 +1,6 @@
 use gensee_crate_core::{AgentEvent, EventKind};
 
+pub mod capability;
 pub mod policy;
 
 #[derive(Debug, Clone)]

@@ -244,7 +244,12 @@ pub(crate) fn fork_suggestion_already_recorded(
         return false;
     };
     store
-        .session_has_alert_evidence_string(session_id, "policy_fork_suggested", "reason", reason)
+        .session_has_alert_evidence_string(
+            session_id,
+            "policy_capability_delegation_required",
+            "reason",
+            reason,
+        )
         .unwrap_or(false)
 }
 
@@ -295,6 +300,50 @@ impl ForkSuggestionReason {
             Self::TestStrategyChange => "test strategy change",
         }
     }
+
+    fn capability_request(self) -> CapabilityRequest {
+        match self {
+            Self::DependencyUpgrade => CapabilityRequest::isolated(
+                "dependency_graph_change",
+                EffectScope::ReversibleLocal,
+                vec![
+                    Capability::FilesystemWrite,
+                    Capability::NetworkEgress,
+                    Capability::ProcessExecution,
+                    Capability::UntrustedCodeExecution,
+                ],
+            ),
+            Self::SchemaMigration | Self::DestructiveDatabaseCommand => {
+                CapabilityRequest::brokered(
+                    "external_data_mutation",
+                    vec![
+                        Capability::NetworkEgress,
+                        Capability::IdentityUse,
+                        Capability::ExternalMutation,
+                    ],
+                )
+            }
+            Self::LargeRefactor | Self::LockfileChange => CapabilityRequest::isolated(
+                "workspace_mutation",
+                EffectScope::ReversibleLocal,
+                vec![Capability::FilesystemWrite, Capability::ProcessExecution],
+            ),
+            Self::DestructiveFileCleanup => CapabilityRequest::isolated(
+                "destructive_workspace_mutation",
+                EffectScope::IrreversibleLocal,
+                vec![
+                    Capability::FilesystemWrite,
+                    Capability::DestructiveFilesystem,
+                    Capability::ProcessExecution,
+                ],
+            ),
+            Self::TestStrategyChange => CapabilityRequest::isolated(
+                "broad_process_execution",
+                EffectScope::ReversibleLocal,
+                vec![Capability::FilesystemWrite, Capability::ProcessExecution],
+            ),
+        }
+    }
 }
 
 pub(crate) fn fork_suggestion_finding(
@@ -313,6 +362,7 @@ pub(crate) fn fork_suggestion_finding(
         return None;
     }
     let reason = fork_suggestion_reason(command, subjects)?;
+    let capability_request = reason.capability_request();
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
@@ -328,12 +378,13 @@ pub(crate) fn fork_suggestion_finding(
     Some(PolicyFinding {
         action: fork_suggestion_action(event, current_run_id),
         severity: fork_suggestion_severity(event, current_run_id).to_string(),
-        rule_id: "policy_fork_suggested".to_string(),
+        rule_id: "policy_capability_delegation_required".to_string(),
         message,
         path: event.cwd.clone(),
         evidence: json!({
-            "source": "fork_suggestion",
+            "source": "capability_policy",
             "reason": reason.code(),
+            "capability_request": capability_request,
             "suggested_name": name_hint,
             "current_run_id": current_run_id,
             "provider": event.provider,
@@ -386,6 +437,7 @@ pub(crate) fn fork_suggestion_prompt_finding(
     }
     let prompt = user_prompt_from_hook(event)?;
     let reason = fork_suggestion_reason_for_prompt(&prompt)?;
+    let capability_request = reason.capability_request();
     let name_hint = reason.name_hint();
     let message = if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         format!(
@@ -401,13 +453,14 @@ pub(crate) fn fork_suggestion_prompt_finding(
     Some(PolicyFinding {
         action: PolicyAction::Allow,
         severity: "info".to_string(),
-        rule_id: "policy_fork_suggested".to_string(),
+        rule_id: "policy_capability_delegation_required".to_string(),
         message,
         path: event.cwd.clone(),
         evidence: json!({
-            "source": "fork_suggestion",
+            "source": "capability_policy",
             "phase": "user_prompt",
             "reason": reason.code(),
+            "capability_request": capability_request,
             "suggested_name": name_hint,
             "current_run_id": current_run_id,
             "provider": event.provider,

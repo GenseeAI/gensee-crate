@@ -140,8 +140,15 @@ section of `gensee run list`. The launcher also prints it directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
 When hooks see requests or commands that are good fork candidates, such as
 dependency upgrades, migrations, broad refactors, lockfile changes, destructive
-cleanup, or database resets, Gensee records a `policy_fork_suggested` alert with
-suggested `gensee run fork --attach tmux:right --json` guidance. In Codex source
+cleanup, or database resets, Gensee records a
+`policy_capability_delegation_required` alert with a provider-neutral capability
+request. The request declares filesystem, network, identity, process, untrusted
+code, and external-mutation needs; resource selectors whose empty value means
+"not granted" rather than "allow all"; its effect scope; a maximum lease lifetime;
+and whether execution requires an isolated cell or a brokered commit. This model
+is intentionally operation-based rather than package-manager-specific. The
+alert also includes suggested `gensee run fork --attach tmux:right --json`
+guidance. In Codex source
 runs, matching user prompts add fork guidance before planning; matching source
 commands are blocked as a backstop so Codex can ask for a fork and continue the
 work there. The live-cloned Codex turn continues the original approved task
