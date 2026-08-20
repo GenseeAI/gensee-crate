@@ -199,6 +199,37 @@ Use the same `gensee-tclone` wrapper for `run list`, `run fork`, `run shell`,
 `run attach`, `run send`, `run exec`, `run merge`, `run switch`, and cleanup;
 otherwise Gensee may read the source record but look in a different Podman store
 and report that the container is missing.
+
+### Capability cells
+
+For a bounded authority-expanding operation, a trusted host operator can issue a
+one-use lease bound to a source run, an exact command, scoped workspace paths,
+and an expiry:
+
+```console
+gensee run lease issue run_... --request request.json -- cargo check
+gensee run cell run_... --lease lease_... --json
+gensee run cell inspect cell_... --json
+```
+
+The cell is a fresh container rather than a live-memory clone. It does not
+inherit the source agent home, credentials, memory, host-control capability, or
+network. Its root filesystem is read-only, Linux capabilities are dropped,
+privilege gain is disabled, resources are capped, and only explicitly selected
+workspace paths are copied and mounted. Podman independently enforces the
+remaining lease lifetime and automatic removal as a backstop if the Gensee
+client exits. The exact command is fixed when the trusted host
+issues the lease; the lease is consumed atomically before execution and expiry
+is enforced while the command runs. The container is destroyed on completion,
+while its scoped workspace snapshot and execution record are retained for
+inspection and replay planning. Nothing is promoted into the source
+automatically.
+
+Network, identity, privileged, and external-mutation capabilities fail closed
+in this first implementation. They require separate brokers that can enforce
+resource-level grants and stage or account for external effects; enabling
+ordinary container networking would not satisfy that requirement.
+
 Before cloning a tmux-backed source, `gensee run fork` may briefly detach the
 active `gensee-agent` client so tclone can checkpoint a stable process tree.
 Gensee shows a short tmux status message and automatically reattaches the source

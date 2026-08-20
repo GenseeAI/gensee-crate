@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
+mod capability_cell;
+pub(crate) use capability_cell::{tclone_capability_cell, tclone_capability_lease};
+
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
@@ -1585,6 +1588,7 @@ fn tclone_host_control_should_proxy(args: &[OsString]) -> bool {
                 | "switch"
                 | "discard"
                 | "lifecycle-ack"
+                | "cell"
         )
     )
 }
@@ -2356,6 +2360,14 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
                     "only a tclone source may request a fork",
                 ));
             }
+            validate_tclone_host_control_target(
+                &request.args[2..],
+                caller_run_id,
+                TcloneHostControlTargetScope::CallerOnly,
+            )?;
+        }
+        "cell" => {
+            validate_tclone_source_caller(caller_run_id)?;
             validate_tclone_host_control_target(
                 &request.args[2..],
                 caller_run_id,
@@ -13008,6 +13020,13 @@ gensee async job job_1: exited status=0
             OsString::from("run"),
             OsString::from("exec"),
             OsString::from("run_1"),
+        ]));
+        assert!(tclone_host_control_should_proxy(&[
+            OsString::from("run"),
+            OsString::from("cell"),
+            OsString::from("run_1"),
+            OsString::from("--lease"),
+            OsString::from("lease_1"),
         ]));
         assert!(tclone_host_control_should_proxy(&[
             OsString::from("run"),
