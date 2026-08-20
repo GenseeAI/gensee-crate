@@ -4,6 +4,7 @@ use gensee_crate_rules::capability_broker::{
     BrokerLeaseStatus, BrokerResourceKind, ExternalActionCommitClaims,
     SignedExternalActionCommitToken, BROKER_PROTOCOL_VERSION,
 };
+use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
 const BROKER_ADAPTER_SCHEMA_VERSION: u32 = 1;
@@ -203,78 +204,95 @@ fn issue_broker_lease(args: &[OsString]) -> io::Result<()> {
         request.ttl_seconds = request.ttl_seconds.min(remaining_seconds);
     }
     let lease_id = format!("broker_lease_{}", Uuid::new_v4().simple());
-    let (delivery, public_metadata, adapter_max_ttl) = match request.resource_kind {
-        BrokerResourceKind::ExternalActionCommitToken => {
-            if request.adapter_id != BUILTIN_EXTERNAL_ACTION_ADAPTER {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "external commit tokens must use the built-in signer",
-                ));
+    let (delivery, public_metadata, gateway_effects, effect_telemetry_complete, adapter_max_ttl) =
+        match request.resource_kind {
+            BrokerResourceKind::ExternalActionCommitToken => {
+                if request.adapter_id != BUILTIN_EXTERNAL_ACTION_ADAPTER {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "external commit tokens must use the built-in signer",
+                    ));
+                }
+                let token_id = issue_external_commit_token(&lease_id, &request, issued_at_ms)?;
+                (
+                    BrokerDelivery::CommitToken {
+                        commit_token_id: token_id,
+                    },
+                    Value::Null,
+                    Vec::new(),
+                    true,
+                    BROKER_MAX_TTL_SECONDS,
+                )
             }
-            let token_id = issue_external_commit_token(&lease_id, &request, issued_at_ms)?;
-            (
-                BrokerDelivery::CommitToken {
-                    commit_token_id: token_id,
-                },
-                Value::Null,
-                BROKER_MAX_TTL_SECONDS,
-            )
-        }
-        BrokerResourceKind::FilesystemHandle => {
-            if request.adapter_id != BUILTIN_FILESYSTEM_ADAPTER {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "filesystem handles must use the built-in filesystem mediator",
-                ));
+            BrokerResourceKind::FilesystemHandle => {
+                if request.adapter_id != BUILTIN_FILESYSTEM_ADAPTER {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "filesystem handles must use the built-in filesystem mediator",
+                    ));
+                }
+                validate_filesystem_constraints(&request.constraints)?;
+                (
+                    BrokerDelivery::FilesystemHandle {
+                        handle_id: format!("fs_handle_{}", Uuid::new_v4().simple()),
+                    },
+                    Value::Null,
+                    Vec::new(),
+                    true,
+                    BROKER_MAX_TTL_SECONDS,
+                )
             }
-            validate_filesystem_constraints(&request.constraints)?;
-            (
-                BrokerDelivery::FilesystemHandle {
-                    handle_id: format!("fs_handle_{}", Uuid::new_v4().simple()),
-                },
-                Value::Null,
-                BROKER_MAX_TTL_SECONDS,
-            )
-        }
-        BrokerResourceKind::NetworkLease => {
-            if request.adapter_id != BUILTIN_NETWORK_ADAPTER {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "network leases must use the built-in network mediator",
-                ));
+            BrokerResourceKind::NetworkLease => {
+                if request.adapter_id != BUILTIN_NETWORK_ADAPTER {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "network leases must use the built-in network mediator",
+                    ));
+                }
+                validate_network_constraints(&request.constraints)?;
+                (
+                    BrokerDelivery::NetworkLease {
+                        network_lease_id: format!("net_lease_{}", Uuid::new_v4().simple()),
+                    },
+                    Value::Null,
+                    Vec::new(),
+                    false,
+                    BROKER_MAX_TTL_SECONDS,
+                )
             }
-            validate_network_constraints(&request.constraints)?;
-            (
-                BrokerDelivery::NetworkLease {
-                    network_lease_id: format!("net_lease_{}", Uuid::new_v4().simple()),
-                },
-                Value::Null,
-                BROKER_MAX_TTL_SECONDS,
-            )
-        }
-        _ => {
-            let config = load_broker_adapter(&request.adapter_id)?;
-            if !config.resource_kinds.contains(&request.resource_kind) {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "broker adapter is not registered for the requested resource kind",
-                ));
+            _ => {
+                let config = load_broker_adapter(&request.adapter_id)?;
+                if !config.resource_kinds.contains(&request.resource_kind) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "broker adapter is not registered for the requested resource kind",
+                    ));
+                }
+                let response = invoke_broker_adapter(&config, "mint", &request, None)?;
+                (
+                    BrokerDelivery::Gateway {
+                        gateway_endpoint: response.gateway_endpoint,
+                        provider_handle: response.provider_handle,
+                    },
+                    response.public_metadata,
+                    response.effects,
+                    response.effect_telemetry_complete,
+                    config.max_ttl_seconds,
+                )
             }
-            let response = invoke_broker_adapter(&config, "mint", &request, None)?;
-            (
-                BrokerDelivery::Gateway {
-                    gateway_endpoint: response.gateway_endpoint,
-                    provider_handle: response.provider_handle,
-                },
-                response.public_metadata,
-                config.max_ttl_seconds,
-            )
-        }
-    };
+        };
     let ttl_seconds = request
         .ttl_seconds
         .min(adapter_max_ttl)
         .min(BROKER_MAX_TTL_SECONDS);
+    if request.cell_id.is_some() {
+        if let BrokerDelivery::Gateway {
+            gateway_endpoint, ..
+        } = &delivery
+        {
+            validate_cell_gateway_socket(gateway_endpoint)?;
+        }
+    }
     let lease = BrokerLease {
         protocol_version: BROKER_PROTOCOL_VERSION,
         lease_id: lease_id.clone(),
@@ -291,6 +309,8 @@ fn issue_broker_lease(args: &[OsString]) -> io::Result<()> {
         status: BrokerLeaseStatus::Active,
         delivery,
         public_metadata,
+        gateway_effects,
+        effect_telemetry_complete,
         revoked_at_ms: None,
         consumed_at_ms: None,
     };
@@ -351,6 +371,29 @@ fn validate_broker_lease_request(request: &BrokerLeaseRequest) -> io::Result<()>
             io::ErrorKind::PermissionDenied,
             "broker constraints must contain selectors and handles, never credential material",
         ));
+    }
+    if request.cell_id.is_some() {
+        let expected_gateway_kinds: &[&str] = match request.resource_kind {
+            BrokerResourceKind::RepositoryToken => &["repository_api"],
+            BrokerResourceKind::ApiToken => {
+                &["external_api", "cloud_api", "browser_automation", "secret"]
+            }
+            BrokerResourceKind::WorkloadIdentity => &["workload_identity"],
+            BrokerResourceKind::MtlsCertificate => &["mtls"],
+            BrokerResourceKind::DatabaseRole => &["database"],
+            BrokerResourceKind::FilesystemHandle
+            | BrokerResourceKind::NetworkLease
+            | BrokerResourceKind::ExternalActionCommitToken => &[],
+        };
+        if !expected_gateway_kinds.is_empty() {
+            let gateway_kind = required_json_string(&request.constraints, "gateway_kind")?;
+            if !expected_gateway_kinds.contains(&gateway_kind) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "broker gateway kind does not match the requested resource",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -463,7 +506,11 @@ fn revoke_broker_lease_record(lease: &mut BrokerLease) -> io::Result<()> {
         } => {
             let config = load_broker_adapter(&lease.adapter_id)?;
             let request = lease_to_request(lease);
-            invoke_broker_adapter(&config, "revoke", &request, Some(provider_handle.clone()))?;
+            let response =
+                invoke_broker_adapter(&config, "revoke", &request, Some(provider_handle.clone()))?;
+            lease.gateway_effects.extend(response.effects);
+            lease.effect_telemetry_complete = response.effect_telemetry_complete;
+            lease.public_metadata = response.public_metadata;
         }
         BrokerDelivery::CommitToken { commit_token_id } => {
             let token_path = external_commit_token_path(commit_token_id)?;
@@ -652,6 +699,23 @@ fn validate_broker_adapter_response(response: &BrokerAdapterResponse) -> io::Res
         || secret_shaped_string(&response.provider_handle)
         || !valid_gateway_endpoint(&response.gateway_endpoint)
         || contains_secret_shaped_json(&response.public_metadata)
+        || response.effects.iter().any(|effect| {
+            effect.occurred_at_ms == 0
+                || effect.target.trim().is_empty()
+                || effect.target == "*"
+                || effect.action.trim().is_empty()
+                || effect.action == "*"
+                || !effect.request_digest.starts_with("sha256:")
+                || effect.request_digest.len() != "sha256:".len() + 64
+                || effect
+                    .protocol
+                    .as_deref()
+                    .is_some_and(|protocol| protocol.trim().is_empty())
+                || effect
+                    .broker_handle_id
+                    .as_deref()
+                    .is_some_and(secret_shaped_string)
+        })
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -981,28 +1045,122 @@ fn persist_external_commit_token(token: &SignedExternalActionCommitToken) -> io:
     )
 }
 
-pub(super) fn revoke_attached_broker_leases(lease_ids: &[String]) -> io::Result<()> {
+pub(super) fn revoke_attached_broker_leases(lease_ids: &[String]) -> io::Result<Vec<BrokerLease>> {
     let mut errors = Vec::new();
+    let mut revoked = Vec::new();
     for lease_id in lease_ids {
         let result = (|| {
             let path = broker_lease_path(lease_id)?;
             let _lock = TcloneStateLock::acquire(&path)?;
             let mut lease = load_broker_lease(lease_id)?;
             revoke_broker_lease_record(&mut lease)?;
-            persist_broker_lease(&lease)
+            persist_broker_lease(&lease)?;
+            Ok::<BrokerLease, io::Error>(lease)
         })();
-        if let Err(error) = result {
-            errors.push(format!("{lease_id}: {error}"));
+        match result {
+            Ok(lease) => revoked.push(lease),
+            Err(error) => errors.push(format!("{lease_id}: {error}")),
         }
     }
     if errors.is_empty() {
-        Ok(())
+        Ok(revoked)
     } else {
         Err(io::Error::other(format!(
             "failed to revoke attached broker leases: {}",
             errors.join("; ")
         )))
     }
+}
+
+pub(super) fn active_attached_broker_leases(
+    lease_ids: &[String],
+    source_run_id: &str,
+    operation_id: &str,
+    cell_id: &str,
+    now_ms: u64,
+) -> io::Result<Vec<BrokerLease>> {
+    let mut leases = Vec::new();
+    let mut unique = BTreeSet::new();
+    for lease_id in lease_ids {
+        if !unique.insert(lease_id.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate broker lease attachment",
+            ));
+        }
+        let path = broker_lease_path(lease_id)?;
+        let _lock = TcloneStateLock::acquire(&path)?;
+        let lease = load_broker_lease(lease_id)?;
+        if lease.status != BrokerLeaseStatus::Active
+            || lease.source_run_id != source_run_id
+            || lease.operation_id != operation_id
+            || lease.cell_id.as_deref() != Some(cell_id)
+            || now_ms < lease.issued_at_ms
+            || now_ms >= lease.expires_at_ms
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("broker lease is inactive or bound to another operation: {lease_id}"),
+            ));
+        }
+        if let BrokerDelivery::Gateway {
+            gateway_endpoint, ..
+        } = &lease.delivery
+        {
+            validate_cell_gateway_socket(gateway_endpoint)?;
+        }
+        leases.push(lease);
+    }
+    Ok(leases)
+}
+
+fn validate_cell_gateway_socket(endpoint: &str) -> io::Result<PathBuf> {
+    let path = endpoint.strip_prefix("unix://").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cell-bound gateways must use a Unix socket so the cell can keep IP networking disabled",
+        )
+    })?;
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "broker gateway Unix socket must be absolute",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&path)?;
+    #[cfg(unix)]
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "broker gateway endpoint is not a Unix socket",
+        ));
+    }
+    #[cfg(not(unix))]
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "broker gateway endpoint is not a supported local endpoint",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "gateway has no parent"))?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "broker gateway parent must be a non-symlink directory",
+        ));
+    }
+    #[cfg(unix)]
+    if parent_metadata.permissions().mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "broker gateway parent must not be group- or world-writable",
+        ));
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -1133,6 +1291,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cell_gateway_requires_a_socket_in_a_private_directory() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let root = PathBuf::from("/tmp").join(format!("gs-{}", &suffix[..8]));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.join("gateway.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        assert_eq!(
+            validate_cell_gateway_socket(&format!("unix://{}", socket.display())).unwrap(),
+            socket
+        );
+        let regular = root.join("not-a-socket");
+        fs::write(&regular, "no").unwrap();
+        assert_eq!(
+            validate_cell_gateway_socket(&format!("unix://{}", regular.display()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn external_adapter_returns_only_gateway_and_opaque_handle() {
         let _guard = crate::cli_test_env_lock();
         let root = env::temp_dir().join(format!("gensee-broker-adapter-{}", Uuid::new_v4()));
@@ -1141,7 +1324,7 @@ mod tests {
         let executable = root.join("adapter.sh");
         fs::write(
             &executable,
-            "#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf '%s\\n' '{\"protocol_version\":1,\"provider_handle\":\"opaque_1\",\"gateway_endpoint\":\"unix:///run/gensee/repo.sock\",\"public_metadata\":{\"repository\":\"one\"}}'\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf '%s\\n' '{\"protocol_version\":1,\"provider_handle\":\"opaque_1\",\"gateway_endpoint\":\"unix:///run/gensee/repo.sock\",\"public_metadata\":{\"repository\":\"one\"},\"effects\":[],\"effect_telemetry_complete\":false}'\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();

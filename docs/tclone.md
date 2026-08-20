@@ -227,10 +227,10 @@ The orchestrator must declare mediators active for the specific operation;
 installation on the host is not enough. Boundaries include process/cgroup,
 filesystem, network, secret and workload-identity brokers, kernel controls,
 cloud/API and browser gateways, database proxy, and transactional output
-promotion. The current fresh-cell lease path invokes this engine with only its
-actually implemented filesystem and process/cgroup boundaries. Newly modeled
-authority therefore fails closed until the matching broker or gateway is
-attached.
+promotion. The fresh-cell lease path recomputes the decision immediately before
+execution from its actually active boundaries. Filesystem, process/cgroup,
+seccomp, AppArmor, and attached local broker gateways are supported; newly
+modeled or unattached authority fails closed.
 
 Typed filesystem operations are enforced by the fresh-cell path at this layer:
 `read` and `execute` selectors become read-only mounts, while `create`, `write`,
@@ -261,9 +261,12 @@ gensee run cell promote cell_... --into run_... --path Cargo.lock
 
 The cell is a fresh container rather than a live-memory clone. It does not
 inherit the source agent home, credentials, memory, host-control capability, or
-network. Its root filesystem is read-only, Linux capabilities are dropped,
-privilege gain is disabled, resources are capped, and only explicitly selected
-workspace paths are copied and mounted. Podman independently enforces the
+ambient network. Its root filesystem is read-only, Linux capabilities are
+dropped, privilege gain is disabled, an explicit seccomp deny profile and
+AppArmor profile are applied, resources are capped, and only explicitly
+selected workspace paths are copied and mounted. Attached broker authority is
+represented only by opaque ids and exact Unix-domain gateway socket mounts;
+the cell keeps `--network none`. Podman independently enforces the
 remaining lease lifetime and automatic removal as a backstop if the Gensee
 client exits. The exact command is fixed when the trusted host
 issues the lease; the lease is consumed atomically before scoped input copying,
@@ -290,10 +293,12 @@ successful promotion is appended to the manifest; a repeated or overlapping
 promotion is rejected. Use `--dry-run` to perform all evidence and conflict
 checks without changing the source.
 
-Network, identity, privileged, and external-mutation capabilities fail closed
-in this first implementation. They require separate brokers that can enforce
-resource-level grants and stage or account for external effects; enabling
-ordinary container networking would not satisfy that requirement.
+Direct network leases, policy-denied kernel authority, and external mutations
+fail closed. Repository/API, identity, mTLS, browser, cloud, and database
+authority can run only through a source/operation/cell-bound broker gateway.
+The gateway must return complete typed effect telemetry at revocation or the
+result cannot be promoted. Enabling ordinary container networking would not
+satisfy that requirement.
 
 Before cloning a tmux-backed source, `gensee run fork` may briefly detach the
 active `gensee-agent` client so tclone can checkpoint a stable process tree.
@@ -535,12 +540,13 @@ fork-specific run id after live cloning.
 
 ## Current Limitations
 
-- `--runtime tclone` is separate from `--sandbox linux` in this first version.
-  Linux seccomp, fanotify, and cgroup/nftables controls are not yet applied to
-  tclone containers by `gensee run`.
-- Tclone mode is not yet a confinement boundary. Source containers currently run
-  with unconfined seccomp/AppArmor settings required by the live-clone bring-up,
-  and copied agent/Gensee config is duplicated into each fork.
+- Long-lived `--runtime tclone` sources and live forks remain separate from
+  `--sandbox linux`; Linux fanotify and cgroup/nftables controls are not yet
+  applied to those containers by `gensee run`.
+- Fresh capability cells are a fail-closed confinement boundary. Long-lived
+  Tclone sources and live forks are not: they currently run with unconfined
+  seccomp/AppArmor settings required by live-clone bring-up, and copied
+  agent/Gensee config is duplicated into each fork.
 - Hook telemetry inside an already-running fork may still identify as the
   source run until post-fork rebind is implemented.
 - `gensee run merge` defaults to `--git`, which merges repo changes from the
