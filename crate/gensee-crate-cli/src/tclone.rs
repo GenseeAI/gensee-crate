@@ -60,6 +60,8 @@ const TCLONE_HOST_TMUX_RUN_OPTION: &str = "@gensee_run_id";
 const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
 const TCLONE_WAIT_QUIET_FOR_FORK_ENV: &str = "GENSEE_TCLONE_WAIT_QUIET_FOR_FORK";
 const TCLONE_FORK_TIMING_ENV: &str = "GENSEE_TCLONE_FORK_TIMING";
+const TCLONE_NETWORK_ENV: &str = "GENSEE_TCLONE_NETWORK";
+const TCLONE_FORWARD_ENV_ENV: &str = "GENSEE_TCLONE_FORWARD_ENV";
 const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
 const TCLONE_NODE_MOUNT_PATH: &str = "/opt/gensee-host-node";
 const TCLONE_NODE_BIN_MOUNT_PATH: &str = "/opt/gensee-host-node-bin";
@@ -4060,6 +4062,18 @@ fn run_tclone_agent_inner(
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
+    if let Some(network) = tclone_network()? {
+        create_args.push(OsString::from("--network"));
+        create_args.push(OsString::from(network));
+    }
+    for name in tclone_forward_env_names()? {
+        if env::var_os(&name).is_some() {
+            // Passing only the name asks Podman to copy the value from its
+            // environment without placing credentials in the process argv.
+            create_args.push(OsString::from("-e"));
+            create_args.push(OsString::from(name));
+        }
+    }
     if let Some(host_observer_socket) = host_observer_socket {
         create_args.push(OsString::from("-v"));
         create_args.push(OsString::from(format!(
@@ -10604,6 +10618,74 @@ fn tclone_podman() -> OsString {
         .unwrap_or_else(|| OsString::from("podman"))
 }
 
+fn tclone_network() -> io::Result<Option<String>> {
+    let Some(value) = env::var_os(TCLONE_NETWORK_ENV) else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{TCLONE_NETWORK_ENV} must be valid UTF-8"),
+        )
+    })?;
+    parse_tclone_network(&value)
+}
+
+fn parse_tclone_network(value: &str) -> io::Result<Option<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{TCLONE_NETWORK_ENV} contains unsupported characters: {value}"),
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn tclone_forward_env_names() -> io::Result<Vec<String>> {
+    let Some(value) = env::var_os(TCLONE_FORWARD_ENV_ENV) else {
+        return Ok(Vec::new());
+    };
+    let value = value.into_string().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{TCLONE_FORWARD_ENV_ENV} must be valid UTF-8"),
+        )
+    })?;
+    parse_tclone_forward_env_names(&value)
+}
+
+fn parse_tclone_forward_env_names(value: &str) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for raw in value.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let mut bytes = name.bytes();
+        let valid_start = bytes
+            .next()
+            .map(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            .unwrap_or(false);
+        if !valid_start || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{TCLONE_FORWARD_ENV_ENV} contains invalid environment name: {name}"),
+            ));
+        }
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
 fn tclone_host_observer_socket(gensee_home: &Path) -> Option<PathBuf> {
     let socket = tclone_observer_socket_path(gensee_home);
     fs::symlink_metadata(&socket)
@@ -14685,6 +14767,25 @@ gensee async job job_1: exited status=0
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 
         fs::remove_dir_all(run_root).ok();
+    }
+
+    #[test]
+    fn tclone_runtime_options_parse_network_and_forwarded_environment() {
+        assert_eq!(parse_tclone_network(" host ").unwrap(), Some("host".into()));
+        assert_eq!(
+            parse_tclone_network("bridge:lab_1").unwrap(),
+            Some("bridge:lab_1".into())
+        );
+        assert_eq!(parse_tclone_network("  ").unwrap(), None);
+        assert!(parse_tclone_network("host --privileged").is_err());
+
+        assert_eq!(
+            parse_tclone_forward_env_names("LITELLM_API_KEY, ARTIFACTORY_URL,LITELLM_API_KEY")
+                .unwrap(),
+            vec!["LITELLM_API_KEY", "ARTIFACTORY_URL"]
+        );
+        assert!(parse_tclone_forward_env_names("OK,BAD-NAME").is_err());
+        assert!(parse_tclone_forward_env_names("1BAD").is_err());
     }
 
     #[test]
