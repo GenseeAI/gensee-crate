@@ -417,14 +417,16 @@ final class ConsoleModel: ObservableObject {
                 response.deleted
                     + failures.filter(\.orphanedMetadataRemoved).map(\.id)
             )
-            for requestID in Array(recoveryPointsByRequest.keys) {
-                recoveryPointsByRequest[requestID]?.removeAll {
-                    removedIDs.contains($0.id)
-                }
+            recoveryPointsByRequest = recoveryPointsByRequest.filter {
+                !removedIDs.contains($0.value.id)
             }
-            noticeMessage = "Removed \(response.deleted.count) retained recovery point\(response.deleted.count == 1 ? "" : "s")."
+            let removedMessage = "Removed \(response.deleted.count) retained recovery point\(response.deleted.count == 1 ? "" : "s")."
             if let firstFailure = failures.first {
-                errorMessage = "\(failures.count) recovery point\(failures.count == 1 ? "" : "s") could not be fully removed. \(firstFailure.workspace): \(firstFailure.error)"
+                noticeMessage = nil
+                errorMessage = "\(removedMessage) \(failures.count) recovery point\(failures.count == 1 ? "" : "s") could not be fully removed. \(firstFailure.workspace): \(firstFailure.error)"
+            } else {
+                errorMessage = nil
+                noticeMessage = removedMessage
             }
         } catch {
             errorMessage = "Could not remove retained recovery points: \(error.localizedDescription)"

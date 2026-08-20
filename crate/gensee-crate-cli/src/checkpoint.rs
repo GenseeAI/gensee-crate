@@ -204,18 +204,13 @@ pub(crate) fn handle_checkpoint(args: Vec<OsString>) -> io::Result<()> {
             let response = if parsed.all_workspaces {
                 prune_all_checkpoints_at(&storage_root, cutoff, parsed.all_ages)?
             } else {
-                let mut deleted = Vec::new();
                 let repository = git_repository_root(&workspace)?;
-                for checkpoint in list_checkpoints_at(&repository, &storage_root)? {
-                    if parsed.all_ages || checkpoint.created_at_ms < cutoff {
-                        delete_checkpoint_at(&repository, &storage_root, &checkpoint.id)?;
-                        deleted.push(checkpoint.id);
-                    }
-                }
-                CheckpointDeleteResponse {
-                    deleted,
-                    failed: Vec::new(),
-                }
+                prune_repository_checkpoints_at(
+                    &repository,
+                    &storage_root,
+                    cutoff,
+                    parsed.all_ages,
+                )?
             };
             if parsed.json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -590,6 +585,13 @@ fn prune_all_checkpoints_at(
                 }),
             },
             Err(repository_error) => {
+                // The path may now be a symlink or nested under a different
+                // Git root. Delete only a ref that still resolves to this
+                // checkpoint's recorded commit, then discard stale metadata.
+                let _ = remove_matching_checkpoint_reference_at(
+                    Path::new(&checkpoint.workspace),
+                    &checkpoint,
+                );
                 let cleanup = remove_checkpoint_metadata_at(storage_root, &checkpoint);
                 let orphaned_metadata_removed = cleanup.is_ok();
                 let error = match cleanup {
@@ -605,6 +607,31 @@ fn prune_all_checkpoints_at(
                     orphaned_metadata_removed,
                 });
             }
+        }
+    }
+    Ok(CheckpointDeleteResponse { deleted, failed })
+}
+
+fn prune_repository_checkpoints_at(
+    repository: &Path,
+    storage_root: &Path,
+    cutoff: u64,
+    all_ages: bool,
+) -> io::Result<CheckpointDeleteResponse> {
+    let mut deleted = Vec::new();
+    let mut failed = Vec::new();
+    for checkpoint in list_checkpoints_at(repository, storage_root)? {
+        if !all_ages && checkpoint.created_at_ms >= cutoff {
+            continue;
+        }
+        match delete_checkpoint_at(repository, storage_root, &checkpoint.id) {
+            Ok(()) => deleted.push(checkpoint.id),
+            Err(error) => failed.push(CheckpointDeleteFailure {
+                id: checkpoint.id,
+                workspace: checkpoint.workspace,
+                error: error.to_string(),
+                orphaned_metadata_removed: false,
+            }),
         }
     }
     Ok(CheckpointDeleteResponse { deleted, failed })
@@ -626,6 +653,23 @@ fn checkpoint_repository_for_cleanup(checkpoint: &WorkspaceCheckpoint) -> io::Re
         ));
     }
     Ok(repository)
+}
+
+fn remove_matching_checkpoint_reference_at(
+    workspace: &Path,
+    checkpoint: &WorkspaceCheckpoint,
+) -> io::Result<bool> {
+    validate_checkpoint_id(&checkpoint.id)?;
+    let repository = git_repository_root(workspace)?;
+    let reference = format!("{CHECKPOINT_REF_PREFIX}/{}", checkpoint.id);
+    let Some(commit) = git_optional(&repository, &["rev-parse", "--verify", &reference])? else {
+        return Ok(false);
+    };
+    if commit != checkpoint.commit {
+        return Ok(false);
+    }
+    git(&repository, None, &["update-ref", "-d", &reference])?;
+    Ok(true)
 }
 
 pub(crate) fn ensure_request_recovery_point_in_repository(
@@ -1538,6 +1582,86 @@ mod tests {
                 .expect("check deleted ref"),
             None
         );
+        fs::remove_dir_all(sandbox).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_cleanup_removes_a_matching_ref_from_a_relocated_repository() {
+        let sandbox = test_directory("relocated-repository-cleanup");
+        let original_repository = sandbox.join("original");
+        let relocated_repository = sandbox.join("relocated");
+        let storage = sandbox.join("storage");
+        fs::create_dir_all(&original_repository).expect("create repository");
+        run_git(&original_repository, &["init"]);
+        fs::write(original_repository.join("file.txt"), "before").expect("write file");
+        let context = RecoveryPointContext {
+            request_id: 91,
+            session_id: "session-91",
+            provider: "codex",
+            trigger: "File mutation",
+        };
+        let checkpoint = ensure_request_recovery_point_at(
+            &original_repository,
+            &storage,
+            &context,
+            DEFAULT_CHECKPOINT_PRUNE_HOURS,
+        )
+        .expect("recovery point");
+        fs::rename(&original_repository, &relocated_repository).expect("move repository");
+        std::os::unix::fs::symlink(&relocated_repository, &original_repository)
+            .expect("link old path to relocated repository");
+
+        let response = prune_all_checkpoints_at(&storage, 0, true).expect("global prune");
+        assert!(response.deleted.is_empty());
+        assert_eq!(response.failed.len(), 1);
+        assert!(response.failed[0].orphaned_metadata_removed);
+        let reference = format!("{CHECKPOINT_REF_PREFIX}/{}", checkpoint.id);
+        assert_eq!(
+            git_optional(
+                &relocated_repository,
+                &["rev-parse", "--verify", &reference]
+            )
+            .expect("check relocated ref"),
+            None
+        );
+        assert!(list_all_checkpoints_at(&storage)
+            .expect("list after cleanup")
+            .is_empty());
+        fs::remove_dir_all(sandbox).expect("cleanup");
+    }
+
+    #[test]
+    fn single_workspace_prune_reports_one_failure_and_continues() {
+        let sandbox = test_directory("single-workspace-prune-failure");
+        let repository = sandbox.join("repo");
+        let storage = sandbox.join("storage");
+        fs::create_dir_all(&repository).expect("create repository");
+        run_git(&repository, &["init"]);
+        fs::write(repository.join("file.txt"), "first").expect("write first file");
+        let first = create_checkpoint_at(&repository, &storage, Some("First"), None)
+            .expect("first checkpoint");
+        fs::write(repository.join("file.txt"), "second").expect("write second file");
+        let second = create_checkpoint_at(&repository, &storage, Some("Second"), None)
+            .expect("second checkpoint");
+        let canonical = fs::canonicalize(&repository).expect("canonical repository");
+        let first_metadata = repository_checkpoint_directory(&storage, &canonical)
+            .join(format!("{}.json", first.id));
+        let mut invalid: WorkspaceCheckpoint =
+            serde_json::from_slice(&fs::read(&first_metadata).expect("read metadata"))
+                .expect("decode metadata");
+        invalid.id = "invalid/id".to_string();
+        fs::write(
+            first_metadata,
+            serde_json::to_vec(&invalid).expect("encode invalid metadata"),
+        )
+        .expect("write invalid metadata");
+
+        let response =
+            prune_repository_checkpoints_at(&canonical, &storage, 0, true).expect("prune");
+        assert_eq!(response.deleted, vec![second.id]);
+        assert_eq!(response.failed.len(), 1);
+        assert_eq!(response.failed[0].id, "invalid/id");
         fs::remove_dir_all(sandbox).expect("cleanup");
     }
 

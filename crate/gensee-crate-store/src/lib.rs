@@ -3026,24 +3026,14 @@ fn dashboard_request_file_touches(
             ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
             LIMIT 100
          ),
-         raw_touches AS (
+         request_artifacts AS MATERIALIZED (
             SELECT request_relation.src_id AS request_id,
+                   artifacts.artifact_id,
                    CASE
                      WHEN artifacts.uri LIKE 'file://%' THEN substr(artifacts.uri, 8)
                      WHEN artifacts.uri LIKE 'file:%' THEN substr(artifacts.uri, 6)
                      ELSE artifacts.uri
-                   END AS path,
-                   EXISTS (
-                     SELECT 1
-                     FROM relations AS declared_relation
-                     JOIN agent_events AS declaring_event
-                       ON declaring_event.event_id = declared_relation.src_id
-                     WHERE declared_relation.src_kind = 'agent_event'
-                       AND declared_relation.dst_kind = 'artifact'
-                       AND declared_relation.dst_id = artifacts.artifact_id
-                       AND declared_relation.relation_type IN ('produced', 'modified', 'deleted')
-                       AND declaring_event.request_id = request_relation.src_id
-                   ) AS intended_and_verified
+                   END AS path
             FROM recent_requests
             JOIN relations AS request_relation INDEXED BY idx_relations_src
               ON request_relation.src_kind = 'request'
@@ -3051,19 +3041,42 @@ fn dashboard_request_file_touches(
              AND request_relation.dst_kind = 'artifact'
              AND request_relation.relation_type IN ('produced', 'modified', 'deleted')
             JOIN artifacts ON artifacts.artifact_id = request_relation.dst_id
+            WHERE gensee_dashboard_file_touch_is_background(
+                    CASE
+                      WHEN artifacts.uri LIKE 'file://%' THEN substr(artifacts.uri, 8)
+                      WHEN artifacts.uri LIKE 'file:%' THEN substr(artifacts.uri, 6)
+                      ELSE artifacts.uri
+                    END
+                  ) = 0
+            GROUP BY request_relation.src_id, artifacts.artifact_id, artifacts.uri
+         ),
+         raw_touches AS (
+            SELECT request_artifacts.request_id,
+                   request_artifacts.path,
+                   EXISTS (
+                     SELECT 1
+                     FROM relations AS declared_relation
+                     JOIN agent_events AS declaring_event
+                       ON declaring_event.event_id = declared_relation.src_id
+                     WHERE declared_relation.src_kind = 'agent_event'
+                       AND declared_relation.dst_kind = 'artifact'
+                       AND declared_relation.dst_id = request_artifacts.artifact_id
+                       AND declared_relation.relation_type IN ('produced', 'modified', 'deleted')
+                       AND declaring_event.request_id = request_artifacts.request_id
+                   ) AS intended_and_verified
+            FROM request_artifacts
             WHERE EXISTS (
               SELECT 1
               FROM relations AS observed_relation INDEXED BY idx_relations_dst
               JOIN system_events
                 ON system_events.event_id = observed_relation.src_id
-               AND system_events.request_id = recent_requests.request_id
+               AND system_events.request_id = request_artifacts.request_id
                AND system_events.source = 'macos-endpoint-security'
               WHERE observed_relation.src_kind = 'system_event'
                 AND observed_relation.dst_kind = 'artifact'
-                AND observed_relation.dst_id = artifacts.artifact_id
+                AND observed_relation.dst_id = request_artifacts.artifact_id
                 AND observed_relation.relation_type IN ('wrote', 'modified', 'deleted')
             )
-            GROUP BY request_relation.src_id, artifacts.artifact_id, artifacts.uri
          ),
          candidate_touches AS (
             SELECT request_id, path, intended_and_verified,
@@ -3072,7 +3085,6 @@ fn dashboard_request_file_touches(
                      ORDER BY path
                    ) AS touch_rank
             FROM raw_touches
-            WHERE gensee_dashboard_file_touch_is_background(path) = 0
          )
          SELECT request_id, path, intended_and_verified
          FROM candidate_touches
