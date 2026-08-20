@@ -562,15 +562,21 @@ final class ConsoleModel: ObservableObject {
                 CheckpointDeleteResponse.self,
                 from: Data(output.stdout.utf8)
             )
+            let orphaned = response.orphaned ?? []
             let failures = response.failed ?? []
             let removedIDs = Set(
                 response.deleted
+                    + orphaned.map(\.id)
                     + failures.filter(\.orphanedMetadataRemoved).map(\.id)
             )
             recoveryPointsByRequest = recoveryPointsByRequest.filter {
                 !removedIDs.contains($0.value.id)
             }
-            let removedMessage = "Removed \(response.deleted.count) retained recovery point\(response.deleted.count == 1 ? "" : "s")."
+            let removedCount = response.deleted.count + orphaned.count
+            var removedMessage = "Removed \(removedCount) retained recovery point\(removedCount == 1 ? "" : "s")."
+            if !orphaned.isEmpty {
+                removedMessage += " \(orphaned.count) orphaned record\(orphaned.count == 1 ? " was" : "s were") cleaned up."
+            }
             if let firstFailure = failures.first {
                 noticeMessage = nil
                 errorMessage = "\(removedMessage) \(failures.count) recovery point\(failures.count == 1 ? "" : "s") could not be fully removed. \(firstFailure.workspace): \(firstFailure.error)"
@@ -832,6 +838,77 @@ final class ConsoleModel: ObservableObject {
         }
         do {
             _ = try await cli.run(arguments)
+            await refreshDashboard(reportErrors: false)
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Persist a rule-scoped review adjustment in the active policy. Unlike
+    /// thumbs feedback, this changes how the same rule is classified and
+    /// enforced for future findings while preserving the immutable alert log.
+    func tuneFinding(
+        _ alert: SecurityAlert,
+        severity: String? = nil,
+        action: String? = nil
+    ) async -> Bool {
+        guard !isDemoMode else {
+            noticeMessage = "Synthetic demo mode never changes your policy."
+            return false
+        }
+        guard feedbackAlertID == nil else { return false }
+        feedbackAlertID = alert.alertID
+        defer { feedbackAlertID = nil }
+
+        do {
+            guard var root = try JSONSerialization.jsonObject(
+                with: Data(policyDocument.utf8)
+            ) as? [String: Any] else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+            var overrides = root["review_overrides"] as? [[String: Any]] ?? []
+            var reviewOverride = overrides.first {
+                ($0["rule_id"] as? String) == alert.ruleID
+            } ?? ["rule_id": alert.ruleID]
+            overrides.removeAll { ($0["rule_id"] as? String) == alert.ruleID }
+            if let severity { reviewOverride["severity"] = severity.lowercased() }
+            if let action { reviewOverride["action"] = action.lowercased() }
+            overrides.append(reviewOverride)
+            root["review_overrides"] = overrides
+            let data = try JSONSerialization.data(
+                withJSONObject: root,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+            let saved = await savePolicyDocument(String(decoding: data, as: UTF8.self))
+            guard saved else { return false }
+
+            let effectiveSeverity = (reviewOverride["severity"] as? String) ?? alert.severity.lowercased()
+            let effectiveAction = (reviewOverride["action"] as? String) ?? alert.action.lowercased()
+
+            var feedbackArguments = [
+                "feedback", "record",
+                "--verdict", "agree",
+                "--event-key", "alert:\(alert.alertID)",
+                "--gensee", alert.action,
+                "--label", "rule_tuning",
+                "--rule", alert.ruleID,
+                "--note", "future severity=\(effectiveSeverity); future action=\(effectiveAction)",
+            ]
+            if let sessionID = alert.sessionID, !sessionID.isEmpty {
+                feedbackArguments += ["--session", sessionID]
+            }
+            if let path = alert.path, !path.isEmpty {
+                feedbackArguments += ["--path", path]
+            }
+            var auditNote = ""
+            do {
+                _ = try await cli.run(feedbackArguments)
+            } catch {
+                auditNote = " The policy was saved, but its local audit note could not be recorded."
+            }
+            noticeMessage = "Future \(alert.ruleID) findings will use \(effectiveSeverity.uppercased()) · \(effectiveAction.uppercased()).\(auditNote)"
             await refreshDashboard(reportErrors: false)
             return true
         } catch {

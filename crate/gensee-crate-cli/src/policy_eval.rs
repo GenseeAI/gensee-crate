@@ -29,6 +29,7 @@ impl PolicyAction {
     fn from_policy(action: policy::Action) -> Self {
         match action {
             policy::Action::Allow => Self::Allow,
+            policy::Action::Warn => Self::Warn,
             policy::Action::Ask => Self::Ask,
             policy::Action::Block => Self::Block,
         }

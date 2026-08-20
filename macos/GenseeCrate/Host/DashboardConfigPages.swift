@@ -845,7 +845,7 @@ struct DashboardSettingsPage: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(notifications.isAuthorized ? "Notifications are allowed" : "Notifications need macOS permission")
                         .font(.system(size: 12, weight: .semibold))
-                    Text("Clean completions stay in Agent Inbox history. Gensee interrupts you only for scope drift, blocked or high-risk activity, or stale verification.")
+                    Text("Clean completions stay in Review Queue history. Gensee interrupts you only for scope drift, blocked or high-risk activity, or stale verification.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }

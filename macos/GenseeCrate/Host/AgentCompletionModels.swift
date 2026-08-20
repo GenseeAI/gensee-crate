@@ -1,5 +1,15 @@
 import Foundation
 
+func searchTermsMatch(_ search: String, fields: [String?]) -> Bool {
+    let terms = search
+        .split(whereSeparator: { $0.isWhitespace })
+        .map(String.init)
+    guard !terms.isEmpty else { return true }
+
+    let searchableText = fields.compactMap { $0 }.joined(separator: "\n")
+    return terms.allSatisfy { searchableText.localizedCaseInsensitiveContains($0) }
+}
+
 enum NotificationSeverity: String, CaseIterable, Identifiable {
     case critical
     case high
@@ -107,7 +117,7 @@ struct AgentCompletionSummary: Identifiable, Equatable {
         return lastMutationAt > lastTestAt
     }
 
-    /// The deliberately narrow signal shared by the Agent Inbox, menu bar,
+    /// The deliberately narrow signal shared by the Review Queue, menu bar,
     /// and native notifications. Routine warnings and clean completions stay
     /// in history instead of interrupting the developer.
     var attentionSignal: AgentAttentionSignal? {
@@ -310,7 +320,10 @@ enum AgentCompletionDerivation {
                 "\($0.ruleID)|\($0.path ?? "")|\($0.action.lowercased())"
             }).count
             let incompleteToolEvidence = calls.contains { $0.endTimestamp == nil }
-            let lastTestAt = calls.filter(isTestCall).map(\.startTimestamp).max()
+            let lastTestAt = calls
+                .filter(isTestCall)
+                .map { $0.endTimestamp ?? $0.startTimestamp }
+                .max()
             let lastMutationAt = classifiedTouches.compactMap(\.lastObservedAt).max()
             let staleVerification = lastTestAt != nil && lastMutationAt != nil && lastMutationAt! > lastTestAt!
             let reviewState: AgentReviewState

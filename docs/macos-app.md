@@ -12,7 +12,7 @@ console.
 
 ## What the app manages
 
-- A decision-first **Status** page and **Review Queue** backed by the existing
+- A decision-first **Overview** page and **Review Queue** backed by the existing
   Rust CLI and local store. Requests are classified as Verified, Review
   recommended, Needs attention, or Incomplete evidence.
 - A **Daily Highlight** view with today's summary and rolling 53-week heatmaps

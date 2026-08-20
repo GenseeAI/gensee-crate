@@ -298,6 +298,29 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertEqual(summary.attentionSignal?.kind, .staleVerification)
     }
 
+    func testMutationDuringVerificationDoesNotMakeCompletedVerificationStale() throws {
+        var snapshot = SecuritySnapshot()
+        var recordedRequest = request(id: 7, started: 1_000, completed: 4_000)
+        recordedRequest.fileTouches = [
+            FileTouchEvidence(
+                path: "/repo/App.swift",
+                intendedAndVerified: true,
+                lastObservedAt: 2_500
+            ),
+        ]
+        snapshot.requests = [recordedRequest]
+        snapshot.agentEvents = [
+            event(id: 1, type: "PreToolUse", timestamp: 2_000, tool: "Bash", input: #"{"command":"swift test"}"#, useID: "test"),
+            event(id: 2, type: "PostToolUse", timestamp: 3_000, tool: "Bash", useID: "test"),
+        ]
+
+        let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
+
+        XCTAssertEqual(summary.lastTestAt, 3_000)
+        XCTAssertFalse(summary.testEvidenceIsStale)
+        XCTAssertNil(summary.attentionSignal)
+    }
+
     func testSensitiveFileTouchCarriesDecisionBadges() throws {
         var snapshot = SecuritySnapshot()
         var recordedRequest = request(id: 7, started: 1_000, completed: 8_000)
@@ -348,6 +371,17 @@ final class AgentCompletionModelsTests: XCTestCase {
         XCTAssertFalse(NotificationSeverity.high.includes("medium"))
         XCTAssertTrue(NotificationSeverity.info.includes("info"))
         XCTAssertTrue(NotificationSeverity.info.includes("unknown"))
+    }
+
+    func testSearchMatchesMultipleTermsAcrossPromptAndFileFields() {
+        XCTAssertTrue(searchTermsMatch(
+            "auth migration",
+            fields: ["Refactor the authentication flow", "/repo/db/migrations/2026.sql"]
+        ))
+        XCTAssertFalse(searchTermsMatch(
+            "auth payment",
+            fields: ["Refactor the authentication flow", "/repo/db/migrations/2026.sql"]
+        ))
     }
 
     private func request(id: Int64, started: Int64, completed: Int64) -> RecordedRequest {

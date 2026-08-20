@@ -5,6 +5,7 @@ import SwiftUI
 struct DashboardOverviewPage: View {
     @ObservedObject var model: ConsoleModel
     @ObservedObject var sensor: EndpointSecuritySensor
+    @StateObject private var findingColumns = AlertColumnLayout()
 
     private var reviews: [AgentCompletionSummary] {
         AgentCompletionDerivation.summaries(from: model.snapshot)
@@ -18,8 +19,8 @@ struct DashboardOverviewPage: View {
         DashboardPage {
             VStack(alignment: .leading, spacing: 16) {
                 DashboardPageHeader(
-                    "Status",
-                    description: "What needs your decision, what is independently verified, and whether protection is healthy."
+                    "Overview",
+                    description: "What is ready for review, what is independently verified, and whether protection is healthy."
                 ) {
                     if let updated = model.lastUpdated {
                         Text("Updated \(updated.formatted(.relative(presentation: .named)))")
@@ -63,7 +64,7 @@ struct DashboardOverviewPage: View {
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.dashboardLine))
 
                 HStack(spacing: 16) {
-                    DashboardStatCard(title: "Needs you", value: reviews.filter { model.reviewNeedsAttention($0) }.count, symbol: "bell.badge", color: .dashboardRed)
+                    DashboardStatCard(title: "To review", value: reviews.filter { model.reviewNeedsAttention($0) }.count, symbol: "bell.badge", color: .dashboardRed)
                     DashboardStatCard(title: "Scope drift", value: issueCount(.scopeDrift), symbol: "arrow.triangle.branch", color: .dashboardGold)
                     DashboardStatCard(title: "Blocked actions", value: issueCount(.blockedAction), symbol: "hand.raised", color: .dashboardRed)
                     DashboardStatCard(title: "Clean history", value: reviews.filter { !$0.needsIntervention }.count, symbol: "checkmark.circle", color: .dashboardGreen)
@@ -79,10 +80,10 @@ struct DashboardOverviewPage: View {
                         DashboardEmpty(text: "No recent alerts — all clear.", symbol: "checkmark.shield")
                     } else {
                         VStack(spacing: 0) {
-                            AlertListHeader()
+                            AlertListHeader(layout: findingColumns)
                             ForEach(model.snapshot.alerts.prefix(10)) { alert in
                                 Divider()
-                                ExpandableAlertRow(alert: alert, model: model)
+                                ExpandableAlertRow(alert: alert, model: model, layout: findingColumns)
                             }
                         }
                     }
@@ -106,7 +107,7 @@ private enum WorkReviewSection: String, CaseIterable, Identifiable {
 }
 
 private enum WorkReviewFilter: String, CaseIterable, Identifiable {
-    case actionNeeded = "Needs you"
+    case actionNeeded = "To review"
     case all = "All history"
     case verified = "Clean"
     case incomplete = "Incomplete evidence"
@@ -154,6 +155,10 @@ struct DashboardWorkReviewPage: View {
         }
     }
 
+    private var hasSearchQuery: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private var resolvedSelection: WorkReviewSelection? {
         if let selection, selectionExists(selection) { return selection }
         return sessions.first?.requests.first.map { .request($0.requestID) }
@@ -167,8 +172,8 @@ struct DashboardWorkReviewPage: View {
     var body: some View {
         VStack(spacing: 0) {
             DashboardPageHeader(
-                "Agent Inbox",
-                description: "One place for work that needs you across Codex, Claude, Cursor, and other agents. Clean completions stay in history."
+                "Review Queue",
+                description: "Review scope drift, blocked actions, high-risk activity, and stale verification across every agent. Clean completions stay in history."
             ) {
                 if let updated = model.lastUpdated {
                     Text("Updated \(updated.formatted(.relative(presentation: .named)))")
@@ -186,7 +191,13 @@ struct DashboardWorkReviewPage: View {
             Divider()
 
             if sessions.isEmpty {
-                if filter == .actionNeeded {
+                if hasSearchQuery {
+                    DashboardEmpty(
+                        text: "No requests match every search term. Search covers prompts, harnesses, session IDs, and touched files across all loaded history.",
+                        symbol: "magnifyingglass"
+                    )
+                    .padding(24)
+                } else if filter == .actionNeeded {
                     AgentInboxClearCard {
                         filter = .all
                     }
@@ -218,7 +229,7 @@ struct DashboardWorkReviewPage: View {
                   sessions.contains(where: { $0.requests.contains(where: { $0.requestID == requestID }) })
             else { return }
             selection = .request(requestID)
-            section = .files
+            section = .findings
             model.requestedReviewRequestID = nil
         }
         .task(id: selectedRequestID) {
@@ -232,12 +243,12 @@ struct DashboardWorkReviewPage: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("TASKS BY HARNESS")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(.system(size: 11, weight: .bold))
                         .tracking(0.9)
                         .foregroundStyle(.secondary)
                     Spacer()
                     Text("\(sessions.reduce(0) { $0 + $1.requestCount }) requests")
-                        .font(.system(size: 9))
+                        .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }
                 Picker("Filter", selection: $filter) {
@@ -246,6 +257,11 @@ struct DashboardWorkReviewPage: View {
                 .pickerStyle(.menu)
                 .labelsHidden()
                 .frame(maxWidth: .infinity)
+                if hasSearchQuery {
+                    Label("Searching all loaded history", systemImage: "magnifyingglass")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(14)
             .background(Color.dashboardMutedFill.opacity(0.55))
@@ -262,7 +278,7 @@ struct DashboardWorkReviewPage: View {
                                     section = .files
                                 }
                             ),
-                            initiallyExpanded: index == 0
+                            initiallyExpanded: index == 0 || sessionContainsResolvedSelection(session)
                         )
                     }
                 }
@@ -305,11 +321,13 @@ struct DashboardWorkReviewPage: View {
         case .verified: matchesFilter = request.reviewState == .verified
         case .incomplete: matchesFilter = request.reviewState == .incomplete
         }
-        return matchesFilter && containsSearch(
+        let matchesQuery = containsSearch(
             searchText,
             fields: request.prompt, request.harness, request.sessionID,
-            request.affectedFiles.joined(separator: " ")
+            String(request.requestID), request.affectedFiles.joined(separator: " "),
+            request.strongestSeverity, request.strongestAction
         )
+        return matchesQuery && (hasSearchQuery || matchesFilter)
     }
 
     private func selectionExists(_ selection: WorkReviewSelection) -> Bool {
@@ -319,7 +337,22 @@ struct DashboardWorkReviewPage: View {
         }
     }
 
+    private func sessionContainsResolvedSelection(_ session: AgentSessionSummary) -> Bool {
+        switch resolvedSelection {
+        case let .session(id): return session.sessionID == id
+        case let .request(id): return session.requests.contains { $0.requestID == id }
+        case nil: return false
+        }
+    }
+
     private func establishSelection() {
+        if let requestID = model.requestedReviewRequestID,
+           selectionExists(.request(requestID)) {
+            selection = .request(requestID)
+            section = .findings
+            model.requestedReviewRequestID = nil
+            return
+        }
         guard resolvedSelection == nil, let request = sessions.first?.requests.first else { return }
         selection = .request(request.requestID)
     }
@@ -336,11 +369,11 @@ private struct AgentInboxAttentionBar: View {
                 size: 13,
                 weight: .regular
             )
-            Text(counts.isEmpty ? "No agent needs you right now" : "Needs you across harnesses")
-                .font(.system(size: 11, weight: .semibold))
+            Text(counts.isEmpty ? "No reviews pending" : "Requests to review")
+                .font(.system(size: 13, weight: .semibold))
             if counts.isEmpty {
                 Text("Clean work remains available under All history.")
-                    .font(.system(size: 10))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(counts) { item in
@@ -348,7 +381,7 @@ private struct AgentInboxAttentionBar: View {
                         Text(item.harness)
                         Text(item.count.formatted()).fontWeight(.bold)
                     }
-                    .font(.system(size: 9))
+                    .font(.system(size: 11))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(Color.dashboardGold.opacity(0.11), in: Capsule())
@@ -356,7 +389,7 @@ private struct AgentInboxAttentionBar: View {
             }
             Spacer()
             Text("Notifications stay silent for clean completions")
-                .font(.system(size: 9))
+                .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 12)
@@ -373,7 +406,7 @@ private struct AgentInboxClearCard: View {
         DashboardCard {
             VStack(spacing: 12) {
                 DashboardSymbol("checkmark.circle.fill", color: .dashboardGreen, size: 28, weight: .regular)
-                Text("No agent needs you")
+                Text("All caught up")
                     .font(.system(size: 18, weight: .semibold))
                 Text("Gensee found no scope drift, blocked or high-risk activity, or stale verification in completed work.")
                     .font(.system(size: 11))
@@ -405,7 +438,7 @@ private struct WorkReviewSessionGroup: View {
             HStack(spacing: 7) {
                 Button { expanded.toggle() } label: {
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .rotationEffect(.degrees(expanded ? 90 : 0))
                         .frame(width: 14)
                 }
@@ -414,13 +447,13 @@ private struct WorkReviewSessionGroup: View {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 6) {
                             Circle().fill(session.needsIntervention ? Color.dashboardRed : reviewStateColor(session.reviewState)).frame(width: 7, height: 7)
-                            Text(session.harness).font(.system(size: 11, weight: .semibold))
+                            Text(session.harness).font(.system(size: 13, weight: .semibold))
                             Spacer()
-                            Text("\(session.requestCount)").font(.system(size: 10, weight: .semibold))
-                            Text("req").font(.system(size: 9)).foregroundStyle(.secondary)
+                            Text("\(session.requestCount)").font(.system(size: 12, weight: .semibold))
+                            Text("req").font(.system(size: 11)).foregroundStyle(.secondary)
                         }
                         Text("\(relativeTimestamp(session.completedAt)) · \(formattedDuration(session.durationMS))")
-                            .font(.system(size: 9))
+                            .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                     }
                     .contentShape(Rectangle())
@@ -440,15 +473,15 @@ private struct WorkReviewSessionGroup: View {
                                 Circle().fill(request.needsIntervention ? Color.dashboardRed : reviewStateColor(request.reviewState)).frame(width: 6, height: 6).padding(.top, 4)
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(request.prompt)
-                                        .font(.system(size: 10, weight: selection == .request(request.requestID) ? .semibold : .regular))
+                                        .font(.system(size: 12, weight: selection == .request(request.requestID) ? .semibold : .regular))
                                         .lineLimit(2)
                                         .multilineTextAlignment(.leading)
                                     HStack(spacing: 7) {
                                         Text(relativeTimestamp(request.completedAt))
                                         Text("\(request.toolCallCount) tools")
-                                        if request.alertCount > 0 { Text("\(request.alertCount) findings") }
+                                        if request.decisionCount > 0 { Text("\(request.decisionCount) findings") }
                                     }
-                                    .font(.system(size: 8))
+                                    .font(.system(size: 10))
                                     .foregroundStyle(.secondary)
                                 }
                                 Spacer(minLength: 0)
@@ -463,6 +496,16 @@ private struct WorkReviewSessionGroup: View {
                     }
                 }
                 .padding(.leading, 18)
+            }
+        }
+        .onChange(of: selection) { selection in
+            switch selection {
+            case let .session(id) where id == session.sessionID:
+                expanded = true
+            case let .request(id) where session.requests.contains(where: { $0.requestID == id }):
+                expanded = true
+            default:
+                break
             }
         }
     }
@@ -500,7 +543,8 @@ private struct RequestReviewDetail: View {
             ReviewSectionPicker(
                 section: $section,
                 findingCount: effectiveFindingCount,
-                fileCount: effectiveSummary.affectedFiles.count
+                fileCount: effectiveSummary.affectedFiles.count,
+                isLoading: requestEvidenceIsLoading
             )
             switch section {
             case .timeline:
@@ -557,7 +601,29 @@ private struct RequestReviewDetail: View {
     }
 
     private var effectiveFindingCount: Int {
-        payload?.alerts.count ?? summary.alertCount
+        guard let payload else { return summary.decisionCount }
+        return ReviewDecisionGroup.grouped(from: payload.alerts).count
+    }
+
+    private var requestEvidenceIsLoading: Bool {
+        guard payload == nil else { return false }
+        if case let .unavailable(requestID, _) = model.requestReviewLoadState,
+           requestID == summary.requestID
+        {
+            return false
+        }
+        return true
+    }
+
+    private var requestEvidenceLoadingMessage: String {
+        switch section {
+        case .timeline:
+            "Loading the complete execution timeline…"
+        case .findings:
+            "Loading correlated findings and evidence…"
+        case .files:
+            "Loading Endpoint Security file evidence…"
+        }
     }
 
     private var recoveryPoint: WorkspaceCheckpointRecord? {
@@ -609,23 +675,13 @@ private struct RequestReviewDetail: View {
             content()
         case let .loading(requestID) where requestID == summary.requestID:
             DashboardCard {
-                HStack(spacing: 10) {
-                    ProgressView().controlSize(.small)
-                    Text("Loading complete request evidence…")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
+                DashboardLoadingHint(message: requestEvidenceLoadingMessage)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(6)
             }
         case .idle:
             DashboardCard {
-                HStack(spacing: 10) {
-                    ProgressView().controlSize(.small)
-                    Text("Loading complete request evidence…")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
+                DashboardLoadingHint(message: requestEvidenceLoadingMessage)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(6)
             }
@@ -635,12 +691,7 @@ private struct RequestReviewDetail: View {
             }
         default:
             DashboardCard {
-                HStack(spacing: 10) {
-                    ProgressView().controlSize(.small)
-                    Text("Loading complete request evidence…")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
+                DashboardLoadingHint(message: requestEvidenceLoadingMessage)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(6)
             }
@@ -668,11 +719,9 @@ private struct ReviewResolutionRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(handled ? "Marked as reviewed" : recommendedTitle)
                     .font(.system(size: 12, weight: .semibold))
-                Text(handled ? "This stays in history. New evidence will return it to Needs You." : recommendedDetail)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
+            .help(handled ? "This stays in history. New evidence will return it to the Review Queue." : recommendedDetail)
+            .accessibilityHint(handled ? "This stays in history. New evidence will return it to the Review Queue." : recommendedDetail)
             Spacer(minLength: 16)
             if handled {
                 Button("Return to Needs You", action: returnToNeedsYou)
@@ -749,10 +798,9 @@ private struct RecoveryPointReviewRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Recovery point created before changes")
                     .font(.system(size: 12, weight: .semibold))
-                Text(recoveryPoint.trigger ?? "Captured before the first risky or mutating tool call.")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
             }
+            .help(recoveryPoint.trigger ?? "Captured before the first risky or mutating tool call.")
+            .accessibilityHint(recoveryPoint.trigger ?? "Captured before the first risky or mutating tool call.")
             Spacer()
             Text(Date(timeIntervalSince1970: TimeInterval(recoveryPoint.createdAtMS) / 1_000).formatted(date: .omitted, time: .shortened))
                 .font(.system(size: 9, design: .monospaced))
@@ -782,11 +830,15 @@ private struct SessionReviewDetail: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            SessionReviewCard(session: session)
+            SessionReviewCard(
+                session: session,
+                findingCount: ReviewDecisionGroup.grouped(from: findings).count
+            )
             ReviewSectionPicker(
                 section: $section,
-                findingCount: findings.count,
-                fileCount: session.affectedFiles.count
+                findingCount: ReviewDecisionGroup.grouped(from: findings).count,
+                fileCount: session.affectedFiles.count,
+                isLoading: false
             )
             switch section {
             case .timeline:
@@ -815,6 +867,7 @@ private struct SessionReviewDetail: View {
 
 private struct SessionReviewCard: View {
     let session: AgentSessionSummary
+    let findingCount: Int
 
     var body: some View {
         DashboardCard {
@@ -831,15 +884,17 @@ private struct SessionReviewCard: View {
                         HStack(spacing: 8) {
                             Text("Session summary").font(.system(size: 18, weight: .semibold))
                             DashboardTag(text: session.harness, color: .dashboardBlue)
+                            Text(relativeTimestamp(session.completedAt))
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
                         }
-                        Text("\(session.requestCount) completed request\(session.requestCount == 1 ? "" : "s") · \(relativeTimestamp(session.completedAt))")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
+                    .help("\(session.requestCount) completed request\(session.requestCount == 1 ? "" : "s")")
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text(formattedDuration(session.durationMS)).font(.system(size: 17, weight: .semibold, design: .rounded))
-                        Text("session span").font(.system(size: 9)).foregroundStyle(.secondary)
-                    }
+                    Text(formattedDuration(session.durationMS))
+                        .font(.system(size: 17, weight: .semibold, design: .rounded))
+                        .help("Session span")
+                        .accessibilityLabel("Session span: \(formattedDuration(session.durationMS))")
                 }
                 HStack(spacing: 0) {
                     ReviewMetric(value: session.requestCount, label: "requests", symbol: "text.bubble")
@@ -848,7 +903,7 @@ private struct SessionReviewCard: View {
                     reviewMetricDivider
                     ReviewMetric(value: session.affectedFiles.count, label: "files touched", symbol: "doc.badge.ellipsis")
                     reviewMetricDivider
-                    ReviewMetric(value: session.alertCount, label: "findings", symbol: "exclamationmark.triangle")
+                    ReviewMetric(value: findingCount, label: "findings", symbol: "exclamationmark.triangle")
                 }
                 .padding(.vertical, 12)
                 .background(Color.dashboardMutedFill.opacity(0.72), in: RoundedRectangle(cornerRadius: 7))
@@ -867,23 +922,32 @@ private struct ReviewSectionPicker: View {
     @Binding var section: WorkReviewSection
     let findingCount: Int
     let fileCount: Int
+    let isLoading: Bool
 
     var body: some View {
-        Picker("Review detail", selection: $section) {
-            ForEach(WorkReviewSection.allCases) { item in
-                Text(sectionTitle(item)).tag(item)
+        VStack(alignment: .leading, spacing: 7) {
+            Picker("Review detail", selection: $section) {
+                ForEach(WorkReviewSection.allCases) { item in
+                    Text(sectionTitle(item)).tag(item)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 420)
+
+            if isLoading {
+                DashboardLoadingHint(message: "Loading request timeline, findings, and files…", compact: true)
+                    .transition(.opacity)
             }
         }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .frame(maxWidth: 420)
+        .animation(.easeInOut(duration: 0.15), value: isLoading)
     }
 
     private func sectionTitle(_ item: WorkReviewSection) -> String {
         switch item {
         case .timeline: "Timeline"
-        case .findings: "Findings (\(findingCount))"
-        case .files: "Files (\(fileCount))"
+        case .findings: isLoading ? "Findings (…)" : "Findings (\(findingCount))"
+        case .files: isLoading ? "Files (…)" : "Files (\(fileCount))"
         }
     }
 }
@@ -914,7 +978,7 @@ private struct ReviewFilesPanel: View {
                     )
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
-                    .help("The detailed ignored-event scan is bounded to keep Agent Inbox responsive.")
+                    .help("The detailed ignored-event scan is bounded to keep Review Queue responsive.")
                 }
                 if ignoredPathsTruncated {
                     Label(
@@ -923,7 +987,7 @@ private struct ReviewFilesPanel: View {
                     )
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
-                    .help("The ignored-path list is bounded to keep Agent Inbox responsive.")
+                    .help("The ignored-path list is bounded to keep Review Queue responsive.")
                 }
                 Divider()
                 if affectedFiles.isEmpty {
@@ -958,6 +1022,7 @@ private struct ReviewFilesPanel: View {
                                 ForEach(sensitive?.riskLabels ?? [], id: \.self) { label in
                                     DashboardTag(text: label, color: .dashboardRed)
                                 }
+                                DashboardPathActions(path: path)
                             }
                             .help(
                                 verified
@@ -1131,8 +1196,52 @@ private struct LifecycleStop: View {
 private struct ReviewFindingsPanel: View {
     let alerts: [SecurityAlert]
     @ObservedObject var model: ConsoleModel
+    @StateObject private var columns = AlertColumnLayout()
 
     private var decisions: [ReviewDecisionGroup] {
+        ReviewDecisionGroup.grouped(from: alerts)
+    }
+
+    var body: some View {
+        DashboardCard("Findings in this review") {
+            if decisions.isEmpty {
+                DashboardEmpty(text: "No findings were correlated with this selection.", symbol: "checkmark.shield")
+            } else {
+                VStack(spacing: 0) {
+                    HStack {
+                        Text("\(decisions.count) grouped finding\(decisions.count == 1 ? "" : "s")")
+                            .font(.system(size: 11, weight: .semibold))
+                            .help("From \(alerts.count) raw event\(alerts.count == 1 ? "" : "s"), grouped by rule, path, and action")
+                            .accessibilityHint("From \(alerts.count) raw event\(alerts.count == 1 ? "" : "s"), grouped by rule, path, and action")
+                        Spacer()
+                    }
+                    .padding(.bottom, 8)
+                    AlertListHeader(layout: columns)
+                    ForEach(decisions) { decision in
+                        Divider()
+                        VStack(alignment: .trailing, spacing: 0) {
+                            ExpandableAlertRow(
+                                alert: decision.representative,
+                                model: model,
+                                layout: columns
+                            )
+                        }
+                        .help(decision.rawEventCount > 1
+                              ? "\(decision.rawEventCount) related low-level findings are grouped into this decision"
+                              : "One low-level finding produced this decision")
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ReviewDecisionGroup: Identifiable {
+    let representative: SecurityAlert
+    let rawEventCount: Int
+    var id: String { "\(representative.ruleID)|\(representative.path ?? "")|\(representative.action.lowercased())" }
+
+    static func grouped(from alerts: [SecurityAlert]) -> [ReviewDecisionGroup] {
         Dictionary(grouping: alerts) {
             "\($0.ruleID)|\($0.path ?? "")|\($0.action.lowercased())"
         }
@@ -1151,46 +1260,6 @@ private struct ReviewFindingsPanel: View {
                 : lhs > rhs
         }
     }
-
-    var body: some View {
-        DashboardCard("Findings in this review") {
-            if decisions.isEmpty {
-                DashboardEmpty(text: "No findings were correlated with this selection.", symbol: "checkmark.shield")
-            } else {
-                VStack(spacing: 0) {
-                    HStack {
-                        Text("\(decisions.count) actionable decision\(decisions.count == 1 ? "" : "s")")
-                            .font(.system(size: 11, weight: .semibold))
-                        Text("aggregated from \(alerts.count) raw finding\(alerts.count == 1 ? "" : "s")")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    }
-                    .padding(.bottom, 8)
-                    AlertListHeader()
-                    ForEach(decisions) { decision in
-                        Divider()
-                        VStack(alignment: .trailing, spacing: 0) {
-                            ExpandableAlertRow(alert: decision.representative, model: model)
-                            if decision.rawEventCount > 1 {
-                                Text("\(decision.rawEventCount) related low-level findings grouped into this decision")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(.tertiary)
-                                    .padding(.trailing, 12)
-                                    .padding(.bottom, 5)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-private struct ReviewDecisionGroup: Identifiable {
-    let representative: SecurityAlert
-    let rawEventCount: Int
-    var id: String { "\(representative.ruleID)|\(representative.path ?? "")|\(representative.action.lowercased())" }
 }
 
 private func reviewStateColor(_ state: AgentReviewState) -> Color {
@@ -1228,13 +1297,10 @@ private struct CompletionReviewCard: View {
                             .textSelection(.enabled)
                     }
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 3) {
-                        Text(formattedDuration(summary.durationMS))
-                            .font(.system(size: 17, weight: .semibold, design: .rounded))
-                        Text("elapsed")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                    }
+                    Text(formattedDuration(summary.durationMS))
+                        .font(.system(size: 17, weight: .semibold, design: .rounded))
+                        .help("Elapsed time")
+                        .accessibilityLabel("Elapsed time: \(formattedDuration(summary.durationMS))")
                 }
 
                 HStack(spacing: 0) {
@@ -1384,14 +1450,14 @@ private struct VerificationLine: View {
     let detail: String
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            DashboardSymbol(symbol, color: color, size: 12, weight: .regular).padding(.top, 1)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 11, weight: .semibold))
-                Text(detail).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
+        HStack(alignment: .center, spacing: 8) {
+            DashboardSymbol(symbol, color: color, size: 12, weight: .regular)
+            Text(title).font(.system(size: 11, weight: .semibold))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .help(detail)
+        .accessibilityElement(children: .combine)
+        .accessibilityHint(detail)
     }
 }
 
@@ -1449,22 +1515,39 @@ private struct ActivityChartCard: View {
         let calendar = Calendar.current
         let slots = range == "7 d" ? 7 : 24
         let component: Calendar.Component = range == "7 d" ? .day : .hour
-        let interval: TimeInterval = range == "7 d" ? 86_400 : 3_600
         let now = Date()
-        let timestamps: [Int64]
+        let anchor = calendar.dateInterval(of: component, for: now)?.start ?? now
+        let interval = range == "7 d" ? "day" : "hour"
+        let buckets = Dictionary(
+            uniqueKeysWithValues: model.snapshot.recentActivity
+                .filter { $0.interval == interval }
+                .map { ($0.bucketStart, $0) }
+        )
+        let fallbackTimestamps: [Int64]
         switch metric {
-        case "Alerts": timestamps = model.snapshot.alerts.map(\.createdAt)
-        case "Agent Events": timestamps = model.snapshot.agentEvents.map(\.timestamp)
-        default: timestamps = model.snapshot.sessions.map(\.firstEventAt)
+        case "Alerts": fallbackTimestamps = model.snapshot.alerts.map(\.createdAt)
+        case "Agent Events": fallbackTimestamps = model.snapshot.agentEvents.map(\.timestamp)
+        default: fallbackTimestamps = model.snapshot.sessions.map(\.firstEventAt)
         }
         return (0..<slots).map { index in
-            let date = now.addingTimeInterval(-Double(slots - 1 - index) * interval)
-            let start = calendar.dateInterval(of: component, for: date)?.start ?? date
-            let end = start.addingTimeInterval(interval)
-            let count = timestamps.filter {
-                let eventDate = Date(timeIntervalSince1970: Double($0) / 1_000)
-                return eventDate >= start && eventDate < end
-            }.count
+            let offset = index - (slots - 1)
+            let start = calendar.date(byAdding: component, value: offset, to: anchor) ?? anchor
+            let bucketStart = Int64(start.timeIntervalSince1970 * 1_000)
+            let bucket = buckets[bucketStart]
+            let count: Int
+            switch metric {
+            case "Alerts": count = bucket?.alerts ?? 0
+            case "Agent Events": count = bucket?.agentEvents ?? 0
+            default: count = bucket?.sessions ?? 0
+            }
+            if model.snapshot.recentActivity.isEmpty {
+                let end = calendar.date(byAdding: component, value: 1, to: start) ?? start
+                let fallbackCount = fallbackTimestamps.filter {
+                    let eventDate = Date(timeIntervalSince1970: Double($0) / 1_000)
+                    return eventDate >= start && eventDate < end
+                }.count
+                return ActivityPoint(hour: start, count: fallbackCount)
+            }
             return ActivityPoint(hour: start, count: count)
         }
     }
@@ -1641,8 +1724,7 @@ struct TodayHighlightPage: View {
                     DashboardCard("Daily details") {
                         HStack(spacing: 10) {
                             if detailIsLoading {
-                                ProgressView().controlSize(.small)
-                                Text("Loading session, file, web, alert, and tool details…")
+                                DashboardLoadingHint(message: "Loading session, file, web, alert, and tool details…")
                             } else if let detailUnavailableMessage {
                                 Image(systemName: "exclamationmark.triangle")
                                     .foregroundStyle(Color.dashboardGold)
@@ -1655,8 +1737,7 @@ struct TodayHighlightPage: View {
                                         .lineLimit(2)
                                 }
                             } else {
-                                ProgressView().controlSize(.small)
-                                Text("Preparing daily details…")
+                                DashboardLoadingHint(message: "Preparing daily details…")
                             }
                         }
                         .frame(maxWidth: .infinity, minHeight: 90, alignment: .leading)

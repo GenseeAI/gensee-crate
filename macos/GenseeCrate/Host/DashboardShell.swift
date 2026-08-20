@@ -1,10 +1,9 @@
 import SwiftUI
 
 enum DashboardDestination: String, CaseIterable, Identifiable {
-    case overview = "Status"
-    case reviews = "Agent Inbox"
+    case overview = "Overview"
+    case reviews = "Review Queue"
     case today = "Daily Highlight"
-    case alerts = "Alerts"
     case lineage = "Watchlist"
     case harnesses = "Harnesses"
     case policy = "Policy"
@@ -17,7 +16,6 @@ enum DashboardDestination: String, CaseIterable, Identifiable {
         case .overview: "rectangle.grid.2x2"
         case .reviews: "doc.text.magnifyingglass"
         case .today: "calendar"
-        case .alerts: "exclamationmark.triangle"
         case .lineage: "eye"
         case .harnesses: "slider.horizontal.3"
         case .policy: "shield"
@@ -42,12 +40,25 @@ struct DashboardShell: View {
                 demoBanner
             }
             HStack(spacing: 0) {
-                DashboardSidebar(selection: $selection, alertCount: model.unreadAlertCount)
+                DashboardSidebar(selection: $selection)
                     .frame(width: 220)
                 Rectangle().fill(Color.dashboardLine).frame(width: 1)
                 ZStack {
                     Color.dashboardCanvas.ignoresSafeArea()
                     destinationView
+                    if model.lastUpdated == nil, model.runningCommand == nil, !model.isDemoMode {
+                        VStack {
+                            DashboardLoadingHint(message: "Loading local Gensee data…")
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+                                .shadow(color: .black.opacity(0.10), radius: 8, y: 3)
+                            Spacer()
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .padding(.top, 18)
+                        .allowsHitTesting(false)
+                    }
                     if let command = model.runningCommand {
                         VStack(spacing: 10) {
                             ProgressView()
@@ -61,6 +72,12 @@ struct DashboardShell: View {
             }
         }
         .preferredColorScheme(darkMode ? .dark : .light)
+        .onChange(of: searchText) { query in
+            guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            if ![DashboardDestination.reviews, .lineage].contains(selection) {
+                selection = .reviews
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .genseeOpenAgentReview)) { notification in
             guard let requestID = (notification.userInfo?["request_id"] as? NSNumber)?.int64Value else { return }
             model.requestedReviewRequestID = requestID
@@ -162,22 +179,15 @@ struct DashboardShell: View {
         HStack(spacing: 16) {
             HStack(spacing: 10) {
                 BrandEye(size: 28)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("GenseeAI")
-                        .font(.system(size: 9, weight: .medium))
-                        .tracking(2)
-                        .textCase(.uppercase)
-                        .foregroundStyle(.secondary)
-                    Text("Gensee Crate")
-                        .font(.system(size: 14, weight: .bold))
-                        .tracking(0.5)
-                }
+                Text("Gensee Crate")
+                    .font(.system(size: 15, weight: .bold))
+                    .tracking(0.3)
             }
             .frame(width: 204, alignment: .leading)
 
             HStack(spacing: 7) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search sessions, alerts, artifacts…", text: $searchText)
+                TextField(searchPlaceholder, text: $searchText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12))
                 if !searchText.isEmpty {
@@ -208,7 +218,6 @@ struct DashboardShell: View {
                     .foregroundStyle(Color.dashboardGold)
                     .help(issue)
             }
-            toolbarIconButton(symbol: "bell", help: "Alerts") { selection = .alerts }
             toolbarIconButton(symbol: "questionmark.circle", help: "Help and settings") { selection = .settings }
             toolbarIconButton(
                 symbol: darkMode ? "sun.max" : "moon",
@@ -219,6 +228,14 @@ struct DashboardShell: View {
         .frame(height: 56)
         .background(Color.dashboardPanel)
         .overlay(alignment: .bottom) { Rectangle().fill(Color.dashboardLine).frame(height: 1) }
+    }
+
+    private var searchPlaceholder: String {
+        switch selection {
+        case .reviews: "Search prompts, harnesses, sessions, or files…"
+        case .lineage: "Search watched files, risks, or sources…"
+        default: "Search Review Queue prompts and files…"
+        }
     }
 
     private func toolbarIconButton(
@@ -272,7 +289,6 @@ struct DashboardShell: View {
                 searchText: searchText
             )
             case .today: TodayHighlightPage(model: model)
-            case .alerts: DashboardAlertsPage(model: model, searchText: searchText)
             case .lineage: LineagePage(model: model, searchText: searchText)
             case .harnesses: DashboardHarnessesPage(model: model)
             case .policy: DashboardPolicyPage(model: model)
@@ -340,64 +356,38 @@ private struct DemoConfigurationPage: View {
 
 private struct DashboardSidebar: View {
     @Binding var selection: DashboardDestination
-    let alertCount: Int
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            navGroup("NOW", [.overview, .reviews])
-            separator
-            navGroup("INSIGHTS", [.today, .lineage])
-            separator
-            navGroup("SECURITY", [.alerts])
-            separator
-            navGroup("CONFIGURATION", [.harnesses, .policy, .settings])
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(DashboardDestination.allCases) { destination in
+                navItem(destination)
+            }
             Spacer()
         }
-        .padding(.top, 8)
+        .padding(.top, 12)
         .background(Color.dashboardPanel)
     }
 
-    private func navGroup(_ title: String, _ destinations: [DashboardDestination]) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.tertiary)
-                .padding(.horizontal, 20)
-                .padding(.top, 8)
-                .padding(.bottom, 5)
-            ForEach(destinations) { destination in
-                Button { selection = destination } label: {
-                    HStack(spacing: 10) {
-                        DashboardSymbol(
-                            destination.symbol,
-                            color: selection == destination ? .dashboardRed : .secondary,
-                            size: 13,
-                            weight: selection == destination ? .semibold : .regular
-                        )
-                        .frame(width: 16)
-                        Text(destination.rawValue)
-                        Spacer()
-                        if destination == .alerts, alertCount > 0 {
-                            Text(alertCount.formatted())
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 6).padding(.vertical, 2)
-                                .background(Color.dashboardRed, in: Capsule())
-                        }
-                    }
-                    .font(.system(size: 13, weight: selection == destination ? .semibold : .regular))
-                    .foregroundStyle(selection == destination ? Color.dashboardRed : Color.primary)
-                    .padding(.horizontal, 20)
-                    .frame(height: 34)
-                    .background(selection == destination ? Color.dashboardRed.opacity(0.09) : .clear)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
+    private func navItem(_ destination: DashboardDestination) -> some View {
+        Button { selection = destination } label: {
+            HStack(spacing: 10) {
+                DashboardSymbol(
+                    destination.symbol,
+                    color: selection == destination ? .dashboardRed : .secondary,
+                    size: 13,
+                    weight: selection == destination ? .semibold : .regular
+                )
+                .frame(width: 16)
+                Text(destination.rawValue)
+                Spacer()
             }
+            .font(.system(size: 13, weight: selection == destination ? .semibold : .regular))
+            .foregroundStyle(selection == destination ? Color.dashboardRed : Color.primary)
+            .padding(.horizontal, 20)
+            .frame(height: 36)
+            .background(selection == destination ? Color.dashboardRed.opacity(0.09) : .clear)
+            .contentShape(Rectangle())
         }
-    }
-
-    private var separator: some View {
-        Rectangle().fill(Color.dashboardLine).frame(height: 1).padding(.vertical, 5)
+        .buttonStyle(.plain)
     }
 }

@@ -20,6 +20,20 @@
       "description": "Extensions never treated as secrets (e.g. .rs, .ts)."
     },
     "wildcard_chars": { "type": "array", "items": { "type": "string" } },
+    "review_overrides": {
+      "type": "array",
+      "description": "Developer-reviewed severity and enforcement adjustments keyed by stable rule ID.",
+      "items": {
+        "type": "object",
+        "required": ["rule_id"],
+        "additionalProperties": false,
+        "properties": {
+          "rule_id": { "type": "string", "minLength": 1 },
+          "severity": { "type": "string", "enum": ["info", "low", "medium", "high", "critical"] },
+          "action": { "type": "string", "enum": ["allow", "warn", "ask", "block"] }
+        }
+      }
+    },
     "operations": {
       "type": "object",
       "description": "Operation-class membership: which file operations count as read / destructive / metadata / mutating.",

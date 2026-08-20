@@ -51,8 +51,9 @@ The console includes:
   baseline before requesting Apple approvals, scans all six harnesses, and offers one-click
   setup for every installed direct-hook integration. It does not require a
   separate SQLite install, Homebrew, Rust, jq, or Xcode Command Line Tools.
-- Overview, activity, alerts, and run inventory backed by `gensee dashboard-state`
-  and `gensee run list --json`.
+- An **Overview** of review demand, independently verified activity, protection
+  health, and recent findings backed by `gensee dashboard-state` and
+  `gensee run list --json`.
 - A Daily Highlight page with today's summary and four rolling-year activity
   heatmaps for agent turns, tool calls, alerts, and token usage. Heatmap days
   are selectable and update the detailed summary.

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct DashboardPage<Content: View>: View {
@@ -108,6 +109,24 @@ struct DashboardEmpty: View {
     }
 }
 
+struct DashboardLoadingHint: View {
+    let message: String
+    var compact = false
+
+    var body: some View {
+        HStack(spacing: compact ? 7 : 10) {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityHidden(true)
+            Text(message)
+                .font(.system(size: compact ? 10 : 11, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(message)
+    }
+}
+
 struct DashboardTag: View {
     let text: String
     let color: Color
@@ -156,8 +175,99 @@ func dashboardTime(_ milliseconds: Int64) -> String {
 }
 
 func containsSearch(_ search: String, fields: String?...) -> Bool {
-    guard !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return true }
-    return fields.compactMap { $0 }.contains { $0.localizedCaseInsensitiveContains(search) }
+    searchTermsMatch(search, fields: fields)
+}
+
+func dashboardPathURL(_ path: String) -> URL {
+    URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
+}
+
+func dashboardPathExists(_ path: String) -> Bool {
+    FileManager.default.fileExists(atPath: dashboardPathURL(path).path)
+}
+
+func dashboardPathIsDirectory(_ path: String) -> Bool {
+    var directory: ObjCBool = false
+    return FileManager.default.fileExists(atPath: dashboardPathURL(path).path, isDirectory: &directory)
+        && directory.boolValue
+}
+
+func openDashboardPath(_ path: String) {
+    NSWorkspace.shared.open(dashboardPathURL(path))
+}
+
+func revealDashboardPath(_ path: String) {
+    let url = dashboardPathURL(path)
+    if dashboardPathExists(path) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    } else {
+        NSWorkspace.shared.open(url.deletingLastPathComponent())
+    }
+}
+
+struct DashboardPathActions: View {
+    let path: String
+
+    private var url: URL { dashboardPathURL(path) }
+
+    private var exists: Bool { dashboardPathExists(path) }
+
+    private var isDirectory: Bool {
+        dashboardPathIsDirectory(path)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Button {
+                openDashboardPath(path)
+            } label: {
+                Label(isDirectory ? "Open Folder" : "Open File", systemImage: isDirectory ? "folder" : "doc")
+            }
+            .disabled(!exists)
+            .help(exists ? "Open \(url.path)" : "This path no longer exists on disk")
+
+            Button {
+                revealDashboardPath(path)
+            } label: {
+                Label("Show in Finder", systemImage: "folder.badge.gearshape")
+            }
+            .help(exists ? "Reveal this item in Finder" : "Open its containing folder in Finder")
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .fixedSize()
+    }
+
+}
+
+struct DashboardPathMenu: View {
+    let path: String
+
+    var body: some View {
+        Menu {
+            DashboardPathContextActions(path: path)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("File actions")
+    }
+}
+
+struct DashboardPathContextActions: View {
+    let path: String
+
+    var body: some View {
+        let isDirectory = dashboardPathIsDirectory(path)
+        Button(isDirectory ? "Open Folder" : "Open File") {
+            openDashboardPath(path)
+        }
+        .disabled(!dashboardPathExists(path))
+        Button("Show in Finder") {
+            revealDashboardPath(path)
+        }
+    }
 }
 
 struct DashboardRefreshButton: View {

@@ -31,17 +31,21 @@ final class CheckpointModelsTests: XCTestCase {
     func testDecodesPartialCheckpointCleanupFailures() throws {
         let response = try JSONDecoder().decode(
             CheckpointDeleteResponse.self,
-            from: Data(#"{"deleted":["cp-valid"],"failed":[{"id":"cp-orphan","workspace":"/tmp/missing","error":"workspace not found","orphaned_metadata_removed":true}]}"#.utf8)
+            from: Data(#"{"deleted":["cp-valid"],"orphaned":[{"id":"cp-orphan","workspace":"/tmp/missing","reason":"workspace not found","reference_removed":false}],"failed":[{"id":"cp-failed","workspace":"/tmp/locked","error":"permission denied","orphaned_metadata_removed":false}]}"#.utf8)
         )
         XCTAssertEqual(response.deleted, ["cp-valid"])
-        XCTAssertEqual(response.failed?.first?.id, "cp-orphan")
-        XCTAssertEqual(response.failed?.first?.workspace, "/tmp/missing")
-        XCTAssertEqual(response.failed?.first?.orphanedMetadataRemoved, true)
+        XCTAssertEqual(response.orphaned?.first?.id, "cp-orphan")
+        XCTAssertEqual(response.orphaned?.first?.workspace, "/tmp/missing")
+        XCTAssertEqual(response.orphaned?.first?.referenceRemoved, false)
+        XCTAssertEqual(response.failed?.first?.id, "cp-failed")
+        XCTAssertEqual(response.failed?.first?.workspace, "/tmp/locked")
+        XCTAssertEqual(response.failed?.first?.orphanedMetadataRemoved, false)
 
         let legacy = try JSONDecoder().decode(
             CheckpointDeleteResponse.self,
             from: Data(#"{"deleted":["cp-old"]}"#.utf8)
         )
+        XCTAssertNil(legacy.orphaned)
         XCTAssertNil(legacy.failed)
     }
 }

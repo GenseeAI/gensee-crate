@@ -25,6 +25,7 @@ use serde::Deserialize;
 #[serde(rename_all = "lowercase")]
 pub enum Action {
     Allow,
+    Warn,
     Ask,
     Block,
 }
@@ -33,6 +34,7 @@ impl Action {
     pub fn as_str(self) -> &'static str {
         match self {
             Action::Allow => "allow",
+            Action::Warn => "warn",
             Action::Ask => "ask",
             Action::Block => "block",
         }
@@ -83,6 +85,11 @@ pub struct PolicyDocument {
     pub url_rules: Vec<UrlRule>,
     #[serde(default)]
     pub command_rules: Vec<CommandRule>,
+    /// User-reviewed adjustments keyed by stable rule ID. These are applied
+    /// after rule matching so the same choice governs hook enforcement and
+    /// passive findings without mutating Gensee's bundled rule definitions.
+    #[serde(default)]
+    pub review_overrides: Vec<ReviewOverride>,
     // --- configuration (formerly GENSEE_* env vars; env still overrides) -------
     #[serde(default)]
     pub resource_governance: ResourceGovernance,
@@ -104,6 +111,15 @@ pub struct PolicyDocument {
     /// findings (the JSON form of `GENSEE_POLICY_ALLOW_PATH_PREFIXES`).
     #[serde(default)]
     pub allow_path_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewOverride {
+    pub rule_id: String,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub action: Option<Action>,
 }
 
 fn default_wildcard_chars() -> Vec<String> {
@@ -719,6 +735,19 @@ impl Policy {
                     .to_string(),
             );
         }
+        for review_override in &doc.review_overrides {
+            if review_override.rule_id.trim().is_empty() {
+                return Err("review_overrides.rule_id must not be empty".to_string());
+            }
+            if review_override.severity.as_deref().is_some_and(|severity| {
+                !matches!(severity, "info" | "low" | "medium" | "high" | "critical")
+            }) {
+                return Err(format!(
+                    "review override for {} has invalid severity",
+                    review_override.rule_id
+                ));
+            }
+        }
         if !(1..=24 * 365).contains(&doc.recovery.retention_hours) {
             return Err("recovery.retention_hours must be between 1 and 8760".to_string());
         }
@@ -793,6 +822,54 @@ impl Policy {
     /// load. Enforcement callers should deny in this state.
     pub fn override_error(&self) -> Option<&str> {
         self.override_error.as_deref()
+    }
+
+    /// Apply a user-reviewed rule adjustment. This is intentionally keyed by
+    /// rule ID rather than an individual alert, so later detections inherit the
+    /// developer's review while the immutable historical alert stays intact.
+    pub fn tune_finding(&self, mut finding: Finding) -> Finding {
+        if let Some(review_override) = self
+            .doc
+            .review_overrides
+            .iter()
+            .rev()
+            .find(|candidate| candidate.rule_id == finding.rule_id)
+        {
+            if let Some(severity) = &review_override.severity {
+                finding.severity.clone_from(severity);
+            }
+            if let Some(action) = review_override.action {
+                finding.action = action;
+            }
+        }
+        finding
+    }
+
+    /// Tune alert values produced outside the declarative matcher engine (for
+    /// example Endpoint Security correlation findings) before they are stored.
+    pub fn tuned_alert_values<'a>(
+        &self,
+        rule_id: &str,
+        severity: &'a str,
+        action: &'a str,
+    ) -> (String, String) {
+        let mut severity = severity.to_string();
+        let mut action = action.to_string();
+        if let Some(review_override) = self
+            .doc
+            .review_overrides
+            .iter()
+            .rev()
+            .find(|candidate| candidate.rule_id == rule_id)
+        {
+            if let Some(value) = &review_override.severity {
+                severity.clone_from(value);
+            }
+            if let Some(value) = review_override.action {
+                action = value.as_str().to_string();
+            }
+        }
+        (severity, action)
     }
 
     // --- operation predicates ------------------------------------------------
@@ -883,17 +960,17 @@ impl Policy {
                 path: Some(path.to_string()),
             },
         };
-        Some(finding)
+        Some(self.tune_finding(finding))
     }
 
     fn category_finding(&self, rule: &CategoryRule, path: &str) -> Finding {
-        Finding {
+        self.tune_finding(Finding {
             action: rule.action,
             severity: rule.severity.clone(),
             rule_id: rule.rule_id.clone(),
             message: render(&rule.message, path),
             path: Some(path.to_string()),
-        }
+        })
     }
 
     fn path_matches(&self, matcher: &PathMatcher, path: &str) -> bool {
@@ -984,13 +1061,13 @@ impl Policy {
         if !allowed && self.is_mutating(operation) {
             let persistence = &self.doc.persistence_writes;
             if self.path_matches(&persistence.matcher, path) {
-                findings.push(Finding {
+                findings.push(self.tune_finding(Finding {
                     action: persistence.action,
                     severity: persistence.severity.clone(),
                     rule_id: persistence.rule_id.clone(),
                     message: render(&persistence.message, path),
                     path: Some(path.to_string()),
-                });
+                }));
             }
         }
         if self.is_mutating(operation) && self.is_control_plane_path(path) {
@@ -1036,13 +1113,13 @@ impl Policy {
                 let needle = needle.to_ascii_lowercase();
                 hosts.iter().any(|host| host_matches_rule(host, &needle))
             }) {
-                findings.push(Finding {
+                findings.push(self.tune_finding(Finding {
                     action: rule.action,
                     severity: rule.severity.clone(),
                     rule_id: rule.rule_id.clone(),
                     message: rule.message.replace("{match}", hit),
                     path: None,
-                });
+                }));
             }
         }
         findings
@@ -1067,13 +1144,13 @@ impl Policy {
                     .iter()
                     .all(|needle| command.contains(needle.as_str()));
             if raw_any || raw_all {
-                findings.push(Finding {
+                findings.push(self.tune_finding(Finding {
                     action: rule.action,
                     severity: rule.severity.clone(),
                     rule_id: rule.rule_id.clone(),
                     message: rule.message.replace("{match}", &rule.id),
                     path: None,
-                });
+                }));
                 continue;
             }
             let matched = segments.iter().find_map(|segment| {
@@ -1109,13 +1186,13 @@ impl Policy {
                 None
             });
             if let Some(name) = matched {
-                findings.push(Finding {
+                findings.push(self.tune_finding(Finding {
                     action: rule.action,
                     severity: rule.severity.clone(),
                     rule_id: rule.rule_id.clone(),
                     message: rule.message.replace("{match}", &name),
                     path: None,
-                });
+                }));
             }
         }
         findings
@@ -1139,7 +1216,7 @@ impl Policy {
         // (no path) still applies, failing toward detection.
         let dd_applies = path.is_none_or(|path| self.is_executable_artifact_path(path));
         if dd_applies && dangerous_dd_wipe_content(&collapsed, &compact) {
-            findings.push(Finding {
+            findings.push(self.tune_finding(Finding {
                 action: Action::Block,
                 severity: "critical".to_string(),
                 rule_id: "policy_dangerous_executable_content".to_string(),
@@ -1147,7 +1224,7 @@ impl Policy {
                     "Executable artifact contains a raw disk wipe command: dd if=/dev/zero of=/dev/"
                         .to_string(),
                 path: path.map(str::to_string),
-            });
+            }));
         }
         for rule in &self.doc.content_rules {
             if !self.content_rule_applies_to_path(rule, path) {
@@ -1167,13 +1244,13 @@ impl Policy {
                     .all(|pattern| content_pattern_matches(&collapsed, &compact, pattern));
             let label = any_hit.or_else(|| all_hit.then(|| rule.all_of.join(" + ")));
             if let Some(label) = label {
-                findings.push(Finding {
+                findings.push(self.tune_finding(Finding {
                     action: rule.action,
                     severity: rule.severity.clone(),
                     rule_id: rule.rule_id.clone(),
                     message: rule.message.replace("{match}", &label),
                     path: path.map(str::to_string),
-                });
+                }));
             }
         }
         findings
@@ -1636,6 +1713,38 @@ mod tests {
         assert!(!AlertSeverity::High.includes("medium"));
         assert!(AlertSeverity::High.includes("high"));
         assert!(AlertSeverity::High.includes("critical"));
+    }
+
+    #[test]
+    fn review_override_tunes_matching_rule_for_future_evaluation() {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(default_policy_json()).expect("default parses");
+        doc["review_overrides"] = serde_json::json!([{
+            "rule_id": "policy_destructive_file_operation",
+            "severity": "low",
+            "action": "warn"
+        }]);
+        let policy = Policy::from_json(&doc.to_string()).expect("override parses");
+
+        let tuned = policy.tune_finding(Finding {
+            action: Action::Block,
+            severity: "critical".to_string(),
+            rule_id: "policy_destructive_file_operation".to_string(),
+            message: "destructive operation".to_string(),
+            path: Some("/repo/file".to_string()),
+        });
+        assert_eq!(tuned.severity, "low");
+        assert_eq!(tuned.action, Action::Warn);
+
+        let untouched = policy.tune_finding(Finding {
+            action: Action::Ask,
+            severity: "medium".to_string(),
+            rule_id: "another_rule".to_string(),
+            message: "other operation".to_string(),
+            path: None,
+        });
+        assert_eq!(untouched.severity, "medium");
+        assert_eq!(untouched.action, Action::Ask);
     }
 
     #[test]

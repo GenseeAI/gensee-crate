@@ -1055,6 +1055,86 @@ impl EventStore {
                 "tokens": row.get::<_, i64>(4)?,
             }))
         })?;
+        let recent_activity_sql =
+            "WITH hourly_sessions AS (
+                SELECT (first_event_at / 3600000) * 3600000 AS bucket_start,
+                       COUNT(*) AS count
+                FROM sessions
+                WHERE first_event_at >= (unixepoch('now') - 90000) * 1000
+                GROUP BY bucket_start
+             ),
+             hourly_events AS (
+                SELECT (ts / 3600000) * 3600000 AS bucket_start,
+                       COUNT(*) AS count
+                FROM agent_events
+                WHERE ts >= (unixepoch('now') - 90000) * 1000
+                GROUP BY bucket_start
+             ),
+             hourly_alerts AS (
+                SELECT (created_at / 3600000) * 3600000 AS bucket_start,
+                       COUNT(*) AS count
+                FROM dashboard_visible_alerts
+                WHERE created_at >= (unixepoch('now') - 90000) * 1000
+                GROUP BY bucket_start
+             ),
+             hourly_buckets AS (
+                SELECT bucket_start FROM hourly_sessions
+                UNION SELECT bucket_start FROM hourly_events
+                UNION SELECT bucket_start FROM hourly_alerts
+             ),
+             daily_sessions AS (
+                SELECT unixepoch(date(first_event_at / 1000, 'unixepoch', 'localtime'), 'utc') * 1000 AS bucket_start,
+                       COUNT(*) AS count
+                FROM sessions
+                WHERE date(first_event_at / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-6 days')
+                GROUP BY bucket_start
+             ),
+             daily_events AS (
+                SELECT unixepoch(date(ts / 1000, 'unixepoch', 'localtime'), 'utc') * 1000 AS bucket_start,
+                       COUNT(*) AS count
+                FROM agent_events
+                WHERE date(ts / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-6 days')
+                GROUP BY bucket_start
+             ),
+             daily_alerts AS (
+                SELECT unixepoch(date(created_at / 1000, 'unixepoch', 'localtime'), 'utc') * 1000 AS bucket_start,
+                       COUNT(*) AS count
+                FROM dashboard_visible_alerts
+                WHERE date(created_at / 1000, 'unixepoch', 'localtime') >= date('now', 'localtime', '-6 days')
+                GROUP BY bucket_start
+             ),
+             daily_buckets AS (
+                SELECT bucket_start FROM daily_sessions
+                UNION SELECT bucket_start FROM daily_events
+                UNION SELECT bucket_start FROM daily_alerts
+             )
+             SELECT 'hour', hourly_buckets.bucket_start,
+                    COALESCE(hourly_sessions.count, 0),
+                    COALESCE(hourly_events.count, 0),
+                    COALESCE(hourly_alerts.count, 0)
+             FROM hourly_buckets
+             LEFT JOIN hourly_sessions USING (bucket_start)
+             LEFT JOIN hourly_events USING (bucket_start)
+             LEFT JOIN hourly_alerts USING (bucket_start)
+             UNION ALL
+             SELECT 'day', daily_buckets.bucket_start,
+                    COALESCE(daily_sessions.count, 0),
+                    COALESCE(daily_events.count, 0),
+                    COALESCE(daily_alerts.count, 0)
+             FROM daily_buckets
+             LEFT JOIN daily_sessions USING (bucket_start)
+             LEFT JOIN daily_events USING (bucket_start)
+             LEFT JOIN daily_alerts USING (bucket_start)
+             ORDER BY 1, 2";
+        let recent_activity = query_json_rows(conn, recent_activity_sql, |row| {
+            Ok(json!({
+                "interval": row.get::<_, String>(0)?,
+                "bucket_start": row.get::<_, i64>(1)?,
+                "sessions": row.get::<_, i64>(2)?,
+                "agent_events": row.get::<_, i64>(3)?,
+                "alerts": row.get::<_, i64>(4)?,
+            }))
+        })?;
         let json_sessions = self.list_sessions()?;
         Ok(json!({
             "source": "gensee",
@@ -1067,6 +1147,7 @@ impl EventStore {
             "relations": relations,
             "humanFeedback": human_feedback,
             "dailyActivity": daily_activity,
+            "recentActivity": recent_activity,
             "jsonSessions": json_sessions,
         }))
     }
@@ -1296,14 +1377,6 @@ impl EventStore {
     }
 
     pub fn append_policy_alert(&self, alert: &PolicyAlert) -> io::Result<()> {
-        if !Policy::load_current()
-            .document()
-            .endpoint_security
-            .minimum_recorded_severity
-            .includes(&alert.severity)
-        {
-            return Ok(());
-        }
         self.with_sqlite_transaction(|db| {
             let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
@@ -1342,11 +1415,14 @@ impl EventStore {
         dedupe_key: &str,
         window_ms: u64,
     ) -> io::Result<bool> {
-        if !Policy::load_current()
+        let policy = Policy::load_current();
+        let (severity, _) =
+            policy.tuned_alert_values(&alert.rule_id, &alert.severity, &alert.action);
+        if !policy
             .document()
             .endpoint_security
             .minimum_recorded_severity
-            .includes(&alert.severity)
+            .includes(&severity)
         {
             return Ok(false);
         }
@@ -2490,11 +2566,13 @@ fn insert_entity_relation(
 }
 
 fn insert_alert(db: &SqliteStore, input: AlertInput<'_>) -> io::Result<()> {
-    if !Policy::load_current()
+    let policy = Policy::load_current();
+    let (severity, action) = policy.tuned_alert_values(input.rule_id, input.severity, input.action);
+    if !policy
         .document()
         .endpoint_security
         .minimum_recorded_severity
-        .includes(input.severity)
+        .includes(&severity)
     {
         return Ok(());
     }
@@ -2502,8 +2580,8 @@ fn insert_alert(db: &SqliteStore, input: AlertInput<'_>) -> io::Result<()> {
         request_id: input.request_id,
         entity_kind: input.entity.map(|entity| entity.kind.to_string()),
         entity_id: input.entity.map(|entity| entity.id),
-        severity: input.severity.to_string(),
-        action: input.action.to_string(),
+        severity,
+        action,
         rule_id: input.rule_id.to_string(),
         message: input.message.to_string(),
         path: input.path.map(str::to_string),
@@ -3388,13 +3466,42 @@ fn merge_harness_declared_file_touches(
         }
     }
     observed.sort_by(|left, right| {
-        left["path"]
-            .as_str()
-            .unwrap_or_default()
-            .cmp(right["path"].as_str().unwrap_or_default())
+        dashboard_file_touch_priority(left)
+            .cmp(&dashboard_file_touch_priority(right))
+            .then_with(|| {
+                left["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["path"].as_str().unwrap_or_default())
+            })
     });
     observed.truncate(MAX_DASHBOARD_REQUEST_FILE_TOUCHES);
     observed
+}
+
+fn dashboard_file_touch_priority(touch: &Value) -> u8 {
+    let os_verified = touch["os_verified"].as_bool().unwrap_or(false);
+    let declared_by_harness = touch["declared_by_harness"].as_bool().unwrap_or(false);
+    if os_verified && !declared_by_harness {
+        return 0;
+    }
+    if [
+        "is_control_plane",
+        "is_memory_artifact",
+        "is_persistent_target",
+    ]
+    .iter()
+    .any(|key| dashboard_json_flag(&touch[*key]))
+    {
+        return 1;
+    }
+    2
+}
+
+fn dashboard_json_flag(value: &Value) -> bool {
+    value
+        .as_bool()
+        .unwrap_or_else(|| value.as_i64().is_some_and(|number| number != 0))
 }
 
 /// Return a small path-only projection for the Work Review request list. The
@@ -3487,7 +3594,15 @@ fn dashboard_request_file_touches(
                    is_persistent_target, is_control_plane,
                    ROW_NUMBER() OVER (
                      PARTITION BY request_id
-                     ORDER BY path
+                     ORDER BY
+                       CASE
+                         WHEN intended_and_verified = 0 THEN 0
+                         WHEN is_control_plane != 0
+                           OR is_memory_artifact != 0
+                           OR is_persistent_target != 0 THEN 1
+                         ELSE 2
+                       END,
+                       path
                    ) AS touch_rank
             FROM raw_touches
          )
@@ -3496,7 +3611,7 @@ fn dashboard_request_file_touches(
                 is_persistent_target, is_control_plane
          FROM candidate_touches
          WHERE touch_rank <= {MAX_DASHBOARD_FILE_TOUCH_CANDIDATES}
-         ORDER BY request_id, path"
+         ORDER BY request_id, touch_rank, path"
     );
     let mut statement = conn.prepare(&sql).map_err(sqlite_error_from_rusqlite)?;
     let rows = statement
@@ -3553,6 +3668,26 @@ fn dashboard_file_touch_is_background(path: &str) -> bool {
         || lower.starts_with("/private/tmp/")
         || lower.contains("/library/caches/")
         || lower.contains("/library/httpstorages/")
+        || [
+            ".pytest_cache",
+            "__pycache__",
+            ".mypy_cache",
+            ".ruff_cache",
+            ".tox",
+            "htmlcov",
+            "dist",
+            "build",
+            "coverage",
+            ".nyc_output",
+            ".next",
+            ".turbo",
+            ".vite",
+            ".gradle",
+        ]
+        .iter()
+        .any(|directory| {
+            lower.contains(&format!("/{directory}/")) || lower.ends_with(&format!("/{directory}"))
+        })
 }
 
 struct DashboardIgnoredFileTouches {
@@ -3979,7 +4114,9 @@ fn materialize_dashboard_visible_alerts(conn: &rusqlite::Connection) -> io::Resu
          CREATE INDEX temp.dashboard_visible_alerts_request
            ON dashboard_visible_alerts(request_id);
          CREATE INDEX temp.dashboard_visible_alerts_severity
-           ON dashboard_visible_alerts(severity, created_at);"
+           ON dashboard_visible_alerts(severity, created_at);
+         CREATE INDEX temp.dashboard_visible_alerts_created_at
+           ON dashboard_visible_alerts(created_at);"
     ))
     .map_err(sqlite_error_from_rusqlite)
 }
@@ -5060,6 +5197,18 @@ mod tests {
         // The first cumulative transcript observation establishes a baseline;
         // it must not attribute earlier session usage to this request.
         assert_eq!(today["tokens"], 0);
+        let hour_bucket = (now / 3_600_000) * 3_600_000;
+        let recent_hour = dashboard["recentActivity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|bucket| {
+                bucket["interval"] == "hour" && bucket["bucket_start"].as_u64() == Some(hour_bucket)
+            })
+            .unwrap();
+        assert_eq!(recent_hour["sessions"], 1);
+        assert_eq!(recent_hour["agent_events"], 1);
+        assert_eq!(recent_hour["alerts"], 1);
         let day = today["date"].as_str().unwrap();
         let detail = store.dashboard_day(day).unwrap();
         assert_eq!(detail["sessions"], 1);
@@ -5311,7 +5460,7 @@ mod tests {
         assert!(request["file_touches"].as_array().unwrap().is_empty());
         assert_eq!(
             request["summary_file_touch_paths"],
-            json!(["/repo/App.swift", "/repo/Outside.swift"])
+            json!(["/repo/Outside.swift", "/repo/App.swift"])
         );
         let summary_touches = request["summary_file_touches"].as_array().unwrap();
         assert_eq!(summary_touches.len(), 2);
@@ -5469,12 +5618,64 @@ mod tests {
             "/Users/test/Library/Caches/tool/cache.db",
             "/Users/test/Library/HTTPStorages/tool/httpstorages.sqlite",
             "/Users/test/.gensee/gensee.db",
+            "/repo/.pytest_cache/v/cache/nodeids",
+            "/repo/src/__pycache__/module.cpython-313.pyc",
+            "/repo/.mypy_cache/3.13/module.meta.json",
+            "/repo/.ruff_cache/0.12/content",
+            "/repo/.tox/py313/log/py313-0.log",
+            "/repo/htmlcov/index.html",
+            "/repo/dist/app.js",
+            "/repo/build/output.o",
+            "/repo/coverage/lcov.info",
+            "/repo/.nyc_output/processinfo/index.json",
+            "/repo/.next/cache/webpack/client.pack",
+            "/repo/.turbo/turbo-build.log",
+            "/repo/.vite/deps/chunk.js",
+            "/repo/.gradle/8.10/fileHashes/fileHashes.bin",
         ] {
             assert!(dashboard_file_touch_is_background(path), "{path}");
         }
         assert!(!dashboard_file_touch_is_background(
             "/Users/test/project/Sources/App.swift"
         ));
+        assert!(!dashboard_file_touch_is_background(
+            "/Users/test/project/src/build.rs"
+        ));
+    }
+
+    #[test]
+    fn dashboard_file_touch_cap_prioritizes_undeclared_and_sensitive_paths() {
+        let mut observed = (0..(MAX_DASHBOARD_REQUEST_FILE_TOUCHES + 8))
+            .map(|index| {
+                json!({
+                    "path": format!("/repo/normal-{index:02}.txt"),
+                    "intended_and_verified": true,
+                    "is_memory_artifact": 0,
+                    "is_persistent_target": 0,
+                    "is_control_plane": 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        observed.push(json!({
+            "path": "/repo/zz-undeclared.txt",
+            "intended_and_verified": false,
+            "is_memory_artifact": 0,
+            "is_persistent_target": 0,
+            "is_control_plane": 0,
+        }));
+        observed.push(json!({
+            "path": "/repo/zz-sensitive.txt",
+            "intended_and_verified": true,
+            "is_memory_artifact": 1,
+            "is_persistent_target": 0,
+            "is_control_plane": 1,
+        }));
+
+        let touches = merge_harness_declared_file_touches(observed, Vec::new());
+
+        assert_eq!(touches.len(), MAX_DASHBOARD_REQUEST_FILE_TOUCHES);
+        assert_eq!(touches[0]["path"], "/repo/zz-undeclared.txt");
+        assert_eq!(touches[1]["path"], "/repo/zz-sensitive.txt");
     }
 
     #[test]

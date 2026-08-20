@@ -120,7 +120,7 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
 
         let content = UNMutableNotificationContent()
         content.title = "Gensee notifications are working"
-        content.body = "Gensee will notify you when agent work needs your attention."
+        content.body = "Gensee will notify you when agent work is ready for review."
         content.sound = .default
         content.interruptionLevel = .active
         let request = UNNotificationRequest(
@@ -207,7 +207,7 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         guard let signal = summary.attentionSignal else { return false }
         let content = UNMutableNotificationContent()
         content.title = signal.title
-        content.subtitle = "\(summary.harness) needs you"
+        content.subtitle = "\(summary.harness) · Review recommended"
         content.body = AgentCompletionDerivation.notificationBody(for: summary)
         content.sound = .default
         // Keep the default active interruption level. Time-sensitive delivery

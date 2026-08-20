@@ -49,6 +49,7 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
 
     private weak var model: ConsoleModel?
     private var statusItem: NSStatusItem?
+    private weak var attentionBadge: NSView?
     private var modelChangeSubscription: AnyCancellable?
     private var reviewObserver: NSObjectProtocol?
 
@@ -71,13 +72,14 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
             defaults.set(true, forKey: Self.visibleKey)
         }
 
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.autosaveName = Self.autosaveName
         item.isVisible = true
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
         statusItem = item
+        installAttentionBadge(on: item.button)
         refreshStatusItem()
     }
 
@@ -97,7 +99,7 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
                 queue: .main
             ) { [weak self] notification in
                 guard let requestID = (notification.userInfo?["request_id"] as? NSNumber)?.int64Value else { return }
-                Task { @MainActor in self?.openAgentInbox(requestID: requestID) }
+                Task { @MainActor in self?.openReviewQueue(requestID: requestID) }
             }
         }
 
@@ -117,51 +119,71 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
     private func refreshStatusItem() {
         guard let button = statusItem?.button else { return }
         let count = actionableReviews.count
-        let eye = NSImage(
-            systemSymbolName: count > 0 ? "eye.circle.fill" : "eye.circle",
+        let mark = NSImage(named: "MenuBarEye") ?? NSImage(
+            systemSymbolName: "eye.circle",
             accessibilityDescription: "Gensee Crate"
         )
-        eye?.isTemplate = true
-        button.image = eye
-        button.imagePosition = .imageLeading
-        button.attributedTitle = count > 0
-            ? NSAttributedString(
-                string: "  •",
-                attributes: [
-                    .foregroundColor: NSColor.systemRed,
-                    .font: NSFont.systemFont(ofSize: 9, weight: .bold),
-                ]
-            )
-            : NSAttributedString(string: "")
+        mark?.isTemplate = true
+        mark?.size = NSSize(width: 18, height: 18)
+        button.image = mark
+        button.imageScaling = .scaleProportionallyDown
+        button.imagePosition = .imageOnly
+        button.title = ""
+        button.attributedTitle = NSAttributedString(string: "")
+        installAttentionBadge(on: button)
+        attentionBadge?.isHidden = count == 0
         button.toolTip = count == 0
             ? "Gensee Crate — all agents clear"
-            : "Gensee Crate — \(count) request\(count == 1 ? "" : "s") need attention"
+            : "Gensee Crate — \(count) request\(count == 1 ? "" : "s") to review"
         button.setAccessibilityLabel(button.toolTip ?? "Gensee Crate")
+    }
+
+    private func installAttentionBadge(on button: NSStatusBarButton?) {
+        guard attentionBadge == nil, let button else { return }
+
+        let badge = GenseeStatusBadgeView(frame: .zero)
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.systemRed.cgColor
+        badge.layer?.cornerRadius = 2.5
+        badge.isHidden = true
+        button.addSubview(badge)
+        NSLayoutConstraint.activate([
+            badge.widthAnchor.constraint(equalToConstant: 5),
+            badge.heightAnchor.constraint(equalToConstant: 5),
+            badge.topAnchor.constraint(equalTo: button.topAnchor, constant: 2),
+            badge.trailingAnchor.constraint(equalTo: button.trailingAnchor, constant: -2),
+        ])
+        attentionBadge = badge
     }
 
     private func rebuildMenu(_ menu: NSMenu) {
         menu.removeAllItems()
         let actionable = actionableReviews
 
-        let title = NSMenuItem(title: "Gensee Crate", action: nil, keyEquivalent: "")
-        title.isEnabled = false
+        let title = NSMenuItem(title: "Gensee Crate", action: #selector(openStatus(_:)), keyEquivalent: "")
+        title.target = self
         menu.addItem(title)
 
         let statusTitle: String
         if model?.endpointSensor.health.connected == true {
             statusTitle = actionable.isEmpty
                 ? "Independent verification is active"
-                : "\(actionable.count) request\(actionable.count == 1 ? "" : "s") need you"
+                : "\(actionable.count) request\(actionable.count == 1 ? "" : "s") to review"
         } else {
             statusTitle = "Independent sensor is not connected"
         }
-        let status = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
-        status.isEnabled = false
+        let status = NSMenuItem(
+            title: statusTitle,
+            action: actionable.isEmpty ? #selector(openStatus(_:)) : #selector(openQueue(_:)),
+            keyEquivalent: ""
+        )
+        status.target = self
         menu.addItem(status)
         menu.addItem(.separator())
 
         if actionable.isEmpty {
-            let clear = NSMenuItem(title: "No agent needs you", action: nil, keyEquivalent: "")
+            let clear = NSMenuItem(title: "No reviews pending", action: nil, keyEquivalent: "")
             clear.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil)
             clear.isEnabled = false
             menu.addItem(clear)
@@ -183,30 +205,29 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
                 menu.addItem(item)
             }
         }
-
-        menu.addItem(.separator())
-        let open = NSMenuItem(
-            title: actionable.isEmpty ? "Open Gensee Crate" : "Open Agent Inbox",
-            action: #selector(openInbox(_:)),
-            keyEquivalent: ""
-        )
-        open.target = self
-        menu.addItem(open)
     }
 
     @objc private func openReview(_ sender: NSMenuItem) {
         guard let requestID = (sender.representedObject as? NSNumber)?.int64Value else { return }
-        openAgentInbox(requestID: requestID)
+        openReviewQueue(requestID: requestID)
     }
 
-    @objc private func openInbox(_ sender: NSMenuItem) {
-        openAgentInbox(requestID: nil)
+    @objc private func openStatus(_ sender: NSMenuItem) {
+        openGensee(destination: .overview, requestID: nil)
     }
 
-    private func openAgentInbox(requestID: Int64?) {
+    @objc private func openQueue(_ sender: NSMenuItem) {
+        openReviewQueue(requestID: nil)
+    }
+
+    private func openReviewQueue(requestID: Int64?) {
+        openGensee(destination: .reviews, requestID: requestID)
+    }
+
+    private func openGensee(destination: DashboardDestination, requestID: Int64?) {
         guard let model else { return }
         model.requestedReviewRequestID = requestID
-        model.requestedDashboardDestination = .reviews
+        model.requestedDashboardDestination = destination
         NSApp.activate(ignoringOtherApps: true)
 
         if let window = NSApp.windows.first(where: {
@@ -215,6 +236,13 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
             window.makeKeyAndOrderFront(nil)
         }
     }
+}
+
+/// The attention badge is visual state for the status item, not a separate
+/// click target. Let clicks anywhere in the square icon continue to open the
+/// menu, including directly over the badge.
+private final class GenseeStatusBadgeView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 private struct GenseeMenuBarLabel: View {
@@ -242,7 +270,7 @@ private struct GenseeMenuBarLabel: View {
             }
         }
         .frame(width: 20, height: 18)
-        .accessibilityLabel("Gensee Crate, \(actionableReviewCount) requests need review")
+        .accessibilityLabel("Gensee Crate, \(actionableReviewCount) requests to review")
         .onReceive(NotificationCenter.default.publisher(for: .genseeOpenAgentReview)) { notification in
             guard let requestID = (notification.userInfo?["request_id"] as? NSNumber)?.int64Value else { return }
             model.requestedReviewRequestID = requestID
@@ -292,10 +320,10 @@ private struct GenseeMenuBarView: View {
 
             if actionableReviews.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    Label("No agent needs you", systemImage: "checkmark.circle.fill")
+                    Label("No reviews pending", systemImage: "checkmark.circle.fill")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Color.dashboardGreen)
-                    Text("Clean completions are available in Agent Inbox history.")
+                    Text("Completed requests remain available under All.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                     Button("Open History") { openMain(.reviews) }
@@ -303,7 +331,7 @@ private struct GenseeMenuBarView: View {
                 }
             } else {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("NEEDS YOU").font(.system(size: 8, weight: .bold)).tracking(0.8).foregroundStyle(.secondary)
+                    Text("TO REVIEW").font(.system(size: 8, weight: .bold)).tracking(0.8).foregroundStyle(.secondary)
                     HStack(spacing: 7) {
                         ForEach(attentionByHarness, id: \.harness) { item in
                             Text("\(item.harness) \(item.count)")
@@ -349,12 +377,12 @@ private struct GenseeMenuBarView: View {
 
             HStack {
                 Label(
-                    actionableReviews.isEmpty ? "All agents clear" : "\(actionableReviews.count) need\(actionableReviews.count == 1 ? "s" : "") you",
+                    actionableReviews.isEmpty ? "All agents clear" : "\(actionableReviews.count) to review",
                     systemImage: actionableReviews.isEmpty ? "checkmark.circle" : "bell.badge"
                 )
                     .font(.system(size: 10, weight: .medium))
                 Spacer()
-                Button(actionableReviews.isEmpty ? "Open Gensee" : "Open Agent Inbox") {
+                Button(actionableReviews.isEmpty ? "Open Gensee" : "Open Review Queue") {
                     openMain(actionableReviews.isEmpty ? .overview : .reviews)
                 }
                     .controlSize(.small)

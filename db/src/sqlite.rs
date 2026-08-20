@@ -11,12 +11,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // already-initialized store must not rerun CREATE/ALTER statements on every
 // short-lived hook or dashboard process: schema DDL needs a writer lock and can
 // otherwise starve behind the long-lived Endpoint Security ingester.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 // This checksum intentionally names the schema version. If schema.sql changes,
 // bump SCHEMA_VERSION and replace this with the checksum for the new version.
 #[cfg(test)]
-const SCHEMA_V1_SQL_SHA256: &str =
-    "4212799929a031a1002673fb5f276626a896478fcfb354806f102d4576031381";
+const SCHEMA_V2_SQL_SHA256: &str =
+    "708e9f5ce79743ba025dfc76373c7bedb38cfafebde933e7e8e842f0a7eb26fb";
 // Increment whenever dashboard artifact visibility rules change. Existing
 // stores are reclassified by bounded background maintenance before this
 // version is stamped on their cached count.
@@ -3042,10 +3042,10 @@ mod tests {
 
     #[test]
     fn schema_checksum_is_tied_to_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 2);
         let actual = format!("{:x}", Sha256::digest(include_bytes!("../schema.sql")));
         assert_eq!(
-            actual, SCHEMA_V1_SQL_SHA256,
+            actual, SCHEMA_V2_SQL_SHA256,
             "schema.sql changed: bump SCHEMA_VERSION and replace the versioned checksum"
         );
     }

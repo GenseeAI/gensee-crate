@@ -352,6 +352,11 @@ END;
 CREATE INDEX IF NOT EXISTS idx_agent_events_request_ts
     ON agent_events(request_id, ts);
 
+-- Time-series dashboards aggregate across requests by timestamp. Keep that
+-- query independent from the bounded recent-event detail projection.
+CREATE INDEX IF NOT EXISTS idx_agent_events_ts
+    ON agent_events(ts);
+
 CREATE INDEX IF NOT EXISTS idx_requests_created_at
     ON requests(created_at);
 

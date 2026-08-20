@@ -8,6 +8,7 @@
     "kt", "m", "mm", "py", "rb", "rs", "scss", "sh", "swift", "ts", "tsx"
   ],
   "wildcard_chars": ["*", "?", "["],
+  "review_overrides": [],
 
   "operations": {
     "read": ["read", "copy_source"],

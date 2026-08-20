@@ -42,7 +42,16 @@ struct CheckpointRestoreResponse {
 #[derive(Debug, Serialize)]
 struct CheckpointDeleteResponse {
     deleted: Vec<String>,
+    orphaned: Vec<CheckpointDeleteOrphan>,
     failed: Vec<CheckpointDeleteFailure>,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckpointDeleteOrphan {
+    id: String,
+    workspace: String,
+    reason: String,
+    reference_removed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -187,6 +196,7 @@ pub(crate) fn handle_checkpoint(args: Vec<OsString>) -> io::Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&CheckpointDeleteResponse {
                         deleted: vec![id.clone()],
+                        orphaned: Vec::new(),
                         failed: Vec::new(),
                     })?
                 );
@@ -216,8 +226,9 @@ pub(crate) fn handle_checkpoint(args: Vec<OsString>) -> io::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&response)?);
             } else {
                 println!(
-                    "Pruned {} checkpoint(s); {} could not be fully removed",
+                    "Pruned {} checkpoint(s); removed {} orphaned record(s); {} could not be fully removed",
                     response.deleted.len(),
+                    response.orphaned.len(),
                     response.failed.len()
                 );
             }
@@ -568,6 +579,7 @@ fn prune_all_checkpoints_at(
     all_ages: bool,
 ) -> io::Result<CheckpointDeleteResponse> {
     let mut deleted = Vec::new();
+    let mut orphaned = Vec::new();
     let mut failed = Vec::new();
     for checkpoint in list_all_checkpoints_at(storage_root)? {
         if !all_ages && checkpoint.created_at_ms >= cutoff {
@@ -588,28 +600,38 @@ fn prune_all_checkpoints_at(
                 // The path may now be a symlink or nested under a different
                 // Git root. Delete only a ref that still resolves to this
                 // checkpoint's recorded commit, then discard stale metadata.
-                let _ = remove_matching_checkpoint_reference_at(
+                let reference_cleanup = remove_matching_checkpoint_reference_at(
                     Path::new(&checkpoint.workspace),
                     &checkpoint,
                 );
                 let cleanup = remove_checkpoint_metadata_at(storage_root, &checkpoint);
-                let orphaned_metadata_removed = cleanup.is_ok();
-                let error = match cleanup {
-                    Ok(()) => repository_error.to_string(),
-                    Err(cleanup_error) => format!(
-                        "{repository_error}; orphaned metadata cleanup also failed: {cleanup_error}"
-                    ),
-                };
-                failed.push(CheckpointDeleteFailure {
-                    id: checkpoint.id,
-                    workspace: checkpoint.workspace,
-                    error,
-                    orphaned_metadata_removed,
-                });
+                match cleanup {
+                    Ok(()) => orphaned.push(CheckpointDeleteOrphan {
+                        id: checkpoint.id,
+                        workspace: checkpoint.workspace,
+                        reason: repository_error.to_string(),
+                        reference_removed: reference_cleanup.unwrap_or(false),
+                    }),
+                    Err(cleanup_error) => {
+                        let error = format!(
+                            "{repository_error}; orphaned metadata cleanup also failed: {cleanup_error}"
+                        );
+                        failed.push(CheckpointDeleteFailure {
+                            id: checkpoint.id,
+                            workspace: checkpoint.workspace,
+                            error,
+                            orphaned_metadata_removed: false,
+                        });
+                    }
+                }
             }
         }
     }
-    Ok(CheckpointDeleteResponse { deleted, failed })
+    Ok(CheckpointDeleteResponse {
+        deleted,
+        orphaned,
+        failed,
+    })
 }
 
 fn prune_repository_checkpoints_at(
@@ -619,6 +641,7 @@ fn prune_repository_checkpoints_at(
     all_ages: bool,
 ) -> io::Result<CheckpointDeleteResponse> {
     let mut deleted = Vec::new();
+    let orphaned = Vec::new();
     let mut failed = Vec::new();
     for checkpoint in list_checkpoints_at(repository, storage_root)? {
         if !all_ages && checkpoint.created_at_ms >= cutoff {
@@ -634,7 +657,11 @@ fn prune_repository_checkpoints_at(
             }),
         }
     }
-    Ok(CheckpointDeleteResponse { deleted, failed })
+    Ok(CheckpointDeleteResponse {
+        deleted,
+        orphaned,
+        failed,
+    })
 }
 
 fn checkpoint_repository_for_cleanup(checkpoint: &WorkspaceCheckpoint) -> io::Result<PathBuf> {
@@ -1569,9 +1596,10 @@ mod tests {
 
         let response = prune_all_checkpoints_at(&storage, 0, true).expect("global prune");
         assert_eq!(response.deleted, vec![valid.id.clone()]);
-        assert_eq!(response.failed.len(), 1);
-        assert_eq!(response.failed[0].id, missing.id);
-        assert!(response.failed[0].orphaned_metadata_removed);
+        assert!(response.failed.is_empty());
+        assert_eq!(response.orphaned.len(), 1);
+        assert_eq!(response.orphaned[0].id, missing.id);
+        assert!(!response.orphaned[0].reference_removed);
         assert!(!missing_marker.exists());
         assert!(list_all_checkpoints_at(&storage)
             .expect("list after prune")
@@ -1614,8 +1642,9 @@ mod tests {
 
         let response = prune_all_checkpoints_at(&storage, 0, true).expect("global prune");
         assert!(response.deleted.is_empty());
-        assert_eq!(response.failed.len(), 1);
-        assert!(response.failed[0].orphaned_metadata_removed);
+        assert!(response.failed.is_empty());
+        assert_eq!(response.orphaned.len(), 1);
+        assert!(response.orphaned[0].reference_removed);
         let reference = format!("{CHECKPOINT_REF_PREFIX}/{}", checkpoint.id);
         assert_eq!(
             git_optional(
