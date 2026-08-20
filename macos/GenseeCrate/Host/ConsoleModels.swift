@@ -785,6 +785,6 @@ struct IntegrationDescriptor: Identifiable, Equatable {
         if !supportsDirectHooks { return "Managed launch only" }
         if configurationIssue != nil { return canRepair ? "Needs repair" : "Manual fix needed" }
         if !configured { return "Ready to enable" }
-        return verified ? "Protected" : "Restart & test"
+        return verified ? "Protected" : "Waiting for first event"
     }
 }

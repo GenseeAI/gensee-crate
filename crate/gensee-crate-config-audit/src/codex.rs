@@ -1401,7 +1401,15 @@ fn discover_rules(
 }
 
 fn inspect_rule_file(path: &Path, text: &str, findings: &mut Vec<AuditFinding>) {
-    for block in text.split("prefix_rule(").skip(1) {
+    let marker = "prefix_rule(";
+    let rule_offsets: Vec<usize> = text
+        .match_indices(marker)
+        .map(|(offset, _)| offset)
+        .collect();
+    for (index, offset) in rule_offsets.iter().copied().enumerate() {
+        let content_start = offset + marker.len();
+        let content_end = rule_offsets.get(index + 1).copied().unwrap_or(text.len());
+        let block = &text[content_start..content_end];
         if !block.contains("decision = \"allow\"")
             && !block.contains("decision=\"allow\"")
             && !block.contains("decision = 'allow'")
@@ -1430,6 +1438,12 @@ fn inspect_rule_file(path: &Path, text: &str, findings: &mut Vec<AuditFinding>) 
                 | "env"
         );
         if shell_or_interpreter || tokens.len() <= 1 {
+            // Keep the command itself private while retaining a stable, useful identity for
+            // each finding. Without the line locator every redacted rule has identical
+            // evidence, so distinct broad rules collapse to the same fingerprint and look
+            // like duplicate cards in audit consumers.
+            let line = text[..offset].bytes().filter(|byte| *byte == b'\n').count() + 1;
+            let evidence_key = format!("prefix_rule[line {line}]");
             findings.push(make_finding(
                 "CAX-RUL-001",
                 "autonomy_and_approval",
@@ -1442,7 +1456,11 @@ fn inspect_rule_file(path: &Path, text: &str, findings: &mut Vec<AuditFinding>) 
                 Assessment::Potential,
                 "Command rule grants a broad approval exception",
                 "An `allow` prefix for an interpreter, privilege wrapper, or single-token command can authorize many materially different commands outside the sandbox.",
-                vec![evidence(path, Some("prefix_rule"), Some("<redacted-allow-rule>"))],
+                vec![evidence(
+                    path,
+                    Some(&evidence_key),
+                    Some("<redacted-allow-rule>"),
+                )],
                 "Replace the allow rule with a narrow multi-token prefix, use `prompt`, or remove it. Validate intended and unintended examples with `codex execpolicy check`.",
                 &[RULES_REFERENCE],
                 &["OWASP-ASI02", "OWASP-ASI03"],
@@ -2687,6 +2705,47 @@ mod tests {
             .iter()
             .any(|finding| finding.rule_id == "CAX-RUL-001"));
         assert_eq!(report.inventory.rule_files, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn redacted_broad_allow_rules_keep_distinct_fingerprints() {
+        let root = temp_root("distinct-broad-rules");
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("repo");
+        let codex_home = root.join("codex");
+        fs::create_dir_all(&workspace).unwrap();
+        write(
+            &codex_home.join("rules/default.rules"),
+            concat!(
+                "prefix_rule(pattern = [\"bash\"], decision = \"allow\")\n",
+                "prefix_rule(pattern = [\"python3\"], decision = \"allow\")\n",
+            ),
+        );
+
+        let report = audit_codex(&CodexAuditOptions {
+            workspace,
+            codex_home,
+            profile: None,
+        })
+        .unwrap();
+        let findings: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id == "CAX-RUL-001")
+            .collect();
+
+        assert_eq!(findings.len(), 2);
+        assert_ne!(findings[0].fingerprint, findings[1].fingerprint);
+        assert!(findings.iter().all(|finding| {
+            finding.evidence[0].value.as_deref() == Some("<redacted-allow-rule>")
+        }));
+        assert!(findings
+            .iter()
+            .any(|finding| { finding.evidence[0].key.as_deref() == Some("prefix_rule[line 1]") }));
+        assert!(findings
+            .iter()
+            .any(|finding| { finding.evidence[0].key.as_deref() == Some("prefix_rule[line 2]") }));
         let _ = fs::remove_dir_all(root);
     }
 

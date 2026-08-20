@@ -208,8 +208,18 @@ struct HarnessConfigAuditPanel: View {
     }
 
     private func findingsView(_ bundle: ConfigAuditBundle) -> some View {
-        let findings = bundle.includedReports.flatMap { targetReport in
-            targetReport.report.findings.map { AuditFindingDisplay(target: targetReport.target, finding: $0) }
+        let rawFindings = bundle.includedReports.flatMap { targetReport in
+            targetReport.report.findings.map {
+                AuditFindingDisplay(target: targetReport.target, finding: $0)
+            }
+        }
+        var findings: [AuditFindingDisplay] = []
+        for item in rawFindings {
+            if let index = findings.firstIndex(where: { $0.groupingKey == item.groupingKey }) {
+                findings[index].merge(item)
+            } else {
+                findings.append(item)
+            }
         }
         return VStack(alignment: .leading, spacing: 8) {
             if findings.isEmpty {
@@ -401,7 +411,35 @@ private enum AuditSection: String, CaseIterable, Identifiable {
 private struct AuditFindingDisplay: Identifiable {
     let target: String
     let finding: ConfigAuditFinding
-    var id: String { "\(target):\(finding.fingerprint)" }
+    var occurrenceCount: Int
+    var evidence: [ConfigAuditEvidence]
+
+    init(target: String, finding: ConfigAuditFinding) {
+        self.target = target
+        self.finding = finding
+        occurrenceCount = 1
+        evidence = finding.evidence
+    }
+
+    var groupingKey: String {
+        [
+            target,
+            finding.ruleID,
+            finding.severity,
+            finding.assessment,
+            finding.title,
+            finding.description,
+            finding.remediation.summary,
+        ].joined(separator: "|")
+    }
+
+    var id: String { groupingKey }
+
+    mutating func merge(_ other: AuditFindingDisplay) {
+        occurrenceCount += other.occurrenceCount
+        let existingIDs = Set(evidence.map(\.id))
+        evidence.append(contentsOf: other.evidence.filter { !existingIDs.contains($0.id) })
+    }
 }
 
 private struct ConfigAuditFindingCard: View {
@@ -423,9 +461,9 @@ private struct ConfigAuditFindingCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.dashboardBlue.opacity(0.07), in: RoundedRectangle(cornerRadius: 5))
 
-                    if !item.finding.evidence.isEmpty {
+                    if !item.evidence.isEmpty {
                         Text("Evidence").font(.system(size: 11, weight: .semibold))
-                        ForEach(item.finding.evidence) { evidence in
+                        ForEach(item.evidence) { evidence in
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(abbreviatedPath(evidence.source))
                                     .font(.system(size: 10, design: .monospaced))
@@ -453,6 +491,9 @@ private struct ConfigAuditFindingCard: View {
                             AuditPill(text: pretty(item.finding.assessment), color: item.finding.assessment == "confirmed" ? .dashboardRed : .dashboardGold)
                             AuditPill(text: item.finding.ruleID, color: .secondary)
                             AuditPill(text: pretty(item.target), color: .dashboardBlue)
+                            if item.occurrenceCount > 1 {
+                                AuditPill(text: "\(item.occurrenceCount) occurrences", color: .secondary)
+                            }
                         }
                     }
                     Spacer()
