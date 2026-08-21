@@ -3197,7 +3197,10 @@ mod tests {
         assert!(resolution.lease_id.is_none());
         assert!(state.record.envelope.grants.is_empty());
         let effect = effect.expect("denied attempts remain in effect evidence");
-        assert_eq!(effect.decision.disposition, NetworkBoundaryDisposition::Deny);
+        assert_eq!(
+            effect.decision.disposition,
+            NetworkBoundaryDisposition::Deny
+        );
         assert!(effect.decision.lease.is_none());
     }
 
