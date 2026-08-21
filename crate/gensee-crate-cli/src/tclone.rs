@@ -551,6 +551,9 @@ fn tclone_host_control_capability_rotation_error(run_id: &str) -> io::Error {
 }
 
 fn read_tclone_run_context() -> io::Result<Value> {
+    #[cfg(not(test))]
+    let path = PathBuf::from(TCLONE_RUN_CONTEXT_PATH);
+    #[cfg(test)]
     let path = env::var_os("GENSEE_TCLONE_CONTEXT_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(TCLONE_RUN_CONTEXT_PATH));
@@ -561,6 +564,18 @@ fn read_tclone_run_context() -> io::Result<Value> {
             format!("invalid tclone run context: {error}"),
         )
     })
+}
+
+pub(crate) fn current_tclone_context_run_id() -> Option<String> {
+    let context = read_tclone_run_context().ok()?;
+    let role = context.get("role").and_then(Value::as_str)?;
+    let run_id = context.get("run_id").and_then(Value::as_str)?.trim();
+    let role_matches_run_id = match role {
+        "fork" => run_id.contains("_fork_"),
+        "source" => !run_id.contains("_fork_"),
+        _ => false,
+    };
+    (role_matches_run_id && tclone_is_safe_token(run_id)).then(|| run_id.to_string())
 }
 
 fn tclone_fork_result_path() -> PathBuf {
@@ -1395,7 +1410,7 @@ fn tclone_hook_output_excerpt(event: &AgentHookEvent) -> Option<String> {
     }
 }
 
-fn tclone_is_safe_token(value: &str) -> bool {
+pub(crate) fn tclone_is_safe_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 200
         && value != "."
@@ -4773,6 +4788,8 @@ fn prepare_tclone_fork_contexts(
             "source_run_id": &source.run_id,
             "workspace": &source.container_workspace,
             "host_control_capability": capability,
+            "identity_rebound_at_ms": forked_at_ms,
+            "source_identity_revoked_during_clone": true,
         });
         write_atomic_nofollow(&payload_path, &serde_json::to_vec(&payload)?, 0o600)?;
     }
@@ -5640,6 +5657,7 @@ fn tclone_run_context_payload(record: &TcloneRunRecord, capability: &str) -> Val
         "fork_count": record.fork_count,
         "fork_approach": &record.fork_approach,
         "host_control_capability": capability,
+        "identity_rebound_at_ms": record.updated_at_ms,
     })
 }
 
@@ -12216,6 +12234,43 @@ mod tests {
         env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
 
         assert_eq!(read_tclone_run_context().unwrap()["run_id"], "override-run");
+
+        match old_context {
+            Some(value) => env::set_var("GENSEE_TCLONE_CONTEXT_PATH", value),
+            None => env::remove_var("GENSEE_TCLONE_CONTEXT_PATH"),
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tclone_context_identity_requires_a_valid_role_and_safe_run_id() {
+        let _guard = tclone_test_env_lock();
+        let root = temp_tree("run-context-identity");
+        let context_path = root.join("context.json");
+        let old_context = env::var_os("GENSEE_TCLONE_CONTEXT_PATH");
+        env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+
+        fs::write(
+            &context_path,
+            r#"{"run_id":"run_source_fork_1_0","role":"fork"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            current_tclone_context_run_id().as_deref(),
+            Some("run_source_fork_1_0")
+        );
+        fs::write(&context_path, r#"{"run_id":"../../source","role":"fork"}"#).unwrap();
+        assert!(current_tclone_context_run_id().is_none());
+        fs::write(&context_path, r#"{"run_id":"run_source","role":"unknown"}"#).unwrap();
+        assert!(current_tclone_context_run_id().is_none());
+        fs::write(
+            &context_path,
+            r#"{"run_id":"run_source_fork_1_0","role":"source"}"#,
+        )
+        .unwrap();
+        assert!(current_tclone_context_run_id().is_none());
+        fs::write(&context_path, r#"{"run_id":"run_source","role":"fork"}"#).unwrap();
+        assert!(current_tclone_context_run_id().is_none());
 
         match old_context {
             Some(value) => env::set_var("GENSEE_TCLONE_CONTEXT_PATH", value),

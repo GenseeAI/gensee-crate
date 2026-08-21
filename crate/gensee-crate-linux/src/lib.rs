@@ -2,6 +2,7 @@ pub mod audit;
 pub mod capabilities;
 pub mod enforcement;
 pub mod fanotify;
+pub mod landlock;
 pub mod network;
 pub mod policy;
 mod procfs;
@@ -21,6 +22,7 @@ pub use fanotify::{
     plan_fanotify_marks, LinuxFanotifyConfig, LinuxFanotifyEnforcer, LinuxFanotifyEvent,
     LinuxFanotifyMark, LinuxFanotifyMarkPlan, LinuxFanotifyStatus,
 };
+pub use landlock::apply_landlock_write_sandbox;
 pub use network::{
     apply_nftables_script, attach_current_process_to_cgroup, attach_process_tree_to_cgroup,
     bind_nftables_plan_to_source_address, collect_process_tree, create_agent_cgroup,

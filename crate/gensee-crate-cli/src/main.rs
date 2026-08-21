@@ -132,6 +132,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             args.remove(0);
             linux_exec_wrapper(args)
         }
+        Some("__cell-landlock-exec") => {
+            args.remove(0);
+            cell_landlock_exec_wrapper(args)
+        }
         Some("__tclone-cleanup-resolved") => {
             args.remove(0);
             tclone_cleanup_resolved(args)
@@ -348,6 +352,7 @@ fn should_bootstrap_telemetry_for_command(command: &str) -> bool {
         && command != "linux"
         && command != "debug"
         && command != "__linux-exec"
+        && command != "__cell-landlock-exec"
         && !is_linux_top_level_command(command)
 }
 
@@ -799,6 +804,62 @@ fn linux_exec_wrapper(args: Vec<OsString>) -> io::Result<()> {
         cgroup_path.as_deref(),
         seccomp_profile,
     )
+}
+
+fn cell_landlock_exec_wrapper(args: Vec<OsString>) -> io::Result<()> {
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing cell command"))?;
+    let command = &args[separator + 1..];
+    let (program, program_args) = command
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing cell command"))?;
+    let mut write_paths = Vec::new();
+    let mut gate = None;
+    let mut index = 0;
+    while index < separator {
+        match args[index].to_str() {
+            Some("--write-path") if index + 1 < separator => {
+                let path = args[index + 1]
+                    .to_str()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid Landlock path")
+                    })?
+                    .to_string();
+                let path_value = Path::new(&path);
+                if !path_value.is_absolute()
+                    || path_value
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Landlock write paths must be absolute without traversal",
+                    ));
+                }
+                write_paths.push(path);
+                index += 2;
+            }
+            Some("--gate") if index + 1 < separator => {
+                gate = Some(PathBuf::from(&args[index + 1]));
+                index += 2;
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid cell Landlock option",
+                ));
+            }
+        }
+    }
+    if let Some(gate) = gate {
+        while !gate.is_file() {
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+    gensee_crate_linux::apply_landlock_write_sandbox(&write_paths)?;
+    linux_exec_agent(program, program_args, None, None)
 }
 
 fn linux_args_after_double_dash(args: &[OsString]) -> Option<Vec<OsString>> {
@@ -4406,7 +4467,12 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
         }
     };
 
-    let event = build_hook_event(&payload, effective_provider)?;
+    let tclone_context_run_id = current_tclone_context_run_id();
+    let event = build_hook_event_with_tclone_context(
+        &payload,
+        effective_provider,
+        tclone_context_run_id.as_deref(),
+    )?;
     let session_registration = hook_session_registration(&event);
 
     // Fast path: if the warm daemon is up, hand off over its socket — PreToolUse
@@ -4414,7 +4480,12 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     // events fire-and-forget off the critical path. Falls through to the
     // in-process path if the daemon is unreachable, so enforcement never
     // silently disappears.
-    if dispatch_via_daemon(&payload, &event, session_registration.as_ref()) {
+    if dispatch_via_daemon(
+        &payload,
+        &event,
+        session_registration.as_ref(),
+        tclone_context_run_id.as_deref(),
+    ) {
         return Ok(());
     }
 
