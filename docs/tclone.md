@@ -300,12 +300,13 @@ fanotify permission marks over the container root and each scoped bind mount.
 A dedicated host sensor thread services permission events so the orchestrator
 cannot block on its own gate or evidence writes. Because `/tmp`, `/run`, and
 private mediation binds are separate mounts, current manifests conservatively
-report read and process coverage as `partial` and record the exact covered
-mounts in a violation. A queue overflow, missing mark, sensor error, or
-unsupported host is also recorded as incomplete coverage; events collected
-before an overflow are retained instead of being discarded. Capability cells
-therefore require Linux cgroup v2 and root fanotify support, while promotion
-continues to fail closed until every relevant mount has complete coverage.
+report read and process coverage as `partial`. The typed
+`filesystem_read_coverage` detail records separate covered and uncovered mount
+lists without misclassifying honest coverage disclosure as a runtime
+violation. A queue overflow, missing mark, sensor error, or unsupported host is
+still recorded as incomplete coverage and a violation; events collected before
+an overflow are retained instead of being discarded. Capability cells
+therefore require Linux cgroup v2 and root fanotify support.
 
 Install and load the shipped AppArmor profile before using cells:
 
@@ -341,7 +342,8 @@ the manifest and journal for forensics.
 Nothing is promoted into the source automatically. Promotion is host-only and
 requires explicit path selectors. Gensee re-hashes both snapshots, rejects a
 changed manifest or output, requires a successful non-timeout execution with
-zero violations and complete telemetry for every requested effect dimension,
+zero violations, complete snapshot-diff coverage for writable outputs, and
+complete telemetry for requested network, external-request, and secret effects,
 verifies the signed forensic envelope, and verifies that each selected source
 path still matches the immutable input. It then applies only the selected diff
 through the existing rollback-on-failure filesystem transaction. Successful

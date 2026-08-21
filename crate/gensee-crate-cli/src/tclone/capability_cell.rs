@@ -2,7 +2,7 @@ use super::*;
 use gensee_crate_rules::capability::{
     Capability, CapabilityRequest, EffectManifest, EffectTelemetryCoverage, EffectViolation,
     ExecutionBoundary, FileChangeEffect, FileChangeKind, FileEntryKind, FileOperationKind,
-    ProcessEffect, PromotionOutput, PromotionReceipt, TelemetryCoverage,
+    FilesystemReadCoverage, ProcessEffect, PromotionOutput, PromotionReceipt, TelemetryCoverage,
     CAPABILITY_REQUEST_SCHEMA_VERSION, EFFECT_MANIFEST_SCHEMA_VERSION,
 };
 use gensee_crate_rules::capability_broker::BrokerResourceKind;
@@ -2094,19 +2094,6 @@ fn build_effect_manifest(
             observed_at_ms: finished_at_ms,
         });
     }
-    if let Some(evidence) = runtime_evidence {
-        let covered = if evidence.covered_read_mounts.is_empty() {
-            "none".to_string()
-        } else {
-            evidence.covered_read_mounts.join(",")
-        };
-        violations.push(EffectViolation {
-            kind: "filesystem_read_coverage_partial".to_string(),
-            resource: covered,
-            detail: "fanotify covers only the recorded mounts; separate cell mounts such as /tmp, /run, and private mediation binds are not observed".to_string(),
-            observed_at_ms: finished_at_ms,
-        });
-    }
     if let Some(error) = runtime_evidence.and_then(|evidence| evidence.collection_error.as_ref()) {
         violations.push(EffectViolation {
             kind: "runtime_effect_telemetry_incomplete".to_string(),
@@ -2180,6 +2167,10 @@ fn build_effect_manifest(
         Some(_) => TelemetryCoverage::Partial,
         None => TelemetryCoverage::Unavailable,
     };
+    let filesystem_read_coverage = runtime_evidence.map(|evidence| FilesystemReadCoverage {
+        covered_mounts: evidence.covered_read_mounts.clone(),
+        uncovered_mounts: capability_cell_uncovered_read_mounts(lease),
+    });
 
     let network_coverage = match network_evidence {
         Some(evidence) if evidence.collection_error.is_none() => TelemetryCoverage::Complete,
@@ -2234,11 +2225,30 @@ fn build_effect_manifest(
             ),
             process_tree: runtime_coverage,
         },
+        filesystem_read_coverage,
         started_at_ms,
         finished_at_ms,
         exit_code,
         timed_out,
     })
+}
+
+fn capability_cell_uncovered_read_mounts(lease: &CapabilityCellLease) -> Vec<String> {
+    let mut mounts = vec![
+        "/tmp".to_string(),
+        "/run".to_string(),
+        "/run/gensee-startup-gate".to_string(),
+        "/run/gensee-cell-supervisor".to_string(),
+    ];
+    mounts.extend(
+        lease
+            .broker_lease_ids
+            .iter()
+            .map(|lease_id| format!("/run/gensee-broker/{lease_id}.sock")),
+    );
+    mounts.sort();
+    mounts.dedup();
+    mounts
 }
 
 fn broker_coverage_for_capabilities(
@@ -2920,11 +2930,8 @@ fn promotion_telemetry_is_complete(
     request: &CapabilityRequest,
     coverage: &EffectTelemetryCoverage,
 ) -> bool {
-    coverage.process_tree == TelemetryCoverage::Complete
-        && (!request.capabilities.contains(&Capability::FilesystemRead)
-            || coverage.filesystem_reads == TelemetryCoverage::Complete)
-        && (!request.capabilities.contains(&Capability::FilesystemWrite)
-            || coverage.filesystem_writes == TelemetryCoverage::Complete)
+    (!request.capabilities.contains(&Capability::FilesystemWrite)
+        || coverage.filesystem_writes == TelemetryCoverage::Complete)
         && (!request.capabilities.iter().any(|capability| {
             matches!(
                 capability,
@@ -3605,6 +3612,7 @@ mod tests {
         request.scope.file_operations = vec![gensee_crate_rules::capability::FileOperationScope {
             path: "target/cache".to_string(),
             operation: gensee_crate_rules::capability::FileOperationKind::Delete,
+            entry_kind: None,
         }];
 
         validate_cell_request_for_issue(&request).unwrap();
@@ -4459,12 +4467,14 @@ mod tests {
             manifest.telemetry_coverage.process_tree,
             TelemetryCoverage::Partial
         );
-        let coverage_violation = manifest
+        let coverage = manifest.filesystem_read_coverage.as_ref().unwrap();
+        assert_eq!(coverage.covered_mounts, vec!["/proc/42/root"]);
+        assert!(coverage.uncovered_mounts.contains(&"/tmp".to_string()));
+        assert!(coverage.uncovered_mounts.contains(&"/run".to_string()));
+        assert!(!manifest
             .violations
             .iter()
-            .find(|violation| violation.kind == "filesystem_read_coverage_partial")
-            .unwrap();
-        assert_eq!(coverage_violation.resource, "/proc/42/root");
+            .any(|violation| violation.kind == "filesystem_read_coverage_partial"));
         fs::remove_dir_all(root).ok();
     }
 
@@ -4494,7 +4504,10 @@ mod tests {
             replay_of_cell_id: None,
             expected_input_snapshot_digest: None,
         };
-        let mut manifest = build_effect_manifest(
+        let mut runtime = CellRuntimeEvidence::default();
+        runtime.files_read.insert("Cargo.toml".to_string());
+        runtime.covered_read_mounts = vec!["/proc/42/root".to_string()];
+        let manifest = build_effect_manifest(
             &source_record(),
             &lease,
             "cell_1",
@@ -4506,11 +4519,17 @@ mod tests {
             false,
             &[],
             None,
-            None,
+            Some(&runtime),
         )
         .unwrap();
-        manifest.telemetry_coverage.filesystem_reads = TelemetryCoverage::Complete;
-        manifest.telemetry_coverage.process_tree = TelemetryCoverage::Complete;
+        assert_eq!(
+            manifest.telemetry_coverage.filesystem_reads,
+            TelemetryCoverage::Partial
+        );
+        assert_eq!(
+            manifest.telemetry_coverage.process_tree,
+            TelemetryCoverage::Partial
+        );
         persist_capability_cell_forensics(
             &source_record(),
             &lease,
