@@ -48,7 +48,8 @@ final class CompletionNotificationCoordinatorTests: XCTestCase {
             toolUseID: nil,
             humanVerdict: nil,
             feedbackLabel: nil,
-            feedbackCreatedAt: nil
+            feedbackCreatedAt: nil,
+            rawEventCount: nil
         )
     }
 }

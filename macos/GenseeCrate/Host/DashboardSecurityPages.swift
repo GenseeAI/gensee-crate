@@ -125,6 +125,7 @@ private struct ResizableAlertHeaderCell: View {
 
 struct ExpandableAlertRow: View {
     let alert: SecurityAlert
+    var requestPrompt: String? = nil
     @ObservedObject var model: ConsoleModel
     @ObservedObject var layout: AlertColumnLayout
     @State private var expanded = false
@@ -205,7 +206,7 @@ struct ExpandableAlertRow: View {
                 AlertEvidenceBlock(
                     title: "User request",
                     symbol: "text.bubble",
-                    content: alert.originalUserPrompt,
+                    content: alert.originalUserPrompt ?? requestPrompt,
                     unavailable: "The originating harness did not provide a captured user request."
                 )
                 .frame(maxWidth: .infinity, alignment: .topLeading)

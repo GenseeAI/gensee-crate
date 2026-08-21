@@ -557,7 +557,12 @@ private struct RequestReviewDetail: View {
                 }
             case .findings:
                 requestEvidenceContent {
-                    ReviewFindingsPanel(alerts: payload?.alerts ?? [], model: model)
+                    ReviewFindingsPanel(
+                        alerts: payload?.alerts ?? [],
+                        rawAlertCount: payload?.rawAlertCount,
+                        requestPrompt: payload?.request.originalUserPrompt,
+                        model: model
+                    )
                 }
             case .files:
                 requestEvidenceContent {
@@ -1195,6 +1200,8 @@ private struct LifecycleStop: View {
 
 private struct ReviewFindingsPanel: View {
     let alerts: [SecurityAlert]
+    var rawAlertCount: Int? = nil
+    var requestPrompt: String? = nil
     @ObservedObject var model: ConsoleModel
     @StateObject private var columns = AlertColumnLayout()
 
@@ -1207,12 +1214,12 @@ private struct ReviewFindingsPanel: View {
             if decisions.isEmpty {
                 DashboardEmpty(text: "No findings were correlated with this selection.", symbol: "checkmark.shield")
             } else {
-                VStack(spacing: 0) {
+                LazyVStack(spacing: 0) {
                     HStack {
                         Text("\(decisions.count) grouped finding\(decisions.count == 1 ? "" : "s")")
                             .font(.system(size: 11, weight: .semibold))
-                            .help("From \(alerts.count) raw event\(alerts.count == 1 ? "" : "s"), grouped by rule, path, and action")
-                            .accessibilityHint("From \(alerts.count) raw event\(alerts.count == 1 ? "" : "s"), grouped by rule, path, and action")
+                            .help("From \(rawAlertCount ?? alerts.count) raw event\((rawAlertCount ?? alerts.count) == 1 ? "" : "s"), grouped by rule, path, and action")
+                            .accessibilityHint("From \(rawAlertCount ?? alerts.count) raw event\((rawAlertCount ?? alerts.count) == 1 ? "" : "s"), grouped by rule, path, and action")
                         Spacer()
                     }
                     .padding(.bottom, 8)
@@ -1222,6 +1229,7 @@ private struct ReviewFindingsPanel: View {
                         VStack(alignment: .trailing, spacing: 0) {
                             ExpandableAlertRow(
                                 alert: decision.representative,
+                                requestPrompt: requestPrompt,
                                 model: model,
                                 layout: columns
                             )
@@ -1250,7 +1258,13 @@ private struct ReviewDecisionGroup: Identifiable {
             guard let representative = grouped.max(by: {
                 NotificationSeverity.rank(for: $0.severity) < NotificationSeverity.rank(for: $1.severity)
             }) else { return nil }
-            return ReviewDecisionGroup(representative: representative, rawEventCount: grouped.count)
+            return ReviewDecisionGroup(
+                representative: representative,
+                // Request detail already arrives grouped with its server-side
+                // raw count, while session/global paths can still contain
+                // several rows for the same decision.
+                rawEventCount: max(representative.rawEventCount ?? 0, grouped.count)
+            )
         }
         .sorted {
             let lhs = NotificationSeverity.rank(for: $0.representative.severity)

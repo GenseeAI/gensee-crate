@@ -466,7 +466,7 @@ enum DemoSnapshotFactory {
         use: String,
         evidence: String = #"{"source":"synthetic-demo"}"#
     ) -> SecurityAlert {
-        SecurityAlert(alertID: id, requestID: request, sessionID: session, severity: severity, action: action, ruleID: rule, message: message, path: path, evidence: evidence, createdAt: timestamp, originalUserPrompt: prompt, eventSource: "synthetic-demo", eventType: "PreToolUse", toolName: tool, toolInput: input, toolUseID: use, humanVerdict: nil, feedbackLabel: nil, feedbackCreatedAt: nil)
+        SecurityAlert(alertID: id, requestID: request, sessionID: session, severity: severity, action: action, ruleID: rule, message: message, path: path, evidence: evidence, createdAt: timestamp, originalUserPrompt: prompt, eventSource: "synthetic-demo", eventType: "PreToolUse", toolName: tool, toolInput: input, toolUseID: use, humanVerdict: nil, feedbackLabel: nil, feedbackCreatedAt: nil, rawEventCount: nil)
     }
 
     private static func artifact(
