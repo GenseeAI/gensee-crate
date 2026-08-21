@@ -1007,7 +1007,7 @@ final class ConsoleModel: ObservableObject {
             if shouldOpenHookApproval {
                 Task { @MainActor [weak self] in
                     await Task.yield()
-                    self?.openCodexHookReview()
+                    self?.openCodexHookReview(automatically: true)
                 }
             }
         }
@@ -1066,7 +1066,7 @@ final class ConsoleModel: ObservableObject {
             if shouldOpenHookApproval {
                 Task { @MainActor [weak self] in
                     await Task.yield()
-                    self?.openCodexHookReview()
+                    self?.openCodexHookReview(automatically: true)
                 }
             }
         }
@@ -1270,8 +1270,11 @@ final class ConsoleModel: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
-    func openCodexHookReview() {
-        guard runningCommand == nil else { return }
+    func openCodexHookReview(automatically: Bool = false) {
+        guard runningCommand == nil else {
+            noticeMessage = "Finish \(runningCommand ?? "the current Gensee task") before opening Codex hook review."
+            return
+        }
         runningCommand = "Finding the installed Codex CLI"
         let candidates = Self.codexExecutableCandidates()
         Task { [weak self] in
@@ -1307,9 +1310,13 @@ final class ConsoleModel: ObservableObject {
                 errorMessage = "Could not open Codex hook review: \(detail)"
                 return
             }
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString("/hooks", forType: .string)
-            noticeMessage = "Opened Codex CLI and copied /hooks. The review window closes automatically after Gensee hooks are trusted."
+            if automatically {
+                noticeMessage = "Opened Codex CLI at /hooks. The review window closes automatically after Gensee hooks are trusted."
+            } else {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString("/hooks", forType: .string)
+                noticeMessage = "Opened Codex CLI and copied /hooks. The review window closes automatically after Gensee hooks are trusted."
+            }
         }
     }
 
