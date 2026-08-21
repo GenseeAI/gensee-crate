@@ -3529,6 +3529,8 @@ mod tests {
             expires_at_ms: 2,
             consumed_at_ms: None,
             broker_lease_ids: Vec::new(),
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
         };
 
         copy_capability_scope(
