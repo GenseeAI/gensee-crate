@@ -210,6 +210,8 @@ and an expiry:
 gensee run lease issue run_... --request request.json -- /bin/sh -lc 'find . -maxdepth 2 -type f -print'
 gensee run cell run_... --lease lease_... --json
 gensee run cell inspect cell_... --json
+gensee run cell promote cell_... --into run_... --path Cargo.lock --dry-run
+gensee run cell promote cell_... --into run_... --path Cargo.lock
 ```
 
 The cell is a fresh container rather than a live-memory clone. It does not
@@ -224,8 +226,24 @@ and its lifetime covers both snapshot preparation and command execution. This
 prevents a caller from using an expired grant merely because staging was slow.
 The container is destroyed on completion,
 while its scoped workspace snapshot and execution record are retained for
-inspection and replay planning. Nothing is promoted into the source
-automatically.
+inspection and replay planning. Gensee keeps an immutable input snapshot and a
+separate writable output snapshot, hashes their actual contents, and writes a
+typed `effect-manifest.json`. The manifest distinguishes requested capabilities
+from observed use and records changed files, the exact-command digest, promotion
+proposals, violations, and explicit telemetry coverage. Filesystem-write
+coverage is complete for the retained scope; reads and the complete descendant
+process tree are not yet observable and are marked unavailable/partial rather
+than being reported as empty facts.
+
+Nothing is promoted into the source automatically. Promotion is host-only and
+requires explicit path selectors. Gensee re-hashes both snapshots, rejects a
+changed manifest or output, requires a successful non-timeout execution with
+zero violations and complete write telemetry, and verifies that each selected
+source path still matches the immutable input. It then applies only the selected
+diff through the existing rollback-on-failure filesystem transaction. A
+successful promotion is appended to the manifest; a repeated or overlapping
+promotion is rejected. Use `--dry-run` to perform all evidence and conflict
+checks without changing the source.
 
 Network, identity, privileged, and external-mutation capabilities fail closed
 in this first implementation. They require separate brokers that can enforce

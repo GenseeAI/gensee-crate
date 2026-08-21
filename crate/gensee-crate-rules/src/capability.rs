@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const CAPABILITY_REQUEST_SCHEMA_VERSION: u32 = 1;
+pub const EFFECT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +69,161 @@ pub struct CapabilityRequest {
     /// Outputs must be inspected and explicitly promoted instead of sharing a
     /// writable workspace with the source environment.
     pub inspect_before_commit: bool,
+}
+
+/// Whether an enforcement boundary can account for a class of effects. An
+/// empty effect list is trustworthy only when its coverage is `complete` or
+/// the capability was made `not_applicable` by an enforced denial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryCoverage {
+    Complete,
+    Partial,
+    Unavailable,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectTelemetryCoverage {
+    pub filesystem_reads: TelemetryCoverage,
+    pub filesystem_writes: TelemetryCoverage,
+    pub network_connections: TelemetryCoverage,
+    pub external_requests: TelemetryCoverage,
+    pub secret_accesses: TelemetryCoverage,
+    pub process_tree: TelemetryCoverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    Created,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileEntryKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangeEffect {
+    pub path: String,
+    pub change: FileChangeKind,
+    pub entry_kind: FileEntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkConnectionEffect {
+    pub protocol: String,
+    pub destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    pub broker_lease_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalRequestEffect {
+    pub gateway: String,
+    pub target: String,
+    pub action: String,
+    pub request_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_token_id: Option<String>,
+}
+
+/// Records a broker handle and its purpose, never secret material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretAccessEffect {
+    pub broker: String,
+    pub handle_id: String,
+    pub identity: String,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessEffect {
+    pub executable: String,
+    pub argv_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub started_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotionOutput {
+    pub path: String,
+    pub change: FileChangeKind,
+    pub entry_kind: FileEntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotionReceipt {
+    pub promotion_id: String,
+    pub source_run_id: String,
+    pub paths: Vec<String>,
+    pub promoted_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_token_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectViolation {
+    pub kind: String,
+    pub resource: String,
+    pub detail: String,
+    pub observed_at_ms: u64,
+}
+
+/// A telemetry-backed account of a privileged operation. Promotion policy
+/// consumes this record; it must never rely on an agent's success claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectManifest {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub source_run_id: String,
+    pub cell_id: String,
+    pub requested_capabilities: Vec<Capability>,
+    pub capabilities_used: Vec<Capability>,
+    pub files_read: Vec<String>,
+    pub files_changed: Vec<FileChangeEffect>,
+    pub network_connections: Vec<NetworkConnectionEffect>,
+    pub external_requests: Vec<ExternalRequestEffect>,
+    pub secrets_accessed: Vec<SecretAccessEffect>,
+    pub processes_started: Vec<ProcessEffect>,
+    pub outputs_proposed_for_promotion: Vec<PromotionOutput>,
+    #[serde(default)]
+    pub promotions: Vec<PromotionReceipt>,
+    pub violations: Vec<EffectViolation>,
+    pub telemetry_coverage: EffectTelemetryCoverage,
+    pub started_at_ms: u64,
+    pub finished_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
 }
 
 impl CapabilityRequest {

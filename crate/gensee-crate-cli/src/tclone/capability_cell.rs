@@ -1,8 +1,11 @@
 use super::*;
 use gensee_crate_rules::capability::{
-    Capability, CapabilityRequest, ExecutionBoundary, CAPABILITY_REQUEST_SCHEMA_VERSION,
+    Capability, CapabilityRequest, EffectManifest, EffectTelemetryCoverage, EffectViolation,
+    ExecutionBoundary, FileChangeEffect, FileChangeKind, FileEntryKind, ProcessEffect,
+    PromotionOutput, PromotionReceipt, TelemetryCoverage, CAPABILITY_REQUEST_SCHEMA_VERSION,
+    EFFECT_MANIFEST_SCHEMA_VERSION,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const CELL_LEASE_SCHEMA_VERSION: u32 = 1;
 // Leave time for the host-control bridge to return the result and reap the
@@ -14,6 +17,7 @@ const CELL_POLL_INTERVAL_MS: u64 = 25;
 struct CapabilityCellLease {
     schema_version: u32,
     lease_id: String,
+    operation_id: String,
     source_run_id: String,
     request: CapabilityRequest,
     command: Vec<String>,
@@ -26,13 +30,16 @@ struct CapabilityCellLease {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CapabilityCellRecord {
     schema_version: u32,
+    operation_id: String,
     cell_id: String,
     lease_id: String,
     source_run_id: String,
     request: CapabilityRequest,
     command: Vec<String>,
     container_name: String,
+    input_snapshot: String,
     workspace_snapshot: String,
+    effect_manifest: String,
     started_at_ms: u64,
     finished_at_ms: u64,
     exit_code: Option<i32>,
@@ -124,6 +131,7 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
     let lease = CapabilityCellLease {
         schema_version: CELL_LEASE_SCHEMA_VERSION,
         lease_id: lease_id.clone(),
+        operation_id: format!("op_{}", Uuid::new_v4().simple()),
         source_run_id,
         request,
         command,
@@ -142,6 +150,7 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
             "{}",
             serde_json::to_string_pretty(&json!({
                 "lease_id": lease.lease_id,
+                "operation_id": lease.operation_id,
                 "source_run_id": lease.source_run_id,
                 "expires_at_ms": lease.expires_at_ms,
                 "execution_boundary": lease.request.execution_boundary,
@@ -160,6 +169,9 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
 pub(crate) fn tclone_capability_cell(args: Vec<OsString>) -> io::Result<()> {
     if args.first().and_then(|arg| arg.to_str()) == Some("inspect") {
         return inspect_capability_cell(args[1..].to_vec());
+    }
+    if args.first().and_then(|arg| arg.to_str()) == Some("promote") {
+        return promote_capability_cell(args[1..].to_vec());
     }
     let source_run_id = tclone_target_arg(
         &args,
@@ -351,13 +363,21 @@ fn execute_capability_cell(
     let cell_id = format!("cell_{}", Uuid::new_v4().simple());
     let container_name = format!("gensee-tclone-{cell_id}");
     let cell_root = capability_cell_path(&cell_id)?;
-    let snapshot = cell_root.join("workspace");
-    create_restrictive_dir_all(&snapshot)?;
+    let input_snapshot = cell_root.join("input");
+    let snapshot = cell_root.join("output");
+    create_restrictive_dir_all(&input_snapshot)?;
     let podman = tclone_podman();
-    copy_capability_scope(&podman, source, lease, &snapshot)?;
+    copy_capability_scope(&podman, source, lease, &input_snapshot)?;
+    copy_path_all(&input_snapshot, &snapshot)?;
 
-    let mut run_args =
-        capability_cell_run_args(source, lease, &container_name, &snapshot, unix_millis()?)?;
+    let mut run_args = capability_cell_run_args(
+        source,
+        lease,
+        &container_name,
+        &input_snapshot,
+        &snapshot,
+        unix_millis()?,
+    )?;
     run_args.extend(lease.command.iter().skip(1).map(OsString::from));
     let cleanup = TcloneContainerCleanup::new(&podman, &container_name);
     let started_at_ms = unix_millis()?;
@@ -378,17 +398,38 @@ fn execute_capability_cell(
         thread::sleep(Duration::from_millis(CELL_POLL_INTERVAL_MS));
     };
     drop(cleanup);
+    let finished_at_ms = unix_millis()?;
+    let manifest = build_effect_manifest(
+        source,
+        lease,
+        &cell_id,
+        &input_snapshot,
+        &snapshot,
+        started_at_ms,
+        finished_at_ms,
+        status.code(),
+        timed_out,
+    )?;
+    let manifest_path = cell_root.join("effect-manifest.json");
+    write_atomic_nofollow(
+        &manifest_path,
+        &serde_json::to_vec_pretty(&manifest)?,
+        0o600,
+    )?;
     let record = CapabilityCellRecord {
         schema_version: CELL_LEASE_SCHEMA_VERSION,
+        operation_id: lease.operation_id.clone(),
         cell_id,
         lease_id: lease.lease_id.clone(),
         source_run_id: source.run_id.clone(),
         request: lease.request.clone(),
         command: lease.command.clone(),
         container_name,
+        input_snapshot: input_snapshot.to_string_lossy().to_string(),
         workspace_snapshot: snapshot.to_string_lossy().to_string(),
+        effect_manifest: manifest_path.to_string_lossy().to_string(),
         started_at_ms,
-        finished_at_ms: unix_millis()?,
+        finished_at_ms,
         exit_code: status.code(),
         timed_out,
     };
@@ -404,7 +445,8 @@ fn capability_cell_run_args(
     source: &TcloneRunRecord,
     lease: &CapabilityCellLease,
     container_name: &str,
-    snapshot: &Path,
+    input_snapshot: &Path,
+    output_snapshot: &Path,
     now_ms: u64,
 ) -> io::Result<Vec<OsString>> {
     let remaining_ms = lease.expires_at_ms.saturating_sub(now_ms);
@@ -449,10 +491,22 @@ fn capability_cell_run_args(
         OsString::from(&lease.command[0]),
     ];
     for path in &lease.request.scope.read_paths {
-        add_scope_mount(&mut args, snapshot, &source.container_workspace, path, "ro")?;
+        add_scope_mount(
+            &mut args,
+            input_snapshot,
+            &source.container_workspace,
+            path,
+            "ro",
+        )?;
     }
     for path in &lease.request.scope.write_paths {
-        add_scope_mount(&mut args, snapshot, &source.container_workspace, path, "rw")?;
+        add_scope_mount(
+            &mut args,
+            output_snapshot,
+            &source.container_workspace,
+            path,
+            "rw",
+        )?;
     }
     args.push(OsString::from(&source.image));
     Ok(args)
@@ -539,6 +593,684 @@ fn add_scope_mount(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CellSnapshotEntry {
+    kind: FileEntryKind,
+    digest: Option<String>,
+    size: Option<u64>,
+    mode: Option<u32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_effect_manifest(
+    source: &TcloneRunRecord,
+    lease: &CapabilityCellLease,
+    cell_id: &str,
+    input_snapshot: &Path,
+    output_snapshot: &Path,
+    started_at_ms: u64,
+    finished_at_ms: u64,
+    exit_code: Option<i32>,
+    timed_out: bool,
+) -> io::Result<EffectManifest> {
+    let before = collect_cell_snapshot(input_snapshot)?;
+    let after = collect_cell_snapshot(output_snapshot)?;
+    let files_changed = diff_cell_snapshots(&before, &after);
+    let mut outputs = Vec::new();
+    let mut violations = Vec::new();
+    for effect in &files_changed {
+        if effect.change != FileChangeKind::Deleted && effect.entry_kind == FileEntryKind::Symlink {
+            let target = fs::read_link(output_snapshot.join(&effect.path))?;
+            if target.is_absolute()
+                || target.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                violations.push(EffectViolation {
+                    kind: "unsafe_symlink_output".to_string(),
+                    resource: effect.path.clone(),
+                    detail: format!(
+                        "symlink output has an absolute or parent-traversing target: {}",
+                        target.display()
+                    ),
+                    observed_at_ms: finished_at_ms,
+                });
+            }
+        }
+        if path_is_in_scopes(&effect.path, &lease.request.scope.write_paths) {
+            outputs.push(PromotionOutput {
+                path: effect.path.clone(),
+                change: effect.change,
+                entry_kind: effect.entry_kind,
+                digest: effect.after_digest.clone(),
+            });
+        } else {
+            violations.push(EffectViolation {
+                kind: "filesystem_write_outside_scope".to_string(),
+                resource: effect.path.clone(),
+                detail: "observed output differs from the immutable input but is not covered by a write selector".to_string(),
+                observed_at_ms: finished_at_ms,
+            });
+        }
+    }
+    let mut capabilities_used = vec![Capability::ProcessExecution];
+    if !files_changed.is_empty() {
+        capabilities_used.push(Capability::FilesystemWrite);
+    }
+    let argv = serde_json::to_vec(&lease.command)?;
+    let argv_digest = format!("sha256:{:x}", Sha256::digest(argv));
+
+    Ok(EffectManifest {
+        schema_version: EFFECT_MANIFEST_SCHEMA_VERSION,
+        operation_id: lease.operation_id.clone(),
+        source_run_id: source.run_id.clone(),
+        cell_id: cell_id.to_string(),
+        requested_capabilities: lease.request.capabilities.clone(),
+        capabilities_used,
+        files_read: Vec::new(),
+        files_changed,
+        network_connections: Vec::new(),
+        external_requests: Vec::new(),
+        secrets_accessed: Vec::new(),
+        processes_started: vec![ProcessEffect {
+            executable: lease.command[0].clone(),
+            argv_digest,
+            pid: None,
+            started_at_ms,
+            finished_at_ms: Some(finished_at_ms),
+            exit_code,
+        }],
+        outputs_proposed_for_promotion: outputs,
+        promotions: Vec::new(),
+        violations,
+        telemetry_coverage: EffectTelemetryCoverage {
+            filesystem_reads: TelemetryCoverage::Unavailable,
+            filesystem_writes: TelemetryCoverage::Complete,
+            network_connections: TelemetryCoverage::NotApplicable,
+            external_requests: TelemetryCoverage::NotApplicable,
+            secret_accesses: TelemetryCoverage::NotApplicable,
+            process_tree: TelemetryCoverage::Partial,
+        },
+        started_at_ms,
+        finished_at_ms,
+        exit_code,
+        timed_out,
+    })
+}
+
+fn diff_cell_snapshots(
+    before: &BTreeMap<String, CellSnapshotEntry>,
+    after: &BTreeMap<String, CellSnapshotEntry>,
+) -> Vec<FileChangeEffect> {
+    let paths = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let before_entry = before.get(&path);
+            let after_entry = after.get(&path);
+            if before_entry == after_entry {
+                return None;
+            }
+            let change = match (before_entry, after_entry) {
+                (None, Some(_)) => FileChangeKind::Created,
+                (Some(_), None) => FileChangeKind::Deleted,
+                (Some(_), Some(_)) => FileChangeKind::Modified,
+                (None, None) => return None,
+            };
+            let entry_kind = after_entry
+                .or(before_entry)
+                .expect("changed entry exists")
+                .kind;
+            Some(FileChangeEffect {
+                path,
+                change,
+                entry_kind,
+                before_digest: before_entry.and_then(|entry| entry.digest.clone()),
+                after_digest: after_entry.and_then(|entry| entry.digest.clone()),
+                before_size: before_entry.and_then(|entry| entry.size),
+                after_size: after_entry.and_then(|entry| entry.size),
+                before_mode: before_entry.and_then(|entry| entry.mode),
+                after_mode: after_entry.and_then(|entry| entry.mode),
+            })
+        })
+        .collect()
+}
+
+fn collect_cell_snapshot(root: &Path) -> io::Result<BTreeMap<String, CellSnapshotEntry>> {
+    let mut entries = BTreeMap::new();
+    collect_cell_snapshot_inner(root, root, &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_cell_snapshot_inner(
+    root: &Path,
+    current: &Path,
+    entries: &mut BTreeMap<String, CellSnapshotEntry>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root).map_err(io::Error::other)?;
+        let relative = relative.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cell snapshots require UTF-8 workspace paths",
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&path)?;
+        let state = if metadata.is_dir() {
+            CellSnapshotEntry {
+                kind: FileEntryKind::Directory,
+                digest: None,
+                size: None,
+                mode: cell_metadata_mode(&metadata),
+            }
+        } else if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path)?;
+            CellSnapshotEntry {
+                kind: FileEntryKind::Symlink,
+                digest: Some(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(target.to_string_lossy().as_bytes())
+                )),
+                size: None,
+                mode: None,
+            }
+        } else if metadata.is_file() {
+            CellSnapshotEntry {
+                kind: FileEntryKind::File,
+                digest: Some(digest_cell_file(&path)?),
+                size: Some(metadata.len()),
+                mode: cell_metadata_mode(&metadata),
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("special filesystem entry is not allowed in a cell output: {relative}"),
+            ));
+        };
+        entries.insert(relative.to_string(), state);
+        if metadata.is_dir() {
+            collect_cell_snapshot_inner(root, &path, entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn digest_cell_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn path_is_in_scopes(path: &str, scopes: &[String]) -> bool {
+    scopes
+        .iter()
+        .any(|scope| scope == "." || path == scope || path.starts_with(&format!("{scope}/")))
+}
+
+fn promote_capability_cell(args: Vec<OsString>) -> io::Result<()> {
+    if env::var_os("GENSEE_TCLONE_HOST_CONTROL_CALLER").is_some()
+        || env::var_os(TCLONE_HOST_CONTROL_SOCKET_ENV).is_some()
+        || env::var_os(TCLONE_HOST_CONTROL_DIR_ENV).is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cell promotion is host-only and cannot be requested through the agent bridge",
+        ));
+    }
+    let usage = "usage: gensee run cell promote <cell-id> --into <source-run-id> --path <workspace-relative-path> [--path <path>...] [--dry-run] [--json]";
+    let cell_id = tclone_target_arg(&args, usage)?;
+    let source_run_id = arg_value(&args, "--into")
+        .filter(|value| tclone_is_safe_token(value))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, usage))?;
+    let selectors = repeated_arg_values(&args, "--path")?;
+    if selectors.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "promotion requires at least one explicit --path selector",
+        ));
+    }
+    validate_scope_paths(&selectors)?;
+
+    let cell_root = capability_cell_path(&cell_id)?;
+    let record: CapabilityCellRecord =
+        serde_json::from_str(&read_nofollow_to_string(&cell_root.join("record.json"))?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let manifest_path = cell_root.join("effect-manifest.json");
+    let mut manifest: EffectManifest =
+        serde_json::from_str(&read_nofollow_to_string(&manifest_path)?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    validate_promotion_evidence(&record, &manifest, &cell_id, &source_run_id, &cell_root)?;
+
+    let mut selected = manifest
+        .outputs_proposed_for_promotion
+        .iter()
+        .filter(|output| path_is_in_scopes(&output.path, &selectors))
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| left.path.cmp(&right.path));
+    selected.dedup_by(|left, right| left.path == right.path);
+    for selector in &selectors {
+        if !selected
+            .iter()
+            .any(|output| path_is_in_scopes(&output.path, std::slice::from_ref(selector)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("promotion selector has no proposed output: {selector}"),
+            ));
+        }
+    }
+    if manifest.promotions.iter().any(|receipt| {
+        receipt.paths.iter().any(|promoted| {
+            selected.iter().any(|output| {
+                promoted == &output.path
+                    || promoted.starts_with(&format!("{}/", output.path))
+                    || output.path.starts_with(&format!("{promoted}/"))
+            })
+        })
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "one or more selected outputs have already been promoted",
+        ));
+    }
+
+    let source = find_tclone_record(&source_run_id)?;
+    if source.role != "source" || source.status != "running" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cell outputs can be promoted only into their running source",
+        ));
+    }
+    let podman = tclone_podman();
+    ensure_tclone_container_exists(&podman, &source)?;
+    let plan = build_cell_promotion_plan(&podman, &source, &cell_root, &selected)?;
+    if !plan.conflicts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "source changed since the cell snapshot; refusing promotion for: {}",
+                plan.conflicts.join(", ")
+            ),
+        ));
+    }
+
+    let dry_run = args.iter().any(|arg| arg == "--dry-run");
+    let promotion_id = format!("promotion_{}", Uuid::new_v4().simple());
+    if !dry_run {
+        apply_tclone_overlay_merge(&podman, &source, &plan)?;
+        manifest.promotions.push(PromotionReceipt {
+            promotion_id: promotion_id.clone(),
+            source_run_id: source.run_id.clone(),
+            paths: selected.iter().map(|output| output.path.clone()).collect(),
+            promoted_at_ms: unix_millis()?,
+            approval_token_id: None,
+        });
+        write_atomic_nofollow(
+            &manifest_path,
+            &serde_json::to_vec_pretty(&manifest)?,
+            0o600,
+        )?;
+    }
+
+    let result = json!({
+        "promotion_id": promotion_id,
+        "cell_id": cell_id,
+        "source_run_id": source_run_id,
+        "dry_run": dry_run,
+        "paths": selected.iter().map(|output| &output.path).collect::<Vec<_>>(),
+        "conflicts": plan.conflicts,
+    });
+    if option_flag(&args, "--json") {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if dry_run {
+        println!(
+            "validated promotion of {} output(s) from {} into {}; no changes applied",
+            selected.len(),
+            cell_id,
+            source_run_id
+        );
+    } else {
+        println!(
+            "transactionally promoted {} output(s) from {} into {} ({promotion_id})",
+            selected.len(),
+            cell_id,
+            source_run_id
+        );
+    }
+    Ok(())
+}
+
+fn repeated_arg_values(args: &[OsString], flag: &str) -> io::Result<Vec<String>> {
+    let prefix = format!("{flag}=");
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let value = args[index].to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("{flag} must be UTF-8"))
+        })?;
+        if value == "--" {
+            break;
+        }
+        if value == flag {
+            let next = args
+                .get(index + 1)
+                .and_then(|arg| arg.to_str())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("missing {flag} value"))
+                })?;
+            values.push(next.to_string());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = value.strip_prefix(&prefix) {
+            if value.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing {flag} value"),
+                ));
+            }
+            values.push(value.to_string());
+        }
+        index += 1;
+    }
+    Ok(values)
+}
+
+fn option_flag(args: &[OsString], flag: &str) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_os_str() != "--")
+        .any(|arg| arg == flag)
+}
+
+fn validate_promotion_evidence(
+    record: &CapabilityCellRecord,
+    manifest: &EffectManifest,
+    cell_id: &str,
+    source_run_id: &str,
+    cell_root: &Path,
+) -> io::Result<()> {
+    if record.cell_id != cell_id
+        || manifest.cell_id != cell_id
+        || record.operation_id != manifest.operation_id
+        || record.source_run_id != source_run_id
+        || manifest.source_run_id != source_run_id
+        || record.exit_code != Some(0)
+        || manifest.exit_code != Some(0)
+        || record.timed_out
+        || manifest.timed_out
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cell identity, source, or successful completion evidence does not match",
+        ));
+    }
+    if !record.request.inspect_before_commit
+        || manifest.telemetry_coverage.filesystem_writes != TelemetryCoverage::Complete
+        || !manifest.violations.is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "promotion requires inspect-before-commit, complete write telemetry, and zero violations",
+        ));
+    }
+    let actual_before = collect_cell_snapshot(&cell_root.join("input"))?;
+    let actual_after = collect_cell_snapshot(&cell_root.join("output"))?;
+    if diff_cell_snapshots(&actual_before, &actual_after) != manifest.files_changed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cell snapshots no longer match the recorded effect evidence",
+        ));
+    }
+    let expected_outputs = manifest
+        .files_changed
+        .iter()
+        .filter(|effect| path_is_in_scopes(&effect.path, &record.request.scope.write_paths))
+        .map(|effect| PromotionOutput {
+            path: effect.path.clone(),
+            change: effect.change,
+            entry_kind: effect.entry_kind,
+            digest: effect.after_digest.clone(),
+        })
+        .collect::<Vec<_>>();
+    if expected_outputs != manifest.outputs_proposed_for_promotion {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "promotion proposals do not match the observed filesystem diff",
+        ));
+    }
+    Ok(())
+}
+
+fn build_cell_promotion_plan(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+    cell_root: &Path,
+    selected: &[PromotionOutput],
+) -> io::Result<TcloneOverlayMergePlan> {
+    let current_root = cell_root.join(format!(".promotion-current-{}", Uuid::new_v4().simple()));
+    let cleanup = CapabilityCellDirectoryCleanup(current_root.clone());
+    create_restrictive_dir_all(&current_root)?;
+    let mut changes = Vec::new();
+    let mut conflicts = Vec::new();
+    for output in selected {
+        let input = cell_root.join("input").join(&output.path);
+        let current = current_root.join(&output.path);
+        let container_path = Path::new(&source.container_workspace).join(&output.path);
+        ensure_source_path_has_no_symlink_ancestor(podman, source, &container_path)?;
+        capture_source_path(podman, source, &container_path, &current)?;
+        if snapshot_cell_path(&input)? != snapshot_cell_path(&current)? {
+            conflicts.push(output.path.clone());
+            continue;
+        }
+        let path =
+            normalize_tclone_workspace_merge_path(&output.path, &source.container_workspace)?;
+        let (op, source_path) = match output.change {
+            FileChangeKind::Deleted => (TcloneOverlayMergeOp::Delete, None),
+            FileChangeKind::Created | FileChangeKind::Modified
+                if output.entry_kind == FileEntryKind::Directory =>
+            {
+                (
+                    TcloneOverlayMergeOp::CreateDir,
+                    Some(cell_root.join("output").join(&output.path)),
+                )
+            }
+            FileChangeKind::Created | FileChangeKind::Modified => (
+                TcloneOverlayMergeOp::UpsertFile,
+                Some(cell_root.join("output").join(&output.path)),
+            ),
+        };
+        if let Some(path) = source_path.as_deref() {
+            ensure_cell_path_has_no_symlink_ancestor(&cell_root.join("output"), path)?;
+        }
+        changes.push(TcloneOverlayMergeChange {
+            path,
+            op,
+            source: source_path,
+        });
+    }
+    drop(cleanup);
+    Ok(TcloneOverlayMergePlan { changes, conflicts })
+}
+
+fn capture_source_path(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+    container_path: &Path,
+    destination: &Path,
+) -> io::Result<()> {
+    if let Some(parent) = destination.parent() {
+        create_restrictive_dir_all(parent)?;
+    }
+    let status = Command::new(podman)
+        .args([
+            OsString::from("cp"),
+            OsString::from(format!(
+                "{}:{}",
+                source.container_name,
+                container_path.display()
+            )),
+            destination.as_os_str().to_os_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    let path = container_path.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "container path must be UTF-8")
+    })?;
+    let missing = Command::new(podman)
+        .args([
+            OsString::from("exec"),
+            OsString::from(&source.container_name),
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("[ ! -e \"$1\" ] && [ ! -L \"$1\" ]"),
+            OsString::from("sh"),
+            OsString::from(path),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if missing.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "failed to capture source path for conflict detection: {path}"
+        )))
+    }
+}
+
+fn ensure_source_path_has_no_symlink_ancestor(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+    container_path: &Path,
+) -> io::Result<()> {
+    let path = container_path.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "container path must be UTF-8")
+    })?;
+    tclone_exec(
+        podman,
+        &source.container_name,
+        &[
+            "sh",
+            "-c",
+            "p=$1; while [ \"$p\" != / ]; do p=${p%/*}; [ -z \"$p\" ] && p=/; [ ! -L \"$p\" ] || exit 42; done",
+            "sh",
+            path,
+        ],
+    )
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("source path has a symlink ancestor: {path}"),
+        )
+    })
+}
+
+fn ensure_cell_path_has_no_symlink_ancestor(root: &Path, path: &Path) -> io::Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cell output escaped its root",
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    let components = relative.components().collect::<Vec<_>>();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component.as_os_str());
+        if fs::symlink_metadata(&current)?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("cell output has a symlink ancestor: {}", current.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_cell_path(path: &Path) -> io::Result<Option<CellSnapshotEntry>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() {
+        return Ok(Some(CellSnapshotEntry {
+            kind: FileEntryKind::Directory,
+            digest: None,
+            size: None,
+            mode: cell_metadata_mode(&metadata),
+        }));
+    }
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path)?;
+        return Ok(Some(CellSnapshotEntry {
+            kind: FileEntryKind::Symlink,
+            digest: Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(target.to_string_lossy().as_bytes())
+            )),
+            size: None,
+            mode: None,
+        }));
+    }
+    if metadata.is_file() {
+        return Ok(Some(CellSnapshotEntry {
+            kind: FileEntryKind::File,
+            digest: Some(digest_cell_file(path)?),
+            size: Some(metadata.len()),
+            mode: cell_metadata_mode(&metadata),
+        }));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "special filesystem entry cannot be promoted: {}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn cell_metadata_mode(metadata: &fs::Metadata) -> Option<u32> {
+    Some(metadata.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn cell_metadata_mode(_metadata: &fs::Metadata) -> Option<u32> {
+    None
+}
+
+struct CapabilityCellDirectoryCleanup(PathBuf);
+
+impl Drop for CapabilityCellDirectoryCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn inspect_capability_cell(args: Vec<OsString>) -> io::Result<()> {
     if env::var_os("GENSEE_TCLONE_HOST_CONTROL_CALLER").is_some() {
         return Err(io::Error::new(
@@ -547,11 +1279,25 @@ fn inspect_capability_cell(args: Vec<OsString>) -> io::Result<()> {
         ));
     }
     let cell_id = tclone_target_arg(&args, "usage: gensee run cell inspect <cell-id> [--json]")?;
-    let record = read_nofollow_to_string(&capability_cell_path(&cell_id)?.join("record.json"))?;
+    let cell_path = capability_cell_path(&cell_id)?;
+    let record = read_nofollow_to_string(&cell_path.join("record.json"))?;
+    let manifest = read_nofollow_to_string(&cell_path.join("effect-manifest.json"))?;
     if args.iter().any(|arg| arg == "--json") {
-        println!("{record}");
+        let record: serde_json::Value = serde_json::from_str(&record)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let manifest: EffectManifest = serde_json::from_str(&manifest)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "record": record,
+                "effect_manifest": manifest,
+            }))?
+        );
     } else {
         let parsed: CapabilityCellRecord = serde_json::from_str(&record)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let manifest: EffectManifest = serde_json::from_str(&manifest)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         println!("cell: {}", parsed.cell_id);
         println!("source: {}", parsed.source_run_id);
@@ -561,6 +1307,13 @@ fn inspect_capability_cell(args: Vec<OsString>) -> io::Result<()> {
             parsed.exit_code, parsed.timed_out
         );
         println!("snapshot: {}", parsed.workspace_snapshot);
+        println!("manifest: {}", parsed.effect_manifest);
+        println!(
+            "effects: {} changed path(s), {} promotion proposal(s), {} violation(s)",
+            manifest.files_changed.len(),
+            manifest.outputs_proposed_for_promotion.len(),
+            manifest.violations.len()
+        );
     }
     Ok(())
 }
@@ -696,6 +1449,7 @@ mod tests {
         let lease = CapabilityCellLease {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_dot".to_string(),
+            operation_id: "op_dot".to_string(),
             source_run_id: "run_1".to_string(),
             request,
             command: vec!["true".to_string()],
@@ -727,6 +1481,7 @@ mod tests {
         let lease = CapabilityCellLease {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_one".to_string(),
+            operation_id: "op_one".to_string(),
             source_run_id: "run_one".to_string(),
             request: request(),
             command: vec!["true".to_string()],
@@ -761,6 +1516,7 @@ mod tests {
         let lease = CapabilityCellLease {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_1".to_string(),
+            operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             request,
             command: vec!["cargo".to_string(), "check".to_string()],
@@ -770,7 +1526,7 @@ mod tests {
         };
         let source = source_record();
 
-        let args = capability_cell_run_args(&source, &lease, "cell", &root, 1).unwrap();
+        let args = capability_cell_run_args(&source, &lease, "cell", &root, &root, 1).unwrap();
         let rendered = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -789,6 +1545,230 @@ mod tests {
         assert!(rendered.iter().any(|arg| arg.ends_with("/Cargo.toml:ro,Z")));
         assert!(rendered.iter().any(|arg| arg.ends_with("/Cargo.lock:rw,Z")));
         assert!(!rendered.iter().any(|arg| arg.contains(".codex")));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_snapshot_copy_preserves_directory_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::temp_dir().join(format!("gensee-cell-dir-mode-{}", Uuid::new_v4()));
+        let input = root.join("input");
+        let nested = input.join("private");
+        let output = root.join("output");
+        fs::create_dir_all(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o2710)).unwrap();
+        fs::write(nested.join("value"), "x").unwrap();
+
+        copy_path_all(&input, &output).unwrap();
+
+        let source_mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o7777;
+        let output_mode = fs::metadata(output.join("private"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(output_mode, source_mode);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cell_cli_paths_accept_equals_and_stop_at_command_separator() {
+        let promotion_args = vec![
+            OsString::from("--path=src"),
+            OsString::from("--path"),
+            OsString::from("Cargo.lock"),
+            OsString::from("--"),
+            OsString::from("--path=ignored"),
+        ];
+        assert_eq!(
+            repeated_arg_values(&promotion_args, "--path").unwrap(),
+            vec!["src", "Cargo.lock"]
+        );
+        assert!(repeated_arg_values(&[OsString::from("--path")], "--path").is_err());
+    }
+
+    #[test]
+    fn manifest_uses_actual_diff_and_flags_out_of_scope_changes() {
+        let root = env::temp_dir().join(format!("gensee-cell-manifest-{}", Uuid::new_v4()));
+        let input = root.join("input");
+        let output = root.join("output");
+        fs::create_dir_all(input.join("src")).unwrap();
+        fs::create_dir_all(output.join("src")).unwrap();
+        fs::write(input.join("Cargo.lock"), "before").unwrap();
+        fs::write(output.join("Cargo.lock"), "after").unwrap();
+        fs::write(input.join("src/lib.rs"), "same").unwrap();
+        fs::write(output.join("src/lib.rs"), "changed outside scope").unwrap();
+        let mut manifest_request = request();
+        manifest_request
+            .capabilities
+            .push(Capability::UntrustedCodeExecution);
+        let lease = CapabilityCellLease {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            lease_id: "lease_1".to_string(),
+            operation_id: "op_1".to_string(),
+            source_run_id: "run_1".to_string(),
+            request: manifest_request,
+            command: vec!["cargo".to_string(), "check".to_string()],
+            issued_at_ms: 1,
+            expires_at_ms: 2,
+            consumed_at_ms: Some(1),
+        };
+
+        let manifest = build_effect_manifest(
+            &source_record(),
+            &lease,
+            "cell_1",
+            &input,
+            &output,
+            10,
+            20,
+            Some(0),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.operation_id, "op_1");
+        assert!(manifest
+            .requested_capabilities
+            .contains(&Capability::UntrustedCodeExecution));
+        assert!(!manifest
+            .capabilities_used
+            .contains(&Capability::UntrustedCodeExecution));
+        assert_eq!(manifest.files_changed.len(), 2);
+        assert_eq!(manifest.outputs_proposed_for_promotion.len(), 1);
+        assert_eq!(
+            manifest.outputs_proposed_for_promotion[0].path,
+            "Cargo.lock"
+        );
+        assert_eq!(manifest.violations.len(), 1);
+        assert_eq!(manifest.violations[0].resource, "src/lib.rs");
+        assert_eq!(
+            manifest.telemetry_coverage.filesystem_writes,
+            TelemetryCoverage::Complete
+        );
+        assert_eq!(
+            manifest.telemetry_coverage.filesystem_reads,
+            TelemetryCoverage::Unavailable
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn promotion_evidence_rejects_tampering_and_incomplete_telemetry() {
+        let root = env::temp_dir().join(format!("gensee-cell-promotion-{}", Uuid::new_v4()));
+        let input = root.join("input");
+        let output = root.join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(input.join("Cargo.lock"), "before").unwrap();
+        fs::write(output.join("Cargo.lock"), "after").unwrap();
+        let lease = CapabilityCellLease {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            lease_id: "lease_1".to_string(),
+            operation_id: "op_1".to_string(),
+            source_run_id: "run_1".to_string(),
+            request: request(),
+            command: vec!["cargo".to_string(), "check".to_string()],
+            issued_at_ms: 1,
+            expires_at_ms: 2,
+            consumed_at_ms: Some(1),
+        };
+        let manifest = build_effect_manifest(
+            &source_record(),
+            &lease,
+            "cell_1",
+            &input,
+            &output,
+            10,
+            20,
+            Some(0),
+            false,
+        )
+        .unwrap();
+        let record = CapabilityCellRecord {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            operation_id: "op_1".to_string(),
+            cell_id: "cell_1".to_string(),
+            lease_id: "lease_1".to_string(),
+            source_run_id: "run_1".to_string(),
+            request: lease.request,
+            command: lease.command,
+            container_name: "cell".to_string(),
+            input_snapshot: input.to_string_lossy().to_string(),
+            workspace_snapshot: output.to_string_lossy().to_string(),
+            effect_manifest: root
+                .join("effect-manifest.json")
+                .to_string_lossy()
+                .to_string(),
+            started_at_ms: 10,
+            finished_at_ms: 20,
+            exit_code: Some(0),
+            timed_out: false,
+        };
+
+        validate_promotion_evidence(&record, &manifest, "cell_1", "run_1", &root).unwrap();
+
+        let mut incomplete = manifest.clone();
+        incomplete.telemetry_coverage.filesystem_writes = TelemetryCoverage::Partial;
+        assert_eq!(
+            validate_promotion_evidence(&record, &incomplete, "cell_1", "run_1", &root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        fs::write(output.join("Cargo.lock"), "tampered").unwrap();
+        assert_eq!(
+            validate_promotion_evidence(&record, &manifest, "cell_1", "run_1", &root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_blocks_escaping_symlink_outputs() {
+        let root = env::temp_dir().join(format!("gensee-cell-symlink-{}", Uuid::new_v4()));
+        let input = root.join("input");
+        let output = root.join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        std::os::unix::fs::symlink("../../outside", output.join("escape")).unwrap();
+        let mut cell_request = request();
+        cell_request.scope.read_paths.clear();
+        cell_request.scope.write_paths = vec![".".to_string()];
+        let lease = CapabilityCellLease {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            lease_id: "lease_1".to_string(),
+            operation_id: "op_1".to_string(),
+            source_run_id: "run_1".to_string(),
+            request: cell_request,
+            command: vec!["true".to_string()],
+            issued_at_ms: 1,
+            expires_at_ms: 2,
+            consumed_at_ms: Some(1),
+        };
+        let manifest = build_effect_manifest(
+            &source_record(),
+            &lease,
+            "cell_1",
+            &input,
+            &output,
+            10,
+            20,
+            Some(0),
+            false,
+        )
+        .unwrap();
+
+        assert!(manifest
+            .violations
+            .iter()
+            .any(|violation| violation.kind == "unsafe_symlink_output"));
         fs::remove_dir_all(root).ok();
     }
 }
