@@ -29,33 +29,52 @@ struct DashboardOverviewPage: View {
                     }
                 }
 
-                HStack(spacing: 10) {
-                    if model.isDemoMode {
-                        DashboardSymbol("rectangle.stack", color: .secondary, size: 13, weight: .regular)
-                        Text("Synthetic product tour")
-                            .font(.system(size: 12, weight: .semibold))
-                        DashboardTag(text: "Demo data", color: .dashboardBlue)
-                        Text("Explore the evidence model before connecting a harness.")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                        Spacer()
-                        DashboardTag(text: "This Mac untouched", color: .dashboardGreen)
-                    } else {
-                        DashboardSymbol(
-                            sensor.health.connected ? "checkmark.shield" : "exclamationmark.triangle",
-                            color: sensor.health.connected ? .dashboardGreen : .dashboardGold,
-                            size: 13,
-                            weight: .regular
-                        )
-                        Text(sensor.health.connected ? "Endpoint Security sensor connected" : "Endpoint Security sensor disconnected")
-                            .font(.system(size: 12, weight: .semibold))
-                        DashboardTag(text: sensor.health.mode.capitalized, color: sensor.health.mode == "observe" ? .dashboardBlue : .dashboardRed)
-                        Text("\(sensor.health.ingestedEvents.formatted()) events ingested")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                        Spacer()
-                        if sensor.health.hasDataLoss {
-                            DashboardTag(text: "Event gaps detected", color: .dashboardRed)
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        if model.isDemoMode {
+                            DashboardSymbol("rectangle.stack", color: .secondary, size: 13, weight: .regular)
+                            Text("Synthetic product tour")
+                                .font(.system(size: 12, weight: .semibold))
+                            DashboardTag(text: "Demo data", color: .dashboardBlue)
+                            Text("Explore the evidence model before connecting a harness.")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                            Spacer()
+                            DashboardTag(text: "This Mac untouched", color: .dashboardGreen)
                         } else {
-                            DashboardTag(text: "No event gaps", color: .green)
+                            DashboardSymbol(
+                                sensor.health.connected ? "checkmark.shield" : "exclamationmark.triangle",
+                                color: sensor.health.connected ? .dashboardGreen : .dashboardGold,
+                                size: 13,
+                                weight: .regular
+                            )
+                            Text(sensor.health.connected ? "Endpoint Security sensor connected" : "Endpoint Security sensor disconnected")
+                                .font(.system(size: 12, weight: .semibold))
+                            DashboardTag(text: sensor.health.mode.capitalized, color: sensor.health.mode == "observe" ? .dashboardBlue : .dashboardRed)
+                            Text("\(sensor.health.ingestedEvents.formatted()) events ingested")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                            Spacer()
+                            if sensor.health.hasDataLoss {
+                                DashboardTag(text: "Event gaps detected", color: .dashboardRed)
+                            } else {
+                                DashboardTag(text: "No event gaps", color: .green)
+                            }
+                        }
+                    }
+                    if !model.isDemoMode, let issue = sensor.health.launchContinuityIssue {
+                        Divider()
+                        HStack(spacing: 8) {
+                            DashboardSymbol(
+                                "exclamationmark.triangle.fill",
+                                color: .dashboardRed,
+                                size: 12,
+                                weight: .semibold
+                            )
+                            Text(issue.detail)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(Color.dashboardRed)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 12)
+                            DashboardTag(text: "Incomplete evidence", color: .dashboardRed)
                         }
                     }
                 }

@@ -119,6 +119,7 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
     private func refreshStatusItem() {
         guard let button = statusItem?.button else { return }
         let count = actionableReviews.count
+        let continuityIssue = model?.endpointSensor.health.launchContinuityIssue
         let mark = NSImage(named: "MenuBarEye") ?? NSImage(
             systemSymbolName: "eye.circle",
             accessibilityDescription: "Gensee Crate"
@@ -131,10 +132,14 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
         button.title = ""
         button.attributedTitle = NSAttributedString(string: "")
         installAttentionBadge(on: button)
-        attentionBadge?.isHidden = count == 0
-        button.toolTip = count == 0
-            ? "Gensee Crate — all agents clear"
-            : "Gensee Crate — \(count) request\(count == 1 ? "" : "s") to review"
+        attentionBadge?.isHidden = count == 0 && continuityIssue == nil
+        if let continuityIssue {
+            button.toolTip = "Gensee Crate — \(continuityIssue.summary.lowercased())"
+        } else {
+            button.toolTip = count == 0
+                ? "Gensee Crate — all agents clear"
+                : "Gensee Crate — \(count) request\(count == 1 ? "" : "s") to review"
+        }
         button.setAccessibilityLabel(button.toolTip ?? "Gensee Crate")
     }
 
@@ -166,7 +171,9 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
         menu.addItem(title)
 
         let statusTitle: String
-        if model?.endpointSensor.health.connected == true {
+        if let issue = model?.endpointSensor.health.launchContinuityIssue {
+            statusTitle = "Incomplete evidence — \(issue.summary.lowercased())"
+        } else if model?.endpointSensor.health.connected == true {
             statusTitle = actionable.isEmpty
                 ? "Independent verification is active"
                 : "\(actionable.count) request\(actionable.count == 1 ? "" : "s") to review"
@@ -175,9 +182,11 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
         }
         let status = NSMenuItem(
             title: statusTitle,
-            action: model?.endpointSensor.health.connected == true
-                ? (actionable.isEmpty ? #selector(openStatus(_:)) : #selector(openQueue(_:)))
-                : #selector(openSettings(_:)),
+            action: model?.endpointSensor.health.launchContinuityIssue != nil
+                ? #selector(openStatus(_:))
+                : (model?.endpointSensor.health.connected == true
+                    ? (actionable.isEmpty ? #selector(openStatus(_:)) : #selector(openQueue(_:)))
+                    : #selector(openSettings(_:))),
             keyEquivalent: ""
         )
         status.target = self

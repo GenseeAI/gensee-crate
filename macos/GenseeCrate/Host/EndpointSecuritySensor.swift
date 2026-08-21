@@ -24,8 +24,11 @@ struct EndpointSensorHealth: Equatable {
     var managedProcesses: UInt64 = 0
     var lastEventAt: Date?
     var error: String?
+    var launchContinuityIssue: EndpointEvidenceContinuityIssue?
 
-    var hasDataLoss: Bool { kernelDrops > 0 || ringDrops > 0 || rejectedEvents > 0 }
+    var hasDataLoss: Bool {
+        kernelDrops > 0 || ringDrops > 0 || rejectedEvents > 0 || launchContinuityIssue != nil
+    }
     var hasBackpressure: Bool { backlogEvents >= 1_000 || lastBatchDurationMS >= 1_000 }
     var exceedsAuthorizationLatencyBudget: Bool {
         maxAuthorizationLatencyUS > configuredMaxAuthorizationLatencyUS
@@ -43,6 +46,7 @@ final class EndpointSecuritySensor: ObservableObject {
     private let executableURL: URL?
     private let cursorDefaultsKey: String
     private let bootIDDefaultsKey: String
+    private let kernelDropsDefaultsKey: String
     private var connection: GenseeEndpointSecurityBridge?
     private var ingestProcess: Process?
     private var ingestInput: FileHandle?
@@ -50,6 +54,8 @@ final class EndpointSecuritySensor: ObservableObject {
     private var pollingTask: Task<Void, Never>?
     private var cursor: UInt64 = 0
     private var bootID = ""
+    private var persistedKernelDrops: UInt64?
+    private var checkedLaunchContinuity = false
     private var started = false
     private var pendingConfiguration: [String: Any] = ["mode": "observe"]
     private var pendingConfigurationData: Data?
@@ -67,9 +73,11 @@ final class EndpointSecuritySensor: ObservableObject {
         let defaultsSuffix = homeURL.standardizedFileURL.path
         cursorDefaultsKey = "gensee.endpointSecurity.cursor.\(defaultsSuffix)"
         bootIDDefaultsKey = "gensee.endpointSecurity.bootID.\(defaultsSuffix)"
+        kernelDropsDefaultsKey = "gensee.endpointSecurity.kernelDrops.\(defaultsSuffix)"
         let defaults = UserDefaults.standard
         cursor = (defaults.object(forKey: cursorDefaultsKey) as? NSNumber)?.uint64Value ?? 0
         bootID = defaults.string(forKey: bootIDDefaultsKey) ?? ""
+        persistedKernelDrops = (defaults.object(forKey: kernelDropsDefaultsKey) as? NSNumber)?.uint64Value
     }
 
     deinit {
@@ -316,6 +324,19 @@ final class EndpointSecuritySensor: ObservableObject {
         let nextBootID = dictionary["boot_id"] as? String ?? ""
         let nextCursor = number(dictionary["next_cursor"])
         let oldestCursor = number(dictionary["oldest_cursor"])
+        let nextKernelDrops = number(dictionary["kernel_drops"])
+        if !checkedLaunchContinuity {
+            health.launchContinuityIssue = EndpointEvidenceContinuityPolicy.issue(
+                persistedBootID: bootID,
+                currentBootID: nextBootID,
+                persistedCursor: cursor,
+                oldestCursor: oldestCursor,
+                nextCursor: nextCursor,
+                persistedKernelDrops: persistedKernelDrops,
+                currentKernelDrops: nextKernelDrops
+            )
+            checkedLaunchContinuity = true
+        }
         let firstObservation = bootID.isEmpty
         let didRewind = firstObservation || bootID != nextBootID || cursor >= nextCursor
         if didRewind {
@@ -337,7 +358,7 @@ final class EndpointSecuritySensor: ObservableObject {
         health.backlogEvents = nextCursor > effectiveCursor
             ? nextCursor - effectiveCursor - 1
             : 0
-        health.kernelDrops = number(dictionary["kernel_drops"])
+        health.kernelDrops = nextKernelDrops
         health.ringDrops = number(dictionary["ring_drops"])
         health.lastGlobalSequence = number(dictionary["last_global_seq_num"])
         health.authorizationCount = number(dictionary["authorization_count"])
@@ -355,6 +376,8 @@ final class EndpointSecuritySensor: ObservableObject {
         let defaults = UserDefaults.standard
         defaults.set(NSNumber(value: cursor), forKey: cursorDefaultsKey)
         defaults.set(bootID, forKey: bootIDDefaultsKey)
+        defaults.set(NSNumber(value: health.kernelDrops), forKey: kernelDropsDefaultsKey)
+        persistedKernelDrops = health.kernelDrops
     }
 
     private func write(

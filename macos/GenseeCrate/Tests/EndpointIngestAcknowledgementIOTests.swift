@@ -21,6 +21,62 @@ final class EndpointIngestAcknowledgementIOTests: XCTestCase {
         XCTAssertNil(EndpointIngestBatchPolicy.warning(forRejectedEvents: 0))
     }
 
+    func testLaunchContinuityReportsEventsOverwrittenBeforeDrainResumed() {
+        let issue = EndpointEvidenceContinuityPolicy.issue(
+            persistedBootID: "boot-a",
+            currentBootID: "boot-a",
+            persistedCursor: 100,
+            oldestCursor: 125,
+            nextCursor: 500,
+            persistedKernelDrops: 4,
+            currentKernelDrops: 7
+        )
+
+        XCTAssertEqual(issue?.unavailableEventCount, 27)
+        XCTAssertEqual(issue?.sensorRestarted, false)
+        XCTAssertTrue(issue?.detail.contains("27 Endpoint Security events were not retained") == true)
+    }
+
+    func testLaunchContinuityDoesNotReportHealthyResume() {
+        XCTAssertNil(EndpointEvidenceContinuityPolicy.issue(
+            persistedBootID: "boot-a",
+            currentBootID: "boot-a",
+            persistedCursor: 100,
+            oldestCursor: 80,
+            nextCursor: 110,
+            persistedKernelDrops: 4,
+            currentKernelDrops: 4
+        ))
+    }
+
+    func testLaunchContinuityReportsSensorRestartWithoutInventingACount() {
+        let issue = EndpointEvidenceContinuityPolicy.issue(
+            persistedBootID: "boot-a",
+            currentBootID: "boot-b",
+            persistedCursor: 100,
+            oldestCursor: 1,
+            nextCursor: 20,
+            persistedKernelDrops: 9,
+            currentKernelDrops: 0
+        )
+
+        XCTAssertEqual(issue?.unavailableEventCount, 0)
+        XCTAssertEqual(issue?.sensorRestarted, true)
+        XCTAssertTrue(issue?.detail.contains("restarted while Gensee Crate was closed") == true)
+    }
+
+    func testLaunchContinuityIgnoresFirstEverConnection() {
+        XCTAssertNil(EndpointEvidenceContinuityPolicy.issue(
+            persistedBootID: "",
+            currentBootID: "boot-a",
+            persistedCursor: 0,
+            oldestCursor: 20,
+            nextCursor: 40,
+            persistedKernelDrops: nil,
+            currentKernelDrops: 10
+        ))
+    }
+
     func testReadChunkReturnsAvailableAcknowledgementData() throws {
         let pipe = Pipe()
         defer {
