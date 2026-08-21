@@ -298,11 +298,14 @@ telemetry coverage. Every Linux cell is held behind a startup gate while Gensee
 places the container tree in its own cgroup and establishes mount-wide
 fanotify permission marks over the container root and each scoped bind mount.
 A dedicated host sensor thread services permission events so the orchestrator
-cannot block on its own gate or evidence writes. A
-queue overflow, missing mark, sensor error, or unsupported host is recorded as
-incomplete read/process coverage and a violation; it is never represented as an
-empty effect list. Capability cells therefore require Linux cgroup v2. Complete
-forensic coverage additionally requires root fanotify support.
+cannot block on its own gate or evidence writes. Because `/tmp`, `/run`, and
+private mediation binds are separate mounts, current manifests conservatively
+report read and process coverage as `partial` and record the exact covered
+mounts in a violation. A queue overflow, missing mark, sensor error, or
+unsupported host is also recorded as incomplete coverage; events collected
+before an overflow are retained instead of being discarded. Capability cells
+therefore require Linux cgroup v2 and root fanotify support, while promotion
+continues to fail closed until every relevant mount has complete coverage.
 
 Install and load the shipped AppArmor profile before using cells:
 
@@ -312,7 +315,9 @@ sudo apparmor_parser -r /etc/apparmor.d/gensee-capability-cell
 ```
 
 The default profile name is `gensee-capability-cell`; a missing profile causes
-cell startup to fail closed.
+cell startup to fail closed. `gensee status` reports whether this default
+capability-cell profile is loaded, so the prerequisite can be checked before a
+cell is issued.
 
 The immutable part of the manifest, the exact request and command, and both
 snapshot tree digests are bound into an HMAC-authenticated
@@ -349,7 +354,10 @@ An exact write scope may name a path that does not exist yet when its typed
 file operation is `create`. Gensee preserves that absence in the immutable
 input snapshot and materializes only the declared file or directory in the
 isolated output layer, so the manifest records `created` and promotion can
-perform the correct absence/conflict check. Symlink mount targets are rejected.
+perform the correct absence/conflict check. A declared file create is an exact
+single-file bind mount; programs that publish through a sibling temporary file
+and `rename(2)` must instead declare a writable parent directory. Symlink mount
+targets are rejected.
 
 Direct network leases are supported on Linux only when they pin IP/CIDR,
 TCP/UDP, and exact ports. Gensee creates a private cell network namespace,

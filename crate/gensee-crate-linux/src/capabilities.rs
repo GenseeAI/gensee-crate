@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LinuxCapabilityReport {
     pub apparmor_enabled: bool,
+    #[serde(default)]
+    pub capability_cell_apparmor_profile_loaded: bool,
     pub selinux_enabled: bool,
     pub landlock_available: bool,
     pub bpf_fs_mounted: bool,
@@ -32,6 +34,9 @@ impl LinuxCapabilityReport {
         Self {
             apparmor_enabled: read_trimmed("/sys/module/apparmor/parameters/enabled")
                 .is_some_and(|value| value.eq_ignore_ascii_case("y")),
+            capability_cell_apparmor_profile_loaded: apparmor_profile_loaded(
+                "gensee-capability-cell",
+            ),
             selinux_enabled: read_trimmed("/sys/fs/selinux/enforce")
                 .is_some_and(|value| value != "0"),
             landlock_available: Path::new("/sys/kernel/security/landlock").exists()
@@ -62,6 +67,16 @@ impl LinuxCapabilityReport {
     pub fn supports_cgroup_network_controls(&self) -> bool {
         self.cgroup_v2_mounted && self.nft_available && self.running_as_root
     }
+}
+
+fn apparmor_profile_loaded(profile: &str) -> bool {
+    fs::read_to_string("/sys/kernel/security/apparmor/profiles")
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            line.strip_prefix(profile)
+                .is_some_and(|suffix| suffix.starts_with(' ') || suffix.starts_with("//"))
+        })
 }
 
 fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {

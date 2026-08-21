@@ -30,6 +30,14 @@ const BASE_WRITE_ACCESS: u64 = ACCESS_FS_WRITE_FILE
     | ACCESS_FS_MAKE_FIFO
     | ACCESS_FS_MAKE_BLOCK
     | ACCESS_FS_MAKE_SYM;
+const RUNTIME_WRITE_PATHS: &[&str] = &[
+    "/tmp",
+    "/run",
+    "/dev/null",
+    "/dev/tty",
+    "/dev/stdout",
+    "/dev/stderr",
+];
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -96,12 +104,7 @@ pub fn apply_landlock_write_sandbox(write_paths: &[String]) -> io::Result<()> {
 
     add_path_rule(&ruleset_fd, Path::new("/"), READ_EXECUTE_ACCESS)?;
     let mut paths = write_paths.to_vec();
-    paths.extend([
-        "/tmp".to_string(),
-        "/run".to_string(),
-        "/dev/null".to_string(),
-        "/dev/tty".to_string(),
-    ]);
+    paths.extend(RUNTIME_WRITE_PATHS.iter().map(|path| (*path).to_string()));
     paths.sort();
     paths.dedup();
     for path in paths {
@@ -190,5 +193,11 @@ mod tests {
         assert_ne!(BASE_WRITE_ACCESS & ACCESS_FS_WRITE_FILE, 0);
         assert_ne!(BASE_WRITE_ACCESS & ACCESS_FS_REMOVE_FILE, 0);
         assert_ne!(BASE_WRITE_ACCESS & ACCESS_FS_MAKE_REG, 0);
+    }
+
+    #[test]
+    fn runtime_write_paths_include_standard_output_symlinks() {
+        assert!(RUNTIME_WRITE_PATHS.contains(&"/dev/stdout"));
+        assert!(RUNTIME_WRITE_PATHS.contains(&"/dev/stderr"));
     }
 }

@@ -177,6 +177,7 @@ mod tests {
     fn capabilities(backends: Vec<LinuxSpeculationBackend>) -> LinuxCapabilityReport {
         LinuxCapabilityReport {
             apparmor_enabled: false,
+            capability_cell_apparmor_profile_loaded: false,
             selinux_enabled: false,
             landlock_available: false,
             bpf_fs_mounted: false,

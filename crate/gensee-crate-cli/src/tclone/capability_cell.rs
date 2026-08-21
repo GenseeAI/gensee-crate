@@ -152,13 +152,19 @@ struct CellNetworkEvidence {
 struct CellRuntimeEvidence {
     files_read: BTreeSet<String>,
     processes_started: Vec<ProcessEffect>,
+    covered_read_mounts: Vec<String>,
+    collection_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CellRuntimeWorkerResult {
+    events: Vec<gensee_crate_linux::LinuxFanotifyEvent>,
     collection_error: Option<String>,
 }
 
 struct CellRuntimeSensor {
     stop: Arc<AtomicBool>,
-    worker:
-        Option<std::thread::JoinHandle<io::Result<Vec<gensee_crate_linux::LinuxFanotifyEvent>>>>,
+    worker: Option<std::thread::JoinHandle<CellRuntimeWorkerResult>>,
     evidence: CellRuntimeEvidence,
     input_snapshot: PathBuf,
     output_snapshot: PathBuf,
@@ -247,54 +253,67 @@ impl CellRuntimeSensor {
             output_snapshot: output_snapshot.to_path_buf(),
             container_workspace: container_workspace.to_string(),
         };
-        let result = (|| -> io::Result<gensee_crate_linux::LinuxFanotifyEnforcer> {
-            let process_root = PathBuf::from("/proc")
-                .join(root_pid.to_string())
-                .join("root");
-            if !process_root.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "gated capability-cell process root is not inspectable",
-                ));
-            }
-            let workspace_root = process_root.join(container_workspace.trim_start_matches('/'));
-            let mut mount_marks = vec![process_root.to_string_lossy().to_string()];
-            for relative in scoped_paths {
-                let path = if relative == "." {
-                    workspace_root.clone()
-                } else {
-                    workspace_root.join(relative)
-                };
-                mount_marks.push(path.to_string_lossy().to_string());
-            }
-            mount_marks.sort();
-            mount_marks.dedup();
-            let session = gensee_crate_linux::LinuxSessionTarget::from_pid(cell_id, root_pid)?;
-            let config = gensee_crate_linux::LinuxFanotifyConfig::with_session_filesystem_audit(
-                gensee_crate_linux::LinuxPolicy::default(),
-                session,
-                mount_marks,
-            );
-            let enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(config)?;
-            let status = enforcer.status();
-            if !status.warnings.is_empty() || status.marked_paths.is_empty() {
-                return Err(io::Error::other(format!(
-                    "fanotify cell sensor did not establish complete mount marks: {}",
-                    status.warnings.join("; ")
-                )));
-            }
-            Ok(enforcer)
-        })();
+        let result =
+            (|| -> io::Result<(gensee_crate_linux::LinuxFanotifyEnforcer, Vec<String>)> {
+                let process_root = PathBuf::from("/proc")
+                    .join(root_pid.to_string())
+                    .join("root");
+                if !process_root.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "gated capability-cell process root is not inspectable",
+                    ));
+                }
+                let workspace_root = process_root.join(container_workspace.trim_start_matches('/'));
+                let mut mount_marks = vec![process_root.to_string_lossy().to_string()];
+                for relative in scoped_paths {
+                    let path = if relative == "." {
+                        workspace_root.clone()
+                    } else {
+                        workspace_root.join(relative)
+                    };
+                    mount_marks.push(path.to_string_lossy().to_string());
+                }
+                mount_marks.sort();
+                mount_marks.dedup();
+                let session = gensee_crate_linux::LinuxSessionTarget::from_pid(cell_id, root_pid)?;
+                let config = gensee_crate_linux::LinuxFanotifyConfig::with_session_filesystem_audit(
+                    gensee_crate_linux::LinuxPolicy::default(),
+                    session,
+                    mount_marks,
+                );
+                let enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(config)?;
+                let status = enforcer.status();
+                if !status.warnings.is_empty() || status.marked_paths.is_empty() {
+                    return Err(io::Error::other(format!(
+                        "fanotify cell sensor did not establish complete mount marks: {}",
+                        status.warnings.join("; ")
+                    )));
+                }
+                Ok((enforcer, status.marked_paths))
+            })();
         match result {
-            Ok(mut enforcer) => {
+            Ok((mut enforcer, covered_read_mounts)) => {
+                sensor.evidence.covered_read_mounts = covered_read_mounts;
                 sensor.worker = Some(thread::spawn(move || {
                     let mut observed = Vec::new();
                     loop {
-                        let events = enforcer.handle_events_once()?;
+                        let events = match enforcer.handle_events_once() {
+                            Ok(events) => events,
+                            Err(error) => {
+                                return CellRuntimeWorkerResult {
+                                    events: observed,
+                                    collection_error: Some(error.to_string()),
+                                };
+                            }
+                        };
                         let empty = events.is_empty();
                         observed.extend(events);
                         if stop.load(Ordering::Acquire) && empty {
-                            return Ok(observed);
+                            return CellRuntimeWorkerResult {
+                                events: observed,
+                                collection_error: None,
+                            };
                         }
                         if empty {
                             thread::sleep(Duration::from_millis(5));
@@ -351,8 +370,10 @@ impl CellRuntimeSensor {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             match worker.join() {
-                Ok(Ok(events)) => self.record_events(events),
-                Ok(Err(error)) => self.evidence.collection_error = Some(error.to_string()),
+                Ok(result) => {
+                    self.record_events(result.events);
+                    self.evidence.collection_error = result.collection_error;
+                }
                 Err(_) => {
                     self.evidence.collection_error =
                         Some("fanotify cell sensor thread panicked".to_string())
@@ -2073,6 +2094,19 @@ fn build_effect_manifest(
             observed_at_ms: finished_at_ms,
         });
     }
+    if let Some(evidence) = runtime_evidence {
+        let covered = if evidence.covered_read_mounts.is_empty() {
+            "none".to_string()
+        } else {
+            evidence.covered_read_mounts.join(",")
+        };
+        violations.push(EffectViolation {
+            kind: "filesystem_read_coverage_partial".to_string(),
+            resource: covered,
+            detail: "fanotify covers only the recorded mounts; separate cell mounts such as /tmp, /run, and private mediation binds are not observed".to_string(),
+            observed_at_ms: finished_at_ms,
+        });
+    }
     if let Some(error) = runtime_evidence.and_then(|evidence| evidence.collection_error.as_ref()) {
         violations.push(EffectViolation {
             kind: "runtime_effect_telemetry_incomplete".to_string(),
@@ -2143,7 +2177,6 @@ fn build_effect_manifest(
         );
     }
     let runtime_coverage = match runtime_evidence {
-        Some(evidence) if evidence.collection_error.is_none() => TelemetryCoverage::Complete,
         Some(_) => TelemetryCoverage::Partial,
         None => TelemetryCoverage::Unavailable,
     };
@@ -3557,6 +3590,7 @@ mod tests {
         request.scope.file_operations = vec![gensee_crate_rules::capability::FileOperationScope {
             path: "target/cache".to_string(),
             operation: gensee_crate_rules::capability::FileOperationKind::Delete,
+            entry_kind: None,
         }];
 
         validate_cell_request_for_issue(&request).unwrap();
@@ -4363,7 +4397,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_records_complete_runtime_sensor_evidence() {
+    fn manifest_records_runtime_evidence_with_explicit_partial_mount_coverage() {
         let root = env::temp_dir().join(format!("gensee-cell-runtime-{}", Uuid::new_v4()));
         let input = root.join("input");
         let output = root.join("output");
@@ -4388,6 +4422,7 @@ mod tests {
         };
         let mut runtime = CellRuntimeEvidence::default();
         runtime.files_read.insert("Cargo.toml".to_string());
+        runtime.covered_read_mounts = vec!["/proc/42/root".to_string()];
         runtime.processes_started.push(ProcessEffect {
             executable: "/usr/bin/cargo".to_string(),
             argv_digest: format!("sha256:{}", "a".repeat(64)),
@@ -4418,12 +4453,18 @@ mod tests {
             .any(|process| process.pid == Some(42)));
         assert_eq!(
             manifest.telemetry_coverage.filesystem_reads,
-            TelemetryCoverage::Complete
+            TelemetryCoverage::Partial
         );
         assert_eq!(
             manifest.telemetry_coverage.process_tree,
-            TelemetryCoverage::Complete
+            TelemetryCoverage::Partial
         );
+        let coverage_violation = manifest
+            .violations
+            .iter()
+            .find(|violation| violation.kind == "filesystem_read_coverage_partial")
+            .unwrap();
+        assert_eq!(coverage_violation.resource, "/proc/42/root");
         fs::remove_dir_all(root).ok();
     }
 
