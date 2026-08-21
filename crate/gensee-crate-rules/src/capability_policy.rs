@@ -261,7 +261,14 @@ impl CapabilityPolicyEngine {
                 missing_mediators,
             );
         }
-        let capabilities = if executor == CapabilityExecutor::CurrentOperation {
+        let capabilities = if matches!(
+            executor,
+            CapabilityExecutor::CurrentOperation | CapabilityExecutor::LiveFork
+        ) {
+            // A live fork inherits the current operation. Its lease delta is
+            // therefore only authority not already present in the parent,
+            // while a fresh cell or mediator starts from an independent
+            // authority context.
             local_delta
         } else {
             request.capabilities.clone()
@@ -916,6 +923,7 @@ mod tests {
         let decision = CapabilityPolicyEngine::default().evaluate(&request, &evaluation_context);
 
         assert_eq!(decision.executor, Some(CapabilityExecutor::LiveFork));
+        assert!(decision.lease_delta.capabilities.is_empty());
         assert_eq!(decision.approval, ApprovalRequirement::None);
         assert_eq!(
             decision.promotion,
