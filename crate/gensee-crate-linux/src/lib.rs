@@ -42,4 +42,7 @@ pub use seccomp::{
     install_seccomp_filter, LinuxSeccompDeniedSyscall, LinuxSeccompProfile,
     LinuxSeccompSyscallGroup,
 };
-pub use session::LinuxSessionTarget;
+pub use session::{
+    collect_process_lineage, LinuxProcessIdentity, LinuxSessionTarget,
+    MAX_PROCESS_LINEAGE_IDENTITIES,
+};

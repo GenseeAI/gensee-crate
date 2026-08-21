@@ -16,7 +16,8 @@ anything else             -> deny and record
 
 ## Enforcement model
 
-The supervisor owns one operation record and one enforcement subject:
+The supervisor owns one network record and joins the shared
+[operation supervisor](operation-supervisor.md) for one enforcement subject:
 
 - root_pid puts a local process tree in an operation cgroup and applies
   nftables output policy to that cgroup; or
@@ -98,7 +99,8 @@ sudo env GENSEE_HOME=/var/lib/gensee \
 
 The control socket and evidence are retained under
 GENSEE_HOME/network-operations/OPERATION_ID as supervisor.sock, record.json,
-and effects.jsonl.
+and effects.jsonl. The generic lifecycle/envelope record is retained separately
+under GENSEE_HOME/operations/OPERATION_ID/record.json.
 
 Submit a structured direct-network capability fault:
 

@@ -1566,7 +1566,7 @@ fn open_nofollow_read(path: &Path) -> io::Result<fs::File> {
     Ok(file)
 }
 
-fn read_nofollow_to_string(path: &Path) -> io::Result<String> {
+pub(crate) fn read_nofollow_to_string(path: &Path) -> io::Result<String> {
     let mut file = open_nofollow_read(path)?;
     let mut text = String::new();
     file.read_to_string(&mut text)?;
