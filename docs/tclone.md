@@ -347,10 +347,12 @@ changing the source.
 
 Direct network leases are supported on Linux only when they pin IP/CIDR,
 TCP/UDP, and exact ports. Gensee creates a private cell network namespace,
-never the host network namespace, binds an nftables forward allowlist to its
-inspected address, and attaches its
-process tree to a fresh cgroup before a trusted startup gate releases the leased
-command. It then records allowed counters and blocked attempts. Policy-denied
+never the host network namespace, binds identical nftables forward and
+host-input allowlists to its inspected
+address, and attaches its process tree to a fresh cgroup before a trusted
+startup gate releases the leased command. Covering both routing hooks prevents
+an allowed origin from redirecting a cell to an unleased service on the Gensee
+host. Gensee then records allowed counters and blocked attempts. Policy-denied
 kernel authority and external mutations still fail closed. Repository/API,
 identity, mTLS, browser, cloud, and database authority can run only through a
 source/operation/cell-bound broker gateway.
@@ -569,6 +571,12 @@ export GENSEE_TCLONE_NODE_ROOT="$HOME/.nvm"
 export GENSEE_TCLONE_NODE_BIN="$(dirname "$(command -v node)")"
 export GENSEE_TCLONE_READY_TIMEOUT_SECS=120
 ```
+
+The Node root is mounted read-only at `/opt/gensee-host-node` (with a separate
+safe bin mount when needed), and absolute agent executables are remapped into
+that tree. It is deliberately never mounted over `/usr/local`: doing so would
+hide Gensee's trusted `gensee-tclone-init` and `gensee` launchers before the
+container can establish its control and cleanup invariants.
 
 ## Control Split
 
