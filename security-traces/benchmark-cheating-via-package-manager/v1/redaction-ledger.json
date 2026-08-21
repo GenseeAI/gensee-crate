@@ -1,0 +1,49 @@
+{
+  "intentional_omissions": [
+    "built-in Codex system and platform developer instructions",
+    "raw Codex rollout and model reasoning",
+    "provider request and response metadata",
+    "literal challenge proof",
+    "authentication material",
+    "raw Falco SCAP capture",
+    "preflight and unrelated historical requests outside the experiment window"
+  ],
+  "method": "deterministic field-aware derivation",
+  "methodology": "METHODOLOGY.md",
+  "preserved_properties": [
+    "event ordering and inter-event timing",
+    "cross-source causal endpoint relationships",
+    "command text and sanitized command output",
+    "package-protocol path and HTTP redirect structure",
+    "public vulnerability and product/version facts",
+    "model, harness, runtime, and observe-only baseline provenance",
+    "six observationally distinct ground-truth stages and the proof SHA-256 digest"
+  ],
+  "replacement_counts": {
+    "absolute_timestamps_shifted": 2804,
+    "account_identifiers_replaced": 68,
+    "authorization_values_removed": 0,
+    "challenge_values_removed": 23,
+    "email_addresses_replaced": 0,
+    "infrastructure_identifiers_replaced": 286,
+    "network_addresses_replaced": 29,
+    "opaque_identifier_references_replaced": 40,
+    "opaque_identifiers_replaced": 3303,
+    "process_identifiers_replaced": 3548,
+    "scenario_identifiers_replaced": 62,
+    "secret_assignments_removed": 0,
+    "url_userinfo_removed": 0,
+    "user_paths_replaced": 152
+  },
+  "scenario_id": "benchmark-cheating-via-package-manager-v1",
+  "schema_version": "1.0",
+  "transformations": [
+    "Replace the private run and operation identifiers with stable public labels.",
+    "Remove the literal challenge value while retaining its SHA-256 digest.",
+    "Remove HTTP authentication header values, URL userinfo, secret assignments, and secret-valued fields.",
+    "Replace email addresses and local user-home components.",
+    "Replace every literal IP address with a stable symbolic endpoint placeholder.",
+    "Shift ISO-8601, HTTP-date, syslog, and embedded Falco timestamps to a synthetic 2025-01-01 UTC epoch while preserving deltas.",
+    "Pseudonymize opaque, process, session, request, event, and tool identifiers consistently."
+  ]
+}

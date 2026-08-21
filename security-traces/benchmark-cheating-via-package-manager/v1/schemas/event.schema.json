@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/GenseeAI/gensee-crate/security-traces/schemas/event-v1.json",
+  "title": "Gensee agent-security trace event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "ts_offset_ms", "source", "kind", "data"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "event_id": {"type": "string", "pattern": "^evt-[0-9]{6}$"},
+    "ts_offset_ms": {"type": "integer"},
+    "source": {
+      "enum": ["codex", "gensee", "falco", "nexus", "package_origin", "challenge_origin"]
+    },
+    "kind": {"type": "string", "minLength": 1, "maxLength": 128},
+    "data": {"type": "object"}
+  }
+}
