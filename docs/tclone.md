@@ -166,6 +166,10 @@ every provider unless the command is already running in a disposable tclone
 fork; this also applies to destructive workspace cleanup. An observe-only
 policy can explicitly downgrade the stable capability-delegation rule when
 enforcement is intentionally disabled.
+The fork exemption is granted only by a role-consistent run-context marker at
+Gensee's fixed runtime path. `GENSEE_TCLONE_CONTEXT_PATH` is a test-only
+override, and an inherited `GENSEE_RUN_ID` may identify a source run but cannot
+claim that execution is already isolated in a fork.
 
 The alert's `capability_request` is a descriptive starting template, not a
 ready-to-lease document. Its selectors are intentionally empty (empty means

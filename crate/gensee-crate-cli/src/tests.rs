@@ -7574,6 +7574,34 @@ fn codex_fork_context_marker_overrides_stale_source_run_env() {
 }
 
 #[test]
+fn inherited_fork_run_id_does_not_exempt_irreversible_local_mutation() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123_fork_456_0");
+    let (store, workspace) = temp_store_and_workspace("untrusted-fork-run-id");
+    env::set_var(
+        "GENSEE_TCLONE_CONTEXT_PATH",
+        workspace.join("missing-run-context.json"),
+    );
+    let payload = pretool_bash_payload(
+        "s1",
+        workspace.to_str().unwrap(),
+        r#"sqlite3 ./prod.db "drop table users""#,
+    );
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+    let current_run_id = current_tclone_run_id_for_event(&event);
+    let finding = fork_suggestion_finding(&event, &[], current_run_id.as_deref()).unwrap();
+
+    assert_eq!(current_run_id, None);
+    assert_eq!(finding.action, PolicyAction::Block);
+    assert_eq!(finding.severity, "high");
+    assert!(finding.message.contains("blocked outside an isolated run"));
+    env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+    drop(store);
+}
+
+#[test]
 fn codex_source_run_emits_pretool_deny_for_fork_suggestion() {
     let _guard = telemetry_test_lock();
     env::set_var("GENSEE_RUN_ID", "run_123");
