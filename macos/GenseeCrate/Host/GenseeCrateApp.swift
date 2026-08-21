@@ -207,6 +207,26 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
                 menu.addItem(item)
             }
         }
+
+        menu.addItem(.separator())
+
+        let settings = NSMenuItem(
+            title: "Settings…",
+            action: #selector(openSettings(_:)),
+            keyEquivalent: ","
+        )
+        settings.target = self
+        settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        menu.addItem(settings)
+
+        let quit = NSMenuItem(
+            title: "Quit Gensee Crate",
+            action: #selector(quitGensee(_:)),
+            keyEquivalent: "q"
+        )
+        quit.target = self
+        quit.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
+        menu.addItem(quit)
     }
 
     @objc private func openReview(_ sender: NSMenuItem) {
@@ -224,6 +244,10 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
 
     @objc private func openSettings(_ sender: NSMenuItem) {
         openGensee(destination: .settings, requestID: nil)
+    }
+
+    @objc private func quitGensee(_ sender: NSMenuItem) {
+        NSApp.terminate(nil)
     }
 
     private func openReviewQueue(requestID: Int64?) {
