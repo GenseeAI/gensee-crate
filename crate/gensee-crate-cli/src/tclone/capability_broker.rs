@@ -845,33 +845,15 @@ fn consume_external_commit_token(args: &[OsString]) -> io::Result<()> {
     let target = required_arg(args, "--target")?;
     let action = required_arg(args, "--action")?;
     let digest = required_arg(args, "--request-digest")?;
-    let initial_token = load_external_commit_token(&token_id)?;
-    let lease_path = broker_lease_path(&initial_token.claims.lease_id)?;
-    let _lease_lock = TcloneStateLock::acquire(&lease_path)?;
-    let path = external_commit_token_path(&token_id)?;
-    let _token_lock = TcloneStateLock::acquire(&path)?;
-    let mut token = load_external_commit_token(&token_id)?;
-    let mut lease = load_broker_lease(&token.claims.lease_id)?;
-    let now = unix_millis()?;
-    if lease.status != BrokerLeaseStatus::Active || now >= lease.expires_at_ms {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "external commit token lease is not active",
-        ));
-    }
-    validate_and_consume_external_commit_token(
-        &mut token, &token_id, &gateway, &target, &action, &digest, now,
+    let (lease_id, now) = consume_external_commit_token_for_gateway(
+        &token_id, &gateway, &target, &action, &digest, None, None,
     )?;
-    persist_external_commit_token(&token)?;
-    lease.status = BrokerLeaseStatus::Consumed;
-    lease.consumed_at_ms = Some(now);
-    persist_broker_lease(&lease)?;
     if args.iter().any(|arg| arg == "--json") {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "token_id": token_id,
-                "lease_id": lease.lease_id,
+                "lease_id": lease_id,
                 "consumed_at_ms": now,
                 "request_digest": digest,
             }))?
@@ -880,6 +862,47 @@ fn consume_external_commit_token(args: &[OsString]) -> io::Result<()> {
         println!("consumed one-use external commit token {token_id}");
     }
     Ok(())
+}
+
+/// Atomically consume a one-use, signed external-action commit token for an
+/// exact trusted gateway request. The caller must invoke this immediately
+/// before performing the irreversible effect; a crash after consumption is
+/// therefore fail-safe (the effect may be absent, but cannot be duplicated).
+pub(crate) fn consume_external_commit_token_for_gateway(
+    token_id: &str,
+    gateway: &str,
+    target: &str,
+    action: &str,
+    digest: &str,
+    expected_operation_id: Option<&str>,
+    expected_source_run_id: Option<&str>,
+) -> io::Result<(String, u64)> {
+    let initial_token = load_external_commit_token(token_id)?;
+    let lease_path = broker_lease_path(&initial_token.claims.lease_id)?;
+    let _lease_lock = TcloneStateLock::acquire(&lease_path)?;
+    let path = external_commit_token_path(token_id)?;
+    let _token_lock = TcloneStateLock::acquire(&path)?;
+    let mut token = load_external_commit_token(token_id)?;
+    let mut lease = load_broker_lease(&token.claims.lease_id)?;
+    let now = unix_millis()?;
+    if lease.status != BrokerLeaseStatus::Active
+        || now >= lease.expires_at_ms
+        || expected_operation_id.is_some_and(|id| token.claims.operation_id != id)
+        || expected_source_run_id.is_some_and(|id| token.claims.source_run_id != id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "external commit token lease is not active or belongs to another operation",
+        ));
+    }
+    validate_and_consume_external_commit_token(
+        &mut token, token_id, gateway, target, action, digest, now,
+    )?;
+    persist_external_commit_token(&token)?;
+    lease.status = BrokerLeaseStatus::Consumed;
+    lease.consumed_at_ms = Some(now);
+    persist_broker_lease(&lease)?;
+    Ok((lease.lease_id, now))
 }
 
 #[allow(clippy::too_many_arguments)]

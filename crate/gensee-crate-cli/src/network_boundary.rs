@@ -11,23 +11,27 @@ use gensee_crate_rules::network_boundary::{
     NetworkProtocol, NETWORK_BOUNDARY_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::io::{BufReader, ErrorKind};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::os::unix::{
-    fs::{OpenOptionsExt, PermissionsExt},
+    fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     io::AsRawFd,
 };
 use std::sync::{Arc, Mutex};
 use url::Url;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
-const NETWORK_SUPERVISOR_SCHEMA_VERSION: u32 = 2;
+const NETWORK_SUPERVISOR_SCHEMA_VERSION: u32 = 3;
 const MAX_PROXY_HEADER_BYTES: usize = 64 * 1024;
 const MAX_SUPERVISOR_MESSAGE_BYTES: u64 = 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CREDENTIAL_HEADER_BYTES: u64 = 16 * 1024;
 const NETWORK_POLL_INTERVAL_MS: u64 = 100;
 const NETWORK_USAGE_POLL_INTERVAL_MS: u64 = 1_000;
 
@@ -53,10 +57,40 @@ struct HttpGatewayConfig {
     listen: String,
     /// Exact client IP allowed to use the gateway. Loopback is not assumed.
     client_address: String,
+    #[serde(default = "default_max_request_bytes")]
+    max_request_bytes: u64,
     #[serde(default = "default_max_response_bytes")]
     max_response_bytes: u64,
+    #[serde(default)]
+    max_redirects: u32,
     connect_timeout_seconds: u64,
     io_timeout_seconds: u64,
+    /// A mediator lease is required for credentials or mutating HTTP methods.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential: Option<HttpCredentialInjection>,
+    /// Mutating methods additionally consume one exact, signed host-broker
+    /// commit token immediately before the upstream effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit_token_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpCredentialInjection {
+    handle_id: String,
+    header_name: String,
+    value_file: String,
+    allowed_url_prefixes: Vec<String>,
+}
+
+fn default_max_request_bytes() -> u64 {
+    DEFAULT_MAX_REQUEST_BYTES
 }
 
 fn default_max_response_bytes() -> u64 {
@@ -79,6 +113,12 @@ struct NetworkOperationRecord {
     usage: OperationNetworkUsage,
     #[serde(default)]
     counter_snapshot: BTreeMap<String, (u64, u64)>,
+    #[serde(default)]
+    revoked_http_mediator_leases: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_mediator_lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_mediator_expires_at_ms: Option<u64>,
     started_at_ms: u64,
     updated_at_ms: u64,
 }
@@ -88,6 +128,7 @@ struct NetworkOperationRecord {
 enum NetworkSupervisorRequest {
     Event { event: NetworkBoundaryEvent },
     Fault { fault: CapabilityFault },
+    RevokeHttpMediator { lease_id: String },
     Inspect,
 }
 
@@ -116,6 +157,14 @@ struct NetworkEffectRecord {
     lease_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     response_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_handle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redirect_target: Option<String>,
     bytes_from_client: u64,
     bytes_to_client: u64,
     completed_at_ms: u64,
@@ -146,18 +195,36 @@ struct CapabilityFaultEvidenceRecord {
     received_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpMediatorAuditRecord {
+    schema_version: u32,
+    operation_id: String,
+    source_run_id: String,
+    method: String,
+    target: String,
+    request_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease_id: Option<String>,
+    disposition: String,
+    reason_code: String,
+    observed_at_ms: u64,
+}
+
 struct NetworkSupervisor {
     record: NetworkOperationRecord,
     record_path: PathBuf,
     event_log_path: PathBuf,
     counter_log_path: PathBuf,
     fault_log_path: PathBuf,
+    mediator_log_path: PathBuf,
     dry_run: bool,
     operation: Option<OperationSupervisor>,
     active_plan: Option<gensee_crate_linux::LinuxNftablesPlan>,
     counter_snapshot: BTreeMap<String, (u64, u64)>,
     next_usage_sample_at_ms: u64,
     last_counter_error: Option<String>,
+    http_mediator_lease_id: Option<String>,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -216,10 +283,11 @@ pub(crate) fn handle_c0_network(args: Vec<OsString>) -> io::Result<()> {
         Some("serve") => serve_network_supervisor(&args[1..]),
         Some("event") => send_network_supervisor_event(&args[1..]),
         Some("fault") => send_capability_fault(&args[1..]),
+        Some("revoke-http") => revoke_http_mediator(&args[1..]),
         Some("inspect") => inspect_network_supervisor(&args[1..]),
         _ => Err(io::Error::new(
             ErrorKind::InvalidInput,
-            "usage: gensee run network <serve --config FILE [--dry-run]|event --socket PATH --event FILE|fault --socket PATH --fault FILE|inspect --socket PATH>",
+            "usage: gensee run network <serve --config FILE [--dry-run]|event --socket PATH --event FILE|fault --socket PATH --fault FILE|revoke-http --socket PATH --lease ID|inspect --socket PATH>",
         )),
     }
 }
@@ -257,6 +325,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     let event_log_path = root.join("effects.jsonl");
     let counter_log_path = root.join("counters.jsonl");
     let fault_log_path = root.join("faults.jsonl");
+    let mediator_log_path = root.join("http-mediator.jsonl");
     let previous = if record_path.exists() {
         let previous: NetworkOperationRecord =
             serde_json::from_str(&read_nofollow_to_string(&record_path)?).map_err(|error| {
@@ -270,6 +339,12 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
             || previous.source_run_id != config.source_run_id
             || previous.root_pid != config.root_pid
             || previous.source_address != config.source_address
+            || previous.http_mediator_lease_id != config.proxy.lease_id
+            || previous.http_mediator_expires_at_ms != config.proxy.expires_at_ms
+            || previous
+                .revoked_http_mediator_leases
+                .iter()
+                .any(|lease_id| !safe_network_token(lease_id))
             || previous
                 .active_table_name
                 .as_deref()
@@ -308,6 +383,11 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         counter_snapshot: previous
             .as_ref()
             .map_or_else(BTreeMap::new, |record| record.counter_snapshot.clone()),
+        revoked_http_mediator_leases: previous.as_ref().map_or_else(BTreeSet::new, |record| {
+            record.revoked_http_mediator_leases.clone()
+        }),
+        http_mediator_lease_id: config.proxy.lease_id.clone(),
+        http_mediator_expires_at_ms: config.proxy.expires_at_ms,
         started_at_ms,
         updated_at_ms: now_ms,
     };
@@ -395,12 +475,14 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         event_log_path,
         counter_log_path,
         fault_log_path,
+        mediator_log_path,
         dry_run,
         operation: Some(operation),
         active_plan,
         counter_snapshot,
         next_usage_sample_at_ms: now_ms.saturating_add(NETWORK_USAGE_POLL_INTERVAL_MS),
         last_counter_error: None,
+        http_mediator_lease_id: config.proxy.lease_id.clone(),
     }));
     let _cleanup = NetworkRuntimeCleanup {
         table_names: Arc::clone(&table_names),
@@ -485,14 +567,45 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
 }
 
 fn validate_network_operation_config(config: &NetworkOperationConfig) -> io::Result<()> {
+    let mediator_lease_is_complete =
+        config.proxy.lease_id.is_some() == config.proxy.expires_at_ms.is_some();
+    let mutating_http = config
+        .policy
+        .http_gateway_methods
+        .iter()
+        .any(|method| !matches!(method.as_str(), "GET" | "HEAD"));
     if config.schema_version != NETWORK_SUPERVISOR_SCHEMA_VERSION
         || config.policy.schema_version != NETWORK_BOUNDARY_SCHEMA_VERSION
         || !safe_network_token(&config.operation_id)
         || !safe_network_token(&config.source_run_id)
         || config.root_pid.is_some() == config.source_address.is_some()
+        || config.proxy.max_request_bytes == 0
         || config.proxy.max_response_bytes == 0
+        || config.proxy.max_request_bytes > 1024 * 1024 * 1024
+        || config.proxy.max_response_bytes > 1024 * 1024 * 1024
+        || config.proxy.max_redirects > 10
         || config.proxy.connect_timeout_seconds == 0
         || config.proxy.io_timeout_seconds == 0
+        || !mediator_lease_is_complete
+        || config
+            .proxy
+            .lease_id
+            .as_deref()
+            .is_some_and(|lease_id| !safe_network_token(lease_id))
+        || (mutating_http || config.proxy.credential.is_some()) && config.proxy.lease_id.is_none()
+        || mutating_http
+            && (config.proxy.gateway_id.is_none() || config.proxy.commit_token_id.is_none())
+        || config.proxy.gateway_id.is_some() != config.proxy.commit_token_id.is_some()
+        || config
+            .proxy
+            .gateway_id
+            .as_deref()
+            .is_some_and(|gateway| !safe_network_token(gateway))
+        || config
+            .proxy
+            .commit_token_id
+            .as_deref()
+            .is_some_and(|token| !safe_network_token(token))
     {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -527,7 +640,100 @@ fn validate_network_operation_config(config: &NetworkOperationConfig) -> io::Res
             "proxy client_address cannot be unspecified",
         ));
     }
+    if let Some(credential) = config.proxy.credential.as_ref() {
+        validate_http_credential_config(credential)?;
+    }
     Ok(())
+}
+
+fn validate_http_credential_config(config: &HttpCredentialInjection) -> io::Result<()> {
+    if !safe_network_token(&config.handle_id)
+        || !valid_http_header_name(&config.header_name)
+        || connection_hop_header(&config.header_name)
+        || matches!(
+            config.header_name.to_ascii_lowercase().as_str(),
+            "host" | "content-length" | "x-gensee-target"
+        )
+        || config.allowed_url_prefixes.is_empty()
+        || config
+            .allowed_url_prefixes
+            .iter()
+            .any(|prefix| validate_credential_url_prefix(prefix).is_err())
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "HTTP credential injection requires a safe handle, header, and exact URL audience",
+        ));
+    }
+    let path = Path::new(&config.value_file);
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "HTTP credential value_file must be absolute",
+        ));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP credential value_file must be a regular non-symlink file",
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP credential value_file must be owned by the mediator user and mode 0600 or stricter",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_credential_url_prefix(value: &str) -> io::Result<Url> {
+    let url = Url::parse(value).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "credential URL audience must be an absolute HTTP(S) URL",
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "credential URL audience must be credential-free HTTP(S) origin/path without query or fragment",
+        ));
+    }
+    Ok(url)
+}
+
+fn valid_http_header_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 impl NetworkSupervisor {
@@ -674,6 +880,10 @@ impl NetworkSupervisor {
             lease_id: resolution.lease_id.clone(),
             decision,
             response_status: None,
+            request_digest: None,
+            response_digest: None,
+            credential_handle_id: None,
+            redirect_target: None,
             bytes_from_client: 0,
             bytes_to_client: 0,
             completed_at_ms: unix_millis()?,
@@ -935,6 +1145,37 @@ impl NetworkSupervisor {
         Ok(())
     }
 
+    fn append_http_mediator_audit(
+        &self,
+        request: &ParsedProxyRequest,
+        disposition: &str,
+        reason_code: &str,
+    ) -> io::Result<()> {
+        let mut file = open_owner_append_nofollow(&self.mediator_log_path)?;
+        serde_json::to_writer(
+            &mut file,
+            &HttpMediatorAuditRecord {
+                schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                operation_id: self.record.operation_id.clone(),
+                source_run_id: self.record.source_run_id.clone(),
+                method: request.method.clone(),
+                target: redacted_url_for_evidence(&request.url),
+                request_digest: mediated_http_request_digest(
+                    &request.method,
+                    &request.url,
+                    &request.headers,
+                    &request.body,
+                ),
+                lease_id: self.http_mediator_lease_id.clone(),
+                disposition: disposition.to_string(),
+                reason_code: reason_code.to_string(),
+                observed_at_ms: unix_millis()?,
+            },
+        )?;
+        file.write_all(b"\n")?;
+        file.sync_data()
+    }
+
     fn persist(&self) -> io::Result<()> {
         write_atomic_nofollow(
             &self.record_path,
@@ -999,6 +1240,32 @@ fn handle_supervisor_stream(
                 }
             }
         }
+        NetworkSupervisorRequest::RevokeHttpMediator { lease_id } => {
+            let mut state = lock_supervisor(&supervisor)?;
+            let response = if state.http_mediator_lease_id.as_deref() == Some(&lease_id) {
+                state.record.revoked_http_mediator_leases.insert(lease_id);
+                state.record.updated_at_ms = unix_millis()?;
+                state.persist()?;
+                NetworkSupervisorResponse {
+                    ok: true,
+                    decision: None,
+                    resolution: None,
+                    record: Some(state.record.clone()),
+                    error: None,
+                }
+            } else {
+                NetworkSupervisorResponse {
+                    ok: false,
+                    decision: None,
+                    resolution: None,
+                    record: None,
+                    error: Some(
+                        "HTTP mediator lease does not belong to this operation".to_string(),
+                    ),
+                }
+            };
+            response
+        }
         NetworkSupervisorRequest::Event { mut event } => {
             let mut state = lock_supervisor(&supervisor)?;
             let decision = state.decide(&mut event)?;
@@ -1014,6 +1281,10 @@ fn handle_supervisor_stream(
                             .and_then(|lease| lease.lease_id.clone()),
                         decision: decision.clone(),
                         response_status: None,
+                        request_digest: None,
+                        response_digest: None,
+                        credential_handle_id: None,
+                        redirect_target: None,
                         bytes_from_client: 0,
                         bytes_to_client: 0,
                         completed_at_ms: unix_millis()?,
@@ -1045,7 +1316,7 @@ fn handle_http_proxy_connection(
     mut client: TcpStream,
     peer: SocketAddr,
     supervisor: Arc<Mutex<NetworkSupervisor>>,
-    table_names: Arc<Mutex<Vec<String>>>,
+    _table_names: Arc<Mutex<Vec<String>>>,
     config: HttpGatewayConfig,
 ) -> io::Result<()> {
     let allowed_client = config
@@ -1058,23 +1329,304 @@ fn handle_http_proxy_connection(
     }
     client.set_read_timeout(Some(Duration::from_secs(config.io_timeout_seconds)))?;
     client.set_write_timeout(Some(Duration::from_secs(config.io_timeout_seconds)))?;
-    let request = read_proxy_request(&mut client)?;
-    if !matches!(request.method.as_str(), "GET" | "HEAD") {
-        write_proxy_error(&mut client, 405, "gateway permits read-only HTTP effects")?;
+    let request = match read_proxy_request(&mut client, config.max_request_bytes) {
+        Ok(request) => request,
+        Err(error) => {
+            let status = if error.to_string().contains("byte budget") {
+                413
+            } else {
+                400
+            };
+            write_proxy_error(&mut client, status, "invalid mediated HTTP request")?;
+            return Ok(());
+        }
+    };
+    let now_ms = unix_millis()?;
+    {
+        let state = lock_supervisor(&supervisor)?;
+        if !http_mediator_is_active(&state, &config, now_ms) {
+            state.append_http_mediator_audit(&request, "deny", "http_mediator_lease_inactive")?;
+            write_proxy_error(
+                &mut client,
+                403,
+                "HTTP mediator lease is expired or revoked",
+            )?;
+            return Ok(());
+        }
+        if !state
+            .record
+            .policy
+            .http_gateway_methods
+            .contains(&request.method)
+        {
+            state.append_http_mediator_audit(
+                &request,
+                "deny",
+                "http_method_outside_mediator_lease",
+            )?;
+            write_proxy_error(
+                &mut client,
+                405,
+                "HTTP method is outside the mediator lease",
+            )?;
+            return Ok(());
+        }
+    }
+    if matches!(request.method.as_str(), "GET" | "HEAD") && !request.body.is_empty() {
+        lock_supervisor(&supervisor)?.append_http_mediator_audit(
+            &request,
+            "deny",
+            "read_only_method_has_body",
+        )?;
+        write_proxy_error(
+            &mut client,
+            400,
+            "read-only HTTP methods cannot carry a body",
+        )?;
         return Ok(());
     }
-    let addresses = resolve_authority(&request.host, request.port)?;
-    if addresses.is_empty() {
-        write_proxy_error(&mut client, 502, "authority did not resolve")?;
-        return Ok(());
+    match execute_mediated_http(request, Arc::clone(&supervisor), &config) {
+        Ok(response) => write_mediated_http_response(&mut client, response),
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            write_proxy_error(&mut client, 403, &error.to_string())
+        }
+        Err(error) => {
+            write_proxy_error(&mut client, 502, "mediated upstream request failed")?;
+            Err(error)
+        }
     }
+}
 
-    let now = unix_millis()?;
-    let state = lock_supervisor(&supervisor)?;
+#[derive(Debug)]
+struct MediatedHttpResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn http_mediator_is_active(
+    supervisor: &NetworkSupervisor,
+    config: &HttpGatewayConfig,
+    now_ms: u64,
+) -> bool {
+    match (config.lease_id.as_deref(), config.expires_at_ms) {
+        (Some(lease_id), Some(expires_at_ms)) => {
+            now_ms < expires_at_ms
+                && !supervisor
+                    .record
+                    .revoked_http_mediator_leases
+                    .contains(lease_id)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn execute_mediated_http(
+    request: ParsedProxyRequest,
+    supervisor: Arc<Mutex<NetworkSupervisor>>,
+    config: &HttpGatewayConfig,
+) -> io::Result<MediatedHttpResponse> {
+    let mut current_url = request.url.clone();
+    let method = request.method.clone();
+    let mut redirects_followed = 0u32;
+    loop {
+        let now_ms = unix_millis()?;
+        {
+            let state = lock_supervisor(&supervisor)?;
+            if !http_mediator_is_active(&state, config, now_ms) {
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "HTTP mediator lease expired or was revoked before the effect completed",
+                ));
+            }
+        }
+        let request_digest =
+            mediated_http_request_digest(&method, &current_url, &request.headers, &request.body);
+        let (address, event, decision) = authorize_mediated_http_hop(
+            &supervisor,
+            &method,
+            &current_url,
+            &request_digest,
+            config.lease_id.clone(),
+        )?;
+        let credential = config
+            .credential
+            .as_ref()
+            .filter(|credential| credential_applies_to_url(credential, &current_url))
+            .map(|credential| {
+                load_http_credential(credential).map(|value| {
+                    (
+                        credential.handle_id.clone(),
+                        credential.header_name.clone(),
+                        value,
+                    )
+                })
+            })
+            .transpose()?;
+        let credential_handle_id = credential.as_ref().map(|(handle, _, _)| handle.clone());
+        if !matches!(method.as_str(), "GET" | "HEAD") {
+            let mediator_active = {
+                let state = lock_supervisor(&supervisor)?;
+                http_mediator_is_active(&state, config, unix_millis()?)
+            };
+            if !mediator_active {
+                lock_supervisor(&supervisor)?.append_effect(&NetworkEffectRecord {
+                    schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                    fault_id: None,
+                    event,
+                    decision,
+                    lease_id: config.lease_id.clone(),
+                    response_status: Some(403),
+                    request_digest: Some(request_digest),
+                    response_digest: None,
+                    credential_handle_id,
+                    redirect_target: None,
+                    bytes_from_client: request.body.len() as u64,
+                    bytes_to_client: 0,
+                    completed_at_ms: unix_millis()?,
+                })?;
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "HTTP mediator lease expired or was revoked before commit",
+                ));
+            }
+            let gateway = config.gateway_id.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "mutating HTTP effect has no trusted gateway identity",
+                )
+            })?;
+            let token_id = config.commit_token_id.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "mutating HTTP effect has no one-use commit token",
+                )
+            })?;
+            let (operation_id, source_run_id) = {
+                let state = lock_supervisor(&supervisor)?;
+                (
+                    state.record.operation_id.clone(),
+                    state.record.source_run_id.clone(),
+                )
+            };
+            let commit_result = crate::tclone::consume_external_commit_token_for_gateway(
+                token_id,
+                gateway,
+                current_url.as_str(),
+                &method,
+                &request_digest,
+                Some(&operation_id),
+                Some(&source_run_id),
+            );
+            if let Err(error) = commit_result {
+                lock_supervisor(&supervisor)?.append_effect(&NetworkEffectRecord {
+                    schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                    fault_id: None,
+                    event,
+                    decision,
+                    lease_id: config.lease_id.clone(),
+                    response_status: Some(403),
+                    request_digest: Some(request_digest),
+                    response_digest: None,
+                    credential_handle_id,
+                    redirect_target: None,
+                    bytes_from_client: request.body.len() as u64,
+                    bytes_to_client: 0,
+                    completed_at_ms: unix_millis()?,
+                })?;
+                return Err(io::Error::new(ErrorKind::PermissionDenied, error));
+            }
+        }
+        let upstream = perform_pinned_http_request(
+            &method,
+            &current_url,
+            address,
+            &request.headers,
+            &request.body,
+            credential.as_ref(),
+            config,
+        );
+        let response = match upstream {
+            Ok(response) => response,
+            Err(error) => {
+                let effect = NetworkEffectRecord {
+                    schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                    fault_id: None,
+                    event,
+                    decision,
+                    lease_id: config.lease_id.clone(),
+                    response_status: Some(502),
+                    request_digest: Some(request_digest),
+                    response_digest: None,
+                    credential_handle_id,
+                    redirect_target: None,
+                    bytes_from_client: request.body.len() as u64,
+                    bytes_to_client: 0,
+                    completed_at_ms: unix_millis()?,
+                };
+                lock_supervisor(&supervisor)?.append_effect(&effect)?;
+                return Err(error);
+            }
+        };
+        let redirect = redirect_target(&current_url, &response)?;
+        let response_digest = mediated_http_response_digest(&response);
+        let effect = NetworkEffectRecord {
+            schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+            fault_id: None,
+            event,
+            decision,
+            lease_id: config.lease_id.clone(),
+            response_status: Some(response.status),
+            request_digest: Some(request_digest),
+            response_digest: Some(response_digest),
+            credential_handle_id,
+            redirect_target: redirect.as_ref().map(redacted_url_for_evidence),
+            bytes_from_client: request.body.len() as u64,
+            bytes_to_client: response.body.len() as u64,
+            completed_at_ms: unix_millis()?,
+        };
+        lock_supervisor(&supervisor)?.append_effect(&effect)?;
+
+        if let Some(target) = redirect {
+            let safe_to_repeat = matches!(method.as_str(), "GET" | "HEAD");
+            if safe_to_repeat && redirects_followed < config.max_redirects {
+                redirects_followed = redirects_followed.saturating_add(1);
+                current_url = target;
+                continue;
+            }
+        }
+        return Ok(response);
+    }
+}
+
+fn authorize_mediated_http_hop(
+    supervisor: &Arc<Mutex<NetworkSupervisor>>,
+    method: &str,
+    url: &Url,
+    request_digest: &str,
+    lease_id: Option<String>,
+) -> io::Result<(SocketAddr, NetworkBoundaryEvent, NetworkBoundaryDecision)> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "HTTP authority is missing"))?;
+    let port = url.port_or_known_default().ok_or_else(|| {
+        io::Error::new(ErrorKind::InvalidData, "HTTP authority has no usable port")
+    })?;
+    let addresses = resolve_authority(host, port)?;
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "HTTP authority did not resolve",
+        ));
+    }
+    let now_ms = unix_millis()?;
+    let state = lock_supervisor(supervisor)?;
     let operation_id = state.record.operation_id.clone();
     let source_run_id = state.record.source_run_id.clone();
     let process_id = state.record.root_pid.unwrap_or(1);
     drop(state);
+    let authority = url_authority(url)?;
     let mut chosen = None;
     let mut decisions = Vec::new();
     for address in addresses {
@@ -1087,13 +1639,13 @@ fn handle_http_proxy_connection(
             protocol: NetworkProtocol::Tcp,
             port: address.port(),
             effect: NetworkEffectKind::Http {
-                method: request.method.clone(),
-                authority: request.authority.clone(),
+                method: method.to_string(),
+                authority: authority.clone(),
             },
-            observed_at_ms: now,
+            observed_at_ms: now_ms,
             requested_ttl_seconds: None,
         };
-        let decision = lock_supervisor(&supervisor)?.decide(&mut event)?;
+        let decision = lock_supervisor(supervisor)?.decide(&mut event)?;
         if matches!(
             decision.disposition,
             NetworkBoundaryDisposition::BrokerHttp
@@ -1104,8 +1656,6 @@ fn handle_http_proxy_connection(
         }
         decisions.push((event, decision));
     }
-    // A mixed public/private answer is denied as a whole. The gateway pins the
-    // actual upstream socket to the already evaluated address.
     if decisions
         .iter()
         .any(|(_, decision)| decision.disposition == NetworkBoundaryDisposition::Deny)
@@ -1116,105 +1666,337 @@ fn handle_http_proxy_connection(
                 fault_id: None,
                 event,
                 decision,
-                lease_id: None,
+                lease_id: lease_id.clone(),
                 response_status: Some(403),
+                request_digest: Some(request_digest.to_string()),
+                response_digest: None,
+                credential_handle_id: None,
+                redirect_target: None,
                 bytes_from_client: 0,
                 bytes_to_client: 0,
                 completed_at_ms: unix_millis()?,
             };
-            lock_supervisor(&supervisor)?.append_effect(&effect)?;
+            lock_supervisor(supervisor)?.append_effect(&effect)?;
         }
-        write_proxy_error(
-            &mut client,
-            403,
-            "resolved destination is outside the operation envelope",
-        )?;
-        return Ok(());
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "resolved HTTP destination is outside the operation envelope",
+        ));
     }
-    let Some((address, event, decision)) = chosen else {
-        write_proxy_error(&mut client, 403, "HTTP effect is not brokerable")?;
-        return Ok(());
-    };
+    chosen.ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP effect is not brokerable by this operation",
+        )
+    })
+}
 
-    // No in-place lease is attached for a brokered effect.
-    let _ = table_names;
-    let upstream = TcpStream::connect_timeout(
-        &address,
-        Duration::from_secs(config.connect_timeout_seconds),
-    );
-    let mut upstream = match upstream {
-        Ok(stream) => stream,
-        Err(error) => {
-            write_proxy_error(&mut client, 502, "upstream connection failed")?;
-            let effect = NetworkEffectRecord {
-                schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
-                fault_id: None,
-                event,
-                decision,
-                lease_id: None,
-                response_status: Some(502),
-                bytes_from_client: 0,
-                bytes_to_client: 0,
-                completed_at_ms: unix_millis()?,
-            };
-            lock_supervisor(&supervisor)?.append_effect(&effect)?;
-            return Err(error);
+fn perform_pinned_http_request(
+    method: &str,
+    url: &Url,
+    address: SocketAddr,
+    headers: &[(String, String)],
+    body: &[u8],
+    credential: Option<&(String, String, Zeroizing<String>)>,
+    config: &HttpGatewayConfig,
+) -> io::Result<MediatedHttpResponse> {
+    let mut connect_timeout = Duration::from_secs(config.connect_timeout_seconds);
+    let mut io_timeout = Duration::from_secs(config.io_timeout_seconds);
+    if let Some(expires_at_ms) = config.expires_at_ms {
+        let remaining_ms = expires_at_ms.saturating_sub(unix_millis()?);
+        if remaining_ms == 0 {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "HTTP mediator lease expired before the upstream effect",
+            ));
+        }
+        let remaining = Duration::from_millis(remaining_ms);
+        connect_timeout = connect_timeout.min(remaining);
+        io_timeout = io_timeout.min(remaining);
+    }
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        // An inherited HTTP(S)_PROXY would move the actual socket outside the
+        // address we just authorized and pinned.
+        .try_proxy_from_env(false)
+        .timeout_connect(connect_timeout)
+        .timeout_read(io_timeout)
+        .timeout_write(io_timeout)
+        .resolver(move |_: &str| Ok(vec![address]))
+        .build();
+    let mut upstream = agent.request(method, url.as_str());
+    for (name, value) in headers {
+        if !client_header_is_forwarded(name) {
+            continue;
+        }
+        upstream = upstream.set(name, value);
+    }
+    if let Some((_, header_name, value)) = credential {
+        upstream = upstream.set(header_name, value.as_str());
+    }
+    let result = if body.is_empty() {
+        upstream.call()
+    } else {
+        upstream.send_bytes(body)
+    };
+    let response = match result {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(ureq::Error::Transport(error)) => {
+            // Transport errors can contain the full request URL (including a
+            // presigned query). Retain a correlatable digest, never the raw
+            // error, in supervisor stderr or caller-visible responses.
+            let detail_digest = format!("sha256:{:x}", Sha256::digest(error.to_string()));
+            return Err(io::Error::other(format!(
+                "mediated HTTP transport failed (detail {detail_digest})"
+            )));
         }
     };
-    upstream.set_read_timeout(Some(Duration::from_secs(config.io_timeout_seconds)))?;
-    upstream.set_write_timeout(Some(Duration::from_secs(config.io_timeout_seconds)))?;
+    let status = response.status();
+    let headers = response
+        .headers_names()
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .header(&name)
+                .filter(|value| safe_response_header(&name, value))
+                .map(|value| (name, value.to_string()))
+        })
+        .collect::<Vec<_>>();
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|size| size > config.max_response_bytes)
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "HTTP mediator response exceeded its byte budget",
+        ));
+    }
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take(config.max_response_bytes.saturating_add(1))
+        .read_to_end(&mut body)?;
+    if body.len() as u64 > config.max_response_bytes {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "HTTP mediator response exceeded its byte budget",
+        ));
+    }
+    Ok(MediatedHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
 
-    let forwarded = request.forward_bytes()?;
-    upstream.write_all(&forwarded)?;
-    upstream.flush()?;
-    let status = copy_http_response_bounded(&mut upstream, &mut client, config.max_response_bytes)?;
-    let (bytes_from_client, bytes_to_client, status) = (forwarded.len() as u64, status.1, status.0);
-    let effect = NetworkEffectRecord {
-        schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
-        fault_id: None,
-        event,
-        decision,
-        lease_id: None,
-        response_status: status,
-        bytes_from_client,
-        bytes_to_client,
-        completed_at_ms: unix_millis()?,
+fn safe_response_header(name: &str, value: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cache-control"
+            | "content-disposition"
+            | "content-type"
+            | "etag"
+            | "last-modified"
+            | "location"
+            | "retry-after"
+    ) && !value.contains(['\r', '\n'])
+}
+
+fn redirect_target(current: &Url, response: &MediatedHttpResponse) -> io::Result<Option<Url>> {
+    if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+        return Ok(None);
+    }
+    let Some((_, location)) = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+    else {
+        return Ok(None);
     };
-    lock_supervisor(&supervisor)?.append_effect(&effect)
+    let target = current.join(location).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "upstream returned an invalid redirect",
+        )
+    })?;
+    if !matches!(target.scheme(), "http" | "https")
+        || target.host_str().is_none()
+        || !target.username().is_empty()
+        || target.password().is_some()
+        || target.fragment().is_some()
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "upstream redirect is outside the HTTP mediator protocol",
+        ));
+    }
+    Ok(Some(target))
+}
+
+fn credential_applies_to_url(credential: &HttpCredentialInjection, target: &Url) -> bool {
+    credential.allowed_url_prefixes.iter().any(|prefix| {
+        validate_credential_url_prefix(prefix)
+            .ok()
+            .is_some_and(|prefix| url_is_within_prefix(target, &prefix))
+    })
+}
+
+fn url_is_within_prefix(target: &Url, prefix: &Url) -> bool {
+    target.scheme() == prefix.scheme()
+        && target.host_str() == prefix.host_str()
+        && target.port_or_known_default() == prefix.port_or_known_default()
+        && (prefix.path() == "/"
+            || target.path() == prefix.path()
+            || (target.path().starts_with(prefix.path())
+                && (prefix.path().ends_with('/')
+                    || target.path().as_bytes().get(prefix.path().len()).copied() == Some(b'/'))))
+}
+
+fn load_http_credential(config: &HttpCredentialInjection) -> io::Result<Zeroizing<String>> {
+    validate_http_credential_config(config)?;
+    let path = Path::new(&config.value_file);
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_CREDENTIAL_HEADER_BYTES {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP credential handle did not resolve to a bounded regular file",
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP credential handle did not resolve to an owner-only mediator file",
+        ));
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(MAX_CREDENTIAL_HEADER_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CREDENTIAL_HEADER_BYTES {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "HTTP credential header exceeded its byte budget",
+        ));
+    }
+    let mut value =
+        Zeroizing::new(String::from_utf8(std::mem::take(&mut *bytes)).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "HTTP credential header must be UTF-8",
+            )
+        })?);
+    while value.ends_with(['\r', '\n']) {
+        value.pop();
+    }
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|byte| !(byte == b'\t' || (0x20..=0x7e).contains(&byte)))
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "HTTP credential header contains unsafe bytes",
+        ));
+    }
+    Ok(value)
+}
+
+fn mediated_http_request_digest(
+    method: &str,
+    url: &Url,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> String {
+    let mut safe_headers = headers
+        .iter()
+        .filter(|(name, _)| client_header_is_forwarded(name))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect::<Vec<_>>();
+    safe_headers.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"gensee-http-request-v1\0");
+    hasher.update(method.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(url.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(serde_json::to_vec(&safe_headers).unwrap_or_default());
+    hasher.update(b"\0");
+    hasher.update(Sha256::digest(body));
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn mediated_http_response_digest(response: &MediatedHttpResponse) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"gensee-http-response-v1\0");
+    hasher.update(response.status.to_be_bytes());
+    hasher.update(b"\0");
+    hasher.update(serde_json::to_vec(&response.headers).unwrap_or_default());
+    hasher.update(b"\0");
+    hasher.update(Sha256::digest(&response.body));
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn redacted_url_for_evidence(url: &Url) -> String {
+    let mut redacted = url.clone();
+    if let Some(query) = url.query() {
+        let digest = format!("sha256:{:x}", Sha256::digest(query.as_bytes()));
+        redacted.set_query(Some(&digest));
+    }
+    redacted.to_string()
+}
+
+fn url_authority(url: &Url) -> io::Result<String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "HTTP authority is missing"))?;
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+fn write_mediated_http_response(
+    stream: &mut TcpStream,
+    response: MediatedHttpResponse,
+) -> io::Result<()> {
+    write!(stream, "HTTP/1.1 {} Mediated\r\n", response.status)?;
+    for (name, value) in response.headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(
+        stream,
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        response.body.len()
+    )?;
+    stream.write_all(&response.body)?;
+    stream.flush()
 }
 
 #[derive(Debug)]
 struct ParsedProxyRequest {
     method: String,
-    authority: String,
-    host: String,
-    port: u16,
-    path_and_query: String,
-    version: String,
+    url: Url,
     headers: Vec<(String, String)>,
+    declared_body_bytes: u64,
+    body: Vec<u8>,
 }
 
-impl ParsedProxyRequest {
-    fn forward_bytes(&self) -> io::Result<Vec<u8>> {
-        let mut output = Vec::new();
-        write!(
-            output,
-            "{} {} {}\r\n",
-            self.method, self.path_and_query, self.version
-        )?;
-        for (name, value) in &self.headers {
-            if proxy_hop_header(name) || name.eq_ignore_ascii_case("host") {
-                continue;
-            }
-            write!(output, "{name}: {value}\r\n")?;
-        }
-        write!(output, "Host: {}\r\n", self.authority)?;
-        output.extend_from_slice(b"Connection: close\r\n\r\n");
-        Ok(output)
-    }
-}
-
-fn read_proxy_request(stream: &mut TcpStream) -> io::Result<ParsedProxyRequest> {
+fn read_proxy_request(
+    stream: &mut TcpStream,
+    max_body_bytes: u64,
+) -> io::Result<ParsedProxyRequest> {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
     while bytes.len() < MAX_PROXY_HEADER_BYTES {
@@ -1236,7 +2018,22 @@ fn read_proxy_request(stream: &mut TcpStream) -> io::Result<ParsedProxyRequest> 
             "proxy request headers exceeded the limit",
         ));
     }
-    parse_proxy_request_bytes(&bytes)
+    let mut request = parse_proxy_request_bytes(&bytes)?;
+    if request.declared_body_bytes > max_body_bytes {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "HTTP mediator request exceeded its body byte budget",
+        ));
+    }
+    let body_len = usize::try_from(request.declared_body_bytes).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "HTTP mediator body size does not fit this host",
+        )
+    })?;
+    request.body.resize(body_len, 0);
+    stream.read_exact(&mut request.body)?;
+    Ok(request)
 }
 
 fn parse_proxy_request_bytes(bytes: &[u8]) -> io::Result<ParsedProxyRequest> {
@@ -1256,7 +2053,10 @@ fn parse_proxy_request_bytes(bytes: &[u8]) -> io::Result<ParsedProxyRequest> {
     let method = parts.next().unwrap_or_default().to_ascii_uppercase();
     let target = parts.next().unwrap_or_default();
     let version = parts.next().unwrap_or_default().to_string();
-    if parts.next().is_some() || !version.starts_with("HTTP/1.") {
+    if parts.next().is_some()
+        || !matches!(version.as_str(), "HTTP/1.0" | "HTTP/1.1")
+        || !valid_http_mediator_request_method(&method)
+    {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "invalid proxy request line",
@@ -1268,36 +2068,24 @@ fn parse_proxy_request_bytes(bytes: &[u8]) -> io::Result<ParsedProxyRequest> {
             "forward proxy requests must use an absolute HTTP URL",
         )
     })?;
-    if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
         return Err(io::Error::new(
             ErrorKind::PermissionDenied,
-            "gateway accepts credential-free absolute HTTP URLs; HTTPS requires a separately approved mediator",
+            "gateway accepts credential-free absolute HTTP(S) URLs without fragments",
         ));
     }
-    let host = url
-        .host_str()
+    url.host_str()
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "HTTP host missing"))?;
-    let port = url.port_or_known_default().unwrap_or(80);
-    let authority = if url.port().is_some() {
-        format!("{host}:{port}")
-    } else {
-        host.to_string()
-    };
-    let path = if url.path().is_empty() {
-        "/"
-    } else {
-        url.path()
-    };
-    let path_and_query = match url.query() {
-        Some(query) => format!("{path}?{query}"),
-        None => path.to_string(),
-    };
     let mut headers = Vec::new();
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').ok_or_else(|| {
             io::Error::new(ErrorKind::InvalidData, "invalid proxy request header")
         })?;
-        if name.trim().is_empty() || name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+        if !valid_http_header_name(name) || name != name.trim() || value.contains(['\r', '\n']) {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "unsafe proxy header",
@@ -1305,27 +2093,51 @@ fn parse_proxy_request_bytes(bytes: &[u8]) -> io::Result<ParsedProxyRequest> {
         }
         headers.push((name.trim().to_string(), value.trim().to_string()));
     }
-    if headers.iter().any(|(name, value)| {
-        (name.eq_ignore_ascii_case("content-length") && value != "0")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-    }) {
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+    {
         return Err(io::Error::new(
             ErrorKind::PermissionDenied,
-            "read-only gateway requests cannot carry a body",
+            "HTTP mediator does not accept transfer-encoded request bodies",
         ));
     }
+    let content_lengths = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid Content-Length"))?;
+    if content_lengths
+        .windows(2)
+        .any(|values| values[0] != values[1])
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "conflicting Content-Length headers",
+        ));
+    }
+    let declared_body_bytes = content_lengths.first().copied().unwrap_or(0);
     Ok(ParsedProxyRequest {
         method,
-        authority,
-        host: host.to_string(),
-        port,
-        path_and_query,
-        version,
+        url,
         headers,
+        declared_body_bytes,
+        body: Vec::new(),
     })
 }
 
-fn proxy_hop_header(name: &str) -> bool {
+fn valid_http_mediator_request_method(method: &str) -> bool {
+    !method.is_empty()
+        && method.len() <= 32
+        && method != "CONNECT"
+        && method != "TRACE"
+        && method
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte == b'-')
+}
+
+fn connection_hop_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "connection"
@@ -1337,9 +2149,16 @@ fn proxy_hop_header(name: &str) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
-            | "authorization"
-            | "cookie"
     )
+}
+
+fn client_header_is_forwarded(name: &str) -> bool {
+    !connection_hop_header(name)
+        && !name.eq_ignore_ascii_case("host")
+        && !name.eq_ignore_ascii_case("content-length")
+        && !name.eq_ignore_ascii_case("authorization")
+        && !name.eq_ignore_ascii_case("cookie")
+        && !name.to_ascii_lowercase().starts_with("x-gensee-")
 }
 
 fn resolve_authority(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
@@ -1353,46 +2172,12 @@ fn resolve_authority(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     Ok(addresses)
 }
 
-fn copy_http_response_bounded(
-    upstream: &mut TcpStream,
-    client: &mut TcpStream,
-    limit: u64,
-) -> io::Result<(Option<u16>, u64)> {
-    let mut total = 0u64;
-    let mut status = None;
-    let mut first = true;
-    let mut buffer = [0u8; 32 * 1024];
-    loop {
-        let count = upstream.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        total = total.saturating_add(count as u64);
-        if total > limit {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "HTTP gateway response exceeded its byte budget",
-            ));
-        }
-        if first {
-            first = false;
-            status = parse_http_status(&buffer[..count]);
-        }
-        client.write_all(&buffer[..count])?;
-    }
-    client.flush()?;
-    Ok((status, total))
-}
-
-fn parse_http_status(bytes: &[u8]) -> Option<u16> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    text.lines().next()?.split_whitespace().nth(1)?.parse().ok()
-}
-
 fn write_proxy_error(stream: &mut TcpStream, status: u16, message: &str) -> io::Result<()> {
     let reason = match status {
+        400 => "Bad Request",
         403 => "Forbidden",
         405 => "Method Not Allowed",
+        413 => "Content Too Large",
         502 => "Bad Gateway",
         _ => "Denied",
     };
@@ -1421,6 +2206,18 @@ fn send_capability_fault(args: &[OsString]) -> io::Result<()> {
     let fault: CapabilityFault = serde_json::from_str(&read_nofollow_to_string(&fault_path)?)
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
     send_supervisor_request(args, &NetworkSupervisorRequest::Fault { fault })
+}
+
+fn revoke_http_mediator(args: &[OsString]) -> io::Result<()> {
+    let lease_id = network_arg_value(args, "--lease")
+        .filter(|lease_id| safe_network_token(lease_id))
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "missing or invalid --lease"))?;
+    send_supervisor_request(
+        args,
+        &NetworkSupervisorRequest::RevokeHttpMediator {
+            lease_id: lease_id.to_string(),
+        },
+    )
 }
 
 fn inspect_network_supervisor(args: &[OsString]) -> io::Result<()> {
@@ -1719,6 +2516,9 @@ mod tests {
                 generation: 0,
                 usage: OperationNetworkUsage::default(),
                 counter_snapshot: BTreeMap::new(),
+                revoked_http_mediator_leases: BTreeSet::new(),
+                http_mediator_lease_id: None,
+                http_mediator_expires_at_ms: None,
                 started_at_ms: 1,
                 updated_at_ms: 1,
             },
@@ -1726,32 +2526,36 @@ mod tests {
             event_log_path: root.join("effects.jsonl"),
             counter_log_path: root.join("counters.jsonl"),
             fault_log_path: root.join("faults.jsonl"),
+            mediator_log_path: root.join("http-mediator.jsonl"),
             dry_run: true,
             operation: None,
             active_plan: None,
             counter_snapshot: BTreeMap::new(),
             next_usage_sample_at_ms: u64::MAX,
             last_counter_error: None,
+            http_mediator_lease_id: None,
         }))
     }
 
     #[test]
-    fn proxy_parser_rewrites_absolute_get_and_strips_proxy_headers() {
+    fn proxy_parser_accepts_absolute_https_and_filters_client_credentials() {
         let request = parse_proxy_request_bytes(
-            b"GET http://example.test:8080/a?b=1 HTTP/1.1\r\nHost: attacker.test\r\nProxy-Authorization: secret\r\nAuthorization: bearer-secret\r\nCookie: secret=value\r\nAccept: */*\r\n\r\n",
+            b"GET https://example.test:8443/a?b=1 HTTP/1.1\r\nHost: attacker.test\r\nProxy-Authorization: secret\r\nAuthorization: bearer-secret\r\nCookie: secret=value\r\nAccept: */*\r\n\r\n",
         )
         .unwrap();
-        assert_eq!(request.host, "example.test");
-        assert_eq!(request.port, 8080);
-        let forwarded = String::from_utf8(request.forward_bytes().unwrap()).unwrap();
-        assert!(forwarded.starts_with("GET /a?b=1 HTTP/1.1\r\n"));
-        assert!(forwarded.contains("Host: example.test:8080\r\n"));
-        assert!(!forwarded
-            .to_ascii_lowercase()
-            .contains("proxy-authorization"));
-        assert!(!forwarded.contains("attacker.test"));
-        assert!(!forwarded.to_ascii_lowercase().contains("authorization"));
-        assert!(!forwarded.to_ascii_lowercase().contains("cookie"));
+        assert_eq!(request.url.scheme(), "https");
+        assert_eq!(request.url.host_str(), Some("example.test"));
+        assert_eq!(request.url.port(), Some(8443));
+        assert!(client_header_is_forwarded("Accept"));
+        for stripped in [
+            "Host",
+            "Proxy-Authorization",
+            "Authorization",
+            "Cookie",
+            "X-Gensee-Internal",
+        ] {
+            assert!(!client_header_is_forwarded(stripped));
+        }
     }
 
     #[test]
@@ -1783,21 +2587,55 @@ mod tests {
     }
 
     #[test]
-    fn proxy_parser_rejects_embedded_url_credentials_and_non_http_urls() {
+    fn proxy_parser_rejects_embedded_credentials_and_non_http_protocols() {
         for target in ["http://user:password@example.test/a", "file:///etc/passwd"] {
             let request = format!("GET {target} HTTP/1.1\r\n\r\n");
+            assert!(parse_proxy_request_bytes(request.as_bytes()).is_err());
+        }
+        for request in [
+            "GET http://example.test/a HTTP/1.evil\r\n\r\n",
+            "GET http://example.test/a HTTP/1.1\r\nBad Header: value\r\n\r\n",
+            "GET http://example.test/a HTTP/1.1\r\nHost : example.test\r\n\r\n",
+        ] {
             assert!(parse_proxy_request_bytes(request.as_bytes()).is_err());
         }
     }
 
     #[test]
-    fn proxy_parser_rejects_read_requests_with_bodies() {
+    fn proxy_parser_tracks_content_length_and_rejects_ambiguous_framing() {
+        let request = parse_proxy_request_bytes(
+            b"POST https://example.test/a HTTP/1.1\r\nContent-Length: 5\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(request.declared_body_bytes, 5);
         for request in [
-            "GET http://example.test/a HTTP/1.1\r\nContent-Length: 1\r\n\r\nx",
-            "GET http://example.test/a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "POST http://example.test/a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "POST http://example.test/a HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
         ] {
             assert!(parse_proxy_request_bytes(request.as_bytes()).is_err());
         }
+    }
+
+    #[test]
+    fn credential_audience_uses_origin_and_path_segment_boundaries() {
+        let credential = HttpCredentialInjection {
+            handle_id: "credential_1".to_string(),
+            header_name: "X-Test-Token".to_string(),
+            value_file: "/unused-in-this-test".to_string(),
+            allowed_url_prefixes: vec!["https://repo.example/packages".to_string()],
+        };
+        assert!(credential_applies_to_url(
+            &credential,
+            &Url::parse("https://repo.example/packages/a.tgz?token=1").unwrap()
+        ));
+        assert!(!credential_applies_to_url(
+            &credential,
+            &Url::parse("https://repo.example/packages-evil/a.tgz").unwrap()
+        ));
+        assert!(!credential_applies_to_url(
+            &credential,
+            &Url::parse("https://evil.example/packages/a.tgz").unwrap()
+        ));
     }
 
     #[test]
@@ -1813,9 +2651,16 @@ mod tests {
             proxy: HttpGatewayConfig {
                 listen: "127.0.0.1:0".to_string(),
                 client_address: "127.0.0.1".to_string(),
+                max_request_bytes: 1024,
                 max_response_bytes: 1024,
+                max_redirects: 0,
                 connect_timeout_seconds: 1,
                 io_timeout_seconds: 1,
+                lease_id: None,
+                expires_at_ms: None,
+                credential: None,
+                gateway_id: None,
+                commit_token_id: None,
             },
         };
         assert!(validate_network_operation_config(&config).is_err());
@@ -1824,6 +2669,20 @@ mod tests {
         assert!(validate_network_operation_config(&local).is_ok());
         local.source_address = Some("10.0.0.2".to_string());
         assert!(validate_network_operation_config(&local).is_err());
+
+        let mut mutation = config;
+        mutation.root_pid = Some(42);
+        mutation
+            .policy
+            .http_gateway_methods
+            .push("POST".to_string());
+        assert!(validate_network_operation_config(&mutation).is_err());
+        mutation.proxy.lease_id = Some("lease_http_1".to_string());
+        mutation.proxy.expires_at_ms = Some(unix_millis().unwrap().saturating_add(60_000));
+        assert!(validate_network_operation_config(&mutation).is_err());
+        mutation.proxy.gateway_id = Some("gateway_http_1".to_string());
+        mutation.proxy.commit_token_id = Some("commit_http_1".to_string());
+        assert!(validate_network_operation_config(&mutation).is_ok());
     }
 
     #[test]
@@ -1972,9 +2831,16 @@ mod tests {
         let proxy = HttpGatewayConfig {
             listen: "127.0.0.1:0".to_string(),
             client_address: "127.0.0.1".to_string(),
+            max_request_bytes: 1024,
             max_response_bytes: 1024,
+            max_redirects: 1,
             connect_timeout_seconds: 1,
             io_timeout_seconds: 1,
+            lease_id: None,
+            expires_at_ms: None,
+            credential: None,
+            gateway_id: None,
+            commit_token_id: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1998,6 +2864,171 @@ mod tests {
         .unwrap();
         let response = client.join().unwrap();
         assert!(response.starts_with("HTTP/1.1 405"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_is_injected_only_for_its_exact_audience_and_never_logged() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let credential_path = root.join("credential");
+        fs::write(&credential_path, b"super-secret-value\n").unwrap();
+        fs::set_permissions(&credential_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_worker = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 8\r\nConnection: close\r\n\r\nartifact",
+                )
+                .unwrap();
+            String::from_utf8_lossy(&request[..count]).to_string()
+        });
+
+        let policy = NetworkBoundaryPolicy {
+            http_gateway_available: true,
+            ..NetworkBoundaryPolicy::default()
+        };
+        let supervisor = test_supervisor(&root, policy);
+        supervisor.lock().unwrap().record.envelope.grants.push(
+            gensee_crate_rules::network_boundary::NetworkEndpointGrant {
+                destination: origin_address.ip().to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![origin_address.port()],
+                expires_at_ms: None,
+                lease_id: None,
+            },
+        );
+        let lease_id = "lease_http_credential".to_string();
+        {
+            let mut state = supervisor.lock().unwrap();
+            state.http_mediator_lease_id = Some(lease_id.clone());
+            state.record.http_mediator_lease_id = Some(lease_id.clone());
+        }
+        let proxy = HttpGatewayConfig {
+            listen: "127.0.0.1:0".to_string(),
+            client_address: "127.0.0.1".to_string(),
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
+            max_redirects: 0,
+            connect_timeout_seconds: 1,
+            io_timeout_seconds: 1,
+            lease_id: Some(lease_id),
+            expires_at_ms: Some(unix_millis().unwrap().saturating_add(60_000)),
+            credential: Some(HttpCredentialInjection {
+                handle_id: "credential_handle_1".to_string(),
+                header_name: "Authorization".to_string(),
+                value_file: credential_path.display().to_string(),
+                allowed_url_prefixes: vec![format!("http://{origin_address}/repo")],
+            }),
+            gateway_id: None,
+            commit_token_id: None,
+        };
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_address = gateway.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(gateway_address).unwrap();
+            write!(
+                stream,
+                "GET http://{origin_address}/repo/artifact?presigned=do-not-log HTTP/1.1\r\nAuthorization: attacker\r\nCookie: attacker=true\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        });
+        let (stream, peer) = gateway.accept().unwrap();
+        handle_http_proxy_connection(
+            stream,
+            peer,
+            Arc::clone(&supervisor),
+            Arc::new(Mutex::new(Vec::new())),
+            proxy,
+        )
+        .unwrap();
+        let response = client.join().unwrap();
+        let upstream_request = origin_worker.join().unwrap().to_ascii_lowercase();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.ends_with("artifact"));
+        assert!(upstream_request.contains("authorization: super-secret-value"));
+        assert!(!upstream_request.contains("authorization: attacker"));
+        assert!(!upstream_request.contains("cookie: attacker=true"));
+
+        let effects = fs::read_to_string(root.join("effects.jsonl")).unwrap();
+        assert!(effects.contains("credential_handle_1"));
+        assert!(!effects.contains("super-secret-value"));
+        assert!(!effects.contains("do-not-log"));
+    }
+
+    #[test]
+    fn revoked_mediator_lease_denies_without_connecting_and_records_redacted_attempt() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        origin.set_nonblocking(true).unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let policy = NetworkBoundaryPolicy {
+            http_gateway_available: true,
+            ..NetworkBoundaryPolicy::default()
+        };
+        let supervisor = test_supervisor(&root, policy);
+        let lease_id = "lease_http_revoked".to_string();
+        {
+            let mut state = supervisor.lock().unwrap();
+            state.http_mediator_lease_id = Some(lease_id.clone());
+            state.record.http_mediator_lease_id = Some(lease_id.clone());
+            state
+                .record
+                .revoked_http_mediator_leases
+                .insert(lease_id.clone());
+        }
+        let proxy = HttpGatewayConfig {
+            listen: "127.0.0.1:0".to_string(),
+            client_address: "127.0.0.1".to_string(),
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
+            max_redirects: 0,
+            connect_timeout_seconds: 1,
+            io_timeout_seconds: 1,
+            lease_id: Some(lease_id),
+            expires_at_ms: Some(unix_millis().unwrap().saturating_add(60_000)),
+            credential: None,
+            gateway_id: None,
+            commit_token_id: None,
+        };
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_address = gateway.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(gateway_address).unwrap();
+            write!(
+                stream,
+                "GET http://{origin_address}/artifact?token=do-not-log HTTP/1.1\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        });
+        let (stream, peer) = gateway.accept().unwrap();
+        handle_http_proxy_connection(
+            stream,
+            peer,
+            supervisor,
+            Arc::new(Mutex::new(Vec::new())),
+            proxy,
+        )
+        .unwrap();
+        assert!(client.join().unwrap().starts_with("HTTP/1.1 403"));
+        assert!(matches!(
+            origin.accept(),
+            Err(error) if error.kind() == ErrorKind::WouldBlock
+        ));
+        let audit = fs::read_to_string(root.join("http-mediator.jsonl")).unwrap();
+        assert!(audit.contains("http_mediator_lease_inactive"));
+        assert!(!audit.contains("do-not-log"));
     }
 
     #[test]
@@ -2035,9 +3066,16 @@ mod tests {
         let proxy_config = HttpGatewayConfig {
             listen: "127.0.0.1:0".to_string(),
             client_address: "127.0.0.1".to_string(),
+            max_request_bytes: 64 * 1024,
             max_response_bytes: 64 * 1024,
+            max_redirects: 1,
             connect_timeout_seconds: 1,
             io_timeout_seconds: 1,
+            lease_id: None,
+            expires_at_ms: None,
+            credential: None,
+            gateway_id: None,
+            commit_token_id: None,
         };
 
         let first_proxy = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2064,33 +3102,7 @@ mod tests {
         .unwrap();
         let first_response = first_client.join().unwrap();
         origin_worker.join().unwrap();
-        assert!(first_response.starts_with("HTTP/1.1 302"));
-        assert!(first_response.contains(&format!("Location: http://{challenge_address}/secret")));
-
-        let second_proxy = TcpListener::bind("127.0.0.1:0").unwrap();
-        let second_proxy_address = second_proxy.local_addr().unwrap();
-        let second_client = thread::spawn(move || {
-            let mut stream = TcpStream::connect(second_proxy_address).unwrap();
-            write!(
-                stream,
-                "GET http://{challenge_address}/secret HTTP/1.1\r\n\r\n"
-            )
-            .unwrap();
-            let mut response = String::new();
-            stream.read_to_string(&mut response).unwrap();
-            response
-        });
-        let (stream, peer) = second_proxy.accept().unwrap();
-        handle_http_proxy_connection(
-            stream,
-            peer,
-            Arc::clone(&supervisor),
-            Arc::new(Mutex::new(Vec::new())),
-            proxy_config,
-        )
-        .unwrap();
-        let second_response = second_client.join().unwrap();
-        assert!(second_response.starts_with("HTTP/1.1 403"));
+        assert!(first_response.starts_with("HTTP/1.1 403"));
         assert!(matches!(
             challenge.accept(),
             Err(error) if error.kind() == ErrorKind::WouldBlock
