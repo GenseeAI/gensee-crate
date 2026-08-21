@@ -24,11 +24,40 @@
 use crate::*;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 const NO_HOOK_OUTPUT: &str = "__gensee_no_hook_output__";
 pub(crate) const EVENT_STORE_APPEND_SESSION: &str = "event_store_append_session";
 pub(crate) const EVENT_STORE_APPEND_TRANSACTION: &str = "event_store_append_transaction";
+const EVENT_STORE_APPEND_TCLONE_HOOK: &str = "event_store_append_tclone_hook";
+const TCLONE_OBSERVER_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+const TCLONE_OBSERVER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const TCLONE_OBSERVER_MAX_CONNECTIONS: usize = 32;
+
+struct TcloneObserverConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl TcloneObserverConnectionPermit {
+    fn try_acquire(active: Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < limit).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| Self { active })
+    }
+}
+
+impl Drop for TcloneObserverConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonResponseMode {
@@ -50,12 +79,50 @@ pub(crate) fn run_daemon() -> io::Result<()> {
     // owner-only data root (0700) and owner-only socket (0600).
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
     let socket = daemon_socket_path(&root);
-    // Clear a stale socket from a previous (crashed) daemon so bind() succeeds.
-    let _ = fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let listener = bind_owner_only_listener(&socket)?;
+    let observer_socket = tclone_observer_socket_path(&root);
+    let observer_listener = bind_owner_only_listener(&observer_socket)?;
     let store = Arc::new(EventStore::default_local()?);
     eprintln!("gensee daemon: listening on {}", socket.display());
+    eprintln!(
+        "gensee daemon: tclone observer listening on {}",
+        observer_socket.display()
+    );
+
+    let observer_store = Arc::clone(&store);
+    let observer_connections = Arc::new(AtomicUsize::new(0));
+    thread::spawn(move || {
+        for conn in observer_listener.incoming() {
+            match conn {
+                Ok(stream) => {
+                    let Some(permit) = TcloneObserverConnectionPermit::try_acquire(
+                        Arc::clone(&observer_connections),
+                        TCLONE_OBSERVER_MAX_CONNECTIONS,
+                    ) else {
+                        // Refuse excess untrusted clients before allocating a
+                        // thread. The hook client is fire-and-forget, so closing
+                        // here cannot interfere with policy enforcement.
+                        continue;
+                    };
+                    let store = Arc::clone(&observer_store);
+                    if let Err(error) = thread::Builder::new()
+                        .name("gensee-tclone-observer".to_string())
+                        .spawn(move || {
+                            let _permit = permit;
+                            if let Err(error) = serve_tclone_observer_connection(stream, &store) {
+                                eprintln!(
+                                    "gensee daemon: tclone observer connection error: {error}"
+                                );
+                            }
+                        })
+                    {
+                        eprintln!("gensee daemon: cannot start tclone observer worker: {error}");
+                    }
+                }
+                Err(error) => eprintln!("gensee daemon: tclone observer accept error: {error}"),
+            }
+        }
+    });
 
     for conn in listener.incoming() {
         match conn {
@@ -71,6 +138,19 @@ pub(crate) fn run_daemon() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn bind_owner_only_listener(socket: &Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    // Clear a stale socket from a previous (crashed) daemon so bind() succeeds.
+    let _ = fs::remove_file(socket);
+    let listener = UnixListener::bind(socket)?;
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+pub(crate) fn tclone_observer_socket_path(root: &Path) -> PathBuf {
+    root.join("tclone-observer.sock")
 }
 
 /// Read one hook event from `stream`, process it against the warm store, and
@@ -178,10 +258,143 @@ fn serve_event_store_request(
     stream.write_all(response.to_string().as_bytes())
 }
 
+fn serve_tclone_observer_connection(mut stream: UnixStream, store: &EventStore) -> io::Result<()> {
+    let request = read_tclone_observer_request(
+        &mut stream,
+        TCLONE_OBSERVER_MAX_REQUEST_BYTES,
+        TCLONE_OBSERVER_READ_TIMEOUT,
+    )?;
+    let result = serde_json::from_str::<Value>(&request)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+        .and_then(|request| process_tclone_observer_request(store, request));
+    // The in-container hook deliberately does not wait for a response. This is
+    // useful to host diagnostics and tests without placing observation on the
+    // hook's decision-critical path.
+    let response = match result {
+        Ok(()) => json!({"gensee_daemon_protocol": 1, "ok": true}),
+        Err(error) => json!({
+            "gensee_daemon_protocol": 1,
+            "ok": false,
+            "error": error.to_string(),
+        }),
+    };
+    let _ = stream.write_all(response.to_string().as_bytes());
+    Ok(())
+}
+
+fn read_tclone_observer_request(
+    stream: &mut UnixStream,
+    max_bytes: usize,
+    timeout: Duration,
+) -> io::Result<String> {
+    let deadline = Instant::now() + timeout;
+    let mut request = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tclone observer request read timed out",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let count = match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tclone observer request read timed out",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if request.len().saturating_add(count) > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tclone observer request exceeds {max_bytes} bytes"),
+            ));
+        }
+        request.extend_from_slice(&buffer[..count]);
+    }
+    String::from_utf8(request).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("tclone observer request is not UTF-8: {error}"),
+        )
+    })
+}
+
+fn process_tclone_observer_request(store: &EventStore, request: Value) -> io::Result<()> {
+    if request
+        .get("gensee_daemon_protocol")
+        .and_then(Value::as_u64)
+        != Some(1)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tclone observer request missing gensee_daemon_protocol=1",
+        ));
+    }
+    if request.get("operation").and_then(Value::as_str) != Some(EVENT_STORE_APPEND_TCLONE_HOOK) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tclone observer only accepts authenticated hook observations",
+        ));
+    }
+    let input = request.get("input").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tclone observation is missing its input",
+        )
+    })?;
+    let mut event =
+        serde_json::from_value::<AgentHookEvent>(input.get("event").cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tclone observation is missing its event",
+            )
+        })?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let run_id = input.get("run_id").and_then(Value::as_str).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tclone observation is missing its run id",
+        )
+    })?;
+    let capability = input
+        .get("capability")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tclone observation is missing its capability",
+            )
+        })?;
+    authenticate_tclone_observation(run_id, capability)?;
+    scope_tclone_observation_event(&mut event, run_id)?;
+    store.append_hook_event(&event)
+}
+
 fn dispatch_event_store_request(operation: &str, input: &impl serde::Serialize) -> io::Result<()> {
     let root = default_root()?;
     let socket = daemon_socket_path(&root);
-    let mut stream = UnixStream::connect(&socket)?;
+    dispatch_event_store_request_to_socket(&socket, operation, input)
+}
+
+fn dispatch_event_store_request_to_socket(
+    socket: &Path,
+    operation: &str,
+    input: &impl serde::Serialize,
+) -> io::Result<()> {
+    let mut stream = UnixStream::connect(socket)?;
     let request = json!({
         "gensee_daemon_protocol": 1,
         "operation": operation,
@@ -206,6 +419,74 @@ fn dispatch_event_store_request(operation: &str, input: &impl serde::Serialize) 
             .and_then(Value::as_str)
             .unwrap_or("daemon event-store request failed"),
     ))
+}
+
+fn dispatch_tclone_hook_observation(event: &AgentHookEvent) -> io::Result<()> {
+    let Some(socket) = env::var_os(TCLONE_HOST_OBSERVER_SOCKET_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    let Some((run_id, capability)) = current_tclone_observation_credentials()? else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "host observation socket is configured without a tclone run context",
+        ));
+    };
+    let mut stream = UnixStream::connect(socket)?;
+    let request = json!({
+        "gensee_daemon_protocol": 1,
+        "operation": EVENT_STORE_APPEND_TCLONE_HOOK,
+        "input": {
+            "event": event,
+            "run_id": run_id,
+            "capability": capability,
+        },
+    });
+    stream.write_all(request.to_string().as_bytes())?;
+    stream.shutdown(std::net::Shutdown::Write)
+}
+
+/// Best-effort host attribution for hooks running inside a tclone container.
+/// This is intentionally invoked only after the normal hook decision path and
+/// never prints per-event failures unless observer diagnostics are enabled.
+pub(crate) fn mirror_tclone_hook_observation(event: &AgentHookEvent) {
+    if let Err(error) = dispatch_tclone_hook_observation(event) {
+        if env::var("GENSEE_TCLONE_HOST_OBSERVER_DEBUG")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+        {
+            eprintln!("gensee hook: could not mirror tclone event to the host observer: {error}");
+        }
+    }
+}
+
+fn scope_tclone_observation_event(event: &mut AgentHookEvent, run_id: &str) -> io::Result<()> {
+    let agent_session_id = event.session_id.replace(run_id.to_string());
+    let mut raw = serde_json::from_str::<Value>(&event.raw_json).unwrap_or_else(|_| json!({}));
+    let object = raw.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tclone hook event payload must be a JSON object",
+        )
+    })?;
+    let gensee = object
+        .entry("gensee")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tclone hook event gensee metadata must be an object",
+            )
+        })?;
+    gensee.insert("run_id".to_string(), Value::String(run_id.to_string()));
+    if let Some(agent_session_id) = agent_session_id.filter(|value| value != run_id) {
+        gensee.insert(
+            "agent_session_id".to_string(),
+            Value::String(agent_session_id),
+        );
+    }
+    event.raw_json = serde_json::to_string(&raw).map_err(io::Error::other)?;
+    Ok(())
 }
 
 pub(crate) fn daemon_append_session(session: &AgentSession) -> io::Result<()> {
@@ -352,5 +633,145 @@ pub(crate) fn daemon_response_mode(event: &AgentHookEvent) -> DaemonResponseMode
             DaemonResponseMode::Optional
         }
         _ => DaemonResponseMode::FireAndForget,
+    }
+}
+
+#[cfg(test)]
+mod tclone_observation_tests {
+    use super::*;
+
+    fn test_store(label: &str) -> (EventStore, PathBuf) {
+        let root = env::temp_dir().join(format!(
+            "gensee-tclone-observer-{label}-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap()
+        ));
+        (EventStore::new(&root).unwrap(), root)
+    }
+
+    #[test]
+    fn tclone_observer_request_reader_enforces_exact_byte_limit() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(&[b'a'; 64]).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let request =
+            read_tclone_observer_request(&mut server, 64, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(request.len(), 64);
+
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(&[b'a'; 65]).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let error =
+            read_tclone_observer_request(&mut server, 64, Duration::from_secs(1)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 64 bytes"));
+    }
+
+    #[test]
+    fn tclone_observer_request_reader_times_out_idle_clients() {
+        let (mut server, _client) = UnixStream::pair().unwrap();
+
+        let error =
+            read_tclone_observer_request(&mut server, 64, Duration::from_millis(20)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn tclone_observer_connection_permits_bound_concurrency() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let first = TcloneObserverConnectionPermit::try_acquire(Arc::clone(&active), 2).unwrap();
+        let second = TcloneObserverConnectionPermit::try_acquire(Arc::clone(&active), 2).unwrap();
+
+        assert!(TcloneObserverConnectionPermit::try_acquire(Arc::clone(&active), 2).is_none());
+        assert_eq!(active.load(Ordering::Acquire), 2);
+
+        drop(first);
+        let replacement =
+            TcloneObserverConnectionPermit::try_acquire(Arc::clone(&active), 2).unwrap();
+        assert_eq!(active.load(Ordering::Acquire), 2);
+
+        drop(second);
+        drop(replacement);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn tclone_observer_rejects_general_daemon_requests() {
+        let (store, root) = test_store("strict-protocol");
+        let request = json!({
+            "gensee_daemon_protocol": 1,
+            "provider": "codex",
+            "payload": "{}",
+        });
+
+        let error = process_tclone_observer_request(&store, request).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error
+            .to_string()
+            .contains("only accepts authenticated hook observations"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn general_daemon_rejects_tclone_observer_operation() {
+        let (store, root) = test_store("general-rejects-observer");
+        let mut response = Vec::new();
+        serve_event_store_request(
+            &mut response,
+            &store,
+            json!({
+                "gensee_daemon_protocol": 1,
+                "operation": EVENT_STORE_APPEND_TCLONE_HOOK,
+                "input": {},
+            }),
+        )
+        .unwrap();
+        let response = serde_json::from_slice::<Value>(&response).unwrap();
+
+        assert_eq!(response.get("ok"), Some(&json!(false)));
+        assert!(response
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("unsupported daemon event-store operation")));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn host_observation_scopes_event_to_tclone_run() {
+        let mut event = AgentHookEvent {
+            provider: "codex".to_string(),
+            session_id: Some("agent-session".to_string()),
+            hook_event_name: Some("PreToolUse".to_string()),
+            cwd: Some("/workspace".to_string()),
+            transcript_path: None,
+            tool_name: Some("Bash".to_string()),
+            tool_use_id: Some("tool-1".to_string()),
+            tool_input_command: Some("true".to_string()),
+            tool_input_description: None,
+            tool_response_stdout: None,
+            tool_response_stderr: None,
+            tool_response_interrupted: None,
+            duration_ms: None,
+            permission_mode: None,
+            effort_level: None,
+            observed_at_ms: 1,
+            raw_json: json!({"session_id": "agent-session"}).to_string(),
+        };
+
+        scope_tclone_observation_event(&mut event, "run_1").unwrap();
+
+        assert_eq!(event.session_id.as_deref(), Some("run_1"));
+        let raw = serde_json::from_str::<Value>(&event.raw_json).unwrap();
+        assert_eq!(raw.pointer("/gensee/run_id"), Some(&json!("run_1")));
+        assert_eq!(
+            raw.pointer("/gensee/agent_session_id"),
+            Some(&json!("agent-session"))
+        );
     }
 }

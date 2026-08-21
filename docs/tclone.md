@@ -622,6 +622,17 @@ source process environment, so telemetry and host-control requests rebind to the
 fork run immediately; the source receives a freshly rotated capability only
 after clone completion.
 
+Host hook observation uses a separate owner-only Unix socket that accepts only
+authenticated `event_store_append_tclone_hook` messages. The general Gensee
+daemon socket is never mounted into the container, so the observer cannot append
+sessions or transactions and cannot ask the host policy engine for decisions.
+This capability establishes run attribution, not containment: a process that can
+read the run context can submit observations for that run. Set
+`GENSEE_TCLONE_BIND_HOST_OBSERVER=0` before launch to omit the observer socket
+entirely. The observer rejects requests over 2 MiB, applies a five-second total
+read deadline, and admits at most 32 concurrent connections; excess clients are
+closed before a worker thread is allocated.
+
 ## Current Limitations
 
 - Long-lived `--runtime tclone` sources and live forks remain separate from
