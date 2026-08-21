@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
+mod capability_cell;
+pub(crate) use capability_cell::{tclone_capability_cell, tclone_capability_lease};
+
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
@@ -1585,6 +1588,7 @@ fn tclone_host_control_should_proxy(args: &[OsString]) -> bool {
                 | "switch"
                 | "discard"
                 | "lifecycle-ack"
+                | "cell"
         )
     )
 }
@@ -2356,6 +2360,14 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
                     "only a tclone source may request a fork",
                 ));
             }
+            validate_tclone_host_control_target(
+                &request.args[2..],
+                caller_run_id,
+                TcloneHostControlTargetScope::CallerOnly,
+            )?;
+        }
+        "cell" => {
+            validate_tclone_source_caller(caller_run_id)?;
             validate_tclone_host_control_target(
                 &request.args[2..],
                 caller_run_id,
@@ -9923,6 +9935,11 @@ fn tclone_option_takes_value(option: &str) -> bool {
             | "--to"
             | "--into"
             | "--paths"
+            | "--lease"
+            | "--request"
+            | "--ttl-seconds"
+            | "--source"
+            | "--path"
     )
 }
 
@@ -12954,6 +12971,20 @@ gensee async job job_1: exited status=0
         ];
 
         assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+
+        let cell_args = vec![
+            OsString::from("--lease"),
+            OsString::from("lease_1"),
+            OsString::from("--ttl-seconds"),
+            OsString::from("120"),
+            OsString::from("--path"),
+            OsString::from("src"),
+            OsString::from("run_cell_source"),
+        ];
+        assert_eq!(
+            tclone_target_arg(&cell_args, "usage").unwrap(),
+            "run_cell_source"
+        );
     }
 
     #[test]
@@ -13008,6 +13039,13 @@ gensee async job job_1: exited status=0
             OsString::from("run"),
             OsString::from("exec"),
             OsString::from("run_1"),
+        ]));
+        assert!(tclone_host_control_should_proxy(&[
+            OsString::from("run"),
+            OsString::from("cell"),
+            OsString::from("run_1"),
+            OsString::from("--lease"),
+            OsString::from("lease_1"),
         ]));
         assert!(tclone_host_control_should_proxy(&[
             OsString::from("run"),
