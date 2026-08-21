@@ -230,6 +230,12 @@ actually implemented filesystem and process/cgroup boundaries. Newly modeled
 authority therefore fails closed until the matching broker or gateway is
 attached.
 
+Typed filesystem operations are enforced by the fresh-cell path at this layer:
+`read` and `execute` selectors become read-only mounts, while `create`, `write`,
+`rename`, `delete`, and `metadata` selectors become writable mounts. This keeps
+`destructive_filesystem` requests satisfiable without accepting unrelated typed
+network, identity, or external selectors before their mediators exist.
+
 ### Capability cells
 
 For a bounded authority-expanding operation, a trusted host operator can issue a
