@@ -97,6 +97,43 @@ pub struct LinuxNetworkBlockEvent {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinuxNetworkAttemptEvent {
+    pub trace_id: String,
+    pub table_name: String,
+    pub chain_name: String,
+    pub destination: String,
+    pub protocol: LinuxNetworkProtocol,
+    pub port: u16,
+}
+
+#[cfg(target_os = "linux")]
+pub struct LinuxNetworkAttemptMonitor {
+    child: std::process::Child,
+    receiver: std::sync::mpsc::Receiver<LinuxNetworkAttemptEvent>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxNetworkAttemptMonitor {
+    pub fn drain(&self) -> (Vec<LinuxNetworkAttemptEvent>, u64, bool) {
+        use std::sync::atomic::Ordering;
+        let events = self.receiver.try_iter().collect();
+        let dropped = self.dropped.swap(0, Ordering::AcqRel);
+        let exited = self.exited.load(Ordering::Acquire);
+        (events, dropped, exited)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxNetworkAttemptMonitor {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl LinuxNetworkEnforcementConfig {
     pub fn new(session_id: impl Into<String>, network: LinuxNetworkPolicy) -> Self {
         let session_id = session_id.into();
@@ -145,7 +182,7 @@ pub fn plan_nftables_policy(config: &LinuxNetworkEnforcementConfig) -> LinuxNetw
 }
 
 pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftablesPlan {
-    let table_name = format!("gensee_{}", sanitize_nft_identifier(&config.session_id));
+    let table_name = nft_table_name(&config.session_id);
     let chain_name = "egress".to_string();
     let mut destinations = Vec::new();
     let mut denied_destinations = Vec::new();
@@ -307,6 +344,175 @@ pub fn attach_current_process_to_cgroup(_cgroup_path: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn trusted_nft_binary() -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    for candidate in ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"] {
+        let path = PathBuf::from(candidate);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == 0
+            && metadata.mode() & 0o022 == 0
+            && path.ancestors().skip(1).all(|ancestor| {
+                std::fs::symlink_metadata(ancestor).is_ok_and(|metadata| {
+                    metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0
+                })
+            })
+        {
+            return Ok(path);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "no root-owned, non-writable nft binary found in a trusted system path",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn start_nftables_attempt_monitor(
+    plan: &LinuxNftablesPlan,
+) -> io::Result<LinuxNetworkAttemptMonitor> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc,
+    };
+
+    let mut child = Command::new(trusted_nft_binary()?)
+        .env_clear()
+        .env("LANG", "C")
+        .args(["-nn", "monitor", "trace"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "nft trace monitor stdout unavailable",
+        )
+    })?;
+    let (sender, receiver) = mpsc::sync_channel(1024);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let exited = Arc::new(AtomicBool::new(false));
+    let thread_dropped = Arc::clone(&dropped);
+    let thread_exited = Arc::clone(&exited);
+    let table_name = plan.table_name.clone();
+    let table_prefix = table_name
+        .rsplit_once('_')
+        .filter(|(_, generation)| generation.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(|(prefix, _)| format!("{prefix}_"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nftables operation table is missing its numeric generation",
+            )
+        })?;
+    let chain_name = plan.chain_name.clone();
+    std::thread::Builder::new()
+        .name(format!("gensee-nft-trace-{table_name}"))
+        .spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                let Some(event) =
+                    parse_nft_trace_attempt_for_prefix(&line, &table_prefix, &chain_name)
+                else {
+                    continue;
+                };
+                if sender.try_send(event).is_err() {
+                    thread_dropped.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            thread_exited.store(true, Ordering::Release);
+        })?;
+    Ok(LinuxNetworkAttemptMonitor {
+        child,
+        receiver,
+        dropped,
+        exited,
+    })
+}
+
+#[cfg(test)]
+fn parse_nft_trace_attempt(
+    line: &str,
+    expected_table: &str,
+    expected_chain: &str,
+) -> Option<LinuxNetworkAttemptEvent> {
+    parse_nft_trace_attempt_inner(line, expected_table, expected_chain, false)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_nft_trace_attempt_for_prefix(
+    line: &str,
+    expected_table_prefix: &str,
+    expected_chain: &str,
+) -> Option<LinuxNetworkAttemptEvent> {
+    parse_nft_trace_attempt_inner(line, expected_table_prefix, expected_chain, true)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_nft_trace_attempt_inner(
+    line: &str,
+    expected_table: &str,
+    expected_chain: &str,
+    table_is_prefix: bool,
+) -> Option<LinuxNetworkAttemptEvent> {
+    if line.len() > 64 * 1024 {
+        return None;
+    }
+    let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() < 10
+        || fields.first().copied() != Some("trace")
+        || fields.get(1).copied() != Some("id")
+        || fields.get(6).copied() != Some("packet:")
+    {
+        return None;
+    }
+    let table = *fields.get(4)?;
+    if if table_is_prefix {
+        let suffix = table.strip_prefix(expected_table)?;
+        suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+    } else {
+        table != expected_table
+    } {
+        return None;
+    }
+    let chain = *fields.get(5)?;
+    if chain != expected_chain && chain != format!("{expected_chain}_input") {
+        return None;
+    }
+    let destination = fields.windows(3).find_map(|values| {
+        (matches!(values[0], "ip" | "ip6") && values[1] == "daddr").then_some(values[2])
+    })?;
+    let destination = destination.parse::<IpAddr>().ok()?.to_string();
+    let (protocol, port) = fields.windows(3).find_map(|values| {
+        let protocol = match values[0] {
+            "tcp" => LinuxNetworkProtocol::Tcp,
+            "udp" => LinuxNetworkProtocol::Udp,
+            _ => return None,
+        };
+        (values[1] == "dport")
+            .then(|| values[2].parse::<u16>().ok().map(|port| (protocol, port)))
+            .flatten()
+    })?;
+    Some(LinuxNetworkAttemptEvent {
+        trace_id: fields.get(2)?.to_string(),
+        table_name: table.to_string(),
+        chain_name: chain.to_string(),
+        destination,
+        protocol,
+        port,
+    })
+}
+
+#[cfg(target_os = "linux")]
 pub fn apply_nftables_script(script: &str) -> io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -315,7 +521,9 @@ pub fn apply_nftables_script(script: &str) -> io::Result<()> {
         return Ok(());
     }
 
-    let mut child = Command::new("nft")
+    let mut child = Command::new(trusted_nft_binary()?)
+        .env_clear()
+        .env("LANG", "C")
         .arg("-f")
         .arg("-")
         .stdin(Stdio::piped())
@@ -337,7 +545,9 @@ pub fn apply_nftables_script(script: &str) -> io::Result<()> {
 pub fn delete_nftables_table(table_name: &str) -> io::Result<()> {
     use std::process::Command;
 
-    let status = Command::new("nft")
+    let status = Command::new(trusted_nft_binary()?)
+        .env_clear()
+        .env("LANG", "C")
         .arg("delete")
         .arg("table")
         .arg("inet")
@@ -354,7 +564,9 @@ pub fn delete_nftables_table(table_name: &str) -> io::Result<()> {
 pub fn delete_nftables_table_if_exists(table_name: &str) -> io::Result<()> {
     use std::process::Command;
 
-    let output = Command::new("nft")
+    let output = Command::new(trusted_nft_binary()?)
+        .env_clear()
+        .env("LANG", "C")
         .arg("-j")
         .arg("list")
         .arg("tables")
@@ -455,7 +667,9 @@ pub fn read_nftables_block_events(
         return Ok(Vec::new());
     }
 
-    let output = Command::new("nft")
+    let output = Command::new(trusted_nft_binary()?)
+        .env_clear()
+        .env("LANG", "C")
         .arg("-j")
         .arg("list")
         .arg("counters")
@@ -482,7 +696,9 @@ pub fn read_nftables_endpoint_events(
     if plan.endpoint_counters.is_empty() {
         return Ok(Vec::new());
     }
-    let output = Command::new("nft")
+    let output = Command::new(trusted_nft_binary()?)
+        .env_clear()
+        .env("LANG", "C")
         .arg("-j")
         .arg("list")
         .arg("counters")
@@ -635,7 +851,7 @@ fn append_nftables_chain(
             LinuxNftablesAddressFamily::Ipv6 => "ip6 daddr",
         };
         lines.push(format!(
-            "    {subject_match} {address} {} counter name {counter_name} reject with icmpx admin-prohibited",
+            "    {subject_match} {address} {} meta nftrace set 1 counter name {counter_name} reject with icmpx admin-prohibited",
             destination.value
         ));
     }
@@ -688,7 +904,7 @@ fn append_nftables_chain(
             .map(|counter| counter.name.as_str())
             .unwrap_or(DEFAULT_REJECT_COUNTER);
         lines.push(format!(
-            "    {subject_match} counter name {default_counter_name} reject with icmpx admin-prohibited"
+            "    {subject_match} meta nftrace set 1 counter name {default_counter_name} reject with icmpx admin-prohibited"
         ));
     }
     lines.push("  }".to_string());
@@ -886,6 +1102,26 @@ fn sanitize_nft_identifier(value: &str) -> String {
     output
 }
 
+fn nft_table_name(session_id: &str) -> String {
+    let (identity, generation) = session_id
+        .rsplit_once('_')
+        .filter(|(_, suffix)| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .map_or((session_id, None), |(identity, generation)| {
+            (identity, Some(generation))
+        });
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in identity.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let mut readable = sanitize_nft_identifier(identity);
+    readable.truncate(80);
+    let base = format!("gensee_{readable}_{hash:016x}");
+    generation.map_or(base.clone(), |generation| format!("{base}_{generation}"))
+}
+
 fn escape_nft_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -900,6 +1136,15 @@ mod tests {
             default_agent_cgroup_path("agent/session 1"),
             PathBuf::from("/sys/fs/cgroup/gensee/agent_session_1")
         );
+    }
+
+    #[test]
+    fn nft_table_identity_is_collision_resistant_and_bounded_across_generations() {
+        let hyphen = nft_table_name("op-a_7");
+        let underscore = nft_table_name("op_a_7");
+        assert_ne!(hyphen, underscore);
+        assert!(hyphen.ends_with("_7"));
+        assert!(nft_table_name(&format!("{}_{}", "x".repeat(128), u64::MAX)).len() <= 128);
     }
 
     #[test]
@@ -929,13 +1174,45 @@ mod tests {
         assert!(plan.script.contains("counter default_block {}"));
         assert!(plan.script.contains("socket cgroupv2 level 2"));
         assert!(plan.script.contains(
-            "ip daddr 169.254.169.254 counter name deny_0 reject with icmpx admin-prohibited"
+            "ip daddr 169.254.169.254 meta nftrace set 1 counter name deny_0 reject with icmpx admin-prohibited"
         ));
         assert!(plan.script.contains("ip daddr 1.2.3.4 accept"));
         assert!(plan.script.contains("ip6 daddr 2001:db8::/32 accept"));
-        assert!(plan
-            .script
-            .contains("counter name default_block reject with icmpx admin-prohibited"));
+        assert!(plan.script.contains(
+            "meta nftrace set 1 counter name default_block reject with icmpx admin-prohibited"
+        ));
+    }
+
+    #[test]
+    fn parses_only_exact_operation_packet_traces_with_endpoint_identity() {
+        let ipv4 = "trace id a95ea7ef ip gensee_op_1 egress packet: oif \"eth0\" ip saddr 10.0.0.2 ip daddr 203.0.113.9 ip ttl 64 tcp sport 50000 tcp dport 443 tcp flags == syn";
+        assert_eq!(
+            parse_nft_trace_attempt(ipv4, "gensee_op_1", "egress"),
+            Some(LinuxNetworkAttemptEvent {
+                trace_id: "a95ea7ef".to_string(),
+                table_name: "gensee_op_1".to_string(),
+                chain_name: "egress".to_string(),
+                destination: "203.0.113.9".to_string(),
+                protocol: LinuxNetworkProtocol::Tcp,
+                port: 443,
+            })
+        );
+        let ipv6 = "trace id 00000002 ip6 gensee_op_1 egress_input packet: iif \"veth0\" ip6 saddr fd00::2 ip6 daddr 2001:db8::9 udp sport 50000 udp dport 53";
+        assert_eq!(
+            parse_nft_trace_attempt(ipv6, "gensee_op_1", "egress")
+                .unwrap()
+                .destination,
+            "2001:db8::9"
+        );
+        assert!(parse_nft_trace_attempt(ipv4, "gensee_other", "egress").is_none());
+        assert!(parse_nft_trace_attempt_for_prefix(ipv4, "gensee_op_", "egress").is_some());
+        assert!(parse_nft_trace_attempt_for_prefix(ipv4, "gensee_o_", "egress").is_none());
+        assert!(parse_nft_trace_attempt(
+            "trace id a ip gensee_op_1 egress rule tcp dport 443",
+            "gensee_op_1",
+            "egress"
+        )
+        .is_none());
     }
 
     #[test]
@@ -1013,7 +1290,7 @@ mod tests {
         );
         assert_eq!(
             plan.script
-                .matches("ip saddr 10.88.0.2 counter name default_block reject")
+                .matches("ip saddr 10.88.0.2 meta nftrace set 1 counter name default_block reject")
                 .count(),
             2,
             "unleased traffic must fail closed on both routing paths"
@@ -1082,7 +1359,7 @@ mod tests {
 
         validate_nftables_plan_for_apply(&plan).unwrap();
         assert!(plan.script.contains(
-            "ip daddr 169.254.169.254 counter name deny_0 reject with icmpx admin-prohibited"
+            "ip daddr 169.254.169.254 meta nftrace set 1 counter name deny_0 reject with icmpx admin-prohibited"
         ));
     }
 

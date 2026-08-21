@@ -445,6 +445,31 @@ impl OperationSupervisor {
         Ok(matches)
     }
 
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn root_process_identity(&mut self) -> io::Result<Option<(u32, u64)>> {
+        let _lock = OperationRecordLock::acquire(&self.lock_path)?;
+        self.reload()?;
+        self.refresh_lineage_in_memory()?;
+        let identity = self.record.root_pid.and_then(|root_pid| {
+            self.record
+                .process_lineage
+                .iter()
+                .find(|identity| identity.pid == root_pid && identity.active)
+                .map(|identity| (identity.pid, identity.start_time_ticks))
+        });
+        self.persist()?;
+        Ok(identity)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn record_boundary_violation(&mut self, kind: &str, detail: &str) -> io::Result<()> {
+        let _lock = OperationRecordLock::acquire(&self.lock_path)?;
+        self.reload()?;
+        self.record_violation(kind, detail)?;
+        self.record.updated_at_ms = unix_millis()?;
+        self.persist()
+    }
+
     fn refresh_lineage_in_memory(&mut self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {

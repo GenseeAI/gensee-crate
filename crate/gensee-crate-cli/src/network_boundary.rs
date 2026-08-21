@@ -225,6 +225,10 @@ struct NetworkSupervisor {
     next_usage_sample_at_ms: u64,
     last_counter_error: Option<String>,
     http_mediator_lease_id: Option<String>,
+    #[cfg(target_os = "linux")]
+    attempt_monitor: Option<gensee_crate_linux::LinuxNetworkAttemptMonitor>,
+    #[cfg(any(target_os = "linux", test))]
+    observed_attempt_traces: BTreeSet<String>,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -414,17 +418,18 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         None
     };
     let counter_snapshot = record.counter_snapshot.clone();
-    let cgroup_path = if let Some(root_pid) = config.root_pid {
+    #[cfg(target_os = "linux")]
+    let attempt_monitor = if dry_run {
+        None
+    } else {
+        Some(gensee_crate_linux::start_nftables_attempt_monitor(
+            &network_plan_for_record(&record)?.nftables,
+        )?)
+    };
+    let cgroup_path = if config.root_pid.is_some() {
         let path = gensee_crate_linux::default_agent_cgroup_path(&config.operation_id);
         if !dry_run {
             gensee_crate_linux::create_agent_cgroup(&path)?;
-            let attached = gensee_crate_linux::attach_process_tree_to_cgroup(root_pid, &path)?;
-            if !attached.contains(&root_pid) {
-                return Err(io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "network supervisor could not attach the operation root to its cgroup",
-                ));
-            }
         }
         Some(path)
     } else {
@@ -466,12 +471,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         }
         Err(error) => return Err(error),
     };
-    if let Some(root_pid) = config.root_pid {
-        operation.activate(root_pid)?;
-    } else {
-        operation.update_network_envelope(config.envelope.clone())?;
-        operation.activate_external_subject()?;
-    }
+    operation.update_network_envelope(config.envelope.clone())?;
     let supervisor = Arc::new(Mutex::new(NetworkSupervisor {
         record,
         record_path,
@@ -486,6 +486,10 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         next_usage_sample_at_ms: now_ms.saturating_add(NETWORK_USAGE_POLL_INTERVAL_MS),
         last_counter_error: None,
         http_mediator_lease_id: config.proxy.lease_id.clone(),
+        #[cfg(target_os = "linux")]
+        attempt_monitor,
+        #[cfg(any(target_os = "linux", test))]
+        observed_attempt_traces: BTreeSet::new(),
     }));
     let _cleanup = NetworkRuntimeCleanup {
         table_names: Arc::clone(&table_names),
@@ -494,6 +498,19 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     {
         let mut state = lock_supervisor(&supervisor)?;
         state.reconcile_expired_and_apply(&table_names)?;
+        if let Some(root_pid) = config.root_pid {
+            state
+                .operation
+                .as_mut()
+                .ok_or_else(|| io::Error::other("operation supervisor unavailable"))?
+                .activate(root_pid)?;
+        } else {
+            state
+                .operation
+                .as_mut()
+                .ok_or_else(|| io::Error::other("operation supervisor unavailable"))?
+                .activate_external_subject()?;
+        }
     }
     #[cfg(not(unix))]
     {
@@ -565,6 +582,8 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
                 if state.has_expired_leases(now_ms) {
                     state.reconcile_expired_and_apply(&table_names)?;
                 }
+                #[cfg(target_os = "linux")]
+                state.sample_kernel_network_attempts(&table_names)?;
                 if now_ms >= state.next_usage_sample_at_ms {
                     state.sample_usage()?;
                     state.next_usage_sample_at_ms =
@@ -956,14 +975,6 @@ impl NetworkSupervisor {
             .grants
             .retain(|grant| grant.expires_at_ms.is_none_or(|expiry| now_ms < expiry));
         self.record.generation = self.record.generation.saturating_add(1);
-        if let Some(pid) = self.record.root_pid {
-            if !self.dry_run {
-                gensee_crate_linux::attach_process_tree_to_cgroup(
-                    pid,
-                    &gensee_crate_linux::default_agent_cgroup_path(&self.record.operation_id),
-                )?;
-            }
-        }
         let plan = network_plan_for_record(&self.record)?;
         if !plan.warnings.is_empty() {
             return Err(io::Error::new(
@@ -981,6 +992,26 @@ impl NetworkSupervisor {
                 .lock()
                 .map_err(|_| io::Error::other("network table registry lock poisoned"))?
                 .push(new_table.clone());
+            // On initial activation, install the empty-cgroup policy before
+            // attaching the process tree. Once attached, both the root and
+            // future descendants inherit enforcement without an ambient-
+            // network window. On rotation, the prior table remains active.
+            if let Some(pid) = self.record.root_pid {
+                let attachment = gensee_crate_linux::attach_process_tree_to_cgroup(
+                    pid,
+                    &gensee_crate_linux::default_agent_cgroup_path(&self.record.operation_id),
+                );
+                if !matches!(attachment, Ok(ref attached) if attached.contains(&pid)) {
+                    let _ = gensee_crate_linux::delete_nftables_table_if_exists(&new_table);
+                    return Err(match attachment {
+                        Err(error) => error,
+                        Ok(_) => io::Error::new(
+                            ErrorKind::PermissionDenied,
+                            "network supervisor could not attach the operation root to its cgroup",
+                        ),
+                    });
+                }
+            }
             self.sample_usage()?;
             let new_snapshot = match read_counter_snapshot(&plan.nftables) {
                 Ok(snapshot) => snapshot,
@@ -1114,6 +1145,120 @@ impl NetworkSupervisor {
                 blocked_packets,
                 blocked_bytes,
             )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sample_kernel_network_attempts(
+        &mut self,
+        table_names: &Arc<Mutex<Vec<String>>>,
+    ) -> io::Result<()> {
+        let Some(monitor) = self.attempt_monitor.as_ref() else {
+            return Ok(());
+        };
+        let (attempts, dropped, exited) = monitor.drain();
+        self.process_kernel_network_attempts(attempts, dropped, exited, table_names)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn process_kernel_network_attempts(
+        &mut self,
+        attempts: Vec<gensee_crate_linux::LinuxNetworkAttemptEvent>,
+        dropped: u64,
+        exited: bool,
+        table_names: &Arc<Mutex<Vec<String>>>,
+    ) -> io::Result<()> {
+        if dropped > 0 {
+            if let Some(operation) = self.operation.as_mut() {
+                operation.record_boundary_violation(
+                    "network_attempt_event_loss",
+                    &format!("kernel network trace channel dropped {dropped} events"),
+                )?;
+            }
+        }
+        if exited {
+            if let Some(operation) = self.operation.as_mut() {
+                operation.record_boundary_violation(
+                    "network_attempt_sensor_stopped",
+                    "nftables trace monitor stopped; hard deny remains active but automatic capability-fault resolution is disabled",
+                )?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                self.attempt_monitor = None;
+            }
+        }
+        for attempt in attempts {
+            let trace_key = format!(
+                "{}:{}:{}:{}:{}",
+                attempt.table_name,
+                attempt.trace_id,
+                attempt.destination,
+                match attempt.protocol {
+                    gensee_crate_linux::LinuxNetworkProtocol::Tcp => "tcp",
+                    gensee_crate_linux::LinuxNetworkProtocol::Udp => "udp",
+                },
+                attempt.port
+            );
+            if !self.observed_attempt_traces.insert(trace_key.clone()) {
+                continue;
+            }
+            if self.observed_attempt_traces.len() > 4096 {
+                self.observed_attempt_traces.clear();
+                self.observed_attempt_traces.insert(trace_key.clone());
+                if let Some(operation) = self.operation.as_mut() {
+                    operation.record_boundary_violation(
+                        "network_attempt_dedupe_limit_reached",
+                        "kernel network attempt deduplication reached its bounded limit",
+                    )?;
+                }
+            }
+            let subject = if let Some(source_address) = self.record.source_address.clone() {
+                CapabilityFaultSubject::NetworkPeer { source_address }
+            } else if let Some((pid, start_time_ticks)) = self
+                .operation
+                .as_mut()
+                .ok_or_else(|| io::Error::other("operation supervisor unavailable"))?
+                .root_process_identity()?
+            {
+                CapabilityFaultSubject::LocalProcess {
+                    pid,
+                    start_time_ticks,
+                }
+            } else {
+                if let Some(operation) = self.operation.as_mut() {
+                    operation.record_boundary_violation(
+                        "network_attempt_subject_unavailable",
+                        "kernel denied an endpoint but the operation subject identity was unavailable",
+                    )?;
+                }
+                continue;
+            };
+            let fault_digest = format!("{:x}", Sha256::digest(trace_key.as_bytes()));
+            let fault = CapabilityFault {
+                schema_version:
+                    gensee_crate_rules::capability_fault::CAPABILITY_FAULT_SCHEMA_VERSION,
+                fault_id: format!("fault_nft_{}", &fault_digest[..24]),
+                operation_id: self.record.operation_id.clone(),
+                source_run_id: self.record.source_run_id.clone(),
+                subject,
+                effect: BoundaryEffectObservation::NetworkConnect {
+                    destination: attempt.destination,
+                    protocol: match attempt.protocol {
+                        gensee_crate_linux::LinuxNetworkProtocol::Tcp => "tcp".to_string(),
+                        gensee_crate_linux::LinuxNetworkProtocol::Udp => "udp".to_string(),
+                    },
+                    port: attempt.port,
+                },
+                requested_ttl_seconds: self.record.policy.max_in_place_lease_ttl_seconds,
+                observed_at_ms: unix_millis()?,
+            };
+            let (resolution, effect) = self.resolve_fault(&fault, table_names)?;
+            self.append_fault_evidence(&fault, &resolution)?;
+            if let Some(effect) = effect.as_ref() {
+                self.append_effect(effect)?;
+            }
         }
         Ok(())
     }
@@ -2650,6 +2795,10 @@ mod tests {
             next_usage_sample_at_ms: u64::MAX,
             last_counter_error: None,
             http_mediator_lease_id: None,
+            #[cfg(target_os = "linux")]
+            attempt_monitor: None,
+            #[cfg(any(target_os = "linux", test))]
+            observed_attempt_traces: BTreeSet::new(),
         }))
     }
 
@@ -2904,6 +3053,70 @@ mod tests {
         assert!(resolution.lease_id.is_some());
         assert_eq!(state.record.envelope.grants.len(), 1);
         assert_eq!(effect.unwrap().fault_id.as_deref(), Some("fault_network_1"));
+    }
+
+    #[test]
+    fn kernel_observed_unknown_endpoint_becomes_one_typed_fault_and_scoped_lease() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let policy = NetworkBoundaryPolicy {
+            in_place_lease_destinations: vec!["8.8.8.8".to_string()],
+            ..NetworkBoundaryPolicy::default()
+        };
+        let supervisor = test_supervisor(&root, policy);
+        let tables = Arc::new(Mutex::new(Vec::new()));
+        let attempt = gensee_crate_linux::LinuxNetworkAttemptEvent {
+            trace_id: "trace_1".to_string(),
+            table_name: "gensee_op_1_hash_1".to_string(),
+            chain_name: "egress".to_string(),
+            destination: "8.8.8.8".to_string(),
+            protocol: gensee_crate_linux::LinuxNetworkProtocol::Tcp,
+            port: 443,
+        };
+        let mut state = supervisor.lock().unwrap();
+        state.record.root_pid = None;
+        state.record.source_address = Some("10.88.0.12".to_string());
+        state
+            .process_kernel_network_attempts(vec![attempt.clone(), attempt], 0, false, &tables)
+            .unwrap();
+        assert_eq!(state.record.envelope.grants.len(), 1);
+        assert_eq!(state.record.envelope.grants[0].destination, "8.8.8.8");
+        assert_eq!(state.record.envelope.grants[0].ports, vec![443]);
+        drop(state);
+        let faults = fs::read_to_string(root.join("faults.jsonl")).unwrap();
+        assert_eq!(faults.lines().count(), 1);
+        assert!(faults.contains("retry_after_lease"));
+        let effects = fs::read_to_string(root.join("effects.jsonl")).unwrap();
+        assert_eq!(effects.lines().count(), 1);
+        assert!(effects.contains("attach_in_place_lease"));
+    }
+
+    #[test]
+    fn kernel_observed_private_endpoint_stays_denied_without_authority_growth() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let mut state = supervisor.lock().unwrap();
+        state.record.root_pid = None;
+        state.record.source_address = Some("10.88.0.12".to_string());
+        state
+            .process_kernel_network_attempts(
+                vec![gensee_crate_linux::LinuxNetworkAttemptEvent {
+                    trace_id: "trace_private".to_string(),
+                    table_name: "gensee_op_1_hash_1".to_string(),
+                    chain_name: "egress".to_string(),
+                    destination: "127.0.0.1".to_string(),
+                    protocol: gensee_crate_linux::LinuxNetworkProtocol::Tcp,
+                    port: 8080,
+                }],
+                0,
+                false,
+                &Arc::new(Mutex::new(Vec::new())),
+            )
+            .unwrap();
+        assert!(state.record.envelope.grants.is_empty());
+        drop(state);
+        let faults = fs::read_to_string(root.join("faults.jsonl")).unwrap();
+        assert!(faults.contains("restricted_destination"));
+        assert!(faults.contains("\"retry_allowed\":false"));
     }
 
     #[test]
