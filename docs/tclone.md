@@ -295,8 +295,10 @@ typed `effect-manifest.json`. The manifest distinguishes requested capabilities
 from observed use and records changed files, file reads, each executable open,
 the exact-command digest, promotion proposals, violations, and explicit
 telemetry coverage. Every Linux cell is held behind a startup gate while Gensee
-places the container tree in its own cgroup and establishes filesystem-wide
-fanotify permission marks over the container root and scoped bind mounts. A
+places the container tree in its own cgroup and establishes mount-wide
+fanotify permission marks over the container root and each scoped bind mount.
+A dedicated host sensor thread services permission events so the orchestrator
+cannot block on its own gate or evidence writes. A
 queue overflow, missing mark, sensor error, or unsupported host is recorded as
 incomplete read/process coverage and a violation; it is never represented as an
 empty effect list. Capability cells therefore require Linux cgroup v2. Complete

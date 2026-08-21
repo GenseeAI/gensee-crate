@@ -6,7 +6,7 @@ use crate::session::LinuxSessionTarget;
 pub struct LinuxFanotifyConfig {
     pub policy: LinuxPolicy,
     pub session: Option<LinuxSessionTarget>,
-    /// Filesystems to observe in full. Events are still filtered to `session`.
+    /// Container/bind mounts to observe in full. Events are still filtered to `session`.
     pub filesystem_marks: Vec<String>,
 }
 
@@ -239,7 +239,7 @@ mod platform {
                     ));
                     continue;
                 }
-                match add_filesystem_mark(fd, path) {
+                match add_mount_mark(fd, path) {
                     Ok(()) => marked_paths.push(mark.clone()),
                     Err(error) => setup_warnings.push(format!(
                         "fanotify filesystem mark failed for {mark}: {error}"
@@ -405,12 +405,12 @@ mod platform {
         }
     }
 
-    fn add_filesystem_mark(fd: RawFd, path: &Path) -> io::Result<()> {
+    fn add_mount_mark(fd: RawFd, path: &Path) -> io::Result<()> {
         let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "fanotify path contains NUL")
         })?;
         let mask = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN_OPEN_EXEC_PERM;
-        fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, mask, &path)
+        fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT, mask, &path)
     }
 
     fn read_fanotify(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
@@ -503,7 +503,7 @@ mod platform {
     const FAN_NONBLOCK: u32 = 0x0000_0002;
     const FAN_MARK_ADD: u32 = 0x0000_0001;
     const FAN_MARK_ONLYDIR: u32 = 0x0000_0008;
-    const FAN_MARK_FILESYSTEM: u32 = 0x0000_0100;
+    const FAN_MARK_MOUNT: u32 = 0x0000_0010;
 }
 
 #[cfg(not(target_os = "linux"))]

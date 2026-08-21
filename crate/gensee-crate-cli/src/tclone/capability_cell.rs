@@ -156,7 +156,9 @@ struct CellRuntimeEvidence {
 }
 
 struct CellRuntimeSensor {
-    enforcer: Option<gensee_crate_linux::LinuxFanotifyEnforcer>,
+    stop: Arc<AtomicBool>,
+    worker:
+        Option<std::thread::JoinHandle<io::Result<Vec<gensee_crate_linux::LinuxFanotifyEvent>>>>,
     evidence: CellRuntimeEvidence,
     input_snapshot: PathBuf,
     output_snapshot: PathBuf,
@@ -234,9 +236,12 @@ impl CellRuntimeSensor {
         input_snapshot: &Path,
         output_snapshot: &Path,
         container_workspace: &str,
+        scoped_paths: &[String],
     ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
         let mut sensor = Self {
-            enforcer: None,
+            stop: Arc::clone(&stop),
+            worker: None,
             evidence: CellRuntimeEvidence::default(),
             input_snapshot: input_snapshot.to_path_buf(),
             output_snapshot: output_snapshot.to_path_buf(),
@@ -252,96 +257,108 @@ impl CellRuntimeSensor {
                     "gated capability-cell process root is not inspectable",
                 ));
             }
+            let workspace_root = process_root.join(container_workspace.trim_start_matches('/'));
+            let mut mount_marks = vec![process_root.to_string_lossy().to_string()];
+            for relative in scoped_paths {
+                let path = if relative == "." {
+                    workspace_root.clone()
+                } else {
+                    workspace_root.join(relative)
+                };
+                mount_marks.push(path.to_string_lossy().to_string());
+            }
+            mount_marks.sort();
+            mount_marks.dedup();
             let session = gensee_crate_linux::LinuxSessionTarget::from_pid(cell_id, root_pid)?;
             let config = gensee_crate_linux::LinuxFanotifyConfig::with_session_filesystem_audit(
                 gensee_crate_linux::LinuxPolicy::default(),
                 session,
-                vec![
-                    process_root.to_string_lossy().to_string(),
-                    input_snapshot.to_string_lossy().to_string(),
-                    output_snapshot.to_string_lossy().to_string(),
-                ],
+                mount_marks,
             );
             let enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(config)?;
             let status = enforcer.status();
             if !status.warnings.is_empty() || status.marked_paths.is_empty() {
                 return Err(io::Error::other(format!(
-                    "fanotify cell sensor did not establish complete filesystem marks: {}",
+                    "fanotify cell sensor did not establish complete mount marks: {}",
                     status.warnings.join("; ")
                 )));
             }
             Ok(enforcer)
         })();
         match result {
-            Ok(enforcer) => sensor.enforcer = Some(enforcer),
+            Ok(mut enforcer) => {
+                sensor.worker = Some(thread::spawn(move || {
+                    let mut observed = Vec::new();
+                    loop {
+                        let events = enforcer.handle_events_once()?;
+                        let empty = events.is_empty();
+                        observed.extend(events);
+                        if stop.load(Ordering::Acquire) && empty {
+                            return Ok(observed);
+                        }
+                        if empty {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }));
+            }
             Err(error) => sensor.evidence.collection_error = Some(error.to_string()),
         }
         sensor
     }
 
-    fn drain(&mut self) {
-        let Some(enforcer) = self.enforcer.as_mut() else {
-            return;
-        };
-        for _ in 0..32 {
-            let events = match enforcer.handle_events_once() {
-                Ok(events) => events,
-                Err(error) => {
-                    self.evidence.collection_error = Some(error.to_string());
-                    self.enforcer = None;
-                    return;
+    fn record_events(&mut self, events: Vec<gensee_crate_linux::LinuxFanotifyEvent>) {
+        for event in events {
+            let path = event.request.path.as_deref().map(|path| {
+                cell_effect_path(
+                    path,
+                    &self.input_snapshot,
+                    &self.output_snapshot,
+                    &self.container_workspace,
+                )
+            });
+            if matches!(
+                event.request.operation,
+                gensee_crate_linux::LinuxAccessOperation::FileRead
+            ) {
+                if let Some(path) = path.clone() {
+                    self.evidence.files_read.insert(path);
                 }
-            };
-            if events.is_empty() {
-                return;
             }
-            for event in events {
-                let path = event.request.path.as_deref().map(|path| {
-                    cell_effect_path(
-                        path,
-                        &self.input_snapshot,
-                        &self.output_snapshot,
-                        &self.container_workspace,
-                    )
-                });
-                if matches!(
-                    event.request.operation,
-                    gensee_crate_linux::LinuxAccessOperation::FileRead
-                ) {
-                    if let Some(path) = path.clone() {
-                        self.evidence.files_read.insert(path);
-                    }
-                }
-                if event.executable_open {
-                    let command_line = event.request.command_line.unwrap_or_default();
-                    let argv_digest =
-                        format!("sha256:{:x}", Sha256::digest(command_line.as_bytes()));
-                    let process = ProcessEffect {
-                        executable: path.unwrap_or_else(|| "unknown".to_string()),
-                        argv_digest,
-                        pid: event.request.pid,
-                        started_at_ms: unix_millis().unwrap_or_default(),
-                        finished_at_ms: None,
-                        exit_code: None,
-                    };
-                    if !self.evidence.processes_started.iter().any(|observed| {
-                        observed.pid == process.pid
-                            && observed.executable == process.executable
-                            && observed.argv_digest == process.argv_digest
-                    }) {
-                        self.evidence.processes_started.push(process);
-                    }
+            if event.executable_open {
+                let command_line = event.request.command_line.unwrap_or_default();
+                let argv_digest = format!("sha256:{:x}", Sha256::digest(command_line.as_bytes()));
+                let process = ProcessEffect {
+                    executable: path.unwrap_or_else(|| "unknown".to_string()),
+                    argv_digest,
+                    pid: event.request.pid,
+                    started_at_ms: unix_millis().unwrap_or_default(),
+                    finished_at_ms: None,
+                    exit_code: None,
+                };
+                if !self.evidence.processes_started.iter().any(|observed| {
+                    observed.pid == process.pid
+                        && observed.executable == process.executable
+                        && observed.argv_digest == process.argv_digest
+                }) {
+                    self.evidence.processes_started.push(process);
                 }
             }
         }
-        self.evidence.collection_error = Some(
-            "fanotify cell sensor could not drain its queue within the bounded cycle".to_string(),
-        );
-        self.enforcer = None;
     }
 
     fn finish(mut self) -> CellRuntimeEvidence {
-        self.drain();
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            match worker.join() {
+                Ok(Ok(events)) => self.record_events(events),
+                Ok(Err(error)) => self.evidence.collection_error = Some(error.to_string()),
+                Err(_) => {
+                    self.evidence.collection_error =
+                        Some("fanotify cell sensor thread panicked".to_string())
+                }
+            }
+        }
         self.evidence
     }
 }
@@ -1273,12 +1290,17 @@ fn execute_capability_cell(
     let started_at_ms = unix_millis()?;
     let mut child = Command::new(&podman).args(&run_args).spawn()?;
     let root_pid = wait_for_capability_cell_pid(&podman, &container_name, &mut child)?;
-    let mut runtime_sensor = CellRuntimeSensor::start(
+    let mut sensor_paths = effective_read_paths(&lease.request);
+    sensor_paths.extend(effective_write_paths(&lease.request));
+    sensor_paths.sort();
+    sensor_paths.dedup();
+    let runtime_sensor = CellRuntimeSensor::start(
         &cell_id,
         root_pid,
         &input_snapshot,
         &snapshot,
         &source.container_workspace,
+        &sensor_paths,
     );
     cgroup_guard.attach(root_pid)?;
     if let Some(guard) = network_guard.as_mut() {
@@ -1294,7 +1316,6 @@ fn execute_capability_cell(
     write_atomic_nofollow(&startup_gate.join("open"), b"open\n", 0o600)?;
     let mut timed_out = false;
     let status = loop {
-        runtime_sensor.drain();
         if let Some(status) = child.try_wait()? {
             break status;
         }
