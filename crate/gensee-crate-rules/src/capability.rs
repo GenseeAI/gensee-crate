@@ -15,12 +15,23 @@ pub const EFFECT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub enum Capability {
     FilesystemRead,
     FilesystemWrite,
+    FilesystemMetadata,
     DestructiveFilesystem,
     NetworkEgress,
+    NetworkListen,
+    SecretUse,
     IdentityUse,
+    WorkloadIdentity,
+    CloudIam,
+    Syscall,
+    LinuxCapability,
     ProcessExecution,
     PrivilegedExecution,
     UntrustedCodeExecution,
+    ExternalApplication,
+    DatabaseAccess,
+    IrreversibleEffect,
+    OutputPromotion,
     ExternalMutation,
 }
 
@@ -41,16 +52,113 @@ pub enum ExecutionBoundary {
     BrokeredCommit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOperationKind {
+    Read,
+    Create,
+    Write,
+    Rename,
+    Delete,
+    Metadata,
+    Execute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOperationScope {
+    pub path: String,
+    pub operation: FileOperationKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkDestinationScope {
+    pub destination: String,
+    pub protocol: String,
+    #[serde(default)]
+    pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretIdentityScope {
+    /// A broker-side reference. It must never contain secret material.
+    pub handle: String,
+    pub identity: String,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudIamScope {
+    pub provider: String,
+    pub resource: String,
+    pub actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assume_role: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelScope {
+    #[serde(default)]
+    pub syscalls: Vec<String>,
+    #[serde(default)]
+    pub linux_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalApplicationScope {
+    pub application: String,
+    pub target: String,
+    pub actions: Vec<String>,
+    pub irreversible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseScope {
+    pub service: String,
+    pub database: String,
+    pub roles: Vec<String>,
+    pub actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputPromotionScope {
+    pub path: String,
+    pub destination: String,
+    pub transactional: bool,
+}
+
 /// Requested resource selectors. Empty lists mean that no resource has been
 /// granted yet; they never mean "all resources". A lease issuer must resolve
 /// these selectors before execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityScope {
+    /// Compatibility selectors for schema-v1 producers. New producers should
+    /// also populate the typed scopes below.
+    #[serde(default)]
     pub read_paths: Vec<String>,
+    #[serde(default)]
     pub write_paths: Vec<String>,
+    #[serde(default)]
     pub network_hosts: Vec<String>,
+    #[serde(default)]
     pub identities: Vec<String>,
+    #[serde(default)]
     pub external_targets: Vec<String>,
+    #[serde(default)]
+    pub file_operations: Vec<FileOperationScope>,
+    #[serde(default)]
+    pub network_destinations: Vec<NetworkDestinationScope>,
+    #[serde(default)]
+    pub secret_identities: Vec<SecretIdentityScope>,
+    #[serde(default)]
+    pub cloud_iam: Vec<CloudIamScope>,
+    #[serde(default)]
+    pub kernel: KernelScope,
+    #[serde(default)]
+    pub external_applications: Vec<ExternalApplicationScope>,
+    #[serde(default)]
+    pub databases: Vec<DatabaseScope>,
+    #[serde(default)]
+    pub output_promotions: Vec<OutputPromotionScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,5 +391,27 @@ mod tests {
         assert_eq!(value["inspect_before_commit"], true);
         assert_eq!(value["scope"]["network_hosts"], serde_json::json!([]));
         assert_eq!(value["lease_ttl_seconds"], 240);
+    }
+
+    #[test]
+    fn legacy_capability_scope_defaults_new_privilege_dimensions_to_empty() {
+        let scope: CapabilityScope = serde_json::from_value(serde_json::json!({
+            "read_paths": ["src"],
+            "write_paths": [],
+            "network_hosts": [],
+            "identities": [],
+            "external_targets": []
+        }))
+        .unwrap();
+
+        assert_eq!(scope.read_paths, vec!["src"]);
+        assert!(scope.file_operations.is_empty());
+        assert!(scope.network_destinations.is_empty());
+        assert!(scope.secret_identities.is_empty());
+        assert!(scope.cloud_iam.is_empty());
+        assert!(scope.kernel.syscalls.is_empty());
+        assert!(scope.external_applications.is_empty());
+        assert!(scope.databases.is_empty());
+        assert!(scope.output_promotions.is_empty());
     }
 }

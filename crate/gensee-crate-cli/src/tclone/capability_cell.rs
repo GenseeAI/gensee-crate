@@ -5,6 +5,9 @@ use gensee_crate_rules::capability::{
     PromotionOutput, PromotionReceipt, TelemetryCoverage, CAPABILITY_REQUEST_SCHEMA_VERSION,
     EFFECT_MANIFEST_SCHEMA_VERSION,
 };
+use gensee_crate_rules::capability_policy::{
+    CapabilityPolicyDecision, CapabilityPolicyEngine, MediationBoundary, PolicyEvaluationContext,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 const CELL_LEASE_SCHEMA_VERSION: u32 = 1;
@@ -241,26 +244,35 @@ fn validate_cell_request(request: &CapabilityRequest) -> io::Result<()> {
             "cell requests must include process_execution",
         ));
     }
-    if !request.scope.read_paths.is_empty()
-        && !request.capabilities.contains(&Capability::FilesystemRead)
-    {
+    let read_paths = effective_read_paths(request);
+    let write_paths = effective_write_paths(request);
+    if !read_paths.is_empty() && !request.capabilities.contains(&Capability::FilesystemRead) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "read_paths require filesystem_read capability",
         ));
     }
-    if !request.scope.write_paths.is_empty()
-        && !request.capabilities.contains(&Capability::FilesystemWrite)
-    {
+    if !write_paths.is_empty() && !request.capabilities.contains(&Capability::FilesystemWrite) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "write_paths require filesystem_write capability",
         ));
     }
     for unsupported in [
+        Capability::FilesystemMetadata,
         Capability::NetworkEgress,
+        Capability::NetworkListen,
+        Capability::SecretUse,
         Capability::IdentityUse,
+        Capability::WorkloadIdentity,
+        Capability::CloudIam,
+        Capability::Syscall,
+        Capability::LinuxCapability,
         Capability::PrivilegedExecution,
+        Capability::ExternalApplication,
+        Capability::DatabaseAccess,
+        Capability::IrreversibleEffect,
+        Capability::OutputPromotion,
         Capability::ExternalMutation,
     ] {
         if request.capabilities.contains(&unsupported) {
@@ -272,13 +284,11 @@ fn validate_cell_request(request: &CapabilityRequest) -> io::Result<()> {
             ));
         }
     }
-    validate_scope_paths(&request.scope.read_paths)?;
-    validate_scope_paths(&request.scope.write_paths)?;
-    if request
-        .scope
-        .read_paths
+    validate_scope_paths(&read_paths)?;
+    validate_scope_paths(&write_paths)?;
+    if read_paths
         .iter()
-        .any(|read| request.scope.write_paths.iter().any(|write| read == write))
+        .any(|read| write_paths.iter().any(|write| read == write))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -288,13 +298,95 @@ fn validate_cell_request(request: &CapabilityRequest) -> io::Result<()> {
     if !request.scope.network_hosts.is_empty()
         || !request.scope.identities.is_empty()
         || !request.scope.external_targets.is_empty()
+        || !request.scope.network_destinations.is_empty()
+        || !request.scope.secret_identities.is_empty()
+        || !request.scope.cloud_iam.is_empty()
+        || !request.scope.kernel.syscalls.is_empty()
+        || !request.scope.kernel.linux_capabilities.is_empty()
+        || !request.scope.external_applications.is_empty()
+        || !request.scope.databases.is_empty()
+        || !request.scope.output_promotions.is_empty()
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "fresh cells currently accept only filesystem resource selectors",
+            "fresh cells currently accept only legacy filesystem selectors; typed privilege deltas require their mandatory mediators",
+        ));
+    }
+    let decision = CapabilityPolicyEngine::default().evaluate(
+        request,
+        &PolicyEvaluationContext {
+            active_mediators: vec![
+                MediationBoundary::ProcessCgroup,
+                MediationBoundary::FilesystemBoundary,
+            ],
+            locally_authorized_capabilities: Vec::new(),
+            isolated_cell_available: true,
+            approval_staging_available: false,
+        },
+    );
+    if decision.decision != CapabilityPolicyDecision::DelegateToIsolatedCell {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "capability policy denied fresh-cell lease: {}",
+                decision.reason_codes.join(", ")
+            ),
         ));
     }
     Ok(())
+}
+
+fn effective_read_paths(request: &CapabilityRequest) -> Vec<String> {
+    request
+        .scope
+        .read_paths
+        .iter()
+        .cloned()
+        .chain(
+            request
+                .scope
+                .file_operations
+                .iter()
+                .filter(|operation| {
+                    matches!(
+                        operation.operation,
+                        gensee_crate_rules::capability::FileOperationKind::Read
+                            | gensee_crate_rules::capability::FileOperationKind::Execute
+                    )
+                })
+                .map(|operation| operation.path.clone()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn effective_write_paths(request: &CapabilityRequest) -> Vec<String> {
+    request
+        .scope
+        .write_paths
+        .iter()
+        .cloned()
+        .chain(
+            request
+                .scope
+                .file_operations
+                .iter()
+                .filter(|operation| {
+                    matches!(
+                        operation.operation,
+                        gensee_crate_rules::capability::FileOperationKind::Create
+                            | gensee_crate_rules::capability::FileOperationKind::Write
+                            | gensee_crate_rules::capability::FileOperationKind::Rename
+                            | gensee_crate_rules::capability::FileOperationKind::Delete
+                            | gensee_crate_rules::capability::FileOperationKind::Metadata
+                    )
+                })
+                .map(|operation| operation.path.clone()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn validate_scope_paths(paths: &[String]) -> io::Result<()> {
@@ -490,21 +582,21 @@ fn capability_cell_run_args(
         OsString::from("--entrypoint"),
         OsString::from(&lease.command[0]),
     ];
-    for path in &lease.request.scope.read_paths {
+    for path in effective_read_paths(&lease.request) {
         add_scope_mount(
             &mut args,
             input_snapshot,
             &source.container_workspace,
-            path,
+            &path,
             "ro",
         )?;
     }
-    for path in &lease.request.scope.write_paths {
+    for path in effective_write_paths(&lease.request) {
         add_scope_mount(
             &mut args,
             output_snapshot,
             &source.container_workspace,
-            path,
+            &path,
             "rw",
         )?;
     }
@@ -518,15 +610,12 @@ fn copy_capability_scope(
     lease: &CapabilityCellLease,
     snapshot: &Path,
 ) -> io::Result<()> {
-    let paths = lease
-        .request
-        .scope
-        .read_paths
-        .iter()
-        .chain(&lease.request.scope.write_paths)
+    let paths = effective_read_paths(&lease.request)
+        .into_iter()
+        .chain(effective_write_paths(&lease.request))
         .collect::<BTreeSet<_>>();
     for relative in paths {
-        let destination = snapshot.join(relative);
+        let destination = snapshot.join(&relative);
         if relative == "." {
             run_command_status(
                 podman,
@@ -642,7 +731,7 @@ fn build_effect_manifest(
                 });
             }
         }
-        if path_is_in_scopes(&effect.path, &lease.request.scope.write_paths) {
+        if path_is_in_scopes(&effect.path, &effective_write_paths(&lease.request)) {
             outputs.push(PromotionOutput {
                 path: effect.path.clone(),
                 change: effect.change,
@@ -1044,7 +1133,7 @@ fn validate_promotion_evidence(
     let expected_outputs = manifest
         .files_changed
         .iter()
-        .filter(|effect| path_is_in_scopes(&effect.path, &record.request.scope.write_paths))
+        .filter(|effect| path_is_in_scopes(&effect.path, &effective_write_paths(&record.request)))
         .map(|effect| PromotionOutput {
             path: effect.path.clone(),
             change: effect.change,
@@ -1401,9 +1490,20 @@ mod tests {
     #[test]
     fn cell_request_rejects_unbrokered_authority() {
         for capability in [
+            Capability::FilesystemMetadata,
             Capability::NetworkEgress,
+            Capability::NetworkListen,
+            Capability::SecretUse,
             Capability::IdentityUse,
+            Capability::WorkloadIdentity,
+            Capability::CloudIam,
+            Capability::Syscall,
+            Capability::LinuxCapability,
             Capability::PrivilegedExecution,
+            Capability::ExternalApplication,
+            Capability::DatabaseAccess,
+            Capability::IrreversibleEffect,
+            Capability::OutputPromotion,
             Capability::ExternalMutation,
         ] {
             let mut request = request();
@@ -1423,6 +1523,32 @@ mod tests {
             validate_cell_request(&request).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn destructive_filesystem_request_accepts_typed_delete_scope() {
+        let mut request = request();
+        request.capabilities.push(Capability::DestructiveFilesystem);
+        request.scope.file_operations = vec![gensee_crate_rules::capability::FileOperationScope {
+            path: "target/cache".to_string(),
+            operation: gensee_crate_rules::capability::FileOperationKind::Delete,
+        }];
+
+        validate_cell_request(&request).unwrap();
+        assert!(effective_write_paths(&request).contains(&"target/cache".to_string()));
+    }
+
+    #[test]
+    fn irreversible_local_request_is_issuable_when_the_cell_contains_the_effect() {
+        let mut request = request();
+        request.effect_scope = EffectScope::IrreversibleLocal;
+        request.capabilities.push(Capability::DestructiveFilesystem);
+        request.scope.file_operations = vec![gensee_crate_rules::capability::FileOperationScope {
+            path: "target/cache".to_string(),
+            operation: gensee_crate_rules::capability::FileOperationKind::Delete,
+        }];
+
+        validate_cell_request(&request).unwrap();
     }
 
     #[cfg(unix)]

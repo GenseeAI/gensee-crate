@@ -200,6 +200,48 @@ Use the same `gensee-tclone` wrapper for `run list`, `run fork`, `run shell`,
 otherwise Gensee may read the source record but look in a different Podman store
 and report that the container is missing.
 
+### Capability decision engine
+
+Capability requests carry typed privilege deltas for file operations, network
+destinations and protocols, secret handles and identities, cloud/IAM resources
+and actions, syscalls and Linux capabilities, external applications/APIs,
+database roles/actions, irreversible effects, and output promotion. Legacy path
+and host selectors remain readable during the schema transition, but an empty
+selector always means unresolved authority rather than a wildcard grant.
+
+The provider-neutral policy engine returns exactly one of four decisions:
+
+- `allow_locally` when every capability is within the declared local envelope
+  and all mandatory mediators are active;
+- `delegate_to_isolated_cell` when the source lacks authority but the operation
+  is scoped, fully mediated, and an isolated cell is available. Irreversible
+  local effects are cell-eligible only when source execution is forbidden and
+  inspect-before-commit is mandatory;
+- `stage_for_approval` for brokered commits, external effects, uncontained
+  irreversible effects, and output promotion;
+- `deny` for unresolved scopes, expired/excessive leases, missing mediators,
+  unavailable staging/cells, unbounded network grants, raw secret material, or
+  policy-denied kernel authority.
+
+The orchestrator must declare mediators active for the specific operation;
+installation on the host is not enough. Boundaries include process/cgroup,
+filesystem, network, secret and workload-identity brokers, kernel controls,
+cloud/API and browser gateways, database proxy, and transactional output
+promotion. The current fresh-cell lease path invokes this engine with only its
+actually implemented filesystem and process/cgroup boundaries. Newly modeled
+authority therefore fails closed until the matching broker or gateway is
+attached.
+
+Typed filesystem operations are enforced by the fresh-cell path at this layer:
+`read` and `execute` selectors become read-only mounts, while `create`, `write`,
+`rename`, `delete`, and `metadata` selectors become writable mounts. This keeps
+`destructive_filesystem` requests satisfiable without accepting unrelated typed
+network, identity, or external selectors before their mediators exist.
+The cell's disposable snapshot contains an `irreversible_local` effect, so it
+does not require approval merely to execute there. Promotion remains a separate
+inspect-and-commit action; removing either isolation or inspect-before-commit
+restores the approval requirement.
+
 ### Capability cells
 
 For a bounded authority-expanding operation, a trusted host operator can issue a
