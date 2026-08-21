@@ -157,13 +157,25 @@ struct CellRuntimeEvidence {
     files_read: BTreeSet<String>,
     processes_started: Vec<ProcessEffect>,
     covered_read_mounts: Vec<String>,
-    collection_error: Option<String>,
+    expected_read_mounts: Vec<String>,
+    filesystem_collection_error: Option<String>,
+    process_collection_error: Option<String>,
+    process_telemetry_complete: bool,
 }
 
 #[derive(Debug, Default)]
 struct CellRuntimeWorkerResult {
-    events: Vec<gensee_crate_linux::LinuxFanotifyEvent>,
-    collection_error: Option<String>,
+    filesystem_events: Vec<gensee_crate_linux::LinuxFanotifyEvent>,
+    processes_started: Vec<ProcessEffect>,
+    filesystem_collection_error: Option<String>,
+    process_collection_error: Option<String>,
+    process_telemetry_complete: bool,
+}
+
+#[derive(Debug)]
+struct CellProcessTracker {
+    tracked_pids: BTreeSet<u32>,
+    processes_started: Vec<ProcessEffect>,
 }
 
 struct CellRuntimeSensor {
@@ -246,7 +258,7 @@ impl CellRuntimeSensor {
         input_snapshot: &Path,
         output_snapshot: &Path,
         container_workspace: &str,
-        scoped_paths: &[String],
+        read_mounts: &[String],
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let mut sensor = Self {
@@ -257,8 +269,11 @@ impl CellRuntimeSensor {
             output_snapshot: output_snapshot.to_path_buf(),
             container_workspace: container_workspace.to_string(),
         };
+        sensor.evidence.expected_read_mounts = read_mounts.to_vec();
+        sensor.evidence.expected_read_mounts.sort();
+        sensor.evidence.expected_read_mounts.dedup();
         let result =
-            (|| -> io::Result<(gensee_crate_linux::LinuxFanotifyEnforcer, Vec<String>)> {
+            (|| -> io::Result<(gensee_crate_linux::LinuxFanotifyEnforcer, Vec<String>, Option<String>)> {
                 let process_root = PathBuf::from("/proc")
                     .join(root_pid.to_string())
                     .join("root");
@@ -268,69 +283,88 @@ impl CellRuntimeSensor {
                         "gated capability-cell process root is not inspectable",
                     ));
                 }
-                let workspace_root = process_root.join(container_workspace.trim_start_matches('/'));
-                let mut mount_marks = vec![process_root.to_string_lossy().to_string()];
-                for relative in scoped_paths {
-                    let path = if relative == "." {
-                        workspace_root.clone()
-                    } else {
-                        workspace_root.join(relative)
-                    };
-                    mount_marks.push(path.to_string_lossy().to_string());
-                }
-                mount_marks.sort();
-                mount_marks.dedup();
+                let mount_marks = read_mounts
+                    .iter()
+                    .map(|mount| {
+                        if mount == "/" {
+                            process_root.clone()
+                        } else {
+                            process_root.join(mount.trim_start_matches('/'))
+                        }
+                    })
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>();
                 let session = gensee_crate_linux::LinuxSessionTarget::from_pid(cell_id, root_pid)?;
                 let config = gensee_crate_linux::LinuxFanotifyConfig::with_session_filesystem_audit(
                     gensee_crate_linux::LinuxPolicy::default(),
                     session,
-                    mount_marks,
+                    mount_marks.clone(),
                 );
                 let enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(config)?;
                 let status = enforcer.status();
-                if !status.warnings.is_empty() || status.marked_paths.is_empty() {
-                    return Err(io::Error::other(format!(
-                        "fanotify cell sensor did not establish complete mount marks: {}",
-                        status.warnings.join("; ")
-                    )));
-                }
-                Ok((enforcer, status.marked_paths))
+                let covered_read_mounts = read_mounts
+                    .iter()
+                    .zip(mount_marks.iter())
+                    .filter(|(_, host)| status.marked_paths.contains(host))
+                    .map(|(mount, _)| mount.clone())
+                    .collect::<Vec<_>>();
+                let missing_read_mounts = read_mounts
+                    .iter()
+                    .filter(|mount| !covered_read_mounts.contains(*mount))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let setup_error = if status.warnings.is_empty()
+                    && missing_read_mounts.is_empty()
+                {
+                    None
+                } else {
+                    Some(format!(
+                        "fanotify did not establish every declared cell mount; missing [{}]; {}",
+                        missing_read_mounts.join(", "),
+                        status.warnings.join("; "),
+                    ))
+                };
+                Ok((enforcer, covered_read_mounts, setup_error))
             })();
-        match result {
-            Ok((mut enforcer, covered_read_mounts)) => {
+        let (fanotify, filesystem_setup_error) = match result {
+            Ok((enforcer, covered_read_mounts, setup_error)) => {
                 sensor.evidence.covered_read_mounts = covered_read_mounts;
-                sensor.worker = Some(thread::spawn(move || {
-                    let mut observed = Vec::new();
-                    loop {
-                        let events = match enforcer.handle_events_once() {
-                            Ok(events) => events,
-                            Err(error) => {
-                                return CellRuntimeWorkerResult {
-                                    events: observed,
-                                    collection_error: Some(error.to_string()),
-                                };
-                            }
-                        };
-                        let empty = events.is_empty();
-                        observed.extend(events);
-                        if stop.load(Ordering::Acquire) && empty {
-                            return CellRuntimeWorkerResult {
-                                events: observed,
-                                collection_error: None,
-                            };
-                        }
-                        if empty {
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                    }
-                }));
+                (Some(enforcer), setup_error)
             }
-            Err(error) => sensor.evidence.collection_error = Some(error.to_string()),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        sensor.evidence.filesystem_collection_error = filesystem_setup_error.clone();
+
+        let process_setup = gensee_crate_linux::LinuxProcessEventSensor::new()
+            .and_then(|sensor| CellProcessTracker::new(root_pid).map(|tracker| (sensor, tracker)));
+        let (process_sensor, process_tracker, process_setup_error) = match process_setup {
+            Ok((process_sensor, process_tracker)) => {
+                (Some(process_sensor), Some(process_tracker), None)
+            }
+            Err(error) => (None, None, Some(error.to_string())),
+        };
+        sensor.evidence.process_collection_error = process_setup_error.clone();
+
+        if fanotify.is_some() || process_sensor.is_some() {
+            sensor.worker = Some(thread::spawn(move || {
+                run_cell_runtime_sensors(
+                    stop,
+                    fanotify,
+                    process_sensor,
+                    process_tracker,
+                    filesystem_setup_error,
+                    process_setup_error,
+                )
+            }));
         }
         sensor
     }
 
-    fn record_events(&mut self, events: Vec<gensee_crate_linux::LinuxFanotifyEvent>) {
+    fn record_events(
+        &mut self,
+        events: Vec<gensee_crate_linux::LinuxFanotifyEvent>,
+        record_process_fallback: bool,
+    ) {
         for event in events {
             let path = event.request.path.as_deref().map(|path| {
                 cell_effect_path(
@@ -348,13 +382,15 @@ impl CellRuntimeSensor {
                     self.evidence.files_read.insert(path);
                 }
             }
-            if event.executable_open {
+            if record_process_fallback && event.executable_open {
                 let command_line = event.request.command_line.unwrap_or_default();
                 let argv_digest = format!("sha256:{:x}", Sha256::digest(command_line.as_bytes()));
                 let process = ProcessEffect {
                     executable: path.unwrap_or_else(|| "unknown".to_string()),
                     argv_digest,
                     pid: event.request.pid,
+                    parent_pid: None,
+                    start_time_ticks: None,
                     started_at_ms: unix_millis().unwrap_or_default(),
                     finished_at_ms: None,
                     exit_code: None,
@@ -375,16 +411,268 @@ impl CellRuntimeSensor {
         if let Some(worker) = self.worker.take() {
             match worker.join() {
                 Ok(result) => {
-                    self.record_events(result.events);
-                    self.evidence.collection_error = result.collection_error;
+                    self.record_events(
+                        result.filesystem_events,
+                        !result.process_telemetry_complete,
+                    );
+                    self.evidence
+                        .processes_started
+                        .extend(result.processes_started);
+                    append_collection_error(
+                        &mut self.evidence.filesystem_collection_error,
+                        result.filesystem_collection_error,
+                    );
+                    append_collection_error(
+                        &mut self.evidence.process_collection_error,
+                        result.process_collection_error,
+                    );
+                    self.evidence.process_telemetry_complete = result.process_telemetry_complete
+                        && self.evidence.process_collection_error.is_none();
                 }
                 Err(_) => {
-                    self.evidence.collection_error =
-                        Some("fanotify cell sensor thread panicked".to_string())
+                    let error = Some("cell runtime sensor thread panicked".to_string());
+                    append_collection_error(
+                        &mut self.evidence.filesystem_collection_error,
+                        error.clone(),
+                    );
+                    append_collection_error(&mut self.evidence.process_collection_error, error);
                 }
             }
         }
         self.evidence
+    }
+}
+
+impl CellProcessTracker {
+    fn new(root_pid: u32) -> io::Result<Self> {
+        let identities = gensee_crate_linux::collect_process_lineage(root_pid)?;
+        if identities.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "capability-cell root process identity is unavailable",
+            ));
+        }
+        let started_at_ms = unix_millis()?;
+        let tracked_pids = identities.iter().map(|identity| identity.pid).collect();
+        let processes_started = identities
+            .iter()
+            .map(|identity| process_effect_from_identity(identity, started_at_ms))
+            .collect();
+        Ok(Self {
+            tracked_pids,
+            processes_started,
+        })
+    }
+
+    fn record(&mut self, event: gensee_crate_linux::LinuxProcessEvent) -> io::Result<()> {
+        let observed_at_ms = unix_millis()?;
+        match event {
+            gensee_crate_linux::LinuxProcessEvent::Fork {
+                parent_pid,
+                parent_tgid,
+                child_pid,
+                child_tgid,
+                ..
+            } if self.tracked_pids.contains(&parent_pid)
+                || self.tracked_pids.contains(&parent_tgid) =>
+            {
+                self.tracked_pids.insert(child_pid);
+                self.tracked_pids.insert(child_tgid);
+                if child_pid == child_tgid {
+                    let effect = match gensee_crate_linux::inspect_process_identity(child_tgid) {
+                        Ok(identity) => process_effect_from_identity(&identity, observed_at_ms),
+                        Err(_) => {
+                            self.inherited_process_effect(parent_tgid, child_tgid, observed_at_ms)?
+                        }
+                    };
+                    self.processes_started.push(effect);
+                }
+            }
+            gensee_crate_linux::LinuxProcessEvent::Exec {
+                process_pid,
+                process_tgid,
+                ..
+            } if self.tracked_pids.contains(&process_pid)
+                || self.tracked_pids.contains(&process_tgid) =>
+            {
+                self.tracked_pids.insert(process_pid);
+                self.tracked_pids.insert(process_tgid);
+                let identity = gensee_crate_linux::inspect_process_identity(process_tgid)?;
+                let effect = process_effect_from_identity(&identity, observed_at_ms);
+                if !self.processes_started.iter().any(|observed| {
+                    observed.pid == effect.pid
+                        && observed.start_time_ticks == effect.start_time_ticks
+                        && observed.executable == effect.executable
+                        && observed.argv_digest == effect.argv_digest
+                }) {
+                    self.processes_started.push(effect);
+                }
+            }
+            gensee_crate_linux::LinuxProcessEvent::Exit {
+                process_pid,
+                process_tgid,
+                exit_code,
+                exit_signal,
+                ..
+            } if self.tracked_pids.contains(&process_pid)
+                || self.tracked_pids.contains(&process_tgid) =>
+            {
+                self.tracked_pids.remove(&process_pid);
+                if process_pid == process_tgid {
+                    self.tracked_pids.remove(&process_tgid);
+                    let exit_code = decode_process_exit(exit_code, exit_signal);
+                    for process in self
+                        .processes_started
+                        .iter_mut()
+                        .filter(|process| process.pid == Some(process_tgid))
+                    {
+                        process.finished_at_ms = Some(observed_at_ms);
+                        process.exit_code = Some(exit_code);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn inherited_process_effect(
+        &self,
+        parent_pid: u32,
+        child_pid: u32,
+        started_at_ms: u64,
+    ) -> io::Result<ProcessEffect> {
+        let parent = self
+            .processes_started
+            .iter()
+            .rev()
+            .find(|process| process.pid == Some(parent_pid))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fork event parent was not present in process evidence",
+                )
+            })?;
+        Ok(ProcessEffect {
+            executable: parent.executable.clone(),
+            argv_digest: parent.argv_digest.clone(),
+            pid: Some(child_pid),
+            parent_pid: Some(parent_pid),
+            start_time_ticks: None,
+            started_at_ms,
+            finished_at_ms: None,
+            exit_code: None,
+        })
+    }
+}
+
+fn process_effect_from_identity(
+    identity: &gensee_crate_linux::LinuxProcessIdentity,
+    started_at_ms: u64,
+) -> ProcessEffect {
+    let command_line = identity.command_line.as_deref().unwrap_or_default();
+    ProcessEffect {
+        executable: identity
+            .executable_path
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        argv_digest: format!("sha256:{:x}", Sha256::digest(command_line.as_bytes())),
+        pid: Some(identity.pid),
+        parent_pid: Some(identity.parent_pid),
+        start_time_ticks: Some(identity.start_time_ticks),
+        started_at_ms,
+        finished_at_ms: None,
+        exit_code: None,
+    }
+}
+
+fn decode_process_exit(exit_code: u32, exit_signal: u32) -> i32 {
+    if exit_signal != 0 {
+        128_i32.saturating_add(exit_signal.min(i32::MAX as u32) as i32)
+    } else {
+        ((exit_code >> 8) & 0xff) as i32
+    }
+}
+
+fn run_cell_runtime_sensors(
+    stop: Arc<AtomicBool>,
+    mut fanotify: Option<gensee_crate_linux::LinuxFanotifyEnforcer>,
+    mut process_sensor: Option<gensee_crate_linux::LinuxProcessEventSensor>,
+    mut process_tracker: Option<CellProcessTracker>,
+    mut filesystem_collection_error: Option<String>,
+    mut process_collection_error: Option<String>,
+) -> CellRuntimeWorkerResult {
+    let mut filesystem_events = Vec::new();
+    loop {
+        let mut filesystem_empty = true;
+        if let Some(enforcer) = fanotify.as_mut() {
+            match enforcer.handle_events_once() {
+                Ok(events) => {
+                    filesystem_empty = events.is_empty();
+                    filesystem_events.extend(events);
+                }
+                Err(error) => {
+                    append_collection_error(
+                        &mut filesystem_collection_error,
+                        Some(error.to_string()),
+                    );
+                    fanotify = None;
+                }
+            }
+        }
+
+        let mut process_empty = true;
+        if let Some(sensor) = process_sensor.as_mut() {
+            match sensor.handle_events_once() {
+                Ok(events) => {
+                    process_empty = events.is_empty();
+                    if let Some(tracker) = process_tracker.as_mut() {
+                        for event in events {
+                            if let Err(error) = tracker.record(event) {
+                                append_collection_error(
+                                    &mut process_collection_error,
+                                    Some(error.to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    append_collection_error(&mut process_collection_error, Some(error.to_string()));
+                    process_sensor = None;
+                }
+            }
+        }
+
+        if stop.load(Ordering::Acquire) && filesystem_empty && process_empty {
+            return CellRuntimeWorkerResult {
+                filesystem_events,
+                processes_started: process_tracker
+                    .map(|tracker| tracker.processes_started)
+                    .unwrap_or_default(),
+                filesystem_collection_error,
+                process_telemetry_complete: process_sensor.is_some()
+                    && process_collection_error.is_none(),
+                process_collection_error,
+            };
+        }
+        if filesystem_empty && process_empty {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+fn append_collection_error(target: &mut Option<String>, error: Option<String>) {
+    let Some(error) = error.filter(|error| !error.is_empty()) else {
+        return;
+    };
+    match target {
+        Some(existing) if !existing.contains(&error) => {
+            existing.push_str("; ");
+            existing.push_str(&error);
+        }
+        None => *target = Some(error),
+        _ => {}
     }
 }
 
@@ -1341,17 +1629,14 @@ fn execute_capability_cell(
     let started_at_ms = unix_millis()?;
     let mut child = Command::new(&podman).args(&run_args).spawn()?;
     let root_pid = wait_for_capability_cell_pid(&podman, &container_name, &mut child)?;
-    let mut sensor_paths = effective_read_paths(&lease.request);
-    sensor_paths.extend(effective_write_paths(&lease.request));
-    sensor_paths.sort();
-    sensor_paths.dedup();
+    let sensor_mounts = capability_cell_read_mounts(lease, &source.container_workspace);
     let runtime_sensor = CellRuntimeSensor::start(
         &cell_id,
         root_pid,
         &input_snapshot,
         &snapshot,
         &source.container_workspace,
-        &sensor_paths,
+        &sensor_mounts,
     );
     cgroup_guard.attach(root_pid)?;
     if let Some(guard) = network_guard.as_mut() {
@@ -2124,9 +2409,21 @@ fn build_effect_manifest(
             observed_at_ms: finished_at_ms,
         });
     }
-    if let Some(error) = runtime_evidence.and_then(|evidence| evidence.collection_error.as_ref()) {
+    if let Some(error) =
+        runtime_evidence.and_then(|evidence| evidence.filesystem_collection_error.as_ref())
+    {
         violations.push(EffectViolation {
-            kind: "runtime_effect_telemetry_incomplete".to_string(),
+            kind: "filesystem_read_telemetry_incomplete".to_string(),
+            resource: cell_id.to_string(),
+            detail: error.clone(),
+            observed_at_ms: finished_at_ms,
+        });
+    }
+    if let Some(error) =
+        runtime_evidence.and_then(|evidence| evidence.process_collection_error.as_ref())
+    {
+        violations.push(EffectViolation {
+            kind: "process_lifecycle_telemetry_incomplete".to_string(),
             resource: cell_id.to_string(),
             detail: error.clone(),
             observed_at_ms: finished_at_ms,
@@ -2187,19 +2484,60 @@ fn build_effect_manifest(
                 executable: lease.command[0].clone(),
                 argv_digest,
                 pid: None,
+                parent_pid: None,
+                start_time_ticks: None,
                 started_at_ms,
                 finished_at_ms: Some(finished_at_ms),
                 exit_code,
             },
         );
     }
-    let runtime_coverage = match runtime_evidence {
-        Some(_) => TelemetryCoverage::Partial,
+    if runtime_evidence.is_some_and(|evidence| !evidence.processes_started.is_empty()) {
+        for capability in [
+            Capability::ProcessExecution,
+            Capability::PrivilegedExecution,
+            Capability::UntrustedCodeExecution,
+        ] {
+            if lease.request.capabilities.contains(&capability)
+                && !capabilities_used.contains(&capability)
+            {
+                capabilities_used.push(capability);
+            }
+        }
+    }
+    let filesystem_read_coverage_status = match runtime_evidence {
+        Some(evidence)
+            if evidence.filesystem_collection_error.is_none()
+                && !evidence.expected_read_mounts.is_empty()
+                && evidence.covered_read_mounts.len() == evidence.expected_read_mounts.len() =>
+        {
+            TelemetryCoverage::Complete
+        }
+        Some(evidence) if !evidence.covered_read_mounts.is_empty() => TelemetryCoverage::Partial,
         None => TelemetryCoverage::Unavailable,
+        Some(_) => TelemetryCoverage::Unavailable,
     };
-    let filesystem_read_coverage = runtime_evidence.map(|evidence| FilesystemReadCoverage {
-        covered_mounts: evidence.covered_read_mounts.clone(),
-        uncovered_mounts: capability_cell_uncovered_read_mounts(lease),
+    let process_coverage = match runtime_evidence {
+        Some(evidence) if evidence.process_telemetry_complete => TelemetryCoverage::Complete,
+        Some(evidence) if !evidence.processes_started.is_empty() => TelemetryCoverage::Partial,
+        None => TelemetryCoverage::Unavailable,
+        Some(_) => TelemetryCoverage::Unavailable,
+    };
+    let filesystem_read_coverage = runtime_evidence.map(|evidence| {
+        let covered = evidence
+            .covered_read_mounts
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        FilesystemReadCoverage {
+            covered_mounts: covered.iter().cloned().collect(),
+            uncovered_mounts: evidence
+                .expected_read_mounts
+                .iter()
+                .filter(|mount| !covered.contains(*mount))
+                .cloned()
+                .collect(),
+        }
     });
 
     let network_coverage = match network_evidence {
@@ -2230,7 +2568,7 @@ fn build_effect_manifest(
         promotions: Vec::new(),
         violations,
         telemetry_coverage: EffectTelemetryCoverage {
-            filesystem_reads: runtime_coverage,
+            filesystem_reads: filesystem_read_coverage_status,
             filesystem_writes: TelemetryCoverage::Complete,
             network_connections: network_coverage,
             external_requests: broker_coverage_for_capabilities(
@@ -2253,7 +2591,7 @@ fn build_effect_manifest(
                 broker_telemetry_required,
                 broker_telemetry_complete,
             ),
-            process_tree: runtime_coverage,
+            process_tree: process_coverage,
         },
         filesystem_read_coverage,
         started_at_ms,
@@ -2263,8 +2601,12 @@ fn build_effect_manifest(
     })
 }
 
-fn capability_cell_uncovered_read_mounts(lease: &CapabilityCellLease) -> Vec<String> {
+fn capability_cell_read_mounts(
+    lease: &CapabilityCellLease,
+    container_workspace: &str,
+) -> Vec<String> {
     let mut mounts = vec![
+        "/".to_string(),
         "/tmp".to_string(),
         "/run".to_string(),
         "/run/gensee-startup-gate".to_string(),
@@ -2275,6 +2617,12 @@ fn capability_cell_uncovered_read_mounts(lease: &CapabilityCellLease) -> Vec<Str
             .broker_lease_ids
             .iter()
             .map(|lease_id| format!("/run/gensee-broker/{lease_id}.sock")),
+    );
+    mounts.extend(
+        effective_read_paths(&lease.request)
+            .into_iter()
+            .chain(effective_write_paths(&lease.request))
+            .map(|path| container_scope_path(container_workspace, &path)),
     );
     mounts.sort();
     mounts.dedup();
@@ -2391,7 +2739,9 @@ fn verify_capability_cell_forensics(
         &evidence.signature,
     )?;
     let claims = &evidence.claims;
-    if claims.schema_version != CELL_FORENSICS_SCHEMA_VERSION
+    if record.schema_version != CELL_LEASE_SCHEMA_VERSION
+        || manifest.schema_version != EFFECT_MANIFEST_SCHEMA_VERSION
+        || claims.schema_version != CELL_FORENSICS_SCHEMA_VERSION
         || replay_plan.schema_version != CELL_FORENSICS_SCHEMA_VERSION
         || claims.operation_id != record.operation_id
         || claims.cell_id != record.cell_id
@@ -2977,8 +3327,18 @@ fn promotion_telemetry_is_complete(
     request: &CapabilityRequest,
     coverage: &EffectTelemetryCoverage,
 ) -> bool {
-    (!request.capabilities.contains(&Capability::FilesystemWrite)
-        || coverage.filesystem_writes == TelemetryCoverage::Complete)
+    (!request.capabilities.contains(&Capability::FilesystemRead)
+        || coverage.filesystem_reads == TelemetryCoverage::Complete)
+        && (!request.capabilities.contains(&Capability::FilesystemWrite)
+            || coverage.filesystem_writes == TelemetryCoverage::Complete)
+        && (!request.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::ProcessExecution
+                    | Capability::PrivilegedExecution
+                    | Capability::UntrustedCodeExecution
+            )
+        }) || coverage.process_tree == TelemetryCoverage::Complete)
         && (!request.capabilities.iter().any(|capability| {
             matches!(
                 capability,
@@ -4486,11 +4846,15 @@ mod tests {
         };
         let mut runtime = CellRuntimeEvidence::default();
         runtime.files_read.insert("Cargo.toml".to_string());
-        runtime.covered_read_mounts = vec!["/proc/42/root".to_string()];
+        runtime.covered_read_mounts = vec!["/".to_string()];
+        runtime.expected_read_mounts =
+            vec!["/".to_string(), "/run".to_string(), "/tmp".to_string()];
         runtime.processes_started.push(ProcessEffect {
             executable: "/usr/bin/cargo".to_string(),
             argv_digest: format!("sha256:{}", "a".repeat(64)),
             pid: Some(42),
+            parent_pid: Some(1),
+            start_time_ticks: Some(100),
             started_at_ms: 10,
             finished_at_ms: None,
             exit_code: None,
@@ -4524,7 +4888,7 @@ mod tests {
             TelemetryCoverage::Partial
         );
         let coverage = manifest.filesystem_read_coverage.as_ref().unwrap();
-        assert_eq!(coverage.covered_mounts, vec!["/proc/42/root"]);
+        assert_eq!(coverage.covered_mounts, vec!["/"]);
         assert!(coverage.uncovered_mounts.contains(&"/tmp".to_string()));
         assert!(coverage.uncovered_mounts.contains(&"/run".to_string()));
         assert!(!manifest
@@ -4532,6 +4896,100 @@ mod tests {
             .iter()
             .any(|violation| violation.kind == "filesystem_read_coverage_partial"));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn process_tracker_records_inherited_forks_and_exit_status() {
+        let parent_pid = std::process::id();
+        let parent_effect = ProcessEffect {
+            executable: "/bin/test-parent".to_string(),
+            argv_digest: format!("sha256:{}", "c".repeat(64)),
+            pid: Some(parent_pid),
+            parent_pid: None,
+            start_time_ticks: Some(1),
+            started_at_ms: 10,
+            finished_at_ms: None,
+            exit_code: None,
+        };
+        let mut tracker = CellProcessTracker {
+            tracked_pids: BTreeSet::from([parent_pid]),
+            processes_started: vec![parent_effect.clone()],
+        };
+        let child_pid = u32::MAX - 1;
+        tracker
+            .record(gensee_crate_linux::LinuxProcessEvent::Fork {
+                parent_pid,
+                parent_tgid: parent_pid,
+                child_pid,
+                child_tgid: child_pid,
+                timestamp_ns: 1,
+            })
+            .unwrap();
+        let child = tracker
+            .processes_started
+            .iter()
+            .find(|process| process.pid == Some(child_pid))
+            .unwrap();
+        assert_eq!(child.parent_pid, Some(parent_pid));
+        assert_eq!(child.executable, parent_effect.executable);
+
+        tracker
+            .record(gensee_crate_linux::LinuxProcessEvent::Exit {
+                process_pid: child_pid,
+                process_tgid: child_pid,
+                exit_code: 7 << 8,
+                exit_signal: 0,
+                parent_pid,
+                parent_tgid: parent_pid,
+                timestamp_ns: 2,
+            })
+            .unwrap();
+        let child = tracker
+            .processes_started
+            .iter()
+            .find(|process| process.pid == Some(child_pid))
+            .unwrap();
+        assert_eq!(child.exit_code, Some(7));
+        assert!(child.finished_at_ms.is_some());
+    }
+
+    #[test]
+    fn cell_read_mount_plan_covers_every_separate_effect_mount() {
+        let mut lease_request = request();
+        lease_request
+            .scope
+            .write_paths
+            .push("generated".to_string());
+        let lease = CapabilityCellLease {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            lease_id: "lease_mounts".to_string(),
+            operation_id: "op_mounts".to_string(),
+            cell_id: "cell_mounts".to_string(),
+            source_run_id: "run_1".to_string(),
+            policy_decision: policy_decision_for(&lease_request),
+            request: lease_request,
+            command: vec!["cargo".to_string(), "check".to_string()],
+            issued_at_ms: 1,
+            expires_at_ms: 2,
+            consumed_at_ms: Some(1),
+            broker_lease_ids: vec!["broker_1".to_string()],
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
+        };
+        let mounts = capability_cell_read_mounts(&lease, "/workspace");
+        for required in [
+            "/",
+            "/tmp",
+            "/run",
+            "/run/gensee-startup-gate",
+            "/run/gensee-cell-supervisor",
+            "/run/gensee-broker/broker_1.sock",
+            "/workspace/Cargo.toml",
+            "/workspace/Cargo.lock",
+            "/workspace/generated",
+        ] {
+            assert!(mounts.contains(&required.to_string()), "missing {required}");
+        }
     }
 
     #[test]
@@ -4563,7 +5021,19 @@ mod tests {
         };
         let mut runtime = CellRuntimeEvidence::default();
         runtime.files_read.insert("Cargo.toml".to_string());
-        runtime.covered_read_mounts = vec!["/proc/42/root".to_string()];
+        runtime.covered_read_mounts = vec!["/".to_string(), "/tmp".to_string()];
+        runtime.expected_read_mounts = runtime.covered_read_mounts.clone();
+        runtime.process_telemetry_complete = true;
+        runtime.processes_started.push(ProcessEffect {
+            executable: "/usr/bin/cargo".to_string(),
+            argv_digest: format!("sha256:{}", "b".repeat(64)),
+            pid: Some(42),
+            parent_pid: Some(1),
+            start_time_ticks: Some(101),
+            started_at_ms: 10,
+            finished_at_ms: Some(20),
+            exit_code: Some(0),
+        });
         let manifest = build_effect_manifest(
             &source_record(),
             &lease,
@@ -4581,11 +5051,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             manifest.telemetry_coverage.filesystem_reads,
-            TelemetryCoverage::Partial
+            TelemetryCoverage::Complete
         );
         assert_eq!(
             manifest.telemetry_coverage.process_tree,
-            TelemetryCoverage::Partial
+            TelemetryCoverage::Complete
         );
         persist_capability_cell_forensics(
             &source_record(),
@@ -4638,6 +5108,46 @@ mod tests {
         .unwrap();
         assert_eq!(
             validate_promotion_evidence(&record, &incomplete, "cell_1", "run_1", &root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let mut incomplete_reads = manifest.clone();
+        incomplete_reads.telemetry_coverage.filesystem_reads = TelemetryCoverage::Partial;
+        persist_capability_cell_forensics(
+            &source_record(),
+            &lease,
+            &root,
+            &input,
+            &output,
+            &incomplete_reads,
+            &[],
+            20,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_promotion_evidence(&record, &incomplete_reads, "cell_1", "run_1", &root,)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let mut incomplete_process = manifest.clone();
+        incomplete_process.telemetry_coverage.process_tree = TelemetryCoverage::Partial;
+        persist_capability_cell_forensics(
+            &source_record(),
+            &lease,
+            &root,
+            &input,
+            &output,
+            &incomplete_process,
+            &[],
+            20,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_promotion_evidence(&record, &incomplete_process, "cell_1", "run_1", &root,)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied

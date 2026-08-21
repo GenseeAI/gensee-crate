@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const CAPABILITY_REQUEST_SCHEMA_VERSION: u32 = 2;
-pub const EFFECT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const EFFECT_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -272,6 +272,12 @@ pub struct ProcessEffect {
     pub argv_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_pid: Option<u32>,
+    /// Linux `/proc/<pid>/stat` start time, in clock ticks since boot. This
+    /// disambiguates PID reuse without exposing command arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time_ticks: Option<u64>,
     pub started_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_ms: Option<u64>,
