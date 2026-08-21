@@ -13,6 +13,9 @@ use gensee_crate_rules::capability_policy::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const CELL_LEASE_SCHEMA_VERSION: u32 = 1;
+const CELL_FORENSICS_SCHEMA_VERSION: u32 = 1;
+const CELL_FORENSICS_SIGNATURE_DOMAIN: &str = "capability-cell-forensics-v1";
+const CELL_PROMOTION_SIGNATURE_DOMAIN: &str = "capability-cell-promotion-v1";
 // Leave time for the host-control bridge to return the result and reap the
 // container before its own hard command timeout.
 const CELL_LEASE_MAX_TTL_SECONDS: u64 = TCLONE_HOST_CONTROL_COMMAND_TIMEOUT_SECS - 60;
@@ -33,6 +36,64 @@ struct CapabilityCellLease {
     consumed_at_ms: Option<u64>,
     #[serde(default)]
     broker_lease_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay_of_cell_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_input_snapshot_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityCellReplayPlan {
+    schema_version: u32,
+    original_cell_id: String,
+    original_operation_id: String,
+    original_source_run_id: String,
+    request: CapabilityRequest,
+    command: Vec<String>,
+    input_snapshot_digest: String,
+    manifest_digest: String,
+    required_broker_resources: Vec<BrokerResourceKind>,
+    created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityCellForensicsClaims {
+    schema_version: u32,
+    operation_id: String,
+    cell_id: String,
+    lease_id: String,
+    source_run_id: String,
+    request_digest: String,
+    command_digest: String,
+    input_snapshot_digest: String,
+    output_snapshot_digest: String,
+    manifest_digest: String,
+    replay_plan_digest: String,
+    created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityCellForensicsEvidence {
+    claims: CapabilityCellForensicsClaims,
+    signature: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPromotionReceipt {
+    claims: CapabilityCellPromotionClaims,
+    signature: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityCellPromotionClaims {
+    schema_version: u32,
+    cell_id: String,
+    receipt: PromotionReceipt,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -78,7 +139,6 @@ struct CapabilityCellCleanupJournal {
 #[derive(Debug)]
 struct CellNetworkPlan {
     enforcement: gensee_crate_linux::LinuxNetworkEnforcementPlan,
-    gate_dir: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -88,10 +148,215 @@ struct CellNetworkEvidence {
     collection_error: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct CellRuntimeEvidence {
+    files_read: BTreeSet<String>,
+    processes_started: Vec<ProcessEffect>,
+    collection_error: Option<String>,
+}
+
+struct CellRuntimeSensor {
+    enforcer: Option<gensee_crate_linux::LinuxFanotifyEnforcer>,
+    evidence: CellRuntimeEvidence,
+    input_snapshot: PathBuf,
+    output_snapshot: PathBuf,
+    container_workspace: String,
+}
+
 struct CellNetworkGuard {
     plan: CellNetworkPlan,
     table_applied: bool,
     cleaned: bool,
+}
+
+struct CellCgroupGuard {
+    path: PathBuf,
+    cleaned: bool,
+}
+
+impl CellCgroupGuard {
+    fn activate(cell_id: &str) -> io::Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cell_id;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "capability cells require Linux cgroup v2",
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let path = gensee_crate_linux::default_agent_cgroup_path(cell_id);
+            gensee_crate_linux::create_agent_cgroup(&path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot create capability-cell cgroup: {error}"),
+                )
+            })?;
+            Ok(Self {
+                path,
+                cleaned: false,
+            })
+        }
+    }
+
+    fn attach(&self, pid: u32) -> io::Result<()> {
+        let attached = gensee_crate_linux::attach_process_tree_to_cgroup(pid, &self.path)?;
+        if attached.contains(&pid) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "capability-cell process was not attached to its cgroup",
+            ))
+        }
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        if !self.cleaned {
+            gensee_crate_linux::remove_agent_cgroup(&self.path)?;
+            self.cleaned = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CellCgroupGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+impl CellRuntimeSensor {
+    fn start(
+        podman: &OsString,
+        container_name: &str,
+        cell_id: &str,
+        root_pid: u32,
+        input_snapshot: &Path,
+        output_snapshot: &Path,
+        container_workspace: &str,
+    ) -> Self {
+        let mut sensor = Self {
+            enforcer: None,
+            evidence: CellRuntimeEvidence::default(),
+            input_snapshot: input_snapshot.to_path_buf(),
+            output_snapshot: output_snapshot.to_path_buf(),
+            container_workspace: container_workspace.to_string(),
+        };
+        let result = (|| -> io::Result<gensee_crate_linux::LinuxFanotifyEnforcer> {
+            let merged_root = inspect_capability_cell_merged_root(podman, container_name)?;
+            let session = gensee_crate_linux::LinuxSessionTarget::from_pid(cell_id, root_pid)?;
+            let config = gensee_crate_linux::LinuxFanotifyConfig::with_session_filesystem_audit(
+                gensee_crate_linux::LinuxPolicy::default(),
+                session,
+                vec![
+                    merged_root.to_string_lossy().to_string(),
+                    input_snapshot.to_string_lossy().to_string(),
+                    output_snapshot.to_string_lossy().to_string(),
+                ],
+            );
+            let enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(config)?;
+            let status = enforcer.status();
+            if !status.warnings.is_empty() || status.marked_paths.is_empty() {
+                return Err(io::Error::other(format!(
+                    "fanotify cell sensor did not establish complete filesystem marks: {}",
+                    status.warnings.join("; ")
+                )));
+            }
+            Ok(enforcer)
+        })();
+        match result {
+            Ok(enforcer) => sensor.enforcer = Some(enforcer),
+            Err(error) => sensor.evidence.collection_error = Some(error.to_string()),
+        }
+        sensor
+    }
+
+    fn drain(&mut self) {
+        let Some(enforcer) = self.enforcer.as_mut() else {
+            return;
+        };
+        for _ in 0..32 {
+            let events = match enforcer.handle_events_once() {
+                Ok(events) => events,
+                Err(error) => {
+                    self.evidence.collection_error = Some(error.to_string());
+                    self.enforcer = None;
+                    return;
+                }
+            };
+            if events.is_empty() {
+                return;
+            }
+            for event in events {
+                let path = event.request.path.as_deref().map(|path| {
+                    cell_effect_path(
+                        path,
+                        &self.input_snapshot,
+                        &self.output_snapshot,
+                        &self.container_workspace,
+                    )
+                });
+                if matches!(
+                    event.request.operation,
+                    gensee_crate_linux::LinuxAccessOperation::FileRead
+                ) {
+                    if let Some(path) = path.clone() {
+                        self.evidence.files_read.insert(path);
+                    }
+                }
+                if event.executable_open {
+                    let command_line = event.request.command_line.unwrap_or_default();
+                    let argv_digest =
+                        format!("sha256:{:x}", Sha256::digest(command_line.as_bytes()));
+                    let process = ProcessEffect {
+                        executable: path.unwrap_or_else(|| "unknown".to_string()),
+                        argv_digest,
+                        pid: event.request.pid,
+                        started_at_ms: unix_millis().unwrap_or_default(),
+                        finished_at_ms: None,
+                        exit_code: None,
+                    };
+                    if !self.evidence.processes_started.iter().any(|observed| {
+                        observed.pid == process.pid
+                            && observed.executable == process.executable
+                            && observed.argv_digest == process.argv_digest
+                    }) {
+                        self.evidence.processes_started.push(process);
+                    }
+                }
+            }
+        }
+        self.evidence.collection_error = Some(
+            "fanotify cell sensor could not drain its queue within the bounded cycle".to_string(),
+        );
+        self.enforcer = None;
+    }
+
+    fn finish(mut self) -> CellRuntimeEvidence {
+        self.drain();
+        self.evidence
+    }
+}
+
+fn cell_effect_path(
+    observed: &str,
+    input_snapshot: &Path,
+    output_snapshot: &Path,
+    container_workspace: &str,
+) -> String {
+    let path = Path::new(observed);
+    for root in [input_snapshot, output_snapshot] {
+        if let Ok(relative) = path.strip_prefix(root) {
+            return relative.to_string_lossy().to_string();
+        }
+    }
+    let workspace = container_workspace.trim_end_matches('/');
+    if let Some((_, relative)) = observed.split_once(&format!("{workspace}/")) {
+        return relative.to_string();
+    }
+    observed.to_string()
 }
 
 pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
@@ -190,6 +455,8 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
         expires_at_ms: issued_at_ms.saturating_add(ttl_seconds.saturating_mul(1_000)),
         consumed_at_ms: None,
         broker_lease_ids: Vec::new(),
+        replay_of_cell_id: None,
+        expected_input_snapshot_digest: None,
     };
     let path = capability_lease_path(&lease_id)?;
     if let Some(parent) = path.parent() {
@@ -238,6 +505,9 @@ pub(crate) fn tclone_capability_cell(args: Vec<OsString>) -> io::Result<()> {
     recovery?;
     if args.first().and_then(|arg| arg.to_str()) == Some("promote") {
         return promote_capability_cell(args[1..].to_vec());
+    }
+    if args.first().and_then(|arg| arg.to_str()) == Some("replay") {
+        return replay_capability_cell(args[1..].to_vec());
     }
     let source_run_id = tclone_target_arg(
         &args,
@@ -556,7 +826,6 @@ fn validate_broker_scope_against_request(
 
 fn cell_network_plan(
     cell_id: &str,
-    cell_root: &Path,
     broker_leases: &[BrokerLease],
 ) -> io::Result<Option<CellNetworkPlan>> {
     let mut endpoints = Vec::new();
@@ -634,10 +903,7 @@ fn cell_network_plan(
     );
     let enforcement = gensee_crate_linux::plan_nftables_policy(&config);
     gensee_crate_linux::validate_nftables_plan_for_apply(&enforcement.nftables)?;
-    Ok(Some(CellNetworkPlan {
-        enforcement,
-        gate_dir: cell_root.join("network-gate"),
-    }))
+    Ok(Some(CellNetworkPlan { enforcement }))
 }
 
 impl CellNetworkGuard {
@@ -652,14 +918,6 @@ impl CellNetworkGuard {
         }
         #[cfg(target_os = "linux")]
         {
-            create_restrictive_dir_all(&plan.gate_dir)?;
-            let cgroup_path = Path::new(&plan.enforcement.cgroup.cgroup_path);
-            gensee_crate_linux::create_agent_cgroup(cgroup_path).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("cannot create capability-cell network cgroup: {error}"),
-                )
-            })?;
             let guard = Self {
                 plan,
                 table_applied: false,
@@ -669,7 +927,7 @@ impl CellNetworkGuard {
         }
     }
 
-    fn attach_and_release(&mut self, podman: &OsString, container_name: &str) -> io::Result<()> {
+    fn attach(&mut self, podman: &OsString, container_name: &str) -> io::Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (podman, container_name);
@@ -680,21 +938,6 @@ impl CellNetworkGuard {
         }
         #[cfg(target_os = "linux")]
         {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let pid = loop {
-                match super::inspect_container_pid(podman, container_name) {
-                    Ok(pid) if pid != 0 => break pid,
-                    Ok(_) | Err(_) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(CELL_POLL_INTERVAL_MS));
-                    }
-                    Ok(_) | Err(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "timed out locating gated capability-cell process",
-                        ));
-                    }
-                }
-            };
             let source_address = inspect_capability_cell_ip(podman, container_name)?;
             gensee_crate_linux::bind_nftables_plan_to_source_address(
                 &mut self.plan.enforcement.nftables,
@@ -708,17 +951,7 @@ impl CellNetworkGuard {
                     )
                 })?;
             self.table_applied = true;
-            let attached = gensee_crate_linux::attach_process_tree_to_cgroup(
-                pid,
-                Path::new(&self.plan.enforcement.cgroup.cgroup_path),
-            )?;
-            if !attached.contains(&pid) {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "capability-cell process was not attached to its network cgroup",
-                ));
-            }
-            write_atomic_nofollow(&self.plan.gate_dir.join("open"), b"open\n", 0o600)
+            Ok(())
         }
     }
 
@@ -757,12 +990,54 @@ impl CellNetworkGuard {
             )?;
             self.table_applied = false;
         }
-        gensee_crate_linux::remove_agent_cgroup(Path::new(
-            &self.plan.enforcement.cgroup.cgroup_path,
-        ))?;
         self.cleaned = true;
         Ok(())
     }
+}
+
+fn wait_for_capability_cell_pid(podman: &OsString, container_name: &str) -> io::Result<u32> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match super::inspect_container_pid(podman, container_name) {
+            Ok(pid) if pid != 0 => return Ok(pid),
+            Ok(_) | Err(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(CELL_POLL_INTERVAL_MS));
+            }
+            Ok(_) | Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out locating gated capability-cell process",
+                ));
+            }
+        }
+    }
+}
+
+fn inspect_capability_cell_merged_root(
+    podman: &OsString,
+    container_name: &str,
+) -> io::Result<PathBuf> {
+    let output = run_command_capture(
+        podman,
+        &[OsString::from("inspect"), OsString::from(container_name)],
+    )?;
+    let value: Value = serde_json::from_str(&output)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    value
+        .as_array()
+        .and_then(|containers| containers.first())
+        .and_then(|container| container.get("GraphDriver"))
+        .and_then(|driver| driver.get("Data"))
+        .and_then(|data| data.get("MergedDir"))
+        .and_then(Value::as_str)
+        .filter(|path| Path::new(path).is_absolute())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "gated capability cell has no inspectable merged root",
+            )
+        })
 }
 
 impl Drop for CellNetworkGuard {
@@ -952,11 +1227,14 @@ fn execute_capability_cell(
     let cell_root = capability_cell_path(&cell_id)?;
     let input_snapshot = cell_root.join("input");
     let snapshot = cell_root.join("output");
+    let startup_gate = cell_root.join("startup-gate");
     create_restrictive_dir_all(&input_snapshot)?;
+    create_restrictive_dir_all(&startup_gate)?;
     let _cleanup_journal_lock =
         TcloneStateLock::acquire(&capability_cell_cleanup_journal_path(&cell_id)?)?;
     let seccomp_profile = write_cell_seccomp_profile(&cell_root)?;
-    let network_plan = cell_network_plan(&cell_id, &cell_root, &broker_leases)?;
+    let network_plan = cell_network_plan(&cell_id, &broker_leases)?;
+    let mut cgroup_guard = CellCgroupGuard::activate(&cell_id)?;
     let mut cleanup_journal = CapabilityCellCleanupJournal {
         schema_version: CELL_LEASE_SCHEMA_VERSION,
         cell_id: cell_id.clone(),
@@ -966,9 +1244,7 @@ fn execute_capability_cell(
         nftables_table: network_plan
             .as_ref()
             .map(|plan| plan.enforcement.nftables.table_name.clone()),
-        cgroup_path: network_plan
-            .as_ref()
-            .map(|plan| plan.enforcement.cgroup.cgroup_path.clone()),
+        cgroup_path: Some(cgroup_guard.path.to_string_lossy().to_string()),
         state: "active".to_string(),
         cleaned_at_ms: None,
         last_error: None,
@@ -978,6 +1254,17 @@ fn execute_capability_cell(
     let podman = tclone_podman();
     let cell_supervisor = copy_cell_supervisor(&podman, source, &cell_root)?;
     copy_capability_scope(&podman, source, lease, &input_snapshot)?;
+    if let Some(expected) = lease.expected_input_snapshot_digest.as_deref() {
+        let actual = digest_cell_snapshot(&input_snapshot)?;
+        if actual != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replay input does not match the signed original snapshot: expected {expected}, observed {actual}"
+                ),
+            ));
+        }
+    }
     copy_path_all(&input_snapshot, &snapshot)?;
 
     let mut run_args = capability_cell_run_args(
@@ -988,6 +1275,7 @@ fn execute_capability_cell(
         &snapshot,
         &broker_leases,
         network_guard.as_ref().map(|guard| &guard.plan),
+        &startup_gate,
         &cell_supervisor,
         &seccomp_profile,
         unix_millis()?,
@@ -996,8 +1284,19 @@ fn execute_capability_cell(
     let cleanup = TcloneContainerCleanup::new(&podman, &container_name);
     let started_at_ms = unix_millis()?;
     let mut child = Command::new(&podman).args(&run_args).spawn()?;
+    let root_pid = wait_for_capability_cell_pid(&podman, &container_name)?;
+    let mut runtime_sensor = CellRuntimeSensor::start(
+        &podman,
+        &container_name,
+        &cell_id,
+        root_pid,
+        &input_snapshot,
+        &snapshot,
+        &source.container_workspace,
+    );
+    cgroup_guard.attach(root_pid)?;
     if let Some(guard) = network_guard.as_mut() {
-        if let Err(error) = guard.attach_and_release(&podman, &container_name) {
+        if let Err(error) = guard.attach(&podman, &container_name) {
             let _ = Command::new(&podman)
                 .args(["kill", &container_name])
                 .status();
@@ -1006,8 +1305,10 @@ fn execute_capability_cell(
             return Err(error);
         }
     }
+    write_atomic_nofollow(&startup_gate.join("open"), b"open\n", 0o600)?;
     let mut timed_out = false;
     let status = loop {
+        runtime_sensor.drain();
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -1021,8 +1322,10 @@ fn execute_capability_cell(
         }
         thread::sleep(Duration::from_millis(CELL_POLL_INTERVAL_MS));
     };
+    let runtime_evidence = runtime_sensor.finish();
     drop(cleanup);
     verify_capability_cell_terminated(&podman, &container_name)?;
+    let cgroup_cleanup_error = cgroup_guard.cleanup().err();
     let network_evidence = network_guard
         .as_mut()
         .map(CellNetworkGuard::collect_and_cleanup);
@@ -1032,7 +1335,10 @@ fn execute_capability_cell(
         Err(error) => (Vec::new(), Some(error)),
     };
     let network_cleanup_complete = network_guard.as_ref().is_none_or(|guard| guard.cleaned);
-    if network_cleanup_complete && broker_revocation_error.is_none() {
+    if network_cleanup_complete
+        && broker_revocation_error.is_none()
+        && cgroup_cleanup_error.is_none()
+    {
         cleanup_journal.state = "cleaned".to_string();
         cleanup_journal.cleaned_at_ms = Some(finished_at_ms);
         cleanup_journal.last_error = None;
@@ -1041,6 +1347,7 @@ fn execute_capability_cell(
             broker_revocation_error
                 .as_ref()
                 .map(ToString::to_string)
+                .or_else(|| cgroup_cleanup_error.as_ref().map(ToString::to_string))
                 .unwrap_or_else(|| "network cleanup incomplete".to_string()),
         );
     }
@@ -1057,6 +1364,7 @@ fn execute_capability_cell(
         timed_out,
         &broker_effect_leases,
         network_evidence.as_ref(),
+        Some(&runtime_evidence),
     )?;
     if let Some(error) = broker_revocation_error {
         manifest.violations.push(EffectViolation {
@@ -1066,11 +1374,29 @@ fn execute_capability_cell(
             observed_at_ms: finished_at_ms,
         });
     }
+    if let Some(error) = cgroup_cleanup_error {
+        manifest.violations.push(EffectViolation {
+            kind: "cgroup_cleanup_failed".to_string(),
+            resource: cgroup_guard.path.to_string_lossy().to_string(),
+            detail: error.to_string(),
+            observed_at_ms: finished_at_ms,
+        });
+    }
     let manifest_path = cell_root.join("effect-manifest.json");
     write_atomic_nofollow(
         &manifest_path,
         &serde_json::to_vec_pretty(&manifest)?,
         0o600,
+    )?;
+    persist_capability_cell_forensics(
+        source,
+        lease,
+        &cell_root,
+        &input_snapshot,
+        &snapshot,
+        &manifest,
+        &broker_leases,
+        finished_at_ms,
     )?;
     let record = CapabilityCellRecord {
         schema_version: CELL_LEASE_SCHEMA_VERSION,
@@ -1155,6 +1481,7 @@ fn capability_cell_run_args(
     output_snapshot: &Path,
     broker_leases: &[BrokerLease],
     network_plan: Option<&CellNetworkPlan>,
+    startup_gate: &Path,
     cell_supervisor: &Path,
     seccomp_profile: &Path,
     now_ms: u64,
@@ -1262,13 +1589,11 @@ fn capability_cell_run_args(
             )));
         }
     }
-    if let Some(network_plan) = network_plan {
-        args.push(OsString::from("--mount"));
-        args.push(OsString::from(format!(
-            "type=bind,source={},destination=/run/gensee-network-gate,ro",
-            network_plan.gate_dir.display()
-        )));
-    }
+    args.push(OsString::from("--mount"));
+    args.push(OsString::from(format!(
+        "type=bind,source={},destination=/run/gensee-startup-gate,ro",
+        startup_gate.display()
+    )));
     let supervisor_path = cell_supervisor.to_string_lossy();
     if supervisor_path.contains(',')
         || supervisor_path.contains('\n')
@@ -1286,10 +1611,8 @@ fn capability_cell_run_args(
     )));
     args.push(OsString::from(&source.image));
     args.push(OsString::from("__cell-landlock-exec"));
-    if network_plan.is_some() {
-        args.push(OsString::from("--gate"));
-        args.push(OsString::from("/run/gensee-network-gate/open"));
-    }
+    args.push(OsString::from("--gate"));
+    args.push(OsString::from("/run/gensee-startup-gate/open"));
     for path in effective_write_paths(&lease.request) {
         args.push(OsString::from("--write-path"));
         args.push(OsString::from(container_scope_path(
@@ -1445,7 +1768,7 @@ fn add_scope_mount(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CellSnapshotEntry {
     kind: FileEntryKind,
     digest: Option<String>,
@@ -1466,6 +1789,7 @@ fn build_effect_manifest(
     timed_out: bool,
     broker_leases: &[BrokerLease],
     network_evidence: Option<&CellNetworkEvidence>,
+    runtime_evidence: Option<&CellRuntimeEvidence>,
 ) -> io::Result<EffectManifest> {
     let before = collect_cell_snapshot(input_snapshot)?;
     let after = collect_cell_snapshot(output_snapshot)?;
@@ -1655,6 +1979,14 @@ fn build_effect_manifest(
             observed_at_ms: finished_at_ms,
         });
     }
+    if let Some(error) = runtime_evidence.and_then(|evidence| evidence.collection_error.as_ref()) {
+        violations.push(EffectViolation {
+            kind: "runtime_effect_telemetry_incomplete".to_string(),
+            resource: cell_id.to_string(),
+            detail: error.clone(),
+            observed_at_ms: finished_at_ms,
+        });
+    }
     if !network_connections.is_empty()
         && lease
             .request
@@ -1691,6 +2023,36 @@ fn build_effect_manifest(
     }
     let argv = serde_json::to_vec(&lease.command)?;
     let argv_digest = format!("sha256:{:x}", Sha256::digest(argv));
+    let files_read = runtime_evidence
+        .map(|evidence| evidence.files_read.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !files_read.is_empty() && !capabilities_used.contains(&Capability::FilesystemRead) {
+        capabilities_used.push(Capability::FilesystemRead);
+    }
+    let mut processes_started = runtime_evidence
+        .map(|evidence| evidence.processes_started.clone())
+        .unwrap_or_default();
+    if !processes_started
+        .iter()
+        .any(|process| process.executable == lease.command[0] && process.argv_digest == argv_digest)
+    {
+        processes_started.insert(
+            0,
+            ProcessEffect {
+                executable: lease.command[0].clone(),
+                argv_digest,
+                pid: None,
+                started_at_ms,
+                finished_at_ms: Some(finished_at_ms),
+                exit_code,
+            },
+        );
+    }
+    let runtime_coverage = match runtime_evidence {
+        Some(evidence) if evidence.collection_error.is_none() => TelemetryCoverage::Complete,
+        Some(_) => TelemetryCoverage::Partial,
+        None => TelemetryCoverage::Unavailable,
+    };
 
     let network_coverage = match network_evidence {
         Some(evidence) if evidence.collection_error.is_none() => TelemetryCoverage::Complete,
@@ -1710,24 +2072,17 @@ fn build_effect_manifest(
         cell_id: cell_id.to_string(),
         requested_capabilities: lease.request.capabilities.clone(),
         capabilities_used,
-        files_read: Vec::new(),
+        files_read,
         files_changed,
         network_connections,
         external_requests,
         secrets_accessed,
-        processes_started: vec![ProcessEffect {
-            executable: lease.command[0].clone(),
-            argv_digest,
-            pid: None,
-            started_at_ms,
-            finished_at_ms: Some(finished_at_ms),
-            exit_code,
-        }],
+        processes_started,
         outputs_proposed_for_promotion: outputs,
         promotions: Vec::new(),
         violations,
         telemetry_coverage: EffectTelemetryCoverage {
-            filesystem_reads: TelemetryCoverage::Unavailable,
+            filesystem_reads: runtime_coverage,
             filesystem_writes: TelemetryCoverage::Complete,
             network_connections: network_coverage,
             external_requests: broker_coverage_for_capabilities(
@@ -1750,7 +2105,7 @@ fn build_effect_manifest(
                 broker_telemetry_required,
                 broker_telemetry_complete,
             ),
-            process_tree: TelemetryCoverage::Partial,
+            process_tree: runtime_coverage,
         },
         started_at_ms,
         finished_at_ms,
@@ -1778,6 +2133,122 @@ fn broker_coverage_for_capabilities(
     } else {
         TelemetryCoverage::Unavailable
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_capability_cell_forensics(
+    source: &TcloneRunRecord,
+    lease: &CapabilityCellLease,
+    cell_root: &Path,
+    input_snapshot: &Path,
+    output_snapshot: &Path,
+    manifest: &EffectManifest,
+    broker_leases: &[BrokerLease],
+    created_at_ms: u64,
+) -> io::Result<()> {
+    let input_snapshot_digest = digest_cell_snapshot(input_snapshot)?;
+    let output_snapshot_digest = digest_cell_snapshot(output_snapshot)?;
+    let manifest_digest = effect_manifest_evidence_digest(manifest)?;
+    let mut required_broker_resources = Vec::new();
+    for lease in broker_leases {
+        if !required_broker_resources.contains(&lease.resource_kind) {
+            required_broker_resources.push(lease.resource_kind);
+        }
+    }
+    let replay_plan = CapabilityCellReplayPlan {
+        schema_version: CELL_FORENSICS_SCHEMA_VERSION,
+        original_cell_id: lease.cell_id.clone(),
+        original_operation_id: lease.operation_id.clone(),
+        original_source_run_id: source.run_id.clone(),
+        request: lease.request.clone(),
+        command: lease.command.clone(),
+        input_snapshot_digest: input_snapshot_digest.clone(),
+        manifest_digest: manifest_digest.clone(),
+        required_broker_resources,
+        created_at_ms,
+    };
+    let replay_path = cell_root.join("replay-plan.json");
+    write_atomic_nofollow(
+        &replay_path,
+        &serde_json::to_vec_pretty(&replay_plan)?,
+        0o600,
+    )?;
+    let claims = CapabilityCellForensicsClaims {
+        schema_version: CELL_FORENSICS_SCHEMA_VERSION,
+        operation_id: lease.operation_id.clone(),
+        cell_id: lease.cell_id.clone(),
+        lease_id: lease.lease_id.clone(),
+        source_run_id: source.run_id.clone(),
+        request_digest: digest_serialized(&lease.request)?,
+        command_digest: digest_serialized(&lease.command)?,
+        input_snapshot_digest,
+        output_snapshot_digest,
+        manifest_digest,
+        replay_plan_digest: digest_serialized(&replay_plan)?,
+        created_at_ms,
+    };
+    let signature = super::capability_broker::sign_host_evidence(
+        CELL_FORENSICS_SIGNATURE_DOMAIN,
+        &serde_json::to_vec(&claims)?,
+    )?;
+    let evidence = CapabilityCellForensicsEvidence { claims, signature };
+    write_atomic_nofollow(
+        &cell_root.join("forensics-evidence.json"),
+        &serde_json::to_vec_pretty(&evidence)?,
+        0o600,
+    )?;
+    write_atomic_nofollow(
+        &cell_root.join("promotion-ledger.json"),
+        &serde_json::to_vec_pretty(&Vec::<SignedPromotionReceipt>::new())?,
+        0o600,
+    )
+}
+
+fn verify_capability_cell_forensics(
+    record: &CapabilityCellRecord,
+    manifest: &EffectManifest,
+    cell_root: &Path,
+) -> io::Result<(CapabilityCellForensicsEvidence, CapabilityCellReplayPlan)> {
+    let evidence: CapabilityCellForensicsEvidence = serde_json::from_str(&read_nofollow_to_string(
+        &cell_root.join("forensics-evidence.json"),
+    )?)
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let replay_plan: CapabilityCellReplayPlan = serde_json::from_str(&read_nofollow_to_string(
+        &cell_root.join("replay-plan.json"),
+    )?)
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    super::capability_broker::verify_host_evidence(
+        CELL_FORENSICS_SIGNATURE_DOMAIN,
+        &serde_json::to_vec(&evidence.claims)?,
+        &evidence.signature,
+    )?;
+    let claims = &evidence.claims;
+    if claims.schema_version != CELL_FORENSICS_SCHEMA_VERSION
+        || replay_plan.schema_version != CELL_FORENSICS_SCHEMA_VERSION
+        || claims.operation_id != record.operation_id
+        || claims.cell_id != record.cell_id
+        || claims.lease_id != record.lease_id
+        || claims.source_run_id != record.source_run_id
+        || replay_plan.original_cell_id != record.cell_id
+        || replay_plan.original_operation_id != record.operation_id
+        || replay_plan.original_source_run_id != record.source_run_id
+        || replay_plan.request != record.request
+        || replay_plan.command != record.command
+        || claims.request_digest != digest_serialized(&record.request)?
+        || claims.command_digest != digest_serialized(&record.command)?
+        || claims.input_snapshot_digest != digest_cell_snapshot(&cell_root.join("input"))?
+        || claims.output_snapshot_digest != digest_cell_snapshot(&cell_root.join("output"))?
+        || claims.manifest_digest != effect_manifest_evidence_digest(manifest)?
+        || claims.replay_plan_digest != digest_serialized(&replay_plan)?
+        || replay_plan.input_snapshot_digest != claims.input_snapshot_digest
+        || replay_plan.manifest_digest != claims.manifest_digest
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "capability-cell forensic evidence does not match its signed record, snapshots, manifest, or replay plan",
+        ));
+    }
+    Ok((evidence, replay_plan))
 }
 
 fn diff_cell_snapshots(
@@ -1897,10 +2368,186 @@ fn digest_cell_file(path: &Path) -> io::Result<String> {
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
+fn digest_serialized<T: serde::Serialize>(value: &T) -> io::Result<String> {
+    Ok(format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(value)?)
+    ))
+}
+
+fn digest_cell_snapshot(root: &Path) -> io::Result<String> {
+    digest_serialized(&collect_cell_snapshot(root)?)
+}
+
+fn effect_manifest_evidence_digest(manifest: &EffectManifest) -> io::Result<String> {
+    let mut immutable = manifest.clone();
+    immutable.promotions.clear();
+    digest_serialized(&immutable)
+}
+
 fn path_is_in_scopes(path: &str, scopes: &[String]) -> bool {
     scopes
         .iter()
         .any(|scope| scope == "." || path == scope || path.starts_with(&format!("{scope}/")))
+}
+
+fn replay_capability_cell(args: Vec<OsString>) -> io::Result<()> {
+    if env::var_os("GENSEE_TCLONE_HOST_CONTROL_CALLER").is_some()
+        || env::var_os(TCLONE_HOST_CONTROL_SOCKET_ENV).is_some()
+        || env::var_os(TCLONE_HOST_CONTROL_DIR_ENV).is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cell replay is host-only and cannot be requested through the agent bridge",
+        ));
+    }
+    let usage = "usage: gensee run cell replay <cell-id> --source <running-source-id> [--ttl-seconds N] [--json]";
+    let original_cell_id = tclone_target_arg(&args, usage)?;
+    let source_run_id = arg_value(&args, "--source")
+        .filter(|value| tclone_is_safe_token(value))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, usage))?;
+    let source = find_tclone_record(&source_run_id)?;
+    if source.role != "source" || source.status != "running" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cell replay requires a running tclone source",
+        ));
+    }
+    let original_root = capability_cell_path(&original_cell_id)?;
+    let original_record: CapabilityCellRecord = serde_json::from_str(&read_nofollow_to_string(
+        &original_root.join("record.json"),
+    )?)
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let original_manifest: EffectManifest = serde_json::from_str(&read_nofollow_to_string(
+        &original_root.join("effect-manifest.json"),
+    )?)
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let (_, replay_plan) =
+        verify_capability_cell_forensics(&original_record, &original_manifest, &original_root)?;
+    validate_cell_request_for_issue(&replay_plan.request)?;
+    let ttl_seconds = arg_value(&args, "--ttl-seconds")
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid --ttl-seconds value")
+            })
+        })
+        .transpose()?
+        .unwrap_or(replay_plan.request.lease_ttl_seconds)
+        .min(replay_plan.request.lease_ttl_seconds)
+        .min(CELL_LEASE_MAX_TTL_SECONDS);
+    if ttl_seconds == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replay lease TTL must be positive",
+        ));
+    }
+    let issued_at_ms = unix_millis()?;
+    let lease_id = format!("lease_{}", Uuid::new_v4().simple());
+    let cell_id = format!("cell_{}", Uuid::new_v4().simple());
+    let lease = CapabilityCellLease {
+        schema_version: CELL_LEASE_SCHEMA_VERSION,
+        lease_id: lease_id.clone(),
+        operation_id: format!("op_{}", Uuid::new_v4().simple()),
+        cell_id: cell_id.clone(),
+        source_run_id: source.run_id.clone(),
+        request: replay_plan.request.clone(),
+        command: replay_plan.command.clone(),
+        issued_at_ms,
+        expires_at_ms: issued_at_ms.saturating_add(ttl_seconds.saturating_mul(1_000)),
+        consumed_at_ms: None,
+        broker_lease_ids: Vec::new(),
+        replay_of_cell_id: Some(original_cell_id.clone()),
+        expected_input_snapshot_digest: Some(replay_plan.input_snapshot_digest.clone()),
+    };
+    let path = capability_lease_path(&lease_id)?;
+    if let Some(parent) = path.parent() {
+        create_restrictive_dir_all(parent)?;
+    }
+    write_atomic_nofollow(&path, &serde_json::to_vec_pretty(&lease)?, 0o600)?;
+    write_atomic_nofollow(
+        &capability_cell_binding_path(&cell_id)?,
+        format!("{lease_id}\n").as_bytes(),
+        0o600,
+    )?;
+    let result = json!({
+        "lease_id": lease_id,
+        "operation_id": lease.operation_id,
+        "cell_id": cell_id,
+        "source_run_id": source.run_id,
+        "replay_of_cell_id": original_cell_id,
+        "expected_input_snapshot_digest": replay_plan.input_snapshot_digest,
+        "required_broker_resources": replay_plan.required_broker_resources,
+        "expires_at_ms": lease.expires_at_ms,
+    });
+    if args.iter().any(|arg| arg == "--json") {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "issued replay lease {} for cell {}",
+            lease.lease_id, lease.cell_id
+        );
+        println!("the source snapshot must match the signed original input exactly");
+        if !replay_plan.required_broker_resources.is_empty() {
+            println!(
+                "attach fresh broker leases for: {:?}",
+                replay_plan.required_broker_resources
+            );
+        }
+        println!(
+            "execute with: gensee run cell {} --lease {}",
+            lease.source_run_id, lease.lease_id
+        );
+    }
+    Ok(())
+}
+
+fn load_verified_promotion_ledger(
+    cell_root: &Path,
+    cell_id: &str,
+) -> io::Result<Vec<SignedPromotionReceipt>> {
+    let ledger: Vec<SignedPromotionReceipt> = serde_json::from_str(&read_nofollow_to_string(
+        &cell_root.join("promotion-ledger.json"),
+    )?)
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    for signed in &ledger {
+        if signed.claims.schema_version != CELL_FORENSICS_SCHEMA_VERSION
+            || signed.claims.cell_id != cell_id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "promotion ledger contains a receipt for another cell or schema",
+            ));
+        }
+        super::capability_broker::verify_host_evidence(
+            CELL_PROMOTION_SIGNATURE_DOMAIN,
+            &serde_json::to_vec(&signed.claims)?,
+            &signed.signature,
+        )?;
+    }
+    Ok(ledger)
+}
+
+fn append_signed_promotion_receipt(
+    cell_root: &Path,
+    cell_id: &str,
+    receipt: PromotionReceipt,
+) -> io::Result<()> {
+    let mut ledger = load_verified_promotion_ledger(cell_root, cell_id)?;
+    let claims = CapabilityCellPromotionClaims {
+        schema_version: CELL_FORENSICS_SCHEMA_VERSION,
+        cell_id: cell_id.to_string(),
+        receipt,
+    };
+    let signature = super::capability_broker::sign_host_evidence(
+        CELL_PROMOTION_SIGNATURE_DOMAIN,
+        &serde_json::to_vec(&claims)?,
+    )?;
+    ledger.push(SignedPromotionReceipt { claims, signature });
+    write_atomic_nofollow(
+        &cell_root.join("promotion-ledger.json"),
+        &serde_json::to_vec_pretty(&ledger)?,
+        0o600,
+    )
 }
 
 fn promote_capability_cell(args: Vec<OsString>) -> io::Result<()> {
@@ -1936,6 +2583,7 @@ fn promote_capability_cell(args: Vec<OsString>) -> io::Result<()> {
         serde_json::from_str(&read_nofollow_to_string(&manifest_path)?)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     validate_promotion_evidence(&record, &manifest, &cell_id, &source_run_id, &cell_root)?;
+    let promotion_ledger = load_verified_promotion_ledger(&cell_root, &cell_id)?;
 
     let mut selected = manifest
         .outputs_proposed_for_promotion
@@ -1956,8 +2604,8 @@ fn promote_capability_cell(args: Vec<OsString>) -> io::Result<()> {
             ));
         }
     }
-    if manifest.promotions.iter().any(|receipt| {
-        receipt.paths.iter().any(|promoted| {
+    if promotion_ledger.iter().any(|signed| {
+        signed.claims.receipt.paths.iter().any(|promoted| {
             selected.iter().any(|output| {
                 promoted == &output.path
                     || promoted.starts_with(&format!("{}/", output.path))
@@ -1995,13 +2643,15 @@ fn promote_capability_cell(args: Vec<OsString>) -> io::Result<()> {
     let promotion_id = format!("promotion_{}", Uuid::new_v4().simple());
     if !dry_run {
         apply_tclone_overlay_merge(&podman, &source, &plan)?;
-        manifest.promotions.push(PromotionReceipt {
+        let receipt = PromotionReceipt {
             promotion_id: promotion_id.clone(),
             source_run_id: source.run_id.clone(),
             paths: selected.iter().map(|output| output.path.clone()).collect(),
             promoted_at_ms: unix_millis()?,
             approval_token_id: None,
-        });
+        };
+        append_signed_promotion_receipt(&cell_root, &cell_id, receipt.clone())?;
+        manifest.promotions.push(receipt);
         write_atomic_nofollow(
             &manifest_path,
             &serde_json::to_vec_pretty(&manifest)?,
@@ -2086,6 +2736,7 @@ fn validate_promotion_evidence(
     source_run_id: &str,
     cell_root: &Path,
 ) -> io::Result<()> {
+    verify_capability_cell_forensics(record, manifest, cell_root)?;
     if record.cell_id != cell_id
         || manifest.cell_id != cell_id
         || record.operation_id != manifest.operation_id
@@ -2102,12 +2753,12 @@ fn validate_promotion_evidence(
         ));
     }
     if !record.request.inspect_before_commit
-        || manifest.telemetry_coverage.filesystem_writes != TelemetryCoverage::Complete
+        || !promotion_telemetry_is_complete(&record.request, &manifest.telemetry_coverage)
         || !manifest.violations.is_empty()
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "promotion requires inspect-before-commit, complete write telemetry, and zero violations",
+            "promotion requires inspect-before-commit, complete relevant effect telemetry, authenticated evidence, and zero violations",
         ));
     }
     let actual_before = collect_cell_snapshot(&cell_root.join("input"))?;
@@ -2136,6 +2787,35 @@ fn validate_promotion_evidence(
         ));
     }
     Ok(())
+}
+
+fn promotion_telemetry_is_complete(
+    request: &CapabilityRequest,
+    coverage: &EffectTelemetryCoverage,
+) -> bool {
+    coverage.process_tree == TelemetryCoverage::Complete
+        && (!request.capabilities.contains(&Capability::FilesystemRead)
+            || coverage.filesystem_reads == TelemetryCoverage::Complete)
+        && (!request.capabilities.contains(&Capability::FilesystemWrite)
+            || coverage.filesystem_writes == TelemetryCoverage::Complete)
+        && (!request.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::NetworkEgress | Capability::NetworkListen
+            )
+        }) || coverage.network_connections == TelemetryCoverage::Complete)
+        && (!request.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::ExternalApplication | Capability::CloudIam | Capability::DatabaseAccess
+            )
+        }) || coverage.external_requests == TelemetryCoverage::Complete)
+        && (!request.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::SecretUse | Capability::IdentityUse | Capability::WorkloadIdentity
+            )
+        }) || coverage.secret_accesses == TelemetryCoverage::Complete)
 }
 
 fn build_cell_promotion_plan(
@@ -2359,38 +3039,42 @@ fn inspect_capability_cell(args: Vec<OsString>) -> io::Result<()> {
     let cell_path = capability_cell_path(&cell_id)?;
     let record = read_nofollow_to_string(&cell_path.join("record.json"))?;
     let manifest = read_nofollow_to_string(&cell_path.join("effect-manifest.json"))?;
+    let parsed_record: CapabilityCellRecord = serde_json::from_str(&record)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let parsed_manifest: EffectManifest = serde_json::from_str(&manifest)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let (forensics, replay_plan) =
+        verify_capability_cell_forensics(&parsed_record, &parsed_manifest, &cell_path)?;
+    let promotion_ledger = load_verified_promotion_ledger(&cell_path, &cell_id)?;
     if args.iter().any(|arg| arg == "--json") {
-        let record: serde_json::Value = serde_json::from_str(&record)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let manifest: EffectManifest = serde_json::from_str(&manifest)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "record": record,
-                "effect_manifest": manifest,
+                "record": parsed_record,
+                "effect_manifest": parsed_manifest,
+                "forensics_evidence": forensics,
+                "replay_plan": replay_plan,
+                "promotion_ledger": promotion_ledger,
             }))?
         );
     } else {
-        let parsed: CapabilityCellRecord = serde_json::from_str(&record)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let manifest: EffectManifest = serde_json::from_str(&manifest)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        println!("cell: {}", parsed.cell_id);
-        println!("source: {}", parsed.source_run_id);
-        println!("lease: {}", parsed.lease_id);
+        println!("cell: {}", parsed_record.cell_id);
+        println!("source: {}", parsed_record.source_run_id);
+        println!("lease: {}", parsed_record.lease_id);
         println!(
             "exit: {:?} timed_out={}",
-            parsed.exit_code, parsed.timed_out
+            parsed_record.exit_code, parsed_record.timed_out
         );
-        println!("snapshot: {}", parsed.workspace_snapshot);
-        println!("manifest: {}", parsed.effect_manifest);
+        println!("snapshot: {}", parsed_record.workspace_snapshot);
+        println!("manifest: {}", parsed_record.effect_manifest);
+        println!("forensics signature: verified");
         println!(
             "effects: {} changed path(s), {} promotion proposal(s), {} violation(s)",
-            manifest.files_changed.len(),
-            manifest.outputs_proposed_for_promotion.len(),
-            manifest.violations.len()
+            parsed_manifest.files_changed.len(),
+            parsed_manifest.outputs_proposed_for_promotion.len(),
+            parsed_manifest.violations.len()
         );
+        println!("signed promotions: {}", promotion_ledger.len());
     }
     Ok(())
 }
@@ -2879,6 +3563,8 @@ mod tests {
             expires_at_ms: 200,
             consumed_at_ms: None,
             broker_lease_ids: Vec::new(),
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
         };
         let path = capability_lease_path(&lease.lease_id).unwrap();
         create_restrictive_dir_all(path.parent().unwrap()).unwrap();
@@ -2914,6 +3600,8 @@ mod tests {
             expires_at_ms: 200,
             consumed_at_ms: None,
             broker_lease_ids: Vec::new(),
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
         };
         let path = capability_lease_path(&lease.lease_id).unwrap();
         create_restrictive_dir_all(path.parent().unwrap()).unwrap();
@@ -3001,6 +3689,8 @@ mod tests {
             expires_at_ms: 300,
             consumed_at_ms: None,
             broker_lease_ids: vec!["broker_gateway".to_string()],
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
         };
         let broker_lease = BrokerLease {
             protocol_version: gensee_crate_rules::capability_broker::BROKER_PROTOCOL_VERSION,
@@ -3049,6 +3739,7 @@ mod tests {
             std::slice::from_ref(&broker_lease),
             None,
             &root,
+            &root,
             &root.join("seccomp.json"),
             150,
         )
@@ -3091,6 +3782,7 @@ mod tests {
             false,
             &[revoked],
             None,
+            None,
         )
         .unwrap();
         assert!(manifest
@@ -3126,6 +3818,8 @@ mod tests {
             expires_at_ms: 2,
             consumed_at_ms: Some(1),
             broker_lease_ids: Vec::new(),
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
         };
         let source = source_record();
 
@@ -3137,6 +3831,7 @@ mod tests {
             &root,
             &[],
             None,
+            &root,
             &root,
             &root,
             1,
@@ -3161,6 +3856,9 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--entrypoint", "/run/gensee-cell-supervisor"]));
         assert!(rendered.iter().any(|arg| arg == "__cell-landlock-exec"));
+        assert!(rendered
+            .windows(2)
+            .any(|pair| pair == ["--gate", "/run/gensee-startup-gate/open"]));
         assert!(rendered
             .windows(2)
             .any(|pair| pair == ["--write-path", "/workspace/Cargo.lock"]));
@@ -3239,6 +3937,8 @@ mod tests {
             expires_at_ms: 2,
             consumed_at_ms: Some(1),
             broker_lease_ids: vec!["broker_network".to_string()],
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
         };
         let broker = BrokerLease {
             protocol_version: gensee_crate_rules::capability_broker::BROKER_PROTOCOL_VERSION,
@@ -3281,7 +3981,7 @@ mod tests {
                 .len(),
             1
         );
-        let mut plan = cell_network_plan("cell_network", &root, std::slice::from_ref(&broker))
+        let mut plan = cell_network_plan("cell_network", std::slice::from_ref(&broker))
             .unwrap()
             .unwrap();
         gensee_crate_linux::bind_nftables_plan_to_source_address(
@@ -3302,6 +4002,7 @@ mod tests {
             std::slice::from_ref(&broker),
             Some(&plan),
             &root,
+            &root,
             &root.join("seccomp.json"),
             1,
         )
@@ -3318,10 +4019,10 @@ mod tests {
             .any(|pair| pair == ["--entrypoint", "/run/gensee-cell-supervisor"]));
         assert!(rendered
             .iter()
-            .any(|arg| { arg.contains("destination=/run/gensee-network-gate,ro") }));
+            .any(|arg| { arg.contains("destination=/run/gensee-startup-gate,ro") }));
         assert!(rendered
             .windows(2)
-            .any(|pair| pair == ["--gate", "/run/gensee-network-gate/open"]));
+            .any(|pair| pair == ["--gate", "/run/gensee-startup-gate/open"]));
 
         let input = root.join("input");
         let output = root.join("output");
@@ -3352,6 +4053,7 @@ mod tests {
             false,
             std::slice::from_ref(&broker),
             Some(&evidence),
+            None,
         )
         .unwrap();
         assert_eq!(manifest.network_connections.len(), 1);
@@ -3462,6 +4164,8 @@ mod tests {
             expires_at_ms: 2,
             consumed_at_ms: Some(1),
             broker_lease_ids: Vec::new(),
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
         };
 
         let manifest = build_effect_manifest(
@@ -3475,6 +4179,7 @@ mod tests {
             Some(0),
             false,
             &[],
+            None,
             None,
         )
         .unwrap();
@@ -3506,8 +4211,75 @@ mod tests {
     }
 
     #[test]
+    fn manifest_records_complete_runtime_sensor_evidence() {
+        let root = env::temp_dir().join(format!("gensee-cell-runtime-{}", Uuid::new_v4()));
+        let input = root.join("input");
+        let output = root.join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(input.join("Cargo.toml"), "[package]").unwrap();
+        fs::write(output.join("Cargo.toml"), "[package]").unwrap();
+        let lease = CapabilityCellLease {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            lease_id: "lease_runtime".to_string(),
+            operation_id: "op_runtime".to_string(),
+            cell_id: "cell_runtime".to_string(),
+            source_run_id: "run_1".to_string(),
+            request: request(),
+            command: vec!["cargo".to_string(), "check".to_string()],
+            issued_at_ms: 1,
+            expires_at_ms: 2,
+            consumed_at_ms: Some(1),
+            broker_lease_ids: Vec::new(),
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
+        };
+        let mut runtime = CellRuntimeEvidence::default();
+        runtime.files_read.insert("Cargo.toml".to_string());
+        runtime.processes_started.push(ProcessEffect {
+            executable: "/usr/bin/cargo".to_string(),
+            argv_digest: format!("sha256:{}", "a".repeat(64)),
+            pid: Some(42),
+            started_at_ms: 10,
+            finished_at_ms: None,
+            exit_code: None,
+        });
+        let manifest = build_effect_manifest(
+            &source_record(),
+            &lease,
+            "cell_runtime",
+            &input,
+            &output,
+            10,
+            20,
+            Some(0),
+            false,
+            &[],
+            None,
+            Some(&runtime),
+        )
+        .unwrap();
+        assert_eq!(manifest.files_read, vec!["Cargo.toml"]);
+        assert!(manifest
+            .processes_started
+            .iter()
+            .any(|process| process.pid == Some(42)));
+        assert_eq!(
+            manifest.telemetry_coverage.filesystem_reads,
+            TelemetryCoverage::Complete
+        );
+        assert_eq!(
+            manifest.telemetry_coverage.process_tree,
+            TelemetryCoverage::Complete
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn promotion_evidence_rejects_tampering_and_incomplete_telemetry() {
+        let _guard = crate::cli_test_env_lock();
         let root = env::temp_dir().join(format!("gensee-cell-promotion-{}", Uuid::new_v4()));
+        env::set_var("GENSEE_HOME", root.join("state"));
         let input = root.join("input");
         let output = root.join("output");
         fs::create_dir_all(&input).unwrap();
@@ -3526,8 +4298,10 @@ mod tests {
             expires_at_ms: 2,
             consumed_at_ms: Some(1),
             broker_lease_ids: Vec::new(),
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
         };
-        let manifest = build_effect_manifest(
+        let mut manifest = build_effect_manifest(
             &source_record(),
             &lease,
             "cell_1",
@@ -3539,6 +4313,20 @@ mod tests {
             false,
             &[],
             None,
+            None,
+        )
+        .unwrap();
+        manifest.telemetry_coverage.filesystem_reads = TelemetryCoverage::Complete;
+        manifest.telemetry_coverage.process_tree = TelemetryCoverage::Complete;
+        persist_capability_cell_forensics(
+            &source_record(),
+            &lease,
+            &root,
+            &input,
+            &output,
+            &manifest,
+            &[],
+            20,
         )
         .unwrap();
         let record = CapabilityCellRecord {
@@ -3547,8 +4335,8 @@ mod tests {
             cell_id: "cell_1".to_string(),
             lease_id: "lease_1".to_string(),
             source_run_id: "run_1".to_string(),
-            request: lease.request,
-            command: lease.command,
+            request: lease.request.clone(),
+            command: lease.command.clone(),
             broker_lease_ids: Vec::new(),
             container_name: "cell".to_string(),
             input_snapshot: input.to_string_lossy().to_string(),
@@ -3567,6 +4355,17 @@ mod tests {
 
         let mut incomplete = manifest.clone();
         incomplete.telemetry_coverage.filesystem_writes = TelemetryCoverage::Partial;
+        persist_capability_cell_forensics(
+            &source_record(),
+            &lease,
+            &root,
+            &input,
+            &output,
+            &incomplete,
+            &[],
+            20,
+        )
+        .unwrap();
         assert_eq!(
             validate_promotion_evidence(&record, &incomplete, "cell_1", "run_1", &root)
                 .unwrap_err()
@@ -3574,13 +4373,81 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
 
+        persist_capability_cell_forensics(
+            &source_record(),
+            &lease,
+            &root,
+            &input,
+            &output,
+            &manifest,
+            &[],
+            20,
+        )
+        .unwrap();
+        let mut altered_manifest = manifest.clone();
+        altered_manifest.files_read.push("invented.txt".to_string());
+        assert_eq!(
+            validate_promotion_evidence(&record, &altered_manifest, "cell_1", "run_1", &root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let mut replay: CapabilityCellReplayPlan =
+            serde_json::from_str(&fs::read_to_string(root.join("replay-plan.json")).unwrap())
+                .unwrap();
+        replay.command.push("--tampered".to_string());
+        write_atomic_nofollow(
+            &root.join("replay-plan.json"),
+            &serde_json::to_vec_pretty(&replay).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_promotion_evidence(&record, &manifest, "cell_1", "run_1", &root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        persist_capability_cell_forensics(
+            &source_record(),
+            &lease,
+            &root,
+            &input,
+            &output,
+            &manifest,
+            &[],
+            20,
+        )
+        .unwrap();
+        append_signed_promotion_receipt(
+            &root,
+            "cell_1",
+            PromotionReceipt {
+                promotion_id: "promotion_1".to_string(),
+                source_run_id: "run_1".to_string(),
+                paths: vec!["Cargo.lock".to_string()],
+                promoted_at_ms: 21,
+                approval_token_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load_verified_promotion_ledger(&root, "cell_1")
+                .unwrap()
+                .len(),
+            1
+        );
+
         fs::write(output.join("Cargo.lock"), "tampered").unwrap();
         assert_eq!(
             validate_promotion_evidence(&record, &manifest, "cell_1", "run_1", &root)
                 .unwrap_err()
                 .kind(),
-            io::ErrorKind::InvalidData
+            io::ErrorKind::PermissionDenied
         );
+        env::remove_var("GENSEE_HOME");
         fs::remove_dir_all(root).ok();
     }
 
@@ -3608,6 +4475,8 @@ mod tests {
             expires_at_ms: 2,
             consumed_at_ms: Some(1),
             broker_lease_ids: Vec::new(),
+            replay_of_cell_id: None,
+            expected_input_snapshot_digest: None,
         };
         let manifest = build_effect_manifest(
             &source_record(),
@@ -3620,6 +4489,7 @@ mod tests {
             Some(0),
             false,
             &[],
+            None,
             None,
         )
         .unwrap();

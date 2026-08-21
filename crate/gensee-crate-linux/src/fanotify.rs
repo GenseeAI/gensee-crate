@@ -6,6 +6,8 @@ use crate::session::LinuxSessionTarget;
 pub struct LinuxFanotifyConfig {
     pub policy: LinuxPolicy,
     pub session: Option<LinuxSessionTarget>,
+    /// Filesystems to observe in full. Events are still filtered to `session`.
+    pub filesystem_marks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -19,6 +21,7 @@ pub struct LinuxFanotifyStatus {
 pub struct LinuxFanotifyEvent {
     pub request: LinuxEnforcementRequest,
     pub decision: LinuxEnforcementDecision,
+    pub executable_open: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -38,6 +41,7 @@ impl LinuxFanotifyConfig {
         Self {
             policy,
             session: None,
+            filesystem_marks: Vec::new(),
         }
     }
 
@@ -45,6 +49,21 @@ impl LinuxFanotifyConfig {
         Self {
             policy,
             session: Some(session),
+            filesystem_marks: Vec::new(),
+        }
+    }
+
+    pub fn with_session_filesystem_audit(
+        mut policy: LinuxPolicy,
+        session: LinuxSessionTarget,
+        filesystem_marks: Vec<String>,
+    ) -> Self {
+        policy.mode = crate::policy::LinuxEnforcementMode::Monitor;
+        policy.sensitive_paths.clear();
+        Self {
+            policy,
+            session: Some(session),
+            filesystem_marks,
         }
     }
 }
@@ -212,6 +231,21 @@ mod platform {
                         .push(format!("fanotify mark failed for {}: {error}", mark.path)),
                 }
             }
+            for mark in &config.filesystem_marks {
+                let path = Path::new(mark);
+                if !path.exists() {
+                    setup_warnings.push(format!(
+                        "fanotify filesystem mark skipped because path does not exist: {mark}"
+                    ));
+                    continue;
+                }
+                match add_filesystem_mark(fd, path) {
+                    Ok(()) => marked_paths.push(mark.clone()),
+                    Err(error) => setup_warnings.push(format!(
+                        "fanotify filesystem mark failed for {mark}: {error}"
+                    )),
+                }
+            }
 
             Ok(Self {
                 fd,
@@ -251,7 +285,13 @@ mod platform {
                 if offset + event_len > read_len {
                     break;
                 }
+                if metadata.mask & FAN_Q_OVERFLOW != 0 {
+                    return Err(io::Error::other(
+                        "fanotify queue overflowed; effect coverage is incomplete",
+                    ));
+                }
                 if metadata.fd >= 0 {
+                    let executable_open = metadata.mask & FAN_OPEN_EXEC_PERM != 0;
                     let operation = operation_from_event(metadata.mask, metadata.fd);
                     let request = request_from_event(metadata.fd, metadata.pid as u32, operation);
                     if !self.event_belongs_to_session(metadata.pid as u32) {
@@ -277,7 +317,11 @@ mod platform {
                         offset += event_len;
                         continue;
                     }
-                    handled.push(LinuxFanotifyEvent { request, decision });
+                    handled.push(LinuxFanotifyEvent {
+                        request,
+                        decision,
+                        executable_open,
+                    });
                 }
                 offset += event_len;
             }
@@ -359,6 +403,14 @@ mod platform {
         } else {
             Ok(())
         }
+    }
+
+    fn add_filesystem_mark(fd: RawFd, path: &Path) -> io::Result<()> {
+        let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "fanotify path contains NUL")
+        })?;
+        let mask = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN_OPEN_EXEC_PERM;
+        fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, mask, &path)
     }
 
     fn read_fanotify(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
@@ -445,11 +497,13 @@ mod platform {
     const FAN_OPEN_PERM: u64 = 0x0001_0000;
     const FAN_OPEN_EXEC_PERM: u64 = 0x0004_0000;
     const FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
+    const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
     const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
     const FAN_CLOEXEC: u32 = 0x0000_0001;
     const FAN_NONBLOCK: u32 = 0x0000_0002;
     const FAN_MARK_ADD: u32 = 0x0000_0001;
     const FAN_MARK_ONLYDIR: u32 = 0x0000_0008;
+    const FAN_MARK_FILESYSTEM: u32 = 0x0000_0100;
 }
 
 #[cfg(not(target_os = "linux"))]
