@@ -22,6 +22,7 @@ enum EndpointIngestBatchPolicy {
 struct EndpointEvidenceContinuityIssue: Equatable {
     let unavailableEventCount: UInt64
     let sensorRestarted: Bool
+    let fingerprint: String
 
     var title: String { "Incomplete Endpoint Security evidence" }
 
@@ -80,7 +81,16 @@ enum EndpointEvidenceContinuityPolicy {
         guard unavailableEventCount > 0 || sensorRestarted else { return nil }
         return EndpointEvidenceContinuityIssue(
             unavailableEventCount: unavailableEventCount,
-            sensorRestarted: sensorRestarted
+            sensorRestarted: sensorRestarted,
+            fingerprint: [
+                persistedBootID,
+                currentBootID,
+                String(persistedCursor),
+                String(oldestCursor),
+                String(nextCursor),
+                String(persistedKernelDrops ?? 0),
+                String(currentKernelDrops),
+            ].joined(separator: ":")
         )
     }
 }

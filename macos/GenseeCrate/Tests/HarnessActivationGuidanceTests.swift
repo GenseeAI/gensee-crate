@@ -126,16 +126,38 @@ final class HarnessActivationGuidanceTests: XCTestCase {
         XCTAssertFalse(script.contains("mktemp -t gensee-codex-hook-review)\n        /bin/rm"))
     }
 
-    func testCodexReviewLauncherRunsInTerminalWithoutWritingACommandFile() {
-        let command = CodexHookReviewScript.shellCommand(
-            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
+    func testCodexReviewLauncherRunsAProtectedCommandFileInTerminal() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("gensee-codex-review-tests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let scriptURL = try CodexHookReviewScript.writeTemporaryScript(
+            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex"),
+            directory: directory
         )
+        let command = CodexHookReviewScript.shellCommand(scriptURL: scriptURL)
         let source = CodexHookReviewLauncher.appleScriptSource(shellCommand: command)
+        let permissions = try FileManager.default.attributesOfItem(atPath: scriptURL.path)[.posixPermissions] as? NSNumber
 
-        XCTAssertTrue(command.contains("/usr/bin/base64 -D | /bin/zsh"))
+        XCTAssertTrue(command.contains("/bin/zsh"))
+        XCTAssertTrue(command.contains(scriptURL.path))
+        XCTAssertEqual(permissions?.intValue, 0o700)
         XCTAssertTrue(source.contains("tell application \"Terminal\""))
         XCTAssertTrue(source.contains("do script"))
-        XCTAssertFalse(source.contains("review-codex-hooks.command"))
+        XCTAssertFalse(command.contains("/usr/bin/base64"))
+        XCTAssertFalse(command.contains("/usr/bin/printf"))
+    }
+
+    func testCodexHookReviewAttachesCodexToTheTerminalTTY() {
+        let script = CodexHookReviewScript.render(
+            codexURL: URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
+        )
+
+        XCTAssertTrue(script.contains("[[ ! -t 0"))
+        XCTAssertTrue(script.contains("< \"$review_tty\" > \"$review_tty\" 2>&1 &"))
+        XCTAssertTrue(script.contains("wait \"$codex_pid\""))
+        XCTAssertFalse(script.contains("fg %1"))
+        XCTAssertFalse(script.contains("setopt MONITOR"))
     }
 
     func testCodexReviewLauncherRecognizesAutomationPermissionFailures() {

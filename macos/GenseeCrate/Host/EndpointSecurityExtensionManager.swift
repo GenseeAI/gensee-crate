@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 import SystemExtensions
@@ -37,7 +38,7 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
             case .activating:
                 "macOS is validating and activating the bundled system extension."
             case .awaitingApproval:
-                "Approve Gensee Crate in System Settings → Privacy & Security, then return here."
+                "In System Settings, open General → Login Items & Extensions → Endpoint Security Extensions and enable Gensee Crate, then return here."
             case .active:
                 "The system sensor is running. Process, file, and authorization evidence is available in the console."
             case .deactivating:
@@ -118,6 +119,17 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
         request.delegate = self
         OSSystemExtensionManager.shared.submitRequest(request)
     }
+
+    func openApprovalSettings() {
+        let candidates = [
+            "x-apple.systempreferences:com.apple.LoginItems-Settings.extension",
+            "x-apple.systempreferences:com.apple.LoginItems-Settings",
+        ]
+        for candidate in candidates {
+            guard let url = URL(string: candidate) else { continue }
+            if NSWorkspace.shared.open(url) { return }
+        }
+    }
 }
 
 extension EndpointSecurityExtensionManager: OSSystemExtensionRequestDelegate {
@@ -131,6 +143,7 @@ extension EndpointSecurityExtensionManager: OSSystemExtensionRequestDelegate {
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
         state = .awaitingApproval
+        openApprovalSettings()
     }
 
     func request(_ request: OSSystemExtensionRequest, didFinishWithResult result: OSSystemExtensionRequest.Result) {

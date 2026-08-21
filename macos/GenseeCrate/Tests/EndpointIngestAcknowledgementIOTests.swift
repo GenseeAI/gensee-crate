@@ -34,6 +34,7 @@ final class EndpointIngestAcknowledgementIOTests: XCTestCase {
 
         XCTAssertEqual(issue?.unavailableEventCount, 27)
         XCTAssertEqual(issue?.sensorRestarted, false)
+        XCTAssertFalse(issue?.fingerprint.isEmpty ?? true)
         XCTAssertTrue(issue?.detail.contains("27 Endpoint Security events were not retained") == true)
     }
 
@@ -75,6 +76,39 @@ final class EndpointIngestAcknowledgementIOTests: XCTestCase {
             persistedKernelDrops: nil,
             currentKernelDrops: 10
         ))
+    }
+
+    func testLaunchContinuityFingerprintIdentifiesOneSpecificGap() {
+        let original = EndpointEvidenceContinuityPolicy.issue(
+            persistedBootID: "boot-a",
+            currentBootID: "boot-a",
+            persistedCursor: 100,
+            oldestCursor: 125,
+            nextCursor: 500,
+            persistedKernelDrops: 4,
+            currentKernelDrops: 7
+        )
+        let sameGap = EndpointEvidenceContinuityPolicy.issue(
+            persistedBootID: "boot-a",
+            currentBootID: "boot-a",
+            persistedCursor: 100,
+            oldestCursor: 125,
+            nextCursor: 500,
+            persistedKernelDrops: 4,
+            currentKernelDrops: 7
+        )
+        let newerGap = EndpointEvidenceContinuityPolicy.issue(
+            persistedBootID: "boot-a",
+            currentBootID: "boot-a",
+            persistedCursor: 200,
+            oldestCursor: 230,
+            nextCursor: 600,
+            persistedKernelDrops: 7,
+            currentKernelDrops: 9
+        )
+
+        XCTAssertEqual(original?.fingerprint, sameGap?.fingerprint)
+        XCTAssertNotEqual(original?.fingerprint, newerGap?.fingerprint)
     }
 
     func testReadChunkReturnsAvailableAcknowledgementData() throws {

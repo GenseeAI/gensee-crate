@@ -53,8 +53,10 @@ struct DashboardOverviewPage: View {
                             Text("\(sensor.health.ingestedEvents.formatted()) events ingested")
                                 .font(.system(size: 11)).foregroundStyle(.secondary)
                             Spacer()
-                            if sensor.health.hasDataLoss {
+                            if sensor.health.launchContinuityIssue != nil {
                                 DashboardTag(text: "Event gaps detected", color: .dashboardRed)
+                            } else if sensor.health.kernelDrops > 0 || sensor.health.ringDrops > 0 || sensor.health.rejectedEvents > 0 {
+                                DashboardTag(text: "Historical drops", color: .dashboardGold)
                             } else {
                                 DashboardTag(text: "No event gaps", color: .green)
                             }
@@ -75,6 +77,11 @@ struct DashboardOverviewPage: View {
                                 .fixedSize(horizontal: false, vertical: true)
                             Spacer(minLength: 12)
                             DashboardTag(text: "Incomplete evidence", color: .dashboardRed)
+                            Button("Mark Reviewed") {
+                                sensor.acknowledgeLaunchContinuityIssue()
+                            }
+                            .controlSize(.small)
+                            .help("Acknowledge this specific evidence gap. A new gap will appear again.")
                         }
                     }
                 }

@@ -47,6 +47,7 @@ final class EndpointSecuritySensor: ObservableObject {
     private let cursorDefaultsKey: String
     private let bootIDDefaultsKey: String
     private let kernelDropsDefaultsKey: String
+    private let acknowledgedContinuityDefaultsKey: String
     private var connection: GenseeEndpointSecurityBridge?
     private var ingestProcess: Process?
     private var ingestInput: FileHandle?
@@ -74,6 +75,7 @@ final class EndpointSecuritySensor: ObservableObject {
         cursorDefaultsKey = "gensee.endpointSecurity.cursor.\(defaultsSuffix)"
         bootIDDefaultsKey = "gensee.endpointSecurity.bootID.\(defaultsSuffix)"
         kernelDropsDefaultsKey = "gensee.endpointSecurity.kernelDrops.\(defaultsSuffix)"
+        acknowledgedContinuityDefaultsKey = "gensee.endpointSecurity.acknowledgedContinuity.\(defaultsSuffix)"
         let defaults = UserDefaults.standard
         cursor = (defaults.object(forKey: cursorDefaultsKey) as? NSNumber)?.uint64Value ?? 0
         bootID = defaults.string(forKey: bootIDDefaultsKey) ?? ""
@@ -108,6 +110,7 @@ final class EndpointSecuritySensor: ObservableObject {
     func reconnect() {
         connection?.invalidate()
         connection = nil
+        checkedLaunchContinuity = false
         do {
             try connect()
             health.error = nil
@@ -121,6 +124,12 @@ final class EndpointSecuritySensor: ObservableObject {
             connection = nil
             try? connect()
         }
+    }
+
+    func acknowledgeLaunchContinuityIssue() {
+        guard let issue = health.launchContinuityIssue else { return }
+        UserDefaults.standard.set(issue.fingerprint, forKey: acknowledgedContinuityDefaultsKey)
+        health.launchContinuityIssue = nil
     }
 
     func updateConfiguration(
@@ -326,7 +335,7 @@ final class EndpointSecuritySensor: ObservableObject {
         let oldestCursor = number(dictionary["oldest_cursor"])
         let nextKernelDrops = number(dictionary["kernel_drops"])
         if !checkedLaunchContinuity {
-            health.launchContinuityIssue = EndpointEvidenceContinuityPolicy.issue(
+            let issue = EndpointEvidenceContinuityPolicy.issue(
                 persistedBootID: bootID,
                 currentBootID: nextBootID,
                 persistedCursor: cursor,
@@ -335,6 +344,10 @@ final class EndpointSecuritySensor: ObservableObject {
                 persistedKernelDrops: persistedKernelDrops,
                 currentKernelDrops: nextKernelDrops
             )
+            let acknowledgedFingerprint = UserDefaults.standard.string(
+                forKey: acknowledgedContinuityDefaultsKey
+            )
+            health.launchContinuityIssue = issue?.fingerprint == acknowledgedFingerprint ? nil : issue
             checkedLaunchContinuity = true
         }
         let firstObservation = bootID.isEmpty
@@ -376,8 +389,10 @@ final class EndpointSecuritySensor: ObservableObject {
         let defaults = UserDefaults.standard
         defaults.set(NSNumber(value: cursor), forKey: cursorDefaultsKey)
         defaults.set(bootID, forKey: bootIDDefaultsKey)
-        defaults.set(NSNumber(value: health.kernelDrops), forKey: kernelDropsDefaultsKey)
-        persistedKernelDrops = health.kernelDrops
+        if persistedKernelDrops != health.kernelDrops {
+            defaults.set(NSNumber(value: health.kernelDrops), forKey: kernelDropsDefaultsKey)
+            persistedKernelDrops = health.kernelDrops
+        }
     }
 
     private func write(

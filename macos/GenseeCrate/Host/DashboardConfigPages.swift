@@ -1128,6 +1128,11 @@ struct DashboardSettingsPage: View {
             }
             HStack {
                 Button("Full Disk Access") { model.openFullDiskAccess() }
+                if extensionManager.state == .awaitingApproval {
+                    Button("Extension Approval") {
+                        extensionManager.openApprovalSettings()
+                    }
+                }
                 Button("Reconnect") {
                     sensor.start()
                     sensor.reconnect()

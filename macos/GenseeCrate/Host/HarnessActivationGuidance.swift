@@ -163,11 +163,20 @@ enum CodexHookReviewScript {
         config_path="$codex_home/config.toml"
         hooks_path="$codex_home/hooks.json"
         review_tty=$(/usr/bin/tty)
+        if [[ ! -t 0 || "$review_tty" == "not a tty" ]]; then
+          echo 'Gensee could not attach Codex to this Terminal window. Close it and try again.'
+          exit 1
+        fi
+        script_path="${0:A}"
         approval_marker=$(/usr/bin/mktemp -t gensee-codex-hook-review)
         initial_checksum=$(/usr/bin/cksum "$config_path" 2>/dev/null || true)
+        watcher_pid=''
 
         cleanup_review() {
-          /bin/rm -f "$approval_marker"
+          if [[ -n "$watcher_pid" ]]; then
+            /bin/kill -TERM "$watcher_pid" 2>/dev/null || true
+          fi
+          /bin/rm -f "$approval_marker" "$script_path"
         }
         trap cleanup_review EXIT HUP INT TERM
 
@@ -220,8 +229,7 @@ enum CodexHookReviewScript {
           exit 0
         fi
 
-        setopt MONITOR
-        \(quotedCodex) &
+        \(quotedCodex) < "$review_tty" > "$review_tty" 2>&1 &
         codex_pid=$!
         (
           trap - EXIT HUP INT TERM
@@ -237,7 +245,8 @@ enum CodexHookReviewScript {
         ) &
         watcher_pid=$!
 
-        fg %1 >/dev/null 2>&1 || true
+        wait "$codex_pid" 2>/dev/null
+        codex_status=$?
         if [[ -s "$approval_marker" ]]; then
           wait "$watcher_pid" 2>/dev/null || true
           echo
@@ -247,12 +256,36 @@ enum CodexHookReviewScript {
         else
           /bin/kill -TERM "$watcher_pid" 2>/dev/null || true
         fi
+        exit "$codex_status"
         """
     }
 
-    static func shellCommand(codexURL: URL) -> String {
-        let payload = Data(render(codexURL: codexURL).utf8).base64EncodedString()
-        return "/usr/bin/printf '%s' \(shellSingleQuote(payload)) | /usr/bin/base64 -D | /bin/zsh"
+    static func writeTemporaryScript(
+        codexURL: URL,
+        directory: URL = FileManager.default.temporaryDirectory
+    ) throws -> URL {
+        let scriptURL = directory.appendingPathComponent(
+            "gensee-codex-hook-review-\(UUID().uuidString).command"
+        )
+        do {
+            try render(codexURL: codexURL).write(
+                to: scriptURL,
+                atomically: true,
+                encoding: .utf8
+            )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: scriptURL.path
+            )
+            return scriptURL
+        } catch {
+            try? FileManager.default.removeItem(at: scriptURL)
+            throw error
+        }
+    }
+
+    static func shellCommand(scriptURL: URL) -> String {
+        "/bin/zsh \(shellSingleQuote(scriptURL.path))"
     }
 
     private static func shellSingleQuote(_ value: String) -> String {
