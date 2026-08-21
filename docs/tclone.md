@@ -292,11 +292,25 @@ while its scoped workspace snapshot and execution record are retained for
 inspection and replay planning. Gensee keeps an immutable input snapshot and a
 separate writable output snapshot, hashes their actual contents, and writes a
 typed `effect-manifest.json`. The manifest distinguishes requested capabilities
-from observed use and records changed files, the exact-command digest, promotion
-proposals, violations, and explicit telemetry coverage. Filesystem-write
-coverage is complete for the retained scope; reads and the complete descendant
-process tree are not yet observable and are marked unavailable/partial rather
-than being reported as empty facts.
+from observed use and records changed files, file reads, each executable open,
+the exact-command digest, promotion proposals, violations, and explicit
+telemetry coverage. Every Linux cell is held behind a startup gate while Gensee
+places the container tree in its own cgroup and establishes filesystem-wide
+fanotify permission marks over the container root and scoped bind mounts. A
+queue overflow, missing mark, sensor error, or unsupported host is recorded as
+incomplete read/process coverage and a violation; it is never represented as an
+empty effect list. Capability cells therefore require Linux cgroup v2. Complete
+forensic coverage additionally requires root fanotify support.
+
+The immutable part of the manifest, the exact request and command, and both
+snapshot tree digests are bound into an HMAC-authenticated
+`forensics-evidence.json`. `gensee run cell inspect` verifies that signature and
+all retained artifacts before displaying them. `replay-plan.json` contains the
+exact original request, command, input digest, and required broker resource
+kinds. `gensee run cell replay <cell-id> --source <source-id>` issues a new
+one-use lease which will execute only if the new source produces the identical
+input digest. Broker credentials and identities are deliberately not replayed;
+fresh cell-bound broker leases must be attached to the new operation.
 
 Before activating a cell, Gensee writes an owner-only cleanup journal naming
 only its exact container, broker leases, expiry, and, when present, generated
@@ -310,12 +324,14 @@ the manifest and journal for forensics.
 Nothing is promoted into the source automatically. Promotion is host-only and
 requires explicit path selectors. Gensee re-hashes both snapshots, rejects a
 changed manifest or output, requires a successful non-timeout execution with
-zero violations and complete write telemetry, and verifies that each selected
-source path still matches the immutable input. It then applies only the selected
-diff through the existing rollback-on-failure filesystem transaction. A
-successful promotion is appended to the manifest; a repeated or overlapping
-promotion is rejected. Use `--dry-run` to perform all evidence and conflict
-checks without changing the source.
+zero violations and complete telemetry for every requested effect dimension,
+verifies the signed forensic envelope, and verifies that each selected source
+path still matches the immutable input. It then applies only the selected diff
+through the existing rollback-on-failure filesystem transaction. Successful
+promotions are appended to a separately HMAC-authenticated promotion ledger
+(and mirrored in the manifest); a repeated or overlapping promotion is
+rejected. Use `--dry-run` to perform all evidence and conflict checks without
+changing the source.
 
 Direct network leases are supported on Linux only when they pin IP/CIDR,
 TCP/UDP, and exact ports. Gensee creates a private cell network namespace,

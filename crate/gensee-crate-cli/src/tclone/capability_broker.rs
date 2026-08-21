@@ -914,11 +914,39 @@ fn validate_and_consume_external_commit_token(
 }
 
 fn sign_external_commit_claims(claims: &ExternalActionCommitClaims) -> io::Result<String> {
+    sign_host_evidence("external-action-commit-v1", &serde_json::to_vec(claims)?)
+}
+
+pub(super) fn sign_host_evidence(domain: &str, payload: &[u8]) -> io::Result<String> {
+    if !tclone_is_safe_token(domain) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid host-evidence signature domain",
+        ));
+    }
     let key = broker_signing_key()?;
     let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    mac.update(&serde_json::to_vec(claims)?);
+    mac.update(domain.as_bytes());
+    mac.update(&[0]);
+    mac.update(payload);
     Ok(format!("hmac-sha256:{:x}", mac.finalize().into_bytes()))
+}
+
+pub(super) fn verify_host_evidence(
+    domain: &str,
+    payload: &[u8],
+    signature: &str,
+) -> io::Result<()> {
+    let expected = sign_host_evidence(domain, payload)?;
+    if constant_time_bytes_eq(signature.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "host-evidence signature is invalid",
+        ))
+    }
 }
 
 fn broker_signing_key() -> io::Result<Zeroizing<String>> {

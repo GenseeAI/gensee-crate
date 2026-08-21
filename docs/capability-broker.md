@@ -68,6 +68,13 @@ typed, request-digested effects and explicitly attests whether that effect log
 is complete. Gensee copies those effects into the cell manifest; missing or
 incomplete gateway telemetry is a manifest violation and prevents promotion.
 
+The host also authenticates the immutable manifest, request, exact command,
+input/output tree digests, and replay plan with a domain-separated HMAC. The
+underlying signing key remains in the owner-only broker state directory and is
+never mounted into a capability cell. Promotion receipts use a separate
+signature domain and an append-only verified ledger, so editing retained JSON
+cannot erase prior promotion history or manufacture clean evidence.
+
 The adapter contract supports `repository_token`, `api_token`,
 `workload_identity`, `mtls_certificate`, and `database_role`. Provider-specific
 minting remains outside the cell and outside the Gensee process; an adapter can
