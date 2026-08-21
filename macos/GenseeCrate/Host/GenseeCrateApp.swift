@@ -171,11 +171,13 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
                 ? "Independent verification is active"
                 : "\(actionable.count) request\(actionable.count == 1 ? "" : "s") to review"
         } else {
-            statusTitle = "Independent sensor is not connected"
+            statusTitle = "OS verification is off — open Settings to connect"
         }
         let status = NSMenuItem(
             title: statusTitle,
-            action: actionable.isEmpty ? #selector(openStatus(_:)) : #selector(openQueue(_:)),
+            action: model?.endpointSensor.health.connected == true
+                ? (actionable.isEmpty ? #selector(openStatus(_:)) : #selector(openQueue(_:)))
+                : #selector(openSettings(_:)),
             keyEquivalent: ""
         )
         status.target = self
@@ -218,6 +220,10 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
 
     @objc private func openQueue(_ sender: NSMenuItem) {
         openReviewQueue(requestID: nil)
+    }
+
+    @objc private func openSettings(_ sender: NSMenuItem) {
+        openGensee(destination: .settings, requestID: nil)
     }
 
     private func openReviewQueue(requestID: Int64?) {
@@ -398,7 +404,7 @@ private struct GenseeMenuBarView: View {
     }
 
     private var statusLine: String {
-        if !model.endpointSensor.health.connected { return "Independent sensor is not connected" }
+        if !model.endpointSensor.health.connected { return "OS verification is off — open Settings to connect" }
         if let issue = model.dashboardRefreshIssue { return issue }
         return "Independent verification is active"
     }

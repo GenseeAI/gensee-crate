@@ -774,6 +774,11 @@ struct DashboardSettingsPage: View {
             ?? "Unknown"
     }
 
+    private var appBuild: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+            ?? "Unknown"
+    }
+
     var body: some View {
         DashboardPage {
             VStack(alignment: .leading, spacing: 16) {
@@ -862,7 +867,7 @@ struct DashboardSettingsPage: View {
                     }.frame(maxWidth: .infinity)
                     DashboardCard("About") {
                         VStack(alignment: .leading, spacing: 12) {
-                            Text("Gensee Crate v\(appVersion)\nNative macOS security console\n\nGensee backend: \(model.backendAvailable ? "Connected" : "Unavailable")")
+                            Text("Gensee Crate v\(appVersion) build \(appBuild)\nNative macOS security console\n\nGensee backend: \(model.backendAvailable ? "Connected" : "Unavailable")")
                                 .font(.system(size: 11)).foregroundStyle(.secondary)
                             Divider()
                             Button {
@@ -1115,12 +1120,18 @@ struct DashboardSettingsPage: View {
                     .foregroundStyle(Color.dashboardGold)
             }
             settingsLine("Managed processes", sensor.health.managedProcesses.formatted())
-            if let error = sensor.health.error {
-                Text(error).font(.system(size: 10)).foregroundStyle(.red)
+            if let sensorMessage = endpointSensorMessage {
+                Text(sensorMessage)
+                    .font(.system(size: 10))
+                    .foregroundStyle(sensor.health.connected && sensor.health.running ? Color.secondary : Color.dashboardRed)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
                 Button("Full Disk Access") { model.openFullDiskAccess() }
-                Button("Reconnect") { sensor.reconnect() }
+                Button("Reconnect") {
+                    sensor.start()
+                    sensor.reconnect()
+                }
                 Button("Remove…", role: .destructive) { confirmRemoval = true }.disabled(extensionManager.state.isBusy || extensionManager.state == .notInstalled)
                 Spacer()
                 Button(extensionManager.state == .active ? "Installed & Enabled" : "Install & Enable") { extensionManager.activate() }
@@ -1128,6 +1139,19 @@ struct DashboardSettingsPage: View {
                     .disabled(extensionManager.state.isBusy || extensionManager.state == .active || !extensionManager.isRunningFromApplications)
             }.controlSize(.small)
         }
+    }
+
+    private var endpointSensorMessage: String? {
+        guard extensionManager.state == .active else {
+            return extensionManager.state.detail
+        }
+        if !sensor.health.connected {
+            return "The Endpoint Security extension is installed, but the app is not connected to its sensor. Click Reconnect. If it remains disconnected, enable Full Disk Access for Gensee Crate and try again."
+        }
+        if !sensor.health.running {
+            return "The sensor transport is connected but cannot receive Endpoint Security events. Enable Full Disk Access for Gensee Crate, then click Reconnect."
+        }
+        return sensor.health.error
     }
 
     private var localStore: some View {

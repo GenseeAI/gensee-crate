@@ -19,6 +19,11 @@ struct ContentView: View {
                 showsSetupAssistant = true
             }
         }
+        .onChange(of: extensionManager.state) { state in
+            guard state == .active else { return }
+            model.endpointSensor.start()
+            model.endpointSensor.reconnect()
+        }
         .sheet(isPresented: $showsSetupAssistant, onDismiss: {
             hasSeenSetupAssistant = true
         }) {

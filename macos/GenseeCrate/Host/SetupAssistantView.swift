@@ -10,6 +10,8 @@ struct SetupAssistantView: View {
     @State private var isPreparing = false
     @State private var isEnablingAll = false
     @State private var selectedLevel: ProtectionLevel = .observe
+    @State private var showsConfigAuditResults = false
+    @State private var isRefreshingMacProtection = false
 
     private let stepTitles = ["Start here", "Local runtime", "Safety baseline", "Harnesses", "Mac protection", "Verify"]
 
@@ -58,6 +60,22 @@ struct SetupAssistantView: View {
                 if newStep >= 4 {
                     sensor.start()
                 }
+            }
+        }
+        .sheet(isPresented: $showsConfigAuditResults) {
+            if let audit = model.configAudit {
+                ScrollView {
+                    HarnessConfigAuditPanel(
+                        model: model,
+                        target: audit.requestedTarget,
+                        initialWorkspacePath: audit.includedReports.first?.report.target.workspace
+                            ?? FileManager.default.homeDirectoryForCurrentUser.path,
+                        onClose: { showsConfigAuditResults = false }
+                    )
+                    .padding(24)
+                }
+                .frame(width: 900, height: 650)
+                .background(Color.dashboardPanel)
             }
         }
     }
@@ -262,19 +280,23 @@ struct SetupAssistantView: View {
             permissionRow(
                 number: 2,
                 title: "Full Disk Access",
-                detail: sensor.health.connected
-                    ? "The native sensor is connected and can deliver protected file evidence."
-                    : "Open Full Disk Access, enable Gensee Crate, then return here and refresh. A relaunch may be required.",
-                ready: sensor.health.connected
+                detail: macProtectionSensorDetail,
+                ready: macProtectionSensorReady
             ) {
                 Button("Open Full Disk Access") { model.openFullDiskAccess() }
             }
 
             HStack(spacing: 8) {
-                Button { extensionManager.refreshStatus() } label: {
-                    Label("Refresh approvals", systemImage: "arrow.clockwise")
+                Button {
+                    Task { await refreshMacProtection() }
+                } label: {
+                    Label(isRefreshingMacProtection ? "Refreshing…" : "Refresh approvals", systemImage: "arrow.clockwise")
                 }
-                Button("Reconnect sensor") { sensor.reconnect() }
+                .disabled(isRefreshingMacProtection)
+                Button("Reconnect sensor") {
+                    sensor.start()
+                    sensor.reconnect()
+                }
             }
             .controlSize(.small)
 
@@ -343,10 +365,24 @@ struct SetupAssistantView: View {
                         }
                     }
                     if let audit = model.configAudit {
-                        DashboardTag(
-                            text: audit.summary.findingCount == 0 ? "No findings" : "\(audit.summary.findingCount) findings",
-                            color: audit.summary.findingCount == 0 ? .dashboardGreen : .dashboardGold
-                        )
+                        if audit.summary.findingCount == 0 {
+                            DashboardTag(text: "No findings", color: .dashboardGreen)
+                        } else {
+                            Button {
+                                showsConfigAuditResults = true
+                            } label: {
+                                Label(
+                                    audit.summary.findingCount == 1
+                                        ? "Review 1 finding"
+                                        : "Review \(audit.summary.findingCount) findings",
+                                    systemImage: "arrow.right.circle.fill"
+                                )
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.dashboardGold)
+                            .accessibilityIdentifier("setup.configAudit.reviewFindings")
+                            .help("Open the complete configuration audit report")
+                        }
                     }
                 }
                 .controlSize(.small)
@@ -592,17 +628,29 @@ struct SetupAssistantView: View {
             }
             Spacer()
             if integration.installed && integration.supportsDirectHooks {
-                Button(integration.configured ? (integration.requiresRepair ? "Repair" : "Configured") : "Enable") {
+                let activation = HarnessActivationGuidance.instruction(for: integration.id)
+                Button(
+                    integration.requiresRepair
+                        ? "Repair"
+                        : integration.awaitingVerification && activation.actionTitle != nil
+                            ? activation.actionTitle!
+                            : integration.configured ? "Configured" : "Enable"
+                ) {
                     Task {
                         if integration.requiresRepair {
                             await model.repairIntegration(integration.id)
+                        } else if integration.awaitingVerification && integration.id == "codex" {
+                            model.openCodexHookReview()
                         } else if !integration.configured {
                             await model.setIntegrationEnabled(integration.id, enabled: true)
                         }
                     }
                 }
                 .controlSize(.small)
-                .disabled((integration.configured && !integration.requiresRepair) || model.runningCommand != nil)
+                .disabled(
+                    (integration.configured && !integration.requiresRepair && activation.actionTitle == nil)
+                        || model.runningCommand != nil
+                )
             } else if !integration.supportsDirectHooks {
                 Text("Managed launch")
                     .font(.system(size: 10, weight: .medium))
@@ -653,5 +701,34 @@ struct SetupAssistantView: View {
         isPreparing = true
         _ = await model.prepareLocalRuntime()
         isPreparing = false
+    }
+
+    private var macProtectionSensorReady: Bool {
+        extensionManager.state == .active && sensor.health.connected && sensor.health.running
+    }
+
+    private var macProtectionSensorDetail: String {
+        guard extensionManager.state == .active else {
+            return "Approve the Endpoint Security extension first, then refresh both approvals."
+        }
+        guard sensor.health.connected else {
+            return "The extension is approved, but its sensor is disconnected. Enable Full Disk Access, then refresh approvals or reconnect the sensor."
+        }
+        guard sensor.health.running else {
+            return "The sensor transport is connected but cannot receive Endpoint Security events. Enable Full Disk Access, then refresh approvals."
+        }
+        return "The native sensor is connected and receiving operating-system security events."
+    }
+
+    @MainActor
+    private func refreshMacProtection() async {
+        isRefreshingMacProtection = true
+        extensionManager.refreshStatus()
+        sensor.start()
+        sensor.reconnect()
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        extensionManager.refreshStatus()
+        sensor.reconnect()
+        isRefreshingMacProtection = false
     }
 }
