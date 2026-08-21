@@ -277,7 +277,7 @@ dropped, privilege gain is disabled, an explicit seccomp deny profile and
 AppArmor profile are applied, resources are capped, and only explicitly
 selected workspace paths are copied and mounted. Attached broker authority is
 represented only by opaque ids and exact Unix-domain gateway socket mounts;
-the cell keeps `--network none`. Podman independently enforces the
+without a direct network lease the cell keeps `--network none`. Podman independently enforces the
 remaining lease lifetime and automatic removal as a backstop if the Gensee
 client exits. The exact command is fixed when the trusted host
 issues the lease; the lease is consumed atomically before scoped input copying,
@@ -304,12 +304,17 @@ successful promotion is appended to the manifest; a repeated or overlapping
 promotion is rejected. Use `--dry-run` to perform all evidence and conflict
 checks without changing the source.
 
-Direct network leases, policy-denied kernel authority, and external mutations
-fail closed. Repository/API, identity, mTLS, browser, cloud, and database
+Direct network leases are supported on Linux only when they pin IP/CIDR,
+TCP/UDP, and exact ports. The cell receives a private Podman bridge namespace,
+never the host network namespace. While the command waits behind a trusted
+startup gate, Gensee inspects the private address, binds the nftables policy to
+that exact source address on the `forward` hook, applies the allowlist, and only
+then releases execution. Gensee records allowed counters and blocked attempts.
+Policy-denied kernel authority and external mutations
+still fail closed. Repository/API, identity, mTLS, browser, cloud, and database
 authority can run only through a source/operation/cell-bound broker gateway.
 The gateway must return complete typed effect telemetry at revocation or the
-result cannot be promoted. Enabling ordinary container networking would not
-satisfy that requirement.
+result cannot be promoted.
 
 Before cloning a tmux-backed source, `gensee run fork` may briefly detach the
 active `gensee-agent` client so tclone can checkpoint a stable process tree.
@@ -552,8 +557,9 @@ fork-specific run id after live cloning.
 ## Current Limitations
 
 - Long-lived `--runtime tclone` sources and live forks remain separate from
-  `--sandbox linux`; Linux fanotify and cgroup/nftables controls are not yet
-  applied to those containers by `gensee run`.
+  `--sandbox linux`; Linux fanotify and general session cgroup/nftables controls
+  are not yet applied to those containers by `gensee run`. Fresh capability
+  cells do apply their operation-scoped cgroup/nftables policy.
 - Fresh capability cells are a fail-closed confinement boundary. Long-lived
   Tclone sources and live forks are not: they currently run with unconfined
   seccomp/AppArmor settings required by live-clone bring-up, and copied

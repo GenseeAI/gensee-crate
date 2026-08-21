@@ -907,6 +907,7 @@ fn linux_run_network_config(
                 mode,
                 allowed_hosts,
                 denied_hosts,
+                allowed_endpoints: Vec::new(),
             },
         ),
     ))
@@ -953,6 +954,7 @@ pub(crate) fn linux_policy_from_policy_document(
             mode: linux_network_mode_from_policy(policy_doc.linux.network.mode),
             allowed_hosts: policy_doc.linux.network.allow.clone(),
             denied_hosts: policy_doc.linux.network.deny.clone(),
+            allowed_endpoints: Vec::new(),
         },
         seccomp_enabled: policy_doc.linux.seccomp.enabled,
         dangerous_syscalls: linux_dangerous_syscall_policy(&policy_doc.linux.seccomp),

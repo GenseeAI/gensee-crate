@@ -56,6 +56,25 @@ struct CapabilityCellRecord {
     timed_out: bool,
 }
 
+#[derive(Debug)]
+struct CellNetworkPlan {
+    enforcement: gensee_crate_linux::LinuxNetworkEnforcementPlan,
+    gate_dir: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct CellNetworkEvidence {
+    allowed: Vec<gensee_crate_linux::LinuxNetworkEndpointEvent>,
+    blocked: Vec<gensee_crate_linux::LinuxNetworkBlockEvent>,
+    collection_error: Option<String>,
+}
+
+struct CellNetworkGuard {
+    plan: CellNetworkPlan,
+    table_applied: bool,
+    cleaned: bool,
+}
+
 pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
     if args.first().and_then(|arg| arg.to_str()) != Some("issue") {
         return Err(io::Error::new(
@@ -380,10 +399,7 @@ fn validate_cell_request_for_execution(
                 active_mediators.push(MediationBoundary::NetworkBoundary);
             }
             BrokerResourceKind::NetworkLease => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "direct network leases require the nftables/eBPF backend; use a Unix-socket gateway until it is active",
-                ));
+                active_mediators.push(MediationBoundary::NetworkBoundary);
             }
             BrokerResourceKind::ExternalActionCommitToken => {
                 return Err(io::Error::new(
@@ -477,11 +493,27 @@ fn validate_broker_scope_against_request(
                 _ => false,
             }
         }
-        BrokerResourceKind::NetworkLease => lease
-            .constraints
-            .get("destination")
-            .and_then(Value::as_str)
-            .is_some_and(|destination| allowed_audiences.contains(destination)),
+        BrokerResourceKind::NetworkLease => {
+            let destination = lease.constraints.get("destination").and_then(Value::as_str);
+            let protocol = lease.constraints.get("protocol").and_then(Value::as_str);
+            let ports = lease.constraints.get("ports").and_then(Value::as_array);
+            destination
+                .zip(protocol)
+                .zip(ports)
+                .is_some_and(|((destination, protocol), ports)| {
+                    scope.network_destinations.iter().any(|requested| {
+                        requested.destination == destination
+                            && requested.protocol == protocol
+                            && ports.iter().all(|port| {
+                                port.as_u64().is_some_and(|port| {
+                                    u16::try_from(port)
+                                        .ok()
+                                        .is_some_and(|port| requested.ports.contains(&port))
+                                })
+                            })
+                    })
+                })
+        }
         BrokerResourceKind::ExternalActionCommitToken => false,
         _ => allowed_audiences.contains(&lease.audience),
     };
@@ -495,6 +527,252 @@ fn validate_broker_scope_against_request(
         ));
     }
     Ok(())
+}
+
+fn cell_network_plan(
+    cell_id: &str,
+    cell_root: &Path,
+    broker_leases: &[BrokerLease],
+) -> io::Result<Option<CellNetworkPlan>> {
+    let mut endpoints = Vec::new();
+    for lease in broker_leases
+        .iter()
+        .filter(|lease| lease.resource_kind == BrokerResourceKind::NetworkLease)
+    {
+        if !matches!(lease.delivery, BrokerDelivery::NetworkLease { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "network authority must be delivered as a built-in network lease",
+            ));
+        }
+        let destination = lease
+            .constraints
+            .get("destination")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "network destination missing")
+            })?;
+        let protocol = match lease.constraints.get("protocol").and_then(Value::as_str) {
+            Some("tcp") => gensee_crate_linux::LinuxNetworkProtocol::Tcp,
+            Some("udp") => gensee_crate_linux::LinuxNetworkProtocol::Udp,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "network protocol must be tcp or udp",
+                ));
+            }
+        };
+        let ports = lease
+            .constraints
+            .get("ports")
+            .and_then(Value::as_array)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "network ports missing"))?;
+        for port in ports {
+            let port = port
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid network port")
+                })?;
+            endpoints.push(gensee_crate_linux::LinuxNetworkEndpoint {
+                destination: destination.to_string(),
+                protocol,
+                ports: vec![port],
+            });
+        }
+    }
+    if endpoints.is_empty() {
+        return Ok(None);
+    }
+    endpoints.sort_by(|left, right| {
+        (
+            left.destination.as_str(),
+            format!("{:?}", left.protocol),
+            left.ports.as_slice(),
+        )
+            .cmp(&(
+                right.destination.as_str(),
+                format!("{:?}", right.protocol),
+                right.ports.as_slice(),
+            ))
+    });
+    endpoints.dedup();
+    let config = gensee_crate_linux::LinuxNetworkEnforcementConfig::new(
+        cell_id,
+        gensee_crate_linux::LinuxNetworkPolicy {
+            mode: gensee_crate_linux::LinuxNetworkMode::AllowListed,
+            allowed_hosts: Vec::new(),
+            denied_hosts: Vec::new(),
+            allowed_endpoints: endpoints,
+        },
+    );
+    let enforcement = gensee_crate_linux::plan_nftables_policy(&config);
+    gensee_crate_linux::validate_nftables_plan_for_apply(&enforcement.nftables)?;
+    Ok(Some(CellNetworkPlan {
+        enforcement,
+        gate_dir: cell_root.join("network-gate"),
+    }))
+}
+
+impl CellNetworkGuard {
+    fn activate(plan: CellNetworkPlan) -> io::Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = plan;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "direct network capability cells require Linux cgroup v2 and nftables",
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            create_restrictive_dir_all(&plan.gate_dir)?;
+            let cgroup_path = Path::new(&plan.enforcement.cgroup.cgroup_path);
+            gensee_crate_linux::create_agent_cgroup(cgroup_path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot create capability-cell network cgroup: {error}"),
+                )
+            })?;
+            let guard = Self {
+                plan,
+                table_applied: false,
+                cleaned: false,
+            };
+            Ok(guard)
+        }
+    }
+
+    fn attach_and_release(&mut self, podman: &OsString, container_name: &str) -> io::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (podman, container_name);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "direct network capability cells require Linux",
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let pid = loop {
+                match super::inspect_container_pid(podman, container_name) {
+                    Ok(pid) if pid != 0 => break pid,
+                    Ok(_) | Err(_) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(CELL_POLL_INTERVAL_MS));
+                    }
+                    Ok(_) | Err(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "timed out locating gated capability-cell process",
+                        ));
+                    }
+                }
+            };
+            let source_address = inspect_capability_cell_ip(podman, container_name)?;
+            gensee_crate_linux::bind_nftables_plan_to_source_address(
+                &mut self.plan.enforcement.nftables,
+                source_address,
+            );
+            gensee_crate_linux::apply_nftables_script(&self.plan.enforcement.nftables.script)
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("cannot apply capability-cell nftables policy: {error}"),
+                    )
+                })?;
+            self.table_applied = true;
+            let attached = gensee_crate_linux::attach_process_tree_to_cgroup(
+                pid,
+                Path::new(&self.plan.enforcement.cgroup.cgroup_path),
+            )?;
+            if !attached.contains(&pid) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "capability-cell process was not attached to its network cgroup",
+                ));
+            }
+            write_atomic_nofollow(&self.plan.gate_dir.join("open"), b"open\n", 0o600)
+        }
+    }
+
+    fn collect_and_cleanup(&mut self) -> CellNetworkEvidence {
+        let mut evidence = CellNetworkEvidence::default();
+        if self.table_applied {
+            match gensee_crate_linux::read_nftables_endpoint_events(&self.plan.enforcement.nftables)
+            {
+                Ok(events) => evidence.allowed = events,
+                Err(error) => evidence.collection_error = Some(error.to_string()),
+            }
+            match gensee_crate_linux::read_nftables_block_events(&self.plan.enforcement.nftables) {
+                Ok(events) => evidence.blocked = events,
+                Err(error) if evidence.collection_error.is_none() => {
+                    evidence.collection_error = Some(error.to_string());
+                }
+                Err(_) => {}
+            }
+        }
+        if let Err(error) = self.cleanup() {
+            evidence.collection_error = Some(match evidence.collection_error.take() {
+                Some(existing) => format!("{existing}; cleanup failed: {error}"),
+                None => format!("network cleanup failed: {error}"),
+            });
+        }
+        evidence
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        if self.table_applied {
+            gensee_crate_linux::delete_nftables_table_if_exists(
+                &self.plan.enforcement.nftables.table_name,
+            )?;
+            self.table_applied = false;
+        }
+        gensee_crate_linux::remove_agent_cgroup(Path::new(
+            &self.plan.enforcement.cgroup.cgroup_path,
+        ))?;
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for CellNetworkGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_capability_cell_ip(
+    podman: &OsString,
+    container_name: &str,
+) -> io::Result<std::net::IpAddr> {
+    let output = run_command_capture(
+        podman,
+        &[OsString::from("inspect"), OsString::from(container_name)],
+    )?;
+    let value: Value = serde_json::from_str(&output)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    value
+        .as_array()
+        .and_then(|containers| containers.first())
+        .and_then(|container| container.get("NetworkSettings"))
+        .and_then(|settings| settings.get("Networks"))
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|networks| networks.values())
+        .filter_map(|network| network.get("IPAddress").and_then(Value::as_str))
+        .find_map(|address| address.parse::<std::net::IpAddr>().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "gated capability cell has no inspectable private-network address",
+            )
+        })
 }
 
 fn add_gateway_kind_mediator(
@@ -651,6 +929,8 @@ fn execute_capability_cell(
     let snapshot = cell_root.join("output");
     create_restrictive_dir_all(&input_snapshot)?;
     let seccomp_profile = write_cell_seccomp_profile(&cell_root)?;
+    let network_plan = cell_network_plan(&cell_id, &cell_root, &broker_leases)?;
+    let mut network_guard = network_plan.map(CellNetworkGuard::activate).transpose()?;
     let podman = tclone_podman();
     copy_capability_scope(&podman, source, lease, &input_snapshot)?;
     copy_path_all(&input_snapshot, &snapshot)?;
@@ -662,6 +942,7 @@ fn execute_capability_cell(
         &input_snapshot,
         &snapshot,
         &broker_leases,
+        network_guard.as_ref().map(|guard| &guard.plan),
         &seccomp_profile,
         unix_millis()?,
     )?;
@@ -669,6 +950,16 @@ fn execute_capability_cell(
     let cleanup = TcloneContainerCleanup::new(&podman, &container_name);
     let started_at_ms = unix_millis()?;
     let mut child = Command::new(&podman).args(&run_args).spawn()?;
+    if let Some(guard) = network_guard.as_mut() {
+        if let Err(error) = guard.attach_and_release(&podman, &container_name) {
+            let _ = Command::new(&podman)
+                .args(["kill", &container_name])
+                .status();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    }
     let mut timed_out = false;
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -685,6 +976,9 @@ fn execute_capability_cell(
         thread::sleep(Duration::from_millis(CELL_POLL_INTERVAL_MS));
     };
     drop(cleanup);
+    let network_evidence = network_guard
+        .as_mut()
+        .map(CellNetworkGuard::collect_and_cleanup);
     let finished_at_ms = unix_millis()?;
     let (broker_effect_leases, broker_revocation_error) = match broker_cleanup.revoke() {
         Ok(leases) => (leases, None),
@@ -701,6 +995,7 @@ fn execute_capability_cell(
         status.code(),
         timed_out,
         &broker_effect_leases,
+        network_evidence.as_ref(),
     )?;
     if let Some(error) = broker_revocation_error {
         manifest.violations.push(EffectViolation {
@@ -783,6 +1078,7 @@ fn capability_cell_run_args(
     input_snapshot: &Path,
     output_snapshot: &Path,
     broker_leases: &[BrokerLease],
+    network_plan: Option<&CellNetworkPlan>,
     seccomp_profile: &Path,
     now_ms: u64,
 ) -> io::Result<Vec<OsString>> {
@@ -802,7 +1098,11 @@ fn capability_cell_run_args(
         OsString::from("--timeout"),
         OsString::from(remaining_seconds.to_string()),
         OsString::from("--network"),
-        OsString::from("none"),
+        OsString::from(if network_plan.is_some() {
+            "bridge"
+        } else {
+            "none"
+        }),
         OsString::from("--read-only"),
         OsString::from("--cap-drop"),
         OsString::from("ALL"),
@@ -841,7 +1141,11 @@ fn capability_cell_run_args(
         ));
     }
     args.push(OsString::from("--entrypoint"));
-    args.push(OsString::from(&lease.command[0]));
+    args.push(OsString::from(if network_plan.is_some() {
+        "/bin/sh"
+    } else {
+        &lease.command[0]
+    }));
     for path in effective_read_paths(&lease.request) {
         add_scope_mount(
             &mut args,
@@ -885,7 +1189,22 @@ fn capability_cell_run_args(
             )));
         }
     }
+    if let Some(network_plan) = network_plan {
+        args.push(OsString::from("--mount"));
+        args.push(OsString::from(format!(
+            "type=bind,source={},destination=/run/gensee-network-gate,ro",
+            network_plan.gate_dir.display()
+        )));
+    }
     args.push(OsString::from(&source.image));
+    if network_plan.is_some() {
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(
+            "while [ ! -f /run/gensee-network-gate/open ]; do sleep 0.05; done; exec \"$@\"",
+        ));
+        args.push(OsString::from("gensee-network-gate"));
+        args.push(OsString::from(&lease.command[0]));
+    }
     Ok(args)
 }
 
@@ -1018,6 +1337,7 @@ fn build_effect_manifest(
     exit_code: Option<i32>,
     timed_out: bool,
     broker_leases: &[BrokerLease],
+    network_evidence: Option<&CellNetworkEvidence>,
 ) -> io::Result<EffectManifest> {
     let before = collect_cell_snapshot(input_snapshot)?;
     let after = collect_cell_snapshot(output_snapshot)?;
@@ -1130,6 +1450,71 @@ fn build_effect_manifest(
             }
         }
     }
+    if let Some(evidence) = network_evidence {
+        for event in &evidence.allowed {
+            let protocol = match event.protocol {
+                gensee_crate_linux::LinuxNetworkProtocol::Tcp => "tcp",
+                gensee_crate_linux::LinuxNetworkProtocol::Udp => "udp",
+            };
+            let port = event.ports.first().copied();
+            let broker_lease_id = broker_leases
+                .iter()
+                .find(|broker_lease| {
+                    broker_lease.resource_kind == BrokerResourceKind::NetworkLease
+                        && broker_lease
+                            .constraints
+                            .get("destination")
+                            .and_then(Value::as_str)
+                            == Some(event.destination.as_str())
+                        && broker_lease
+                            .constraints
+                            .get("protocol")
+                            .and_then(Value::as_str)
+                            == Some(protocol)
+                        && port.is_some_and(|port| {
+                            broker_lease
+                                .constraints
+                                .get("ports")
+                                .and_then(Value::as_array)
+                                .is_some_and(|ports| {
+                                    ports
+                                        .iter()
+                                        .any(|allowed| allowed.as_u64() == Some(port.into()))
+                                })
+                        })
+                })
+                .map(|broker_lease| broker_lease.lease_id.clone())
+                .unwrap_or_else(|| "unmatched_network_lease".to_string());
+            network_connections.push(gensee_crate_rules::capability::NetworkConnectionEffect {
+                protocol: protocol.to_string(),
+                destination: event.destination.clone(),
+                port,
+                broker_lease_id,
+            });
+        }
+        for event in &evidence.blocked {
+            violations.push(EffectViolation {
+                kind: "network_policy_block".to_string(),
+                resource: event
+                    .destination
+                    .clone()
+                    .unwrap_or_else(|| "unlisted_destination".to_string()),
+                detail: format!(
+                    "nftables blocked {} packets ({} bytes): {:?}",
+                    event.packets, event.bytes, event.reason
+                ),
+                observed_at_ms: finished_at_ms,
+            });
+        }
+        if let Some(error) = &evidence.collection_error {
+            violations.push(EffectViolation {
+                kind: "network_effect_telemetry_incomplete".to_string(),
+                resource: cell_id.to_string(),
+                detail: error.clone(),
+                observed_at_ms: finished_at_ms,
+            });
+        }
+    }
     if broker_telemetry_required && !broker_telemetry_complete {
         violations.push(EffectViolation {
             kind: "broker_effect_telemetry_incomplete".to_string(),
@@ -1179,6 +1564,17 @@ fn build_effect_manifest(
     let argv = serde_json::to_vec(&lease.command)?;
     let argv_digest = format!("sha256:{:x}", Sha256::digest(argv));
 
+    let network_coverage = match network_evidence {
+        Some(evidence) if evidence.collection_error.is_none() => TelemetryCoverage::Complete,
+        Some(_) => TelemetryCoverage::Partial,
+        None => broker_coverage_for_capabilities(
+            &lease.request,
+            &[Capability::NetworkEgress, Capability::NetworkListen],
+            broker_telemetry_required,
+            broker_telemetry_complete,
+        ),
+    };
+
     Ok(EffectManifest {
         schema_version: EFFECT_MANIFEST_SCHEMA_VERSION,
         operation_id: lease.operation_id.clone(),
@@ -1205,12 +1601,7 @@ fn build_effect_manifest(
         telemetry_coverage: EffectTelemetryCoverage {
             filesystem_reads: TelemetryCoverage::Unavailable,
             filesystem_writes: TelemetryCoverage::Complete,
-            network_connections: broker_coverage_for_capabilities(
-                &lease.request,
-                &[Capability::NetworkEgress, Capability::NetworkListen],
-                broker_telemetry_required,
-                broker_telemetry_complete,
-            ),
+            network_connections: network_coverage,
             external_requests: broker_coverage_for_capabilities(
                 &lease.request,
                 &[
@@ -2410,6 +2801,7 @@ mod tests {
             &root,
             &root,
             std::slice::from_ref(&broker_lease),
+            None,
             &root.join("seccomp.json"),
             150,
         )
@@ -2451,6 +2843,7 @@ mod tests {
             Some(0),
             false,
             &[revoked],
+            None,
         )
         .unwrap();
         assert!(manifest
@@ -2490,7 +2883,8 @@ mod tests {
         let source = source_record();
 
         let args =
-            capability_cell_run_args(&source, &lease, "cell", &root, &root, &[], &root, 1).unwrap();
+            capability_cell_run_args(&source, &lease, "cell", &root, &root, &[], None, &root, 1)
+                .unwrap();
         let rendered = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -2555,6 +2949,156 @@ mod tests {
             vec!["src", "Cargo.lock"]
         );
         assert!(repeated_arg_values(&[OsString::from("--path")], "--path").is_err());
+    }
+
+    #[test]
+    fn direct_network_lease_builds_a_gated_exact_endpoint_plan() {
+        let _guard = crate::cli_test_env_lock();
+        let root = env::temp_dir().join(format!("gensee-cell-network-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        env::set_var("GENSEE_HOME", &root);
+        fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        fs::write(root.join("Cargo.lock"), "").unwrap();
+        let mut request = request();
+        request.capabilities.push(Capability::NetworkEgress);
+        request.scope.network_destinations = vec![NetworkDestinationScope {
+            destination: "10.20.30.40/32".to_string(),
+            protocol: "tcp".to_string(),
+            ports: vec![443],
+        }];
+        let lease = CapabilityCellLease {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            lease_id: "lease_network".to_string(),
+            operation_id: "op_network".to_string(),
+            cell_id: "cell_network".to_string(),
+            source_run_id: "run_1".to_string(),
+            request,
+            command: vec!["cargo".to_string(), "check".to_string()],
+            issued_at_ms: 1,
+            expires_at_ms: 2,
+            consumed_at_ms: Some(1),
+            broker_lease_ids: vec!["broker_network".to_string()],
+        };
+        let broker = BrokerLease {
+            protocol_version: gensee_crate_rules::capability_broker::BROKER_PROTOCOL_VERSION,
+            lease_id: "broker_network".to_string(),
+            operation_id: "op_network".to_string(),
+            source_run_id: "run_1".to_string(),
+            cell_id: Some("cell_network".to_string()),
+            resource_kind: BrokerResourceKind::NetworkLease,
+            adapter_id: super::super::capability_broker::BUILTIN_NETWORK_ADAPTER.to_string(),
+            audience: "nexus-pinned-endpoint".to_string(),
+            scopes: vec!["connect".to_string()],
+            constraints: json!({
+                "destination": "10.20.30.40/32",
+                "protocol": "tcp",
+                "ports": [443]
+            }),
+            issued_at_ms: 1,
+            expires_at_ms: 2,
+            status: BrokerLeaseStatus::Active,
+            delivery: BrokerDelivery::NetworkLease {
+                network_lease_id: "net_1".to_string(),
+            },
+            public_metadata: Value::Null,
+            gateway_effects: Vec::new(),
+            effect_telemetry_complete: false,
+            revoked_at_ms: None,
+            consumed_at_ms: None,
+        };
+
+        validate_broker_scope_against_request(&lease.request, &broker).unwrap();
+        write_atomic_nofollow(
+            &root.join("capability-broker/leases/broker_network.json"),
+            &serde_json::to_vec_pretty(&broker).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_cell_request_for_execution(&lease, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut plan = cell_network_plan("cell_network", &root, std::slice::from_ref(&broker))
+            .unwrap()
+            .unwrap();
+        gensee_crate_linux::bind_nftables_plan_to_source_address(
+            &mut plan.enforcement.nftables,
+            "10.88.0.2".parse().unwrap(),
+        );
+        assert_eq!(plan.enforcement.nftables.endpoint_counters.len(), 1);
+        assert!(plan.enforcement.nftables.script.contains(
+            "ip saddr 10.88.0.2 ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport 443 counter name allow_0 accept"
+        ));
+        assert!(plan.enforcement.nftables.script.contains("hook forward"));
+        let args = capability_cell_run_args(
+            &source_record(),
+            &lease,
+            "cell-network",
+            &root,
+            &root,
+            std::slice::from_ref(&broker),
+            Some(&plan),
+            &root.join("seccomp.json"),
+            1,
+        )
+        .unwrap();
+        let rendered = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(rendered
+            .windows(2)
+            .any(|pair| pair == ["--network", "bridge"]));
+        assert!(rendered
+            .windows(2)
+            .any(|pair| pair == ["--entrypoint", "/bin/sh"]));
+        assert!(rendered
+            .iter()
+            .any(|arg| { arg.contains("destination=/run/gensee-network-gate,ro") }));
+        assert!(rendered.iter().any(|arg| arg.contains("exec \"$@\"")));
+
+        let input = root.join("input");
+        let output = root.join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        let evidence = CellNetworkEvidence {
+            allowed: vec![gensee_crate_linux::LinuxNetworkEndpointEvent {
+                table_name: plan.enforcement.nftables.table_name.clone(),
+                counter_name: "allow_0".to_string(),
+                destination: "10.20.30.40/32".to_string(),
+                protocol: gensee_crate_linux::LinuxNetworkProtocol::Tcp,
+                ports: vec![443],
+                packets: 4,
+                bytes: 512,
+            }],
+            blocked: Vec::new(),
+            collection_error: None,
+        };
+        let manifest = build_effect_manifest(
+            &source_record(),
+            &lease,
+            "cell_network",
+            &input,
+            &output,
+            1,
+            2,
+            Some(0),
+            false,
+            std::slice::from_ref(&broker),
+            Some(&evidence),
+        )
+        .unwrap();
+        assert_eq!(manifest.network_connections.len(), 1);
+        assert_eq!(manifest.network_connections[0].port, Some(443));
+        assert_eq!(
+            manifest.telemetry_coverage.network_connections,
+            TelemetryCoverage::Complete
+        );
+
+        env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -2626,6 +3170,7 @@ mod tests {
             Some(0),
             false,
             &[],
+            None,
         )
         .unwrap();
 
@@ -2688,6 +3233,7 @@ mod tests {
             Some(0),
             false,
             &[],
+            None,
         )
         .unwrap();
         let record = CapabilityCellRecord {
@@ -2769,6 +3315,7 @@ mod tests {
             Some(0),
             false,
             &[],
+            None,
         )
         .unwrap();
 
