@@ -64,20 +64,23 @@ struct RequestReviewPayload: Decodable {
     let request: RecordedRequest
     let agentEvents: [AgentEvent]
     let alerts: [SecurityAlert]
+    let rawAlertCount: Int?
 
     enum CodingKeys: String, CodingKey {
-        case request, alerts
+        case request, alerts, rawAlertCount
         case agentEvents
     }
 
     init(
         request: RecordedRequest,
         agentEvents: [AgentEvent],
-        alerts: [SecurityAlert]
+        alerts: [SecurityAlert],
+        rawAlertCount: Int? = nil
     ) {
         self.request = request
         self.agentEvents = agentEvents
         self.alerts = alerts
+        self.rawAlertCount = rawAlertCount
     }
 }
 

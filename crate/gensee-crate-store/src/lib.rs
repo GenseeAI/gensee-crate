@@ -733,10 +733,15 @@ impl EventStore {
         materialize_dashboard_visible_alerts(conn)?;
         let alerts = dashboard_alerts_from_relation(
             conn,
-            "dashboard_visible_alerts",
-            None,
-            Some(200),
-            None,
+            DashboardAlertQuery {
+                relation: "dashboard_visible_alerts",
+                request_id: None,
+                limit: Some(200),
+                visible_alerts_cte: None,
+                include_trigger_context: true,
+                include_request_prompt: true,
+                raw_event_count_expression: "1",
+            },
         )?;
         let agent_events = query_json_rows(
             conn,
@@ -1227,11 +1232,16 @@ impl EventStore {
         )?;
 
         let alerts = dashboard_alerts(conn, Some(request_id), None)?;
+        let raw_alert_count = alerts
+            .iter()
+            .map(|alert| alert["raw_event_count"].as_i64().unwrap_or(1))
+            .sum::<i64>();
 
         Ok(json!({
             "request": request,
             "agentEvents": agent_events,
             "alerts": alerts,
+            "rawAlertCount": raw_alert_count,
         }))
     }
 
@@ -4083,7 +4093,16 @@ fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
 }
 
 fn dashboard_visible_alerts_cte() -> String {
+    dashboard_visible_alerts_cte_with_scope(None)
+}
+
+fn dashboard_visible_alerts_cte_for_request() -> String {
+    dashboard_visible_alerts_cte_with_scope(Some("AND alerts.request_id = ?1"))
+}
+
+fn dashboard_visible_alerts_cte_with_scope(request_scope: Option<&str>) -> String {
     let base_visibility = dashboard_alert_base_visibility_sql("alerts");
+    let request_scope = request_scope.unwrap_or_default();
     format!(
         "ranked_dashboard_alerts AS MATERIALIZED (
             SELECT alerts.*,
@@ -4097,6 +4116,7 @@ fn dashboard_visible_alerts_cte() -> String {
                    ) AS previous_related_alert_at
             FROM alerts
             WHERE {base_visibility}
+              {request_scope}
          ),
          visible_alerts AS MATERIALIZED (
             SELECT *
@@ -4130,23 +4150,96 @@ fn dashboard_alerts(
     request_id: Option<i64>,
     limit: Option<usize>,
 ) -> io::Result<Vec<Value>> {
-    let visible_alerts_cte = dashboard_visible_alerts_cte();
-    dashboard_alerts_from_relation(
-        conn,
-        "visible_alerts",
-        request_id,
-        limit,
-        Some(&visible_alerts_cte),
-    )
+    match request_id {
+        Some(_) => {
+            // Request review displays one actionable finding per rule, path,
+            // and action. Group before resolving trigger-event context so a
+            // noisy low-level stream does not repeat the same prompt, tool
+            // input, and evidence thousands of times in the JSON payload.
+            let visible_alerts_cte = dashboard_visible_alerts_cte_for_request();
+            let grouped_alerts_cte = format!(
+                "{visible_alerts_cte},
+                 ranked_request_alerts AS MATERIALIZED (
+                    SELECT visible_alerts.*,
+                           COUNT(*) OVER (
+                               PARTITION BY rule_id, COALESCE(path, ''), lower(action)
+                           ) AS raw_event_count,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY rule_id, COALESCE(path, ''), lower(action)
+                               ORDER BY CASE severity
+                                          WHEN 'critical' THEN 4
+                                          WHEN 'high' THEN 3
+                                          WHEN 'medium' THEN 2
+                                          WHEN 'low' THEN 1
+                                          ELSE 0
+                                        END DESC,
+                                        created_at DESC,
+                                        alert_id DESC
+                           ) AS representative_rank
+                    FROM visible_alerts
+                 ),
+                 request_alerts AS MATERIALIZED (
+                    SELECT *
+                    FROM ranked_request_alerts
+                    WHERE representative_rank = 1
+                 )"
+            );
+            let mut alerts = dashboard_alerts_from_relation(
+                conn,
+                DashboardAlertQuery {
+                    relation: "request_alerts",
+                    request_id,
+                    limit,
+                    visible_alerts_cte: Some(&grouped_alerts_cte),
+                    include_trigger_context: false,
+                    include_request_prompt: false,
+                    raw_event_count_expression: "alerts.raw_event_count",
+                },
+            )?;
+            enrich_dashboard_alert_context(conn, request_id.unwrap(), &mut alerts)?;
+            Ok(alerts)
+        }
+        None => {
+            let visible_alerts_cte = dashboard_visible_alerts_cte();
+            dashboard_alerts_from_relation(
+                conn,
+                DashboardAlertQuery {
+                    relation: "visible_alerts",
+                    request_id: None,
+                    limit,
+                    visible_alerts_cte: Some(&visible_alerts_cte),
+                    include_trigger_context: true,
+                    include_request_prompt: true,
+                    raw_event_count_expression: "1",
+                },
+            )
+        }
+    }
+}
+
+struct DashboardAlertQuery<'a> {
+    relation: &'a str,
+    request_id: Option<i64>,
+    limit: Option<usize>,
+    visible_alerts_cte: Option<&'a str>,
+    include_trigger_context: bool,
+    include_request_prompt: bool,
+    raw_event_count_expression: &'a str,
 }
 
 fn dashboard_alerts_from_relation(
     conn: &rusqlite::Connection,
-    alert_relation: &str,
-    request_id: Option<i64>,
-    limit: Option<usize>,
-    visible_alerts_cte: Option<&str>,
+    query: DashboardAlertQuery<'_>,
 ) -> io::Result<Vec<Value>> {
+    let DashboardAlertQuery {
+        relation: alert_relation,
+        request_id,
+        limit,
+        visible_alerts_cte,
+        include_trigger_context,
+        include_request_prompt,
+        raw_event_count_expression,
+    } = query;
     let where_clause = request_id
         .map(|_| "WHERE alerts.request_id = ?1")
         .unwrap_or_default();
@@ -4156,18 +4249,16 @@ fn dashboard_alerts_from_relation(
     let with_clause = visible_alerts_cte
         .map(|cte| format!("WITH {cte}"))
         .unwrap_or_default();
-    let sql = format!(
-        "{with_clause}
-         SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
-                alerts.severity, alerts.action, alerts.rule_id, alerts.message,
-                alerts.path, alerts.evidence, alerts.created_at,
-                requests.session_id, substr(requests.original_user_prompt, 1, 16384),
-                trigger_event.source, trigger_event.type, trigger_event.tool_name,
-                trigger_event.tool_input, trigger_event.tool_use_id,
-                feedback.human_verdict, feedback.label, feedback.created_at
-         FROM {alert_relation} AS alerts
-         LEFT JOIN requests ON requests.request_id = alerts.request_id
-         LEFT JOIN agent_events AS trigger_event
+    let request_prompt_expression = if include_request_prompt {
+        "substr(requests.original_user_prompt, 1, 16384)"
+    } else {
+        "NULL"
+    };
+    let (trigger_event_columns, trigger_event_join) = if include_trigger_context {
+        (
+            "trigger_event.source, trigger_event.type, trigger_event.tool_name,
+             trigger_event.tool_input, trigger_event.tool_use_id",
+            "LEFT JOIN agent_events AS trigger_event
            ON trigger_event.event_id = COALESCE(
              CASE WHEN alerts.entity_kind = 'agent_event' THEN alerts.entity_id END,
              (
@@ -4193,7 +4284,23 @@ fn dashboard_alerts_from_relation(
                ORDER BY candidate.ts DESC, candidate.event_id DESC
                LIMIT 1
              )
-           )
+           )",
+        )
+    } else {
+        ("NULL, NULL, NULL, NULL, NULL", "")
+    };
+    let sql = format!(
+        "{with_clause}
+         SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
+                alerts.severity, alerts.action, alerts.rule_id, alerts.message,
+                alerts.path, alerts.evidence, alerts.created_at,
+                requests.session_id, {request_prompt_expression},
+                {trigger_event_columns},
+                feedback.human_verdict, feedback.label, feedback.created_at,
+                {raw_event_count_expression}
+         FROM {alert_relation} AS alerts
+         LEFT JOIN requests ON requests.request_id = alerts.request_id
+         {trigger_event_join}
          LEFT JOIN human_feedback AS feedback
            ON feedback.feedback_id = (
              SELECT candidate_feedback.feedback_id
@@ -4232,12 +4339,122 @@ fn dashboard_alerts_from_relation(
             "human_verdict": row.get::<_, Option<String>>(18)?,
             "feedback_label": row.get::<_, Option<String>>(19)?,
             "feedback_created_at": row.get::<_, Option<i64>>(20)?,
+            "raw_event_count": row.get::<_, i64>(21)?,
         }))
     };
     match request_id {
         Some(request_id) => query_json_rows_with_i64(conn, &sql, request_id, mapper),
         None => query_json_rows(conn, &sql, mapper),
     }
+}
+
+#[derive(Clone)]
+struct DashboardAgentEventContext {
+    event_id: i64,
+    ts: i64,
+    source: String,
+    event_type: String,
+    tool_name: Option<String>,
+    tool_input: Option<String>,
+    tool_use_id: Option<String>,
+}
+
+fn enrich_dashboard_alert_context(
+    conn: &rusqlite::Connection,
+    request_id: i64,
+    alerts: &mut [Value],
+) -> io::Result<()> {
+    let mut statement = conn
+        .prepare(
+            "SELECT event_id, ts, source, type, tool_name, tool_input, tool_use_id
+             FROM agent_events
+             WHERE request_id = ?1
+             ORDER BY ts, event_id",
+        )
+        .map_err(sqlite_error_from_rusqlite)?;
+    let rows = statement
+        .query_map([request_id], |row| {
+            Ok(DashboardAgentEventContext {
+                event_id: row.get(0)?,
+                ts: row.get(1)?,
+                source: row.get(2)?,
+                event_type: row.get(3)?,
+                tool_name: row.get(4)?,
+                tool_input: row.get(5)?,
+                tool_use_id: row.get(6)?,
+            })
+        })
+        .map_err(sqlite_error_from_rusqlite)?;
+    let events = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error_from_rusqlite)?;
+    let pre_tool_events = events
+        .iter()
+        .filter(|event| event.event_type == "PreToolUse")
+        .cloned()
+        .collect::<Vec<_>>();
+    let by_id = events
+        .iter()
+        .map(|event| (event.event_id, event.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut by_tool_use_id = HashMap::<String, DashboardAgentEventContext>::new();
+    for event in &events {
+        let Some(tool_use_id) = event.tool_use_id.as_ref() else {
+            continue;
+        };
+        let replace = by_tool_use_id.get(tool_use_id).is_none_or(|existing| {
+            let event_is_pre = event.event_type == "PreToolUse";
+            let existing_is_pre = existing.event_type == "PreToolUse";
+            (event_is_pre, event.ts, event.event_id)
+                > (existing_is_pre, existing.ts, existing.event_id)
+        });
+        if replace {
+            by_tool_use_id.insert(tool_use_id.clone(), event.clone());
+        }
+    }
+
+    for alert in alerts {
+        let created_at = alert["created_at"].as_i64().unwrap_or(i64::MAX);
+        let entity_event = (alert["entity_kind"].as_str() == Some("agent_event"))
+            .then(|| alert["entity_id"].as_i64())
+            .flatten()
+            .and_then(|event_id| by_id.get(&event_id));
+        let evidence_tool_use_id = alert["evidence"]
+            .as_str()
+            .and_then(|evidence| serde_json::from_str::<Value>(evidence).ok())
+            .and_then(|evidence| {
+                evidence
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let tool_event = evidence_tool_use_id
+            .as_ref()
+            .and_then(|tool_use_id| by_tool_use_id.get(tool_use_id));
+        let latest_pre_tool = latest_dashboard_event_at_or_before(&pre_tool_events, created_at);
+        let latest_event = latest_dashboard_event_at_or_before(&events, created_at);
+        let Some(context) = entity_event
+            .or(tool_event)
+            .or(latest_pre_tool)
+            .or(latest_event)
+        else {
+            continue;
+        };
+        alert["event_source"] = json!(context.source);
+        alert["event_type"] = json!(context.event_type);
+        alert["tool_name"] = json!(context.tool_name);
+        alert["tool_input"] = json!(context.tool_input);
+        alert["tool_use_id"] = json!(context.tool_use_id);
+    }
+    Ok(())
+}
+
+fn latest_dashboard_event_at_or_before(
+    events: &[DashboardAgentEventContext],
+    timestamp: i64,
+) -> Option<&DashboardAgentEventContext> {
+    let index = events.partition_point(|event| (event.ts, event.event_id) <= (timestamp, i64::MAX));
+    index.checked_sub(1).and_then(|index| events.get(index))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5267,18 +5484,33 @@ mod tests {
                 observed_at_ms: now + 2,
             })
             .unwrap();
+        for offset in 3..=4 {
+            store
+                .append_policy_alert(&PolicyAlert {
+                    session_id: Some("s1".to_string()),
+                    tool_use_id: None,
+                    severity: "high".to_string(),
+                    action: "warn".to_string(),
+                    rule_id: "request_rollup_test".to_string(),
+                    message: "Review the preceding read".to_string(),
+                    path: None,
+                    evidence: None,
+                    observed_at_ms: now + offset,
+                })
+                .unwrap();
+        }
         store
             .append_hook_event(&hook_event(
                 "Stop",
                 r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
-                now + 3,
+                now + 5,
             ))
             .unwrap();
 
         let dashboard = store.dashboard_state().unwrap();
         assert_eq!(dashboard["requests"][0]["tool_call_count"], 1);
-        assert_eq!(dashboard["requests"][0]["alert_count"], 1);
-        assert_eq!(dashboard["requests"][0]["high_risk_alert_count"], 1);
+        assert_eq!(dashboard["requests"][0]["alert_count"], 3);
+        assert_eq!(dashboard["requests"][0]["high_risk_alert_count"], 3);
         assert_eq!(dashboard["requests"][0]["strongest_severity"], "high");
         let request_id = dashboard["requests"][0]["request_id"].as_i64().unwrap();
         let detail = store.dashboard_request(request_id).unwrap();
@@ -5289,6 +5521,10 @@ mod tests {
         );
         assert_eq!(detail["agentEvents"].as_array().unwrap().len(), 1);
         assert_eq!(detail["agentEvents"][0]["type"], "PreToolUse");
+        assert_eq!(detail["alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["rawAlertCount"], 3);
+        assert_eq!(detail["alerts"][0]["raw_event_count"], 3);
+        assert!(detail["alerts"][0]["original_user_prompt"].is_null());
         assert_eq!(detail["alerts"][0]["tool_name"], "Read");
         assert!(detail["agentEvents"]
             .as_array()

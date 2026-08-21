@@ -376,7 +376,11 @@ final class ConsoleModel: ObservableObject {
             let payload = try await cli.decode(
                 RequestReviewPayload.self,
                 arguments: ["dashboard-request", String(requestID)],
-                timeout: 12
+                // Large, long-running sessions can legitimately contain
+                // thousands of grouped decisions. The backend scopes and
+                // aggregates them before returning, but JSON decoding still
+                // needs headroom on slower Macs.
+                timeout: 30
             )
             guard acceptsLiveData(generation: liveGeneration),
                   requestReviewLoadState == .loading(requestID)
