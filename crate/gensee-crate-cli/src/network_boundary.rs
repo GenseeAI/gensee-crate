@@ -287,7 +287,7 @@ pub(crate) fn handle_c0_network(args: Vec<OsString>) -> io::Result<()> {
         Some("inspect") => inspect_network_supervisor(&args[1..]),
         _ => Err(io::Error::new(
             ErrorKind::InvalidInput,
-            "usage: gensee run network <serve --config FILE [--dry-run]|event --socket PATH --event FILE|fault --socket PATH --fault FILE|revoke-http --socket PATH --lease ID|inspect --socket PATH>",
+            "usage: gensee run network <serve --state-root ROOT --config FILE [--dry-run]|event --socket PATH --event FILE|fault --socket PATH --fault FILE|revoke-http --socket PATH --lease ID|inspect --socket PATH>",
         )),
     }
 }
@@ -297,9 +297,13 @@ pub(crate) fn handle_capability_fault(args: Vec<OsString>) -> io::Result<()> {
 }
 
 fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
+    let dry_run = args.iter().any(|arg| arg == "--dry-run");
     let config_path = network_arg_value(args, "--config")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "missing --config"))?;
+    if !dry_run {
+        prepare_privileged_boundary_environment(args, &config_path)?;
+    }
     let config: NetworkOperationConfig =
         serde_json::from_str(&read_nofollow_to_string(&config_path)?).map_err(|error| {
             io::Error::new(
@@ -308,7 +312,6 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
             )
         })?;
     validate_network_operation_config(&config)?;
-    let dry_run = args.iter().any(|arg| arg == "--dry-run");
     if !dry_run && std::env::consts::OS != "linux" {
         return Err(io::Error::new(
             ErrorKind::Unsupported,
@@ -522,6 +525,13 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         loop {
             match unix_listener.accept() {
                 Ok((stream, _)) => {
+                    if !dry_run && peer_effective_uid(&stream)? != 0 {
+                        eprintln!(
+                            "gensee: rejected non-root boundary control peer for operation={}",
+                            config.operation_id
+                        );
+                        continue;
+                    }
                     let supervisor = Arc::clone(&supervisor);
                     let tables = Arc::clone(&table_names);
                     thread::spawn(move || {
@@ -2263,6 +2273,112 @@ fn send_supervisor_request(
     ))
 }
 
+#[cfg(unix)]
+fn prepare_privileged_boundary_environment(
+    args: &[OsString],
+    config_path: &Path,
+) -> io::Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "the boundary daemon must run as root",
+        ));
+    }
+    let state_root = network_arg_value(args, "--state-root")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "privileged boundary daemon requires --state-root",
+            )
+        })?;
+    validate_root_owned_path(config_path, false, true)?;
+    validate_root_owned_path(&state_root, true, true)?;
+    // Downstream operation supervision and the capability broker share this
+    // already-validated authority root. Do not inherit GENSEE_HOME from the
+    // launching shell for a privileged boundary process.
+    env::set_var("GENSEE_HOME", &state_root);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_privileged_boundary_environment(
+    _args: &[OsString],
+    _config_path: &Path,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "privileged boundary daemon requires Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn validate_root_owned_path(path: &Path, directory: bool, owner_only: bool) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "privileged boundary paths must be absolute",
+        ));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+        || metadata.uid() != 0
+        || metadata.mode() & if owner_only { 0o077 } else { 0o022 } != 0
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "privileged boundary paths must be root-owned, non-symlink, and non-writable by other principals",
+        ));
+    }
+    for ancestor in path.ancestors().skip(1) {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "privileged boundary path ancestry is not root-controlled",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn peer_effective_uid(stream: &UnixStream) -> io::Result<u32> {
+    let mut credential = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credential as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 || length as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(credential.uid)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn peer_effective_uid(_stream: &UnixStream) -> io::Result<u32> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "privileged boundary peer authentication requires Linux SO_PEERCRED",
+    ))
+}
+
 fn network_operation_root(operation_id: &str) -> io::Result<PathBuf> {
     if !safe_network_token(operation_id) {
         return Err(io::Error::new(
@@ -2568,6 +2684,38 @@ mod tests {
         let mut oversized = vec![b'x'; MAX_SUPERVISOR_MESSAGE_BYTES as usize + 1];
         oversized.push(b'\n');
         assert!(read_bounded_supervisor_line(io::Cursor::new(oversized)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn privileged_boundary_rejects_state_below_an_untrusted_ancestor() {
+        let root = env::temp_dir().join(format!("gensee-boundary-root-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = root.join("operation.json");
+        fs::write(&config, b"{}").unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            validate_root_owned_path(&root, true, true)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            validate_root_owned_path(&config, false, true)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn boundary_control_peer_uses_kernel_authenticated_uid() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        assert_eq!(peer_effective_uid(&left).unwrap(), unsafe {
+            libc::geteuid()
+        });
     }
 
     #[cfg(unix)]
