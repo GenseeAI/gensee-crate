@@ -214,9 +214,11 @@ The provider-neutral policy engine returns exactly one of four decisions:
 - `allow_locally` when every capability is within the declared local envelope
   and all mandatory mediators are active;
 - `delegate_to_isolated_cell` when the source lacks authority but the operation
-  is scoped, reversible, fully mediated, and an isolated cell is available;
-- `stage_for_approval` for brokered commits, external effects, irreversible
-  effects, and output promotion;
+  is scoped, fully mediated, and an isolated cell is available. Irreversible
+  local effects are cell-eligible only when source execution is forbidden and
+  inspect-before-commit is mandatory;
+- `stage_for_approval` for brokered commits, external effects, uncontained
+  irreversible effects, and output promotion;
 - `deny` for unresolved scopes, expired/excessive leases, missing mediators,
   unavailable staging/cells, unbounded network grants, raw secret material, or
   policy-denied kernel authority.
@@ -235,6 +237,10 @@ Typed filesystem operations are enforced by the fresh-cell path at this layer:
 `rename`, `delete`, and `metadata` selectors become writable mounts. This keeps
 `destructive_filesystem` requests satisfiable without accepting unrelated typed
 network, identity, or external selectors before their mediators exist.
+The cell's disposable snapshot contains an `irreversible_local` effect, so it
+does not require approval merely to execute there. Promotion remains a separate
+inspect-and-commit action; removing either isolation or inspect-before-commit
+restores the approval requirement.
 
 ### Capability cells
 

@@ -1538,6 +1538,19 @@ mod tests {
         assert!(effective_write_paths(&request).contains(&"target/cache".to_string()));
     }
 
+    #[test]
+    fn irreversible_local_request_is_issuable_when_the_cell_contains_the_effect() {
+        let mut request = request();
+        request.effect_scope = EffectScope::IrreversibleLocal;
+        request.capabilities.push(Capability::DestructiveFilesystem);
+        request.scope.file_operations = vec![gensee_crate_rules::capability::FileOperationScope {
+            path: "target/cache".to_string(),
+            operation: gensee_crate_rules::capability::FileOperationKind::Delete,
+        }];
+
+        validate_cell_request(&request).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn whole_workspace_selector_copies_contents_even_when_snapshot_root_exists() {

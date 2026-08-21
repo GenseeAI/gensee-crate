@@ -508,11 +508,14 @@ fn is_safe_relative_selector(value: &str) -> bool {
 }
 
 fn requires_approval(request: &CapabilityRequest) -> bool {
+    let irreversible_local_is_contained = request.effect_scope == EffectScope::IrreversibleLocal
+        && request.execution_boundary == ExecutionBoundary::IsolatedCell
+        && request.source_must_not_execute
+        && request.inspect_before_commit;
     request.execution_boundary == ExecutionBoundary::BrokeredCommit
-        || matches!(
-            request.effect_scope,
-            EffectScope::IrreversibleLocal | EffectScope::External
-        )
+        || request.effect_scope == EffectScope::External
+        || (request.effect_scope == EffectScope::IrreversibleLocal
+            && !irreversible_local_is_contained)
         || request.capabilities.iter().any(|capability| {
             matches!(
                 capability,
@@ -547,8 +550,8 @@ fn looks_like_secret_material(handle: &str) -> bool {
 mod tests {
     use super::*;
     use crate::capability::{
-        CloudIamScope, DatabaseScope, ExternalApplicationScope, NetworkDestinationScope,
-        OutputPromotionScope, SecretIdentityScope,
+        CloudIamScope, DatabaseScope, ExternalApplicationScope, FileOperationScope,
+        NetworkDestinationScope, OutputPromotionScope, SecretIdentityScope,
     };
 
     fn context(mediators: Vec<MediationBoundary>) -> PolicyEvaluationContext {
@@ -607,6 +610,72 @@ mod tests {
         assert_eq!(
             decision.decision,
             CapabilityPolicyDecision::DelegateToIsolatedCell
+        );
+    }
+
+    #[test]
+    fn contained_irreversible_local_effect_delegates_without_approval_staging() {
+        let mut request = CapabilityRequest::isolated(
+            "destructive_workspace_mutation",
+            EffectScope::IrreversibleLocal,
+            vec![
+                Capability::FilesystemWrite,
+                Capability::DestructiveFilesystem,
+                Capability::ProcessExecution,
+            ],
+        );
+        request.scope.file_operations = vec![FileOperationScope {
+            path: "target/cache".to_string(),
+            operation: FileOperationKind::Delete,
+        }];
+        let mut evaluation_context = context(vec![
+            MediationBoundary::FilesystemBoundary,
+            MediationBoundary::ProcessCgroup,
+        ]);
+        evaluation_context.approval_staging_available = false;
+
+        let decision = CapabilityPolicyEngine::default().evaluate(&request, &evaluation_context);
+
+        assert_eq!(
+            decision.decision,
+            CapabilityPolicyDecision::DelegateToIsolatedCell
+        );
+        assert_eq!(
+            decision.reason_codes,
+            vec!["source_authority_is_insufficient"]
+        );
+    }
+
+    #[test]
+    fn uncontained_irreversible_local_effect_still_requires_approval() {
+        let mut request = CapabilityRequest::isolated(
+            "destructive_workspace_mutation",
+            EffectScope::IrreversibleLocal,
+            vec![
+                Capability::FilesystemWrite,
+                Capability::DestructiveFilesystem,
+                Capability::ProcessExecution,
+            ],
+        );
+        request.execution_boundary = ExecutionBoundary::Source;
+        request.source_must_not_execute = false;
+        request.inspect_before_commit = false;
+        request.scope.file_operations = vec![FileOperationScope {
+            path: "target/cache".to_string(),
+            operation: FileOperationKind::Delete,
+        }];
+
+        let decision = CapabilityPolicyEngine::default().evaluate(
+            &request,
+            &context(vec![
+                MediationBoundary::FilesystemBoundary,
+                MediationBoundary::ProcessCgroup,
+            ]),
+        );
+
+        assert_eq!(
+            decision.decision,
+            CapabilityPolicyDecision::StageForApproval
         );
     }
 
