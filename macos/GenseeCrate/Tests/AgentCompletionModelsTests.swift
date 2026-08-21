@@ -1,6 +1,16 @@
 import XCTest
 
 final class AgentCompletionModelsTests: XCTestCase {
+    func testSecurityAlertDecodesServerGroupedRawEventCount() throws {
+        let alert = try JSONDecoder().decode(
+            SecurityAlert.self,
+            from: Data(#"{"alert_id":42,"request_id":7,"severity":"high","action":"warn","rule_id":"scope_drift","message":"Unexpected writes","created_at":123,"raw_event_count":500}"#.utf8)
+        )
+
+        XCTAssertEqual(alert.rawEventCount, 500)
+        XCTAssertNil(alert.originalUserPrompt)
+    }
+
     func testFileTouchEvidenceDecodesSQLiteIntegerRiskFlags() throws {
         let touch = try JSONDecoder().decode(
             FileTouchEvidence.self,
@@ -59,7 +69,7 @@ final class AgentCompletionModelsTests: XCTestCase {
             ruleID: "secret", message: "Secret read", path: "/tmp/key", evidence: nil,
             createdAt: 1_500, originalUserPrompt: nil, eventSource: nil, eventType: nil,
             toolName: nil, toolInput: nil, toolUseID: nil, humanVerdict: nil,
-            feedbackLabel: nil, feedbackCreatedAt: nil
+            feedbackLabel: nil, feedbackCreatedAt: nil, rawEventCount: nil
         )]
 
         let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)
@@ -78,7 +88,7 @@ final class AgentCompletionModelsTests: XCTestCase {
             ruleID: "routine", message: "Routine policy warning", path: nil, evidence: nil,
             createdAt: 1_500, originalUserPrompt: nil, eventSource: nil, eventType: nil,
             toolName: nil, toolInput: nil, toolUseID: nil, humanVerdict: nil,
-            feedbackLabel: nil, feedbackCreatedAt: nil
+            feedbackLabel: nil, feedbackCreatedAt: nil, rawEventCount: nil
         )]
 
         let summary = try XCTUnwrap(AgentCompletionDerivation.summaries(from: snapshot).first)

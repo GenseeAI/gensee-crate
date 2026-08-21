@@ -276,6 +276,7 @@ struct SecurityAlert: Decodable, Identifiable {
     let humanVerdict: String?
     let feedbackLabel: String?
     let feedbackCreatedAt: Int64?
+    let rawEventCount: Int?
 
     var id: Int64 { alertID }
 
@@ -296,6 +297,7 @@ struct SecurityAlert: Decodable, Identifiable {
         case humanVerdict = "human_verdict"
         case feedbackLabel = "feedback_label"
         case feedbackCreatedAt = "feedback_created_at"
+        case rawEventCount = "raw_event_count"
     }
 }
 
