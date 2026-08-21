@@ -247,6 +247,17 @@ restores the approval requirement.
 The host-side mint/revoke protocol and secret-free adapter contract are
 documented in [Capability broker](capability-broker.md).
 
+Issuing a cell lease reserves an operation id, cell id, exact command, scope,
+and deadline; it does not claim that future broker-backed mediators are already
+active. At issue time the policy engine receives only the process/cgroup,
+filesystem, and kernel boundaries every fresh cell will actually enforce. A
+request whose only remaining policy reasons are missing attachable mediators is
+reported as `pending_mediation`; unresolved scopes and every other denial still
+fail issuance. Immediately before execution, Gensee derives the active set
+again from the broker leases actually attached to that cell and requires a full
+`delegate_to_isolated_cell` decision. Thus an unimplemented or unattached
+cloud, browser, database, identity, secret, or network gateway cannot execute.
+
 For a bounded authority-expanding operation, a trusted host operator can issue a
 one-use lease bound to a source run, an exact command, scoped workspace paths,
 and an expiry:

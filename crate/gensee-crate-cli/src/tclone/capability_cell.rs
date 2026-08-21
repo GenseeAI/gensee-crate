@@ -173,11 +173,13 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
                 "source_run_id": lease.source_run_id,
                 "expires_at_ms": lease.expires_at_ms,
                 "execution_boundary": lease.request.execution_boundary,
+                "authorization_state": "pending_mediation",
             }))?
         );
     } else {
-        println!("issued one-use capability lease {lease_id}");
+        println!("issued one-use capability lease reservation {lease_id}");
         println!("reserved capability cell {cell_id}");
+        println!("authorization remains pending until required mediators are attached");
         println!(
             "execute with: gensee run cell {} --lease {lease_id}",
             lease.source_run_id
@@ -2142,7 +2144,7 @@ mod tests {
             operation: gensee_crate_rules::capability::FileOperationKind::Delete,
         }];
 
-        validate_cell_request(&request).unwrap();
+        validate_cell_request_for_issue(&request).unwrap();
         assert!(effective_write_paths(&request).contains(&"target/cache".to_string()));
     }
 
@@ -2156,7 +2158,21 @@ mod tests {
             operation: gensee_crate_rules::capability::FileOperationKind::Delete,
         }];
 
-        validate_cell_request(&request).unwrap();
+        validate_cell_request_for_issue(&request).unwrap();
+    }
+
+    #[test]
+    fn cell_issue_marks_broker_mediation_as_pending_without_claiming_it_is_active() {
+        let mut request = request();
+        request.capabilities.push(Capability::NetworkEgress);
+        request.scope.network_destinations =
+            vec![gensee_crate_rules::capability::NetworkDestinationScope {
+                destination: "10.20.30.40/32".to_string(),
+                protocol: "tcp".to_string(),
+                ports: vec![443],
+            }];
+
+        validate_cell_request_for_issue(&request).unwrap();
     }
 
     #[cfg(unix)]
