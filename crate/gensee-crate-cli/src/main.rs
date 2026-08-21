@@ -4467,7 +4467,12 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
         }
     };
 
-    let event = build_hook_event(&payload, effective_provider)?;
+    let tclone_context_run_id = current_tclone_context_run_id();
+    let event = build_hook_event_with_tclone_context(
+        &payload,
+        effective_provider,
+        tclone_context_run_id.as_deref(),
+    )?;
     let session_registration = hook_session_registration(&event);
 
     // Fast path: if the warm daemon is up, hand off over its socket — PreToolUse
@@ -4475,7 +4480,12 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     // events fire-and-forget off the critical path. Falls through to the
     // in-process path if the daemon is unreachable, so enforcement never
     // silently disappears.
-    if dispatch_via_daemon(&payload, &event, session_registration.as_ref()) {
+    if dispatch_via_daemon(
+        &payload,
+        &event,
+        session_registration.as_ref(),
+        tclone_context_run_id.as_deref(),
+    ) {
         return Ok(());
     }
 

@@ -3981,10 +3981,24 @@ fn daemon_request_envelope_preserves_codex_provider() {
     let payload = pretool_bash_payload("s1", "/repo", "ls");
     let request = daemon_request(&payload, PROVIDER_CODEX);
 
-    let (parsed_payload, provider) = daemon_request_parts(&request).unwrap();
+    let (parsed_payload, provider, tclone_context_run_id) = daemon_request_parts(&request).unwrap();
 
     assert_eq!(provider, PROVIDER_CODEX);
     assert_eq!(parsed_payload, payload);
+    assert!(tclone_context_run_id.is_none());
+
+    let request = json!({
+        "gensee_daemon_protocol": 1,
+        "provider": PROVIDER_CODEX,
+        "payload": payload,
+        "tclone_context_run_id": "run_source_fork_1_0",
+    })
+    .to_string();
+    let (_, _, tclone_context_run_id) = daemon_request_parts(&request).unwrap();
+    assert_eq!(
+        tclone_context_run_id.as_deref(),
+        Some("run_source_fork_1_0")
+    );
 }
 
 #[test]
@@ -7719,20 +7733,18 @@ fn codex_fork_allows_exec_in_its_own_run() {
 
 #[test]
 fn fork_context_rebind_overrides_cloned_source_hook_identity() {
-    let _guard = telemetry_test_lock();
     let root = env::temp_dir().join(format!("gensee-hook-rebind-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
-    let context = root.join("context.json");
-    std::fs::write(&context, r#"{"run_id":"run_123_fork_456_0","role":"fork"}"#).unwrap();
-    env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context);
-    env::set_var("AGENT_SHIELD_SESSION_ID", "run_123");
     let payload = pretool_bash_payload("run_123", root.to_str().unwrap(), "cargo test");
 
-    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+    let event = super::build_hook_event_with_tclone_context(
+        &payload,
+        PROVIDER_CODEX,
+        Some("run_123_fork_456_0"),
+    )
+    .unwrap();
 
     assert_eq!(event.session_id.as_deref(), Some("run_123_fork_456_0"));
-    env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
-    env::remove_var("AGENT_SHIELD_SESSION_ID");
     std::fs::remove_dir_all(root).ok();
 }
 

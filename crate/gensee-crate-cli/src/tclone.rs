@@ -551,6 +551,9 @@ fn tclone_host_control_capability_rotation_error(run_id: &str) -> io::Error {
 }
 
 fn read_tclone_run_context() -> io::Result<Value> {
+    #[cfg(not(test))]
+    let path = PathBuf::from(TCLONE_RUN_CONTEXT_PATH);
+    #[cfg(test)]
     let path = env::var_os("GENSEE_TCLONE_CONTEXT_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(TCLONE_RUN_CONTEXT_PATH));
@@ -1407,7 +1410,7 @@ fn tclone_hook_output_excerpt(event: &AgentHookEvent) -> Option<String> {
     }
 }
 
-fn tclone_is_safe_token(value: &str) -> bool {
+pub(crate) fn tclone_is_safe_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 200
         && value != "."

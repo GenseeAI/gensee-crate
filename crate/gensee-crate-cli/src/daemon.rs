@@ -86,11 +86,15 @@ pub(crate) fn serve_connection(mut stream: UnixStream, store: &EventStore) -> io
     {
         return serve_event_store_request(&mut stream, store, value);
     }
-    let (payload, provider) = match daemon_request_parts(&request) {
+    let (payload, provider, tclone_context_run_id) = match daemon_request_parts(&request) {
         Ok(parts) => parts,
         Err(_) => return Ok(()), // malformed request: nothing to do, nothing to answer
     };
-    let event = match build_hook_event(&payload, &provider) {
+    let event = match build_hook_event_with_tclone_context(
+        &payload,
+        &provider,
+        tclone_context_run_id.as_deref(),
+    ) {
         Ok(event) => event,
         Err(_) => return Ok(()), // malformed payload: nothing to do, nothing to answer
     };
@@ -212,7 +216,7 @@ pub(crate) fn daemon_append_transaction_event(event: &TransactionEventInput) -> 
     dispatch_event_store_request(EVENT_STORE_APPEND_TRANSACTION, event)
 }
 
-pub(crate) fn daemon_request_parts(request: &str) -> io::Result<(String, String)> {
+pub(crate) fn daemon_request_parts(request: &str) -> io::Result<(String, String, Option<String>)> {
     let value = serde_json::from_str::<Value>(request).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -248,7 +252,20 @@ pub(crate) fn daemon_request_parts(request: &str) -> io::Result<(String, String)
             format!("unsupported daemon request provider `{provider}`"),
         ));
     }
-    Ok((payload, provider))
+    let tclone_context_run_id = value
+        .get("tclone_context_run_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if tclone_context_run_id
+        .as_deref()
+        .is_some_and(|run_id| !tclone_is_safe_token(run_id))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon request has invalid tclone_context_run_id",
+        ));
+    }
+    Ok((payload, provider, tclone_context_run_id))
 }
 
 /// Client fast path. Returns `true` if the event was fully handled via the
@@ -259,6 +276,7 @@ pub(crate) fn dispatch_via_daemon(
     payload: &str,
     event: &AgentHookEvent,
     session_registration: Option<&AgentSession>,
+    tclone_context_run_id: Option<&str>,
 ) -> bool {
     let Ok(root) = default_root() else {
         return false;
@@ -272,6 +290,7 @@ pub(crate) fn dispatch_via_daemon(
         "provider": event.provider,
         "payload": payload,
         "session_registration": session_registration,
+        "tclone_context_run_id": tclone_context_run_id,
     })
     .to_string();
     if stream.write_all(request.as_bytes()).is_err() {
