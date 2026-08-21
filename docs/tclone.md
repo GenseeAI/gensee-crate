@@ -157,6 +157,12 @@ allowed to execute reversible local commands. Requests classified as external
 mutations remain blocked inside forks because a workspace fork cannot roll back
 an external effect; those require a brokered commit path.
 
+Destructive commands against direct file-backed clients such as `sqlite3` and
+`duckdb` are classified as irreversible local filesystem mutations and routed
+to an isolated cell. Remote database clients and database commands executed
+inside another container remain external mutations that require a brokered
+commit path.
+
 The alert's `capability_request` is a descriptive starting template, not a
 ready-to-lease document. Its selectors are intentionally empty (empty means
 "not granted"), so a trusted issuer must copy it and add exact path, network,

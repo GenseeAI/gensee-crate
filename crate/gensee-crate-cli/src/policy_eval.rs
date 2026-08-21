@@ -261,6 +261,7 @@ pub(crate) enum ForkSuggestionReason {
     LargeRefactor,
     DestructiveFileCleanup,
     LockfileChange,
+    DestructiveLocalDatabaseCommand,
     DestructiveDatabaseCommand,
     TestStrategyChange,
 }
@@ -273,6 +274,7 @@ impl ForkSuggestionReason {
             Self::LargeRefactor => "large_refactor",
             Self::DestructiveFileCleanup => "destructive_file_cleanup",
             Self::LockfileChange => "lockfile_change",
+            Self::DestructiveLocalDatabaseCommand => "destructive_local_database_command",
             Self::DestructiveDatabaseCommand => "destructive_database_command",
             Self::TestStrategyChange => "test_strategy_change",
         }
@@ -285,6 +287,7 @@ impl ForkSuggestionReason {
             Self::LargeRefactor => "try-refactor",
             Self::DestructiveFileCleanup => "try-cleanup",
             Self::LockfileChange => "try-lockfile-change",
+            Self::DestructiveLocalDatabaseCommand => "try-local-db-change",
             Self::DestructiveDatabaseCommand => "try-db-change",
             Self::TestStrategyChange => "try-test-plan",
         }
@@ -297,6 +300,7 @@ impl ForkSuggestionReason {
             Self::LargeRefactor => "large refactor",
             Self::DestructiveFileCleanup => "destructive file cleanup",
             Self::LockfileChange => "lockfile change",
+            Self::DestructiveLocalDatabaseCommand => "destructive local database command",
             Self::DestructiveDatabaseCommand => "destructive database command",
             Self::TestStrategyChange => "test strategy change",
         }
@@ -324,6 +328,15 @@ impl ForkSuggestionReason {
                     ],
                 )
             }
+            Self::DestructiveLocalDatabaseCommand => CapabilityRequest::isolated(
+                "destructive_local_database_mutation",
+                EffectScope::IrreversibleLocal,
+                vec![
+                    Capability::FilesystemWrite,
+                    Capability::DestructiveFilesystem,
+                    Capability::ProcessExecution,
+                ],
+            ),
             Self::LargeRefactor | Self::LockfileChange => CapabilityRequest::isolated(
                 "workspace_mutation",
                 EffectScope::ReversibleLocal,
@@ -675,8 +688,13 @@ pub(crate) fn fork_suggestion_reason(
     subjects: &[PolicySubject],
 ) -> Option<ForkSuggestionReason> {
     let normalized = normalize_command_for_matching(command);
-    if command_suggests_destructive_db(&normalized) {
-        return Some(ForkSuggestionReason::DestructiveDatabaseCommand);
+    if let Some(target) = command_destructive_database_target(&normalized) {
+        return Some(match target {
+            DatabaseMutationTarget::LocalFile => {
+                ForkSuggestionReason::DestructiveLocalDatabaseCommand
+            }
+            DatabaseMutationTarget::External => ForkSuggestionReason::DestructiveDatabaseCommand,
+        });
     }
     if command_suggests_schema_migration(&normalized) {
         return Some(ForkSuggestionReason::SchemaMigration);
@@ -961,27 +979,41 @@ fn command_suggests_destructive_cleanup(command: &str) -> bool {
     )
 }
 
-fn command_suggests_destructive_db(command: &str) -> bool {
-    split_shell_segments(command)
-        .iter()
-        .any(|segment| destructive_db_invocation(&shell_words(segment), 0))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseMutationTarget {
+    LocalFile,
+    External,
 }
 
-fn destructive_db_invocation(tokens: &[String], depth: usize) -> bool {
-    if depth > 2 {
-        return false;
+fn command_destructive_database_target(command: &str) -> Option<DatabaseMutationTarget> {
+    let mut target = None;
+    for segment in split_shell_segments(command) {
+        match destructive_db_invocation(&shell_words(&segment), 0) {
+            Some(DatabaseMutationTarget::External) => {
+                return Some(DatabaseMutationTarget::External)
+            }
+            Some(DatabaseMutationTarget::LocalFile) => {
+                target = Some(DatabaseMutationTarget::LocalFile)
+            }
+            None => {}
+        }
     }
-    let Some(command_index) = executable_token_index(tokens) else {
-        return false;
-    };
+    target
+}
+
+fn destructive_db_invocation(tokens: &[String], depth: usize) -> Option<DatabaseMutationTarget> {
+    if depth > 2 {
+        return None;
+    }
+    let command_index = executable_token_index(tokens)?;
     let executable = command_basename(&tokens[command_index]).to_ascii_lowercase();
     let args = &tokens[command_index + 1..];
 
     if matches!(executable.as_str(), "sh" | "bash" | "zsh" | "dash") {
         if let Some(script) = option_value(args, "-c") {
-            return command_suggests_destructive_db(&script);
+            return command_destructive_database_target(&script);
         }
-        return false;
+        return None;
     }
 
     if matches!(executable.as_str(), "sudo" | "env") {
@@ -995,7 +1027,9 @@ fn destructive_db_invocation(tokens: &[String], depth: usize) -> bool {
             .iter()
             .position(|arg| is_database_client(command_basename(arg)))
             .map(|index| &args[index..]);
-        return nested.is_some_and(|nested| destructive_db_invocation(nested, depth + 1));
+        return nested
+            .and_then(|nested| destructive_db_invocation(nested, depth + 1))
+            .map(|_| DatabaseMutationTarget::External);
     }
 
     if is_database_client(&executable) {
@@ -1016,7 +1050,11 @@ fn destructive_db_invocation(tokens: &[String], depth: usize) -> bool {
             .collect::<Vec<_>>()
             .join(" ")
             .to_ascii_lowercase();
-        return destructive_sql_text(&sql);
+        return destructive_sql_text(&sql).then_some(if is_file_database_client(&executable) {
+            DatabaseMutationTarget::LocalFile
+        } else {
+            DatabaseMutationTarget::External
+        });
     }
 
     let normalized_args = args
@@ -1027,11 +1065,12 @@ fn destructive_db_invocation(tokens: &[String], depth: usize) -> bool {
         executable.as_str(),
         "rails" | "rake" | "bundle" | "prisma" | "npx" | "npm" | "pnpm" | "yarn" | "bun"
     );
-    framework_runner
+    (framework_runner
         && (normalized_args.iter().any(|arg| arg == "db:reset")
             || normalized_args
                 .windows(2)
-                .any(|window| window == ["migrate", "reset"]))
+                .any(|window| window == ["migrate", "reset"])))
+    .then_some(DatabaseMutationTarget::External)
 }
 
 fn trim_matching_shell_quotes(value: &str) -> &str {
@@ -1090,8 +1129,12 @@ fn executable_token_index(tokens: &[String]) -> Option<usize> {
 fn is_database_client(executable: &str) -> bool {
     matches!(
         executable.to_ascii_lowercase().as_str(),
-        "psql" | "mysql" | "mariadb" | "sqlite3" | "sqlcmd" | "mongosh" | "mongo"
+        "psql" | "mysql" | "mariadb" | "sqlite3" | "duckdb" | "sqlcmd" | "mongosh" | "mongo"
     )
+}
+
+fn is_file_database_client(executable: &str) -> bool {
+    matches!(executable, "sqlite3" | "duckdb")
 }
 
 fn destructive_sql_text(sql: &str) -> bool {
@@ -3001,5 +3044,48 @@ mod matcher_tests {
         assert!(!prompt_suggests_schema_migration(
             "verify that the migration guide describes the database"
         ));
+    }
+
+    #[test]
+    fn file_backed_database_mutations_delegate_to_a_local_destructive_cell() {
+        for command in [
+            r#"sqlite3 ./test.db "drop table t""#,
+            r#"env MODE=test duckdb ./analytics.db "delete from events""#,
+        ] {
+            let reason = fork_suggestion_reason(command, &[]).unwrap();
+            assert_eq!(
+                reason,
+                ForkSuggestionReason::DestructiveLocalDatabaseCommand
+            );
+            let request = reason.capability_request();
+            assert_eq!(request.effect_scope, EffectScope::IrreversibleLocal);
+            assert_eq!(request.execution_boundary, ExecutionBoundary::IsolatedCell);
+            assert_eq!(
+                request.capabilities,
+                vec![
+                    Capability::FilesystemWrite,
+                    Capability::DestructiveFilesystem,
+                    Capability::ProcessExecution,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn remote_and_container_database_mutations_stay_brokered() {
+        for command in [
+            r#"psql -h db.example -c "drop table t""#,
+            r#"docker exec db sqlite3 /data/test.db "drop table t""#,
+            r#"sqlite3 ./test.db "drop table t"; psql -c "drop table t""#,
+        ] {
+            let reason = fork_suggestion_reason(command, &[]).unwrap();
+            assert_eq!(reason, ForkSuggestionReason::DestructiveDatabaseCommand);
+            let request = reason.capability_request();
+            assert_eq!(request.effect_scope, EffectScope::External);
+            assert_eq!(
+                request.execution_boundary,
+                ExecutionBoundary::BrokeredCommit
+            );
+        }
     }
 }
