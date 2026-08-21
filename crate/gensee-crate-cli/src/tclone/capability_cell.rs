@@ -635,24 +635,16 @@ impl CellNetworkGuard {
                     format!("cannot create capability-cell network cgroup: {error}"),
                 )
             })?;
-            let mut guard = Self {
+            let guard = Self {
                 plan,
                 table_applied: false,
                 cleaned: false,
             };
-            gensee_crate_linux::apply_nftables_script(&guard.plan.enforcement.nftables.script)
-                .map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!("cannot apply capability-cell nftables policy: {error}"),
-                    )
-                })?;
-            guard.table_applied = true;
             Ok(guard)
         }
     }
 
-    fn attach_and_release(&self, podman: &OsString, container_name: &str) -> io::Result<()> {
+    fn attach_and_release(&mut self, podman: &OsString, container_name: &str) -> io::Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (podman, container_name);
@@ -678,6 +670,19 @@ impl CellNetworkGuard {
                     }
                 }
             };
+            let source_address = inspect_capability_cell_ip(podman, container_name)?;
+            gensee_crate_linux::bind_nftables_plan_to_source_address(
+                &mut self.plan.enforcement.nftables,
+                source_address,
+            );
+            gensee_crate_linux::apply_nftables_script(&self.plan.enforcement.nftables.script)
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("cannot apply capability-cell nftables policy: {error}"),
+                    )
+                })?;
+            self.table_applied = true;
             let attached = gensee_crate_linux::attach_process_tree_to_cgroup(
                 pid,
                 Path::new(&self.plan.enforcement.cgroup.cgroup_path),
@@ -708,30 +713,66 @@ impl CellNetworkGuard {
                 Err(_) => {}
             }
         }
-        self.cleanup();
+        if let Err(error) = self.cleanup() {
+            evidence.collection_error = Some(match evidence.collection_error.take() {
+                Some(existing) => format!("{existing}; cleanup failed: {error}"),
+                None => format!("network cleanup failed: {error}"),
+            });
+        }
         evidence
     }
 
-    fn cleanup(&mut self) {
+    fn cleanup(&mut self) -> io::Result<()> {
         if self.cleaned {
-            return;
+            return Ok(());
         }
         if self.table_applied {
-            let _ = gensee_crate_linux::delete_nftables_table(
+            gensee_crate_linux::delete_nftables_table_if_exists(
                 &self.plan.enforcement.nftables.table_name,
-            );
+            )?;
+            self.table_applied = false;
         }
-        let _ = gensee_crate_linux::remove_agent_cgroup(Path::new(
+        gensee_crate_linux::remove_agent_cgroup(Path::new(
             &self.plan.enforcement.cgroup.cgroup_path,
-        ));
+        ))?;
         self.cleaned = true;
+        Ok(())
     }
 }
 
 impl Drop for CellNetworkGuard {
     fn drop(&mut self) {
-        self.cleanup();
+        let _ = self.cleanup();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_capability_cell_ip(
+    podman: &OsString,
+    container_name: &str,
+) -> io::Result<std::net::IpAddr> {
+    let output = run_command_capture(
+        podman,
+        &[OsString::from("inspect"), OsString::from(container_name)],
+    )?;
+    let value: Value = serde_json::from_str(&output)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    value
+        .as_array()
+        .and_then(|containers| containers.first())
+        .and_then(|container| container.get("NetworkSettings"))
+        .and_then(|settings| settings.get("Networks"))
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|networks| networks.values())
+        .filter_map(|network| network.get("IPAddress").and_then(Value::as_str))
+        .find_map(|address| address.parse::<std::net::IpAddr>().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "gated capability cell has no inspectable private-network address",
+            )
+        })
 }
 
 fn add_gateway_kind_mediator(
@@ -909,7 +950,7 @@ fn execute_capability_cell(
     let cleanup = TcloneContainerCleanup::new(&podman, &container_name);
     let started_at_ms = unix_millis()?;
     let mut child = Command::new(&podman).args(&run_args).spawn()?;
-    if let Some(guard) = network_guard.as_ref() {
+    if let Some(guard) = network_guard.as_mut() {
         if let Err(error) = guard.attach_and_release(&podman, &container_name) {
             let _ = Command::new(&podman)
                 .args(["kill", &container_name])
@@ -1058,7 +1099,7 @@ fn capability_cell_run_args(
         OsString::from(remaining_seconds.to_string()),
         OsString::from("--network"),
         OsString::from(if network_plan.is_some() {
-            "host"
+            "bridge"
         } else {
             "none"
         }),
@@ -2979,13 +3020,18 @@ mod tests {
                 .len(),
             1
         );
-        let plan = cell_network_plan("cell_network", &root, std::slice::from_ref(&broker))
+        let mut plan = cell_network_plan("cell_network", &root, std::slice::from_ref(&broker))
             .unwrap()
             .unwrap();
+        gensee_crate_linux::bind_nftables_plan_to_source_address(
+            &mut plan.enforcement.nftables,
+            "10.88.0.2".parse().unwrap(),
+        );
         assert_eq!(plan.enforcement.nftables.endpoint_counters.len(), 1);
         assert!(plan.enforcement.nftables.script.contains(
-            "ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport 443 counter name allow_0 accept"
+            "ip saddr 10.88.0.2 ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport 443 counter name allow_0 accept"
         ));
+        assert!(plan.enforcement.nftables.script.contains("hook forward"));
         let args = capability_cell_run_args(
             &source_record(),
             &lease,
@@ -3004,7 +3050,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rendered
             .windows(2)
-            .any(|pair| pair == ["--network", "host"]));
+            .any(|pair| pair == ["--network", "bridge"]));
         assert!(rendered
             .windows(2)
             .any(|pair| pair == ["--entrypoint", "/bin/sh"]));

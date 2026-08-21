@@ -277,7 +277,7 @@ dropped, privilege gain is disabled, an explicit seccomp deny profile and
 AppArmor profile are applied, resources are capped, and only explicitly
 selected workspace paths are copied and mounted. Attached broker authority is
 represented only by opaque ids and exact Unix-domain gateway socket mounts;
-the cell keeps `--network none`. Podman independently enforces the
+without a direct network lease the cell keeps `--network none`. Podman independently enforces the
 remaining lease lifetime and automatic removal as a backstop if the Gensee
 client exits. The exact command is fixed when the trusted host
 issues the lease; the lease is consumed atomically before scoped input copying,
@@ -305,9 +305,12 @@ promotion is rejected. Use `--dry-run` to perform all evidence and conflict
 checks without changing the source.
 
 Direct network leases are supported on Linux only when they pin IP/CIDR,
-TCP/UDP, and exact ports. Gensee applies a cgroup-v2/nftables allowlist before a
-trusted startup gate releases the leased command, then records allowed counters
-and blocked attempts. Policy-denied kernel authority and external mutations
+TCP/UDP, and exact ports. The cell receives a private Podman bridge namespace,
+never the host network namespace. While the command waits behind a trusted
+startup gate, Gensee inspects the private address, binds the nftables policy to
+that exact source address on the `forward` hook, applies the allowlist, and only
+then releases execution. Gensee records allowed counters and blocked attempts.
+Policy-denied kernel authority and external mutations
 still fail closed. Repository/API, identity, mTLS, browser, cloud, and database
 authority can run only through a source/operation/cell-bound broker gateway.
 The gateway must return complete typed effect telemetry at revocation or the

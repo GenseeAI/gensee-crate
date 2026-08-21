@@ -226,6 +226,24 @@ pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftab
     }
 }
 
+pub fn bind_nftables_plan_to_source_address(plan: &mut LinuxNftablesPlan, source_address: IpAddr) {
+    let source_match = match source_address {
+        IpAddr::V4(address) => format!("ip saddr {address}"),
+        IpAddr::V6(address) => format!("ip6 saddr {address}"),
+    };
+    plan.script = nftables_script_with_match(
+        &plan.table_name,
+        &plan.chain_name,
+        &source_match,
+        "forward",
+        plan.mode,
+        &plan.destinations,
+        &plan.denied_destinations,
+        &plan.block_counters,
+        &plan.endpoint_counters,
+    );
+}
+
 pub fn collect_process_tree(root_pid: u32) -> io::Result<Vec<u32>> {
     let parent_by_pid = read_parent_by_pid()?;
     let mut pids = parent_by_pid
@@ -332,8 +350,55 @@ pub fn delete_nftables_table(table_name: &str) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub fn delete_nftables_table_if_exists(table_name: &str) -> io::Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("nft")
+        .arg("-j")
+        .arg("list")
+        .arg("tables")
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "nft list tables exited with status {}",
+            output.status
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid nftables table list: {error}"),
+        )
+    })?;
+    let exists = value
+        .get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("table").is_some_and(|table| {
+                    table.get("family").and_then(serde_json::Value::as_str) == Some("inet")
+                        && table.get("name").and_then(serde_json::Value::as_str) == Some(table_name)
+                })
+            })
+        });
+    if exists {
+        delete_nftables_table(table_name)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn delete_nftables_table(_table_name: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "nftables network enforcement is only available on Linux",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn delete_nftables_table_if_exists(_table_name: &str) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "nftables network enforcement is only available on Linux",
@@ -473,6 +538,31 @@ fn nftables_script(
             .count(),
         escape_nft_string(cgroup_path)
     );
+    nftables_script_with_match(
+        table_name,
+        chain_name,
+        &cgroup_match,
+        "output",
+        mode,
+        destinations,
+        denied_destinations,
+        block_counters,
+        endpoint_counters,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nftables_script_with_match(
+    table_name: &str,
+    chain_name: &str,
+    subject_match: &str,
+    hook: &str,
+    mode: LinuxNetworkMode,
+    destinations: &[LinuxNftablesDestination],
+    denied_destinations: &[LinuxNftablesDestination],
+    block_counters: &[LinuxNftablesBlockCounter],
+    endpoint_counters: &[LinuxNftablesEndpointCounter],
+) -> String {
     if mode == LinuxNetworkMode::Off {
         return String::new();
     }
@@ -485,7 +575,9 @@ fn nftables_script(
         lines.push(format!("  counter {} {{}}", counter.name));
     }
     lines.push(format!("  chain {chain_name} {{"));
-    lines.push("    type filter hook output priority filter; policy accept;".to_string());
+    lines.push(format!(
+        "    type filter hook {hook} priority filter; policy accept;"
+    ));
 
     for (index, destination) in denied_destinations.iter().enumerate() {
         let counter_name = block_counters
@@ -498,11 +590,11 @@ fn nftables_script(
             .unwrap_or_else(|| denied_counter_name(index));
         match destination.family {
             LinuxNftablesAddressFamily::Ipv4 => lines.push(format!(
-                "    {cgroup_match} ip daddr {} counter name {} reject with icmpx admin-prohibited",
+                "    {subject_match} ip daddr {} counter name {} reject with icmpx admin-prohibited",
                 destination.value, counter_name
             )),
             LinuxNftablesAddressFamily::Ipv6 => lines.push(format!(
-                "    {cgroup_match} ip6 daddr {} counter name {} reject with icmpx admin-prohibited",
+                "    {subject_match} ip6 daddr {} counter name {} reject with icmpx admin-prohibited",
                 destination.value, counter_name
             )),
         }
@@ -546,18 +638,18 @@ fn nftables_script(
                 LinuxNftablesAddressFamily::Ipv6 => "ip6 daddr",
             };
             lines.push(format!(
-                "    {cgroup_match} {address} {} meta l4proto {protocol_name} {protocol_name} dport {ports} counter name {} accept",
+                "    {subject_match} {address} {} meta l4proto {protocol_name} {protocol_name} dport {ports} counter name {} accept",
                 destination.value, counter.name
             ));
             continue;
         }
         match destination.family {
             LinuxNftablesAddressFamily::Ipv4 => lines.push(format!(
-                "    {cgroup_match} ip daddr {} accept",
+                "    {subject_match} ip daddr {} accept",
                 destination.value
             )),
             LinuxNftablesAddressFamily::Ipv6 => lines.push(format!(
-                "    {cgroup_match} ip6 daddr {} accept",
+                "    {subject_match} ip6 daddr {} accept",
                 destination.value
             )),
         }
@@ -568,7 +660,7 @@ fn nftables_script(
         .map(|counter| counter.name.as_str())
         .unwrap_or(DEFAULT_REJECT_COUNTER);
     lines.push(format!(
-        "    {cgroup_match} counter name {default_counter_name} reject with icmpx admin-prohibited"
+        "    {subject_match} counter name {default_counter_name} reject with icmpx admin-prohibited"
     ));
     lines.push("  }".to_string());
     lines.push("}".to_string());
@@ -854,6 +946,32 @@ mod tests {
         assert_eq!(events[0].destination, "10.20.30.40/32");
         assert_eq!(events[0].protocol, LinuxNetworkProtocol::Tcp);
         assert_eq!(events[0].ports, vec![443, 8443]);
+    }
+
+    #[test]
+    fn rebinds_cell_policy_to_private_namespace_source_address() {
+        let config = LinuxNetworkEnforcementConfig::new(
+            "cell-1",
+            LinuxNetworkPolicy {
+                mode: LinuxNetworkMode::AllowListed,
+                allowed_hosts: Vec::new(),
+                denied_hosts: Vec::new(),
+                allowed_endpoints: vec![crate::policy::LinuxNetworkEndpoint {
+                    destination: "10.20.30.40/32".to_string(),
+                    protocol: LinuxNetworkProtocol::Tcp,
+                    ports: vec![443],
+                }],
+            },
+        );
+        let mut plan = build_nftables_plan(&config);
+
+        bind_nftables_plan_to_source_address(&mut plan, "10.88.0.2".parse().unwrap());
+
+        assert!(plan.script.contains("hook forward"));
+        assert!(plan
+            .script
+            .contains("ip saddr 10.88.0.2 ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport 443"));
+        assert!(!plan.script.contains("socket cgroupv2"));
     }
 
     #[test]
