@@ -12,6 +12,7 @@ quick start, then dive into the topic guides below.
 - [Tclone runtime integration](tclone.md) — launch agents in cloneable Linux containers, fork live source containers, inspect diffs, keep workspaces, and discard forks.
 - [C0 network capability boundary](c0-network-boundary.md) — operation-scoped network envelopes, temporary in-place leases, a read-only HTTP mediator, revocation, and effect evidence.
 - [Operation supervisor](operation-supervisor.md) — durable operation identity, lifecycle, process lineage, cgroup ownership, active envelopes, leases, and boundary-effect coordination.
+- [Capability faults](capability-faults.md) — typed black-box boundary observations, subject binding, fail-closed backend routing, retry-after-lease semantics, and network counter evidence.
 - [`gensee watch` (sidecar)](watch.md) — observe filesystem effects and macOS system events without launching the agent.
 - [`gensee run` and the macOS sandbox](run-and-sandbox.md) — managed launch with `sandbox-exec` confinement and staged workspaces.
 - [`gensee policy`](gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
 
-pub(crate) const OPERATION_RECORD_SCHEMA_VERSION: u32 = 1;
+pub(crate) const OPERATION_RECORD_SCHEMA_VERSION: u32 = 2;
 const OPERATION_POLL_INTERVAL_MS: u64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +84,15 @@ pub(crate) struct OperationViolation {
     pub observed_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperationNetworkUsage {
+    pub allowed_packets: u64,
+    pub allowed_bytes: u64,
+    pub blocked_packets: u64,
+    pub blocked_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManagedOperationRecord {
@@ -102,6 +111,8 @@ pub(crate) struct ManagedOperationRecord {
     pub process_lineage: Vec<OperationProcessIdentity>,
     #[serde(default)]
     pub boundary_effect_count: u64,
+    #[serde(default)]
+    pub network_usage: OperationNetworkUsage,
     #[serde(default)]
     pub violations: Vec<OperationViolation>,
     pub started_at_ms: u64,
@@ -154,14 +165,12 @@ struct OperationRecordLock(fs::File);
 impl OperationRecordLock {
     fn acquire(path: &Path) -> io::Result<Self> {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        let file = options.open(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if result != 0 {
@@ -305,6 +314,7 @@ impl OperationSupervisor {
                 envelope: normalize_envelope(envelope),
                 process_lineage: Vec::new(),
                 boundary_effect_count: 0,
+                network_usage: OperationNetworkUsage::default(),
                 violations: Vec::new(),
                 started_at_ms: now,
                 updated_at_ms: now,
@@ -415,6 +425,24 @@ impl OperationSupervisor {
         self.reload()?;
         self.refresh_lineage_in_memory()?;
         self.persist()
+    }
+
+    pub(crate) fn validates_local_process_identity(
+        &mut self,
+        pid: u32,
+        start_time_ticks: u64,
+    ) -> io::Result<bool> {
+        if pid == 0 || start_time_ticks == 0 {
+            return Ok(false);
+        }
+        let _lock = OperationRecordLock::acquire(&self.lock_path)?;
+        self.reload()?;
+        self.refresh_lineage_in_memory()?;
+        let matches = self.record.process_lineage.iter().any(|identity| {
+            identity.pid == pid && identity.start_time_ticks == start_time_ticks && identity.active
+        });
+        self.persist()?;
+        Ok(matches)
     }
 
     fn refresh_lineage_in_memory(&mut self) -> io::Result<()> {
@@ -532,6 +560,39 @@ impl OperationSupervisor {
                 });
             }
         }
+        self.record.updated_at_ms = unix_millis()?;
+        self.persist()
+    }
+
+    pub(crate) fn record_network_usage(
+        &mut self,
+        allowed_packets: u64,
+        allowed_bytes: u64,
+        blocked_packets: u64,
+        blocked_bytes: u64,
+    ) -> io::Result<()> {
+        let _lock = OperationRecordLock::acquire(&self.lock_path)?;
+        self.reload()?;
+        self.record.network_usage.allowed_packets = self
+            .record
+            .network_usage
+            .allowed_packets
+            .saturating_add(allowed_packets);
+        self.record.network_usage.allowed_bytes = self
+            .record
+            .network_usage
+            .allowed_bytes
+            .saturating_add(allowed_bytes);
+        self.record.network_usage.blocked_packets = self
+            .record
+            .network_usage
+            .blocked_packets
+            .saturating_add(blocked_packets);
+        self.record.network_usage.blocked_bytes = self
+            .record
+            .network_usage
+            .blocked_bytes
+            .saturating_add(blocked_bytes);
         self.record.updated_at_ms = unix_millis()?;
         self.persist()
     }
@@ -793,11 +854,14 @@ mod tests {
             lease: None,
         };
         boundary.record_network_effect(&event, &decision).unwrap();
+        boundary.record_network_usage(2, 200, 1, 80).unwrap();
 
         let record = read_operation_record(&root.join("operations/op_shared/record.json")).unwrap();
         assert_eq!(record.state, OperationState::Succeeded);
         assert_eq!(record.boundary_effect_count, 1);
         assert_eq!(record.envelope.network.grants.len(), 1);
+        assert_eq!(record.network_usage.allowed_packets, 2);
+        assert_eq!(record.network_usage.blocked_bytes, 80);
         env::remove_var("GENSEE_HOME");
         fs::remove_dir_all(root).ok();
     }

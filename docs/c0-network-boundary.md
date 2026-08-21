@@ -46,7 +46,7 @@ containing any restricted address is denied as a whole.
 
 ~~~json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "operation_id": "op_agent_fetch",
   "source_run_id": "run_agent",
   "source_address": "10.88.0.12",
@@ -99,14 +99,25 @@ sudo env GENSEE_HOME=/var/lib/gensee \
 
 The control socket and evidence are retained under
 GENSEE_HOME/network-operations/OPERATION_ID as supervisor.sock, record.json,
-and effects.jsonl. The generic lifecycle/envelope record is retained separately
-under GENSEE_HOME/operations/OPERATION_ID/record.json.
+effects.jsonl, faults.jsonl, and counters.jsonl. The generic lifecycle/envelope
+and cumulative network-usage record is retained separately under
+GENSEE_HOME/operations/OPERATION_ID/record.json.
 
 Submit a structured direct-network capability fault:
 
 ~~~console
 gensee run network event --socket /path/supervisor.sock --event event.json
 ~~~
+
+The provider-neutral fault adapter is preferred for new integrations:
+
+~~~console
+gensee run fault --socket /path/supervisor.sock --fault fault.json
+~~~
+
+It binds a PID/start-time or isolated peer identity to the operation, and
+returns retry permission only after the exact lease is active. See
+[Capability faults](capability-faults.md).
 
 Inspect the active envelope:
 
@@ -117,10 +128,10 @@ gensee run network inspect --socket /path/supervisor.sock
 ## Current boundary
 
 The HTTP gateway is automatic because proxy requests arrive before the external
-effect. Direct black-box connect attempts still need a system boundary adapter
-to produce the structured event and arrange a retry. The CLI accepts that event
-and installs or revokes the lease, but cannot move an arbitrary in-flight
-syscall to another execution substrate.
+effect. Direct black-box connect attempts still need a mandatory system
+boundary adapter to produce the generic fault and arrange a retry. The CLI
+validates that protocol and installs or revokes the lease, but cannot pause an
+arbitrary in-flight syscall or force an opaque program to retry.
 
 The supervisor currently runs as its invoking host principal. Moving authority,
 signing, nftables state, and evidence into a differently privileged daemon

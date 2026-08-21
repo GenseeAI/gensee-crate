@@ -1,4 +1,9 @@
 use crate::*;
+use gensee_crate_rules::capability_fault::{
+    BoundaryEffectObservation, CapabilityFault, CapabilityFaultAction, CapabilityFaultResolution,
+    CapabilityFaultSubject,
+};
+use gensee_crate_rules::capability_policy::CapabilityExecutor;
 use gensee_crate_rules::capability_policy::MediationBoundary;
 use gensee_crate_rules::network_boundary::{
     decide_network_boundary, NetworkBoundaryDecision, NetworkBoundaryDisposition,
@@ -11,15 +16,20 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
-use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
+use std::os::unix::{
+    fs::{OpenOptionsExt, PermissionsExt},
+    io::AsRawFd,
+};
 use std::sync::{Arc, Mutex};
 use url::Url;
 use uuid::Uuid;
 
-const NETWORK_SUPERVISOR_SCHEMA_VERSION: u32 = 1;
+const NETWORK_SUPERVISOR_SCHEMA_VERSION: u32 = 2;
 const MAX_PROXY_HEADER_BYTES: usize = 64 * 1024;
+const MAX_SUPERVISOR_MESSAGE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
 const NETWORK_POLL_INTERVAL_MS: u64 = 100;
+const NETWORK_USAGE_POLL_INTERVAL_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +75,10 @@ struct NetworkOperationRecord {
     policy: NetworkBoundaryPolicy,
     active_table_name: Option<String>,
     generation: u64,
+    #[serde(default)]
+    usage: OperationNetworkUsage,
+    #[serde(default)]
+    counter_snapshot: BTreeMap<String, (u64, u64)>,
     started_at_ms: u64,
     updated_at_ms: u64,
 }
@@ -73,6 +87,7 @@ struct NetworkOperationRecord {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum NetworkSupervisorRequest {
     Event { event: NetworkBoundaryEvent },
+    Fault { fault: CapabilityFault },
     Inspect,
 }
 
@@ -83,6 +98,8 @@ struct NetworkSupervisorResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     decision: Option<NetworkBoundaryDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution: Option<CapabilityFaultResolution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     record: Option<NetworkOperationRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -91,6 +108,8 @@ struct NetworkSupervisorResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NetworkEffectRecord {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fault_id: Option<String>,
     event: NetworkBoundaryEvent,
     decision: NetworkBoundaryDecision,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,12 +121,43 @@ struct NetworkEffectRecord {
     completed_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkCounterEvidenceRecord {
+    schema_version: u32,
+    operation_id: String,
+    generation: u64,
+    table_name: String,
+    #[serde(default)]
+    allowed: Vec<gensee_crate_linux::LinuxNetworkEndpointEvent>,
+    #[serde(default)]
+    blocked: Vec<gensee_crate_linux::LinuxNetworkBlockEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collection_error: Option<String>,
+    observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityFaultEvidenceRecord {
+    schema_version: u32,
+    fault: CapabilityFault,
+    resolution: CapabilityFaultResolution,
+    received_at_ms: u64,
+}
+
 struct NetworkSupervisor {
     record: NetworkOperationRecord,
     record_path: PathBuf,
     event_log_path: PathBuf,
+    counter_log_path: PathBuf,
+    fault_log_path: PathBuf,
     dry_run: bool,
     operation: Option<OperationSupervisor>,
+    active_plan: Option<gensee_crate_linux::LinuxNftablesPlan>,
+    counter_snapshot: BTreeMap<String, (u64, u64)>,
+    next_usage_sample_at_ms: u64,
+    last_counter_error: Option<String>,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -122,12 +172,10 @@ struct NetworkOperationLock(fs::File);
 #[cfg(unix)]
 impl NetworkOperationLock {
     fn acquire(path: &Path) -> io::Result<Self> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        let file = options.open(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
@@ -167,25 +215,30 @@ pub(crate) fn handle_c0_network(args: Vec<OsString>) -> io::Result<()> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("serve") => serve_network_supervisor(&args[1..]),
         Some("event") => send_network_supervisor_event(&args[1..]),
+        Some("fault") => send_capability_fault(&args[1..]),
         Some("inspect") => inspect_network_supervisor(&args[1..]),
         _ => Err(io::Error::new(
             ErrorKind::InvalidInput,
-            "usage: gensee run network <serve --config FILE [--dry-run]|event --socket PATH --event FILE|inspect --socket PATH>",
+            "usage: gensee run network <serve --config FILE [--dry-run]|event --socket PATH --event FILE|fault --socket PATH --fault FILE|inspect --socket PATH>",
         )),
     }
+}
+
+pub(crate) fn handle_capability_fault(args: Vec<OsString>) -> io::Result<()> {
+    send_capability_fault(&args)
 }
 
 fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     let config_path = network_arg_value(args, "--config")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "missing --config"))?;
-    let config: NetworkOperationConfig = serde_json::from_str(&fs::read_to_string(&config_path)?)
-        .map_err(|error| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            format!("invalid network operation config: {error}"),
-        )
-    })?;
+    let config: NetworkOperationConfig =
+        serde_json::from_str(&read_nofollow_to_string(&config_path)?).map_err(|error| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid network operation config: {error}"),
+            )
+        })?;
     validate_network_operation_config(&config)?;
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
     if !dry_run && std::env::consts::OS != "linux" {
@@ -202,16 +255,21 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     let socket_path = root.join("supervisor.sock");
     let record_path = root.join("record.json");
     let event_log_path = root.join("effects.jsonl");
-    let stale_table = if record_path.exists() {
+    let counter_log_path = root.join("counters.jsonl");
+    let fault_log_path = root.join("faults.jsonl");
+    let previous = if record_path.exists() {
         let previous: NetworkOperationRecord =
-            serde_json::from_str(&fs::read_to_string(&record_path)?).map_err(|error| {
+            serde_json::from_str(&read_nofollow_to_string(&record_path)?).map_err(|error| {
                 io::Error::new(
                     ErrorKind::InvalidData,
                     format!("cannot reconcile prior network operation record: {error}"),
                 )
             })?;
-        if previous.operation_id != config.operation_id
+        if previous.schema_version != NETWORK_SUPERVISOR_SCHEMA_VERSION
+            || previous.operation_id != config.operation_id
             || previous.source_run_id != config.source_run_id
+            || previous.root_pid != config.root_pid
+            || previous.source_address != config.source_address
             || previous
                 .active_table_name
                 .as_deref()
@@ -222,11 +280,14 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
                 "prior network operation record is not safe to reconcile",
             ));
         }
-        previous.active_table_name
+        Some(previous)
     } else {
         None
     };
-    let started_at_ms = unix_millis()?;
+    let now_ms = unix_millis()?;
+    let started_at_ms = previous
+        .as_ref()
+        .map_or(now_ms, |record| record.started_at_ms);
     let record = NetworkOperationRecord {
         schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
         operation_id: config.operation_id.clone(),
@@ -235,12 +296,41 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         source_address: config.source_address.clone(),
         envelope: config.envelope.clone(),
         policy: config.policy.clone(),
-        active_table_name: None,
-        generation: 0,
+        active_table_name: previous
+            .as_ref()
+            .and_then(|record| record.active_table_name.clone()),
+        generation: previous.as_ref().map_or(0, |record| record.generation),
+        usage: previous
+            .as_ref()
+            .map_or_else(OperationNetworkUsage::default, |record| {
+                record.usage.clone()
+            }),
+        counter_snapshot: previous
+            .as_ref()
+            .map_or_else(BTreeMap::new, |record| record.counter_snapshot.clone()),
         started_at_ms,
-        updated_at_ms: started_at_ms,
+        updated_at_ms: now_ms,
     };
     let table_names = Arc::new(Mutex::new(Vec::new()));
+    if let Some(table) = record.active_table_name.as_ref() {
+        table_names
+            .lock()
+            .map_err(|_| io::Error::other("network table registry lock poisoned"))?
+            .push(table.clone());
+    }
+    let active_plan = if record.active_table_name.is_some() {
+        let plan = network_plan_for_record(&record)?;
+        if plan.nftables.table_name != record.active_table_name.as_deref().unwrap_or_default() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "prior network operation table does not match its recorded generation",
+            ));
+        }
+        Some(plan.nftables)
+    } else {
+        None
+    };
+    let counter_snapshot = record.counter_snapshot.clone();
     let cgroup_path = if let Some(root_pid) = config.root_pid {
         let path = gensee_crate_linux::default_agent_cgroup_path(&config.operation_id);
         if !dry_run {
@@ -303,8 +393,14 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         record,
         record_path,
         event_log_path,
+        counter_log_path,
+        fault_log_path,
         dry_run,
         operation: Some(operation),
+        active_plan,
+        counter_snapshot,
+        next_usage_sample_at_ms: now_ms.saturating_add(NETWORK_USAGE_POLL_INTERVAL_MS),
+        last_counter_error: None,
     }));
     let _cleanup = NetworkRuntimeCleanup {
         table_names: Arc::clone(&table_names),
@@ -314,13 +410,6 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         let mut state = lock_supervisor(&supervisor)?;
         state.reconcile_expired_and_apply(&table_names)?;
     }
-    if let Some(stale_table) = stale_table {
-        if !dry_run {
-            // The new baseline is active before stale authority is removed.
-            gensee_crate_linux::delete_nftables_table_if_exists(&stale_table)?;
-        }
-    }
-
     #[cfg(not(unix))]
     {
         let _ = (socket_path, supervisor, table_names, config);
@@ -380,8 +469,14 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
             }
             {
                 let mut state = lock_supervisor(&supervisor)?;
-                if state.has_expired_leases(unix_millis()?) {
+                let now_ms = unix_millis()?;
+                if state.has_expired_leases(now_ms) {
                     state.reconcile_expired_and_apply(&table_names)?;
+                }
+                if now_ms >= state.next_usage_sample_at_ms {
+                    state.sample_usage()?;
+                    state.next_usage_sample_at_ms =
+                        now_ms.saturating_add(NETWORK_USAGE_POLL_INTERVAL_MS);
                 }
             }
             thread::sleep(Duration::from_millis(NETWORK_POLL_INTERVAL_MS));
@@ -461,6 +556,131 @@ impl NetworkSupervisor {
         ))
     }
 
+    fn resolve_fault(
+        &mut self,
+        fault: &CapabilityFault,
+        table_names: &Arc<Mutex<Vec<String>>>,
+    ) -> io::Result<(CapabilityFaultResolution, Option<NetworkEffectRecord>)> {
+        let mut reasons = fault.validation_reasons();
+        if fault.operation_id != self.record.operation_id
+            || fault.source_run_id != self.record.source_run_id
+        {
+            reasons.push("fault_is_not_bound_to_this_operation".to_string());
+        }
+        let subject_matches = match &fault.subject {
+            CapabilityFaultSubject::LocalProcess {
+                pid,
+                start_time_ticks,
+            } => {
+                if self.record.root_pid.is_none() {
+                    false
+                } else if let Some(operation) = self.operation.as_mut() {
+                    operation.validates_local_process_identity(*pid, *start_time_ticks)?
+                } else {
+                    false
+                }
+            }
+            CapabilityFaultSubject::NetworkPeer { source_address } => self
+                .record
+                .source_address
+                .as_deref()
+                .is_some_and(|expected| expected == source_address),
+        };
+        if !subject_matches {
+            reasons.push("fault_subject_is_not_in_the_operation".to_string());
+        }
+        if !reasons.is_empty() {
+            return Ok((denied_fault_resolution(fault, reasons), None));
+        }
+
+        let BoundaryEffectObservation::NetworkConnect {
+            destination,
+            protocol,
+            port,
+        } = &fault.effect
+        else {
+            return Ok((
+                denied_fault_resolution(
+                    fault,
+                    vec!["capability_fault_backend_unavailable".to_string()],
+                ),
+                None,
+            ));
+        };
+        let protocol = match protocol.to_ascii_lowercase().as_str() {
+            "tcp" => NetworkProtocol::Tcp,
+            "udp" => NetworkProtocol::Udp,
+            _ => {
+                return Ok((
+                    denied_fault_resolution(
+                        fault,
+                        vec!["invalid_network_connect_effect".to_string()],
+                    ),
+                    None,
+                ));
+            }
+        };
+        let mut event = NetworkBoundaryEvent {
+            schema_version: NETWORK_BOUNDARY_SCHEMA_VERSION,
+            operation_id: fault.operation_id.clone(),
+            source_run_id: fault.source_run_id.clone(),
+            process_id: self.record.root_pid.unwrap_or(1),
+            destination: destination.clone(),
+            protocol,
+            port: *port,
+            effect: NetworkEffectKind::DirectConnect,
+            observed_at_ms: fault.observed_at_ms,
+            requested_ttl_seconds: Some(fault.requested_ttl_seconds),
+        };
+        let decision = self.decide(&mut event)?;
+        let decision = self.apply_decision(&event, decision, table_names)?;
+        let (action, executor, retry_allowed) = match decision.disposition {
+            NetworkBoundaryDisposition::AllowWithinEnvelope => (
+                CapabilityFaultAction::ContinueAlreadyAuthorized,
+                Some(CapabilityExecutor::CurrentOperation),
+                true,
+            ),
+            NetworkBoundaryDisposition::AttachInPlaceLease => (
+                CapabilityFaultAction::RetryAfterLease,
+                Some(CapabilityExecutor::CurrentOperation),
+                true,
+            ),
+            NetworkBoundaryDisposition::BrokerHttp => (
+                CapabilityFaultAction::Delegate,
+                Some(CapabilityExecutor::TrustedMediator),
+                false,
+            ),
+            NetworkBoundaryDisposition::Deny => (CapabilityFaultAction::Deny, None, false),
+        };
+        let resolution = CapabilityFaultResolution {
+            fault_id: fault.fault_id.clone(),
+            action,
+            executor,
+            lease_id: decision
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.lease_id.clone()),
+            expires_at_ms: decision
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.expires_at_ms),
+            retry_allowed,
+            reason_codes: vec![decision.reason_code.clone()],
+        };
+        let effect = NetworkEffectRecord {
+            schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+            fault_id: Some(fault.fault_id.clone()),
+            event,
+            lease_id: resolution.lease_id.clone(),
+            decision,
+            response_status: None,
+            bytes_from_client: 0,
+            bytes_to_client: 0,
+            completed_at_ms: unix_millis()?,
+        };
+        Ok((resolution, Some(effect)))
+    }
+
     fn apply_decision(
         &mut self,
         event: &NetworkBoundaryEvent,
@@ -484,6 +704,12 @@ impl NetworkSupervisor {
                     .envelope
                     .grants
                     .retain(|grant| grant.lease_id.as_deref() != failed_id);
+                self.record.updated_at_ms = unix_millis()?;
+                if let Err(persist_error) = self.persist() {
+                    return Err(io::Error::other(format!(
+                        "network lease activation failed: {error}; rollback evidence could not be persisted: {persist_error}"
+                    )));
+                }
                 return Err(error);
             }
         }
@@ -510,59 +736,15 @@ impl NetworkSupervisor {
             .grants
             .retain(|grant| grant.expires_at_ms.is_none_or(|expiry| now_ms < expiry));
         self.record.generation = self.record.generation.saturating_add(1);
-        let session = format!("{}_{}", self.record.operation_id, self.record.generation);
-        let mut config = gensee_crate_linux::LinuxNetworkEnforcementConfig::new(
-            session,
-            gensee_crate_linux::LinuxNetworkPolicy {
-                mode: gensee_crate_linux::LinuxNetworkMode::AllowListed,
-                allowed_hosts: Vec::new(),
-                denied_hosts: Vec::new(),
-                allowed_endpoints: self
-                    .record
-                    .envelope
-                    .grants
-                    .iter()
-                    .flat_map(|grant| {
-                        grant.ports.iter().map(move |port| {
-                            gensee_crate_linux::LinuxNetworkEndpoint {
-                                destination: grant.destination.clone(),
-                                protocol: match grant.protocol {
-                                    NetworkProtocol::Tcp => {
-                                        gensee_crate_linux::LinuxNetworkProtocol::Tcp
-                                    }
-                                    NetworkProtocol::Udp => {
-                                        gensee_crate_linux::LinuxNetworkProtocol::Udp
-                                    }
-                                },
-                                ports: vec![*port],
-                            }
-                        })
-                    })
-                    .collect(),
-            },
-        );
-        config.root_pid = self.record.root_pid;
         if let Some(pid) = self.record.root_pid {
-            config.cgroup_path =
-                gensee_crate_linux::default_agent_cgroup_path(&self.record.operation_id)
-                    .to_string_lossy()
-                    .to_string();
             if !self.dry_run {
                 gensee_crate_linux::attach_process_tree_to_cgroup(
                     pid,
-                    Path::new(&config.cgroup_path),
+                    &gensee_crate_linux::default_agent_cgroup_path(&self.record.operation_id),
                 )?;
             }
         }
-        let mut plan = gensee_crate_linux::plan_nftables_policy(&config);
-        if let Some(address) = self.record.source_address.as_deref() {
-            gensee_crate_linux::bind_nftables_plan_to_source_address(
-                &mut plan.nftables,
-                address.parse().map_err(|_| {
-                    io::Error::new(ErrorKind::InvalidData, "invalid stored source address")
-                })?,
-            );
-        }
+        let plan = network_plan_for_record(&self.record)?;
         if !plan.warnings.is_empty() {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
@@ -579,11 +761,24 @@ impl NetworkSupervisor {
                 .lock()
                 .map_err(|_| io::Error::other("network table registry lock poisoned"))?
                 .push(new_table.clone());
+            self.sample_usage()?;
+            let new_snapshot = match read_counter_snapshot(&plan.nftables) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let _ = gensee_crate_linux::delete_nftables_table_if_exists(&new_table);
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("cannot establish network usage counter baseline: {error}"),
+                    ));
+                }
+            };
             if let Some(old_table) = self.record.active_table_name.as_deref() {
                 gensee_crate_linux::delete_nftables_table_if_exists(old_table)?;
             }
+            self.counter_snapshot = new_snapshot;
+            self.record.counter_snapshot = self.counter_snapshot.clone();
         }
-        {
+        if self.dry_run {
             let mut names = table_names
                 .lock()
                 .map_err(|_| io::Error::other("network table registry lock poisoned"))?;
@@ -591,8 +786,18 @@ impl NetworkSupervisor {
             if let Some(old) = self.record.active_table_name.as_deref() {
                 names.retain(|name| name != old);
             }
+            self.counter_snapshot.clear();
+            self.record.counter_snapshot.clear();
+        } else {
+            let mut names = table_names
+                .lock()
+                .map_err(|_| io::Error::other("network table registry lock poisoned"))?;
+            if let Some(old) = self.record.active_table_name.as_deref() {
+                names.retain(|name| name != old);
+            }
         }
         self.record.active_table_name = Some(new_table);
+        self.active_plan = Some(plan.nftables);
         self.record.updated_at_ms = now_ms;
         self.persist()?;
         if let Some(operation) = self.operation.as_mut() {
@@ -601,16 +806,126 @@ impl NetworkSupervisor {
         Ok(())
     }
 
-    fn append_effect(&mut self, effect: &NetworkEffectRecord) -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.event_log_path)?;
-        #[cfg(unix)]
-        fs::set_permissions(
-            &self.event_log_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    fn sample_usage(&mut self) -> io::Result<()> {
+        if self.dry_run {
+            return Ok(());
+        }
+        let Some(plan) = self.active_plan.clone() else {
+            return Ok(());
+        };
+        let observed_at_ms = unix_millis()?;
+        let (allowed, blocked) = match read_counter_events(&plan) {
+            Ok(events) => {
+                self.last_counter_error = None;
+                events
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if self.last_counter_error.as_deref() != Some(&message) {
+                    self.append_counter_evidence(&NetworkCounterEvidenceRecord {
+                        schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                        operation_id: self.record.operation_id.clone(),
+                        generation: self.record.generation,
+                        table_name: plan.table_name.clone(),
+                        allowed: Vec::new(),
+                        blocked: Vec::new(),
+                        collection_error: Some(message.clone()),
+                        observed_at_ms,
+                    })?;
+                    self.last_counter_error = Some(message);
+                }
+                return Ok(());
+            }
+        };
+        let allowed = endpoint_counter_deltas(&mut self.counter_snapshot, allowed);
+        let blocked = block_counter_deltas(&mut self.counter_snapshot, blocked);
+        if allowed.is_empty() && blocked.is_empty() {
+            return Ok(());
+        }
+        let allowed_packets = allowed
+            .iter()
+            .fold(0u64, |total, event| total.saturating_add(event.packets));
+        let allowed_bytes = allowed
+            .iter()
+            .fold(0u64, |total, event| total.saturating_add(event.bytes));
+        let blocked_packets = blocked
+            .iter()
+            .fold(0u64, |total, event| total.saturating_add(event.packets));
+        let blocked_bytes = blocked
+            .iter()
+            .fold(0u64, |total, event| total.saturating_add(event.bytes));
+        self.record.usage.allowed_packets = self
+            .record
+            .usage
+            .allowed_packets
+            .saturating_add(allowed_packets);
+        self.record.usage.allowed_bytes = self
+            .record
+            .usage
+            .allowed_bytes
+            .saturating_add(allowed_bytes);
+        self.record.usage.blocked_packets = self
+            .record
+            .usage
+            .blocked_packets
+            .saturating_add(blocked_packets);
+        self.record.usage.blocked_bytes = self
+            .record
+            .usage
+            .blocked_bytes
+            .saturating_add(blocked_bytes);
+        self.record.counter_snapshot = self.counter_snapshot.clone();
+        self.record.updated_at_ms = observed_at_ms;
+        self.persist()?;
+        self.append_counter_evidence(&NetworkCounterEvidenceRecord {
+            schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+            operation_id: self.record.operation_id.clone(),
+            generation: self.record.generation,
+            table_name: plan.table_name.clone(),
+            allowed,
+            blocked,
+            collection_error: None,
+            observed_at_ms,
+        })?;
+        if let Some(operation) = self.operation.as_mut() {
+            operation.record_network_usage(
+                allowed_packets,
+                allowed_bytes,
+                blocked_packets,
+                blocked_bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn append_counter_evidence(&self, evidence: &NetworkCounterEvidenceRecord) -> io::Result<()> {
+        let mut file = open_owner_append_nofollow(&self.counter_log_path)?;
+        serde_json::to_writer(&mut file, evidence)?;
+        file.write_all(b"\n")?;
+        file.sync_data()
+    }
+
+    fn append_fault_evidence(
+        &self,
+        fault: &CapabilityFault,
+        resolution: &CapabilityFaultResolution,
+    ) -> io::Result<()> {
+        let mut file = open_owner_append_nofollow(&self.fault_log_path)?;
+        serde_json::to_writer(
+            &mut file,
+            &CapabilityFaultEvidenceRecord {
+                schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                fault: fault.clone(),
+                resolution: resolution.clone(),
+                received_at_ms: unix_millis()?,
+            },
         )?;
+        file.write_all(b"\n")?;
+        file.sync_data()
+    }
+
+    fn append_effect(&mut self, effect: &NetworkEffectRecord) -> io::Result<()> {
+        let mut file = open_owner_append_nofollow(&self.event_log_path)?;
         serde_json::to_writer(&mut file, effect)?;
         file.write_all(b"\n")?;
         file.sync_data()?;
@@ -635,17 +950,55 @@ fn handle_supervisor_stream(
     supervisor: Arc<Mutex<NetworkSupervisor>>,
     table_names: Arc<Mutex<Vec<String>>>,
 ) -> io::Result<()> {
-    let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let line = read_bounded_supervisor_line(BufReader::new(stream.try_clone()?))?;
     let request: NetworkSupervisorRequest = serde_json::from_str(&line)
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
     let response = match request {
-        NetworkSupervisorRequest::Inspect => NetworkSupervisorResponse {
-            ok: true,
-            decision: None,
-            record: Some(lock_supervisor(&supervisor)?.record.clone()),
-            error: None,
-        },
+        NetworkSupervisorRequest::Inspect => {
+            let mut state = lock_supervisor(&supervisor)?;
+            state.sample_usage()?;
+            NetworkSupervisorResponse {
+                ok: true,
+                decision: None,
+                resolution: None,
+                record: Some(state.record.clone()),
+                error: None,
+            }
+        }
+        NetworkSupervisorRequest::Fault { fault } => {
+            let mut state = lock_supervisor(&supervisor)?;
+            match state.resolve_fault(&fault, &table_names) {
+                Ok((resolution, effect)) => {
+                    state.append_fault_evidence(&fault, &resolution)?;
+                    if let Some(effect) = effect.as_ref() {
+                        state.append_effect(effect)?;
+                    }
+                    NetworkSupervisorResponse {
+                        ok: true,
+                        decision: None,
+                        resolution: Some(resolution),
+                        record: None,
+                        error: None,
+                    }
+                }
+                Err(error) => {
+                    let resolution = denied_fault_resolution(
+                        &fault,
+                        vec!["capability_fault_backend_error".to_string()],
+                    );
+                    state.append_fault_evidence(&fault, &resolution)?;
+                    NetworkSupervisorResponse {
+                        ok: false,
+                        decision: None,
+                        resolution: Some(resolution),
+                        record: None,
+                        error: Some(error.to_string()),
+                    }
+                }
+            }
+        }
         NetworkSupervisorRequest::Event { mut event } => {
             let mut state = lock_supervisor(&supervisor)?;
             let decision = state.decide(&mut event)?;
@@ -653,6 +1006,7 @@ fn handle_supervisor_stream(
                 Ok(decision) => {
                     let effect = NetworkEffectRecord {
                         schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                        fault_id: None,
                         event,
                         lease_id: decision
                             .lease
@@ -668,6 +1022,7 @@ fn handle_supervisor_stream(
                     NetworkSupervisorResponse {
                         ok: true,
                         decision: Some(decision),
+                        resolution: None,
                         record: None,
                         error: None,
                     }
@@ -675,6 +1030,7 @@ fn handle_supervisor_stream(
                 Err(error) => NetworkSupervisorResponse {
                     ok: false,
                     decision: None,
+                    resolution: None,
                     record: None,
                     error: Some(error.to_string()),
                 },
@@ -757,6 +1113,7 @@ fn handle_http_proxy_connection(
         for (event, decision) in decisions {
             let effect = NetworkEffectRecord {
                 schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                fault_id: None,
                 event,
                 decision,
                 lease_id: None,
@@ -791,6 +1148,7 @@ fn handle_http_proxy_connection(
             write_proxy_error(&mut client, 502, "upstream connection failed")?;
             let effect = NetworkEffectRecord {
                 schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                fault_id: None,
                 event,
                 decision,
                 lease_id: None,
@@ -813,6 +1171,7 @@ fn handle_http_proxy_connection(
     let (bytes_from_client, bytes_to_client, status) = (forwarded.len() as u64, status.1, status.0);
     let effect = NetworkEffectRecord {
         schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+        fault_id: None,
         event,
         decision,
         lease_id: None,
@@ -1050,9 +1409,18 @@ fn send_network_supervisor_event(args: &[OsString]) -> io::Result<()> {
     let event_path = network_arg_value(args, "--event")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "missing --event"))?;
-    let event: NetworkBoundaryEvent = serde_json::from_str(&fs::read_to_string(event_path)?)
+    let event: NetworkBoundaryEvent = serde_json::from_str(&read_nofollow_to_string(&event_path)?)
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
     send_supervisor_request(args, &NetworkSupervisorRequest::Event { event })
+}
+
+fn send_capability_fault(args: &[OsString]) -> io::Result<()> {
+    let fault_path = network_arg_value(args, "--fault")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "missing --fault"))?;
+    let fault: CapabilityFault = serde_json::from_str(&read_nofollow_to_string(&fault_path)?)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    send_supervisor_request(args, &NetworkSupervisorRequest::Fault { fault })
 }
 
 fn inspect_network_supervisor(args: &[OsString]) -> io::Result<()> {
@@ -1068,10 +1436,11 @@ fn send_supervisor_request(
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "missing --socket"))?;
     let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response)?;
+    let response = read_bounded_supervisor_line(BufReader::new(stream))?;
     let parsed: NetworkSupervisorResponse = serde_json::from_str(&response)
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
     println!("{}", serde_json::to_string_pretty(&parsed)?);
@@ -1130,12 +1499,202 @@ fn network_arg_value<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {
         .find_map(|pair| (pair[0] == flag).then(|| pair[1].to_str()).flatten())
 }
 
+fn read_bounded_supervisor_line(reader: impl BufRead) -> io::Result<String> {
+    let mut line = String::new();
+    reader
+        .take(MAX_SUPERVISOR_MESSAGE_BYTES + 1)
+        .read_line(&mut line)?;
+    if line.len() as u64 > MAX_SUPERVISOR_MESSAGE_BYTES || !line.ends_with('\n') {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "network supervisor message is incomplete or exceeds its byte limit",
+        ));
+    }
+    Ok(line)
+}
+
+fn open_owner_append_nofollow(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "network evidence destination is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn network_plan_for_record(
+    record: &NetworkOperationRecord,
+) -> io::Result<gensee_crate_linux::LinuxNetworkEnforcementPlan> {
+    let session = format!("{}_{}", record.operation_id, record.generation);
+    let mut config = gensee_crate_linux::LinuxNetworkEnforcementConfig::new(
+        session,
+        gensee_crate_linux::LinuxNetworkPolicy {
+            mode: gensee_crate_linux::LinuxNetworkMode::AllowListed,
+            allowed_hosts: Vec::new(),
+            denied_hosts: Vec::new(),
+            allowed_endpoints: record
+                .envelope
+                .grants
+                .iter()
+                .flat_map(|grant| {
+                    grant
+                        .ports
+                        .iter()
+                        .map(move |port| gensee_crate_linux::LinuxNetworkEndpoint {
+                            destination: grant.destination.clone(),
+                            protocol: match grant.protocol {
+                                NetworkProtocol::Tcp => {
+                                    gensee_crate_linux::LinuxNetworkProtocol::Tcp
+                                }
+                                NetworkProtocol::Udp => {
+                                    gensee_crate_linux::LinuxNetworkProtocol::Udp
+                                }
+                            },
+                            ports: vec![*port],
+                        })
+                })
+                .collect(),
+        },
+    );
+    config.root_pid = record.root_pid;
+    if record.root_pid.is_some() {
+        config.cgroup_path = gensee_crate_linux::default_agent_cgroup_path(&record.operation_id)
+            .to_string_lossy()
+            .to_string();
+    }
+    let mut plan = gensee_crate_linux::plan_nftables_policy(&config);
+    if let Some(address) = record.source_address.as_deref() {
+        gensee_crate_linux::bind_nftables_plan_to_source_address(
+            &mut plan.nftables,
+            address.parse().map_err(|_| {
+                io::Error::new(ErrorKind::InvalidData, "invalid stored source address")
+            })?,
+        );
+    }
+    Ok(plan)
+}
+
+fn read_counter_events(
+    plan: &gensee_crate_linux::LinuxNftablesPlan,
+) -> io::Result<(
+    Vec<gensee_crate_linux::LinuxNetworkEndpointEvent>,
+    Vec<gensee_crate_linux::LinuxNetworkBlockEvent>,
+)> {
+    Ok((
+        gensee_crate_linux::read_nftables_endpoint_events(plan)?,
+        gensee_crate_linux::read_nftables_block_events(plan)?,
+    ))
+}
+
+fn read_counter_snapshot(
+    plan: &gensee_crate_linux::LinuxNftablesPlan,
+) -> io::Result<BTreeMap<String, (u64, u64)>> {
+    let (allowed, blocked) = read_counter_events(plan)?;
+    let mut snapshot = BTreeMap::new();
+    for event in allowed {
+        snapshot.insert(
+            counter_snapshot_key("allow", &event.table_name, &event.counter_name),
+            (event.packets, event.bytes),
+        );
+    }
+    for event in blocked {
+        snapshot.insert(
+            counter_snapshot_key("block", &event.table_name, &event.counter_name),
+            (event.packets, event.bytes),
+        );
+    }
+    Ok(snapshot)
+}
+
+fn endpoint_counter_deltas(
+    snapshot: &mut BTreeMap<String, (u64, u64)>,
+    events: Vec<gensee_crate_linux::LinuxNetworkEndpointEvent>,
+) -> Vec<gensee_crate_linux::LinuxNetworkEndpointEvent> {
+    events
+        .into_iter()
+        .filter_map(|mut event| {
+            let key = counter_snapshot_key("allow", &event.table_name, &event.counter_name);
+            let (packets, bytes) = counter_delta(
+                snapshot.insert(key, (event.packets, event.bytes)),
+                (event.packets, event.bytes),
+            );
+            event.packets = packets;
+            event.bytes = bytes;
+            (packets > 0 || bytes > 0).then_some(event)
+        })
+        .collect()
+}
+
+fn block_counter_deltas(
+    snapshot: &mut BTreeMap<String, (u64, u64)>,
+    events: Vec<gensee_crate_linux::LinuxNetworkBlockEvent>,
+) -> Vec<gensee_crate_linux::LinuxNetworkBlockEvent> {
+    events
+        .into_iter()
+        .filter_map(|mut event| {
+            let key = counter_snapshot_key("block", &event.table_name, &event.counter_name);
+            let (packets, bytes) = counter_delta(
+                snapshot.insert(key, (event.packets, event.bytes)),
+                (event.packets, event.bytes),
+            );
+            event.packets = packets;
+            event.bytes = bytes;
+            (packets > 0 || bytes > 0).then_some(event)
+        })
+        .collect()
+}
+
+fn counter_delta(previous: Option<(u64, u64)>, current: (u64, u64)) -> (u64, u64) {
+    let Some(previous) = previous else {
+        return current;
+    };
+    (
+        if current.0 >= previous.0 {
+            current.0 - previous.0
+        } else {
+            current.0
+        },
+        if current.1 >= previous.1 {
+            current.1 - previous.1
+        } else {
+            current.1
+        },
+    )
+}
+
+fn counter_snapshot_key(kind: &str, table: &str, counter: &str) -> String {
+    format!("{kind}:{table}:{counter}")
+}
+
 fn lock_supervisor(
     supervisor: &Arc<Mutex<NetworkSupervisor>>,
 ) -> io::Result<std::sync::MutexGuard<'_, NetworkSupervisor>> {
     supervisor
         .lock()
         .map_err(|_| io::Error::other("network supervisor lock poisoned"))
+}
+
+fn denied_fault_resolution(
+    fault: &CapabilityFault,
+    reason_codes: Vec<String>,
+) -> CapabilityFaultResolution {
+    CapabilityFaultResolution {
+        fault_id: fault.fault_id.clone(),
+        action: CapabilityFaultAction::Deny,
+        executor: None,
+        lease_id: None,
+        expires_at_ms: None,
+        retry_allowed: false,
+        reason_codes,
+    }
 }
 
 #[cfg(test)]
@@ -1158,13 +1717,21 @@ mod tests {
                 policy,
                 active_table_name: None,
                 generation: 0,
+                usage: OperationNetworkUsage::default(),
+                counter_snapshot: BTreeMap::new(),
                 started_at_ms: 1,
                 updated_at_ms: 1,
             },
             record_path: root.join("record.json"),
             event_log_path: root.join("effects.jsonl"),
+            counter_log_path: root.join("counters.jsonl"),
+            fault_log_path: root.join("faults.jsonl"),
             dry_run: true,
             operation: None,
+            active_plan: None,
+            counter_snapshot: BTreeMap::new(),
+            next_usage_sample_at_ms: u64::MAX,
+            last_counter_error: None,
         }))
     }
 
@@ -1185,6 +1752,34 @@ mod tests {
         assert!(!forwarded.contains("attacker.test"));
         assert!(!forwarded.to_ascii_lowercase().contains("authorization"));
         assert!(!forwarded.to_ascii_lowercase().contains("cookie"));
+    }
+
+    #[test]
+    fn supervisor_messages_are_newline_terminated_and_bounded() {
+        assert_eq!(
+            read_bounded_supervisor_line(io::Cursor::new(b"{}\n")).unwrap(),
+            "{}\n"
+        );
+        assert!(read_bounded_supervisor_line(io::Cursor::new(b"{}".as_slice())).is_err());
+        let mut oversized = vec![b'x'; MAX_SUPERVISOR_MESSAGE_BYTES as usize + 1];
+        oversized.push(b'\n');
+        assert!(read_bounded_supervisor_line(io::Cursor::new(oversized)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn network_evidence_append_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target");
+        fs::write(&target, b"unchanged").unwrap();
+        let link = root.join("effects.jsonl");
+        symlink(&target, &link).unwrap();
+        assert!(open_owner_append_nofollow(&link).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1266,6 +1861,103 @@ mod tests {
         state.reconcile_expired_and_apply(&tables).unwrap();
         assert!(state.record.envelope.grants.is_empty());
         assert!(state.record.generation >= 2);
+    }
+
+    #[test]
+    fn generic_network_fault_retries_only_after_a_scoped_lease_is_active() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let policy = NetworkBoundaryPolicy {
+            in_place_lease_destinations: vec!["8.8.8.8".to_string()],
+            ..NetworkBoundaryPolicy::default()
+        };
+        let supervisor = test_supervisor(&root, policy);
+        let tables = Arc::new(Mutex::new(Vec::new()));
+        let mut state = supervisor.lock().unwrap();
+        state.record.root_pid = None;
+        state.record.source_address = Some("10.88.0.12".to_string());
+        let fault = CapabilityFault {
+            schema_version: gensee_crate_rules::capability_fault::CAPABILITY_FAULT_SCHEMA_VERSION,
+            fault_id: "fault_network_1".to_string(),
+            operation_id: "op_1".to_string(),
+            source_run_id: "run_1".to_string(),
+            subject: CapabilityFaultSubject::NetworkPeer {
+                source_address: "10.88.0.12".to_string(),
+            },
+            effect: BoundaryEffectObservation::NetworkConnect {
+                destination: "8.8.8.8".to_string(),
+                protocol: "tcp".to_string(),
+                port: 443,
+            },
+            requested_ttl_seconds: 5,
+            observed_at_ms: 1,
+        };
+        let (resolution, effect) = state.resolve_fault(&fault, &tables).unwrap();
+        assert_eq!(resolution.action, CapabilityFaultAction::RetryAfterLease);
+        assert!(resolution.retry_allowed);
+        assert!(resolution.lease_id.is_some());
+        assert_eq!(state.record.envelope.grants.len(), 1);
+        assert_eq!(effect.unwrap().fault_id.as_deref(), Some("fault_network_1"));
+    }
+
+    #[test]
+    fn generic_fault_with_the_wrong_subject_fails_closed() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let mut state = supervisor.lock().unwrap();
+        state.record.root_pid = None;
+        state.record.source_address = Some("10.88.0.12".to_string());
+        let fault = CapabilityFault {
+            schema_version: gensee_crate_rules::capability_fault::CAPABILITY_FAULT_SCHEMA_VERSION,
+            fault_id: "fault_network_2".to_string(),
+            operation_id: "op_1".to_string(),
+            source_run_id: "run_1".to_string(),
+            subject: CapabilityFaultSubject::NetworkPeer {
+                source_address: "10.88.0.99".to_string(),
+            },
+            effect: BoundaryEffectObservation::NetworkConnect {
+                destination: "8.8.8.8".to_string(),
+                protocol: "tcp".to_string(),
+                port: 443,
+            },
+            requested_ttl_seconds: 5,
+            observed_at_ms: 1,
+        };
+        let (resolution, effect) = state
+            .resolve_fault(&fault, &Arc::new(Mutex::new(Vec::new())))
+            .unwrap();
+        assert_eq!(resolution.action, CapabilityFaultAction::Deny);
+        assert!(!resolution.retry_allowed);
+        assert!(effect.is_none());
+        assert!(resolution
+            .reason_codes
+            .contains(&"fault_subject_is_not_in_the_operation".to_string()));
+    }
+
+    #[test]
+    fn counter_snapshots_emit_only_new_usage_and_survive_counter_reset() {
+        let mut snapshot = BTreeMap::from([(
+            counter_snapshot_key("allow", "table_1", "counter_1"),
+            (10, 1000),
+        )]);
+        let event = gensee_crate_linux::LinuxNetworkEndpointEvent {
+            table_name: "table_1".to_string(),
+            counter_name: "counter_1".to_string(),
+            destination: "8.8.8.8".to_string(),
+            protocol: gensee_crate_linux::LinuxNetworkProtocol::Tcp,
+            ports: vec![443],
+            packets: 13,
+            bytes: 1600,
+        };
+        let deltas = endpoint_counter_deltas(&mut snapshot, vec![event.clone()]);
+        assert_eq!(deltas[0].packets, 3);
+        assert_eq!(deltas[0].bytes, 600);
+
+        let mut reset = event;
+        reset.packets = 2;
+        reset.bytes = 120;
+        let reset_deltas = endpoint_counter_deltas(&mut snapshot, vec![reset]);
+        assert_eq!(reset_deltas[0].packets, 2);
+        assert_eq!(reset_deltas[0].bytes, 120);
     }
 
     #[test]
