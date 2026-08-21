@@ -229,8 +229,6 @@ impl Drop for CellCgroupGuard {
 
 impl CellRuntimeSensor {
     fn start(
-        podman: &OsString,
-        container_name: &str,
         cell_id: &str,
         root_pid: u32,
         input_snapshot: &Path,
@@ -245,13 +243,21 @@ impl CellRuntimeSensor {
             container_workspace: container_workspace.to_string(),
         };
         let result = (|| -> io::Result<gensee_crate_linux::LinuxFanotifyEnforcer> {
-            let merged_root = inspect_capability_cell_merged_root(podman, container_name)?;
+            let process_root = PathBuf::from("/proc")
+                .join(root_pid.to_string())
+                .join("root");
+            if !process_root.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "gated capability-cell process root is not inspectable",
+                ));
+            }
             let session = gensee_crate_linux::LinuxSessionTarget::from_pid(cell_id, root_pid)?;
             let config = gensee_crate_linux::LinuxFanotifyConfig::with_session_filesystem_audit(
                 gensee_crate_linux::LinuxPolicy::default(),
                 session,
                 vec![
-                    merged_root.to_string_lossy().to_string(),
+                    process_root.to_string_lossy().to_string(),
                     input_snapshot.to_string_lossy().to_string(),
                     output_snapshot.to_string_lossy().to_string(),
                 ],
@@ -995,12 +1001,21 @@ impl CellNetworkGuard {
     }
 }
 
-fn wait_for_capability_cell_pid(podman: &OsString, container_name: &str) -> io::Result<u32> {
+fn wait_for_capability_cell_pid(
+    podman: &OsString,
+    container_name: &str,
+    child: &mut std::process::Child,
+) -> io::Result<u32> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match super::inspect_container_pid(podman, container_name) {
             Ok(pid) if pid != 0 => return Ok(pid),
             Ok(_) | Err(_) if Instant::now() < deadline => {
+                if let Some(status) = child.try_wait()? {
+                    return Err(io::Error::other(format!(
+                        "capability-cell runtime exited before gated startup with {status}"
+                    )));
+                }
                 thread::sleep(Duration::from_millis(CELL_POLL_INTERVAL_MS));
             }
             Ok(_) | Err(_) => {
@@ -1011,33 +1026,6 @@ fn wait_for_capability_cell_pid(podman: &OsString, container_name: &str) -> io::
             }
         }
     }
-}
-
-fn inspect_capability_cell_merged_root(
-    podman: &OsString,
-    container_name: &str,
-) -> io::Result<PathBuf> {
-    let output = run_command_capture(
-        podman,
-        &[OsString::from("inspect"), OsString::from(container_name)],
-    )?;
-    let value: Value = serde_json::from_str(&output)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    value
-        .as_array()
-        .and_then(|containers| containers.first())
-        .and_then(|container| container.get("GraphDriver"))
-        .and_then(|driver| driver.get("Data"))
-        .and_then(|data| data.get("MergedDir"))
-        .and_then(Value::as_str)
-        .filter(|path| Path::new(path).is_absolute())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "gated capability cell has no inspectable merged root",
-            )
-        })
 }
 
 impl Drop for CellNetworkGuard {
@@ -1284,10 +1272,8 @@ fn execute_capability_cell(
     let cleanup = TcloneContainerCleanup::new(&podman, &container_name);
     let started_at_ms = unix_millis()?;
     let mut child = Command::new(&podman).args(&run_args).spawn()?;
-    let root_pid = wait_for_capability_cell_pid(&podman, &container_name)?;
+    let root_pid = wait_for_capability_cell_pid(&podman, &container_name, &mut child)?;
     let mut runtime_sensor = CellRuntimeSensor::start(
-        &podman,
-        &container_name,
         &cell_id,
         root_pid,
         &input_snapshot,
@@ -1661,7 +1647,7 @@ fn container_scope_path(workspace: &str, relative: &str) -> String {
 
 fn capability_cell_apparmor_profile() -> io::Result<String> {
     let profile = env::var("GENSEE_TCLONE_CELL_APPARMOR_PROFILE")
-        .unwrap_or_else(|_| "container-default".to_string());
+        .unwrap_or_else(|_| "gensee-capability-cell".to_string());
     if !tclone_is_safe_token(&profile) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3853,7 +3839,7 @@ mod tests {
         assert!(rendered.iter().any(|arg| arg.starts_with("seccomp=")));
         assert!(rendered
             .iter()
-            .any(|arg| arg == "apparmor=container-default"));
+            .any(|arg| arg == "apparmor=gensee-capability-cell"));
         assert!(rendered
             .windows(2)
             .any(|pair| pair == ["--entrypoint", "/run/gensee-cell-supervisor"]));

@@ -1,0 +1,22 @@
+#include <tunables/global>
+
+profile gensee-capability-cell flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # Landlock supplies path-specific write confinement inside the cell. This
+  # outer profile keeps the container usable while independently denying
+  # namespace, mount, kernel-security, and cross-process escape surfaces.
+  file,
+  network,
+  capability,
+  signal,
+  unix,
+
+  deny mount,
+  deny umount,
+  deny pivot_root,
+  deny ptrace,
+  deny /proc/kcore rwklx,
+  deny /proc/sysrq-trigger rwklx,
+  deny /sys/kernel/security/** rwklx,
+}

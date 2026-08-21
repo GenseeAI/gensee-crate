@@ -302,6 +302,16 @@ incomplete read/process coverage and a violation; it is never represented as an
 empty effect list. Capability cells therefore require Linux cgroup v2. Complete
 forensic coverage additionally requires root fanotify support.
 
+Install and load the shipped AppArmor profile before using cells:
+
+```console
+sudo install -m 0644 packaging/apparmor/gensee-capability-cell /etc/apparmor.d/gensee-capability-cell
+sudo apparmor_parser -r /etc/apparmor.d/gensee-capability-cell
+```
+
+The default profile name is `gensee-capability-cell`; a missing profile causes
+cell startup to fail closed.
+
 The immutable part of the manifest, the exact request and command, and both
 snapshot tree digests are bound into an HMAC-authenticated
 `forensics-evidence.json`. `gensee run cell inspect` verifies that signature and

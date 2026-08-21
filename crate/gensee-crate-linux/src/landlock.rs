@@ -96,11 +96,19 @@ pub fn apply_landlock_write_sandbox(write_paths: &[String]) -> io::Result<()> {
 
     add_path_rule(&ruleset_fd, Path::new("/"), READ_EXECUTE_ACCESS)?;
     let mut paths = write_paths.to_vec();
-    paths.extend(["/tmp".to_string(), "/run".to_string()]);
+    paths.extend([
+        "/tmp".to_string(),
+        "/run".to_string(),
+        "/dev/null".to_string(),
+        "/dev/tty".to_string(),
+    ]);
     paths.sort();
     paths.dedup();
     for path in paths {
         let path = Path::new(&path);
+        if !path.exists() {
+            continue;
+        }
         let allowed_access = if path.is_dir() {
             READ_EXECUTE_ACCESS | write_access
         } else {
