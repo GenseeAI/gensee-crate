@@ -88,11 +88,18 @@ and blocks output promotion.
 
 Built-in filesystem leases validate bounded path/access constraints and are
 realized by exact read-only or read-write cell mounts. Built-in direct network
-leases validate bounded destination/protocol/port constraints but remain
-fail-closed until the cgroup/nftables backend is attached. Brokered repository,
-API, identity, mTLS, browser, cloud, and database capabilities instead mount
-only their exact Unix-domain gateway socket into a cell whose IP network is
-disabled. The broad provider credential remains behind that gateway.
+leases require IP/CIDR-pinned destinations plus exact TCP/UDP ports. On Linux,
+Gensee installs the nftables allowlist against a fresh cgroup before the cell's
+trusted startup gate is released, attaches the initial process tree, and then
+starts the exact leased command. Hostnames are not accepted for this path, so a
+broker must resolve and pin addresses before issuing the lease. Allowed-rule
+counters become network effects; blocked packets or incomplete counter
+collection prevent promotion. On non-Linux hosts this path fails closed.
+
+Brokered repository, API, identity, mTLS, browser, cloud, and database
+capabilities instead mount only their exact Unix-domain gateway socket into a
+cell whose IP network is disabled. The broad provider credential remains
+behind that gateway.
 
 ## External-action commit tokens
 

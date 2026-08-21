@@ -202,6 +202,7 @@ mod tests {
                 mode: LinuxNetworkMode::Monitor,
                 allowed_hosts: Vec::new(),
                 denied_hosts: Vec::new(),
+                allowed_endpoints: Vec::new(),
             },
             seccomp_enabled: false,
             dangerous_syscalls: DangerousSyscallPolicy {

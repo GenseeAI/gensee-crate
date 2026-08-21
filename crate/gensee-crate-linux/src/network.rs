@@ -2,7 +2,7 @@ use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use crate::policy::{LinuxNetworkMode, LinuxNetworkPolicy};
+use crate::policy::{LinuxNetworkMode, LinuxNetworkPolicy, LinuxNetworkProtocol};
 use crate::procfs::{is_descendant_or_self, read_parent_by_pid};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -35,6 +35,7 @@ pub struct LinuxNftablesPlan {
     pub mode: LinuxNetworkMode,
     pub destinations: Vec<LinuxNftablesDestination>,
     pub denied_destinations: Vec<LinuxNftablesDestination>,
+    pub endpoint_counters: Vec<LinuxNftablesEndpointCounter>,
     pub block_counters: Vec<LinuxNftablesBlockCounter>,
     pub script: String,
     pub warnings: Vec<String>,
@@ -44,6 +45,27 @@ pub struct LinuxNftablesPlan {
 pub struct LinuxNftablesDestination {
     pub value: String,
     pub family: LinuxNftablesAddressFamily,
+    pub protocol: Option<LinuxNetworkProtocol>,
+    pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinuxNftablesEndpointCounter {
+    pub name: String,
+    pub destination: String,
+    pub protocol: LinuxNetworkProtocol,
+    pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinuxNetworkEndpointEvent {
+    pub table_name: String,
+    pub counter_name: String,
+    pub destination: String,
+    pub protocol: LinuxNetworkProtocol,
+    pub ports: Vec<u16>,
+    pub packets: u64,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -146,8 +168,39 @@ pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftab
             )),
         }
     }
+    for endpoint in &config.network.allowed_endpoints {
+        match parse_destination(&endpoint.destination) {
+            Some(mut destination) if !endpoint.ports.is_empty() => {
+                destination.protocol = Some(endpoint.protocol);
+                destination.ports = endpoint.ports.clone();
+                destination.ports.sort_unstable();
+                destination.ports.dedup();
+                destinations.push(destination);
+            }
+            _ => warnings.push(format!(
+                "nftables endpoint enforcement requires an IP/CIDR destination and at least one port; skipped `{}`",
+                endpoint.destination
+            )),
+        }
+    }
 
     let block_counters = block_counters(config.network.mode, &denied_destinations);
+    let endpoint_counters = destinations
+        .iter()
+        .filter_map(|destination| {
+            destination
+                .protocol
+                .map(|protocol| LinuxNftablesEndpointCounter {
+                    name: format!(
+                        "allow_{}",
+                        destination_counter_index(&destinations, destination)
+                    ),
+                    destination: destination.value.clone(),
+                    protocol,
+                    ports: destination.ports.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
     let script = nftables_script(
         &table_name,
         &chain_name,
@@ -156,6 +209,7 @@ pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftab
         &destinations,
         &denied_destinations,
         &block_counters,
+        &endpoint_counters,
     );
 
     LinuxNftablesPlan {
@@ -165,6 +219,7 @@ pub fn build_nftables_plan(config: &LinuxNetworkEnforcementConfig) -> LinuxNftab
         mode: config.network.mode,
         destinations,
         denied_destinations,
+        endpoint_counters,
         block_counters,
         script,
         warnings,
@@ -353,6 +408,42 @@ pub fn read_nftables_block_events(
     parse_nftables_counter_json(plan, &output.stdout)
 }
 
+#[cfg(target_os = "linux")]
+pub fn read_nftables_endpoint_events(
+    plan: &LinuxNftablesPlan,
+) -> io::Result<Vec<LinuxNetworkEndpointEvent>> {
+    use std::process::Command;
+
+    if plan.endpoint_counters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let output = Command::new("nft")
+        .arg("-j")
+        .arg("list")
+        .arg("counters")
+        .arg("table")
+        .arg("inet")
+        .arg(&plan.table_name)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "nft exited with status {}",
+            output.status
+        )));
+    }
+    parse_nftables_endpoint_json(plan, &output.stdout)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_nftables_endpoint_events(
+    _plan: &LinuxNftablesPlan,
+) -> io::Result<Vec<LinuxNetworkEndpointEvent>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "nftables network enforcement is only available on Linux",
+    ))
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn read_nftables_block_events(
     _plan: &LinuxNftablesPlan,
@@ -363,6 +454,7 @@ pub fn read_nftables_block_events(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn nftables_script(
     table_name: &str,
     chain_name: &str,
@@ -371,9 +463,14 @@ fn nftables_script(
     destinations: &[LinuxNftablesDestination],
     denied_destinations: &[LinuxNftablesDestination],
     block_counters: &[LinuxNftablesBlockCounter],
+    endpoint_counters: &[LinuxNftablesEndpointCounter],
 ) -> String {
     let cgroup_match = format!(
-        "socket cgroupv2 level 2 \"{}\"",
+        "socket cgroupv2 level {} \"{}\"",
+        cgroup_path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .count(),
         escape_nft_string(cgroup_path)
     );
     if mode == LinuxNetworkMode::Off {
@@ -382,6 +479,9 @@ fn nftables_script(
 
     let mut lines = vec![format!("table inet {table_name} {{")];
     for counter in block_counters {
+        lines.push(format!("  counter {} {{}}", counter.name));
+    }
+    for counter in endpoint_counters {
         lines.push(format!("  counter {} {{}}", counter.name));
     }
     lines.push(format!("  chain {chain_name} {{"));
@@ -415,6 +515,42 @@ fn nftables_script(
     }
 
     for destination in destinations {
+        if let Some(protocol) = destination.protocol {
+            let counter = endpoint_counters
+                .iter()
+                .find(|counter| {
+                    counter.destination == destination.value
+                        && counter.protocol == protocol
+                        && counter.ports == destination.ports
+                })
+                .expect("endpoint destination always has a counter");
+            let protocol_name = match protocol {
+                LinuxNetworkProtocol::Tcp => "tcp",
+                LinuxNetworkProtocol::Udp => "udp",
+            };
+            let ports = if destination.ports.len() == 1 {
+                destination.ports[0].to_string()
+            } else {
+                format!(
+                    "{{ {} }}",
+                    destination
+                        .ports
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let address = match destination.family {
+                LinuxNftablesAddressFamily::Ipv4 => "ip daddr",
+                LinuxNftablesAddressFamily::Ipv6 => "ip6 daddr",
+            };
+            lines.push(format!(
+                "    {cgroup_match} {address} {} meta l4proto {protocol_name} {protocol_name} dport {ports} counter name {} accept",
+                destination.value, counter.name
+            ));
+            continue;
+        }
         match destination.family {
             LinuxNftablesAddressFamily::Ipv4 => lines.push(format!(
                 "    {cgroup_match} ip daddr {} accept",
@@ -437,6 +573,17 @@ fn nftables_script(
     lines.push("  }".to_string());
     lines.push("}".to_string());
     format!("{}\n", lines.join("\n"))
+}
+
+fn destination_counter_index(
+    destinations: &[LinuxNftablesDestination],
+    target: &LinuxNftablesDestination,
+) -> usize {
+    destinations
+        .iter()
+        .filter(|destination| destination.protocol.is_some())
+        .position(|destination| std::ptr::eq(destination, target))
+        .unwrap_or(0)
 }
 
 fn block_counters(
@@ -522,6 +669,60 @@ fn parse_nftables_counter_json(
     Ok(events)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn parse_nftables_endpoint_json(
+    plan: &LinuxNftablesPlan,
+    data: &[u8],
+) -> io::Result<Vec<LinuxNetworkEndpointEvent>> {
+    let value: serde_json::Value = serde_json::from_slice(data).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid nftables counter JSON: {error}"),
+        )
+    })?;
+    let entries = value
+        .get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing nftables array"))?;
+    let mut events = Vec::new();
+    for entry in entries {
+        let Some(counter) = entry.get("counter") else {
+            continue;
+        };
+        let Some(name) = counter.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(planned) = plan
+            .endpoint_counters
+            .iter()
+            .find(|planned| planned.name == name)
+        else {
+            continue;
+        };
+        let packets = counter
+            .get("packets")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let bytes = counter
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if packets == 0 && bytes == 0 {
+            continue;
+        }
+        events.push(LinuxNetworkEndpointEvent {
+            table_name: plan.table_name.clone(),
+            counter_name: name.to_string(),
+            destination: planned.destination.clone(),
+            protocol: planned.protocol,
+            ports: planned.ports.clone(),
+            packets,
+            bytes,
+        });
+    }
+    Ok(events)
+}
+
 fn parse_destination(value: &str) -> Option<LinuxNftablesDestination> {
     let address = value.split_once('/').map(|(addr, _)| addr).unwrap_or(value);
     let ip = address.parse::<IpAddr>().ok()?;
@@ -532,6 +733,8 @@ fn parse_destination(value: &str) -> Option<LinuxNftablesDestination> {
     Some(LinuxNftablesDestination {
         value: value.to_string(),
         family,
+        protocol: None,
+        ports: Vec::new(),
     })
 }
 
@@ -592,6 +795,7 @@ mod tests {
                     "example.com".to_string(),
                 ],
                 denied_hosts: vec!["169.254.169.254".to_string()],
+                allowed_endpoints: Vec::new(),
             },
         );
 
@@ -616,6 +820,43 @@ mod tests {
     }
 
     #[test]
+    fn plans_protocol_and_port_scoped_endpoint_rules_with_usage_counters() {
+        let config = LinuxNetworkEnforcementConfig::new(
+            "cell-1",
+            LinuxNetworkPolicy {
+                mode: LinuxNetworkMode::AllowListed,
+                allowed_hosts: Vec::new(),
+                denied_hosts: Vec::new(),
+                allowed_endpoints: vec![crate::policy::LinuxNetworkEndpoint {
+                    destination: "10.20.30.40/32".to_string(),
+                    protocol: LinuxNetworkProtocol::Tcp,
+                    ports: vec![8443, 443, 443],
+                }],
+            },
+        );
+
+        let plan = build_nftables_plan(&config);
+
+        validate_nftables_plan_for_apply(&plan).unwrap();
+        assert_eq!(plan.endpoint_counters.len(), 1);
+        assert_eq!(plan.endpoint_counters[0].ports, vec![443, 8443]);
+        assert!(plan.script.contains("counter allow_0 {}"));
+        assert!(plan.script.contains(
+            "ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport { 443, 8443 } counter name allow_0 accept"
+        ));
+        let data = br#"{
+            "nftables": [
+                {"counter": {"name": "allow_0", "packets": 4, "bytes": 512}}
+            ]
+        }"#;
+        let events = parse_nftables_endpoint_json(&plan, data).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].destination, "10.20.30.40/32");
+        assert_eq!(events[0].protocol, LinuxNetworkProtocol::Tcp);
+        assert_eq!(events[0].ports, vec![443, 8443]);
+    }
+
+    #[test]
     fn rejects_apply_for_empty_allowlist() {
         let config = LinuxNetworkEnforcementConfig::new(
             "agent-1",
@@ -623,6 +864,7 @@ mod tests {
                 mode: LinuxNetworkMode::AllowListed,
                 allowed_hosts: Vec::new(),
                 denied_hosts: Vec::new(),
+                allowed_endpoints: Vec::new(),
             },
         );
 
@@ -641,6 +883,7 @@ mod tests {
                 mode: LinuxNetworkMode::Monitor,
                 allowed_hosts: Vec::new(),
                 denied_hosts: vec!["169.254.169.254".to_string()],
+                allowed_endpoints: Vec::new(),
             },
         );
 
@@ -660,6 +903,7 @@ mod tests {
                 mode: LinuxNetworkMode::Monitor,
                 allowed_hosts: Vec::new(),
                 denied_hosts: vec!["169.254.169.254".to_string()],
+                allowed_endpoints: Vec::new(),
             },
         );
         let plan = build_nftables_plan(&config);
@@ -688,6 +932,7 @@ mod tests {
                 mode: LinuxNetworkMode::Monitor,
                 allowed_hosts: Vec::new(),
                 denied_hosts: Vec::new(),
+                allowed_endpoints: Vec::new(),
             },
         );
 
@@ -704,6 +949,7 @@ mod tests {
                 mode: LinuxNetworkMode::Off,
                 allowed_hosts: Vec::new(),
                 denied_hosts: Vec::new(),
+                allowed_endpoints: Vec::new(),
             },
         );
 

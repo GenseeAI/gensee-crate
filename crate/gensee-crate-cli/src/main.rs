@@ -705,6 +705,7 @@ fn linux_network_config(
             mode,
             allowed_hosts,
             denied_hosts,
+            allowed_endpoints: Vec::new(),
         },
     );
     config.root_pid = root_pid;

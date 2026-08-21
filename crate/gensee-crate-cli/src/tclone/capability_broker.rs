@@ -13,7 +13,7 @@ const BROKER_ADAPTER_TIMEOUT_SECONDS: u64 = 30;
 const BROKER_ADAPTER_MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 const BUILTIN_EXTERNAL_ACTION_ADAPTER: &str = "gensee.external-action";
 const BUILTIN_FILESYSTEM_ADAPTER: &str = "gensee.filesystem";
-const BUILTIN_NETWORK_ADAPTER: &str = "gensee.network";
+pub(super) const BUILTIN_NETWORK_ADAPTER: &str = "gensee.network";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -436,10 +436,26 @@ fn validate_network_constraints(value: &Value) -> io::Result<()> {
         .get("ports")
         .and_then(Value::as_array)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "network ports missing"))?;
+    let ip_and_prefix = destination.split_once('/');
+    let address = ip_and_prefix
+        .map(|(address, _)| address)
+        .unwrap_or(destination);
+    let parsed_address = address.parse::<std::net::IpAddr>().ok();
+    let valid_prefix = match (parsed_address, ip_and_prefix) {
+        (Some(std::net::IpAddr::V4(_)), Some((_, prefix))) => prefix
+            .parse::<u8>()
+            .is_ok_and(|prefix| prefix > 0 && prefix <= 32),
+        (Some(std::net::IpAddr::V6(_)), Some((_, prefix))) => prefix
+            .parse::<u8>()
+            .is_ok_and(|prefix| prefix > 0 && prefix <= 128),
+        (Some(_), None) => true,
+        _ => false,
+    };
     if destination == "*"
         || destination == "0.0.0.0/0"
         || destination == "::/0"
-        || protocol.trim().is_empty()
+        || !valid_prefix
+        || !matches!(protocol, "tcp" | "udp")
         || ports.is_empty()
         || ports.iter().any(|port| {
             port.as_u64()
@@ -1204,6 +1220,28 @@ mod tests {
             validate_broker_lease_request(&request).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn direct_network_lease_requires_a_pinned_ip_protocol_and_ports() {
+        assert!(validate_network_constraints(&json!({
+            "destination": "repo.example.test",
+            "protocol": "tcp",
+            "ports": [443]
+        }))
+        .is_err());
+        assert!(validate_network_constraints(&json!({
+            "destination": "10.20.30.40/32",
+            "protocol": "https",
+            "ports": [443]
+        }))
+        .is_err());
+        validate_network_constraints(&json!({
+            "destination": "10.20.30.40/32",
+            "protocol": "tcp",
+            "ports": [443, 8443]
+        }))
+        .unwrap();
     }
 
     #[test]

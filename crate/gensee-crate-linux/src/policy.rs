@@ -45,6 +45,22 @@ pub struct LinuxNetworkPolicy {
     pub mode: LinuxNetworkMode,
     pub allowed_hosts: Vec<String>,
     pub denied_hosts: Vec<String>,
+    #[serde(default)]
+    pub allowed_endpoints: Vec<LinuxNetworkEndpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinuxNetworkEndpoint {
+    pub destination: String,
+    pub protocol: LinuxNetworkProtocol,
+    pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinuxNetworkProtocol {
+    Tcp,
+    Udp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -101,6 +117,7 @@ impl Default for LinuxPolicy {
                 mode: LinuxNetworkMode::Off,
                 allowed_hosts: Vec::new(),
                 denied_hosts: Vec::new(),
+                allowed_endpoints: Vec::new(),
             },
             seccomp_enabled: false,
             dangerous_syscalls: DangerousSyscallPolicy {

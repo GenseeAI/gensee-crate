@@ -24,15 +24,16 @@ pub use fanotify::{
 pub use network::{
     apply_nftables_script, attach_current_process_to_cgroup, attach_process_tree_to_cgroup,
     collect_process_tree, create_agent_cgroup, default_agent_cgroup_path, delete_nftables_table,
-    plan_nftables_policy, read_nftables_block_events, remove_agent_cgroup,
-    validate_nftables_plan_for_apply, LinuxCgroupAttachPlan, LinuxNetworkBlockEvent,
-    LinuxNetworkBlockReason, LinuxNetworkEnforcementConfig, LinuxNetworkEnforcementPlan,
-    LinuxNftablesBlockCounter, LinuxNftablesDestination, LinuxNftablesPlan,
+    plan_nftables_policy, read_nftables_block_events, read_nftables_endpoint_events,
+    remove_agent_cgroup, validate_nftables_plan_for_apply, LinuxCgroupAttachPlan,
+    LinuxNetworkBlockEvent, LinuxNetworkBlockReason, LinuxNetworkEndpointEvent,
+    LinuxNetworkEnforcementConfig, LinuxNetworkEnforcementPlan, LinuxNftablesBlockCounter,
+    LinuxNftablesDestination, LinuxNftablesEndpointCounter, LinuxNftablesPlan,
 };
 pub use policy::{
     DangerousSyscallPolicy, LinuxEnforcementComponent, LinuxEnforcementMode, LinuxEnforcementPlan,
-    LinuxNetworkMode, LinuxNetworkPolicy, LinuxPolicy, LinuxPolicyAction,
-    LinuxSpeculationAvailability, SensitivePathAccess, SensitivePathRule,
+    LinuxNetworkEndpoint, LinuxNetworkMode, LinuxNetworkPolicy, LinuxNetworkProtocol, LinuxPolicy,
+    LinuxPolicyAction, LinuxSpeculationAvailability, SensitivePathAccess, SensitivePathRule,
 };
 pub use seccomp::{
     install_seccomp_filter, LinuxSeccompDeniedSyscall, LinuxSeccompProfile,
