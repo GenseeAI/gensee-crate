@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const CAPABILITY_REQUEST_SCHEMA_VERSION: u32 = 1;
+pub const CAPABILITY_REQUEST_SCHEMA_VERSION: u32 = 2;
 pub const EFFECT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,14 +42,6 @@ pub enum EffectScope {
     ReversibleLocal,
     IrreversibleLocal,
     External,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionBoundary {
-    Source,
-    IsolatedCell,
-    BrokeredCommit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,21 +167,16 @@ pub struct CapabilityScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityRequest {
     pub schema_version: u32,
     pub operation_class: String,
     pub effect_scope: EffectScope,
-    pub execution_boundary: ExecutionBoundary,
     pub capabilities: Vec<Capability>,
     pub scope: CapabilityScope,
     /// Upper bound for a lease. The enforcement boundary must reject expired
     /// leases; this is not merely a cleanup hint.
     pub lease_ttl_seconds: u64,
-    /// The source environment must not perform this operation when true.
-    pub source_must_not_execute: bool,
-    /// Outputs must be inspected and explicitly promoted instead of sharing a
-    /// writable workspace with the source environment.
-    pub inspect_before_commit: bool,
 }
 
 /// Whether an enforcement boundary can account for a class of effects. An
@@ -350,7 +337,9 @@ pub struct EffectManifest {
 }
 
 impl CapabilityRequest {
-    pub fn isolated(
+    /// Describe an effect without choosing where it executes. Executor,
+    /// approval, lease delta, and promotion are trusted policy outputs.
+    pub fn new(
         operation_class: impl Into<String>,
         effect_scope: EffectScope,
         capabilities: Vec<Capability>,
@@ -359,27 +348,14 @@ impl CapabilityRequest {
             schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION,
             operation_class: operation_class.into(),
             effect_scope,
-            execution_boundary: ExecutionBoundary::IsolatedCell,
             capabilities,
             scope: CapabilityScope::default(),
             lease_ttl_seconds: 240,
-            source_must_not_execute: true,
-            inspect_before_commit: true,
         }
     }
 
-    pub fn brokered(operation_class: impl Into<String>, capabilities: Vec<Capability>) -> Self {
-        Self {
-            schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION,
-            operation_class: operation_class.into(),
-            effect_scope: EffectScope::External,
-            execution_boundary: ExecutionBoundary::BrokeredCommit,
-            capabilities,
-            scope: CapabilityScope::default(),
-            lease_ttl_seconds: 240,
-            source_must_not_execute: true,
-            inspect_before_commit: true,
-        }
+    pub fn external(operation_class: impl Into<String>, capabilities: Vec<Capability>) -> Self {
+        Self::new(operation_class, EffectScope::External, capabilities)
     }
 }
 
@@ -389,7 +365,7 @@ mod tests {
 
     #[test]
     fn capability_request_has_stable_wire_names() {
-        let request = CapabilityRequest::isolated(
+        let request = CapabilityRequest::new(
             "untrusted_execution",
             EffectScope::ReversibleLocal,
             vec![
@@ -399,11 +375,11 @@ mod tests {
         );
         let value = serde_json::to_value(request).unwrap();
 
-        assert_eq!(value["schema_version"], 1);
-        assert_eq!(value["execution_boundary"], "isolated_cell");
+        assert_eq!(value["schema_version"], 2);
+        assert!(value.get("execution_boundary").is_none());
         assert_eq!(value["capabilities"][0], "network_egress");
-        assert_eq!(value["source_must_not_execute"], true);
-        assert_eq!(value["inspect_before_commit"], true);
+        assert!(value.get("source_must_not_execute").is_none());
+        assert!(value.get("inspect_before_commit").is_none());
         assert_eq!(value["scope"]["network_hosts"], serde_json::json!([]));
         assert_eq!(value["lease_ttl_seconds"], 240);
     }
@@ -428,5 +404,19 @@ mod tests {
         assert!(scope.external_applications.is_empty());
         assert!(scope.databases.is_empty());
         assert!(scope.output_promotions.is_empty());
+    }
+
+    #[test]
+    fn executor_fields_are_rejected_at_the_untrusted_wire_boundary() {
+        let value = serde_json::json!({
+            "schema_version": CAPABILITY_REQUEST_SCHEMA_VERSION,
+            "operation_class": "download",
+            "effect_scope": "read_only",
+            "execution_boundary": "isolated_cell",
+            "capabilities": ["network_egress"],
+            "scope": {"network_hosts": ["packages.example"]},
+            "lease_ttl_seconds": 30
+        });
+        assert!(serde_json::from_value::<CapabilityRequest>(value).is_err());
     }
 }

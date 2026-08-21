@@ -202,26 +202,35 @@ and report that the container is missing.
 
 ### Capability decision engine
 
-Capability requests carry typed privilege deltas for file operations, network
-destinations and protocols, secret handles and identities, cloud/IAM resources
-and actions, syscalls and Linux capabilities, external applications/APIs,
-database roles/actions, irreversible effects, and output promotion. Legacy path
-and host selectors remain readable during the schema transition, but an empty
-selector always means unresolved authority rather than a wildcard grant.
+Schema-v2 capability requests carry typed privilege deltas for file operations,
+network destinations and protocols, secret handles and identities, cloud/IAM
+resources and actions, syscalls and Linux capabilities, external
+applications/APIs, database roles/actions, irreversible effects, and output
+promotion. They do not contain an executor, source-execution toggle, or
+inspect-before-commit toggle. Unknown fields are rejected, so an untrusted
+producer cannot smuggle an old executor choice into the request. Empty
+selectors always mean unresolved authority rather than a wildcard grant.
 
-The provider-neutral policy engine returns exactly one of four decisions:
+The provider-neutral policy engine returns a plan with independent dimensions:
 
-- `allow_locally` when every capability is within the declared local envelope
-  and all mandatory mediators are active;
-- `delegate_to_isolated_cell` when the source lacks authority but the operation
-  is scoped, fully mediated, and an isolated cell is available. Irreversible
-  local effects are cell-eligible only when source execution is forbidden and
-  inspect-before-commit is mandatory;
-- `stage_for_approval` for brokered commits, external effects, uncontained
-  irreversible effects, and output promotion;
-- `deny` for unresolved scopes, expired/excessive leases, missing mediators,
-  unavailable staging/cells, unbounded network grants, raw secret material, or
-  policy-denied kernel authority.
+- `executor`: `current_operation`, `trusted_mediator`, `fresh_cell`, or
+  `live_fork`, selected only from trusted runtime facts;
+- `lease_delta`: exact capability classes, required mediator attachments, and
+  a bounded TTL. A capability listed as locally leaseable means its exact
+  resource scope was already checked by a trusted backend;
+- `approval`: `none`, `before_execution`, or `before_promotion`;
+- `promotion`: `none`, `attest_before_return`, `transactional_promotion`, or
+  `external_commit_receipt`;
+- `decision`: `plan` or `deny`, with required and unavailable mediators plus
+  stable reason codes.
+
+An inseparable live-runtime effect requires a Tclone fork; untrusted or staged
+effects otherwise select a fresh cell. External effects and effects classified
+as completely brokerable by trusted context select a trusted mediator.
+Bounded, fully revocable deltas may stay in the current operation. Unresolved
+scopes, excessive leases, unavailable mediators
+or executors, unbounded network grants, raw secret material, policy-denied
+kernel authority, and unavailable required approval staging fail closed.
 
 The orchestrator must declare mediators active for the specific operation;
 installation on the host is not enough. Boundaries include process/cgroup,
@@ -238,9 +247,9 @@ Typed filesystem operations are enforced by the fresh-cell path at this layer:
 `destructive_filesystem` requests satisfiable without accepting unrelated typed
 network, identity, or external selectors before their mediators exist.
 The cell's disposable snapshot contains an `irreversible_local` effect, so it
-does not require approval merely to execute there. Promotion remains a separate
-inspect-and-commit action; removing either isolation or inspect-before-commit
-restores the approval requirement.
+does not require approval merely to execute there. The trusted decision still
+returns `transactional_promotion` independently; promotion remains a separate
+attest-and-commit action.
 
 ### Capability cells
 
@@ -248,15 +257,14 @@ The host-side mint/revoke protocol and secret-free adapter contract are
 documented in [Capability broker](capability-broker.md).
 
 Issuing a cell lease reserves an operation id, cell id, exact command, scope,
-and deadline; it does not claim that future broker-backed mediators are already
-active. At issue time the policy engine receives only the process/cgroup,
-filesystem, and kernel boundaries every fresh cell will actually enforce. A
-request whose only remaining policy reasons are missing attachable mediators is
-reported as `pending_mediation`; unresolved scopes and every other denial still
-fail issuance. Immediately before execution, Gensee derives the active set
-again from the broker leases actually attached to that cell and requires a full
-`delegate_to_isolated_cell` decision. Thus an unimplemented or unattached
-cloud, browser, database, identity, secret, or network gateway cannot execute.
+deadline, and trusted policy plan; it does not claim that future broker-backed
+mediators are already active. At issue time the policy engine receives the
+process/cgroup, filesystem, and kernel boundaries every fresh cell enforces and
+the explicit set of attachable mediators. Immediately before execution,
+Gensee derives the active set again from broker leases actually attached to
+that cell, requires a `fresh_cell` plan, and requires every mediator delta to
+be empty. Thus an unimplemented or unattached cloud, browser, database,
+identity, secret, or network gateway cannot execute.
 
 For a bounded authority-expanding operation, a trusted host operator can issue a
 one-use lease bound to a source run, an exact command, scoped workspace paths,
