@@ -156,6 +156,31 @@ automatically; the source does not resend the prompt. Forked Codex runs are
 allowed to execute reversible local commands. Requests classified as external
 mutations remain blocked inside forks because a workspace fork cannot roll back
 an external effect; those require a brokered commit path.
+
+The alert's `capability_request` is a descriptive starting template, not a
+ready-to-lease document. Its selectors are intentionally empty (empty means
+"not granted"), so a trusted issuer must copy it and add exact path, network,
+identity, or external-target selectors before `gensee run lease issue` will
+accept it. Generated requests default to the cell runtime's 240-second maximum
+lease lifetime.
+
+The default external-mutation decision is a hard block. For a controlled
+observe-only baseline, an operator can explicitly override the stable rule id
+in the active policy; `warn` records the finding without denying the command:
+
+```json
+{
+  "review_overrides": [
+    {
+      "rule_id": "policy_capability_delegation_required",
+      "action": "warn"
+    }
+  ]
+}
+```
+
+This override applies to every capability-delegation finding and should be
+removed before enforcement testing.
 Use the same `gensee-tclone` wrapper for `run list`, `run fork`, `run shell`,
 `run attach`, `run send`, `run exec`, `run merge`, `run switch`, and cleanup;
 otherwise Gensee may read the source record but look in a different Podman store

@@ -83,7 +83,7 @@ impl CapabilityRequest {
             execution_boundary: ExecutionBoundary::IsolatedCell,
             capabilities,
             scope: CapabilityScope::default(),
-            lease_ttl_seconds: 300,
+            lease_ttl_seconds: 240,
             source_must_not_execute: true,
             inspect_before_commit: true,
         }
@@ -97,7 +97,7 @@ impl CapabilityRequest {
             execution_boundary: ExecutionBoundary::BrokeredCommit,
             capabilities,
             scope: CapabilityScope::default(),
-            lease_ttl_seconds: 300,
+            lease_ttl_seconds: 240,
             source_must_not_execute: true,
             inspect_before_commit: true,
         }
@@ -126,5 +126,6 @@ mod tests {
         assert_eq!(value["source_must_not_execute"], true);
         assert_eq!(value["inspect_before_commit"], true);
         assert_eq!(value["scope"]["network_hosts"], serde_json::json!([]));
+        assert_eq!(value["lease_ttl_seconds"], 240);
     }
 }

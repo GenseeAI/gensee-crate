@@ -211,7 +211,8 @@ pub(crate) fn evaluate_pretool_policy_with_policy(
     }
     if !matches!(action, PolicyAction::Block) {
         let current_run_id = current_tclone_run_id_for_event(event);
-        if let Some(finding) = fork_suggestion_finding(event, &subjects, current_run_id.as_deref())
+        if let Some(finding) =
+            fork_suggestion_finding_with_policy(event, &subjects, current_run_id.as_deref(), policy)
         {
             if finding.action == PolicyAction::Block
                 || !fork_suggestion_already_recorded(store, event, &finding)
@@ -346,7 +347,26 @@ impl ForkSuggestionReason {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn fork_suggestion_finding(
+    event: &AgentHookEvent,
+    subjects: &[PolicySubject],
+    current_run_id: Option<&str>,
+) -> Option<PolicyFinding> {
+    build_fork_suggestion_finding(event, subjects, current_run_id)
+}
+
+fn fork_suggestion_finding_with_policy(
+    event: &AgentHookEvent,
+    subjects: &[PolicySubject],
+    current_run_id: Option<&str>,
+    policy: &Policy,
+) -> Option<PolicyFinding> {
+    let finding = build_fork_suggestion_finding(event, subjects, current_run_id)?;
+    Some(apply_capability_delegation_override(finding, policy))
+}
+
+fn build_fork_suggestion_finding(
     event: &AgentHookEvent,
     subjects: &[PolicySubject],
     current_run_id: Option<&str>,
@@ -407,6 +427,34 @@ pub(crate) fn fork_suggestion_finding(
             "tool_use_id": event.tool_use_id.as_deref(),
         }),
     })
+}
+
+fn apply_capability_delegation_override(
+    mut finding: PolicyFinding,
+    policy: &Policy,
+) -> PolicyFinding {
+    let tuned = policy.tuned_alert_values(
+        &finding.rule_id,
+        &finding.severity,
+        finding.action.alert_action(),
+    );
+    finding.action = match tuned.action.as_str() {
+        "allow" => PolicyAction::Allow,
+        "warn" => PolicyAction::Warn,
+        "ask" => PolicyAction::Ask,
+        "block" => PolicyAction::Block,
+        _ => finding.action,
+    };
+    finding.severity = tuned.severity;
+    if tuned.pre_review_action.is_some() || tuned.pre_review_severity.is_some() {
+        finding.evidence["policy_override"] = json!({
+            "pre_review_action": tuned.pre_review_action,
+            "pre_review_severity": tuned.pre_review_severity,
+            "action": finding.action.alert_action(),
+            "severity": finding.severity,
+        });
+    }
+    finding
 }
 
 fn tclone_source_exec_into_fork_finding(
@@ -770,6 +818,11 @@ fn tclone_option_takes_value(option: &str) -> bool {
             | "--into"
             | "--to"
             | "--paths"
+            | "--lease"
+            | "--request"
+            | "--ttl-seconds"
+            | "--source"
+            | "--path"
     )
 }
 
@@ -909,19 +962,223 @@ fn command_suggests_destructive_cleanup(command: &str) -> bool {
 }
 
 fn command_suggests_destructive_db(command: &str) -> bool {
+    split_shell_segments(command)
+        .iter()
+        .any(|segment| destructive_db_invocation(&shell_words(segment), 0))
+}
+
+fn destructive_db_invocation(tokens: &[String], depth: usize) -> bool {
+    if depth > 2 {
+        return false;
+    }
+    let Some(command_index) = executable_token_index(tokens) else {
+        return false;
+    };
+    let executable = command_basename(&tokens[command_index]).to_ascii_lowercase();
+    let args = &tokens[command_index + 1..];
+
+    if matches!(executable.as_str(), "sh" | "bash" | "zsh" | "dash") {
+        if let Some(script) = option_value(args, "-c") {
+            return command_suggests_destructive_db(&script);
+        }
+        return false;
+    }
+
+    if matches!(executable.as_str(), "sudo" | "env") {
+        return destructive_db_invocation(wrapper_command_args(&executable, args), depth + 1);
+    }
+
+    if matches!(executable.as_str(), "docker" | "podman")
+        && args.first().is_some_and(|arg| arg == "exec")
+    {
+        let nested = args
+            .iter()
+            .position(|arg| is_database_client(command_basename(arg)))
+            .map(|index| &args[index..]);
+        return nested.is_some_and(|nested| destructive_db_invocation(nested, depth + 1));
+    }
+
+    if is_database_client(&executable) {
+        let sql = args
+            .iter()
+            .map(|arg| {
+                arg.split_once('=').map_or_else(
+                    || trim_matching_shell_quotes(arg).to_string(),
+                    |(option, value)| {
+                        if option.starts_with('-') {
+                            trim_matching_shell_quotes(value).to_string()
+                        } else {
+                            format!("{option}={}", trim_matching_shell_quotes(value))
+                        }
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        return destructive_sql_text(&sql);
+    }
+
+    let normalized_args = args
+        .iter()
+        .map(|arg| arg.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let framework_runner = matches!(
+        executable.as_str(),
+        "rails" | "rake" | "bundle" | "prisma" | "npx" | "npm" | "pnpm" | "yarn" | "bun"
+    );
+    framework_runner
+        && (normalized_args.iter().any(|arg| arg == "db:reset")
+            || normalized_args
+                .windows(2)
+                .any(|window| window == ["migrate", "reset"]))
+}
+
+fn trim_matching_shell_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if matches!(bytes[0], b'\'' | b'"') && bytes[0] == bytes[value.len() - 1] {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+fn wrapper_command_args<'a>(wrapper: &str, args: &'a [String]) -> &'a [String] {
+    let mut index = 0;
+    while index < args.len() {
+        let token = args[index].as_str();
+        if token == "--" {
+            return &args[index + 1..];
+        }
+        if wrapper == "env" && token.contains('=') && !token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        if !token.starts_with('-') {
+            break;
+        }
+        let takes_value = if wrapper == "sudo" {
+            matches!(
+                token,
+                "-u" | "--user" | "-g" | "--group" | "-h" | "--host" | "-p" | "--prompt"
+            )
+        } else {
+            matches!(
+                token,
+                "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string"
+            )
+        };
+        index += if takes_value && !token.contains('=') {
+            2
+        } else {
+            1
+        };
+    }
+    &args[index.min(args.len())..]
+}
+
+fn executable_token_index(tokens: &[String]) -> Option<usize> {
+    tokens.iter().position(|token| {
+        !token.is_empty()
+            && !token.contains('=')
+            && !is_shell_control_token(token)
+            && !matches!(token.as_str(), "command" | "builtin" | "nohup")
+    })
+}
+
+fn is_database_client(executable: &str) -> bool {
+    matches!(
+        executable.to_ascii_lowercase().as_str(),
+        "psql" | "mysql" | "mariadb" | "sqlite3" | "sqlcmd" | "mongosh" | "mongo"
+    )
+}
+
+fn destructive_sql_text(sql: &str) -> bool {
+    let sql = sql_code_without_literals_or_comments(sql);
     command_contains_any(
-        command,
+        &sql,
         &[
             "drop table",
             "drop database",
             "truncate table",
             "delete from",
             "alter table",
-            "db:reset",
-            "migrate reset",
-            "prisma migrate reset",
+            "dropdatabase()",
         ],
     )
+}
+
+fn sql_code_without_literals_or_comments(sql: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Code,
+        SingleQuoted,
+        DoubleQuoted,
+        LineComment,
+        BlockComment,
+    }
+
+    let mut output = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut state = State::Code;
+    while let Some(ch) = chars.next() {
+        match state {
+            State::Code => match (ch, chars.peek().copied()) {
+                ('-', Some('-')) => {
+                    chars.next();
+                    output.push(' ');
+                    state = State::LineComment;
+                }
+                ('/', Some('*')) => {
+                    chars.next();
+                    output.push(' ');
+                    state = State::BlockComment;
+                }
+                ('\'', _) => {
+                    output.push(' ');
+                    state = State::SingleQuoted;
+                }
+                ('"', _) => {
+                    output.push(' ');
+                    state = State::DoubleQuoted;
+                }
+                _ => output.push(ch.to_ascii_lowercase()),
+            },
+            State::SingleQuoted => {
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                    } else {
+                        state = State::Code;
+                    }
+                }
+            }
+            State::DoubleQuoted => {
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                    } else {
+                        state = State::Code;
+                    }
+                }
+            }
+            State::LineComment => {
+                if ch == '\n' {
+                    output.push(' ');
+                    state = State::Code;
+                }
+            }
+            State::BlockComment => {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    output.push(' ');
+                    state = State::Code;
+                }
+            }
+        }
+    }
+    output
 }
 
 fn command_suggests_test_strategy_change(command: &str) -> bool {

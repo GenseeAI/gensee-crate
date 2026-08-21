@@ -7318,6 +7318,66 @@ fn fork_suggestion_detects_exploratory_command_families() {
 }
 
 #[test]
+fn destructive_database_detection_requires_a_mutating_database_invocation() {
+    for command in [
+        r#"rg "delete from" migrations/"#,
+        r#"git grep "DROP TABLE""#,
+        r#"printf '%s\n' 'ALTER TABLE examples'"#,
+        r#"cat docs/database-reset.md"#,
+        r#"psql -c "SELECT 'delete from'; -- drop table docs""#,
+    ] {
+        assert_ne!(
+            fork_suggestion_reason(command, &[]),
+            Some(ForkSuggestionReason::DestructiveDatabaseCommand),
+            "read-only command was misclassified: {command}"
+        );
+    }
+
+    for command in [
+        r#"psql -c 'DELETE FROM users'"#,
+        r#"sudo -u postgres psql --command='DROP TABLE users'"#,
+        r#"env PGDATABASE=test psql -c 'TRUNCATE TABLE events'"#,
+        r#"docker exec db psql -c 'ALTER TABLE users ADD COLUMN x int'"#,
+        "bundle exec rails db:reset",
+        "npx prisma migrate reset",
+    ] {
+        assert_eq!(
+            fork_suggestion_reason(command, &[]),
+            Some(ForkSuggestionReason::DestructiveDatabaseCommand),
+            "mutating database command was missed: {command}"
+        );
+    }
+}
+
+#[test]
+fn capability_delegation_rule_has_an_explicit_monitor_only_override() {
+    let mut document: Value = serde_json::from_str(policy::default_policy_json()).unwrap();
+    document["review_overrides"] = json!([{
+        "rule_id": "policy_capability_delegation_required",
+        "severity": "medium",
+        "action": "warn"
+    }]);
+    let policy = Policy::from_json(&document.to_string()).unwrap();
+    let payload = pretool_bash_payload("s1", "/repo", "psql -c 'DROP TABLE users'");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let decision = evaluate_pretool_policy_with_policy(&event, &[], None, &policy);
+
+    assert_eq!(decision.action, PolicyAction::Warn);
+    let finding = decision
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id == "policy_capability_delegation_required")
+        .unwrap();
+    assert_eq!(finding.action, PolicyAction::Warn);
+    assert_eq!(finding.severity, "medium");
+    assert_eq!(
+        finding.evidence["policy_override"]["pre_review_action"],
+        "block"
+    );
+}
+
+#[test]
 fn fork_suggestion_detects_lockfile_writes_from_subjects() {
     let subjects = vec![PolicySubject {
         source: "bash",
