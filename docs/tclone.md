@@ -140,13 +140,61 @@ section of `gensee run list`. The launcher also prints it directly:
 `gensee: fork from another terminal with: gensee run fork run_...`.
 When hooks see requests or commands that are good fork candidates, such as
 dependency upgrades, migrations, broad refactors, lockfile changes, destructive
-cleanup, or database resets, Gensee records a `policy_fork_suggested` alert with
-suggested `gensee run fork --attach tmux:right --json` guidance. In Codex source
+cleanup, or database resets, Gensee records a
+`policy_capability_delegation_required` alert with a provider-neutral capability
+request. The request declares filesystem, network, identity, process, untrusted
+code, and external-mutation needs; resource selectors whose empty value means
+"not granted" rather than "allow all"; its effect scope; a maximum lease lifetime;
+and whether execution requires an isolated cell or a brokered commit. This model
+is intentionally operation-based rather than package-manager-specific. The
+alert also includes suggested `gensee run fork --attach tmux:right --json`
+guidance. In Codex source
 runs, matching user prompts add fork guidance before planning; matching source
 commands are blocked as a backstop so Codex can ask for a fork and continue the
 work there. The live-cloned Codex turn continues the original approved task
 automatically; the source does not resend the prompt. Forked Codex runs are
-allowed to execute the command.
+allowed to execute reversible local commands. Requests classified as external
+mutations remain blocked inside forks because a workspace fork cannot roll back
+an external effect; those require a brokered commit path.
+
+Destructive commands against direct file-backed clients such as `sqlite3` and
+`duckdb` are classified as irreversible local filesystem mutations and routed
+to an isolated cell. Remote database clients and database commands executed
+inside another container remain external mutations that require a brokered
+commit path. Irreversible local requests fail closed with high severity for
+every provider unless the command is already running in a disposable tclone
+fork; this also applies to destructive workspace cleanup. An observe-only
+policy can explicitly downgrade the stable capability-delegation rule when
+enforcement is intentionally disabled.
+The fork exemption is granted only by a role-consistent run-context marker at
+Gensee's fixed runtime path. `GENSEE_TCLONE_CONTEXT_PATH` is a test-only
+override, and an inherited `GENSEE_RUN_ID` may identify a source run but cannot
+claim that execution is already isolated in a fork.
+
+The alert's `capability_request` is a descriptive starting template, not a
+ready-to-lease document. Its selectors are intentionally empty (empty means
+"not granted"), so a trusted issuer must copy it and add exact path, network,
+identity, or external-target selectors before `gensee run lease issue` will
+accept it. Generated requests default to the cell runtime's 240-second maximum
+lease lifetime.
+
+The default external-mutation decision is a hard block. For a controlled
+observe-only baseline, an operator can explicitly override the stable rule id
+in the active policy; `warn` records the finding without denying the command:
+
+```json
+{
+  "review_overrides": [
+    {
+      "rule_id": "policy_capability_delegation_required",
+      "action": "warn"
+    }
+  ]
+}
+```
+
+This override applies to every capability-delegation finding and should be
+removed before enforcement testing.
 Use the same `gensee-tclone` wrapper for `run list`, `run fork`, `run shell`,
 `run attach`, `run send`, `run exec`, `run merge`, `run switch`, and cleanup;
 otherwise Gensee may read the source record but look in a different Podman store

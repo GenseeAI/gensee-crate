@@ -9,6 +9,9 @@ pub(crate) use gensee_crate_macos::{
     endpoint_security_event_is_bookkeeping, EndpointSecurityAlertPipeline, EndpointSecurityEvent,
     EndpointSecurityIngestor,
 };
+pub(crate) use gensee_crate_rules::capability::{
+    Capability, CapabilityRequest, EffectScope, ExecutionBoundary,
+};
 pub(crate) use gensee_crate_rules::policy::{self, Policy};
 pub(crate) use gensee_crate_store::{
     daemon_socket_path, default_root, AlertRecord, ArtifactObservationInput, ArtifactRiskTagInput,

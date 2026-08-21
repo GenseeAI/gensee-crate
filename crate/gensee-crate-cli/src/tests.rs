@@ -7318,6 +7318,66 @@ fn fork_suggestion_detects_exploratory_command_families() {
 }
 
 #[test]
+fn destructive_database_detection_requires_a_mutating_database_invocation() {
+    for command in [
+        r#"rg "delete from" migrations/"#,
+        r#"git grep "DROP TABLE""#,
+        r#"printf '%s\n' 'ALTER TABLE examples'"#,
+        r#"cat docs/database-reset.md"#,
+        r#"psql -c "SELECT 'delete from'; -- drop table docs""#,
+    ] {
+        assert_ne!(
+            fork_suggestion_reason(command, &[]),
+            Some(ForkSuggestionReason::DestructiveDatabaseCommand),
+            "read-only command was misclassified: {command}"
+        );
+    }
+
+    for command in [
+        r#"psql -c 'DELETE FROM users'"#,
+        r#"sudo -u postgres psql --command='DROP TABLE users'"#,
+        r#"env PGDATABASE=test psql -c 'TRUNCATE TABLE events'"#,
+        r#"docker exec db psql -c 'ALTER TABLE users ADD COLUMN x int'"#,
+        "bundle exec rails db:reset",
+        "npx prisma migrate reset",
+    ] {
+        assert_eq!(
+            fork_suggestion_reason(command, &[]),
+            Some(ForkSuggestionReason::DestructiveDatabaseCommand),
+            "mutating database command was missed: {command}"
+        );
+    }
+}
+
+#[test]
+fn capability_delegation_rule_has_an_explicit_monitor_only_override() {
+    let mut document: Value = serde_json::from_str(policy::default_policy_json()).unwrap();
+    document["review_overrides"] = json!([{
+        "rule_id": "policy_capability_delegation_required",
+        "severity": "medium",
+        "action": "warn"
+    }]);
+    let policy = Policy::from_json(&document.to_string()).unwrap();
+    let payload = pretool_bash_payload("s1", "/repo", "psql -c 'DROP TABLE users'");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let decision = evaluate_pretool_policy_with_policy(&event, &[], None, &policy);
+
+    assert_eq!(decision.action, PolicyAction::Warn);
+    let finding = decision
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id == "policy_capability_delegation_required")
+        .unwrap();
+    assert_eq!(finding.action, PolicyAction::Warn);
+    assert_eq!(finding.severity, "medium");
+    assert_eq!(
+        finding.evidence["policy_override"]["pre_review_action"],
+        "block"
+    );
+}
+
+#[test]
 fn fork_suggestion_detects_lockfile_writes_from_subjects() {
     let subjects = vec![PolicySubject {
         source: "bash",
@@ -7339,7 +7399,7 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     let finding = fork_suggestion_finding(&event, &[], Some("run_123")).unwrap();
 
     assert_eq!(finding.action, PolicyAction::Allow);
-    assert_eq!(finding.rule_id, "policy_fork_suggested");
+    assert_eq!(finding.rule_id, "policy_capability_delegation_required");
     assert!(finding
         .message
         .contains("gensee run fork run_123 --name try-upgrade --attach tmux:right --json"));
@@ -7360,6 +7420,97 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
     assert!(finding.message.contains("Do not auto-merge"));
     assert!(finding.message.contains("waits for explicit user approval"));
     assert_eq!(finding.evidence["reason"], json!("dependency_upgrade"));
+    assert_eq!(
+        finding.evidence["capability_request"]["operation_class"],
+        "dependency_graph_change"
+    );
+    assert_eq!(
+        finding.evidence["capability_request"]["execution_boundary"],
+        "isolated_cell"
+    );
+    assert_eq!(
+        finding.evidence["capability_request"]["source_must_not_execute"],
+        true
+    );
+    assert!(finding.evidence["capability_request"]["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("untrusted_code_execution")));
+}
+
+#[test]
+fn external_mutation_requires_brokered_commit_capabilities() {
+    let payload = pretool_bash_payload("s1", "/repo", "psql -c 'DROP TABLE users'");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let finding = fork_suggestion_finding(&event, &[], Some("run_123")).unwrap();
+    let request = &finding.evidence["capability_request"];
+
+    assert_eq!(request["effect_scope"], "external");
+    assert_eq!(request["execution_boundary"], "brokered_commit");
+    assert!(request["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("identity_use")));
+    assert!(request["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("external_mutation")));
+    assert_eq!(finding.action, PolicyAction::Block);
+    assert_eq!(finding.severity, "high");
+    assert!(finding
+        .message
+        .contains("workspace fork alone cannot roll back"));
+}
+
+#[test]
+fn external_mutation_remains_blocked_inside_a_fork() {
+    let payload = pretool_bash_payload("s1", "/repo", "psql -c 'DROP TABLE users'");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    let finding = fork_suggestion_finding(&event, &[], Some("run_123_fork_456_0")).unwrap();
+
+    assert_eq!(finding.action, PolicyAction::Block);
+    assert_eq!(
+        finding.evidence["capability_request"]["effect_scope"],
+        "external"
+    );
+}
+
+#[test]
+fn irreversible_local_mutations_require_an_isolated_run() {
+    for (provider, run_id) in [
+        (PROVIDER_CODEX, None),
+        (PROVIDER_CODEX, Some("run_123")),
+        (PROVIDER_CLAUDE_CODE, None),
+        (PROVIDER_CLAUDE_CODE, Some("run_123")),
+    ] {
+        for command in [
+            r#"sqlite3 ./prod.db "drop table users""#,
+            "find . -name '*.tmp' -delete",
+        ] {
+            let payload = pretool_bash_payload("s1", "/repo", command);
+            let event = super::build_hook_event(&payload, provider).unwrap();
+            let finding = fork_suggestion_finding(&event, &[], run_id).unwrap();
+
+            assert_eq!(finding.action, PolicyAction::Block, "{provider}: {command}");
+            assert_eq!(finding.severity, "high", "{provider}: {command}");
+            assert!(finding.message.contains("blocked outside an isolated run"));
+        }
+    }
+}
+
+#[test]
+fn irreversible_local_mutations_are_allowed_inside_a_fork() {
+    for provider in [PROVIDER_CODEX, PROVIDER_CLAUDE_CODE] {
+        let payload =
+            pretool_bash_payload("s1", "/repo", r#"sqlite3 ./prod.db "drop table users""#);
+        let event = super::build_hook_event(&payload, provider).unwrap();
+        let finding = fork_suggestion_finding(&event, &[], Some("run_123_fork_456_0")).unwrap();
+
+        assert_eq!(finding.action, PolicyAction::Allow, "{provider}");
+        assert_eq!(finding.severity, "info", "{provider}");
+    }
 }
 
 #[test]
@@ -7413,13 +7564,41 @@ fn codex_fork_context_marker_overrides_stale_source_run_env() {
         "fork marker should prevent source-run deny despite stale env: {output:?}"
     );
     assert!(store.list_alerts().unwrap().iter().any(|alert| {
-        alert.rule_id == "policy_fork_suggested"
+        alert.rule_id == "policy_capability_delegation_required"
             && alert.action == "allow"
             && alert.severity == "info"
     }));
     env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
     env::remove_var("GENSEE_RUN_ID");
     std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn inherited_fork_run_id_does_not_exempt_irreversible_local_mutation() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_123_fork_456_0");
+    let (store, workspace) = temp_store_and_workspace("untrusted-fork-run-id");
+    env::set_var(
+        "GENSEE_TCLONE_CONTEXT_PATH",
+        workspace.join("missing-run-context.json"),
+    );
+    let payload = pretool_bash_payload(
+        "s1",
+        workspace.to_str().unwrap(),
+        r#"sqlite3 ./prod.db "drop table users""#,
+    );
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+    let current_run_id = current_tclone_run_id_for_event(&event);
+    let finding = fork_suggestion_finding(&event, &[], current_run_id.as_deref()).unwrap();
+
+    assert_eq!(current_run_id, None);
+    assert_eq!(finding.action, PolicyAction::Block);
+    assert_eq!(finding.severity, "high");
+    assert!(finding.message.contains("blocked outside an isolated run"));
+    env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
+    env::remove_var("GENSEE_RUN_ID");
+    std::fs::remove_dir_all(workspace).ok();
+    drop(store);
 }
 
 #[test]
@@ -7437,7 +7616,7 @@ fn codex_source_run_emits_pretool_deny_for_fork_suggestion() {
     assert!(output.contains("\"permissionDecision\":\"deny\""));
     assert!(output.contains("forked run"));
     assert!(store.list_alerts().unwrap().iter().any(|alert| {
-        alert.rule_id == "policy_fork_suggested"
+        alert.rule_id == "policy_capability_delegation_required"
             && alert.action == "block"
             && alert.severity == "medium"
     }));
@@ -7464,7 +7643,7 @@ fn codex_source_allows_sending_risky_prompt_to_fork() {
         .list_alerts()
         .unwrap()
         .iter()
-        .any(|alert| alert.rule_id == "policy_fork_suggested"));
+        .any(|alert| alert.rule_id == "policy_capability_delegation_required"));
     env::remove_var("GENSEE_RUN_ID");
     std::fs::remove_dir_all(workspace).ok();
 }
@@ -7612,7 +7791,7 @@ fn codex_userpromptsubmit_injects_fork_context_for_source_run() {
         output.contains("gensee run fork run_123 --name try-upgrade --attach tmux:right --json")
     );
     assert!(store.list_alerts().unwrap().iter().any(|alert| {
-        alert.rule_id == "policy_fork_suggested"
+        alert.rule_id == "policy_capability_delegation_required"
             && alert.action == "allow"
             && alert.severity == "info"
             && alert
@@ -7643,7 +7822,7 @@ fn codex_userpromptsubmit_skips_prompt_already_sent_to_fork() {
     );
     assert_eq!(
         store
-            .session_alert_count("s1", "policy_fork_suggested")
+            .session_alert_count("s1", "policy_capability_delegation_required")
             .unwrap(),
         0
     );
@@ -7670,7 +7849,7 @@ fn codex_userpromptsubmit_dedups_fork_context_per_reason() {
         .is_none());
     assert_eq!(
         store
-            .session_alert_count("s1", "policy_fork_suggested")
+            .session_alert_count("s1", "policy_capability_delegation_required")
             .unwrap(),
         1
     );
@@ -7693,7 +7872,7 @@ fn hook_records_fork_suggestion_without_blocking() {
     assert!(output.contains("forked run"));
     let alerts = store.list_alerts().unwrap();
     assert!(alerts.iter().any(|alert| {
-        alert.rule_id == "policy_fork_suggested"
+        alert.rule_id == "policy_capability_delegation_required"
             && alert.action == "allow"
             && alert.severity == "info"
     }));
@@ -7719,7 +7898,7 @@ fn hook_dedups_fork_suggestions_per_session_and_reason() {
         .list_alerts()
         .unwrap()
         .into_iter()
-        .filter(|alert| alert.rule_id == "policy_fork_suggested")
+        .filter(|alert| alert.rule_id == "policy_capability_delegation_required")
         .collect::<Vec<_>>();
     assert_eq!(alerts.len(), 2);
     assert!(alerts.iter().any(|alert| alert

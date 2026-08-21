@@ -579,6 +579,9 @@ such as dependency upgrades, migrations, broad refactors, lockfile changes,
 destructive cleanup, and database resets. In Codex tclone source runs, matching
 user prompts add fork guidance before planning; matching source commands are
 blocked as a backstop so the risky work happens in a fork first.
+Irreversible local operations are blocked with high severity across providers
+until execution is inside a disposable tclone fork; observe-only deployments
+can explicitly downgrade the stable capability-delegation rule in policy.
 Async fork JSON includes `status_command`; poll it immediately and keep retrying
 that same command while `status=running`. The active status poll is intentionally
 inherited by the live clone so the forked Codex turn can stop source
