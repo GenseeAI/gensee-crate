@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 mod capability_cell;
 pub(crate) use capability_cell::{tclone_capability_cell, tclone_capability_lease};
+mod capability_broker;
+pub(crate) use capability_broker::tclone_capability_broker;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
