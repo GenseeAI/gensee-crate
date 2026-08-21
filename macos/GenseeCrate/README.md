@@ -1,294 +1,181 @@
-# Gensee Crate for macOS
+# Gensee Crate Personal for macOS
 
-This is the native macOS security console and Endpoint Security host for Gensee
-Crate. It uses these explicit App IDs:
+Gensee Crate Personal is a local companion for developers who delegate work to
+AI coding agents. It lets agents keep moving without constant supervision,
+independently checks what happened on your Mac, and brings you back only when
+work drifts beyond the request, verification is missing or stale, or a risky
+action needs review.
 
-- Host app: `ai.gensee.crate`
-- Endpoint Security extension: `ai.gensee.crate.endpoint-security`
+Instead of another agent transcript, you get one calm review queue across
+Codex, Claude Code, Cursor, GitHub Copilot, Antigravity, and Omnigent—with the
+original request, commands, files touched, verification evidence, policy
+decisions, and a recovery point when one was created. Your activity and policy
+stay on your Mac.
 
-The extension supports `off`, `observe`, `protect`, and `strict` policy modes.
-It subscribes to process lifecycle, file access and mutation notifications, and
-the corresponding Endpoint Security `AUTH` events. `observe` is the default and
-never denies. `protect` and `strict` can deny configured operations only inside
-explicitly managed agent process trees; unrelated host processes remain outside
-the deny scope.
+**[Download the latest notarized macOS app](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)**
 
-The host app embeds the `gensee` CLI built from this repository and uses it as
-the product backend. The native console reads the local dashboard snapshot,
-managed and transactional runs, policy settings, and agent-integration state
-from the same `GENSEE_HOME` store as the CLI (default `~/.gensee`). Policy and
-integration changes are submitted through the existing `gensee policy` and
-`gensee setup` commands rather than reimplementing their behavior in Swift.
+Requires macOS 13 or later.
 
-The console includes:
+## Why use Gensee Crate Personal?
 
-- A local **Control Center** that turns completed agent requests into concise,
-  evidence-backed reviews. It connects the original request to elapsed time,
-  tool calls, commands, mutation paths, observed test commands, and policy
-  findings without storing or displaying full model responses or tool output.
-  A test command is reported as observed, never as passed unless a future
-  evidence source can verify its result.
-- Optional quiet macOS notifications for substantial completed tasks and an
-  opt-in end-of-day briefing. The first refresh establishes a historical
-  baseline, so enabling notifications never floods Notification Center with
-  old work.
-- An explicit, in-memory **synthetic demo** that can be entered before setup or
-  from the app toolbar. It uses invented sessions, requests, tool calls,
-  findings, artifacts, recovery points, verification results, and a rolling
-  53-week activity history. Its connected AcmeShop scenarios include clean
-  completions, scope drift, a blocked secret read, stale verification, and a
-  migration that needs review, so each screen tells part of the same product
-  story. A persistent banner identifies the data as synthetic. Entering the
-  demo does not initialize a database, install hooks, request Apple permissions,
-  change policy, or touch harness settings. Real configuration pages remain
-  locked until the user exits the demo.
-- A developer-oriented autonomy ladder. **Fast** keeps Endpoint Security
-  notification-only while existing hook decision rules still apply;
-  **Review** enables configured OS authorization while keeping ask decisions
-  interactive; **Sensitive** selects strict OS authorization and escalates
-  medium-or-higher asks to deny so an agent stops instead of waiting for an
-  approval. The ladder changes these two policy controls atomically and never
-  rewrites the user's decision rules.
-- A first-launch setup assistant that installs the bundled backend at
-  `~/.gensee/bin/gensee`, initializes the encrypted event store and default
-  policy, establishes smart recovery and a read-only configuration-audit
-  baseline before requesting Apple approvals, scans all six harnesses, and offers one-click
-  setup for every installed direct-hook integration. It does not require a
-  separate SQLite install, Homebrew, Rust, jq, or Xcode Command Line Tools.
-- An **Overview** of review demand, independently verified activity, protection
-  health, and recent findings backed by `gensee dashboard-state` and
-  `gensee run list --json`.
-- A Daily Highlight page with today's summary and four rolling-year activity
-  heatmaps for agent turns, tool calls, alerts, and token usage. Heatmap days
-  are selectable and update the detailed summary.
-- A decision-first Review Queue that classifies completed requests as
-  **Verified**, **Review recommended**, **Needs attention**, or **Incomplete
-  evidence**. It promotes undeclared and sensitive changes, flags verification
-  that predates a later file mutation, groups low-level findings into decisions,
-  and retains request-scoped timeline, file, recovery, and evidence drill-downs.
-- A cross-session Watchlist for control-plane, agent-memory, and persistent
-  targets. It ranks undeclared and cross-session effects first and keeps the
-  relationship graph as a provenance drill-down.
-- Policy controls backed by `gensee policy get/set/path`. Finding review can
-  tune a rule for future matches, but weakening a rule requires explicit
-  confirmation because the change applies across every path and session. The
-  Settings page inventories these **Tuned rules** and can reset each one;
-  strict and non-interactive fail-closed modes retain the rule's original
-  enforcement floor.
-- A Harnesses page that detects Codex, Claude Code, Antigravity, Cursor,
-  GitHub Copilot, and Omnigent. Installed direct-hook integrations can be
-  enabled or disabled through `gensee setup`; unavailable harnesses remain
-  visible but disabled. Codex and GitHub Copilot rows also open the native
-  Config Audit workflow backed by `gensee audit --json`, with saved baselines,
-  drift since the previous audit, findings,
-  evidence, remediation, inventory, source provenance, and manual checks.
-  Other audit actions are visibly marked **Coming soon**. Enabled integrations
-  are checked for complete hook coverage, the active event-store path, the
-  current backend executable, and harness-specific blockers, with a one-click
-  repair action when needed. A hook configuration becomes **Protected** only
-  after a real event from that harness reaches the active local store.
-- Endpoint Security installation, removal, and Full Disk Access navigation.
-- Per-harness **Smart recovery points** in **Auto**, **Ask**, or **Off** mode.
-  Auto creates one Git-backed point before the first risky or mutating tool
-  call in a request; Review Queue surfaces the point and its Restore action.
-- A menu-bar status window for independent sensor health, pending reviews, and
-  the latest request, with a direct jump into Review Queue.
+- **Supervise less.** Let routine agent work continue while Gensee calls your
+  attention to exceptions and outcomes that actually need a decision.
+- **Catch scope drift.** Compare an agent's declared tool intent with
+  independently observed file activity and highlight changes that do not match.
+- **Review work across agents.** See completed Codex, Claude Code, Cursor,
+  GitHub Copilot, Antigravity, and Omnigent work in one queue.
+- **Recover from risky changes.** Create a Git-backed recovery point before the
+  first risky or mutating action in a request, then restore it from the review.
+- **Check what can influence an agent.** Audit instructions, skills, MCP
+  servers, hooks, permissions, plugins, and command rules without executing
+  them.
+- **Keep evidence local.** Gensee runs on your Mac and does not require a cloud
+  account or a separate developer toolchain.
 
-Token totals are captured from compatible Claude Code and Codex transcript
-usage metadata when a turn completes. Only the numeric per-turn total is stored;
-historical turns and harnesses without compatible usage metadata remain zero.
+## Get started
 
-## Smart recovery points
+1. **Download and install.** Open the disk image and move **Gensee Crate.app**
+   to `/Applications`.
+2. **Try the demo.** Explore realistic synthetic activity without installing
+   hooks, changing policy, creating a database, or requesting Apple permissions.
+3. **Run the setup assistant.** Gensee prepares its local backend and encrypted
+   event store, scans installed coding agents, and explains each optional step.
+4. **Enable the agents you use.** Choose **Enable Protection** for an installed
+   harness. Gensee preserves unrelated hooks and settings.
+5. **Restart or reload the agent when prompted.** Codex also asks you to review
+   and trust the Gensee hook commands. An integration becomes **Protected**
+   only after a real event reaches the local store.
+6. **Add independent Mac verification when you are ready.** The setup assistant
+   guides you through the optional system extension and Full Disk Access
+   approvals.
 
-The **Harnesses** page gives each hook-capable integration a **Smart recovery
-points** control. **Auto** is the default and creates one point per request and
-Git workspace before the first risky or mutating tool call. **Ask** pauses
-supported hook flows for approval in Gensee Crate; Codex blocks the operation
-and asks the user to approve and retry because it has no equally reliable
-generic interactive pre-tool response. **Off** skips automatic creation.
+You can rerun the assistant at any time from **Settings → Run Setup
+Assistant**.
 
-A recovery point captures tracked files and untracked, non-ignored files in
-the repository's local Git object database without committing to the user's
-branch or changing the real Git staging index. Review Queue shows when a point
-was created and provides the explicitly confirmed Restore action. Restoring
-first captures the current state as a rescue checkpoint.
+## What you will use day to day
 
-This is recovery, not isolation. Ignored files, nested repository contents,
-files outside the selected workspace, running processes, databases, and remote
-side effects are outside the checkpoint. Restoring may remove non-ignored files
-created after the checkpoint. Linux tclone remains the stronger transactional
-runtime when an agent needs a fully cloneable environment.
+### Review Queue
 
-Retention and failure fallback are configured in **Settings**. The same
-primitive remains available from the embedded OSS CLI:
+The Review Queue groups work by agent session and request. Each review connects
+the original task to elapsed time, tool calls, commands, files touched, grouped
+findings, and observed verification commands.
 
-```bash
-gensee checkpoint create --workspace . --label "Before agent refactor"
-gensee checkpoint list --workspace . --json
-gensee checkpoint restore cp-123-deadbeef --workspace . --yes
-```
+Gensee keeps clean completions quiet. It can notify you when it detects:
 
-## Use the security console
+- changes outside the agent's declared intent;
+- a blocked or high-risk operation;
+- verification that failed or became stale after another file change;
+- incomplete Endpoint Security evidence; or
+- a request that otherwise needs a human decision.
 
-The **Harnesses** page always lists the six supported harnesses. When Codex,
-Claude Code, Antigravity, Cursor, or GitHub Copilot is detected, **Enable
-Protection** installs the existing Gensee hook integration through the embedded
-OSS CLI. A protected row instead offers **Disable Protection**. A harness that
-is not installed remains visible with disabled, muted actions so users can see
-what is supported without implying that it is active. **Scan again** refreshes
-installation and protection state. If hooks are incomplete, disabled, or
-routed to a different store or backend, **Repair Protection** reruns the
-matching OSS setup command with this app's active store and embedded backend;
-it changes only Gensee-owned hook entries.
+Open a request to inspect its timeline, findings, and files. When a recovery
+point exists, the same review provides the Restore action.
 
-After setup, follow the provider-specific restart or reload instruction and
-start a new agent turn. Codex additionally requires trust review for
-non-managed hooks: use **Open Codex Hook Review**, enter the copied `/hooks`,
-and trust the Gensee commands. The one-time Terminal review closes automatically
-after Codex records approval. The assistant can use the Codex
-binary bundled with the ChatGPT app, so the user does not need a separately
-installed command on `PATH`. Until the first real event arrives, the harness is
-shown as **Restart & test** rather than **Protected**. Rerun the assistant from
-**Settings → Run Setup Assistant** at any time.
+### Smart recovery points
 
-Use **Audit Config** on the Codex or GitHub Copilot row to select a workspace
-and open the read-only audit inline on the Harnesses page. Audit actions for
-Claude Code, Antigravity, Cursor, and Omnigent remain disabled and marked
-**Coming soon** until their static adapters are available.
+Each supported harness has three recovery modes:
 
-Omnigent is shown in the same inventory, but it currently uses managed-launch
-protection instead of a direct hook toggle. Launch it through `gensee run` to
-associate its process tree with Gensee policy and Endpoint Security decisions.
+- **Auto** — create one recovery point before the first risky or mutating tool
+  call in a request. This is the recommended default.
+- **Ask** — pause supported hook flows and ask before creating the point.
+- **Off** — never create a recovery point automatically.
 
-Use **Settings → Protection Level** to move between Fast, Review, and
-Sensitive with a plain-language explanation of the tradeoff. Use **Policy**
-for the underlying Endpoint Security mode, decision rules, protected paths, and
-blocked executables. Use **Settings** to install, inspect, or remove the system
-extension and to open the Full Disk Access pane. Start with Observe, confirm
-event delivery, and review the local evidence before moving to an enforcement
-level.
+Recovery points use the repository's local Git object database without moving
+your branch, creating a normal commit, or changing the staging area. Before a
+restore, Gensee creates a rescue point of the current workspace.
 
-Disabling a direct-hook integration removes only Gensee-owned hook entries and
-preserves unrelated harness settings and hooks. It also removes that harness's
-active roots from Endpoint Security before the next event batch is fetched.
-Only events inside a bounded active tool-call window can become findings;
-runtime bookkeeping is filtered and related file events are coalesced and
-durably deduplicated. Build-output filtering requires both a fixed top-level
-root beneath the active workspace and a known build process. The app leaves
-the mutable event store writable while always protecting
-`$GENSEE_HOME/policy.json` and `$GENSEE_HOME/bin/`. Idle global OS events remain
-available to the in-memory ancestry tracker but are not written to the
-dashboard event store.
+Recovery points cover tracked files and untracked, non-ignored files in the
+selected Git workspace. They cannot undo database changes, network requests,
+remote repository actions, running processes, ignored files, nested
+repositories, or files outside that workspace.
 
-The Policy page controls local recording volume independently from
-enforcement. By default Gensee records alerts at `info` or higher, persists raw
-Endpoint Security events only during active agent tool calls, retains raw
-events for 24 hours with a 100,000-row hard cap, and permanently deletes
-`info`, `low`, and `medium` alerts after 48 hours. High and critical alerts are
-not removed by the low-severity expiry. Users can change the severity floor,
-raw-event scope, retention hours, and row cap without weakening inline policy
-decisions. Settings reports extension backlog, batch latency, suppressed raw
-events, and retention pruning so backpressure is visible instead of silently
-stalling the console. Expiry runs in small bounded ingestion batches so it
-never blocks dashboard projection work and catches up while the sensor runs.
+### Configuration Audit
 
-## Apple Developer configuration
+Open **Harnesses** and choose **Audit Config** for Codex or GitHub Copilot.
+Gensee performs a read-only review of the configuration that can change agent
+behavior, including:
 
-In Certificates, Identifiers & Profiles:
+- instruction and skill files;
+- MCP servers and plugins;
+- hooks and permissions;
+- command approval rules; and
+- the sources that contributed to the final configuration.
 
-1. Register or select the explicit host App ID `ai.gensee.crate` and enable the
-   **System Extension** capability.
-2. Register or select the explicit extension App ID
-   `ai.gensee.crate.endpoint-security` and enable the approved
-   **Endpoint Security** managed capability.
-3. Check the Endpoint Security capability's distribution details. Development
-   access is sufficient for local testing; **Developer ID** access is required
-   to ship the app independently.
-4. Open `GenseeCrate.xcodeproj`, select the same GenseeAI development team for
-   both targets, and let Xcode refresh their provisioning profiles.
+Findings include evidence and a recommended action. The next audit compares
+against the saved local baseline so you can focus on new and resolved drift.
+Audits for additional harnesses are marked **Coming soon**.
 
-The host carries `com.apple.developer.system-extension.install`. The embedded
-extension carries `com.apple.developer.endpoint-security.client`.
+### Daily Highlight and Watchlist
 
-These entitlement declarations and bundle identifiers are public build
-configuration. Publishing them does not grant Endpoint Security access to
-another Apple Developer account: each developer or distributor must receive
-Apple's approval for their own account and sign with matching development or
-Developer ID provisioning. Never commit certificates, private keys, `.p12`
-files, provisioning profiles, notarization credentials, archives, or built
-`.app`/DMG artifacts.
+**Daily Highlight** summarizes today's agent turns, tool calls, alerts, and
+compatible token totals, with rolling 53-week activity views.
 
-## Build and install
+**Watchlist** keeps persistent or sensitive files visible across sessions, so
+you can investigate repeated access or changes without searching individual
+agent histories.
 
-Generate the Xcode project, then build. The host build phase compiles
-`gensee-crate-cli` and embeds the resulting executable in the app bundle.
+## Optional Mac protection
 
-```bash
-xcodegen generate --spec project.yml
+Gensee provides useful features before you grant broad system access. Hook-based
+reviews, smart recovery points, and Configuration Audit work without Full Disk
+Access.
 
-xcodebuild -project GenseeCrate.xcodeproj \
-  -scheme GenseeCrate \
-  -configuration Debug \
-  build
-```
+For independent verification, Gensee can install its signed Endpoint Security
+system extension. This lets the app observe supported process and file activity
+at the operating-system level, correlate it with active agent requests, and
+detect effects that bypass or fall outside normal harness hooks.
 
-System extension activation only works from a properly signed app installed in
-`/Applications`. Copy the built `Gensee Crate.app` there, launch it, and click
-**Install & Enable**. Approve the extension and grant Full Disk Access in System
-Settings when macOS requests them.
+macOS requires you to approve the extension and Full Disk Access yourself;
+Gensee cannot silently grant either permission. You can start in observation
+mode, confirm that evidence is arriving, and enable stronger protection later.
+Unrelated applications remain outside Gensee's enforcement scope.
 
-Inspect the extension after activation:
+## Protection levels
 
-```bash
-systemextensionsctl list
-log stream --predicate 'subsystem == "ai.gensee.crate.endpoint-security"'
-```
+- **Fast** — keeps agents moving and stops only clearly dangerous actions.
+- **Review** — asks before broad or sensitive changes and enables configured OS
+  enforcement.
+- **Sensitive** — uses a stricter, fail-closed posture for managed agent work.
 
-For local extension replacement during development, Apple also provides system
-extension developer mode:
+Use **Policy** when you want to customize the underlying decision rules,
+protected paths, blocked executables, recording level, or retention. The same
+local policy is used by the app, hooks, and embedded backend.
 
-```bash
-systemextensionsctl developer on
-```
+## Supported agents
 
-That command requires administrator approval and should only be used on a
-development Mac.
+| Agent | Protection | Configuration Audit |
+| --- | --- | --- |
+| Codex | Direct Gensee hooks | Available |
+| Claude Code | Direct Gensee hooks | Coming soon |
+| Antigravity | Direct Gensee hooks | Coming soon |
+| Cursor | Direct Gensee hooks | Coming soon |
+| GitHub Copilot in VS Code | VS Code agent hooks | Available |
+| Omnigent | Gensee-managed launch | Coming soon |
 
-## Publish a macOS release
+An installed direct-hook agent can be enabled, disabled, scanned, and repaired
+from **Harnesses**. If an integration points to an old backend or event store,
+or is missing a required hook, Gensee shows **Needs repair** instead of claiming
+that it is protected.
 
-Public builds must be universal, Developer ID signed, notarized by Apple, and
-stapled before upload. Store notarization credentials in the login keychain;
-never put them in the repository or a shell script:
+Omnigent currently requires a Gensee-managed launch because it does not expose
+the same direct hook integration as the other supported agents.
 
-```bash
-xcrun notarytool store-credentials gensee-crate \
-  --apple-id "developer@example.com" \
-  --team-id "3KWVB4M63F"
-```
+## Local data and privacy
 
-The command securely prompts for an app-specific password. Then run the
-release script from the repository root with the version declared as
-`MARKETING_VERSION` in `project.yml`:
+- Activity, policy, recovery metadata, audit baselines, and review feedback stay
+  in the local Gensee store under `~/.gensee`.
+- The app includes its own backend and SQLite support. It does not require
+  Homebrew, Rust, Xcode, `jq`, or a separate SQLite installation.
+- Full model responses and full tool output are not copied into periodic
+  dashboard snapshots.
+- Compatible Codex and Claude Code integrations store numeric per-turn token
+  totals for activity summaries; they do not copy transcript content into that
+  aggregate.
+- Recording severity, raw-event scope, retention, and row limits are editable
+  under **Policy**.
 
-```bash
-NOTARYTOOL_PROFILE=gensee-crate ./scripts/release_macos_app.sh 0.3.0
-```
+## Help
 
-The script builds the host, system extension, and embedded Rust CLI for both
-Apple silicon and Intel; exports them with Developer ID signing; creates and
-notarizes `dist/Gensee-Crate.dmg`; and staples Apple's ticket. Create the
-GitHub release only after the script completes successfully. Keep the asset
-name `Gensee-Crate.dmg` so the stable public URL remains:
-
-```text
-https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg
-```
-
-## Regenerating the Xcode project
-
-`project.yml` is the source of truth for target structure and signing
-capabilities. With XcodeGen 2.46 or newer installed:
-
-```bash
-xcodegen generate --spec project.yml
-```
+- [Read the macOS user guide](../../docs/macos-app.md)
+- [Join the GenseeAI Discord](https://www.gensee.ai/discord)
+- [Report a problem](https://github.com/GenseeAI/gensee-crate/issues)
