@@ -6,6 +6,7 @@ use gensee_crate_rules::capability::{
     EFFECT_MANIFEST_SCHEMA_VERSION,
 };
 use gensee_crate_rules::capability_broker::BrokerResourceKind;
+use gensee_crate_rules::capability_broker::{BrokerDelivery, BrokerGatewayEffectKind, BrokerLease};
 use gensee_crate_rules::capability_policy::{
     CapabilityPolicyDecision, CapabilityPolicyEngine, MediationBoundary, PolicyEvaluationContext,
 };
@@ -117,7 +118,7 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
                 format!("invalid capability request: {error}"),
             )
         })?;
-    validate_cell_request(&request)?;
+    validate_cell_request_for_issue(&request)?;
     let ttl_seconds = arg_value(options, "--ttl-seconds")
         .map(|value| {
             value.parse::<u64>().map_err(|_| {
@@ -172,11 +173,13 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
                 "source_run_id": lease.source_run_id,
                 "expires_at_ms": lease.expires_at_ms,
                 "execution_boundary": lease.request.execution_boundary,
+                "authorization_state": "pending_mediation",
             }))?
         );
     } else {
-        println!("issued one-use capability lease {lease_id}");
+        println!("issued one-use capability lease reservation {lease_id}");
         println!("reserved capability cell {cell_id}");
+        println!("authorization remains pending until required mediators are attached");
         println!(
             "execute with: gensee run cell {} --lease {lease_id}",
             lease.source_run_id
@@ -236,7 +239,7 @@ pub(crate) fn tclone_capability_cell(args: Vec<OsString>) -> io::Result<()> {
     }
 }
 
-fn validate_cell_request(request: &CapabilityRequest) -> io::Result<()> {
+fn validate_cell_request_for_issue(request: &CapabilityRequest) -> io::Result<()> {
     if request.schema_version != CAPABILITY_REQUEST_SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -275,18 +278,9 @@ fn validate_cell_request(request: &CapabilityRequest) -> io::Result<()> {
         ));
     }
     for unsupported in [
-        Capability::FilesystemMetadata,
-        Capability::NetworkEgress,
-        Capability::NetworkListen,
-        Capability::SecretUse,
-        Capability::IdentityUse,
-        Capability::WorkloadIdentity,
-        Capability::CloudIam,
         Capability::Syscall,
         Capability::LinuxCapability,
         Capability::PrivilegedExecution,
-        Capability::ExternalApplication,
-        Capability::DatabaseAccess,
         Capability::IrreversibleEffect,
         Capability::OutputPromotion,
         Capability::ExternalMutation,
@@ -295,7 +289,7 @@ fn validate_cell_request(request: &CapabilityRequest) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
-                    "capability {unsupported:?} requires a broker and is not available to fresh cells"
+                    "capability {unsupported:?} requires approval or kernel authority that is not available to fresh cells"
                 ),
             ));
         }
@@ -311,30 +305,100 @@ fn validate_cell_request(request: &CapabilityRequest) -> io::Result<()> {
             "the same path cannot be mounted both read-only and writable",
         ));
     }
-    if !request.scope.network_hosts.is_empty()
-        || !request.scope.identities.is_empty()
-        || !request.scope.external_targets.is_empty()
-        || !request.scope.network_destinations.is_empty()
-        || !request.scope.secret_identities.is_empty()
-        || !request.scope.cloud_iam.is_empty()
-        || !request.scope.kernel.syscalls.is_empty()
-        || !request.scope.kernel.linux_capabilities.is_empty()
-        || !request.scope.external_applications.is_empty()
-        || !request.scope.databases.is_empty()
-        || !request.scope.output_promotions.is_empty()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "fresh cells currently accept only legacy filesystem selectors; typed privilege deltas require their mandatory mediators",
-        ));
-    }
+    // Issuance reserves an operation before broker leases can be attached.
+    // Declare only boundaries enforced by every fresh cell; execution derives
+    // broker-backed mediators from leases actually attached to this cell.
+    let active_issue_mediators = vec![
+        MediationBoundary::ProcessCgroup,
+        MediationBoundary::FilesystemBoundary,
+        MediationBoundary::KernelBoundary,
+    ];
     let decision = CapabilityPolicyEngine::default().evaluate(
         request,
         &PolicyEvaluationContext {
-            active_mediators: vec![
-                MediationBoundary::ProcessCgroup,
-                MediationBoundary::FilesystemBoundary,
-            ],
+            active_mediators: active_issue_mediators,
+            locally_authorized_capabilities: Vec::new(),
+            isolated_cell_available: true,
+            approval_staging_available: false,
+        },
+    );
+    let pending_only_on_attachable_mediators = decision.decision == CapabilityPolicyDecision::Deny
+        && !decision.reason_codes.is_empty()
+        && decision
+            .reason_codes
+            .iter()
+            .all(|reason| reason == "mandatory_mediator_missing");
+    if decision.decision != CapabilityPolicyDecision::DelegateToIsolatedCell
+        && !pending_only_on_attachable_mediators
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "capability policy denied cell request structure: {}",
+                decision.reason_codes.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cell_request_for_execution(
+    lease: &CapabilityCellLease,
+    now_ms: u64,
+) -> io::Result<Vec<BrokerLease>> {
+    validate_cell_request_for_issue(&lease.request)?;
+    let broker_leases = super::capability_broker::active_attached_broker_leases(
+        &lease.broker_lease_ids,
+        &lease.source_run_id,
+        &lease.operation_id,
+        &lease.cell_id,
+        now_ms,
+    )?;
+    let mut active_mediators = vec![
+        MediationBoundary::ProcessCgroup,
+        MediationBoundary::FilesystemBoundary,
+        MediationBoundary::KernelBoundary,
+    ];
+    for broker_lease in &broker_leases {
+        validate_broker_scope_against_request(&lease.request, broker_lease)?;
+        match broker_lease.resource_kind {
+            BrokerResourceKind::RepositoryToken | BrokerResourceKind::ApiToken => {
+                active_mediators.push(MediationBoundary::SecretBroker);
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+                add_gateway_kind_mediator(&mut active_mediators, broker_lease)?;
+            }
+            BrokerResourceKind::WorkloadIdentity | BrokerResourceKind::MtlsCertificate => {
+                active_mediators.push(MediationBoundary::WorkloadIdentityBroker);
+                active_mediators.push(MediationBoundary::SecretBroker);
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+            }
+            BrokerResourceKind::FilesystemHandle => {
+                active_mediators.push(MediationBoundary::FilesystemBoundary);
+            }
+            BrokerResourceKind::DatabaseRole => {
+                active_mediators.push(MediationBoundary::DatabaseProxy);
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+            }
+            BrokerResourceKind::NetworkLease => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "direct network leases require the nftables/eBPF backend; use a Unix-socket gateway until it is active",
+                ));
+            }
+            BrokerResourceKind::ExternalActionCommitToken => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "external-action commit tokens are consumed by a host gateway, never inside a cell",
+                ));
+            }
+        }
+    }
+    active_mediators.sort();
+    active_mediators.dedup();
+    let decision = CapabilityPolicyEngine::default().evaluate(
+        &lease.request,
+        &PolicyEvaluationContext {
+            active_mediators,
             locally_authorized_capabilities: Vec::new(),
             isolated_cell_available: true,
             approval_staging_available: false,
@@ -344,11 +408,121 @@ fn validate_cell_request(request: &CapabilityRequest) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "capability policy denied fresh-cell lease: {}",
+                "capability policy denied cell execution: {}",
                 decision.reason_codes.join(", ")
             ),
         ));
     }
+    Ok(broker_leases)
+}
+
+fn validate_broker_scope_against_request(
+    request: &CapabilityRequest,
+    lease: &BrokerLease,
+) -> io::Result<()> {
+    let scope = &request.scope;
+    let allowed_audiences = scope
+        .network_hosts
+        .iter()
+        .cloned()
+        .chain(
+            scope
+                .network_destinations
+                .iter()
+                .map(|network| network.destination.clone()),
+        )
+        .chain(scope.external_targets.iter().cloned())
+        .chain(
+            scope
+                .external_applications
+                .iter()
+                .map(|application| application.target.clone()),
+        )
+        .chain(scope.cloud_iam.iter().flat_map(|cloud| {
+            [Some(cloud.resource.clone()), cloud.assume_role.clone()]
+                .into_iter()
+                .flatten()
+        }))
+        .chain(
+            scope
+                .secret_identities
+                .iter()
+                .flat_map(|secret| [secret.handle.clone(), secret.identity.clone()]),
+        )
+        .chain(scope.databases.iter().flat_map(|database| {
+            [
+                database.service.clone(),
+                format!("{}/{}", database.service, database.database),
+            ]
+        }))
+        .collect::<BTreeSet<_>>();
+    let matched = match lease.resource_kind {
+        BrokerResourceKind::FilesystemHandle => {
+            let path = lease
+                .constraints
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let access = lease
+                .constraints
+                .get("access")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let read = effective_read_paths(request);
+            let write = effective_write_paths(request);
+            match access {
+                "read" => path_is_in_scopes(path, &read),
+                "write" => path_is_in_scopes(path, &write),
+                "read_write" => path_is_in_scopes(path, &read) && path_is_in_scopes(path, &write),
+                _ => false,
+            }
+        }
+        BrokerResourceKind::NetworkLease => lease
+            .constraints
+            .get("destination")
+            .and_then(Value::as_str)
+            .is_some_and(|destination| allowed_audiences.contains(destination)),
+        BrokerResourceKind::ExternalActionCommitToken => false,
+        _ => allowed_audiences.contains(&lease.audience),
+    };
+    if !matched {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "broker lease audience or resource is outside the capability request: {}",
+                lease.lease_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn add_gateway_kind_mediator(
+    active_mediators: &mut Vec<MediationBoundary>,
+    lease: &BrokerLease,
+) -> io::Result<()> {
+    let gateway_kind = lease
+        .constraints
+        .get("gateway_kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cell-bound API broker lease is missing gateway_kind",
+            )
+        })?;
+    let mediator = match gateway_kind {
+        "repository_api" | "external_api" | "secret" => MediationBoundary::ExternalApiGateway,
+        "cloud_api" => MediationBoundary::CloudApiGateway,
+        "browser_automation" => MediationBoundary::BrowserAutomationGateway,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported cell gateway kind: {gateway_kind}"),
+            ));
+        }
+    };
+    active_mediators.push(mediator);
     Ok(())
 }
 
@@ -458,7 +632,7 @@ fn consume_capability_lease(
             "capability lease has expired",
         ));
     }
-    validate_cell_request(&lease.request)?;
+    validate_cell_request_for_execution(&lease, now_ms)?;
     lease.consumed_at_ms = Some(now_ms);
     write_atomic_nofollow(&path, &serde_json::to_vec_pretty(&lease)?, 0o600)?;
     Ok(lease)
@@ -469,12 +643,14 @@ fn execute_capability_cell(
     lease: &CapabilityCellLease,
 ) -> io::Result<CapabilityCellRecord> {
     let mut broker_cleanup = AttachedBrokerLeaseCleanup::new(&lease.broker_lease_ids);
+    let broker_leases = validate_cell_request_for_execution(lease, unix_millis()?)?;
     let cell_id = lease.cell_id.clone();
     let container_name = format!("gensee-tclone-{cell_id}");
     let cell_root = capability_cell_path(&cell_id)?;
     let input_snapshot = cell_root.join("input");
     let snapshot = cell_root.join("output");
     create_restrictive_dir_all(&input_snapshot)?;
+    let seccomp_profile = write_cell_seccomp_profile(&cell_root)?;
     let podman = tclone_podman();
     copy_capability_scope(&podman, source, lease, &input_snapshot)?;
     copy_path_all(&input_snapshot, &snapshot)?;
@@ -485,6 +661,8 @@ fn execute_capability_cell(
         &container_name,
         &input_snapshot,
         &snapshot,
+        &broker_leases,
+        &seccomp_profile,
         unix_millis()?,
     )?;
     run_args.extend(lease.command.iter().skip(1).map(OsString::from));
@@ -508,6 +686,10 @@ fn execute_capability_cell(
     };
     drop(cleanup);
     let finished_at_ms = unix_millis()?;
+    let (broker_effect_leases, broker_revocation_error) = match broker_cleanup.revoke() {
+        Ok(leases) => (leases, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
     let mut manifest = build_effect_manifest(
         source,
         lease,
@@ -518,8 +700,9 @@ fn execute_capability_cell(
         finished_at_ms,
         status.code(),
         timed_out,
+        &broker_effect_leases,
     )?;
-    if let Err(error) = broker_cleanup.revoke() {
+    if let Some(error) = broker_revocation_error {
         manifest.violations.push(EffectViolation {
             kind: "broker_lease_revocation_failed".to_string(),
             resource: lease.broker_lease_ids.join(","),
@@ -572,9 +755,9 @@ impl AttachedBrokerLeaseCleanup {
         }
     }
 
-    fn revoke(&mut self) -> io::Result<()> {
+    fn revoke(&mut self) -> io::Result<Vec<BrokerLease>> {
         if !self.armed {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let result = super::capability_broker::revoke_attached_broker_leases(&self.lease_ids);
         if result.is_ok() {
@@ -592,12 +775,15 @@ impl Drop for AttachedBrokerLeaseCleanup {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capability_cell_run_args(
     source: &TcloneRunRecord,
     lease: &CapabilityCellLease,
     container_name: &str,
     input_snapshot: &Path,
     output_snapshot: &Path,
+    broker_leases: &[BrokerLease],
+    seccomp_profile: &Path,
     now_ms: u64,
 ) -> io::Result<Vec<OsString>> {
     let remaining_ms = lease.expires_at_ms.saturating_sub(now_ms);
@@ -622,6 +808,10 @@ fn capability_cell_run_args(
         OsString::from("ALL"),
         OsString::from("--security-opt"),
         OsString::from("no-new-privileges"),
+        OsString::from("--security-opt"),
+        OsString::from(format!("seccomp={}", seccomp_profile.display())),
+        OsString::from("--security-opt"),
+        OsString::from(format!("apparmor={}", capability_cell_apparmor_profile()?)),
         OsString::from("--pids-limit"),
         OsString::from("256"),
         OsString::from("--cpus"),
@@ -645,6 +835,10 @@ fn capability_cell_run_args(
             "GENSEE_BROKER_LEASE_IDS={}",
             lease.broker_lease_ids.join(",")
         )));
+        args.push(OsString::from("-e"));
+        args.push(OsString::from(
+            "GENSEE_BROKER_SOCKET_DIR=/run/gensee-broker",
+        ));
     }
     args.push(OsString::from("--entrypoint"));
     args.push(OsString::from(&lease.command[0]));
@@ -666,8 +860,64 @@ fn capability_cell_run_args(
             "rw",
         )?;
     }
+    for broker_lease in broker_leases {
+        if let BrokerDelivery::Gateway {
+            gateway_endpoint, ..
+        } = &broker_lease.delivery
+        {
+            let host_socket = gateway_endpoint.strip_prefix("unix://").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "cell gateways must use Unix sockets",
+                )
+            })?;
+            if host_socket.contains(',') || host_socket.contains('\n') || host_socket.contains('\r')
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "gateway socket path contains an unsafe mount character",
+                ));
+            }
+            let target = format!("/run/gensee-broker/{}.sock", broker_lease.lease_id);
+            args.push(OsString::from("--mount"));
+            args.push(OsString::from(format!(
+                "type=bind,source={host_socket},destination={target}"
+            )));
+        }
+    }
     args.push(OsString::from(&source.image));
     Ok(args)
+}
+
+fn capability_cell_apparmor_profile() -> io::Result<String> {
+    let profile = env::var("GENSEE_TCLONE_CELL_APPARMOR_PROFILE")
+        .unwrap_or_else(|_| "container-default".to_string());
+    if !tclone_is_safe_token(&profile) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid capability-cell AppArmor profile name",
+        ));
+    }
+    Ok(profile)
+}
+
+fn write_cell_seccomp_profile(cell_root: &Path) -> io::Result<PathBuf> {
+    let denied = gensee_crate_linux::LinuxSeccompProfile::default()
+        .denied_names()
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let profile = json!({
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [{
+            "names": denied,
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+        }]
+    });
+    let path = cell_root.join("seccomp.json");
+    write_atomic_nofollow(&path, &serde_json::to_vec_pretty(&profile)?, 0o600)?;
+    Ok(path)
 }
 
 fn copy_capability_scope(
@@ -767,6 +1017,7 @@ fn build_effect_manifest(
     finished_at_ms: u64,
     exit_code: Option<i32>,
     timed_out: bool,
+    broker_leases: &[BrokerLease],
 ) -> io::Result<EffectManifest> {
     let before = collect_cell_snapshot(input_snapshot)?;
     let after = collect_cell_snapshot(output_snapshot)?;
@@ -817,6 +1068,114 @@ fn build_effect_manifest(
     if !files_changed.is_empty() {
         capabilities_used.push(Capability::FilesystemWrite);
     }
+    let mut network_connections = Vec::new();
+    let mut external_requests = Vec::new();
+    let mut secrets_accessed = Vec::new();
+    let mut broker_telemetry_required = false;
+    let mut broker_telemetry_complete = true;
+    for broker_lease in broker_leases {
+        if matches!(broker_lease.delivery, BrokerDelivery::Gateway { .. }) {
+            broker_telemetry_required = true;
+            broker_telemetry_complete &= broker_lease.effect_telemetry_complete;
+        }
+        for effect in &broker_lease.gateway_effects {
+            match effect.kind {
+                BrokerGatewayEffectKind::NetworkConnection
+                | BrokerGatewayEffectKind::MtlsConnection => {
+                    network_connections.push(
+                        gensee_crate_rules::capability::NetworkConnectionEffect {
+                            protocol: effect
+                                .protocol
+                                .clone()
+                                .unwrap_or_else(|| "brokered".to_string()),
+                            destination: effect.target.clone(),
+                            port: effect.port,
+                            broker_lease_id: broker_lease.lease_id.clone(),
+                        },
+                    );
+                }
+                BrokerGatewayEffectKind::SecretAccess
+                | BrokerGatewayEffectKind::IdentityExchange => {
+                    let handle_id = effect
+                        .broker_handle_id
+                        .clone()
+                        .or_else(|| match &broker_lease.delivery {
+                            BrokerDelivery::Gateway {
+                                provider_handle, ..
+                            } => Some(provider_handle.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| broker_lease.lease_id.clone());
+                    secrets_accessed.push(gensee_crate_rules::capability::SecretAccessEffect {
+                        broker: broker_lease.adapter_id.clone(),
+                        handle_id,
+                        identity: broker_lease.audience.clone(),
+                        purpose: effect.action.clone(),
+                    });
+                }
+                BrokerGatewayEffectKind::RepositoryRequest
+                | BrokerGatewayEffectKind::ApiRequest
+                | BrokerGatewayEffectKind::DatabaseRequest
+                | BrokerGatewayEffectKind::BrowserAction
+                | BrokerGatewayEffectKind::CloudAction => {
+                    external_requests.push(gensee_crate_rules::capability::ExternalRequestEffect {
+                        gateway: broker_lease.adapter_id.clone(),
+                        target: effect.target.clone(),
+                        action: effect.action.clone(),
+                        request_digest: effect.request_digest.clone(),
+                        response_status: effect.response_status,
+                        commit_token_id: None,
+                    });
+                }
+            }
+        }
+    }
+    if broker_telemetry_required && !broker_telemetry_complete {
+        violations.push(EffectViolation {
+            kind: "broker_effect_telemetry_incomplete".to_string(),
+            resource: broker_leases
+                .iter()
+                .map(|lease| lease.lease_id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            detail: "one or more mediated gateways did not attest complete effect coverage at revocation".to_string(),
+            observed_at_ms: finished_at_ms,
+        });
+    }
+    if !network_connections.is_empty()
+        && lease
+            .request
+            .capabilities
+            .contains(&Capability::NetworkEgress)
+    {
+        capabilities_used.push(Capability::NetworkEgress);
+    }
+    if !secrets_accessed.is_empty() {
+        for capability in [
+            Capability::SecretUse,
+            Capability::IdentityUse,
+            Capability::WorkloadIdentity,
+        ] {
+            if lease.request.capabilities.contains(&capability)
+                && !capabilities_used.contains(&capability)
+            {
+                capabilities_used.push(capability);
+            }
+        }
+    }
+    if !external_requests.is_empty() {
+        for capability in [
+            Capability::ExternalApplication,
+            Capability::CloudIam,
+            Capability::DatabaseAccess,
+        ] {
+            if lease.request.capabilities.contains(&capability)
+                && !capabilities_used.contains(&capability)
+            {
+                capabilities_used.push(capability);
+            }
+        }
+    }
     let argv = serde_json::to_vec(&lease.command)?;
     let argv_digest = format!("sha256:{:x}", Sha256::digest(argv));
 
@@ -829,9 +1188,9 @@ fn build_effect_manifest(
         capabilities_used,
         files_read: Vec::new(),
         files_changed,
-        network_connections: Vec::new(),
-        external_requests: Vec::new(),
-        secrets_accessed: Vec::new(),
+        network_connections,
+        external_requests,
+        secrets_accessed,
         processes_started: vec![ProcessEffect {
             executable: lease.command[0].clone(),
             argv_digest,
@@ -846,9 +1205,32 @@ fn build_effect_manifest(
         telemetry_coverage: EffectTelemetryCoverage {
             filesystem_reads: TelemetryCoverage::Unavailable,
             filesystem_writes: TelemetryCoverage::Complete,
-            network_connections: TelemetryCoverage::NotApplicable,
-            external_requests: TelemetryCoverage::NotApplicable,
-            secret_accesses: TelemetryCoverage::NotApplicable,
+            network_connections: broker_coverage_for_capabilities(
+                &lease.request,
+                &[Capability::NetworkEgress, Capability::NetworkListen],
+                broker_telemetry_required,
+                broker_telemetry_complete,
+            ),
+            external_requests: broker_coverage_for_capabilities(
+                &lease.request,
+                &[
+                    Capability::ExternalApplication,
+                    Capability::CloudIam,
+                    Capability::DatabaseAccess,
+                ],
+                broker_telemetry_required,
+                broker_telemetry_complete,
+            ),
+            secret_accesses: broker_coverage_for_capabilities(
+                &lease.request,
+                &[
+                    Capability::SecretUse,
+                    Capability::IdentityUse,
+                    Capability::WorkloadIdentity,
+                ],
+                broker_telemetry_required,
+                broker_telemetry_complete,
+            ),
             process_tree: TelemetryCoverage::Partial,
         },
         started_at_ms,
@@ -856,6 +1238,27 @@ fn build_effect_manifest(
         exit_code,
         timed_out,
     })
+}
+
+fn broker_coverage_for_capabilities(
+    request: &CapabilityRequest,
+    capabilities: &[Capability],
+    telemetry_required: bool,
+    telemetry_complete: bool,
+) -> TelemetryCoverage {
+    if !request
+        .capabilities
+        .iter()
+        .any(|capability| capabilities.contains(capability))
+    {
+        TelemetryCoverage::NotApplicable
+    } else if telemetry_required && telemetry_complete {
+        TelemetryCoverage::Complete
+    } else if telemetry_required {
+        TelemetryCoverage::Partial
+    } else {
+        TelemetryCoverage::Unavailable
+    }
 }
 
 fn diff_cell_snapshots(
@@ -1634,7 +2037,10 @@ pub(super) fn attach_broker_lease_to_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gensee_crate_rules::capability::{CapabilityScope, EffectScope};
+    use gensee_crate_rules::capability::{
+        CapabilityScope, EffectScope, NetworkDestinationScope, SecretIdentityScope,
+    };
+    use gensee_crate_rules::capability_broker::{BrokerGatewayEffect, BrokerLeaseStatus};
 
     fn request() -> CapabilityRequest {
         CapabilityRequest {
@@ -1688,7 +2094,7 @@ mod tests {
     }
 
     #[test]
-    fn cell_request_rejects_unbrokered_authority() {
+    fn cell_request_rejects_unscoped_or_unexecutable_authority() {
         for capability in [
             Capability::FilesystemMetadata,
             Capability::NetworkEgress,
@@ -1708,10 +2114,12 @@ mod tests {
         ] {
             let mut request = request();
             request.capabilities.push(capability);
-            assert_eq!(
-                validate_cell_request(&request).unwrap_err().kind(),
-                io::ErrorKind::Unsupported
-            );
+            assert!(matches!(
+                validate_cell_request_for_issue(&request)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+            ));
         }
     }
 
@@ -1720,7 +2128,9 @@ mod tests {
         let mut request = request();
         request.scope.write_paths = vec!["../outside".to_string()];
         assert_eq!(
-            validate_cell_request(&request).unwrap_err().kind(),
+            validate_cell_request_for_issue(&request)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
     }
@@ -1734,7 +2144,7 @@ mod tests {
             operation: gensee_crate_rules::capability::FileOperationKind::Delete,
         }];
 
-        validate_cell_request(&request).unwrap();
+        validate_cell_request_for_issue(&request).unwrap();
         assert!(effective_write_paths(&request).contains(&"target/cache".to_string()));
     }
 
@@ -1748,7 +2158,21 @@ mod tests {
             operation: gensee_crate_rules::capability::FileOperationKind::Delete,
         }];
 
-        validate_cell_request(&request).unwrap();
+        validate_cell_request_for_issue(&request).unwrap();
+    }
+
+    #[test]
+    fn cell_issue_marks_broker_mediation_as_pending_without_claiming_it_is_active() {
+        let mut request = request();
+        request.capabilities.push(Capability::NetworkEgress);
+        request.scope.network_destinations =
+            vec![gensee_crate_rules::capability::NetworkDestinationScope {
+                destination: "10.20.30.40/32".to_string(),
+                protocol: "tcp".to_string(),
+                ports: vec![443],
+            }];
+
+        validate_cell_request_for_issue(&request).unwrap();
     }
 
     #[cfg(unix)]
@@ -1898,6 +2322,151 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn gateway_broker_must_be_active_and_complete_effect_telemetry() {
+        let _guard = crate::cli_test_env_lock();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let root = PathBuf::from("/tmp").join(format!("gcm-{}", &suffix[..8]));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        env::set_var("GENSEE_HOME", &root);
+        let socket = root.join("api.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let mut gateway_request = CapabilityRequest::isolated(
+            "read_repository_metadata",
+            EffectScope::ReadOnly,
+            vec![
+                Capability::NetworkEgress,
+                Capability::SecretUse,
+                Capability::ProcessExecution,
+            ],
+        );
+        gateway_request.scope.network_destinations = vec![NetworkDestinationScope {
+            destination: "repo.example.test".to_string(),
+            protocol: "https".to_string(),
+            ports: vec![443],
+        }];
+        gateway_request.scope.secret_identities = vec![SecretIdentityScope {
+            handle: "repo_reader".to_string(),
+            identity: "repository-reader".to_string(),
+            purpose: "read package metadata".to_string(),
+        }];
+        let cell_lease = CapabilityCellLease {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            lease_id: "lease_gateway".to_string(),
+            operation_id: "op_gateway".to_string(),
+            cell_id: "cell_gateway".to_string(),
+            source_run_id: "run_gateway".to_string(),
+            request: gateway_request,
+            command: vec!["true".to_string()],
+            issued_at_ms: 100,
+            expires_at_ms: 300,
+            consumed_at_ms: None,
+            broker_lease_ids: vec!["broker_gateway".to_string()],
+        };
+        let broker_lease = BrokerLease {
+            protocol_version: gensee_crate_rules::capability_broker::BROKER_PROTOCOL_VERSION,
+            lease_id: "broker_gateway".to_string(),
+            operation_id: "op_gateway".to_string(),
+            source_run_id: "run_gateway".to_string(),
+            cell_id: Some("cell_gateway".to_string()),
+            resource_kind: BrokerResourceKind::ApiToken,
+            adapter_id: "repo_adapter".to_string(),
+            audience: "repo.example.test".to_string(),
+            scopes: vec!["repository:one:read".to_string()],
+            constraints: json!({ "gateway_kind": "external_api" }),
+            issued_at_ms: 100,
+            expires_at_ms: 250,
+            status: BrokerLeaseStatus::Active,
+            delivery: BrokerDelivery::Gateway {
+                gateway_endpoint: format!("unix://{}", socket.display()),
+                provider_handle: "opaque_gateway".to_string(),
+            },
+            public_metadata: Value::Null,
+            gateway_effects: Vec::new(),
+            effect_telemetry_complete: false,
+            revoked_at_ms: None,
+            consumed_at_ms: None,
+        };
+        let broker_path = root.join("capability-broker/leases/broker_gateway.json");
+        write_atomic_nofollow(
+            &broker_path,
+            &serde_json::to_vec_pretty(&broker_lease).unwrap(),
+            0o600,
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_cell_request_for_execution(&cell_lease, 150)
+                .unwrap()
+                .len(),
+            1
+        );
+        let args = capability_cell_run_args(
+            &source_record(),
+            &cell_lease,
+            "cell-gateway",
+            &root,
+            &root,
+            std::slice::from_ref(&broker_lease),
+            &root.join("seccomp.json"),
+            150,
+        )
+        .unwrap();
+        let rendered = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(rendered.iter().any(|arg| {
+            arg.contains(&format!("source={}", socket.display()))
+                && arg.contains("destination=/run/gensee-broker/broker_gateway.sock")
+        }));
+
+        let input = root.join("input");
+        let output = root.join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        let mut revoked = broker_lease;
+        revoked.status = BrokerLeaseStatus::Revoked;
+        revoked.gateway_effects = vec![BrokerGatewayEffect {
+            kind: BrokerGatewayEffectKind::SecretAccess,
+            occurred_at_ms: 160,
+            target: "repo.example.test".to_string(),
+            action: "read_package_metadata".to_string(),
+            request_digest: format!("sha256:{}", "b".repeat(64)),
+            protocol: None,
+            port: None,
+            response_status: Some(200),
+            broker_handle_id: Some("repo_reader".to_string()),
+        }];
+        let manifest = build_effect_manifest(
+            &source_record(),
+            &cell_lease,
+            "cell_gateway",
+            &input,
+            &output,
+            150,
+            170,
+            Some(0),
+            false,
+            &[revoked],
+        )
+        .unwrap();
+        assert!(manifest
+            .violations
+            .iter()
+            .any(|violation| violation.kind == "broker_effect_telemetry_incomplete"));
+        assert_eq!(manifest.secrets_accessed.len(), 1);
+        assert_eq!(
+            manifest.telemetry_coverage.secret_accesses,
+            TelemetryCoverage::Partial
+        );
+
+        env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn cell_plan_is_fresh_confined_and_scope_mounted() {
         let root = env::temp_dir().join(format!("gensee-cell-plan-{}", Uuid::new_v4()));
@@ -1920,7 +2489,8 @@ mod tests {
         };
         let source = source_record();
 
-        let args = capability_cell_run_args(&source, &lease, "cell", &root, &root, 1).unwrap();
+        let args =
+            capability_cell_run_args(&source, &lease, "cell", &root, &root, &[], &root, 1).unwrap();
         let rendered = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -1932,6 +2502,10 @@ mod tests {
         assert!(rendered.windows(2).any(|pair| pair == ["--timeout", "1"]));
         assert!(rendered.contains(&std::borrow::Cow::Borrowed("--read-only")));
         assert!(rendered.contains(&std::borrow::Cow::Borrowed("ALL")));
+        assert!(rendered.iter().any(|arg| arg.starts_with("seccomp=")));
+        assert!(rendered
+            .iter()
+            .any(|arg| arg == "apparmor=container-default"));
         assert!(rendered
             .windows(2)
             .any(|pair| pair == ["--entrypoint", "cargo"]));
@@ -1984,6 +2558,35 @@ mod tests {
     }
 
     #[test]
+    fn cell_seccomp_profile_denies_kernel_escape_primitives() {
+        let root = env::temp_dir().join(format!("gensee-cell-seccomp-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        let path = write_cell_seccomp_profile(&root).unwrap();
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["defaultAction"], "SCMP_ACT_ALLOW");
+        assert_eq!(value["syscalls"][0]["action"], "SCMP_ACT_ERRNO");
+        let names = value["syscalls"][0]["names"].as_array().unwrap();
+        for denied in [
+            "ptrace",
+            "process_vm_writev",
+            "bpf",
+            "mount",
+            "unshare",
+            "init_module",
+        ] {
+            assert!(names.iter().any(|name| name == denied), "missing {denied}");
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn manifest_uses_actual_diff_and_flags_out_of_scope_changes() {
         let root = env::temp_dir().join(format!("gensee-cell-manifest-{}", Uuid::new_v4()));
         let input = root.join("input");
@@ -2022,6 +2625,7 @@ mod tests {
             20,
             Some(0),
             false,
+            &[],
         )
         .unwrap();
 
@@ -2083,6 +2687,7 @@ mod tests {
             20,
             Some(0),
             false,
+            &[],
         )
         .unwrap();
         let record = CapabilityCellRecord {
@@ -2163,6 +2768,7 @@ mod tests {
             20,
             Some(0),
             false,
+            &[],
         )
         .unwrap();
 

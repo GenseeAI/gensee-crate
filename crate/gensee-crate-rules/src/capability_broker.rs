@@ -44,6 +44,37 @@ pub enum BrokerLeaseStatus {
     Expired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerGatewayEffectKind {
+    RepositoryRequest,
+    ApiRequest,
+    IdentityExchange,
+    MtlsConnection,
+    SecretAccess,
+    NetworkConnection,
+    DatabaseRequest,
+    BrowserAction,
+    CloudAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerGatewayEffect {
+    pub kind: BrokerGatewayEffectKind,
+    pub occurred_at_ms: u64,
+    pub target: String,
+    pub action: String,
+    pub request_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_handle_id: Option<String>,
+}
+
 /// Delivery always names a mediator or an opaque handle. Credential bytes,
 /// private keys, and broad identities are not valid public lease fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +115,10 @@ pub struct BrokerLease {
     pub delivery: BrokerDelivery,
     #[serde(default)]
     pub public_metadata: Value,
+    #[serde(default)]
+    pub gateway_effects: Vec<BrokerGatewayEffect>,
+    #[serde(default)]
+    pub effect_telemetry_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,6 +171,9 @@ pub struct BrokerAdapterResponse {
     pub gateway_endpoint: String,
     #[serde(default)]
     pub public_metadata: Value,
+    #[serde(default)]
+    pub effects: Vec<BrokerGatewayEffect>,
+    pub effect_telemetry_complete: bool,
 }
 
 #[cfg(test)]
@@ -163,6 +201,8 @@ mod tests {
                 provider_handle: "opaque_1".to_string(),
             },
             public_metadata: Value::Null,
+            gateway_effects: Vec::new(),
+            effect_telemetry_complete: false,
             revoked_at_ms: None,
             consumed_at_ms: None,
         };
@@ -181,6 +221,8 @@ mod tests {
             "provider_handle": "opaque_1",
             "gateway_endpoint": "unix:///run/gensee/repo.sock",
             "public_metadata": {},
+            "effects": [],
+            "effect_telemetry_complete": false,
             "access_token": "must-not-cross-boundary"
         }));
 

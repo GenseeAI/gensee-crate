@@ -51,7 +51,9 @@ material and returns only:
   "protocol_version": 1,
   "provider_handle": "opaque-provider-handle",
   "gateway_endpoint": "unix:///run/gensee/repository.sock",
-  "public_metadata": {"repository": "one"}
+  "public_metadata": {"repository": "one"},
+  "effects": [],
+  "effect_telemetry_complete": false
 }
 ```
 
@@ -61,7 +63,10 @@ credential-shaped material. Adapter stderr is never copied into an error or
 manifest; only its SHA-256 digest is retained in an error message. Gateway
 endpoints must be Unix sockets, HTTPS, or loopback HTTP without URL userinfo.
 The same adapter receives a `revoke` request with its opaque provider handle on
-lease expiry, explicit revocation, or cell teardown.
+lease expiry, explicit revocation, or cell teardown. Its final response reports
+typed, request-digested effects and explicitly attests whether that effect log
+is complete. Gensee copies those effects into the cell manifest; missing or
+incomplete gateway telemetry is a manifest violation and prevents promotion.
 
 The adapter contract supports `repository_token`, `api_token`,
 `workload_identity`, `mtls_certificate`, and `database_role`. Provider-specific
@@ -81,11 +86,13 @@ cell exits, times out, or fails during preparation, a cleanup guard revokes all
 attached broker leases. Revocation failure becomes an effect-manifest violation
 and blocks output promotion.
 
-Built-in filesystem and network leases validate bounded path/access and
-destination/protocol/port constraints. They currently create authorization
-records and opaque handles; the subsequent filesystem mount and network
-namespace enforcement are described in the mandatory-mediation work and must
-be active before the policy engine will authorize those capabilities.
+Built-in filesystem leases validate bounded path/access constraints and are
+realized by exact read-only or read-write cell mounts. Built-in direct network
+leases validate bounded destination/protocol/port constraints but remain
+fail-closed until the cgroup/nftables backend is attached. Brokered repository,
+API, identity, mTLS, browser, cloud, and database capabilities instead mount
+only their exact Unix-domain gateway socket into a cell whose IP network is
+disabled. The broad provider credential remains behind that gateway.
 
 ## External-action commit tokens
 
