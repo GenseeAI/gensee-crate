@@ -9935,6 +9935,11 @@ fn tclone_option_takes_value(option: &str) -> bool {
             | "--to"
             | "--into"
             | "--paths"
+            | "--lease"
+            | "--request"
+            | "--ttl-seconds"
+            | "--source"
+            | "--path"
     )
 }
 
@@ -12966,6 +12971,20 @@ gensee async job job_1: exited status=0
         ];
 
         assert_eq!(tclone_target_arg(&args, "usage").unwrap(), "run_1");
+
+        let cell_args = vec![
+            OsString::from("--lease"),
+            OsString::from("lease_1"),
+            OsString::from("--ttl-seconds"),
+            OsString::from("120"),
+            OsString::from("--path"),
+            OsString::from("src"),
+            OsString::from("run_cell_source"),
+        ];
+        assert_eq!(
+            tclone_target_arg(&cell_args, "usage").unwrap(),
+            "run_cell_source"
+        );
     }
 
     #[test]

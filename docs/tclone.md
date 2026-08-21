@@ -207,7 +207,7 @@ one-use lease bound to a source run, an exact command, scoped workspace paths,
 and an expiry:
 
 ```console
-gensee run lease issue run_... --request request.json -- cargo check
+gensee run lease issue run_... --request request.json -- /bin/sh -lc 'find . -maxdepth 2 -type f -print'
 gensee run cell run_... --lease lease_... --json
 gensee run cell inspect cell_... --json
 ```
@@ -219,8 +219,10 @@ privilege gain is disabled, resources are capped, and only explicitly selected
 workspace paths are copied and mounted. Podman independently enforces the
 remaining lease lifetime and automatic removal as a backstop if the Gensee
 client exits. The exact command is fixed when the trusted host
-issues the lease; the lease is consumed atomically before execution and expiry
-is enforced while the command runs. The container is destroyed on completion,
+issues the lease; the lease is consumed atomically before scoped input copying,
+and its lifetime covers both snapshot preparation and command execution. This
+prevents a caller from using an expired grant merely because staging was slow.
+The container is destroyed on completion,
 while its scoped workspace snapshot and execution record are retained for
 inspection and replay planning. Nothing is promoted into the source
 automatically.

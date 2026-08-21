@@ -137,7 +137,7 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
     }
     write_atomic_nofollow(&path, &serde_json::to_vec_pretty(&lease)?, 0o600)?;
 
-    if args.iter().any(|arg| arg == "--json") {
+    if options.iter().any(|arg| arg == "--json") {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -442,7 +442,7 @@ fn capability_cell_run_args(
         OsString::from("--workdir"),
         OsString::from(&source.container_workspace),
         OsString::from("-e"),
-        OsString::from("HOME=/tmp/gensee-home"),
+        OsString::from("HOME=/tmp"),
         OsString::from("-e"),
         OsString::from(format!("GENSEE_CAPABILITY_LEASE_ID={}", lease.lease_id)),
         OsString::from("--entrypoint"),
@@ -473,9 +473,6 @@ fn copy_capability_scope(
         .collect::<BTreeSet<_>>();
     for relative in paths {
         let destination = snapshot.join(relative);
-        if destination.exists() {
-            continue;
-        }
         if relative == "." {
             run_command_status(
                 podman,
@@ -488,6 +485,9 @@ fn copy_capability_scope(
                     OsString::from(snapshot),
                 ],
             )?;
+            continue;
+        }
+        if destination.exists() {
             continue;
         }
         if let Some(parent) = destination.parent() {
@@ -532,7 +532,7 @@ fn add_scope_mount(
     let target = Path::new(container_workspace).join(relative);
     args.push(OsString::from("-v"));
     args.push(OsString::from(format!(
-        "{}:{}:{mode}",
+        "{}:{}:{mode},Z",
         canonical.display(),
         target.display()
     )));
@@ -616,6 +616,35 @@ mod tests {
         }
     }
 
+    fn source_record() -> TcloneRunRecord {
+        TcloneRunRecord {
+            run_id: "run_1".to_string(),
+            parent_run_id: None,
+            role: "source".to_string(),
+            status: "running".to_string(),
+            container_name: "source".to_string(),
+            container_id: None,
+            source_container: None,
+            host_control_owner_run_id: None,
+            fork_prefix: None,
+            fork_group_id: None,
+            fork_index: None,
+            fork_count: None,
+            fork_approach: None,
+            image: "image".to_string(),
+            workspace: "/repo".to_string(),
+            container_workspace: "/workspace".to_string(),
+            container_home: "/home/gensee".to_string(),
+            agent_cmd: vec![],
+            fork_base_git_head: None,
+            fork_base_overlay_lowerdir: None,
+            fork_overlay_upperdir: None,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            exit_code: None,
+        }
+    }
+
     #[test]
     fn cell_request_rejects_unbrokered_authority() {
         for capability in [
@@ -641,6 +670,53 @@ mod tests {
             validate_cell_request(&request).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn whole_workspace_selector_copies_contents_even_when_snapshot_root_exists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::temp_dir().join(format!("gensee-cell-dot-scope-{}", Uuid::new_v4()));
+        let snapshot = root.join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        let fake_podman = root.join("podman");
+        fs::write(
+            &fake_podman,
+            "#!/bin/sh\nif [ \"$1\" = cp ]; then printf copied > \"$3/copied.txt\"; fi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_podman, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut request = request();
+        request.scope.read_paths = vec![".".to_string()];
+        request.scope.write_paths.clear();
+        request
+            .capabilities
+            .retain(|capability| *capability != Capability::FilesystemWrite);
+        let lease = CapabilityCellLease {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            lease_id: "lease_dot".to_string(),
+            source_run_id: "run_1".to_string(),
+            request,
+            command: vec!["true".to_string()],
+            issued_at_ms: 1,
+            expires_at_ms: 2,
+            consumed_at_ms: None,
+        };
+
+        copy_capability_scope(
+            &fake_podman.into_os_string(),
+            &source_record(),
+            &lease,
+            &snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(snapshot.join("copied.txt")).unwrap(),
+            "copied"
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -692,32 +768,7 @@ mod tests {
             expires_at_ms: 2,
             consumed_at_ms: Some(1),
         };
-        let source = TcloneRunRecord {
-            run_id: "run_1".to_string(),
-            parent_run_id: None,
-            role: "source".to_string(),
-            status: "running".to_string(),
-            container_name: "source".to_string(),
-            container_id: None,
-            source_container: None,
-            host_control_owner_run_id: None,
-            fork_prefix: None,
-            fork_group_id: None,
-            fork_index: None,
-            fork_count: None,
-            fork_approach: None,
-            image: "image".to_string(),
-            workspace: "/repo".to_string(),
-            container_workspace: "/workspace".to_string(),
-            container_home: "/home/gensee".to_string(),
-            agent_cmd: vec![],
-            fork_base_git_head: None,
-            fork_base_overlay_lowerdir: None,
-            fork_overlay_upperdir: None,
-            started_at_ms: 1,
-            updated_at_ms: 1,
-            exit_code: None,
-        };
+        let source = source_record();
 
         let args = capability_cell_run_args(&source, &lease, "cell", &root, 1).unwrap();
         let rendered = args
@@ -735,8 +786,8 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--entrypoint", "cargo"]));
         assert!(!rendered.iter().any(|arg| arg.contains("unconfined")));
-        assert!(rendered.iter().any(|arg| arg.ends_with("/Cargo.toml:ro")));
-        assert!(rendered.iter().any(|arg| arg.ends_with("/Cargo.lock:rw")));
+        assert!(rendered.iter().any(|arg| arg.ends_with("/Cargo.toml:ro,Z")));
+        assert!(rendered.iter().any(|arg| arg.ends_with("/Cargo.lock:rw,Z")));
         assert!(!rendered.iter().any(|arg| arg.contains(".codex")));
         fs::remove_dir_all(root).ok();
     }
