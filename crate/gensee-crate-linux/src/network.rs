@@ -485,7 +485,7 @@ fn parse_nft_trace_attempt_inner(
         return None;
     }
     let chain = *fields.get(5)?;
-    if chain != expected_chain && chain != format!("{expected_chain}_input") {
+    if chain != expected_chain && chain.strip_suffix("_input") != Some(expected_chain) {
         return None;
     }
     let destination = fields.windows(3).find_map(|values| {

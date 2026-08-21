@@ -2,14 +2,20 @@ use crate::*;
 use gensee_crate_rules::capability::Capability;
 use gensee_crate_rules::capability_policy::MediationBoundary;
 use gensee_crate_rules::network_boundary::{
-    NetworkBoundaryDecision, NetworkBoundaryEvent, NetworkCapabilityEnvelope,
+    NetworkBoundaryDecision, NetworkBoundaryDisposition, NetworkBoundaryEvent,
+    NetworkCapabilityEnvelope,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const OPERATION_RECORD_SCHEMA_VERSION: u32 = 2;
 const OPERATION_POLL_INTERVAL_MS: u64 = 100;
+#[cfg(target_os = "linux")]
+const LINEAGE_LAST_SEEN_PERSIST_INTERVAL_MS: u64 = 5_000;
+#[cfg(any(target_os = "linux", test))]
+const MAX_RETAINED_INACTIVE_PROCESS_IDENTITIES: usize = 4_096;
+const MAX_OPERATION_VIOLATION_KINDS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +88,12 @@ pub(crate) struct OperationViolation {
     pub kind: String,
     pub detail: String,
     pub observed_at_ms: u64,
+    #[serde(default = "default_violation_occurrences")]
+    pub occurrences: u64,
+}
+
+fn default_violation_occurrences() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +107,7 @@ pub(crate) struct OperationAttestation {
     pub cgroup_state: OperationCgroupState,
     pub envelope: OperationCapabilityEnvelope,
     pub boundary_effect_count: u64,
+    pub denied_boundary_effect_count: u64,
     pub violations: Vec<OperationViolation>,
 }
 
@@ -125,6 +138,11 @@ pub(crate) struct ManagedOperationRecord {
     pub process_lineage: Vec<OperationProcessIdentity>,
     #[serde(default)]
     pub boundary_effect_count: u64,
+    /// Boundary observations that were denied before the effect occurred.
+    /// Keeping this separate lets same-authority continuation distinguish a
+    /// harmless blocked attempt from a completed or authority-changing effect.
+    #[serde(default)]
+    pub denied_boundary_effect_count: u64,
     #[serde(default)]
     pub network_usage: OperationNetworkUsage,
     #[serde(default)]
@@ -155,11 +173,11 @@ impl Drop for OperationSupervisor {
         self.record.state = OperationState::Failed;
         self.record.finished_at_ms = Some(now);
         self.record.updated_at_ms = now;
-        self.record.violations.push(OperationViolation {
-            kind: "abandoned_before_activation".to_string(),
-            detail: "operation supervisor dropped before its subject was activated".to_string(),
-            observed_at_ms: now,
-        });
+        self.record_violation_at(
+            "abandoned_before_activation",
+            "operation supervisor dropped before its subject was activated",
+            now,
+        );
         if self.record.cgroup.owned_by_supervisor
             && self.record.cgroup.state == OperationCgroupState::Prepared
         {
@@ -268,6 +286,25 @@ impl OperationSupervisor {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn prepare_external_subject_at(
+        state_root: &Path,
+        operation_id: impl Into<String>,
+        source_run_id: impl Into<String>,
+        action_class: impl Into<String>,
+        envelope: OperationCapabilityEnvelope,
+    ) -> io::Result<Self> {
+        Self::prepare_inner(
+            state_root,
+            operation_id,
+            source_run_id,
+            action_class,
+            envelope,
+            None,
+            false,
+        )
+    }
+
     fn prepare_inner(
         state_root: &Path,
         operation_id: impl Into<String>,
@@ -351,6 +388,7 @@ impl OperationSupervisor {
                 envelope: normalize_envelope(envelope),
                 process_lineage: Vec::new(),
                 boundary_effect_count: 0,
+                denied_boundary_effect_count: 0,
                 network_usage: OperationNetworkUsage::default(),
                 violations: Vec::new(),
                 started_at_ms: now,
@@ -384,6 +422,15 @@ impl OperationSupervisor {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "managed operation record identity does not match the caller",
+            ));
+        }
+        if matches!(
+            record.state,
+            OperationState::Succeeded | OperationState::Failed | OperationState::TimedOut
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "terminal managed operation cannot be reopened",
             ));
         }
         Ok(Self {
@@ -442,6 +489,7 @@ impl OperationSupervisor {
             cgroup_state: self.record.cgroup.state,
             envelope: self.record.envelope.clone(),
             boundary_effect_count: self.record.boundary_effect_count,
+            denied_boundary_effect_count: self.record.denied_boundary_effect_count,
             violations: self.record.violations.clone(),
         })
     }
@@ -518,8 +566,10 @@ impl OperationSupervisor {
     pub(crate) fn refresh_lineage(&mut self) -> io::Result<()> {
         let _lock = OperationRecordLock::acquire(&self.lock_path)?;
         self.reload()?;
-        self.refresh_lineage_in_memory()?;
-        self.persist()
+        if self.refresh_lineage_in_memory()? {
+            self.persist()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn validates_local_process_identity(
@@ -532,11 +582,13 @@ impl OperationSupervisor {
         }
         let _lock = OperationRecordLock::acquire(&self.lock_path)?;
         self.reload()?;
-        self.refresh_lineage_in_memory()?;
+        let changed = self.refresh_lineage_in_memory()?;
         let matches = self.record.process_lineage.iter().any(|identity| {
             identity.pid == pid && identity.start_time_ticks == start_time_ticks && identity.active
         });
-        self.persist()?;
+        if changed {
+            self.persist()?;
+        }
         Ok(matches)
     }
 
@@ -544,7 +596,7 @@ impl OperationSupervisor {
     pub(crate) fn root_process_identity(&mut self) -> io::Result<Option<(u32, u64)>> {
         let _lock = OperationRecordLock::acquire(&self.lock_path)?;
         self.reload()?;
-        self.refresh_lineage_in_memory()?;
+        let changed = self.refresh_lineage_in_memory()?;
         let identity = self.record.root_pid.and_then(|root_pid| {
             self.record
                 .process_lineage
@@ -552,11 +604,12 @@ impl OperationSupervisor {
                 .find(|identity| identity.pid == root_pid && identity.active)
                 .map(|identity| (identity.pid, identity.start_time_ticks))
         });
-        self.persist()?;
+        if changed {
+            self.persist()?;
+        }
         Ok(identity)
     }
 
-    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn record_boundary_violation(&mut self, kind: &str, detail: &str) -> io::Result<()> {
         let _lock = OperationRecordLock::acquire(&self.lock_path)?;
         self.reload()?;
@@ -565,12 +618,13 @@ impl OperationSupervisor {
         self.persist()
     }
 
-    fn refresh_lineage_in_memory(&mut self) -> io::Result<()> {
+    fn refresh_lineage_in_memory(&mut self) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
         {
             let Some(root_pid) = self.record.root_pid else {
-                return Ok(());
+                return Ok(false);
             };
+            let mut changed = false;
             let now = unix_millis()?;
             let observed = gensee_crate_linux::collect_process_lineage(root_pid)?;
             if observed.len() == gensee_crate_linux::MAX_PROCESS_LINEAGE_IDENTITIES
@@ -584,28 +638,47 @@ impl OperationSupervisor {
                     "process_lineage_limit_reached",
                     "process lineage evidence reached its bounded identity limit",
                 )?;
+                changed = true;
             }
             let observed_keys = observed
                 .iter()
                 .map(|identity| (identity.pid, identity.start_time_ticks))
                 .collect::<BTreeSet<_>>();
             for existing in &mut self.record.process_lineage {
-                existing.active =
-                    observed_keys.contains(&(existing.pid, existing.start_time_ticks));
-                if existing.active {
+                let active = observed_keys.contains(&(existing.pid, existing.start_time_ticks));
+                changed |= existing.active != active;
+                existing.active = active;
+                if existing.active
+                    && now.saturating_sub(existing.last_seen_at_ms)
+                        >= LINEAGE_LAST_SEEN_PERSIST_INTERVAL_MS
+                {
+                    changed = true;
                     existing.last_seen_at_ms = now;
                 }
             }
+            let mut existing_by_identity = self
+                .record
+                .process_lineage
+                .iter()
+                .enumerate()
+                .map(|(index, identity)| ((identity.pid, identity.start_time_ticks), index))
+                .collect::<BTreeMap<_, _>>();
             for identity in observed {
-                if let Some(existing) = self.record.process_lineage.iter_mut().find(|existing| {
-                    existing.pid == identity.pid
-                        && existing.start_time_ticks == identity.start_time_ticks
-                }) {
+                if let Some(index) = existing_by_identity
+                    .get(&(identity.pid, identity.start_time_ticks))
+                    .copied()
+                {
+                    let existing = &mut self.record.process_lineage[index];
+                    changed |= existing.parent_pid != identity.parent_pid
+                        || existing.executable_path != identity.executable_path
+                        || existing.command_line != identity.command_line;
                     existing.parent_pid = identity.parent_pid;
                     existing.executable_path = identity.executable_path;
                     existing.command_line = identity.command_line;
                     continue;
                 }
+                let index = self.record.process_lineage.len();
+                existing_by_identity.insert((identity.pid, identity.start_time_ticks), index);
                 self.record.process_lineage.push(OperationProcessIdentity {
                     pid: identity.pid,
                     parent_pid: identity.parent_pid,
@@ -616,6 +689,7 @@ impl OperationSupervisor {
                     last_seen_at_ms: now,
                     active: true,
                 });
+                changed = true;
             }
             self.record
                 .process_lineage
@@ -627,19 +701,68 @@ impl OperationSupervisor {
                 .find(|identity| identity.pid == root_pid && identity.active);
             if let Some(identity) = root_identity {
                 match self.record.root_start_time_ticks {
-                    None => self.record.root_start_time_ticks = Some(identity.start_time_ticks),
+                    None => {
+                        self.record.root_start_time_ticks = Some(identity.start_time_ticks);
+                        changed = true;
+                    }
                     Some(expected) if expected != identity.start_time_ticks => {
                         self.record_violation(
                             "root_pid_reused",
                             "root PID start time changed while operation was active",
                         )?;
+                        changed = true;
                     }
                     Some(_) => {}
                 }
             }
-            self.record.updated_at_ms = now;
+            changed |= self.bound_process_lineage_history()?;
+            if changed {
+                self.record.updated_at_ms = now;
+            }
+            Ok(changed)
         }
-        Ok(())
+        #[cfg(not(target_os = "linux"))]
+        Ok(false)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn bound_process_lineage_history(&mut self) -> io::Result<bool> {
+        let inactive_count = self
+            .record
+            .process_lineage
+            .iter()
+            .filter(|identity| !identity.active)
+            .count();
+        if inactive_count <= MAX_RETAINED_INACTIVE_PROCESS_IDENTITIES {
+            return Ok(false);
+        }
+        let mut inactive = self
+            .record
+            .process_lineage
+            .iter()
+            .filter(|identity| !identity.active)
+            .map(|identity| {
+                (
+                    identity.last_seen_at_ms,
+                    identity.pid,
+                    identity.start_time_ticks,
+                )
+            })
+            .collect::<Vec<_>>();
+        inactive.sort_unstable_by(|left, right| right.cmp(left));
+        let retained = inactive
+            .into_iter()
+            .take(MAX_RETAINED_INACTIVE_PROCESS_IDENTITIES)
+            .map(|(_, pid, start_time_ticks)| (pid, start_time_ticks))
+            .collect::<std::collections::BTreeSet<_>>();
+        self.record.process_lineage.retain(|identity| {
+            identity.active || retained.contains(&(identity.pid, identity.start_time_ticks))
+        });
+        self.record_violation(
+            "process_lineage_history_truncated",
+            "inactive process lineage exceeded its retained-history bound",
+        )?;
+        Ok(true)
     }
 
     pub(crate) fn update_network_envelope(
@@ -666,6 +789,10 @@ impl OperationSupervisor {
         let _lock = OperationRecordLock::acquire(&self.lock_path)?;
         self.reload()?;
         self.record.boundary_effect_count = self.record.boundary_effect_count.saturating_add(1);
+        if decision.disposition == NetworkBoundaryDisposition::Deny {
+            self.record.denied_boundary_effect_count =
+                self.record.denied_boundary_effect_count.saturating_add(1);
+        }
         if let Some(lease) = decision.lease.as_ref() {
             if let (Some(lease_id), Some(expires_at_ms)) =
                 (lease.lease_id.as_ref(), lease.expires_at_ms)
@@ -762,22 +889,91 @@ impl OperationSupervisor {
         {
             match gensee_crate_linux::remove_agent_cgroup(Path::new(&self.record.cgroup.path)) {
                 Ok(()) => self.record.cgroup.state = OperationCgroupState::Released,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.record.cgroup.state = OperationCgroupState::Released;
+                    self.record.cgroup.error = None;
+                }
                 Err(error) => {
                     self.record.cgroup.error = Some(error.to_string());
                     self.record_violation("cgroup_release_failed", &error.to_string())?;
                 }
             }
+        } else {
+            match reconcile_released_adopted_cgroup(&mut self.record) {
+                Ok(_) => {}
+                Err(error) => {
+                    self.record.cgroup.error = Some(error.to_string());
+                    self.record_violation_at(
+                        "adopted_cgroup_release_check_failed",
+                        &error.to_string(),
+                        now,
+                    );
+                }
+            }
         }
-        self.persist()
+        self.persist()?;
+        drop(_lock);
+        let state_root = default_root()?;
+        let _ = crate::network_boundary::reap_terminal_network_boundary_for_operation(
+            &state_root,
+            &self.record.operation_id,
+            &self.record.source_run_id,
+        )?;
+        Ok(())
     }
 
     fn record_violation(&mut self, kind: &str, detail: &str) -> io::Result<()> {
-        self.record.violations.push(OperationViolation {
-            kind: kind.to_string(),
-            detail: detail.to_string(),
-            observed_at_ms: unix_millis()?,
-        });
+        let now = unix_millis()?;
+        self.record_violation_at(kind, detail, now);
         Ok(())
+    }
+
+    fn record_violation_at(&mut self, kind: &str, detail: &str, now: u64) {
+        if let Some(existing) = self
+            .record
+            .violations
+            .iter_mut()
+            .find(|violation| violation.kind == kind && violation.detail == detail)
+        {
+            existing.observed_at_ms = now;
+            existing.occurrences = existing.occurrences.saturating_add(1);
+            return;
+        }
+        if self.record.violations.len() < MAX_OPERATION_VIOLATION_KINDS {
+            self.record.violations.push(OperationViolation {
+                kind: kind.to_string(),
+                detail: detail.to_string(),
+                observed_at_ms: now,
+                occurrences: 1,
+            });
+            return;
+        }
+        const TRUNCATED_KIND: &str = "violation_evidence_truncated";
+        if let Some(existing) = self
+            .record
+            .violations
+            .iter_mut()
+            .find(|violation| violation.kind == TRUNCATED_KIND)
+        {
+            existing.observed_at_ms = now;
+            existing.occurrences = existing.occurrences.saturating_add(1);
+        } else {
+            let oldest = self
+                .record
+                .violations
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, violation)| violation.observed_at_ms)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            self.record.violations[oldest] = OperationViolation {
+                kind: TRUNCATED_KIND.to_string(),
+                detail: "additional distinct operation violations exceeded the evidence bound"
+                    .to_string(),
+                observed_at_ms: now,
+                occurrences: 1,
+            };
+        }
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -792,6 +988,61 @@ impl OperationSupervisor {
         self.record = read_operation_record(&self.record_path)?;
         Ok(())
     }
+}
+
+fn reconcile_released_adopted_cgroup(record: &mut ManagedOperationRecord) -> io::Result<bool> {
+    if record.cgroup.owned_by_supervisor
+        || !matches!(
+            record.cgroup.state,
+            OperationCgroupState::Prepared | OperationCgroupState::Attached
+        )
+    {
+        return Ok(false);
+    }
+    match fs::symlink_metadata(&record.cgroup.path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // The runner that adopted this cgroup tears it down before
+            // finishing the operation. Reflect that observed release in the
+            // durable lifecycle record so exact boundary cleanup can proceed.
+            record.cgroup.state = OperationCgroupState::Released;
+            record.cgroup.error = None;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns true only after a terminal operation has already released its
+/// enforceable local subject. This is intentionally read-only: boundary
+/// cleanup may verify lifecycle completion, but must not release a subject on
+/// behalf of an active or incompletely terminated operation.
+#[cfg(any(target_os = "linux", test))]
+fn terminal_operation_subject_is_released(record: &ManagedOperationRecord) -> bool {
+    matches!(
+        record.state,
+        OperationState::Succeeded | OperationState::Failed | OperationState::TimedOut
+    ) && (record.cgroup.path.is_empty() || record.cgroup.state == OperationCgroupState::Released)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn terminal_operation_subject_is_released_at(
+    state_root: &Path,
+    operation_id: &str,
+    expected_source_run_id: &str,
+) -> io::Result<bool> {
+    let root = operation_record_root_at(state_root, operation_id)?;
+    let record_path = root.join("record.json");
+    let lock_path = root.join("record.lock");
+    let _lock = OperationRecordLock::acquire(&lock_path)?;
+    let record = read_operation_record(&record_path)?;
+    if record.operation_id != operation_id || record.source_run_id != expected_source_run_id {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "terminal operation identity does not match the boundary record",
+        ));
+    }
+    Ok(terminal_operation_subject_is_released(&record))
 }
 
 fn read_operation_record(path: &Path) -> io::Result<ManagedOperationRecord> {
@@ -868,6 +1119,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_boundary_cleanup_requires_terminal_and_released_subject() {
+        let _guard = crate::cli_test_env_lock();
+        let root = env::temp_dir().join(format!("gensee-operation-test-{}", uuid::Uuid::new_v4()));
+        env::set_var("GENSEE_HOME", &root);
+        let mut supervisor = OperationSupervisor::prepare_external_subject(
+            "op_cleanup_gate",
+            "run_cleanup_gate",
+            "test",
+            OperationCapabilityEnvelope::default(),
+        )
+        .unwrap();
+
+        assert!(!terminal_operation_subject_is_released(&supervisor.record));
+        supervisor.record.state = OperationState::Succeeded;
+        assert!(terminal_operation_subject_is_released(&supervisor.record));
+
+        supervisor.record.cgroup.path = "/sys/fs/cgroup/gensee/op_cleanup_gate".to_string();
+        supervisor.record.cgroup.state = OperationCgroupState::Attached;
+        assert!(!terminal_operation_subject_is_released(&supervisor.record));
+        supervisor.record.cgroup.state = OperationCgroupState::Released;
+        assert!(terminal_operation_subject_is_released(&supervisor.record));
+
+        env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn absent_adopted_cgroup_transitions_to_released() {
+        let _guard = crate::cli_test_env_lock();
+        let root = env::temp_dir().join(format!("gensee-operation-test-{}", uuid::Uuid::new_v4()));
+        let adopted = root.join("adopted-cgroup");
+        fs::create_dir_all(&adopted).unwrap();
+        env::set_var("GENSEE_HOME", &root);
+        let mut supervisor = OperationSupervisor::prepare_external_subject(
+            "op_adopted_release",
+            "run_adopted_release",
+            "test",
+            OperationCapabilityEnvelope::default(),
+        )
+        .unwrap();
+        supervisor.activate_external_subject().unwrap();
+        supervisor.record.cgroup.path = adopted.to_string_lossy().to_string();
+        supervisor.record.cgroup.state = OperationCgroupState::Attached;
+        assert!(!reconcile_released_adopted_cgroup(&mut supervisor.record).unwrap());
+        assert_eq!(
+            supervisor.record.cgroup.state,
+            OperationCgroupState::Attached
+        );
+        fs::remove_dir_all(&adopted).unwrap();
+
+        assert!(reconcile_released_adopted_cgroup(&mut supervisor.record).unwrap());
+        assert_eq!(
+            supervisor.record.cgroup.state,
+            OperationCgroupState::Released
+        );
+        assert!(supervisor.record.cgroup.error.is_none());
+
+        env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn supervisor_persists_envelope_lineage_and_completion() {
         let _guard = crate::cli_test_env_lock();
         let root = env::temp_dir().join(format!("gensee-operation-test-{}", uuid::Uuid::new_v4()));
@@ -928,6 +1241,103 @@ mod tests {
             None,
         )
         .is_err());
+        env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn terminal_operation_cannot_be_reopened() {
+        let _guard = crate::cli_test_env_lock();
+        let root = env::temp_dir().join(format!("gensee-operation-test-{}", uuid::Uuid::new_v4()));
+        env::set_var("GENSEE_HOME", &root);
+        let mut supervisor = OperationSupervisor::prepare(
+            "op_terminal",
+            "run_terminal",
+            "test",
+            OperationCapabilityEnvelope::default(),
+            None,
+        )
+        .unwrap();
+        supervisor.activate(std::process::id()).unwrap();
+        supervisor.finish(Some(0), false).unwrap();
+        let error = OperationSupervisor::open_at(&root, "op_terminal", "run_terminal")
+            .err()
+            .expect("terminal operation must stay terminal");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("cannot be reopened"));
+        env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn lineage_and_violation_history_are_bounded_with_explicit_truncation() {
+        let _guard = crate::cli_test_env_lock();
+        let root = env::temp_dir().join(format!("gensee-operation-test-{}", uuid::Uuid::new_v4()));
+        env::set_var("GENSEE_HOME", &root);
+        let mut supervisor = OperationSupervisor::prepare(
+            "op_bounded",
+            "run_bounded",
+            "test",
+            OperationCapabilityEnvelope::default(),
+            None,
+        )
+        .unwrap();
+        for index in 0..(MAX_RETAINED_INACTIVE_PROCESS_IDENTITIES + 17) {
+            supervisor
+                .record
+                .process_lineage
+                .push(OperationProcessIdentity {
+                    pid: (index + 1) as u32,
+                    parent_pid: 1,
+                    start_time_ticks: (index + 1) as u64,
+                    executable_path: None,
+                    command_line: None,
+                    first_seen_at_ms: index as u64,
+                    last_seen_at_ms: index as u64,
+                    active: false,
+                });
+        }
+        supervisor
+            .record
+            .process_lineage
+            .push(OperationProcessIdentity {
+                pid: 99_999,
+                parent_pid: 1,
+                start_time_ticks: 99_999,
+                executable_path: None,
+                command_line: None,
+                first_seen_at_ms: 1,
+                last_seen_at_ms: 1,
+                active: true,
+            });
+        assert!(supervisor.bound_process_lineage_history().unwrap());
+        assert_eq!(
+            supervisor
+                .record
+                .process_lineage
+                .iter()
+                .filter(|identity| !identity.active)
+                .count(),
+            MAX_RETAINED_INACTIVE_PROCESS_IDENTITIES
+        );
+        assert!(supervisor
+            .record
+            .process_lineage
+            .iter()
+            .any(|identity| identity.pid == 99_999 && identity.active));
+
+        for index in 0..(MAX_OPERATION_VIOLATION_KINDS + 20) {
+            supervisor
+                .record_violation(&format!("kind_{index}"), "distinct")
+                .unwrap();
+        }
+        assert_eq!(
+            supervisor.record.violations.len(),
+            MAX_OPERATION_VIOLATION_KINDS
+        );
+        assert!(supervisor.record.violations.iter().any(|violation| {
+            violation.kind == "violation_evidence_truncated" && violation.occurrences > 1
+        }));
         env::remove_var("GENSEE_HOME");
         fs::remove_dir_all(root).ok();
     }

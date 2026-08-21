@@ -87,6 +87,12 @@ pub struct NetworkBoundaryPolicy {
     #[serde(default)]
     pub in_place_lease_scopes: Vec<NetworkLeaseScope>,
     pub max_in_place_lease_ttl_seconds: u64,
+    /// Hard ceiling for simultaneously active temporary grants. A policy CIDR
+    /// bounds eligible endpoints, but must not let an untrusted workload grow
+    /// the active ruleset without bound by walking that CIDR address by
+    /// address.
+    #[serde(default = "default_max_active_in_place_leases")]
+    pub max_active_in_place_leases: usize,
     #[serde(default)]
     pub http_gateway_available: bool,
     /// Exact HTTP methods the trusted mediator may execute. The default is
@@ -105,26 +111,45 @@ fn default_prefer_http_gateway() -> bool {
     true
 }
 
-fn mandatory_restricted_destinations() -> Vec<String> {
-    vec![
-        "0.0.0.0/8".to_string(),
-        "10.0.0.0/8".to_string(),
-        "100.64.0.0/10".to_string(),
-        "127.0.0.0/8".to_string(),
-        "169.254.0.0/16".to_string(),
-        "172.16.0.0/12".to_string(),
-        "192.0.0.0/24".to_string(),
-        "192.168.0.0/16".to_string(),
-        "198.18.0.0/15".to_string(),
-        "224.0.0.0/4".to_string(),
-        "240.0.0.0/4".to_string(),
-        "::/128".to_string(),
-        "::1/128".to_string(),
-        "fc00::/7".to_string(),
-        "fe80::/10".to_string(),
-        "ff00::/8".to_string(),
-    ]
+fn default_max_active_in_place_leases() -> usize {
+    64
 }
+
+// These are parsed once by the compiler rather than allocating strings and
+// reparsing CIDRs for every boundary decision. Translation/tunnelling prefixes
+// are restricted as prefixes, not only when their currently embedded IPv4
+// value is private: the actual endpoint beyond a translator is not the IPv6
+// address enforced by the operation's local nftables rule.
+const MANDATORY_RESTRICTED_DESTINATIONS: &[(IpAddr, u8)] = &[
+    (IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
+    (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
+    (IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0)), 24),
+    (IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15),
+    (IpAddr::V4(Ipv4Addr::new(224, 0, 0, 0)), 4),
+    (IpAddr::V4(Ipv4Addr::new(240, 0, 0, 0)), 4),
+    (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 128),
+    (IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
+    (IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), 7),
+    (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10),
+    (IpAddr::V6(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0)), 8),
+    // RFC 6052 well-known and RFC 8215 local-use NAT64 prefixes.
+    (
+        IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0)),
+        96,
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0, 0)),
+        48,
+    ),
+    // 6to4 and deprecated IPv4-compatible IPv6 encodings.
+    (IpAddr::V6(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0)), 16),
+    (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 96),
+];
 
 impl Default for NetworkBoundaryPolicy {
     fn default() -> Self {
@@ -133,6 +158,7 @@ impl Default for NetworkBoundaryPolicy {
             restricted_destinations: Vec::new(),
             in_place_lease_scopes: Vec::new(),
             max_in_place_lease_ttl_seconds: 60,
+            max_active_in_place_leases: default_max_active_in_place_leases(),
             http_gateway_available: false,
             http_gateway_methods: default_http_gateway_methods(),
             prefer_http_gateway: true,
@@ -167,6 +193,11 @@ pub fn decide_network_boundary(
         Err(reason_code) => return deny(reason_code),
     };
 
+    // The current envelope is operator-authored baseline authority. An exact
+    // grant is therefore evaluated before the mandatory floor so deployments
+    // can deliberately expose a narrowly scoped local mediator. Runtime
+    // leases and broker decisions are evaluated below the floor and can never
+    // use this exception to authorize a restricted destination.
     if envelope.grants.iter().any(|grant| {
         grant_allows(
             grant,
@@ -183,10 +214,13 @@ pub fn decide_network_boundary(
         };
     }
 
-    if mandatory_restricted_destinations()
+    if MANDATORY_RESTRICTED_DESTINATIONS
         .iter()
-        .chain(&policy.restricted_destinations)
-        .any(|cidr| cidr_contains(cidr, destination))
+        .any(|(network, prefix)| parsed_network_contains(*network, *prefix, destination))
+        || policy
+            .restricted_destinations
+            .iter()
+            .any(|cidr| cidr_contains(cidr, destination))
     {
         return deny("restricted_destination");
     }
@@ -207,6 +241,19 @@ pub fn decide_network_boundary(
             && scope.ports.contains(&event.port)
     }) && policy.max_in_place_lease_ttl_seconds > 0;
     if leaseable {
+        let active_lease_count = envelope
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.lease_id.is_some()
+                    && grant
+                        .expires_at_ms
+                        .is_some_and(|expiry| event.observed_at_ms < expiry)
+            })
+            .count();
+        if active_lease_count >= policy.max_active_in_place_leases {
+            return deny("active_network_lease_limit_reached");
+        }
         let ttl_seconds = event
             .requested_ttl_seconds
             .unwrap_or(policy.max_in_place_lease_ttl_seconds)
@@ -361,13 +408,20 @@ fn cidr_contains(cidr: &str, address: IpAddr) -> bool {
             (network, None)
         }
     };
+    parsed_network_contains(
+        network,
+        prefix.unwrap_or(match network {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        }),
+        address,
+    )
+}
+
+fn parsed_network_contains(network: IpAddr, prefix: u8, address: IpAddr) -> bool {
     match (network, address) {
-        (IpAddr::V4(network), IpAddr::V4(address)) => {
-            ipv4_contains(network, address, prefix.unwrap_or(32))
-        }
-        (IpAddr::V6(network), IpAddr::V6(address)) => {
-            ipv6_contains(network, address, prefix.unwrap_or(128))
-        }
+        (IpAddr::V4(network), IpAddr::V4(address)) => ipv4_contains(network, address, prefix),
+        (IpAddr::V6(network), IpAddr::V6(address)) => ipv6_contains(network, address, prefix),
         _ => false,
     }
 }
@@ -702,6 +756,10 @@ mod tests {
             "ff02::1",
             "::ffff:7f00:1",
             "::ffff:a00:1",
+            "64:ff9b::a00:1",
+            "64:ff9b:1::a00:1",
+            "2002:0a00:0001::",
+            "::7f00:1",
         ];
         for destination in hidden_paths {
             for effect in [
@@ -725,6 +783,45 @@ mod tests {
                 assert!(decision.lease.is_none());
             }
         }
+    }
+
+    #[test]
+    fn active_temporary_lease_count_is_bounded_independently_of_cidr_scope() {
+        let policy = NetworkBoundaryPolicy {
+            in_place_lease_scopes: vec![NetworkLeaseScope {
+                destination: "8.8.8.0/24".to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![443],
+            }],
+            max_active_in_place_leases: 2,
+            ..NetworkBoundaryPolicy::default()
+        };
+        let envelope = NetworkCapabilityEnvelope {
+            grants: vec![
+                NetworkEndpointGrant {
+                    destination: "8.8.8.1".to_string(),
+                    protocol: NetworkProtocol::Tcp,
+                    ports: vec![443],
+                    expires_at_ms: Some(2_000),
+                    lease_id: Some("lease_1".to_string()),
+                },
+                NetworkEndpointGrant {
+                    destination: "8.8.8.2".to_string(),
+                    protocol: NetworkProtocol::Tcp,
+                    ports: vec![443],
+                    expires_at_ms: Some(2_000),
+                    lease_id: Some("lease_2".to_string()),
+                },
+            ],
+        };
+        let decision = decide_network_boundary(
+            &event("8.8.8.3", NetworkEffectKind::DirectConnect),
+            &envelope,
+            &policy,
+        );
+        assert_eq!(decision.disposition, NetworkBoundaryDisposition::Deny);
+        assert_eq!(decision.reason_code, "active_network_lease_limit_reached");
+        assert!(decision.lease.is_none());
     }
 
     #[test]

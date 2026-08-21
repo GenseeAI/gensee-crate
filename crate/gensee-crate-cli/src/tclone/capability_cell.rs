@@ -175,6 +175,7 @@ struct CellRuntimeWorkerResult {
 #[derive(Debug)]
 struct CellProcessTracker {
     tracked_pids: BTreeSet<u32>,
+    active_processes: BTreeMap<u32, Option<u64>>,
     processes_started: Vec<ProcessEffect>,
 }
 
@@ -454,12 +455,17 @@ impl CellProcessTracker {
         }
         let started_at_ms = unix_millis()?;
         let tracked_pids = identities.iter().map(|identity| identity.pid).collect();
+        let active_processes = identities
+            .iter()
+            .map(|identity| (identity.pid, Some(identity.start_time_ticks)))
+            .collect();
         let processes_started = identities
             .iter()
             .map(|identity| process_effect_from_identity(identity, started_at_ms))
             .collect();
         Ok(Self {
             tracked_pids,
+            active_processes,
             processes_started,
         })
     }
@@ -485,6 +491,8 @@ impl CellProcessTracker {
                             self.inherited_process_effect(parent_tgid, child_tgid, observed_at_ms)?
                         }
                     };
+                    self.active_processes
+                        .insert(child_tgid, effect.start_time_ticks);
                     self.processes_started.push(effect);
                 }
             }
@@ -499,6 +507,8 @@ impl CellProcessTracker {
                 self.tracked_pids.insert(process_tgid);
                 let identity = gensee_crate_linux::inspect_process_identity(process_tgid)?;
                 let effect = process_effect_from_identity(&identity, observed_at_ms);
+                self.active_processes
+                    .insert(process_tgid, effect.start_time_ticks);
                 if !self.processes_started.iter().any(|observed| {
                     observed.pid == effect.pid
                         && observed.start_time_ticks == effect.start_time_ticks
@@ -521,11 +531,13 @@ impl CellProcessTracker {
                 if process_pid == process_tgid {
                     self.tracked_pids.remove(&process_tgid);
                     let exit_code = decode_process_exit(exit_code, exit_signal);
-                    for process in self
-                        .processes_started
-                        .iter_mut()
-                        .filter(|process| process.pid == Some(process_tgid))
-                    {
+                    let active_start_time = self.active_processes.remove(&process_tgid);
+                    for process in self.processes_started.iter_mut().filter(|process| {
+                        process.pid == Some(process_tgid)
+                            && process.finished_at_ms.is_none()
+                            && active_start_time
+                                .is_some_and(|start| process.start_time_ticks == start)
+                    }) {
                         process.finished_at_ms = Some(observed_at_ms);
                         process.exit_code = Some(exit_code);
                     }
@@ -4916,6 +4928,7 @@ mod tests {
         };
         let mut tracker = CellProcessTracker {
             tracked_pids: BTreeSet::from([parent_pid]),
+            active_processes: BTreeMap::from([(parent_pid, Some(1))]),
             processes_started: vec![parent_effect.clone()],
         };
         let child_pid = u32::MAX - 1;
@@ -4954,6 +4967,41 @@ mod tests {
             .unwrap();
         assert_eq!(child.exit_code, Some(7));
         assert!(child.finished_at_ms.is_some());
+    }
+
+    #[test]
+    fn process_exit_updates_only_the_active_pid_generation() {
+        let pid = u32::MAX - 2;
+        let effect = |start_time_ticks, finished_at_ms, exit_code| ProcessEffect {
+            executable: "/bin/process".to_string(),
+            argv_digest: format!("sha256:{}", "d".repeat(64)),
+            pid: Some(pid),
+            parent_pid: Some(1),
+            start_time_ticks: Some(start_time_ticks),
+            started_at_ms: start_time_ticks,
+            finished_at_ms,
+            exit_code,
+        };
+        let mut tracker = CellProcessTracker {
+            tracked_pids: BTreeSet::from([pid]),
+            active_processes: BTreeMap::from([(pid, Some(30))]),
+            processes_started: vec![effect(10, Some(20), Some(0)), effect(30, None, None)],
+        };
+        tracker
+            .record(gensee_crate_linux::LinuxProcessEvent::Exit {
+                process_pid: pid,
+                process_tgid: pid,
+                exit_code: 7 << 8,
+                exit_signal: 0,
+                parent_pid: 1,
+                parent_tgid: 1,
+                timestamp_ns: 40,
+            })
+            .unwrap();
+        assert_eq!(tracker.processes_started[0].finished_at_ms, Some(20));
+        assert_eq!(tracker.processes_started[0].exit_code, Some(0));
+        assert!(tracker.processes_started[1].finished_at_ms.is_some());
+        assert_eq!(tracker.processes_started[1].exit_code, Some(7));
     }
 
     #[test]
