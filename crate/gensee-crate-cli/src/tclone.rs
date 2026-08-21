@@ -29,8 +29,8 @@ const TCLONE_STATE_LOCK_STALE_SECS: u64 = 30;
 const TCLONE_HOST_CONTROL_SOCKET_ENV: &str = "GENSEE_TCLONE_HOST_SOCKET";
 const TCLONE_HOST_CONTROL_DIR_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DIR";
 const TCLONE_HOST_CONTROL_DISABLE_ENV: &str = "GENSEE_TCLONE_HOST_CONTROL_DISABLE";
-pub(crate) const TCLONE_HOST_DAEMON_SOCKET_ENV: &str = "GENSEE_TCLONE_HOST_DAEMON_SOCKET";
-const TCLONE_CONTAINER_HOST_DAEMON_SOCKET: &str = "/run/gensee-host-observer.sock";
+pub(crate) const TCLONE_HOST_OBSERVER_SOCKET_ENV: &str = "GENSEE_TCLONE_HOST_OBSERVER_SOCKET";
+const TCLONE_CONTAINER_HOST_OBSERVER_SOCKET: &str = "/run/gensee-host-observer.sock";
 const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
 const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
 const TCLONE_HOST_CONTROL_COMMAND_TIMEOUT_SECS: u64 = 300;
@@ -613,6 +613,9 @@ fn tclone_observation_credentials_from_context(context: &Value) -> io::Result<(S
 }
 
 pub(crate) fn authenticate_tclone_observation(run_id: &str, capability: &str) -> io::Result<()> {
+    // This capability authenticates which tclone run emitted the observation.
+    // It is not a containment boundary: any process inside that run that can
+    // read its context can submit observations attributed to the same run.
     if !tclone_is_safe_token(run_id) || !tclone_is_safe_token(capability) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -3977,7 +3980,10 @@ fn run_tclone_agent_inner(
     let node_mount = tclone_node_mount();
     let container_agent_cmd = remap_tclone_agent_command(&config.agent_cmd, node_mount.as_ref());
     let gensee_home = default_root().ok().filter(|path| path.exists());
-    let host_daemon_socket = gensee_home.as_deref().and_then(tclone_host_daemon_socket);
+    let host_observer_socket = gensee_home
+        .as_deref()
+        .and_then(tclone_host_observer_socket)
+        .filter(|_| env_flag_default_on("GENSEE_TCLONE_BIND_HOST_OBSERVER"));
     prepare_tclone_seed(
         &seed_root,
         &original_workspace,
@@ -4042,15 +4048,15 @@ fn run_tclone_agent_inner(
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
-    if let Some(host_daemon_socket) = host_daemon_socket {
+    if let Some(host_observer_socket) = host_observer_socket {
         create_args.push(OsString::from("-v"));
         create_args.push(OsString::from(format!(
-            "{}:{TCLONE_CONTAINER_HOST_DAEMON_SOCKET}:rw",
-            host_daemon_socket.display()
+            "{}:{TCLONE_CONTAINER_HOST_OBSERVER_SOCKET}:rw",
+            host_observer_socket.display()
         )));
         create_args.push(OsString::from("-e"));
         create_args.push(OsString::from(format!(
-            "{TCLONE_HOST_DAEMON_SOCKET_ENV}={TCLONE_CONTAINER_HOST_DAEMON_SOCKET}"
+            "{TCLONE_HOST_OBSERVER_SOCKET_ENV}={TCLONE_CONTAINER_HOST_OBSERVER_SOCKET}"
         )));
     }
     if env_flag_default_on("GENSEE_TCLONE_BIND_HOST_CONTROL") {
@@ -10502,8 +10508,8 @@ fn tclone_podman() -> OsString {
         .unwrap_or_else(|| OsString::from("podman"))
 }
 
-fn tclone_host_daemon_socket(gensee_home: &Path) -> Option<PathBuf> {
-    let socket = daemon_socket_path(gensee_home);
+fn tclone_host_observer_socket(gensee_home: &Path) -> Option<PathBuf> {
+    let socket = tclone_observer_socket_path(gensee_home);
     fs::symlink_metadata(&socket)
         .ok()
         .filter(|metadata| metadata.file_type().is_socket())
@@ -14531,6 +14537,31 @@ gensee async job job_1: exited status=0
             "run_id": "run_1",
         }))
         .is_err());
+    }
+
+    #[test]
+    fn tclone_observation_authenticates_stored_capability_and_rejects_mismatch() {
+        let run_id = format!(
+            "observation_auth_{}_{}",
+            std::process::id(),
+            unix_millis().unwrap()
+        );
+        let run_root = gensee_tmp_root().unwrap().join(&run_id);
+        let capability = rotate_tclone_host_control_capability(&run_id).unwrap();
+
+        authenticate_tclone_observation(&run_id, &capability).unwrap();
+
+        let mut wrong = capability.into_bytes();
+        let last = wrong.len() - 1;
+        wrong[last] = if wrong[last] == b'a' { b'b' } else { b'a' };
+        let wrong = String::from_utf8(wrong).unwrap();
+        let error = authenticate_tclone_observation(&run_id, &wrong).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        let error = authenticate_tclone_observation("../other-run", &wrong).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        fs::remove_dir_all(run_root).ok();
     }
 
     #[test]

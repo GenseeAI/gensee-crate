@@ -4490,6 +4490,7 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
         session_registration.as_ref(),
         tclone_context_run_id.as_deref(),
     ) {
+        mirror_tclone_hook_observation(&event);
         return Ok(());
     }
 
@@ -4500,6 +4501,7 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     if let Some(decision_json) = process_hook_event(&payload, &event, &store)? {
         print!("{decision_json}");
     }
+    mirror_tclone_hook_observation(&event);
     Ok(())
 }
 
