@@ -399,9 +399,18 @@ fn build_fork_suggestion_finding(
     let name_hint = reason.name_hint();
     let requires_broker =
         capability_request.execution_boundary == ExecutionBoundary::BrokeredCommit;
+    let requires_irreversible_isolation = capability_request.execution_boundary
+        == ExecutionBoundary::IsolatedCell
+        && capability_request.effect_scope == EffectScope::IrreversibleLocal
+        && !current_run_is_tclone_fork(current_run_id);
     let message = if requires_broker {
         format!(
             "This operation has external effects ({reason}) and requires a brokered commit. It is blocked in both source and fork containers until a broker can enforce the declared target, identity, and effect scope; a workspace fork alone cannot roll back an external effect.",
+            reason = reason.label()
+        )
+    } else if requires_irreversible_isolation {
+        format!(
+            "This operation has irreversible local effects ({reason}) and is blocked outside an isolated run. Execute it in a disposable capability cell or an approved tclone fork so its effects can be inspected before promotion.",
             reason = reason.label()
         )
     } else if let Some(run_id) = current_run_id.filter(|run_id| !run_id.trim().is_empty()) {
@@ -416,12 +425,12 @@ fn build_fork_suggestion_finding(
         )
     };
     Some(PolicyFinding {
-        action: if requires_broker {
+        action: if requires_broker || requires_irreversible_isolation {
             PolicyAction::Block
         } else {
             fork_suggestion_action(event, current_run_id)
         },
-        severity: if requires_broker {
+        severity: if requires_broker || requires_irreversible_isolation {
             "high".to_string()
         } else {
             fork_suggestion_severity(event, current_run_id).to_string()
@@ -594,6 +603,12 @@ fn current_run_is_tclone_source(current_run_id: Option<&str>) -> bool {
     current_run_id
         .map(str::trim)
         .is_some_and(|run_id| !run_id.is_empty() && !run_id.contains("_fork_"))
+}
+
+fn current_run_is_tclone_fork(current_run_id: Option<&str>) -> bool {
+    current_run_id
+        .map(str::trim)
+        .is_some_and(|run_id| !run_id.is_empty() && run_id.contains("_fork_"))
 }
 
 fn tclone_fork_command_finding(

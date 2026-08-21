@@ -161,7 +161,11 @@ Destructive commands against direct file-backed clients such as `sqlite3` and
 `duckdb` are classified as irreversible local filesystem mutations and routed
 to an isolated cell. Remote database clients and database commands executed
 inside another container remain external mutations that require a brokered
-commit path.
+commit path. Irreversible local requests fail closed with high severity for
+every provider unless the command is already running in a disposable tclone
+fork; this also applies to destructive workspace cleanup. An observe-only
+policy can explicitly downgrade the stable capability-delegation rule when
+enforcement is intentionally disabled.
 
 The alert's `capability_request` is a descriptive starting template, not a
 ready-to-lease document. Its selectors are intentionally empty (empty means

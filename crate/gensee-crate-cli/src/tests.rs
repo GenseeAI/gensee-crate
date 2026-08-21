@@ -7478,6 +7478,42 @@ fn external_mutation_remains_blocked_inside_a_fork() {
 }
 
 #[test]
+fn irreversible_local_mutations_require_an_isolated_run() {
+    for (provider, run_id) in [
+        (PROVIDER_CODEX, None),
+        (PROVIDER_CODEX, Some("run_123")),
+        (PROVIDER_CLAUDE_CODE, None),
+        (PROVIDER_CLAUDE_CODE, Some("run_123")),
+    ] {
+        for command in [
+            r#"sqlite3 ./prod.db "drop table users""#,
+            "find . -name '*.tmp' -delete",
+        ] {
+            let payload = pretool_bash_payload("s1", "/repo", command);
+            let event = super::build_hook_event(&payload, provider).unwrap();
+            let finding = fork_suggestion_finding(&event, &[], run_id).unwrap();
+
+            assert_eq!(finding.action, PolicyAction::Block, "{provider}: {command}");
+            assert_eq!(finding.severity, "high", "{provider}: {command}");
+            assert!(finding.message.contains("blocked outside an isolated run"));
+        }
+    }
+}
+
+#[test]
+fn irreversible_local_mutations_are_allowed_inside_a_fork() {
+    for provider in [PROVIDER_CODEX, PROVIDER_CLAUDE_CODE] {
+        let payload =
+            pretool_bash_payload("s1", "/repo", r#"sqlite3 ./prod.db "drop table users""#);
+        let event = super::build_hook_event(&payload, provider).unwrap();
+        let finding = fork_suggestion_finding(&event, &[], Some("run_123_fork_456_0")).unwrap();
+
+        assert_eq!(finding.action, PolicyAction::Allow, "{provider}");
+        assert_eq!(finding.severity, "info", "{provider}");
+    }
+}
+
+#[test]
 fn codex_source_run_blocks_fork_suggestion_commands() {
     let payload = pretool_bash_payload("s1", "/repo", "cargo update");
     let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
