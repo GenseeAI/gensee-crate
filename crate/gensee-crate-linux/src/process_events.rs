@@ -65,6 +65,8 @@ pub struct LinuxProcessEventSensor {
     #[cfg(target_os = "linux")]
     port_id: u32,
     #[cfg(target_os = "linux")]
+    // Lifetime-cumulative by design: a correctly addressed non-kernel
+    // datagram is integrity-attack evidence, not routine transient noise.
     rejected_sender_count: u64,
 }
 
@@ -253,6 +255,7 @@ mod platform {
     const SUBSCRIPTION_SEQUENCE: u32 = 1;
     const RECEIVE_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
     const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(1);
+    const NETLINK_PORT_BIND_ATTEMPTS: usize = 8;
 
     enum ReceivedDatagram {
         Kernel(Vec<u8>),
@@ -289,26 +292,45 @@ mod platform {
             // Do not expose the host process ID as the netlink address. A
             // randomized nonzero port id makes blind cross-operation spoofing
             // materially harder while kernel provenance remains nl_pid == 0.
-            local.nl_pid = random_netlink_port_id()?;
-            let bound = unsafe {
-                libc::bind(
-                    fd,
-                    &local as *const _ as *const libc::sockaddr,
-                    mem::size_of_val(&local) as libc::socklen_t,
-                )
-            };
-            if bound < 0 {
-                return Err(io::Error::last_os_error());
+            let mut requested_port_id = None;
+            for attempt in 0..NETLINK_PORT_BIND_ATTEMPTS {
+                let candidate = random_netlink_port_id()?;
+                local.nl_pid = candidate;
+                let bound = unsafe {
+                    libc::bind(
+                        fd,
+                        &local as *const _ as *const libc::sockaddr,
+                        mem::size_of_val(&local) as libc::socklen_t,
+                    )
+                };
+                if bound == 0 {
+                    requested_port_id = Some(candidate);
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AddrInUse
+                    || attempt + 1 == NETLINK_PORT_BIND_ATTEMPTS
+                {
+                    return Err(error);
+                }
             }
+            let requested_port_id = requested_port_id.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "could not reserve a randomized process-connector port id",
+                )
+            })?;
             let mut length = mem::size_of_val(&local) as libc::socklen_t;
             let named = unsafe {
                 libc::getsockname(fd, &mut local as *mut _ as *mut libc::sockaddr, &mut length)
             };
-            if named < 0 || local.nl_pid == 0 {
+            if named < 0 || local.nl_pid != requested_port_id {
                 return Err(if named < 0 {
                     io::Error::last_os_error()
                 } else {
-                    io::Error::other("kernel did not assign a process-connector port id")
+                    io::Error::other(
+                        "kernel process-connector port id differs from the requested address",
+                    )
                 });
             }
             send_subscription(
@@ -480,6 +502,9 @@ mod platform {
     }
 
     pub(super) fn register_rejected_sender(rejected_sender_count: &mut u64) -> io::Result<()> {
+        // Do not decay this counter: every correctly addressed userspace
+        // datagram demonstrates knowledge of the random socket address and is
+        // therefore cumulative evidence that telemetry integrity is at risk.
         *rejected_sender_count = rejected_sender_count.saturating_add(1);
         if *rejected_sender_count >= MAX_REJECTED_NETLINK_DATAGRAMS {
             Err(io::Error::new(

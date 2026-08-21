@@ -326,11 +326,13 @@ impl Drop for NetworkRuntimeCleanup {
         // A standalone boundary daemon creates the operation record itself,
         // so it must also make that lifecycle terminal. When the record was
         // opened from an existing runner, that runner remains the only owner
-        // allowed to finish the operation.
+        // allowed to finish the operation. An implicit daemon teardown has no
+        // authenticated success handshake, so fail closed without inventing a
+        // child-process exit code.
         if self.owns_operation_lifecycle {
             if let Ok(mut state) = self.supervisor.lock() {
                 if let Some(operation) = state.operation.as_mut() {
-                    let _ = operation.finish(Some(1), false);
+                    let _ = operation.finish(None, false);
                 }
             }
         }
@@ -422,6 +424,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         ));
     }
 
+    let state_root = default_root()?;
     let root = network_operation_root(&config.operation_id)?;
     create_restrictive_dir_all(&root)?;
     #[cfg(unix)]
@@ -457,6 +460,27 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
+    if !dry_run && previous.is_some() {
+        // A prior finish may have made the lifecycle terminal while cgroup
+        // deletion returned EBUSY. Retry that exact subject release before
+        // normal startup rejects terminal lifecycle reuse. Keep the network
+        // operation lock held so no replacement policy generation can race
+        // exact terminal-table cleanup.
+        let subject_released =
+            crate::operation_supervisor::retry_terminal_operation_subject_release_at(
+                &state_root,
+                &config.operation_id,
+                &config.source_run_id,
+            )?;
+        if subject_released {
+            reap_terminal_network_boundary_while_locked(
+                &state_root,
+                &config.operation_id,
+                &config.source_run_id,
+            )?;
+        }
+    }
     let now_ms = unix_millis()?;
     let started_at_ms = previous
         .as_ref()
@@ -613,7 +637,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         owns_operation_lifecycle,
         table_names: Arc::clone(&table_names),
         terminal_deny_plan: terminal_deny_plan.clone(),
-        state_root: default_root()?,
+        state_root,
         record_path: record_path.clone(),
         operation_id: config.operation_id.clone(),
         source_run_id: config.source_run_id.clone(),
@@ -2899,6 +2923,23 @@ pub(crate) fn reap_terminal_network_boundary_for_operation(
         Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
         Err(error) => return Err(error),
     };
+    reap_terminal_network_boundary_while_locked(state_root, operation_id, expected_source_run_id)
+}
+
+/// Reaps one exact terminal boundary while its network-supervisor lock is
+/// already held by the caller. This supports startup recovery without dropping
+/// the lock between validating the stale record and deleting its tables.
+#[cfg(target_os = "linux")]
+fn reap_terminal_network_boundary_while_locked(
+    state_root: &Path,
+    operation_id: &str,
+    expected_source_run_id: &str,
+) -> io::Result<bool> {
+    let root = state_root.join("network-operations").join(operation_id);
+    let record_path = root.join("record.json");
+    if !record_path.exists() {
+        return Ok(true);
+    }
     let record: NetworkOperationRecord =
         serde_json::from_str(&read_nofollow_to_string(&record_path)?).map_err(|error| {
             io::Error::new(
@@ -3376,6 +3417,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(record["state"], "failed");
+        assert!(record["exit_code"].is_null());
         assert!(record["finished_at_ms"].is_number());
         assert!(record["cgroup"]["path"].as_str().unwrap().is_empty());
         assert_eq!(record["violations"].as_array().unwrap().len(), 0);

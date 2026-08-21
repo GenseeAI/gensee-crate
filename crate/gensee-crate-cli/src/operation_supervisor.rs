@@ -428,6 +428,25 @@ impl OperationSupervisor {
             record.state,
             OperationState::Succeeded | OperationState::Failed | OperationState::TimedOut
         ) {
+            drop(_lock);
+            #[cfg(target_os = "linux")]
+            {
+                // Terminal records remain single-use, but reopening one is a
+                // safe opportunity to retry an interrupted exact cleanup.
+                // Release the operation lock before the helper reacquires it
+                // and before network cleanup takes its own operation lock.
+                if retry_terminal_operation_subject_release_at(
+                    state_root,
+                    operation_id,
+                    expected_source_run_id,
+                )? {
+                    let _ = crate::network_boundary::reap_terminal_network_boundary_for_operation(
+                        state_root,
+                        operation_id,
+                        expected_source_run_id,
+                    )?;
+                }
+            }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "terminal managed operation cannot be reopened",
@@ -881,35 +900,17 @@ impl OperationSupervisor {
         self.record.exit_code = exit_code;
         self.record.finished_at_ms = Some(now);
         self.record.updated_at_ms = now;
-        if self.record.cgroup.owned_by_supervisor
-            && matches!(
-                self.record.cgroup.state,
-                OperationCgroupState::Prepared | OperationCgroupState::Attached
-            )
-        {
-            match gensee_crate_linux::remove_agent_cgroup(Path::new(&self.record.cgroup.path)) {
-                Ok(()) => self.record.cgroup.state = OperationCgroupState::Released,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    self.record.cgroup.state = OperationCgroupState::Released;
-                    self.record.cgroup.error = None;
-                }
-                Err(error) => {
-                    self.record.cgroup.error = Some(error.to_string());
-                    self.record_violation("cgroup_release_failed", &error.to_string())?;
-                }
-            }
-        } else {
-            match reconcile_released_adopted_cgroup(&mut self.record) {
-                Ok(_) => {}
-                Err(error) => {
-                    self.record.cgroup.error = Some(error.to_string());
-                    self.record_violation_at(
-                        "adopted_cgroup_release_check_failed",
-                        &error.to_string(),
-                        now,
-                    );
-                }
-            }
+        if let Err(error) = attempt_terminal_subject_release_with(
+            &mut self.record,
+            gensee_crate_linux::remove_agent_cgroup,
+        ) {
+            self.record.cgroup.error = Some(error.to_string());
+            let kind = if self.record.cgroup.owned_by_supervisor {
+                "cgroup_release_failed"
+            } else {
+                "adopted_cgroup_release_check_failed"
+            };
+            self.record_violation_at(kind, &error.to_string(), now);
         }
         self.persist()?;
         drop(_lock);
@@ -990,26 +991,52 @@ impl OperationSupervisor {
     }
 }
 
-fn reconcile_released_adopted_cgroup(record: &mut ManagedOperationRecord) -> io::Result<bool> {
-    if record.cgroup.owned_by_supervisor
-        || !matches!(
-            record.cgroup.state,
-            OperationCgroupState::Prepared | OperationCgroupState::Attached
-        )
-    {
+fn attempt_terminal_subject_release_with(
+    record: &mut ManagedOperationRecord,
+    remove_owned_cgroup: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<bool> {
+    if !matches!(
+        record.state,
+        OperationState::Succeeded | OperationState::Failed | OperationState::TimedOut
+    ) {
         return Ok(false);
     }
-    match fs::symlink_metadata(&record.cgroup.path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // The runner that adopted this cgroup tears it down before
-            // finishing the operation. Reflect that observed release in the
-            // durable lifecycle record so exact boundary cleanup can proceed.
-            record.cgroup.state = OperationCgroupState::Released;
-            record.cgroup.error = None;
-            Ok(true)
+    if record.cgroup.path.is_empty() || record.cgroup.state == OperationCgroupState::Released {
+        return Ok(true);
+    }
+    if !matches!(
+        record.cgroup.state,
+        OperationCgroupState::Prepared | OperationCgroupState::Attached
+    ) {
+        return Ok(false);
+    }
+    if record.cgroup.owned_by_supervisor {
+        match remove_owned_cgroup(Path::new(&record.cgroup.path)) {
+            Ok(()) => {
+                record.cgroup.state = OperationCgroupState::Released;
+                record.cgroup.error = None;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                record.cgroup.state = OperationCgroupState::Released;
+                record.cgroup.error = None;
+                Ok(true)
+            }
+            Err(error) => Err(error),
         }
-        Ok(_) => Ok(false),
-        Err(error) => Err(error),
+    } else {
+        match fs::symlink_metadata(&record.cgroup.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // The runner that adopted this cgroup tears it down before
+                // finishing the operation. Reflect that observed release in
+                // the durable record so exact boundary cleanup can proceed.
+                record.cgroup.state = OperationCgroupState::Released;
+                record.cgroup.error = None;
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1023,6 +1050,74 @@ fn terminal_operation_subject_is_released(record: &ManagedOperationRecord) -> bo
         record.state,
         OperationState::Succeeded | OperationState::Failed | OperationState::TimedOut
     ) && (record.cgroup.path.is_empty() || record.cgroup.state == OperationCgroupState::Released)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn retry_terminal_operation_subject_release_at_with(
+    state_root: &Path,
+    operation_id: &str,
+    expected_source_run_id: &str,
+    remove_owned_cgroup: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<bool> {
+    let root = operation_record_root_at(state_root, operation_id)?;
+    let record_path = root.join("record.json");
+    if !record_path.exists() {
+        return Ok(false);
+    }
+    let lock_path = root.join("record.lock");
+    let _lock = OperationRecordLock::acquire(&lock_path)?;
+    let record = read_operation_record(&record_path)?;
+    if record.operation_id != operation_id || record.source_run_id != expected_source_run_id {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "terminal cleanup identity does not match the operation record",
+        ));
+    }
+    if !matches!(
+        record.state,
+        OperationState::Succeeded | OperationState::Failed | OperationState::TimedOut
+    ) {
+        return Ok(false);
+    }
+    let now = unix_millis()?;
+    let mut supervisor = OperationSupervisor {
+        record,
+        record_path,
+        lock_path,
+    };
+    let released =
+        match attempt_terminal_subject_release_with(&mut supervisor.record, remove_owned_cgroup) {
+            Ok(released) => released,
+            Err(error) => {
+                supervisor.record.cgroup.error = Some(error.to_string());
+                let kind = if supervisor.record.cgroup.owned_by_supervisor {
+                    "cgroup_release_retry_failed"
+                } else {
+                    "adopted_cgroup_release_retry_failed"
+                };
+                supervisor.record_violation_at(kind, &error.to_string(), now);
+                false
+            }
+        };
+    supervisor.record.updated_at_ms = now;
+    let persist_result = supervisor.persist();
+    drop(_lock);
+    persist_result?;
+    Ok(released)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn retry_terminal_operation_subject_release_at(
+    state_root: &Path,
+    operation_id: &str,
+    expected_source_run_id: &str,
+) -> io::Result<bool> {
+    retry_terminal_operation_subject_release_at_with(
+        state_root,
+        operation_id,
+        expected_source_run_id,
+        gensee_crate_linux::remove_agent_cgroup,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1162,14 +1257,17 @@ mod tests {
         supervisor.activate_external_subject().unwrap();
         supervisor.record.cgroup.path = adopted.to_string_lossy().to_string();
         supervisor.record.cgroup.state = OperationCgroupState::Attached;
-        assert!(!reconcile_released_adopted_cgroup(&mut supervisor.record).unwrap());
+        supervisor.record.state = OperationState::Failed;
+        assert!(
+            !attempt_terminal_subject_release_with(&mut supervisor.record, |_| Ok(())).unwrap()
+        );
         assert_eq!(
             supervisor.record.cgroup.state,
             OperationCgroupState::Attached
         );
         fs::remove_dir_all(&adopted).unwrap();
 
-        assert!(reconcile_released_adopted_cgroup(&mut supervisor.record).unwrap());
+        assert!(attempt_terminal_subject_release_with(&mut supervisor.record, |_| Ok(())).unwrap());
         assert_eq!(
             supervisor.record.cgroup.state,
             OperationCgroupState::Released
@@ -1177,6 +1275,62 @@ mod tests {
         assert!(supervisor.record.cgroup.error.is_none());
 
         env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn owned_cgroup_release_failure_can_be_retried_after_terminalization() {
+        let root = env::temp_dir().join(format!(
+            "gensee-operation-release-retry-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut supervisor = OperationSupervisor::prepare_external_subject_at(
+            &root,
+            "op_release_retry",
+            "run_release_retry",
+            "test",
+            OperationCapabilityEnvelope::default(),
+        )
+        .unwrap();
+        supervisor.record.state = OperationState::Failed;
+        supervisor.record.finished_at_ms = Some(1);
+        supervisor.record.exit_code = Some(1);
+        supervisor.record.cgroup = OperationCgroupRecord {
+            path: "/sys/fs/cgroup/gensee/op_release_retry".to_string(),
+            state: OperationCgroupState::Attached,
+            owned_by_supervisor: true,
+            error: None,
+        };
+        supervisor.persist().unwrap();
+        drop(supervisor);
+
+        assert!(!retry_terminal_operation_subject_release_at_with(
+            &root,
+            "op_release_retry",
+            "run_release_retry",
+            |_| Err(io::Error::from_raw_os_error(libc::EBUSY)),
+        )
+        .unwrap());
+        let record =
+            read_operation_record(&root.join("operations/op_release_retry/record.json")).unwrap();
+        assert_eq!(record.cgroup.state, OperationCgroupState::Attached);
+        assert!(!terminal_operation_subject_is_released(&record));
+        assert!(record
+            .violations
+            .iter()
+            .any(|violation| violation.kind == "cgroup_release_retry_failed"));
+
+        assert!(retry_terminal_operation_subject_release_at_with(
+            &root,
+            "op_release_retry",
+            "run_release_retry",
+            |_| Ok(()),
+        )
+        .unwrap());
+        let record =
+            read_operation_record(&root.join("operations/op_release_retry/record.json")).unwrap();
+        assert_eq!(record.cgroup.state, OperationCgroupState::Released);
+        assert!(terminal_operation_subject_is_released(&record));
         fs::remove_dir_all(root).ok();
     }
 
