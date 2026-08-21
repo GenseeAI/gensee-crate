@@ -24,12 +24,40 @@
 use crate::*;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 const NO_HOOK_OUTPUT: &str = "__gensee_no_hook_output__";
 pub(crate) const EVENT_STORE_APPEND_SESSION: &str = "event_store_append_session";
 pub(crate) const EVENT_STORE_APPEND_TRANSACTION: &str = "event_store_append_transaction";
 const EVENT_STORE_APPEND_TCLONE_HOOK: &str = "event_store_append_tclone_hook";
+const TCLONE_OBSERVER_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+const TCLONE_OBSERVER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const TCLONE_OBSERVER_MAX_CONNECTIONS: usize = 32;
+
+struct TcloneObserverConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl TcloneObserverConnectionPermit {
+    fn try_acquire(active: Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < limit).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| Self { active })
+    }
+}
+
+impl Drop for TcloneObserverConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonResponseMode {
@@ -62,16 +90,34 @@ pub(crate) fn run_daemon() -> io::Result<()> {
     );
 
     let observer_store = Arc::clone(&store);
+    let observer_connections = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for conn in observer_listener.incoming() {
             match conn {
                 Ok(stream) => {
+                    let Some(permit) = TcloneObserverConnectionPermit::try_acquire(
+                        Arc::clone(&observer_connections),
+                        TCLONE_OBSERVER_MAX_CONNECTIONS,
+                    ) else {
+                        // Refuse excess untrusted clients before allocating a
+                        // thread. The hook client is fire-and-forget, so closing
+                        // here cannot interfere with policy enforcement.
+                        continue;
+                    };
                     let store = Arc::clone(&observer_store);
-                    thread::spawn(move || {
-                        if let Err(error) = serve_tclone_observer_connection(stream, &store) {
-                            eprintln!("gensee daemon: tclone observer connection error: {error}");
-                        }
-                    });
+                    if let Err(error) = thread::Builder::new()
+                        .name("gensee-tclone-observer".to_string())
+                        .spawn(move || {
+                            let _permit = permit;
+                            if let Err(error) = serve_tclone_observer_connection(stream, &store) {
+                                eprintln!(
+                                    "gensee daemon: tclone observer connection error: {error}"
+                                );
+                            }
+                        })
+                    {
+                        eprintln!("gensee daemon: cannot start tclone observer worker: {error}");
+                    }
                 }
                 Err(error) => eprintln!("gensee daemon: tclone observer accept error: {error}"),
             }
@@ -213,8 +259,11 @@ fn serve_event_store_request(
 }
 
 fn serve_tclone_observer_connection(mut stream: UnixStream, store: &EventStore) -> io::Result<()> {
-    let mut request = String::new();
-    stream.read_to_string(&mut request)?;
+    let request = read_tclone_observer_request(
+        &mut stream,
+        TCLONE_OBSERVER_MAX_REQUEST_BYTES,
+        TCLONE_OBSERVER_READ_TIMEOUT,
+    )?;
     let result = serde_json::from_str::<Value>(&request)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
         .and_then(|request| process_tclone_observer_request(store, request));
@@ -231,6 +280,56 @@ fn serve_tclone_observer_connection(mut stream: UnixStream, store: &EventStore) 
     };
     let _ = stream.write_all(response.to_string().as_bytes());
     Ok(())
+}
+
+fn read_tclone_observer_request(
+    stream: &mut UnixStream,
+    max_bytes: usize,
+    timeout: Duration,
+) -> io::Result<String> {
+    let deadline = Instant::now() + timeout;
+    let mut request = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tclone observer request read timed out",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let count = match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tclone observer request read timed out",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if request.len().saturating_add(count) > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tclone observer request exceeds {max_bytes} bytes"),
+            ));
+        }
+        request.extend_from_slice(&buffer[..count]);
+    }
+    String::from_utf8(request).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("tclone observer request is not UTF-8: {error}"),
+        )
+    })
 }
 
 fn process_tclone_observer_request(store: &EventStore, request: Value) -> io::Result<()> {
@@ -548,6 +647,57 @@ mod tclone_observation_tests {
             unix_millis().unwrap()
         ));
         (EventStore::new(&root).unwrap(), root)
+    }
+
+    #[test]
+    fn tclone_observer_request_reader_enforces_exact_byte_limit() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(&[b'a'; 64]).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let request =
+            read_tclone_observer_request(&mut server, 64, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(request.len(), 64);
+
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(&[b'a'; 65]).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let error =
+            read_tclone_observer_request(&mut server, 64, Duration::from_secs(1)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 64 bytes"));
+    }
+
+    #[test]
+    fn tclone_observer_request_reader_times_out_idle_clients() {
+        let (mut server, _client) = UnixStream::pair().unwrap();
+
+        let error =
+            read_tclone_observer_request(&mut server, 64, Duration::from_millis(20)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn tclone_observer_connection_permits_bound_concurrency() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let first = TcloneObserverConnectionPermit::try_acquire(Arc::clone(&active), 2).unwrap();
+        let second = TcloneObserverConnectionPermit::try_acquire(Arc::clone(&active), 2).unwrap();
+
+        assert!(TcloneObserverConnectionPermit::try_acquire(Arc::clone(&active), 2).is_none());
+        assert_eq!(active.load(Ordering::Acquire), 2);
+
+        drop(first);
+        let replacement =
+            TcloneObserverConnectionPermit::try_acquire(Arc::clone(&active), 2).unwrap();
+        assert_eq!(active.load(Ordering::Acquire), 2);
+
+        drop(second);
+        drop(replacement);
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
     #[test]

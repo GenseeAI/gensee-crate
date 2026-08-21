@@ -14522,6 +14522,7 @@ gensee async job job_1: exited status=0
     fn tclone_observation_credentials_require_run_and_capability() {
         assert_eq!(
             tclone_observation_credentials_from_context(&json!({
+                "role": "source",
                 "run_id": "run_1",
                 "host_control_capability": "capability-1",
             }))
@@ -14529,14 +14530,37 @@ gensee async job job_1: exited status=0
             ("run_1".to_string(), "capability-1".to_string())
         );
         assert!(tclone_observation_credentials_from_context(&json!({
+            "role": "source",
             "run_id": "../other-run",
             "host_control_capability": "capability-1",
         }))
         .is_err());
         assert!(tclone_observation_credentials_from_context(&json!({
+            "role": "source",
             "run_id": "run_1",
         }))
         .is_err());
+        assert!(tclone_observation_credentials_from_context(&json!({
+            "role": "source",
+            "run_id": "run_1_fork_1",
+            "host_control_capability": "capability-1",
+        }))
+        .is_err());
+        assert!(tclone_observation_credentials_from_context(&json!({
+            "role": "fork",
+            "run_id": "run_1",
+            "host_control_capability": "capability-1",
+        }))
+        .is_err());
+        assert_eq!(
+            tclone_observation_credentials_from_context(&json!({
+                "role": "fork",
+                "run_id": "run_1_fork_1",
+                "host_control_capability": "capability-1",
+            }))
+            .unwrap(),
+            ("run_1_fork_1".to_string(), "capability-1".to_string())
+        );
     }
 
     #[test]

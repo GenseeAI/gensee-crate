@@ -629,7 +629,9 @@ sessions or transactions and cannot ask the host policy engine for decisions.
 This capability establishes run attribution, not containment: a process that can
 read the run context can submit observations for that run. Set
 `GENSEE_TCLONE_BIND_HOST_OBSERVER=0` before launch to omit the observer socket
-entirely.
+entirely. The observer rejects requests over 2 MiB, applies a five-second total
+read deadline, and admits at most 32 concurrent connections; excess clients are
+closed before a worker thread is allocated.
 
 ## Current Limitations
 
