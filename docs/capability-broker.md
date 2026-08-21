@@ -104,9 +104,11 @@ Built-in filesystem leases validate bounded path/access constraints and are
 realized by exact read-only or read-write cell mounts. Built-in direct network
 leases require IP/CIDR-pinned destinations plus exact TCP/UDP ports. On Linux,
 Gensee starts a trusted gate in a private container network namespace, inspects
-its assigned address, binds an nftables forward allowlist to that address,
-attaches the initial process tree to a fresh cgroup, and only then releases the
-exact leased command. Hostnames are not accepted for this path, so a
+its assigned address, binds identical nftables forward and host-input
+allowlists to that address, attaches the initial process tree to a fresh
+cgroup, and only then releases the exact leased command. Applying the lease to
+both routing paths prevents an allowed endpoint from redirecting the cell to an
+unleased service on the Gensee host. Hostnames are not accepted for this path, so a
 broker must resolve and pin addresses before issuing the lease. Allowed-rule
 counters become network effects; blocked packets or incomplete counter
 collection prevent promotion. On non-Linux hosts this path fails closed.

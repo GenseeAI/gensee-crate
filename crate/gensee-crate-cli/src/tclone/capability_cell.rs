@@ -1,9 +1,9 @@
 use super::*;
 use gensee_crate_rules::capability::{
     Capability, CapabilityRequest, EffectManifest, EffectTelemetryCoverage, EffectViolation,
-    ExecutionBoundary, FileChangeEffect, FileChangeKind, FileEntryKind, ProcessEffect,
-    PromotionOutput, PromotionReceipt, TelemetryCoverage, CAPABILITY_REQUEST_SCHEMA_VERSION,
-    EFFECT_MANIFEST_SCHEMA_VERSION,
+    ExecutionBoundary, FileChangeEffect, FileChangeKind, FileEntryKind, FileOperationKind,
+    ProcessEffect, PromotionOutput, PromotionReceipt, TelemetryCoverage,
+    CAPABILITY_REQUEST_SCHEMA_VERSION, EFFECT_MANIFEST_SCHEMA_VERSION,
 };
 use gensee_crate_rules::capability_broker::BrokerResourceKind;
 use gensee_crate_rules::capability_broker::{BrokerDelivery, BrokerGatewayEffectKind, BrokerLease};
@@ -1258,7 +1258,7 @@ fn execute_capability_cell(
     let mut network_guard = network_plan.map(CellNetworkGuard::activate).transpose()?;
     let podman = tclone_podman();
     let cell_supervisor = copy_cell_supervisor(&podman, source, &cell_root)?;
-    copy_capability_scope(&podman, source, lease, &input_snapshot)?;
+    let declared_creates = copy_capability_scope(&podman, source, lease, &input_snapshot)?;
     if let Some(expected) = lease.expected_input_snapshot_digest.as_deref() {
         let actual = digest_cell_snapshot(&input_snapshot)?;
         if actual != expected {
@@ -1271,6 +1271,7 @@ fn execute_capability_cell(
         }
     }
     copy_path_all(&input_snapshot, &snapshot)?;
+    materialize_declared_create_paths(&snapshot, &declared_creates)?;
 
     let mut run_args = capability_cell_run_args(
         source,
@@ -1702,11 +1703,15 @@ fn copy_capability_scope(
     source: &TcloneRunRecord,
     lease: &CapabilityCellLease,
     snapshot: &Path,
-) -> io::Result<()> {
+) -> io::Result<Vec<(String, FileEntryKind)>> {
+    let write_paths = effective_write_paths(&lease.request)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let paths = effective_read_paths(&lease.request)
         .into_iter()
-        .chain(effective_write_paths(&lease.request))
+        .chain(write_paths.iter().cloned())
         .collect::<BTreeSet<_>>();
+    let mut declared_creates = Vec::new();
     for relative in paths {
         let destination = snapshot.join(&relative);
         if relative == "." {
@@ -1726,6 +1731,20 @@ fn copy_capability_scope(
         if destination.exists() {
             continue;
         }
+        if !capability_source_path_exists(podman, source, &relative)? {
+            if write_paths.contains(&relative) {
+                if let Some(kind) = declared_create_kind(&lease.request, &relative) {
+                    declared_creates.push((relative, kind));
+                    continue;
+                }
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "capability path does not exist in the source; declare an exact create operation to materialize it: {relative}"
+                ),
+            ));
+        }
         if let Some(parent) = destination.parent() {
             create_restrictive_dir_all(parent)?;
         }
@@ -1740,6 +1759,74 @@ fn copy_capability_scope(
                 OsString::from(&destination),
             ],
         )?;
+    }
+    Ok(declared_creates)
+}
+
+fn capability_source_path_exists(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+    relative: &str,
+) -> io::Result<bool> {
+    let target = Path::new(&source.container_workspace).join(relative);
+    let status = Command::new(podman)
+        .args([
+            OsString::from("exec"),
+            OsString::from(&source.container_name),
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("test -e \"$1\" || test -L \"$1\""),
+            OsString::from("gensee-path-check"),
+            target.into_os_string(),
+        ])
+        .status()?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(io::Error::other(format!(
+            "could not inspect capability path in source container: {relative}"
+        ))),
+    }
+}
+
+fn declared_create_kind(request: &CapabilityRequest, relative: &str) -> Option<FileEntryKind> {
+    request
+        .scope
+        .file_operations
+        .iter()
+        .find(|scope| scope.path == relative && scope.operation == FileOperationKind::Create)
+        .map(|scope| scope.entry_kind.unwrap_or(FileEntryKind::File))
+}
+
+fn materialize_declared_create_paths(
+    snapshot: &Path,
+    creates: &[(String, FileEntryKind)],
+) -> io::Result<()> {
+    for (relative, _) in creates
+        .iter()
+        .filter(|(_, kind)| *kind == FileEntryKind::Directory)
+    {
+        create_restrictive_dir_all(&snapshot.join(relative))?;
+    }
+    for (relative, kind) in creates {
+        let destination = snapshot.join(relative);
+        match kind {
+            FileEntryKind::File => {
+                if let Some(parent) = destination.parent() {
+                    create_restrictive_dir_all(parent)?;
+                }
+                write_atomic_nofollow(&destination, b"", 0o600)?;
+            }
+            FileEntryKind::Directory => {}
+            FileEntryKind::Symlink => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "declared symlink creation is not a safe capability mount target: {relative}"
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -3551,6 +3638,62 @@ mod tests {
         assert_eq!(
             fs::read_to_string(snapshot.join("copied.txt")).unwrap(),
             "copied"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn declared_create_paths_materialize_only_in_the_output_snapshot() {
+        let root = env::temp_dir().join(format!("gensee-cell-create-{}", Uuid::new_v4()));
+        let input = root.join("input");
+        let output = root.join("output");
+        fs::create_dir_all(&input).unwrap();
+        copy_path_all(&input, &output).unwrap();
+        let mut request = request();
+        request.scope.write_paths = vec!["generated/report.txt".to_string()];
+        request
+            .scope
+            .file_operations
+            .push(gensee_crate_rules::capability::FileOperationScope {
+                path: "generated/report.txt".to_string(),
+                operation: FileOperationKind::Create,
+                entry_kind: Some(FileEntryKind::File),
+            });
+
+        let kind = declared_create_kind(&request, "generated/report.txt").unwrap();
+        materialize_declared_create_paths(&output, &[("generated/report.txt".to_string(), kind)])
+            .unwrap();
+
+        assert!(!input.join("generated/report.txt").exists());
+        assert!(output.join("generated/report.txt").is_file());
+        let before = collect_cell_snapshot(&input).unwrap();
+        let after = collect_cell_snapshot(&output).unwrap();
+        assert_eq!(
+            diff_cell_snapshots(&before, &after)[0].change,
+            FileChangeKind::Created
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn declared_create_paths_support_directories_but_reject_symlink_mounts() {
+        let root = env::temp_dir().join(format!("gensee-cell-create-kind-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        materialize_declared_create_paths(
+            &root,
+            &[("generated".to_string(), FileEntryKind::Directory)],
+        )
+        .unwrap();
+        assert!(root.join("generated").is_dir());
+        assert_eq!(
+            materialize_declared_create_paths(
+                &root,
+                &[("link".to_string(), FileEntryKind::Symlink)],
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
         );
         fs::remove_dir_all(root).ok();
     }

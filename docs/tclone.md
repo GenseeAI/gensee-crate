@@ -345,6 +345,12 @@ promotions are appended to a separately HMAC-authenticated promotion ledger
 rejected. Use `--dry-run` to perform all evidence and conflict checks without
 changing the source.
 
+An exact write scope may name a path that does not exist yet when its typed
+file operation is `create`. Gensee preserves that absence in the immutable
+input snapshot and materializes only the declared file or directory in the
+isolated output layer, so the manifest records `created` and promotion can
+perform the correct absence/conflict check. Symlink mount targets are rejected.
+
 Direct network leases are supported on Linux only when they pin IP/CIDR,
 TCP/UDP, and exact ports. Gensee creates a private cell network namespace,
 never the host network namespace, binds identical nftables forward and
