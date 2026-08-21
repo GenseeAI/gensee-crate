@@ -28,6 +28,9 @@ The baseline envelope and active leases become an exact IP/protocol/port
 allowlist. Everything else is rejected. Gensee installs each new policy
 generation before deleting the old one, making both grant and revocation
 transitions fail closed. A supervisor timer removes expired leases.
+Temporary authority eligibility is also expressed as destination/protocol/port
+tuples. It is not assembled from independent lists whose cross-product could
+silently authorize a port or protocol the policy author never paired.
 
 For black-box TCP/UDP, the kernel marks every rejected packet for nftables
 trace before returning the reject verdict. A bounded, loss-reporting host sensor
@@ -91,8 +94,13 @@ authentication headers are not returned.
   "policy": {
     "schema_version": 1,
     "restricted_destinations": [],
-    "in_place_lease_destinations": [],
-    "in_place_lease_protocols": ["tcp"],
+    "in_place_lease_scopes": [
+      {
+        "destination": "203.0.113.40/32",
+        "protocol": "tcp",
+        "ports": [443]
+      }
+    ],
     "max_in_place_lease_ttl_seconds": 60,
     "http_gateway_available": true,
     "prefer_http_gateway": true,

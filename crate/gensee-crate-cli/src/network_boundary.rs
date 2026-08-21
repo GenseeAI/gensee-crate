@@ -1775,6 +1775,26 @@ fn authorize_mediated_http_hop(
             "HTTP authority did not resolve",
         ));
     }
+    authorize_mediated_http_addresses(supervisor, method, url, request_digest, lease_id, addresses)
+}
+
+/// Authorize the complete resolver answer as one effect. Keeping this logic
+/// separate makes the all-address fail-closed invariant directly testable
+/// without relying on mutable external DNS.
+fn authorize_mediated_http_addresses(
+    supervisor: &Arc<Mutex<NetworkSupervisor>>,
+    method: &str,
+    url: &Url,
+    request_digest: &str,
+    lease_id: Option<String>,
+    addresses: Vec<SocketAddr>,
+) -> io::Result<(SocketAddr, NetworkBoundaryEvent, NetworkBoundaryDecision)> {
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "HTTP authority did not resolve",
+        ));
+    }
     let now_ms = unix_millis()?;
     let state = lock_supervisor(supervisor)?;
     let operation_id = state.record.operation_id.clone();
@@ -2824,6 +2844,81 @@ mod tests {
     }
 
     #[test]
+    fn numeric_loopback_url_forms_normalize_before_boundary_authorization() {
+        for authority in ["2130706433", "0x7f000001", "017700000001"] {
+            let request =
+                format!("GET http://{authority}/artifact HTTP/1.1\r\nHost: ignored.test\r\n\r\n");
+            let parsed = parse_proxy_request_bytes(request.as_bytes()).unwrap();
+            assert_eq!(
+                parsed.url.host_str(),
+                Some("127.0.0.1"),
+                "numeric host form {authority} was not canonicalized"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_audience_is_origin_port_and_path_segment_exact() {
+        let credential = HttpCredentialInjection {
+            handle_id: "credential_1".to_string(),
+            header_name: "Authorization".to_string(),
+            value_file: "/not/read/by-this-test".to_string(),
+            allowed_url_prefixes: vec!["https://artifacts.example:8443/repository".to_string()],
+        };
+        for allowed in [
+            "https://artifacts.example:8443/repository",
+            "https://artifacts.example:8443/repository/item",
+        ] {
+            assert!(credential_applies_to_url(
+                &credential,
+                &Url::parse(allowed).unwrap()
+            ));
+        }
+        for outside in [
+            "https://artifacts.example/repository/item",
+            "http://artifacts.example:8443/repository/item",
+            "https://artifacts.example:8443/repository-evil/item",
+            "https://artifacts.example.evil:8443/repository/item",
+        ] {
+            assert!(
+                !credential_applies_to_url(&credential, &Url::parse(outside).unwrap()),
+                "credential escaped to {outside}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_restricted_dns_answer_denies_the_entire_brokered_effect() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let supervisor = test_supervisor(
+            &root,
+            NetworkBoundaryPolicy {
+                http_gateway_available: true,
+                ..NetworkBoundaryPolicy::default()
+            },
+        );
+        let result = authorize_mediated_http_addresses(
+            &supervisor,
+            "GET",
+            &Url::parse("https://artifacts.example/object").unwrap(),
+            "sha256:test-request",
+            None,
+            vec![
+                SocketAddr::from(([8, 8, 8, 8], 443)),
+                SocketAddr::from(([127, 0, 0, 1], 443)),
+            ],
+        );
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied
+        ));
+        let effects = fs::read_to_string(root.join("effects.jsonl")).unwrap();
+        assert_eq!(effects.lines().count(), 2);
+        assert!(effects.contains("http_effect_has_trusted_mediator"));
+        assert!(effects.contains("restricted_destination"));
+    }
+
+    #[test]
     fn supervisor_messages_are_newline_terminated_and_bounded() {
         assert_eq!(
             read_bounded_supervisor_line(io::Cursor::new(b"{}\n")).unwrap(),
@@ -2986,7 +3081,11 @@ mod tests {
     fn in_place_lease_is_attached_then_removed_on_expiry() {
         let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
         let policy = NetworkBoundaryPolicy {
-            in_place_lease_destinations: vec!["8.8.8.8".to_string()],
+            in_place_lease_scopes: vec![gensee_crate_rules::network_boundary::NetworkLeaseScope {
+                destination: "8.8.8.8".to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![443],
+            }],
             ..NetworkBoundaryPolicy::default()
         };
         let supervisor = test_supervisor(&root, policy);
@@ -3023,7 +3122,11 @@ mod tests {
     fn generic_network_fault_retries_only_after_a_scoped_lease_is_active() {
         let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
         let policy = NetworkBoundaryPolicy {
-            in_place_lease_destinations: vec!["8.8.8.8".to_string()],
+            in_place_lease_scopes: vec![gensee_crate_rules::network_boundary::NetworkLeaseScope {
+                destination: "8.8.8.8".to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![443],
+            }],
             ..NetworkBoundaryPolicy::default()
         };
         let supervisor = test_supervisor(&root, policy);
@@ -3056,10 +3159,57 @@ mod tests {
     }
 
     #[test]
+    fn fault_outside_the_exact_port_scope_cannot_trigger_authority_growth() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let policy = NetworkBoundaryPolicy {
+            in_place_lease_scopes: vec![gensee_crate_rules::network_boundary::NetworkLeaseScope {
+                destination: "8.8.8.8".to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![443],
+            }],
+            ..NetworkBoundaryPolicy::default()
+        };
+        let supervisor = test_supervisor(&root, policy);
+        let mut state = supervisor.lock().unwrap();
+        state.record.root_pid = None;
+        state.record.source_address = Some("10.88.0.12".to_string());
+        let fault = CapabilityFault {
+            schema_version: gensee_crate_rules::capability_fault::CAPABILITY_FAULT_SCHEMA_VERSION,
+            fault_id: "fault_network_wrong_port".to_string(),
+            operation_id: "op_1".to_string(),
+            source_run_id: "run_1".to_string(),
+            subject: CapabilityFaultSubject::NetworkPeer {
+                source_address: "10.88.0.12".to_string(),
+            },
+            effect: BoundaryEffectObservation::NetworkConnect {
+                destination: "8.8.8.8".to_string(),
+                protocol: "tcp".to_string(),
+                port: 8443,
+            },
+            requested_ttl_seconds: 5,
+            observed_at_ms: 1,
+        };
+        let (resolution, effect) = state
+            .resolve_fault(&fault, &Arc::new(Mutex::new(Vec::new())))
+            .unwrap();
+        assert_eq!(resolution.action, CapabilityFaultAction::Deny);
+        assert!(!resolution.retry_allowed);
+        assert!(resolution.lease_id.is_none());
+        assert!(state.record.envelope.grants.is_empty());
+        let effect = effect.expect("denied attempts remain in effect evidence");
+        assert_eq!(effect.decision.disposition, NetworkBoundaryDisposition::Deny);
+        assert!(effect.decision.lease.is_none());
+    }
+
+    #[test]
     fn kernel_observed_unknown_endpoint_becomes_one_typed_fault_and_scoped_lease() {
         let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
         let policy = NetworkBoundaryPolicy {
-            in_place_lease_destinations: vec!["8.8.8.8".to_string()],
+            in_place_lease_scopes: vec![gensee_crate_rules::network_boundary::NetworkLeaseScope {
+                destination: "8.8.8.8".to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![443],
+            }],
             ..NetworkBoundaryPolicy::default()
         };
         let supervisor = test_supervisor(&root, policy);
@@ -3117,6 +3267,37 @@ mod tests {
         let faults = fs::read_to_string(root.join("faults.jsonl")).unwrap();
         assert!(faults.contains("restricted_destination"));
         assert!(faults.contains("\"retry_allowed\":false"));
+    }
+
+    #[test]
+    fn sensor_loss_records_violations_without_inventing_endpoint_authority() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let operation_root = root.join("trusted-operation-state");
+        fs::create_dir_all(&operation_root).unwrap();
+        let operation = OperationSupervisor::prepare_at(
+            &operation_root,
+            "op_1",
+            "run_1",
+            "hidden_path_test",
+            OperationCapabilityEnvelope::default(),
+            None,
+        )
+        .unwrap();
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let mut state = supervisor.lock().unwrap();
+        state.operation = Some(operation);
+        state
+            .process_kernel_network_attempts(Vec::new(), 7, true, &Arc::new(Mutex::new(Vec::new())))
+            .unwrap();
+        assert!(state.record.envelope.grants.is_empty());
+        let attestation = state.operation.as_mut().unwrap().attestation().unwrap();
+        let violation_kinds = attestation
+            .violations
+            .iter()
+            .map(|violation| violation.kind.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(violation_kinds.contains("network_attempt_event_loss"));
+        assert!(violation_kinds.contains("network_attempt_sensor_stopped"));
     }
 
     #[test]
