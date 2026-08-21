@@ -4,6 +4,7 @@ use gensee_crate_rules::capability_broker::{
     BrokerLeaseStatus, BrokerResourceKind, ExternalActionCommitClaims,
     SignedExternalActionCommitToken, BROKER_PROTOCOL_VERSION,
 };
+use zeroize::Zeroizing;
 
 const BROKER_ADAPTER_SCHEMA_VERSION: u32 = 1;
 const BROKER_MAX_TTL_SECONDS: u64 = 15 * 60;
@@ -830,14 +831,23 @@ fn sign_external_commit_claims(claims: &ExternalActionCommitClaims) -> io::Resul
     Ok(format!("hmac-sha256:{:x}", mac.finalize().into_bytes()))
 }
 
-fn broker_signing_key() -> io::Result<String> {
+fn broker_signing_key() -> io::Result<Zeroizing<String>> {
     let path = broker_root()?.join("signing.key");
     let _lock = TcloneStateLock::acquire(&path)?;
     if path.exists() {
-        return Ok(read_nofollow_to_string(&path)?.trim().to_string());
+        let mut key = Zeroizing::new(read_nofollow_to_string(&path)?);
+        let trimmed_len = key.trim_end().len();
+        key.truncate(trimmed_len);
+        return Ok(key);
     }
-    let key = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    write_atomic_nofollow(&path, format!("{key}\n").as_bytes(), 0o600)?;
+    let key = Zeroizing::new(format!(
+        "{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    ));
+    let mut persisted = Zeroizing::new(key.as_bytes().to_vec());
+    persisted.push(b'\n');
+    write_atomic_nofollow(&path, &persisted, 0o600)?;
     Ok(key)
 }
 

@@ -1776,12 +1776,14 @@ mod tests {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_dot".to_string(),
             operation_id: "op_dot".to_string(),
+            cell_id: "cell_dot".to_string(),
             source_run_id: "run_1".to_string(),
             request,
             command: vec!["true".to_string()],
             issued_at_ms: 1,
             expires_at_ms: 2,
             consumed_at_ms: None,
+            broker_lease_ids: Vec::new(),
         };
 
         copy_capability_scope(

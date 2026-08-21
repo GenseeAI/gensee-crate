@@ -106,3 +106,16 @@ Revocation and consumption use a consistent lease-then-token lock order. A
 consumed token is authoritative during reconciliation, preventing a crash
 between token and lease record updates from making the external action
 replayable.
+
+The local HMAC key protects against accidental evidence drift, other local
+users, and a compromised capability cell because the key never enters the
+cell. It does not protect against code already running as the Gensee host user:
+that principal can read or replace both the owner-only signing key and retained
+evidence. Deployments needing host-user compromise resistance must place the
+key in a separate service, hardware-backed keystore, or differently privileged
+signer. In-memory key copies are zeroized when dropped.
+
+There is intentionally no silent signing-key rotation. Deleting or replacing
+`signing.key` invalidates every outstanding external-action token and all
+retained evidence signed by the old key. Revoke outstanding leases and archive
+or verify retained evidence before an operator performs an explicit rotation.
