@@ -31,10 +31,20 @@ struct BrokerAdapterConfig {
 
 pub(crate) fn tclone_capability_broker(args: Vec<OsString>) -> io::Result<()> {
     ensure_broker_host_only()?;
-    match (
+    let command = (
         args.first().and_then(|arg| arg.to_str()),
         args.get(1).and_then(|arg| arg.to_str()),
+    );
+    let recovery = super::capability_cell::recover_expired_capability_cells(unix_millis()?);
+    if matches!(
+        command,
+        (Some("lease"), Some("issue")) | (Some("commit"), Some("consume"))
     ) {
+        recovery?;
+    } else if let Err(error) = recovery {
+        eprintln!("gensee: warning: capability-cell recovery incomplete: {error}");
+    }
+    match command {
         (Some("adapter"), Some("register")) => register_broker_adapter(&args[2..]),
         (Some("adapter"), Some("inspect")) => inspect_broker_adapter(&args[2..]),
         (Some("lease"), Some("issue")) => issue_broker_lease(&args[2..]),

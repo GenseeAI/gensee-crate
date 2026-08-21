@@ -275,7 +275,11 @@ inherit the source agent home, credentials, memory, host-control capability, or
 ambient network. Its root filesystem is read-only, Linux capabilities are
 dropped, privilege gain is disabled, an explicit seccomp deny profile and
 AppArmor profile are applied, resources are capped, and only explicitly
-selected workspace paths are copied and mounted. Attached broker authority is
+selected workspace paths are copied and mounted. A trusted, read-only copy of
+the source container's Gensee binary supervises startup, requires Landlock,
+grants read/execute access to the immutable image, and grants filesystem
+mutation only to `/tmp`, `/run`, and the declared writable output mounts before
+executing the leased command. Attached broker authority is
 represented only by opaque ids and exact Unix-domain gateway socket mounts;
 without a direct network lease the cell keeps `--network none`. Podman independently enforces the
 remaining lease lifetime and automatic removal as a backstop if the Gensee
@@ -294,6 +298,15 @@ coverage is complete for the retained scope; reads and the complete descendant
 process tree are not yet observable and are marked unavailable/partial rather
 than being reported as empty facts.
 
+Before activating a cell, Gensee writes an owner-only cleanup journal naming
+only its exact container, broker leases, expiry, and, when present, generated
+nftables table and cgroup. Normal teardown marks the journal clean only after
+network cleanup and lease revocation succeed. Subsequent lease, cell, and broker
+operations reconcile expired active journals: they force-remove the exact
+container, idempotently remove generated network state, and retry provider
+revocation. Inspection remains available if reconciliation fails, preserving
+the manifest and journal for forensics.
+
 Nothing is promoted into the source automatically. Promotion is host-only and
 requires explicit path selectors. Gensee re-hashes both snapshots, rejects a
 changed manifest or output, requires a successful non-timeout execution with
@@ -305,14 +318,14 @@ promotion is rejected. Use `--dry-run` to perform all evidence and conflict
 checks without changing the source.
 
 Direct network leases are supported on Linux only when they pin IP/CIDR,
-TCP/UDP, and exact ports. The cell receives a private Podman bridge namespace,
-never the host network namespace. While the command waits behind a trusted
-startup gate, Gensee inspects the private address, binds the nftables policy to
-that exact source address on the `forward` hook, applies the allowlist, and only
-then releases execution. Gensee records allowed counters and blocked attempts.
-Policy-denied kernel authority and external mutations
-still fail closed. Repository/API, identity, mTLS, browser, cloud, and database
-authority can run only through a source/operation/cell-bound broker gateway.
+TCP/UDP, and exact ports. Gensee creates a private cell network namespace,
+never the host network namespace, binds an nftables forward allowlist to its
+inspected address, and attaches its
+process tree to a fresh cgroup before a trusted startup gate releases the leased
+command. It then records allowed counters and blocked attempts. Policy-denied
+kernel authority and external mutations still fail closed. Repository/API,
+identity, mTLS, browser, cloud, and database authority can run only through a
+source/operation/cell-bound broker gateway.
 The gateway must return complete typed effect telemetry at revocation or the
 result cannot be promoted.
 
@@ -550,9 +563,12 @@ The capability authenticates the container, not an individual agent process:
 any process that can read `/tmp/gensee-run-context.json` inside that container
 inherits that run's limited authority. It does not gain another run's capability
 or broader host command execution. Fork/snapshot/rollback mechanics and the run
-registry remain host-owned. Future work should add a post-fork rebind handshake
-so in-container hooks can rotate from the source `GENSEE_RUN_ID` to a
-fork-specific run id after live cloning.
+registry remain host-owned. Before live cloning, Gensee revokes the source host
+capability and preinstalls a distinct context and capability for every planned
+fork. Hook ingestion treats that fork context as authoritative over the cloned
+source process environment, so telemetry and host-control requests rebind to the
+fork run immediately; the source receives a freshly rotated capability only
+after clone completion.
 
 ## Current Limitations
 
@@ -564,8 +580,10 @@ fork-specific run id after live cloning.
   Tclone sources and live forks are not: they currently run with unconfined
   seccomp/AppArmor settings required by live-clone bring-up, and copied
   agent/Gensee config is duplicated into each fork.
-- Hook telemetry inside an already-running fork may still identify as the
-  source run until post-fork rebind is implemented.
+- A live fork intentionally inherits source process memory and is suitable only
+  for same-authority speculative work. Authority-expanding cells always use the
+  fresh-sandbox path, which inherits neither process memory nor agent
+  credentials.
 - `gensee run merge` defaults to `--git`, which merges repo changes from the
   fork into the source container. `--filesystem` and `--paths` merge persistent
   workspace changes with conflict detection and transactional rollback. None

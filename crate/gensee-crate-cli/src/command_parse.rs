@@ -339,6 +339,12 @@ pub(crate) fn compatibility_payload_provider(payload: &str) -> Option<&'static s
 /// Parse an agent hook payload, redact secrets, and project it into an
 /// `AgentHookEvent`. All structured fields are read from the *redacted* JSON, so
 /// nothing secret-bearing is persisted or fed into downstream intent parsing.
+fn effective_hook_session_id(provider_session_id: Option<String>) -> Option<String> {
+    crate::tclone::current_tclone_context_run_id()
+        .or(provider_session_id)
+        .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok())
+}
+
 pub(crate) fn build_hook_event(payload: &str, provider: &str) -> io::Result<AgentHookEvent> {
     let observed_at_ms = unix_millis()?;
 
@@ -352,7 +358,7 @@ pub(crate) fn build_hook_event(payload: &str, provider: &str) -> io::Result<Agen
         // Unparseable payload: keep only a redacted raw copy, no structured fields.
         return Ok(AgentHookEvent {
             provider: provider.to_string(),
-            session_id: env::var("AGENT_SHIELD_SESSION_ID").ok(),
+            session_id: effective_hook_session_id(None),
             hook_event_name: None,
             cwd: current_dir_string(),
             transcript_path: None,
@@ -400,8 +406,7 @@ pub(crate) fn build_hook_event(payload: &str, provider: &str) -> io::Result<Agen
 
     Ok(AgentHookEvent {
         provider: provider.to_string(),
-        session_id: v_str(&value, "session_id")
-            .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok()),
+        session_id: effective_hook_session_id(v_str(&value, "session_id")),
         hook_event_name,
         cwd: v_str(&value, "cwd").or_else(current_dir_string),
         transcript_path: v_str(&value, "transcript_path"),
@@ -456,9 +461,9 @@ fn build_antigravity_hook_event(value: Value, observed_at_ms: u64) -> io::Result
 
     Ok(AgentHookEvent {
         provider: PROVIDER_ANTIGRAVITY.to_string(),
-        session_id: v_str(&value, "conversationId")
-            .or_else(|| v_str(&value, "session_id"))
-            .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok()),
+        session_id: effective_hook_session_id(
+            v_str(&value, "conversationId").or_else(|| v_str(&value, "session_id")),
+        ),
         hook_event_name,
         cwd,
         transcript_path: v_str(&value, "transcriptPath"),
@@ -505,8 +510,7 @@ fn build_vscode_hook_event(value: Value, observed_at_ms: u64) -> io::Result<Agen
 
     Ok(AgentHookEvent {
         provider: PROVIDER_VSCODE.to_string(),
-        session_id: v_str(&value, "session_id")
-            .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok()),
+        session_id: effective_hook_session_id(v_str(&value, "session_id")),
         hook_event_name,
         cwd: v_str(&value, "cwd").or_else(current_dir_string),
         transcript_path: v_str(&value, "transcript_path"),
@@ -599,9 +603,9 @@ fn build_cursor_hook_event(value: Value, observed_at_ms: u64) -> io::Result<Agen
     Ok(AgentHookEvent {
         provider: PROVIDER_CURSOR.to_string(),
         // Cursor uses conversation_id; fall back to session_id for compatibility.
-        session_id: v_str(&value, "conversation_id")
-            .or_else(|| v_str(&value, "session_id"))
-            .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok()),
+        session_id: effective_hook_session_id(
+            v_str(&value, "conversation_id").or_else(|| v_str(&value, "session_id")),
+        ),
         hook_event_name,
         cwd,
         transcript_path: v_str(&value, "transcript_path"),

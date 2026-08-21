@@ -7718,6 +7718,25 @@ fn codex_fork_allows_exec_in_its_own_run() {
 }
 
 #[test]
+fn fork_context_rebind_overrides_cloned_source_hook_identity() {
+    let _guard = telemetry_test_lock();
+    let root = env::temp_dir().join(format!("gensee-hook-rebind-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let context = root.join("context.json");
+    std::fs::write(&context, r#"{"run_id":"run_123_fork_456_0","role":"fork"}"#).unwrap();
+    env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context);
+    env::set_var("AGENT_SHIELD_SESSION_ID", "run_123");
+    let payload = pretool_bash_payload("run_123", root.to_str().unwrap(), "cargo test");
+
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    assert_eq!(event.session_id.as_deref(), Some("run_123_fork_456_0"));
+    env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
+    env::remove_var("AGENT_SHIELD_SESSION_ID");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn codex_source_blocks_immediate_duplicate_fork_command() {
     let _guard = telemetry_test_lock();
     env::set_var("GENSEE_RUN_ID", "run_123");

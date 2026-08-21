@@ -86,12 +86,20 @@ cell exits, times out, or fails during preparation, a cleanup guard revokes all
 attached broker leases. Revocation failure becomes an effect-manifest violation
 and blocks output promotion.
 
+Cell activation also persists an owner-only cleanup journal before authority is
+used. If the host client crashes, Podman's lease timeout still terminates the
+container and the next trusted cell/broker operation reconciles the expired
+journal, removes exact generated network state, and retries adapter revocation.
+New authority issuance fails closed while an expired journal cannot be
+reconciled; inspection commands remain available for diagnosis.
+
 Built-in filesystem leases validate bounded path/access constraints and are
 realized by exact read-only or read-write cell mounts. Built-in direct network
 leases require IP/CIDR-pinned destinations plus exact TCP/UDP ports. On Linux,
-Gensee installs the nftables allowlist against a fresh cgroup before the cell's
-trusted startup gate is released, attaches the initial process tree, and then
-starts the exact leased command. Hostnames are not accepted for this path, so a
+Gensee starts a trusted gate in a private container network namespace, inspects
+its assigned address, binds an nftables forward allowlist to that address,
+attaches the initial process tree to a fresh cgroup, and only then releases the
+exact leased command. Hostnames are not accepted for this path, so a
 broker must resolve and pin addresses before issuing the lease. Allowed-rule
 counters become network effects; blocked packets or incomplete counter
 collection prevent promotion. On non-Linux hosts this path fails closed.

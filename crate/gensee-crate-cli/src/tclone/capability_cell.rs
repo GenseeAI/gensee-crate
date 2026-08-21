@@ -56,6 +56,25 @@ struct CapabilityCellRecord {
     timed_out: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityCellCleanupJournal {
+    schema_version: u32,
+    cell_id: String,
+    container_name: String,
+    broker_lease_ids: Vec<String>,
+    expires_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nftables_table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cgroup_path: Option<String>,
+    state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleaned_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
 #[derive(Debug)]
 struct CellNetworkPlan {
     enforcement: gensee_crate_linux::LinuxNetworkEnforcementPlan,
@@ -76,6 +95,7 @@ struct CellNetworkGuard {
 }
 
 pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
+    recover_expired_capability_cells(unix_millis()?)?;
     if args.first().and_then(|arg| arg.to_str()) != Some("issue") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -208,9 +228,14 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
 }
 
 pub(crate) fn tclone_capability_cell(args: Vec<OsString>) -> io::Result<()> {
+    let recovery = recover_expired_capability_cells(unix_millis()?);
     if args.first().and_then(|arg| arg.to_str()) == Some("inspect") {
+        if let Err(error) = recovery {
+            eprintln!("gensee: warning: capability-cell recovery incomplete: {error}");
+        }
         return inspect_capability_cell(args[1..].to_vec());
     }
+    recovery?;
     if args.first().and_then(|arg| arg.to_str()) == Some("promote") {
         return promote_capability_cell(args[1..].to_vec());
     }
@@ -928,10 +953,30 @@ fn execute_capability_cell(
     let input_snapshot = cell_root.join("input");
     let snapshot = cell_root.join("output");
     create_restrictive_dir_all(&input_snapshot)?;
+    let _cleanup_journal_lock =
+        TcloneStateLock::acquire(&capability_cell_cleanup_journal_path(&cell_id)?)?;
     let seccomp_profile = write_cell_seccomp_profile(&cell_root)?;
     let network_plan = cell_network_plan(&cell_id, &cell_root, &broker_leases)?;
+    let mut cleanup_journal = CapabilityCellCleanupJournal {
+        schema_version: CELL_LEASE_SCHEMA_VERSION,
+        cell_id: cell_id.clone(),
+        container_name: container_name.clone(),
+        broker_lease_ids: lease.broker_lease_ids.clone(),
+        expires_at_ms: lease.expires_at_ms,
+        nftables_table: network_plan
+            .as_ref()
+            .map(|plan| plan.enforcement.nftables.table_name.clone()),
+        cgroup_path: network_plan
+            .as_ref()
+            .map(|plan| plan.enforcement.cgroup.cgroup_path.clone()),
+        state: "active".to_string(),
+        cleaned_at_ms: None,
+        last_error: None,
+    };
+    persist_cell_cleanup_journal(&cleanup_journal)?;
     let mut network_guard = network_plan.map(CellNetworkGuard::activate).transpose()?;
     let podman = tclone_podman();
+    let cell_supervisor = copy_cell_supervisor(&podman, source, &cell_root)?;
     copy_capability_scope(&podman, source, lease, &input_snapshot)?;
     copy_path_all(&input_snapshot, &snapshot)?;
 
@@ -943,6 +988,7 @@ fn execute_capability_cell(
         &snapshot,
         &broker_leases,
         network_guard.as_ref().map(|guard| &guard.plan),
+        &cell_supervisor,
         &seccomp_profile,
         unix_millis()?,
     )?;
@@ -976,6 +1022,7 @@ fn execute_capability_cell(
         thread::sleep(Duration::from_millis(CELL_POLL_INTERVAL_MS));
     };
     drop(cleanup);
+    verify_capability_cell_terminated(&podman, &container_name)?;
     let network_evidence = network_guard
         .as_mut()
         .map(CellNetworkGuard::collect_and_cleanup);
@@ -984,6 +1031,20 @@ fn execute_capability_cell(
         Ok(leases) => (leases, None),
         Err(error) => (Vec::new(), Some(error)),
     };
+    let network_cleanup_complete = network_guard.as_ref().is_none_or(|guard| guard.cleaned);
+    if network_cleanup_complete && broker_revocation_error.is_none() {
+        cleanup_journal.state = "cleaned".to_string();
+        cleanup_journal.cleaned_at_ms = Some(finished_at_ms);
+        cleanup_journal.last_error = None;
+    } else {
+        cleanup_journal.last_error = Some(
+            broker_revocation_error
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "network cleanup incomplete".to_string()),
+        );
+    }
+    persist_cell_cleanup_journal(&cleanup_journal)?;
     let mut manifest = build_effect_manifest(
         source,
         lease,
@@ -1037,6 +1098,21 @@ fn execute_capability_cell(
     Ok(record)
 }
 
+fn verify_capability_cell_terminated(podman: &OsString, container_name: &str) -> io::Result<()> {
+    let status = Command::new(podman)
+        .args(["container", "exists", container_name])
+        .status()?;
+    match status.code() {
+        Some(1) => Ok(()),
+        Some(0) => Err(io::Error::other(
+            "capability-cell container still exists after process-tree termination",
+        )),
+        _ => Err(io::Error::other(format!(
+            "could not verify capability-cell process-tree termination: {status}"
+        ))),
+    }
+}
+
 struct AttachedBrokerLeaseCleanup {
     lease_ids: Vec<String>,
     armed: bool,
@@ -1079,6 +1155,7 @@ fn capability_cell_run_args(
     output_snapshot: &Path,
     broker_leases: &[BrokerLease],
     network_plan: Option<&CellNetworkPlan>,
+    cell_supervisor: &Path,
     seccomp_profile: &Path,
     now_ms: u64,
 ) -> io::Result<Vec<OsString>> {
@@ -1141,11 +1218,7 @@ fn capability_cell_run_args(
         ));
     }
     args.push(OsString::from("--entrypoint"));
-    args.push(OsString::from(if network_plan.is_some() {
-        "/bin/sh"
-    } else {
-        &lease.command[0]
-    }));
+    args.push(OsString::from("/run/gensee-cell-supervisor"));
     for path in effective_read_paths(&lease.request) {
         add_scope_mount(
             &mut args,
@@ -1196,16 +1269,71 @@ fn capability_cell_run_args(
             network_plan.gate_dir.display()
         )));
     }
-    args.push(OsString::from(&source.image));
-    if network_plan.is_some() {
-        args.push(OsString::from("-c"));
-        args.push(OsString::from(
-            "while [ ! -f /run/gensee-network-gate/open ]; do sleep 0.05; done; exec \"$@\"",
+    let supervisor_path = cell_supervisor.to_string_lossy();
+    if supervisor_path.contains(',')
+        || supervisor_path.contains('\n')
+        || supervisor_path.contains('\r')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cell supervisor path contains an unsafe mount character",
         ));
-        args.push(OsString::from("gensee-network-gate"));
-        args.push(OsString::from(&lease.command[0]));
     }
+    args.push(OsString::from("--mount"));
+    args.push(OsString::from(format!(
+        "type=bind,source={},destination=/run/gensee-cell-supervisor,ro",
+        supervisor_path
+    )));
+    args.push(OsString::from(&source.image));
+    args.push(OsString::from("__cell-landlock-exec"));
+    if network_plan.is_some() {
+        args.push(OsString::from("--gate"));
+        args.push(OsString::from("/run/gensee-network-gate/open"));
+    }
+    for path in effective_write_paths(&lease.request) {
+        args.push(OsString::from("--write-path"));
+        args.push(OsString::from(container_scope_path(
+            &source.container_workspace,
+            &path,
+        )));
+    }
+    args.push(OsString::from("--"));
+    args.push(OsString::from(&lease.command[0]));
     Ok(args)
+}
+
+fn copy_cell_supervisor(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+    cell_root: &Path,
+) -> io::Result<PathBuf> {
+    let destination = cell_root.join("gensee-cell-supervisor");
+    run_command_status(
+        podman,
+        &[
+            OsString::from("cp"),
+            OsString::from(format!("{}:/usr/local/bin/gensee", source.container_name)),
+            OsString::from(&destination),
+        ],
+    )?;
+    let metadata = fs::symlink_metadata(&destination)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cell supervisor must be a copied regular file",
+        ));
+    }
+    #[cfg(unix)]
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o500))?;
+    Ok(destination)
+}
+
+fn container_scope_path(workspace: &str, relative: &str) -> String {
+    if relative == "." {
+        workspace.to_string()
+    } else {
+        format!("{}/{}", workspace.trim_end_matches('/'), relative)
+    }
 }
 
 fn capability_cell_apparmor_profile() -> io::Result<String> {
@@ -2291,6 +2419,124 @@ fn capability_cell_path(cell_id: &str) -> io::Result<PathBuf> {
         .join(cell_id))
 }
 
+fn capability_cell_cleanup_journal_path(cell_id: &str) -> io::Result<PathBuf> {
+    Ok(capability_cell_path(cell_id)?.join("cleanup-journal.json"))
+}
+
+fn persist_cell_cleanup_journal(journal: &CapabilityCellCleanupJournal) -> io::Result<()> {
+    write_atomic_nofollow(
+        &capability_cell_cleanup_journal_path(&journal.cell_id)?,
+        &serde_json::to_vec_pretty(journal)?,
+        0o600,
+    )
+}
+
+pub(super) fn recover_expired_capability_cells(now_ms: u64) -> io::Result<()> {
+    let cells_dir = default_root()?.join("tclone-capability-cells");
+    if !cells_dir.exists() {
+        return Ok(());
+    }
+    let podman = tclone_podman();
+    let mut failures = Vec::new();
+    for entry in fs::read_dir(&cells_dir)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let journal_path = entry.path().join("cleanup-journal.json");
+        if !journal_path.exists() {
+            continue;
+        }
+        let _lock = match TcloneStateLock::acquire(&journal_path) {
+            Ok(lock) => lock,
+            Err(error) => {
+                failures.push(format!("{}: {error}", journal_path.display()));
+                continue;
+            }
+        };
+        let mut journal: CapabilityCellCleanupJournal =
+            match serde_json::from_str(&read_nofollow_to_string(&journal_path)?) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    failures.push(format!(
+                        "{}: invalid journal: {error}",
+                        journal_path.display()
+                    ));
+                    continue;
+                }
+            };
+        if journal.state == "cleaned" || now_ms < journal.expires_at_ms {
+            continue;
+        }
+        let result = recover_one_capability_cell(&podman, &journal);
+        match result {
+            Ok(()) => {
+                journal.state = "cleaned".to_string();
+                journal.cleaned_at_ms = Some(now_ms);
+                journal.last_error = None;
+            }
+            Err(error) => {
+                journal.last_error = Some(error.to_string());
+                failures.push(format!("{}: {error}", journal.cell_id));
+            }
+        }
+        write_atomic_nofollow(&journal_path, &serde_json::to_vec_pretty(&journal)?, 0o600)?;
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "capability-cell crash recovery incomplete: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
+fn recover_one_capability_cell(
+    podman: &OsString,
+    journal: &CapabilityCellCleanupJournal,
+) -> io::Result<()> {
+    if !tclone_is_safe_token(&journal.cell_id)
+        || journal.container_name != format!("gensee-tclone-{}", journal.cell_id)
+        || journal
+            .broker_lease_ids
+            .iter()
+            .any(|lease_id| !tclone_is_safe_token(lease_id))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cleanup journal contains an unsafe target",
+        ));
+    }
+    let _ = Command::new(podman)
+        .args(["rm", "--force", &journal.container_name])
+        .status();
+    if let Some(table) = journal.nftables_table.as_deref() {
+        if !tclone_is_safe_token(table) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cleanup journal contains an unsafe nftables table",
+            ));
+        }
+        gensee_crate_linux::delete_nftables_table_if_exists(table)?;
+    }
+    if let Some(cgroup_path) = journal.cgroup_path.as_deref() {
+        let expected = gensee_crate_linux::default_agent_cgroup_path(&journal.cell_id);
+        if Path::new(cgroup_path) != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cleanup journal cgroup does not match its cell",
+            ));
+        }
+        if Path::new(cgroup_path).exists() {
+            gensee_crate_linux::remove_agent_cgroup(Path::new(cgroup_path))?;
+        }
+    }
+    super::capability_broker::revoke_attached_broker_leases(&journal.broker_lease_ids)?;
+    Ok(())
+}
+
 fn capability_cell_binding_path(cell_id: &str) -> io::Result<PathBuf> {
     if !tclone_is_safe_token(cell_id) {
         return Err(io::Error::new(
@@ -2802,6 +3048,7 @@ mod tests {
             &root,
             std::slice::from_ref(&broker_lease),
             None,
+            &root,
             &root.join("seccomp.json"),
             150,
         )
@@ -2882,9 +3129,19 @@ mod tests {
         };
         let source = source_record();
 
-        let args =
-            capability_cell_run_args(&source, &lease, "cell", &root, &root, &[], None, &root, 1)
-                .unwrap();
+        let args = capability_cell_run_args(
+            &source,
+            &lease,
+            "cell",
+            &root,
+            &root,
+            &[],
+            None,
+            &root,
+            &root,
+            1,
+        )
+        .unwrap();
         let rendered = args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -2902,7 +3159,11 @@ mod tests {
             .any(|arg| arg == "apparmor=container-default"));
         assert!(rendered
             .windows(2)
-            .any(|pair| pair == ["--entrypoint", "cargo"]));
+            .any(|pair| pair == ["--entrypoint", "/run/gensee-cell-supervisor"]));
+        assert!(rendered.iter().any(|arg| arg == "__cell-landlock-exec"));
+        assert!(rendered
+            .windows(2)
+            .any(|pair| pair == ["--write-path", "/workspace/Cargo.lock"]));
         assert!(!rendered.iter().any(|arg| arg.contains("unconfined")));
         assert!(rendered.iter().any(|arg| arg.ends_with("/Cargo.toml:ro,Z")));
         assert!(rendered.iter().any(|arg| arg.ends_with("/Cargo.lock:rw,Z")));
@@ -3040,6 +3301,7 @@ mod tests {
             &root,
             std::slice::from_ref(&broker),
             Some(&plan),
+            &root,
             &root.join("seccomp.json"),
             1,
         )
@@ -3053,11 +3315,13 @@ mod tests {
             .any(|pair| pair == ["--network", "bridge"]));
         assert!(rendered
             .windows(2)
-            .any(|pair| pair == ["--entrypoint", "/bin/sh"]));
+            .any(|pair| pair == ["--entrypoint", "/run/gensee-cell-supervisor"]));
         assert!(rendered
             .iter()
             .any(|arg| { arg.contains("destination=/run/gensee-network-gate,ro") }));
-        assert!(rendered.iter().any(|arg| arg.contains("exec \"$@\"")));
+        assert!(rendered
+            .windows(2)
+            .any(|pair| pair == ["--gate", "/run/gensee-network-gate/open"]));
 
         let input = root.join("input");
         let output = root.join("output");
@@ -3127,6 +3391,47 @@ mod tests {
             0o600
         );
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_cell_journal_is_recovered_and_marked_clean() {
+        let _guard = crate::cli_test_env_lock();
+        let root = env::temp_dir().join(format!("gensee-cell-recovery-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let fake_podman = root.join("podman");
+        fs::write(&fake_podman, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&fake_podman, fs::Permissions::from_mode(0o700)).unwrap();
+        env::set_var("GENSEE_HOME", &root);
+        env::set_var("GENSEE_TCLONE_PODMAN", &fake_podman);
+        let journal = CapabilityCellCleanupJournal {
+            schema_version: CELL_LEASE_SCHEMA_VERSION,
+            cell_id: "cell_recovery".to_string(),
+            container_name: "gensee-tclone-cell_recovery".to_string(),
+            broker_lease_ids: Vec::new(),
+            expires_at_ms: 10,
+            nftables_table: None,
+            cgroup_path: None,
+            state: "active".to_string(),
+            cleaned_at_ms: None,
+            last_error: None,
+        };
+        persist_cell_cleanup_journal(&journal).unwrap();
+
+        recover_expired_capability_cells(11).unwrap();
+
+        let recovered: CapabilityCellCleanupJournal = serde_json::from_str(
+            &read_nofollow_to_string(
+                &capability_cell_cleanup_journal_path("cell_recovery").unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recovered.state, "cleaned");
+        assert_eq!(recovered.cleaned_at_ms, Some(11));
+        env::remove_var("GENSEE_TCLONE_PODMAN");
+        env::remove_var("GENSEE_HOME");
         fs::remove_dir_all(root).ok();
     }
 

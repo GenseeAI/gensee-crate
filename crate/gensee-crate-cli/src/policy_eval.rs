@@ -575,33 +575,7 @@ fn fork_suggestion_severity(event: &AgentHookEvent, current_run_id: Option<&str>
 }
 
 pub(crate) fn current_tclone_run_id_for_event(_event: &AgentHookEvent) -> Option<String> {
-    tclone_context_run_id_from_marker().or_else(inherited_tclone_source_run_id)
-}
-
-fn tclone_context_run_id_from_marker() -> Option<String> {
-    #[cfg(test)]
-    if let Some(path) = env::var_os("GENSEE_TCLONE_CONTEXT_PATH").map(PathBuf::from) {
-        return tclone_context_run_id_from_path(&path);
-    }
-    tclone_context_run_id_from_path(Path::new(TCLONE_RUN_CONTEXT_PATH))
-}
-
-fn tclone_context_run_id_from_path(path: &Path) -> Option<String> {
-    let value = fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
-    validated_tclone_marker_run_id(&value)
-}
-
-fn validated_tclone_marker_run_id(value: &Value) -> Option<String> {
-    let run_id = value.get("run_id").and_then(Value::as_str)?.trim();
-    let role = value.get("role").and_then(Value::as_str)?;
-    let role_matches_run_id = match role {
-        "fork" => run_id.contains("_fork_"),
-        "source" => !run_id.contains("_fork_"),
-        _ => false,
-    };
-    (!run_id.is_empty() && role_matches_run_id).then(|| run_id.to_string())
+    crate::tclone::current_tclone_context_run_id().or_else(inherited_tclone_source_run_id)
 }
 
 fn inherited_tclone_source_run_id() -> Option<String> {
@@ -3117,29 +3091,6 @@ mod matcher_tests {
                 ExecutionBoundary::BrokeredCommit
             );
         }
-    }
-
-    #[test]
-    fn marker_role_must_match_the_run_id_shape() {
-        for value in [
-            json!({"run_id": "run_123_fork_456_0", "role": "source"}),
-            json!({"run_id": "run_123", "role": "fork"}),
-            json!({"run_id": "run_123_fork_456_0", "role": "unknown"}),
-            json!({"run_id": "", "role": "fork"}),
-        ] {
-            assert_eq!(validated_tclone_marker_run_id(&value), None);
-        }
-
-        assert_eq!(
-            validated_tclone_marker_run_id(
-                &json!({"run_id": "run_123_fork_456_0", "role": "fork"})
-            ),
-            Some("run_123_fork_456_0".to_string())
-        );
-        assert_eq!(
-            validated_tclone_marker_run_id(&json!({"run_id": "run_123", "role": "source"})),
-            Some("run_123".to_string())
-        );
     }
 
     #[test]
