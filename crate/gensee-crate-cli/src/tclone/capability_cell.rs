@@ -1,9 +1,9 @@
 use super::*;
 use gensee_crate_rules::capability::{
     Capability, CapabilityRequest, EffectManifest, EffectTelemetryCoverage, EffectViolation,
-    ExecutionBoundary, FileChangeEffect, FileChangeKind, FileEntryKind, ProcessEffect,
-    PromotionOutput, PromotionReceipt, TelemetryCoverage, CAPABILITY_REQUEST_SCHEMA_VERSION,
-    EFFECT_MANIFEST_SCHEMA_VERSION,
+    ExecutionBoundary, FileChangeEffect, FileChangeKind, FileEntryKind, FileOperationKind,
+    FilesystemReadCoverage, ProcessEffect, PromotionOutput, PromotionReceipt, TelemetryCoverage,
+    CAPABILITY_REQUEST_SCHEMA_VERSION, EFFECT_MANIFEST_SCHEMA_VERSION,
 };
 use gensee_crate_rules::capability_broker::BrokerResourceKind;
 use gensee_crate_rules::capability_broker::{BrokerDelivery, BrokerGatewayEffectKind, BrokerLease};
@@ -152,11 +152,19 @@ struct CellNetworkEvidence {
 struct CellRuntimeEvidence {
     files_read: BTreeSet<String>,
     processes_started: Vec<ProcessEffect>,
+    covered_read_mounts: Vec<String>,
+    collection_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CellRuntimeWorkerResult {
+    events: Vec<gensee_crate_linux::LinuxFanotifyEvent>,
     collection_error: Option<String>,
 }
 
 struct CellRuntimeSensor {
-    enforcer: Option<gensee_crate_linux::LinuxFanotifyEnforcer>,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<CellRuntimeWorkerResult>>,
     evidence: CellRuntimeEvidence,
     input_snapshot: PathBuf,
     output_snapshot: PathBuf,
@@ -229,113 +237,149 @@ impl Drop for CellCgroupGuard {
 
 impl CellRuntimeSensor {
     fn start(
-        podman: &OsString,
-        container_name: &str,
         cell_id: &str,
         root_pid: u32,
         input_snapshot: &Path,
         output_snapshot: &Path,
         container_workspace: &str,
+        scoped_paths: &[String],
     ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
         let mut sensor = Self {
-            enforcer: None,
+            stop: Arc::clone(&stop),
+            worker: None,
             evidence: CellRuntimeEvidence::default(),
             input_snapshot: input_snapshot.to_path_buf(),
             output_snapshot: output_snapshot.to_path_buf(),
             container_workspace: container_workspace.to_string(),
         };
-        let result = (|| -> io::Result<gensee_crate_linux::LinuxFanotifyEnforcer> {
-            let merged_root = inspect_capability_cell_merged_root(podman, container_name)?;
-            let session = gensee_crate_linux::LinuxSessionTarget::from_pid(cell_id, root_pid)?;
-            let config = gensee_crate_linux::LinuxFanotifyConfig::with_session_filesystem_audit(
-                gensee_crate_linux::LinuxPolicy::default(),
-                session,
-                vec![
-                    merged_root.to_string_lossy().to_string(),
-                    input_snapshot.to_string_lossy().to_string(),
-                    output_snapshot.to_string_lossy().to_string(),
-                ],
-            );
-            let enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(config)?;
-            let status = enforcer.status();
-            if !status.warnings.is_empty() || status.marked_paths.is_empty() {
-                return Err(io::Error::other(format!(
-                    "fanotify cell sensor did not establish complete filesystem marks: {}",
-                    status.warnings.join("; ")
-                )));
-            }
-            Ok(enforcer)
-        })();
+        let result =
+            (|| -> io::Result<(gensee_crate_linux::LinuxFanotifyEnforcer, Vec<String>)> {
+                let process_root = PathBuf::from("/proc")
+                    .join(root_pid.to_string())
+                    .join("root");
+                if !process_root.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "gated capability-cell process root is not inspectable",
+                    ));
+                }
+                let workspace_root = process_root.join(container_workspace.trim_start_matches('/'));
+                let mut mount_marks = vec![process_root.to_string_lossy().to_string()];
+                for relative in scoped_paths {
+                    let path = if relative == "." {
+                        workspace_root.clone()
+                    } else {
+                        workspace_root.join(relative)
+                    };
+                    mount_marks.push(path.to_string_lossy().to_string());
+                }
+                mount_marks.sort();
+                mount_marks.dedup();
+                let session = gensee_crate_linux::LinuxSessionTarget::from_pid(cell_id, root_pid)?;
+                let config = gensee_crate_linux::LinuxFanotifyConfig::with_session_filesystem_audit(
+                    gensee_crate_linux::LinuxPolicy::default(),
+                    session,
+                    mount_marks,
+                );
+                let enforcer = gensee_crate_linux::LinuxFanotifyEnforcer::new(config)?;
+                let status = enforcer.status();
+                if !status.warnings.is_empty() || status.marked_paths.is_empty() {
+                    return Err(io::Error::other(format!(
+                        "fanotify cell sensor did not establish complete mount marks: {}",
+                        status.warnings.join("; ")
+                    )));
+                }
+                Ok((enforcer, status.marked_paths))
+            })();
         match result {
-            Ok(enforcer) => sensor.enforcer = Some(enforcer),
+            Ok((mut enforcer, covered_read_mounts)) => {
+                sensor.evidence.covered_read_mounts = covered_read_mounts;
+                sensor.worker = Some(thread::spawn(move || {
+                    let mut observed = Vec::new();
+                    loop {
+                        let events = match enforcer.handle_events_once() {
+                            Ok(events) => events,
+                            Err(error) => {
+                                return CellRuntimeWorkerResult {
+                                    events: observed,
+                                    collection_error: Some(error.to_string()),
+                                };
+                            }
+                        };
+                        let empty = events.is_empty();
+                        observed.extend(events);
+                        if stop.load(Ordering::Acquire) && empty {
+                            return CellRuntimeWorkerResult {
+                                events: observed,
+                                collection_error: None,
+                            };
+                        }
+                        if empty {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }));
+            }
             Err(error) => sensor.evidence.collection_error = Some(error.to_string()),
         }
         sensor
     }
 
-    fn drain(&mut self) {
-        let Some(enforcer) = self.enforcer.as_mut() else {
-            return;
-        };
-        for _ in 0..32 {
-            let events = match enforcer.handle_events_once() {
-                Ok(events) => events,
-                Err(error) => {
-                    self.evidence.collection_error = Some(error.to_string());
-                    self.enforcer = None;
-                    return;
+    fn record_events(&mut self, events: Vec<gensee_crate_linux::LinuxFanotifyEvent>) {
+        for event in events {
+            let path = event.request.path.as_deref().map(|path| {
+                cell_effect_path(
+                    path,
+                    &self.input_snapshot,
+                    &self.output_snapshot,
+                    &self.container_workspace,
+                )
+            });
+            if matches!(
+                event.request.operation,
+                gensee_crate_linux::LinuxAccessOperation::FileRead
+            ) {
+                if let Some(path) = path.clone() {
+                    self.evidence.files_read.insert(path);
                 }
-            };
-            if events.is_empty() {
-                return;
             }
-            for event in events {
-                let path = event.request.path.as_deref().map(|path| {
-                    cell_effect_path(
-                        path,
-                        &self.input_snapshot,
-                        &self.output_snapshot,
-                        &self.container_workspace,
-                    )
-                });
-                if matches!(
-                    event.request.operation,
-                    gensee_crate_linux::LinuxAccessOperation::FileRead
-                ) {
-                    if let Some(path) = path.clone() {
-                        self.evidence.files_read.insert(path);
-                    }
-                }
-                if event.executable_open {
-                    let command_line = event.request.command_line.unwrap_or_default();
-                    let argv_digest =
-                        format!("sha256:{:x}", Sha256::digest(command_line.as_bytes()));
-                    let process = ProcessEffect {
-                        executable: path.unwrap_or_else(|| "unknown".to_string()),
-                        argv_digest,
-                        pid: event.request.pid,
-                        started_at_ms: unix_millis().unwrap_or_default(),
-                        finished_at_ms: None,
-                        exit_code: None,
-                    };
-                    if !self.evidence.processes_started.iter().any(|observed| {
-                        observed.pid == process.pid
-                            && observed.executable == process.executable
-                            && observed.argv_digest == process.argv_digest
-                    }) {
-                        self.evidence.processes_started.push(process);
-                    }
+            if event.executable_open {
+                let command_line = event.request.command_line.unwrap_or_default();
+                let argv_digest = format!("sha256:{:x}", Sha256::digest(command_line.as_bytes()));
+                let process = ProcessEffect {
+                    executable: path.unwrap_or_else(|| "unknown".to_string()),
+                    argv_digest,
+                    pid: event.request.pid,
+                    started_at_ms: unix_millis().unwrap_or_default(),
+                    finished_at_ms: None,
+                    exit_code: None,
+                };
+                if !self.evidence.processes_started.iter().any(|observed| {
+                    observed.pid == process.pid
+                        && observed.executable == process.executable
+                        && observed.argv_digest == process.argv_digest
+                }) {
+                    self.evidence.processes_started.push(process);
                 }
             }
         }
-        self.evidence.collection_error = Some(
-            "fanotify cell sensor could not drain its queue within the bounded cycle".to_string(),
-        );
-        self.enforcer = None;
     }
 
     fn finish(mut self) -> CellRuntimeEvidence {
-        self.drain();
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            match worker.join() {
+                Ok(result) => {
+                    self.record_events(result.events);
+                    self.evidence.collection_error = result.collection_error;
+                }
+                Err(_) => {
+                    self.evidence.collection_error =
+                        Some("fanotify cell sensor thread panicked".to_string())
+                }
+            }
+        }
         self.evidence
     }
 }
@@ -995,12 +1039,21 @@ impl CellNetworkGuard {
     }
 }
 
-fn wait_for_capability_cell_pid(podman: &OsString, container_name: &str) -> io::Result<u32> {
+fn wait_for_capability_cell_pid(
+    podman: &OsString,
+    container_name: &str,
+    child: &mut std::process::Child,
+) -> io::Result<u32> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match super::inspect_container_pid(podman, container_name) {
             Ok(pid) if pid != 0 => return Ok(pid),
             Ok(_) | Err(_) if Instant::now() < deadline => {
+                if let Some(status) = child.try_wait()? {
+                    return Err(io::Error::other(format!(
+                        "capability-cell runtime exited before gated startup with {status}"
+                    )));
+                }
                 thread::sleep(Duration::from_millis(CELL_POLL_INTERVAL_MS));
             }
             Ok(_) | Err(_) => {
@@ -1011,33 +1064,6 @@ fn wait_for_capability_cell_pid(podman: &OsString, container_name: &str) -> io::
             }
         }
     }
-}
-
-fn inspect_capability_cell_merged_root(
-    podman: &OsString,
-    container_name: &str,
-) -> io::Result<PathBuf> {
-    let output = run_command_capture(
-        podman,
-        &[OsString::from("inspect"), OsString::from(container_name)],
-    )?;
-    let value: Value = serde_json::from_str(&output)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    value
-        .as_array()
-        .and_then(|containers| containers.first())
-        .and_then(|container| container.get("GraphDriver"))
-        .and_then(|driver| driver.get("Data"))
-        .and_then(|data| data.get("MergedDir"))
-        .and_then(Value::as_str)
-        .filter(|path| Path::new(path).is_absolute())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "gated capability cell has no inspectable merged root",
-            )
-        })
 }
 
 impl Drop for CellNetworkGuard {
@@ -1253,7 +1279,7 @@ fn execute_capability_cell(
     let mut network_guard = network_plan.map(CellNetworkGuard::activate).transpose()?;
     let podman = tclone_podman();
     let cell_supervisor = copy_cell_supervisor(&podman, source, &cell_root)?;
-    copy_capability_scope(&podman, source, lease, &input_snapshot)?;
+    let declared_creates = copy_capability_scope(&podman, source, lease, &input_snapshot)?;
     if let Some(expected) = lease.expected_input_snapshot_digest.as_deref() {
         let actual = digest_cell_snapshot(&input_snapshot)?;
         if actual != expected {
@@ -1266,6 +1292,7 @@ fn execute_capability_cell(
         }
     }
     copy_path_all(&input_snapshot, &snapshot)?;
+    materialize_declared_create_paths(&snapshot, &declared_creates)?;
 
     let mut run_args = capability_cell_run_args(
         source,
@@ -1284,15 +1311,18 @@ fn execute_capability_cell(
     let cleanup = TcloneContainerCleanup::new(&podman, &container_name);
     let started_at_ms = unix_millis()?;
     let mut child = Command::new(&podman).args(&run_args).spawn()?;
-    let root_pid = wait_for_capability_cell_pid(&podman, &container_name)?;
-    let mut runtime_sensor = CellRuntimeSensor::start(
-        &podman,
-        &container_name,
+    let root_pid = wait_for_capability_cell_pid(&podman, &container_name, &mut child)?;
+    let mut sensor_paths = effective_read_paths(&lease.request);
+    sensor_paths.extend(effective_write_paths(&lease.request));
+    sensor_paths.sort();
+    sensor_paths.dedup();
+    let runtime_sensor = CellRuntimeSensor::start(
         &cell_id,
         root_pid,
         &input_snapshot,
         &snapshot,
         &source.container_workspace,
+        &sensor_paths,
     );
     cgroup_guard.attach(root_pid)?;
     if let Some(guard) = network_guard.as_mut() {
@@ -1308,7 +1338,6 @@ fn execute_capability_cell(
     write_atomic_nofollow(&startup_gate.join("open"), b"open\n", 0o600)?;
     let mut timed_out = false;
     let status = loop {
-        runtime_sensor.drain();
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -1661,7 +1690,7 @@ fn container_scope_path(workspace: &str, relative: &str) -> String {
 
 fn capability_cell_apparmor_profile() -> io::Result<String> {
     let profile = env::var("GENSEE_TCLONE_CELL_APPARMOR_PROFILE")
-        .unwrap_or_else(|_| "container-default".to_string());
+        .unwrap_or_else(|_| "gensee-capability-cell".to_string());
     if !tclone_is_safe_token(&profile) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1695,11 +1724,15 @@ fn copy_capability_scope(
     source: &TcloneRunRecord,
     lease: &CapabilityCellLease,
     snapshot: &Path,
-) -> io::Result<()> {
+) -> io::Result<Vec<(String, FileEntryKind)>> {
+    let write_paths = effective_write_paths(&lease.request)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let paths = effective_read_paths(&lease.request)
         .into_iter()
-        .chain(effective_write_paths(&lease.request))
+        .chain(write_paths.iter().cloned())
         .collect::<BTreeSet<_>>();
+    let mut declared_creates = Vec::new();
     for relative in paths {
         let destination = snapshot.join(&relative);
         if relative == "." {
@@ -1719,6 +1752,20 @@ fn copy_capability_scope(
         if destination.exists() {
             continue;
         }
+        if !capability_source_path_exists(podman, source, &relative)? {
+            if write_paths.contains(&relative) {
+                if let Some(kind) = declared_create_kind(&lease.request, &relative) {
+                    declared_creates.push((relative, kind));
+                    continue;
+                }
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "capability path does not exist in the source; declare an exact create operation to materialize it: {relative}"
+                ),
+            ));
+        }
         if let Some(parent) = destination.parent() {
             create_restrictive_dir_all(parent)?;
         }
@@ -1733,6 +1780,74 @@ fn copy_capability_scope(
                 OsString::from(&destination),
             ],
         )?;
+    }
+    Ok(declared_creates)
+}
+
+fn capability_source_path_exists(
+    podman: &OsString,
+    source: &TcloneRunRecord,
+    relative: &str,
+) -> io::Result<bool> {
+    let target = Path::new(&source.container_workspace).join(relative);
+    let status = Command::new(podman)
+        .args([
+            OsString::from("exec"),
+            OsString::from(&source.container_name),
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("test -e \"$1\" || test -L \"$1\""),
+            OsString::from("gensee-path-check"),
+            target.into_os_string(),
+        ])
+        .status()?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(io::Error::other(format!(
+            "could not inspect capability path in source container: {relative}"
+        ))),
+    }
+}
+
+fn declared_create_kind(request: &CapabilityRequest, relative: &str) -> Option<FileEntryKind> {
+    request
+        .scope
+        .file_operations
+        .iter()
+        .find(|scope| scope.path == relative && scope.operation == FileOperationKind::Create)
+        .map(|scope| scope.entry_kind.unwrap_or(FileEntryKind::File))
+}
+
+fn materialize_declared_create_paths(
+    snapshot: &Path,
+    creates: &[(String, FileEntryKind)],
+) -> io::Result<()> {
+    for (relative, _) in creates
+        .iter()
+        .filter(|(_, kind)| *kind == FileEntryKind::Directory)
+    {
+        create_restrictive_dir_all(&snapshot.join(relative))?;
+    }
+    for (relative, kind) in creates {
+        let destination = snapshot.join(relative);
+        match kind {
+            FileEntryKind::File => {
+                if let Some(parent) = destination.parent() {
+                    create_restrictive_dir_all(parent)?;
+                }
+                write_atomic_nofollow(&destination, b"", 0o600)?;
+            }
+            FileEntryKind::Directory => {}
+            FileEntryKind::Symlink => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "declared symlink creation is not a safe capability mount target: {relative}"
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -2049,10 +2164,13 @@ fn build_effect_manifest(
         );
     }
     let runtime_coverage = match runtime_evidence {
-        Some(evidence) if evidence.collection_error.is_none() => TelemetryCoverage::Complete,
         Some(_) => TelemetryCoverage::Partial,
         None => TelemetryCoverage::Unavailable,
     };
+    let filesystem_read_coverage = runtime_evidence.map(|evidence| FilesystemReadCoverage {
+        covered_mounts: evidence.covered_read_mounts.clone(),
+        uncovered_mounts: capability_cell_uncovered_read_mounts(lease),
+    });
 
     let network_coverage = match network_evidence {
         Some(evidence) if evidence.collection_error.is_none() => TelemetryCoverage::Complete,
@@ -2107,11 +2225,30 @@ fn build_effect_manifest(
             ),
             process_tree: runtime_coverage,
         },
+        filesystem_read_coverage,
         started_at_ms,
         finished_at_ms,
         exit_code,
         timed_out,
     })
+}
+
+fn capability_cell_uncovered_read_mounts(lease: &CapabilityCellLease) -> Vec<String> {
+    let mut mounts = vec![
+        "/tmp".to_string(),
+        "/run".to_string(),
+        "/run/gensee-startup-gate".to_string(),
+        "/run/gensee-cell-supervisor".to_string(),
+    ];
+    mounts.extend(
+        lease
+            .broker_lease_ids
+            .iter()
+            .map(|lease_id| format!("/run/gensee-broker/{lease_id}.sock")),
+    );
+    mounts.sort();
+    mounts.dedup();
+    mounts
 }
 
 fn broker_coverage_for_capabilities(
@@ -2793,11 +2930,8 @@ fn promotion_telemetry_is_complete(
     request: &CapabilityRequest,
     coverage: &EffectTelemetryCoverage,
 ) -> bool {
-    coverage.process_tree == TelemetryCoverage::Complete
-        && (!request.capabilities.contains(&Capability::FilesystemRead)
-            || coverage.filesystem_reads == TelemetryCoverage::Complete)
-        && (!request.capabilities.contains(&Capability::FilesystemWrite)
-            || coverage.filesystem_writes == TelemetryCoverage::Complete)
+    (!request.capabilities.contains(&Capability::FilesystemWrite)
+        || coverage.filesystem_writes == TelemetryCoverage::Complete)
         && (!request.capabilities.iter().any(|capability| {
             matches!(
                 capability,
@@ -3463,6 +3597,7 @@ mod tests {
         request.scope.file_operations = vec![gensee_crate_rules::capability::FileOperationScope {
             path: "target/cache".to_string(),
             operation: gensee_crate_rules::capability::FileOperationKind::Delete,
+            entry_kind: None,
         }];
 
         validate_cell_request_for_issue(&request).unwrap();
@@ -3477,6 +3612,7 @@ mod tests {
         request.scope.file_operations = vec![gensee_crate_rules::capability::FileOperationScope {
             path: "target/cache".to_string(),
             operation: gensee_crate_rules::capability::FileOperationKind::Delete,
+            entry_kind: None,
         }];
 
         validate_cell_request_for_issue(&request).unwrap();
@@ -3544,6 +3680,62 @@ mod tests {
         assert_eq!(
             fs::read_to_string(snapshot.join("copied.txt")).unwrap(),
             "copied"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn declared_create_paths_materialize_only_in_the_output_snapshot() {
+        let root = env::temp_dir().join(format!("gensee-cell-create-{}", Uuid::new_v4()));
+        let input = root.join("input");
+        let output = root.join("output");
+        fs::create_dir_all(&input).unwrap();
+        copy_path_all(&input, &output).unwrap();
+        let mut request = request();
+        request.scope.write_paths = vec!["generated/report.txt".to_string()];
+        request
+            .scope
+            .file_operations
+            .push(gensee_crate_rules::capability::FileOperationScope {
+                path: "generated/report.txt".to_string(),
+                operation: FileOperationKind::Create,
+                entry_kind: Some(FileEntryKind::File),
+            });
+
+        let kind = declared_create_kind(&request, "generated/report.txt").unwrap();
+        materialize_declared_create_paths(&output, &[("generated/report.txt".to_string(), kind)])
+            .unwrap();
+
+        assert!(!input.join("generated/report.txt").exists());
+        assert!(output.join("generated/report.txt").is_file());
+        let before = collect_cell_snapshot(&input).unwrap();
+        let after = collect_cell_snapshot(&output).unwrap();
+        assert_eq!(
+            diff_cell_snapshots(&before, &after)[0].change,
+            FileChangeKind::Created
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn declared_create_paths_support_directories_but_reject_symlink_mounts() {
+        let root = env::temp_dir().join(format!("gensee-cell-create-kind-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        materialize_declared_create_paths(
+            &root,
+            &[("generated".to_string(), FileEntryKind::Directory)],
+        )
+        .unwrap();
+        assert!(root.join("generated").is_dir());
+        assert_eq!(
+            materialize_declared_create_paths(
+                &root,
+                &[("link".to_string(), FileEntryKind::Symlink)],
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
         );
         fs::remove_dir_all(root).ok();
     }
@@ -3853,7 +4045,7 @@ mod tests {
         assert!(rendered.iter().any(|arg| arg.starts_with("seccomp=")));
         assert!(rendered
             .iter()
-            .any(|arg| arg == "apparmor=container-default"));
+            .any(|arg| arg == "apparmor=gensee-capability-cell"));
         assert!(rendered
             .windows(2)
             .any(|pair| pair == ["--entrypoint", "/run/gensee-cell-supervisor"]));
@@ -4213,7 +4405,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_records_complete_runtime_sensor_evidence() {
+    fn manifest_records_runtime_evidence_with_explicit_partial_mount_coverage() {
         let root = env::temp_dir().join(format!("gensee-cell-runtime-{}", Uuid::new_v4()));
         let input = root.join("input");
         let output = root.join("output");
@@ -4238,6 +4430,7 @@ mod tests {
         };
         let mut runtime = CellRuntimeEvidence::default();
         runtime.files_read.insert("Cargo.toml".to_string());
+        runtime.covered_read_mounts = vec!["/proc/42/root".to_string()];
         runtime.processes_started.push(ProcessEffect {
             executable: "/usr/bin/cargo".to_string(),
             argv_digest: format!("sha256:{}", "a".repeat(64)),
@@ -4268,12 +4461,20 @@ mod tests {
             .any(|process| process.pid == Some(42)));
         assert_eq!(
             manifest.telemetry_coverage.filesystem_reads,
-            TelemetryCoverage::Complete
+            TelemetryCoverage::Partial
         );
         assert_eq!(
             manifest.telemetry_coverage.process_tree,
-            TelemetryCoverage::Complete
+            TelemetryCoverage::Partial
         );
+        let coverage = manifest.filesystem_read_coverage.as_ref().unwrap();
+        assert_eq!(coverage.covered_mounts, vec!["/proc/42/root"]);
+        assert!(coverage.uncovered_mounts.contains(&"/tmp".to_string()));
+        assert!(coverage.uncovered_mounts.contains(&"/run".to_string()));
+        assert!(!manifest
+            .violations
+            .iter()
+            .any(|violation| violation.kind == "filesystem_read_coverage_partial"));
         fs::remove_dir_all(root).ok();
     }
 
@@ -4303,7 +4504,10 @@ mod tests {
             replay_of_cell_id: None,
             expected_input_snapshot_digest: None,
         };
-        let mut manifest = build_effect_manifest(
+        let mut runtime = CellRuntimeEvidence::default();
+        runtime.files_read.insert("Cargo.toml".to_string());
+        runtime.covered_read_mounts = vec!["/proc/42/root".to_string()];
+        let manifest = build_effect_manifest(
             &source_record(),
             &lease,
             "cell_1",
@@ -4315,11 +4519,17 @@ mod tests {
             false,
             &[],
             None,
-            None,
+            Some(&runtime),
         )
         .unwrap();
-        manifest.telemetry_coverage.filesystem_reads = TelemetryCoverage::Complete;
-        manifest.telemetry_coverage.process_tree = TelemetryCoverage::Complete;
+        assert_eq!(
+            manifest.telemetry_coverage.filesystem_reads,
+            TelemetryCoverage::Partial
+        );
+        assert_eq!(
+            manifest.telemetry_coverage.process_tree,
+            TelemetryCoverage::Partial
+        );
         persist_capability_cell_forensics(
             &source_record(),
             &lease,

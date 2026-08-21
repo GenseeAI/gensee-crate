@@ -574,11 +574,53 @@ fn nftables_script_with_match(
     for counter in endpoint_counters {
         lines.push(format!("  counter {} {{}}", counter.name));
     }
+    append_nftables_chain(
+        &mut lines,
+        chain_name,
+        subject_match,
+        hook,
+        mode,
+        destinations,
+        denied_destinations,
+        block_counters,
+        endpoint_counters,
+    );
+    // A private bridge sends remote traffic through `forward`, but traffic to
+    // services on the host itself traverses `input`. Apply the identical exact
+    // allowlist and default reject to both paths for capability cells.
+    if hook == "forward" {
+        append_nftables_chain(
+            &mut lines,
+            &format!("{chain_name}_input"),
+            subject_match,
+            "input",
+            mode,
+            destinations,
+            denied_destinations,
+            block_counters,
+            endpoint_counters,
+        );
+    }
+    lines.push("}".to_string());
+    format!("{}\n", lines.join("\n"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_nftables_chain(
+    lines: &mut Vec<String>,
+    chain_name: &str,
+    subject_match: &str,
+    hook: &str,
+    mode: LinuxNetworkMode,
+    destinations: &[LinuxNftablesDestination],
+    denied_destinations: &[LinuxNftablesDestination],
+    block_counters: &[LinuxNftablesBlockCounter],
+    endpoint_counters: &[LinuxNftablesEndpointCounter],
+) {
     lines.push(format!("  chain {chain_name} {{"));
     lines.push(format!(
         "    type filter hook {hook} priority filter; policy accept;"
     ));
-
     for (index, destination) in denied_destinations.iter().enumerate() {
         let counter_name = block_counters
             .iter()
@@ -588,83 +630,68 @@ fn nftables_script_with_match(
             })
             .map(|counter| counter.name.clone())
             .unwrap_or_else(|| denied_counter_name(index));
-        match destination.family {
-            LinuxNftablesAddressFamily::Ipv4 => lines.push(format!(
-                "    {subject_match} ip daddr {} counter name {} reject with icmpx admin-prohibited",
-                destination.value, counter_name
-            )),
-            LinuxNftablesAddressFamily::Ipv6 => lines.push(format!(
-                "    {subject_match} ip6 daddr {} counter name {} reject with icmpx admin-prohibited",
-                destination.value, counter_name
-            )),
-        }
+        let address = match destination.family {
+            LinuxNftablesAddressFamily::Ipv4 => "ip daddr",
+            LinuxNftablesAddressFamily::Ipv6 => "ip6 daddr",
+        };
+        lines.push(format!(
+            "    {subject_match} {address} {} counter name {counter_name} reject with icmpx admin-prohibited",
+            destination.value
+        ));
     }
-
-    if mode == LinuxNetworkMode::Monitor {
-        lines.push("  }".to_string());
-        lines.push("}".to_string());
-        return format!("{}\n", lines.join("\n"));
-    }
-
-    for destination in destinations {
-        if let Some(protocol) = destination.protocol {
-            let counter = endpoint_counters
-                .iter()
-                .find(|counter| {
-                    counter.destination == destination.value
-                        && counter.protocol == protocol
-                        && counter.ports == destination.ports
-                })
-                .expect("endpoint destination always has a counter");
-            let protocol_name = match protocol {
-                LinuxNetworkProtocol::Tcp => "tcp",
-                LinuxNetworkProtocol::Udp => "udp",
-            };
-            let ports = if destination.ports.len() == 1 {
-                destination.ports[0].to_string()
-            } else {
-                format!(
-                    "{{ {} }}",
-                    destination
-                        .ports
-                        .iter()
-                        .map(u16::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
+    if mode != LinuxNetworkMode::Monitor {
+        for destination in destinations {
             let address = match destination.family {
                 LinuxNftablesAddressFamily::Ipv4 => "ip daddr",
                 LinuxNftablesAddressFamily::Ipv6 => "ip6 daddr",
             };
-            lines.push(format!(
-                "    {subject_match} {address} {} meta l4proto {protocol_name} {protocol_name} dport {ports} counter name {} accept",
-                destination.value, counter.name
-            ));
-            continue;
+            if let Some(protocol) = destination.protocol {
+                let counter = endpoint_counters
+                    .iter()
+                    .find(|counter| {
+                        counter.destination == destination.value
+                            && counter.protocol == protocol
+                            && counter.ports == destination.ports
+                    })
+                    .expect("endpoint destination always has a counter");
+                let protocol_name = match protocol {
+                    LinuxNetworkProtocol::Tcp => "tcp",
+                    LinuxNetworkProtocol::Udp => "udp",
+                };
+                let ports = if destination.ports.len() == 1 {
+                    destination.ports[0].to_string()
+                } else {
+                    format!(
+                        "{{ {} }}",
+                        destination
+                            .ports
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                lines.push(format!(
+                    "    {subject_match} {address} {} meta l4proto {protocol_name} {protocol_name} dport {ports} counter name {} accept",
+                    destination.value, counter.name
+                ));
+            } else {
+                lines.push(format!(
+                    "    {subject_match} {address} {} accept",
+                    destination.value
+                ));
+            }
         }
-        match destination.family {
-            LinuxNftablesAddressFamily::Ipv4 => lines.push(format!(
-                "    {subject_match} ip daddr {} accept",
-                destination.value
-            )),
-            LinuxNftablesAddressFamily::Ipv6 => lines.push(format!(
-                "    {subject_match} ip6 daddr {} accept",
-                destination.value
-            )),
-        }
+        let default_counter_name = block_counters
+            .iter()
+            .find(|counter| counter.reason == LinuxNetworkBlockReason::DefaultReject)
+            .map(|counter| counter.name.as_str())
+            .unwrap_or(DEFAULT_REJECT_COUNTER);
+        lines.push(format!(
+            "    {subject_match} counter name {default_counter_name} reject with icmpx admin-prohibited"
+        ));
     }
-    let default_counter_name = block_counters
-        .iter()
-        .find(|counter| counter.reason == LinuxNetworkBlockReason::DefaultReject)
-        .map(|counter| counter.name.as_str())
-        .unwrap_or(DEFAULT_REJECT_COUNTER);
-    lines.push(format!(
-        "    {subject_match} counter name {default_counter_name} reject with icmpx admin-prohibited"
-    ));
     lines.push("  }".to_string());
-    lines.push("}".to_string());
-    format!("{}\n", lines.join("\n"))
 }
 
 fn destination_counter_index(
@@ -968,10 +995,56 @@ mod tests {
         bind_nftables_plan_to_source_address(&mut plan, "10.88.0.2".parse().unwrap());
 
         assert!(plan.script.contains("hook forward"));
+        assert!(plan.script.contains("hook input"));
+        assert!(plan
+            .script
+            .contains(&format!("chain {}_input", plan.chain_name)));
         assert!(plan
             .script
             .contains("ip saddr 10.88.0.2 ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport 443"));
+        assert_eq!(
+            plan.script
+                .matches(
+                    "ip saddr 10.88.0.2 ip daddr 10.20.30.40/32 meta l4proto tcp tcp dport 443"
+                )
+                .count(),
+            2,
+            "the exact endpoint lease must constrain both forwarded and host-local traffic"
+        );
+        assert_eq!(
+            plan.script
+                .matches("ip saddr 10.88.0.2 counter name default_block reject")
+                .count(),
+            2,
+            "unleased traffic must fail closed on both routing paths"
+        );
         assert!(!plan.script.contains("socket cgroupv2"));
+    }
+
+    #[test]
+    fn cell_monitor_policy_observes_both_routing_paths_without_default_reject() {
+        let config = LinuxNetworkEnforcementConfig::new(
+            "cell-monitor",
+            LinuxNetworkPolicy {
+                mode: LinuxNetworkMode::Monitor,
+                allowed_hosts: Vec::new(),
+                denied_hosts: vec!["169.254.169.254".to_string()],
+                allowed_endpoints: Vec::new(),
+            },
+        );
+        let mut plan = build_nftables_plan(&config);
+
+        bind_nftables_plan_to_source_address(&mut plan, "10.88.0.3".parse().unwrap());
+
+        assert!(plan.script.contains("hook forward"));
+        assert!(plan.script.contains("hook input"));
+        assert_eq!(
+            plan.script
+                .matches("ip saddr 10.88.0.3 ip daddr 169.254.169.254")
+                .count(),
+            2
+        );
+        assert!(!plan.script.contains("counter name default_block reject"));
     }
 
     #[test]

@@ -57,6 +57,8 @@ const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
 const TCLONE_WAIT_QUIET_FOR_FORK_ENV: &str = "GENSEE_TCLONE_WAIT_QUIET_FOR_FORK";
 const TCLONE_FORK_TIMING_ENV: &str = "GENSEE_TCLONE_FORK_TIMING";
 const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
+const TCLONE_NODE_MOUNT_PATH: &str = "/opt/gensee-host-node";
+const TCLONE_NODE_BIN_MOUNT_PATH: &str = "/opt/gensee-host-node-bin";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
 const TCLONE_SOURCE_FORK_HANDOFF_FILE: &str = "source-fork-handoff.json";
@@ -3923,6 +3925,8 @@ fn run_tclone_agent_inner(
 
     let agent_binary = config.agent_cmd[0].to_string_lossy().to_string();
     let agent_home = detect_agent_home(&agent_binary);
+    let node_mount = tclone_node_mount();
+    let container_agent_cmd = remap_tclone_agent_command(&config.agent_cmd, node_mount.as_ref());
     let gensee_home = default_root().ok().filter(|path| path.exists());
     prepare_tclone_seed(
         &seed_root,
@@ -4001,14 +4005,22 @@ fn run_tclone_agent_inner(
         create_args.push(OsString::from(format!("{name}={container_path}")));
     }
     let mut path_prefixes = Vec::new();
-    if let Some((node_root, node_bin)) = tclone_node_mount() {
+    if let Some(node_mount) = node_mount.as_ref() {
         create_args.push(OsString::from("-v"));
         create_args.push(OsString::from(format!(
             "{}:{}:ro",
-            node_root.display(),
-            node_root.display()
+            node_mount.root.display(),
+            node_mount.container_root.display()
         )));
-        path_prefixes.push(node_bin.to_string_lossy().to_string());
+        if !node_mount.node_bin.starts_with(&node_mount.root) {
+            create_args.push(OsString::from("-v"));
+            create_args.push(OsString::from(format!(
+                "{}:{}:ro",
+                node_mount.node_bin.display(),
+                node_mount.container_bin.display()
+            )));
+        }
+        path_prefixes.push(node_mount.container_bin.to_string_lossy().to_string());
     }
     if let Some((cargo_bin, rustup_home)) = tclone_rust_mount() {
         create_args.push(OsString::from("-v"));
@@ -4045,8 +4057,7 @@ fn run_tclone_agent_inner(
     }
     create_args.push(OsString::from(&image));
     create_args.push(OsString::from("idle"));
-    let agent_cmd_strings = config
-        .agent_cmd
+    let agent_cmd_strings = container_agent_cmd
         .iter()
         .map(|arg| arg.to_string_lossy().to_string())
         .collect::<Vec<_>>();
@@ -4092,7 +4103,7 @@ fn run_tclone_agent_inner(
         &[OsString::from("start"), OsString::from(&source_container)],
     )?;
     write_tclone_run_context(&podman, &source_record)?;
-    start_tclone_agent_session(&podman, &source_container, &config.agent_cmd)?;
+    start_tclone_agent_session(&podman, &source_container, &container_agent_cmd)?;
     let _container_file_control = if env_flag(TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV) {
         Some(TcloneContainerFileControlServer::start(
             &podman,
@@ -10356,7 +10367,15 @@ fn should_skip_tclone_workspace_entry(name: &str) -> bool {
     ) || name.ends_with(".tmp")
 }
 
-fn tclone_node_mount() -> Option<(PathBuf, PathBuf)> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TcloneNodeMount {
+    root: PathBuf,
+    node_bin: PathBuf,
+    container_root: PathBuf,
+    container_bin: PathBuf,
+}
+
+fn tclone_node_mount() -> Option<TcloneNodeMount> {
     let root = env::var_os("GENSEE_TCLONE_NODE_ROOT")
         .or_else(|| env::var_os("NODE_ROOT"))
         .map(PathBuf::from)
@@ -10367,7 +10386,38 @@ fn tclone_node_mount() -> Option<(PathBuf, PathBuf)> {
     let node_bin = env::var_os("GENSEE_TCLONE_NODE_BIN")
         .map(PathBuf::from)
         .or_else(|| find_command("node").and_then(|path| path.parent().map(Path::to_path_buf)))?;
-    Some((root, node_bin))
+    Some(tclone_node_mount_layout(root, node_bin))
+}
+
+fn tclone_node_mount_layout(root: PathBuf, node_bin: PathBuf) -> TcloneNodeMount {
+    let container_root = PathBuf::from(TCLONE_NODE_MOUNT_PATH);
+    let container_bin = node_bin
+        .strip_prefix(&root)
+        .map(|relative| container_root.join(relative))
+        .unwrap_or_else(|_| PathBuf::from(TCLONE_NODE_BIN_MOUNT_PATH));
+    TcloneNodeMount {
+        root,
+        node_bin,
+        container_root,
+        container_bin,
+    }
+}
+
+fn remap_tclone_agent_command(
+    command: &[OsString],
+    node_mount: Option<&TcloneNodeMount>,
+) -> Vec<OsString> {
+    let mut command = command.to_vec();
+    let Some((executable, node_mount)) = command.first_mut().zip(node_mount) else {
+        return command;
+    };
+    let executable_path = Path::new(executable);
+    if let Ok(relative) = executable_path.strip_prefix(&node_mount.root) {
+        *executable = node_mount.container_root.join(relative).into_os_string();
+    } else if let Ok(relative) = executable_path.strip_prefix(&node_mount.node_bin) {
+        *executable = node_mount.container_bin.join(relative).into_os_string();
+    }
+    command
 }
 
 fn tclone_rust_mount() -> Option<(PathBuf, Option<PathBuf>)> {
@@ -13892,6 +13942,52 @@ gensee async job job_1: exited status=0
                 < entries
                     .iter()
                     .position(|entry| *entry == "/home/yiying/.cargo/bin")
+        );
+    }
+
+    #[test]
+    fn tclone_node_mount_never_shadows_trusted_usr_local_launchers() {
+        let mount =
+            tclone_node_mount_layout(PathBuf::from("/usr/local"), PathBuf::from("/usr/local/bin"));
+
+        assert_eq!(mount.container_root, PathBuf::from("/opt/gensee-host-node"));
+        assert_eq!(
+            mount.container_bin,
+            PathBuf::from("/opt/gensee-host-node/bin")
+        );
+        assert!(!mount.container_root.starts_with("/usr/local"));
+
+        let command = remap_tclone_agent_command(
+            &[
+                OsString::from("/usr/local/bin/codex"),
+                OsString::from("--search"),
+            ],
+            Some(&mount),
+        );
+        assert_eq!(
+            command,
+            vec![
+                OsString::from("/opt/gensee-host-node/bin/codex"),
+                OsString::from("--search")
+            ]
+        );
+    }
+
+    #[test]
+    fn tclone_node_bin_outside_root_gets_a_separate_safe_mount() {
+        let mount = tclone_node_mount_layout(
+            PathBuf::from("/srv/node-modules"),
+            PathBuf::from("/usr/bin"),
+        );
+
+        assert_eq!(
+            mount.container_bin,
+            PathBuf::from("/opt/gensee-host-node-bin")
+        );
+        let command = remap_tclone_agent_command(&[OsString::from("/usr/bin/node")], Some(&mount));
+        assert_eq!(
+            command,
+            vec![OsString::from("/opt/gensee-host-node-bin/node")]
         );
     }
 

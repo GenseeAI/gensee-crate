@@ -295,12 +295,30 @@ typed `effect-manifest.json`. The manifest distinguishes requested capabilities
 from observed use and records changed files, file reads, each executable open,
 the exact-command digest, promotion proposals, violations, and explicit
 telemetry coverage. Every Linux cell is held behind a startup gate while Gensee
-places the container tree in its own cgroup and establishes filesystem-wide
-fanotify permission marks over the container root and scoped bind mounts. A
-queue overflow, missing mark, sensor error, or unsupported host is recorded as
-incomplete read/process coverage and a violation; it is never represented as an
-empty effect list. Capability cells therefore require Linux cgroup v2. Complete
-forensic coverage additionally requires root fanotify support.
+places the container tree in its own cgroup and establishes mount-wide
+fanotify permission marks over the container root and each scoped bind mount.
+A dedicated host sensor thread services permission events so the orchestrator
+cannot block on its own gate or evidence writes. Because `/tmp`, `/run`, and
+private mediation binds are separate mounts, current manifests conservatively
+report read and process coverage as `partial`. The typed
+`filesystem_read_coverage` detail records separate covered and uncovered mount
+lists without misclassifying honest coverage disclosure as a runtime
+violation. A queue overflow, missing mark, sensor error, or unsupported host is
+still recorded as incomplete coverage and a violation; events collected before
+an overflow are retained instead of being discarded. Capability cells
+therefore require Linux cgroup v2 and root fanotify support.
+
+Install and load the shipped AppArmor profile before using cells:
+
+```console
+sudo install -m 0644 packaging/apparmor/gensee-capability-cell /etc/apparmor.d/gensee-capability-cell
+sudo apparmor_parser -r /etc/apparmor.d/gensee-capability-cell
+```
+
+The default profile name is `gensee-capability-cell`; a missing profile causes
+cell startup to fail closed. `gensee status` reports whether this default
+capability-cell profile is loaded, so the prerequisite can be checked before a
+cell is issued.
 
 The immutable part of the manifest, the exact request and command, and both
 snapshot tree digests are bound into an HMAC-authenticated
@@ -324,7 +342,8 @@ the manifest and journal for forensics.
 Nothing is promoted into the source automatically. Promotion is host-only and
 requires explicit path selectors. Gensee re-hashes both snapshots, rejects a
 changed manifest or output, requires a successful non-timeout execution with
-zero violations and complete telemetry for every requested effect dimension,
+zero violations, complete snapshot-diff coverage for writable outputs, and
+complete telemetry for requested network, external-request, and secret effects,
 verifies the signed forensic envelope, and verifies that each selected source
 path still matches the immutable input. It then applies only the selected diff
 through the existing rollback-on-failure filesystem transaction. Successful
@@ -333,12 +352,23 @@ promotions are appended to a separately HMAC-authenticated promotion ledger
 rejected. Use `--dry-run` to perform all evidence and conflict checks without
 changing the source.
 
+An exact write scope may name a path that does not exist yet when its typed
+file operation is `create`. Gensee preserves that absence in the immutable
+input snapshot and materializes only the declared file or directory in the
+isolated output layer, so the manifest records `created` and promotion can
+perform the correct absence/conflict check. A declared file create is an exact
+single-file bind mount; programs that publish through a sibling temporary file
+and `rename(2)` must instead declare a writable parent directory. Symlink mount
+targets are rejected.
+
 Direct network leases are supported on Linux only when they pin IP/CIDR,
 TCP/UDP, and exact ports. Gensee creates a private cell network namespace,
-never the host network namespace, binds an nftables forward allowlist to its
-inspected address, and attaches its
-process tree to a fresh cgroup before a trusted startup gate releases the leased
-command. It then records allowed counters and blocked attempts. Policy-denied
+never the host network namespace, binds identical nftables forward and
+host-input allowlists to its inspected
+address, and attaches its process tree to a fresh cgroup before a trusted
+startup gate releases the leased command. Covering both routing hooks prevents
+an allowed origin from redirecting a cell to an unleased service on the Gensee
+host. Gensee then records allowed counters and blocked attempts. Policy-denied
 kernel authority and external mutations still fail closed. Repository/API,
 identity, mTLS, browser, cloud, and database authority can run only through a
 source/operation/cell-bound broker gateway.
@@ -557,6 +587,12 @@ export GENSEE_TCLONE_NODE_ROOT="$HOME/.nvm"
 export GENSEE_TCLONE_NODE_BIN="$(dirname "$(command -v node)")"
 export GENSEE_TCLONE_READY_TIMEOUT_SECS=120
 ```
+
+The Node root is mounted read-only at `/opt/gensee-host-node` (with a separate
+safe bin mount when needed), and absolute agent executables are remapped into
+that tree. It is deliberately never mounted over `/usr/local`: doing so would
+hide Gensee's trusted `gensee-tclone-init` and `gensee` launchers before the
+container can establish its control and cleanup invariants.
 
 ## Control Split
 

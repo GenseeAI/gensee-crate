@@ -64,10 +64,23 @@ pub enum FileOperationKind {
     Execute,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileEntryKind {
+    File,
+    Directory,
+    Symlink,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileOperationScope {
     pub path: String,
     pub operation: FileOperationKind,
+    /// Required to distinguish a new file from a new directory. Older
+    /// producers omit this field; a missing kind on `create` remains a file
+    /// for schema-v1 compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_kind: Option<FileEntryKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,20 +214,20 @@ pub struct EffectTelemetryCoverage {
     pub process_tree: TelemetryCoverage,
 }
 
+/// Mount-level disclosure for filesystem-read telemetry. Partial coverage is
+/// informative and machine-readable; it is not itself an effect violation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemReadCoverage {
+    pub covered_mounts: Vec<String>,
+    pub uncovered_mounts: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileChangeKind {
     Created,
     Modified,
     Deleted,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileEntryKind {
-    File,
-    Directory,
-    Symlink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +340,8 @@ pub struct EffectManifest {
     pub promotions: Vec<PromotionReceipt>,
     pub violations: Vec<EffectViolation>,
     pub telemetry_coverage: EffectTelemetryCoverage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem_read_coverage: Option<FilesystemReadCoverage>,
     pub started_at_ms: u64,
     pub finished_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

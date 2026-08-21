@@ -424,6 +424,10 @@ pub(crate) fn handle_linux(args: Vec<OsString>) -> io::Result<()> {
             } else {
                 println!("Linux capability status");
                 print_bool("AppArmor enabled", report.apparmor_enabled);
+                print_bool(
+                    "capability-cell AppArmor profile loaded",
+                    report.capability_cell_apparmor_profile_loaded,
+                );
                 print_bool("SELinux enabled", report.selinux_enabled);
                 print_bool("Landlock available", report.landlock_available);
                 print_bool("bpffs mounted", report.bpf_fs_mounted);

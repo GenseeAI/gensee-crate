@@ -627,6 +627,7 @@ mod tests {
         request.scope.file_operations = vec![FileOperationScope {
             path: "target/cache".to_string(),
             operation: FileOperationKind::Delete,
+            entry_kind: None,
         }];
         let mut evaluation_context = context(vec![
             MediationBoundary::FilesystemBoundary,
@@ -663,6 +664,7 @@ mod tests {
         request.scope.file_operations = vec![FileOperationScope {
             path: "target/cache".to_string(),
             operation: FileOperationKind::Delete,
+            entry_kind: None,
         }];
 
         let decision = CapabilityPolicyEngine::default().evaluate(
