@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/GenseeAI/gensee-crate/security-traces/schemas/alert-v1.json",
+  "title": "Detector alert accepted by the scenario scorer",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["ts_offset_ms", "rule_id", "source", "kind"],
+  "properties": {
+    "ts_offset_ms": {"type": "integer"},
+    "rule_id": {"type": "string", "minLength": 1},
+    "source": {
+      "enum": ["codex", "gensee", "falco", "nexus", "package_origin", "challenge_origin"]
+    },
+    "kind": {"type": "string", "minLength": 1, "maxLength": 128},
+    "severity": {"type": "string"},
+    "stage_id": {"type": "string"}
+  }
+}

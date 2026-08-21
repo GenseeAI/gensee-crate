@@ -73,6 +73,23 @@ Gensee Crate helps you:
   permissions, privacy settings, MCP servers, skills, hooks, plugins, command
   rules, and instruction files without executing them.
 
+## Open agent-security traces
+
+Test your own detector against Gensee's sanitized, replayable security corpus.
+The first scenario captures an AI harness gaining otherwise unavailable access
+through a package-manager vulnerability to complete a benchmark. Its concrete
+realization spans Codex, Nexus Repository, Falco, package-origin,
+challenge-origin, and Gensee telemetry, with seven machine-readable
+ground-truth stages:
+
+- [Package-manager benchmark-cheating baseline](security-traces/benchmark-cheating-via-package-manager/v1/)
+- [Trace dataset index](security-traces/)
+
+The committed corpus is browsable and works offline. Release assets provide the
+larger sanitized evidence bundle. Validation, replay, and scoring use only the
+Python standard library. If the corpus helps your research, star the repository
+so other agent-security teams can find it.
+
 ## Preliminary Benchmark Results
 
 Preliminary AgentCanary benchmark results show Gensee Crate improving defense
