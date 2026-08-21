@@ -10291,6 +10291,11 @@ fn copy_path_all(source: &Path, destination: &Path) -> io::Result<()> {
             let entry = entry?;
             copy_path_all(&entry.path(), &destination.join(entry.file_name()))?;
         }
+        #[cfg(unix)]
+        fs::set_permissions(
+            destination,
+            fs::Permissions::from_mode(metadata.permissions().mode()),
+        )?;
     } else if metadata.file_type().is_symlink() {
         #[cfg(unix)]
         {

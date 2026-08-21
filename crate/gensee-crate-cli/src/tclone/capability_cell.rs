@@ -662,13 +662,6 @@ fn build_effect_manifest(
     if !files_changed.is_empty() {
         capabilities_used.push(Capability::FilesystemWrite);
     }
-    if lease
-        .request
-        .capabilities
-        .contains(&Capability::UntrustedCodeExecution)
-    {
-        capabilities_used.push(Capability::UntrustedCodeExecution);
-    }
     let argv = serde_json::to_vec(&lease.command)?;
     let argv_digest = format!("sha256:{:x}", Sha256::digest(argv));
 
@@ -947,7 +940,7 @@ fn promote_capability_cell(args: Vec<OsString>) -> io::Result<()> {
         "paths": selected.iter().map(|output| &output.path).collect::<Vec<_>>(),
         "conflicts": plan.conflicts,
     });
-    if args.iter().any(|arg| arg == "--json") {
+    if option_flag(&args, "--json") {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else if dry_run {
         println!(
@@ -968,14 +961,45 @@ fn promote_capability_cell(args: Vec<OsString>) -> io::Result<()> {
 }
 
 fn repeated_arg_values(args: &[OsString], flag: &str) -> io::Result<Vec<String>> {
-    args.windows(2)
-        .filter(|pair| pair[0] == flag)
-        .map(|pair| {
-            pair[1].to_str().map(ToString::to_string).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("{flag} must be UTF-8"))
-            })
-        })
-        .collect()
+    let prefix = format!("{flag}=");
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let value = args[index].to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("{flag} must be UTF-8"))
+        })?;
+        if value == "--" {
+            break;
+        }
+        if value == flag {
+            let next = args
+                .get(index + 1)
+                .and_then(|arg| arg.to_str())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("missing {flag} value"))
+                })?;
+            values.push(next.to_string());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = value.strip_prefix(&prefix) {
+            if value.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing {flag} value"),
+                ));
+            }
+            values.push(value.to_string());
+        }
+        index += 1;
+    }
+    Ok(values)
+}
+
+fn option_flag(args: &[OsString], flag: &str) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_os_str() != "--")
+        .any(|arg| arg == flag)
 }
 
 fn validate_promotion_evidence(
@@ -1425,6 +1449,7 @@ mod tests {
         let lease = CapabilityCellLease {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_dot".to_string(),
+            operation_id: "op_dot".to_string(),
             source_run_id: "run_1".to_string(),
             request,
             command: vec!["true".to_string()],
@@ -1523,6 +1548,47 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recursive_snapshot_copy_preserves_directory_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::temp_dir().join(format!("gensee-cell-dir-mode-{}", Uuid::new_v4()));
+        let input = root.join("input");
+        let nested = input.join("private");
+        let output = root.join("output");
+        fs::create_dir_all(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o2710)).unwrap();
+        fs::write(nested.join("value"), "x").unwrap();
+
+        copy_path_all(&input, &output).unwrap();
+
+        let source_mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o7777;
+        let output_mode = fs::metadata(output.join("private"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(output_mode, source_mode);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cell_cli_paths_accept_equals_and_stop_at_command_separator() {
+        let promotion_args = vec![
+            OsString::from("--path=src"),
+            OsString::from("--path"),
+            OsString::from("Cargo.lock"),
+            OsString::from("--"),
+            OsString::from("--path=ignored"),
+        ];
+        assert_eq!(
+            repeated_arg_values(&promotion_args, "--path").unwrap(),
+            vec!["src", "Cargo.lock"]
+        );
+        assert!(repeated_arg_values(&[OsString::from("--path")], "--path").is_err());
+    }
+
     #[test]
     fn manifest_uses_actual_diff_and_flags_out_of_scope_changes() {
         let root = env::temp_dir().join(format!("gensee-cell-manifest-{}", Uuid::new_v4()));
@@ -1534,12 +1600,16 @@ mod tests {
         fs::write(output.join("Cargo.lock"), "after").unwrap();
         fs::write(input.join("src/lib.rs"), "same").unwrap();
         fs::write(output.join("src/lib.rs"), "changed outside scope").unwrap();
+        let mut manifest_request = request();
+        manifest_request
+            .capabilities
+            .push(Capability::UntrustedCodeExecution);
         let lease = CapabilityCellLease {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_1".to_string(),
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
-            request: request(),
+            request: manifest_request,
             command: vec!["cargo".to_string(), "check".to_string()],
             issued_at_ms: 1,
             expires_at_ms: 2,
@@ -1560,6 +1630,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(manifest.operation_id, "op_1");
+        assert!(manifest
+            .requested_capabilities
+            .contains(&Capability::UntrustedCodeExecution));
+        assert!(!manifest
+            .capabilities_used
+            .contains(&Capability::UntrustedCodeExecution));
         assert_eq!(manifest.files_changed.len(), 2);
         assert_eq!(manifest.outputs_proposed_for_promotion.len(), 1);
         assert_eq!(
