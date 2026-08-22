@@ -19,7 +19,8 @@ The record contains:
 - the observed descendant process lineage;
 - the cgroup path, attachment state, and cleanup result;
 - the current capability envelope, active mediation boundaries, and leases;
-- the number of recorded boundary effects and lifecycle violations.
+- the number of recorded boundary effects, cumulative allowed/blocked network
+  packets and bytes, and lifecycle violations.
 
 Linux process identity includes `/proc/PID/stat` field 22, so a reused PID is
 not silently treated as the original process. The supervisor polls the full
