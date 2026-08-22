@@ -11,6 +11,9 @@ pub struct ProcStat {
     pub ppid: u32,
     pub process_group_id: u32,
     pub session_id: u32,
+    /// Kernel clock ticks since boot from `/proc/<pid>/stat` field 22. PID and
+    /// start time together are stable enough to detect PID reuse.
+    pub start_time_ticks: u64,
 }
 
 pub fn read_proc_stat(pid: u32) -> io::Result<ProcStat> {
@@ -33,6 +36,7 @@ pub fn parse_proc_stat(input: &str) -> Option<ProcStat> {
         ppid: fields.get(1)?.parse().ok()?,
         process_group_id: fields.get(2)?.parse().ok()?,
         session_id: fields.get(3)?.parse().ok()?,
+        start_time_ticks: fields.get(19)?.parse().ok()?,
     })
 }
 
@@ -101,13 +105,17 @@ mod tests {
 
     #[test]
     fn parses_proc_stat_with_spaces_and_parentheses_in_comm() {
-        let stat = parse_proc_stat("123 (x) R 1 1 1) S 42 43 44 4 5").unwrap();
+        let stat = parse_proc_stat(
+            "123 (x) R 1 1 1) S 42 43 44 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 999",
+        )
+        .unwrap();
         assert_eq!(stat.pid, 123);
         assert_eq!(stat.comm, "x) R 1 1 1");
         assert_eq!(stat.state, "S");
         assert_eq!(stat.ppid, 42);
         assert_eq!(stat.process_group_id, 43);
         assert_eq!(stat.session_id, 44);
+        assert_eq!(stat.start_time_ticks, 999);
     }
 
     #[test]

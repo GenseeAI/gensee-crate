@@ -351,13 +351,14 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
 
     let started_at_ms = unix_millis()?;
     let run_id = format!("run_{}_{}", std::process::id(), started_at_ms);
+    let operation_id = format!("op_{}", uuid::Uuid::new_v4().simple());
     let original_workspace = canonicalize_or_original(&config.workspace);
     let repo_path = find_repo_root(&original_workspace);
     let run_workspace = prepare_run_workspace(&config, &run_id, &original_workspace)?;
     let agent_binary = config.agent_cmd[0].to_string_lossy().to_string();
     let policy_doc = Policy::global().document();
     let linux_seccomp_profile = linux_run_seccomp_profile(&config, policy_doc);
-    let linux_network = linux_run_network_config(&config, policy_doc, &run_id)?;
+    let linux_network = linux_run_network_config(&config, policy_doc, &operation_id)?;
     if config.sandbox == SandboxMode::Linux
         && linux_seccomp_profile.is_none()
         && !config.linux_fanotify
@@ -403,6 +404,19 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
     } else {
         None
     };
+    let mut operation_supervisor = OperationSupervisor::prepare(
+        &operation_id,
+        &run_id,
+        "managed_agent_run",
+        operation_envelope_for_run(
+            &config,
+            linux_network.as_ref(),
+            linux_seccomp_profile.is_some(),
+        ),
+        linux_network
+            .as_ref()
+            .map(|network| Path::new(&network.cgroup_path)),
+    )?;
 
     let mut command = if let Some(profile_path) = sandbox_profile.as_ref() {
         let mut command = Command::new("/usr/bin/sandbox-exec");
@@ -411,8 +425,10 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
             .arg(profile_path)
             .arg(&config.agent_cmd[0]);
         command
-    } else if config.sandbox == SandboxMode::Linux
-        && (linux_seccomp_profile.is_some() || linux_network.is_some())
+    } else if std::env::consts::OS == "linux"
+        && (linux_seccomp_profile.is_some()
+            || linux_network.is_some()
+            || operation_supervisor.cgroup_path().is_some())
     {
         let mut command = Command::new(env::current_exe()?);
         command.arg("__linux-exec");
@@ -420,6 +436,8 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
             command
                 .arg("--cgroup-path")
                 .arg(&network_config.cgroup_path);
+        } else if let Some(cgroup_path) = operation_supervisor.cgroup_path() {
+            command.arg("--cgroup-path").arg(cgroup_path);
         }
         if let Some(profile) = linux_seccomp_profile.as_ref() {
             command
@@ -435,6 +453,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         .args(&config.agent_cmd[1..])
         .current_dir(&run_workspace)
         .env("GENSEE_RUN_ID", &run_id)
+        .env("GENSEE_OPERATION_ID", operation_supervisor.operation_id())
         .env("AGENT_SHIELD_SESSION_ID", &run_id)
         .env("AGENT_SHIELD_START_TIME_MS", started_at_ms.to_string())
         .env(
@@ -468,6 +487,11 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
 
     let mut child = command.spawn()?;
     let root_pid = child.id();
+    if let Err(error) = operation_supervisor.activate(root_pid) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
 
     store.append_session(&AgentSession {
         session_id: run_id.clone(),
@@ -511,7 +535,8 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         config.profile,
     );
 
-    let (status, timed_out) = wait_for_child_with_timeout(&mut child, config.max_runtime_seconds)?;
+    let (status, timed_out) =
+        operation_supervisor.wait_for_child(&mut child, config.max_runtime_seconds)?;
     if let Some(plan) = linux_network_plan.as_ref() {
         append_linux_network_block_events(
             &store,
@@ -526,6 +551,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
     drop(linux_cleanup.take());
     let ended_at_ms = unix_millis()?;
     let exit_code = status.code();
+    operation_supervisor.finish(exit_code, timed_out)?;
 
     store.append_session(&AgentSession {
         session_id: run_id.clone(),
@@ -575,6 +601,74 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         Err(io::Error::other(format!(
             "agent exited with status {status}"
         )))
+    }
+}
+
+fn operation_envelope_for_run(
+    config: &RunConfig,
+    linux_network: Option<&gensee_crate_linux::LinuxNetworkEnforcementConfig>,
+    seccomp_active: bool,
+) -> OperationCapabilityEnvelope {
+    let mut capabilities = vec![
+        Capability::FilesystemRead,
+        Capability::FilesystemWrite,
+        Capability::ProcessExecution,
+    ];
+    let mut active_mediators = Vec::new();
+    let mut network_envelope =
+        gensee_crate_rules::network_boundary::NetworkCapabilityEnvelope::default();
+    if config.workspace_mode == WorkspaceMode::Staged || config.sandbox != SandboxMode::None {
+        active_mediators
+            .push(gensee_crate_rules::capability_policy::MediationBoundary::FilesystemBoundary);
+    }
+    if seccomp_active {
+        active_mediators
+            .push(gensee_crate_rules::capability_policy::MediationBoundary::KernelBoundary);
+    }
+    if let Some(network) = linux_network {
+        if matches!(
+            network.network.mode,
+            gensee_crate_linux::LinuxNetworkMode::AllowListed
+                | gensee_crate_linux::LinuxNetworkMode::DenyAll
+        ) {
+            active_mediators
+                .push(gensee_crate_rules::capability_policy::MediationBoundary::NetworkBoundary);
+            network_envelope.grants = network
+                .network
+                .allowed_endpoints
+                .iter()
+                .map(
+                    |endpoint| gensee_crate_rules::network_boundary::NetworkEndpointGrant {
+                        destination: endpoint.destination.clone(),
+                        protocol: match endpoint.protocol {
+                            gensee_crate_linux::LinuxNetworkProtocol::Tcp => {
+                                gensee_crate_rules::network_boundary::NetworkProtocol::Tcp
+                            }
+                            gensee_crate_linux::LinuxNetworkProtocol::Udp => {
+                                gensee_crate_rules::network_boundary::NetworkProtocol::Udp
+                            }
+                        },
+                        ports: endpoint.ports.clone(),
+                        expires_at_ms: None,
+                        lease_id: None,
+                    },
+                )
+                .collect();
+        } else {
+            // Monitor/off modes observe ambient network authority but do not
+            // mediate it, so the broad capability remains in the envelope.
+            capabilities.push(Capability::NetworkEgress);
+        }
+    } else {
+        // No enforceable network boundary means ambient network authority is
+        // part of the observed envelope; it is never mistaken for a lease.
+        capabilities.push(Capability::NetworkEgress);
+    }
+    OperationCapabilityEnvelope {
+        capabilities,
+        active_mediators,
+        network: network_envelope,
+        ..OperationCapabilityEnvelope::default()
     }
 }
 
@@ -978,28 +1072,6 @@ pub(crate) fn linux_fanotify_policy_from_policy_document(
     let mut policy = linux_policy_from_policy_document(policy_doc);
     policy.mode = gensee_crate_linux::LinuxEnforcementMode::Enforce;
     policy
-}
-
-pub(crate) fn wait_for_child_with_timeout(
-    child: &mut std::process::Child,
-    max_runtime_seconds: Option<u64>,
-) -> io::Result<(std::process::ExitStatus, bool)> {
-    let Some(max_runtime_seconds) = max_runtime_seconds else {
-        return child.wait().map(|status| (status, false));
-    };
-    let started = Instant::now();
-    let timeout = Duration::from_secs(max_runtime_seconds);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok((status, false));
-        }
-        if started.elapsed() >= timeout {
-            child.kill()?;
-            let status = child.wait()?;
-            return Ok((status, true));
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
 }
 
 pub(crate) fn prepare_run_workspace(

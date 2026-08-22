@@ -97,6 +97,8 @@ mod checkpoint;
 pub(crate) use checkpoint::*;
 mod network_boundary;
 pub(crate) use network_boundary::*;
+mod operation_supervisor;
+pub(crate) use operation_supervisor::*;
 
 #[cfg(feature = "bench")]
 mod bench;

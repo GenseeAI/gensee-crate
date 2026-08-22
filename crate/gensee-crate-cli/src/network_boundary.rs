@@ -1,4 +1,5 @@
 use crate::*;
+use gensee_crate_rules::capability_policy::MediationBoundary;
 use gensee_crate_rules::network_boundary::{
     decide_network_boundary, NetworkBoundaryDecision, NetworkBoundaryDisposition,
     NetworkBoundaryEvent, NetworkBoundaryPolicy, NetworkCapabilityEnvelope, NetworkEffectKind,
@@ -106,6 +107,7 @@ struct NetworkSupervisor {
     record_path: PathBuf,
     event_log_path: PathBuf,
     dry_run: bool,
+    operation: Option<OperationSupervisor>,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -238,12 +240,6 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         started_at_ms,
         updated_at_ms: started_at_ms,
     };
-    let supervisor = Arc::new(Mutex::new(NetworkSupervisor {
-        record,
-        record_path,
-        event_log_path,
-        dry_run,
-    }));
     let table_names = Arc::new(Mutex::new(Vec::new()));
     let cgroup_path = if let Some(root_pid) = config.root_pid {
         let path = gensee_crate_linux::default_agent_cgroup_path(&config.operation_id);
@@ -261,6 +257,55 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     } else {
         None
     };
+    let operation_envelope = OperationCapabilityEnvelope {
+        capabilities: Vec::new(),
+        active_mediators: if config.root_pid.is_some() {
+            vec![
+                MediationBoundary::NetworkBoundary,
+                MediationBoundary::ProcessCgroup,
+            ]
+        } else {
+            vec![MediationBoundary::NetworkBoundary]
+        },
+        network: config.envelope.clone(),
+        ..OperationCapabilityEnvelope::default()
+    };
+    let mut operation = match OperationSupervisor::open(&config.operation_id, &config.source_run_id)
+    {
+        Ok(operation) => operation,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            if let Some(path) = cgroup_path.as_deref() {
+                OperationSupervisor::prepare(
+                    &config.operation_id,
+                    &config.source_run_id,
+                    "network_boundary",
+                    operation_envelope,
+                    Some(path),
+                )?
+            } else {
+                OperationSupervisor::prepare_external_subject(
+                    &config.operation_id,
+                    &config.source_run_id,
+                    "network_boundary",
+                    operation_envelope,
+                )?
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(root_pid) = config.root_pid {
+        operation.activate(root_pid)?;
+    } else {
+        operation.update_network_envelope(config.envelope.clone())?;
+        operation.activate_external_subject()?;
+    }
+    let supervisor = Arc::new(Mutex::new(NetworkSupervisor {
+        record,
+        record_path,
+        event_log_path,
+        dry_run,
+        operation: Some(operation),
+    }));
     let _cleanup = NetworkRuntimeCleanup {
         table_names: Arc::clone(&table_names),
         cgroup_path,
@@ -549,10 +594,14 @@ impl NetworkSupervisor {
         }
         self.record.active_table_name = Some(new_table);
         self.record.updated_at_ms = now_ms;
-        self.persist()
+        self.persist()?;
+        if let Some(operation) = self.operation.as_mut() {
+            operation.update_network_envelope(self.record.envelope.clone())?;
+        }
+        Ok(())
     }
 
-    fn append_effect(&self, effect: &NetworkEffectRecord) -> io::Result<()> {
+    fn append_effect(&mut self, effect: &NetworkEffectRecord) -> io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -564,7 +613,11 @@ impl NetworkSupervisor {
         )?;
         serde_json::to_writer(&mut file, effect)?;
         file.write_all(b"\n")?;
-        file.sync_data()
+        file.sync_data()?;
+        if let Some(operation) = self.operation.as_mut() {
+            operation.record_network_effect(&effect.event, &effect.decision)?;
+        }
+        Ok(())
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -1111,6 +1164,7 @@ mod tests {
             record_path: root.join("record.json"),
             event_log_path: root.join("effects.jsonl"),
             dry_run: true,
+            operation: None,
         }))
     }
 
