@@ -1,9 +1,14 @@
 # Roadmap
 
-Gensee Crate supports macOS and Linux today, with Claude Code, Codex,
-Antigravity, Cursor, and VS Code / GitHub Copilot hook support, local policy
-enforcement, staged workspace runs, local telemetry, a React/Tauri dashboard,
-and a native SwiftUI macOS security console.
+Gensee Crate has two deployment paths built on the same policy and evidence
+model. **Personal** reviews local agent work, creates recovery points, audits
+configuration, and can independently verify supported macOS process and file
+activity. **Team** runs agents on prepared Linux hosts with disposable
+workspace forks, scoped capabilities, short-lived leases, host-side evidence,
+and human-controlled promotion.
+
+Both paths support Claude Code, Codex, Antigravity, Cursor, and VS Code / GitHub
+Copilot integrations, with managed-launch coverage for Omnigent.
 Linux host support includes `/proc` process attribution, capability planning,
 fanotify sensitive-path enforcement, seccomp launcher profiles, and
 cgroup-scoped nftables egress controls. This roadmap is directional and may

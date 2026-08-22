@@ -1,8 +1,12 @@
-# Native macOS security console
+# Gensee Crate Personal for macOS
 
-Gensee Crate for macOS is a SwiftUI security console and the host for Gensee's
-first-party Endpoint Security system extension. Its source lives in
-[`macos/GenseeCrate`](https://github.com/GenseeAI/gensee-crate/tree/main/macos/GenseeCrate).
+Gensee Crate Personal is a local companion for developers who delegate work to
+AI coding agents. It groups completed work into a calm review queue, surfaces
+scope drift and verification gaps, creates recovery points before risky
+workspace changes, and audits configuration that can influence agent behavior.
+Your activity and policy stay on your Mac.
+
+**[Download the latest notarized macOS app](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)**
 
 The app does not implement a second Gensee backend. It embeds the `gensee` CLI
 built from this monorepo and uses the existing Rust crates, policy engine, setup
@@ -208,34 +212,10 @@ tool window are not persisted or surfaced as alerts.
 See the [Endpoint Security sensor](endpoint-security.md) guide for captured
 events, policy keys, safety boundaries, and rollback.
 
-## Signing and installation
+## Install
 
-The host App ID is `ai.gensee.crate`; the extension App ID is
-`ai.gensee.crate.endpoint-security`. Building the source does not grant the
-managed entitlement. The signing team must have Apple's Endpoint Security
-approval and matching provisioning for the intended Development or Developer
-ID distribution method.
-
-Activation only works from a correctly signed app installed in `/Applications`.
-The first-launch assistant provides **Install & Enable**, opens the relevant
-System Settings panes, and confirms sensor connectivity. The same controls
-remain available on the Settings page.
-
-Certificates, private keys, `.p12` files, provisioning profiles, notarization
-credentials, archives, and built app/DMG artifacts must never be committed.
-Entitlement plist files, bundle identifiers, and Xcode build configuration are
-safe and intentionally versioned.
-
-## Download and release
-
-The latest notarized public build is available from the
-[GitHub Releases download](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg).
-Move **Gensee Crate.app** from the disk image to `/Applications` before
-activating the system extension.
-
-Maintainers publish with `scripts/release_macos_app.sh`. It creates a universal
-Developer ID build, verifies the host app, Endpoint Security extension, and
-embedded OSS CLI, submits the disk image to Apple's notarization service, and
-staples the result. The script requires a `notarytool` keychain profile through
-`NOTARYTOOL_PROFILE`; credentials and release artifacts stay outside version
-control. See `macos/GenseeCrate/README.md` for the exact release procedure.
+Open the downloaded disk image and move **Gensee Crate.app** to
+`/Applications`. Run the setup assistant, try the synthetic demo, and enable
+only the harnesses and optional Mac protection you want. macOS requires you to
+approve the system extension and Full Disk Access yourself; the app opens the
+relevant System Settings panes and verifies connectivity afterward.
