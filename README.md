@@ -65,7 +65,7 @@ runtime overhead.
 
 ## Gensee Crate Personal
 
-<details open>
+<details>
 <summary><strong>Local protection and review for your laptop</strong></summary>
 
 ### What it is
