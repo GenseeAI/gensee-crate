@@ -17,27 +17,31 @@ pub struct LinuxProcessIdentity {
     pub command_line: Option<String>,
 }
 
+pub fn inspect_process_identity(pid: u32) -> io::Result<LinuxProcessIdentity> {
+    let stat = read_proc_stat(pid)?;
+    let proc_root = PathBuf::from("/proc").join(pid.to_string());
+    Ok(LinuxProcessIdentity {
+        pid,
+        parent_pid: stat.ppid,
+        start_time_ticks: stat.start_time_ticks,
+        executable_path: fs::read_link(proc_root.join("exe"))
+            .ok()
+            .map(|path| bounded_identity_text(&path.to_string_lossy())),
+        command_line: read_proc_cmdline(pid)
+            .ok()
+            .map(|command| bounded_identity_text(&command)),
+    })
+}
+
 pub fn collect_process_lineage(root_pid: u32) -> io::Result<Vec<LinuxProcessIdentity>> {
     let mut identities = Vec::new();
     let mut process_ids = collect_process_tree(root_pid)?;
     process_ids.sort_unstable_by_key(|pid| (*pid != root_pid, *pid));
     process_ids.truncate(MAX_PROCESS_LINEAGE_IDENTITIES);
     for pid in process_ids {
-        let Ok(stat) = read_proc_stat(pid) else {
-            continue;
-        };
-        let proc_root = PathBuf::from("/proc").join(pid.to_string());
-        identities.push(LinuxProcessIdentity {
-            pid,
-            parent_pid: stat.ppid,
-            start_time_ticks: stat.start_time_ticks,
-            executable_path: fs::read_link(proc_root.join("exe"))
-                .ok()
-                .map(|path| bounded_identity_text(&path.to_string_lossy())),
-            command_line: read_proc_cmdline(pid)
-                .ok()
-                .map(|command| bounded_identity_text(&command)),
-        });
+        if let Ok(identity) = inspect_process_identity(pid) {
+            identities.push(identity);
+        }
     }
     identities.sort_by_key(|identity| (identity.start_time_ticks, identity.pid));
     Ok(identities)

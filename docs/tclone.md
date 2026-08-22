@@ -300,21 +300,37 @@ while its scoped workspace snapshot and execution record are retained for
 inspection and replay planning. Gensee keeps an immutable input snapshot and a
 separate writable output snapshot, hashes their actual contents, and writes a
 typed `effect-manifest.json`. The manifest distinguishes requested capabilities
-from observed use and records changed files, file reads, each executable open,
+from observed use and records changed files, file reads, process lifecycles,
 the exact-command digest, promotion proposals, violations, and explicit
 telemetry coverage. Every Linux cell is held behind a startup gate while Gensee
 places the container tree in its own cgroup and establishes mount-wide
-fanotify permission marks over the container root and each scoped bind mount.
-A dedicated host sensor thread services permission events so the orchestrator
-cannot block on its own gate or evidence writes. Because `/tmp`, `/run`, and
-private mediation binds are separate mounts, current manifests conservatively
-report read and process coverage as `partial`. The typed
-`filesystem_read_coverage` detail records separate covered and uncovered mount
-lists without misclassifying honest coverage disclosure as a runtime
-violation. A queue overflow, missing mark, sensor error, or unsupported host is
-still recorded as incomplete coverage and a violation; events collected before
-an overflow are retained instead of being discarded. Capability cells
-therefore require Linux cgroup v2 and root fanotify support.
+fanotify permission marks over every declared effect mount: the immutable
+container root, `/tmp`, `/run`, scoped workspace binds, the startup gate, the
+trusted supervisor, and each private broker socket bind. A dedicated host
+sensor thread services permission events so the orchestrator cannot block on
+its own gate or evidence writes. The typed `filesystem_read_coverage` detail
+records the container paths for all expected, covered, and uncovered effect
+mounts.
+
+Before opening the same startup gate, Gensee also subscribes to the Linux
+process connector from the host's initial PID namespace and requires the
+kernel's acknowledgement. Fork, exec, and exit events are filtered to the
+container's inspected root PID and descendants. Process evidence records the
+host PID, parent PID, `/proc` start-time ticks, executable, argument digest,
+start/finish time, and decoded exit status; PID plus start-time ticks prevents
+PID reuse from changing attribution. A process-connector receive overrun,
+malformed message, identity race, subscription failure, fanotify queue
+overflow, missing mount mark, or sensor failure produces explicit incomplete
+coverage and a manifest violation. Evidence received before a failure is
+retained, but it is never relabeled complete.
+
+Promotion now requires complete filesystem-read telemetry when filesystem read
+authority was requested and complete process-lifecycle telemetry when process,
+privileged, or untrusted execution was requested. Thus a clean cell can be
+promoted when both sensors prove coverage, while a host without either sensor
+continues to fail closed. Capability cells therefore require Linux cgroup v2,
+root fanotify support, and the Linux process connector (`CONFIG_CONNECTOR` and
+`CONFIG_PROC_EVENTS`) available from the initial user and PID namespaces.
 
 Install and load the shipped AppArmor profile before using cells:
 

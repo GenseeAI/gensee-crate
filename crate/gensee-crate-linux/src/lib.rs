@@ -5,6 +5,7 @@ pub mod fanotify;
 pub mod landlock;
 pub mod network;
 pub mod policy;
+pub mod process_events;
 mod procfs;
 pub mod seccomp;
 pub mod session;
@@ -38,11 +39,12 @@ pub use policy::{
     LinuxNetworkEndpoint, LinuxNetworkMode, LinuxNetworkPolicy, LinuxNetworkProtocol, LinuxPolicy,
     LinuxPolicyAction, LinuxSpeculationAvailability, SensitivePathAccess, SensitivePathRule,
 };
+pub use process_events::{LinuxProcessEvent, LinuxProcessEventSensor};
 pub use seccomp::{
     install_seccomp_filter, LinuxSeccompDeniedSyscall, LinuxSeccompProfile,
     LinuxSeccompSyscallGroup,
 };
 pub use session::{
-    collect_process_lineage, LinuxProcessIdentity, LinuxSessionTarget,
+    collect_process_lineage, inspect_process_identity, LinuxProcessIdentity, LinuxSessionTarget,
     MAX_PROCESS_LINEAGE_IDENTITIES,
 };
