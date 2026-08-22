@@ -20,7 +20,10 @@ The record contains:
 - the cgroup path, attachment state, and cleanup result;
 - the current capability envelope, active mediation boundaries, and leases;
 - the number of recorded boundary effects, cumulative allowed/blocked network
-  packets and bytes, and lifecycle violations.
+  packets and bytes, and lifecycle violations;
+- informational recovery health, including unrelated historical network entries
+  that startup recovery could not validate. Recovery health is not a violation
+  by the current operation and does not enter its capability attestation.
 
 Linux process identity includes `/proc/PID/stat` field 22, so a reused PID is
 not silently treated as the original process. The supervisor polls the full

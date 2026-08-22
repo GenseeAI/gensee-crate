@@ -181,7 +181,15 @@ struct NetworkSupervisorResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     record: Option<NetworkOperationRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_recovery_health: Option<OperationRecoveryHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationRecoveryHealth {
+    network_entries_skipped: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +304,12 @@ struct NetworkRuntimeCleanup {
 struct NetworkOperationLock(fs::File);
 
 #[cfg(unix)]
+struct NetworkOperationLocks {
+    _identity: NetworkOperationLock,
+    _legacy: NetworkOperationLock,
+}
+
+#[cfg(unix)]
 impl NetworkOperationLock {
     fn acquire(path: &Path) -> io::Result<Self> {
         let mut options = fs::OpenOptions::new();
@@ -311,6 +325,26 @@ impl NetworkOperationLock {
             ));
         }
         Ok(Self(file))
+    }
+}
+
+#[cfg(unix)]
+impl NetworkOperationLocks {
+    fn acquire(state_root: &Path, operation_root: &Path, operation_id: &str) -> io::Result<Self> {
+        // The order is part of the migration protocol. The stable lock keeps
+        // the operation identity exclusive across directory renames; the
+        // legacy lock excludes supervisors launched before stable locks were
+        // introduced. Do not remove the legacy half until a versioned state-
+        // root migration can prove those supervisors no longer exist.
+        let identity = NetworkOperationLock::acquire(&network_operation_identity_lock_path(
+            state_root,
+            operation_id,
+        )?)?;
+        let legacy = NetworkOperationLock::acquire(&operation_root.join("supervisor.lock"))?;
+        Ok(Self {
+            _identity: identity,
+            _legacy: legacy,
+        })
     }
 }
 
@@ -434,15 +468,8 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     let root = network_operation_root(&config.operation_id)?;
     create_restrictive_dir_all(&root)?;
     #[cfg(unix)]
-    let _identity_lock = NetworkOperationLock::acquire(&network_operation_identity_lock_path(
-        &state_root,
-        &config.operation_id,
-    )?)?;
-    // Keep taking the legacy in-directory lock while old supervisors may
-    // still exist. The stable identity lock above is outside the directory
-    // that terminal cleanup renames, so exclusion survives archival.
-    #[cfg(unix)]
-    let _legacy_operation_lock = NetworkOperationLock::acquire(&root.join("supervisor.lock"))?;
+    let _operation_locks =
+        NetworkOperationLocks::acquire(&state_root, &root, &config.operation_id)?;
     let socket_path = root.join("supervisor.sock");
     let record_path = root.join("record.json");
     let event_log_path = root.join("effects.jsonl");
@@ -1595,11 +1622,19 @@ fn handle_supervisor_stream(
         NetworkSupervisorRequest::Inspect => {
             let mut state = lock_supervisor(&supervisor)?;
             state.sample_usage()?;
+            let network_entries_skipped = state
+                .operation
+                .as_mut()
+                .ok_or_else(|| io::Error::other("operation supervisor unavailable"))?
+                .network_recovery_skipped_entry_count()?;
             NetworkSupervisorResponse {
                 ok: true,
                 decision: None,
                 resolution: None,
                 record: Some(state.record.clone()),
+                operation_recovery_health: Some(OperationRecoveryHealth {
+                    network_entries_skipped,
+                }),
                 error: None,
             }
         }
@@ -1616,6 +1651,7 @@ fn handle_supervisor_stream(
                         decision: None,
                         resolution: Some(resolution),
                         record: None,
+                        operation_recovery_health: None,
                         error: None,
                     }
                 }
@@ -1630,6 +1666,7 @@ fn handle_supervisor_stream(
                         decision: None,
                         resolution: Some(resolution),
                         record: None,
+                        operation_recovery_health: None,
                         error: Some(error.to_string()),
                     }
                 }
@@ -1646,6 +1683,7 @@ fn handle_supervisor_stream(
                     decision: None,
                     resolution: None,
                     record: Some(state.record.clone()),
+                    operation_recovery_health: None,
                     error: None,
                 }
             } else {
@@ -1654,6 +1692,7 @@ fn handle_supervisor_stream(
                     decision: None,
                     resolution: None,
                     record: None,
+                    operation_recovery_health: None,
                     error: Some(
                         "HTTP mediator lease does not belong to this operation".to_string(),
                     ),
@@ -1690,6 +1729,7 @@ fn handle_supervisor_stream(
                         decision: Some(decision),
                         resolution: None,
                         record: None,
+                        operation_recovery_health: None,
                         error: None,
                     }
                 }
@@ -1698,6 +1738,7 @@ fn handle_supervisor_stream(
                     decision: None,
                     resolution: None,
                     record: None,
+                    operation_recovery_health: None,
                     error: Some(error.to_string()),
                 },
             }
@@ -3082,7 +3123,7 @@ fn archive_reaped_network_operation(
     let active_root = state_root.join("network-operations");
     let operation_root = active_root.join(operation_id);
     match fs::symlink_metadata(&operation_root) {
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
         Ok(metadata) if metadata.file_type().is_dir() => {}
         Ok(_) => {
             return Err(io::Error::new(
@@ -3092,21 +3133,13 @@ fn archive_reaped_network_operation(
         }
         Err(error) => return Err(error),
     }
-    let _identity_lock = match NetworkOperationLock::acquire(&network_operation_identity_lock_path(
-        state_root,
-        operation_id,
-    )?) {
-        Ok(lock) => lock,
-        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let _legacy_lock = match NetworkOperationLock::acquire(&operation_root.join("supervisor.lock"))
-    {
-        Ok(lock) => lock,
-        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(error),
-    };
+    let _operation_locks =
+        match NetworkOperationLocks::acquire(state_root, &operation_root, operation_id) {
+            Ok(locks) => locks,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
     let record_path = operation_root.join("record.json");
     let record: NetworkOperationRecord =
         serde_json::from_str(&read_nofollow_to_string(&record_path)?).map_err(|error| {
@@ -3176,17 +3209,10 @@ fn retry_and_reap_terminal_network_boundary_for_operation(
     expected_source_run_id: &str,
 ) -> io::Result<bool> {
     let root = state_root.join("network-operations").join(operation_id);
-    let _identity_lock = match NetworkOperationLock::acquire(&network_operation_identity_lock_path(
-        state_root,
-        operation_id,
-    )?) {
-        Ok(lock) => lock,
+    let _operation_locks = match NetworkOperationLocks::acquire(state_root, &root, operation_id) {
+        Ok(locks) => locks,
         Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let _legacy_lock = match NetworkOperationLock::acquire(&root.join("supervisor.lock")) {
-        Ok(lock) => lock,
-        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
     if !crate::operation_supervisor::retry_terminal_operation_subject_release_at(
@@ -3214,17 +3240,10 @@ pub(crate) fn reap_terminal_network_boundary_for_operation(
     if !record_path.exists() {
         return Ok(true);
     }
-    let _identity_lock = match NetworkOperationLock::acquire(&network_operation_identity_lock_path(
-        state_root,
-        operation_id,
-    )?) {
-        Ok(lock) => lock,
+    let _operation_locks = match NetworkOperationLocks::acquire(state_root, &root, operation_id) {
+        Ok(locks) => locks,
         Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let _legacy_lock = match NetworkOperationLock::acquire(&root.join("supervisor.lock")) {
-        Ok(lock) => lock,
-        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
     reap_terminal_network_boundary_while_locked(state_root, operation_id, expected_source_run_id)
@@ -3870,7 +3889,27 @@ mod tests {
         assert!(root
             .join("network-operations-archive/op_locked/record.json")
             .is_file());
+        assert!(!archive_reaped_network_operation(&root, operation_id, source_run_id).unwrap());
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn inspect_response_surfaces_informational_recovery_health() {
+        let response = NetworkSupervisorResponse {
+            ok: true,
+            decision: None,
+            resolution: None,
+            record: None,
+            operation_recovery_health: Some(OperationRecoveryHealth {
+                network_entries_skipped: 3,
+            }),
+            error: None,
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            value["operation_recovery_health"]["network_entries_skipped"],
+            3
+        );
     }
 
     #[test]
@@ -3898,6 +3937,7 @@ mod tests {
         .unwrap();
         let attestation = operation.attestation().unwrap();
         assert!(attestation.violations.is_empty());
+        assert_eq!(operation.network_recovery_skipped_entry_count().unwrap(), 2);
         let persisted: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(root.join("operations/op_current/record.json")).unwrap(),
         )

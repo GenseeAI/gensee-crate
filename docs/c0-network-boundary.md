@@ -177,6 +177,17 @@ Inspect the active envelope:
 gensee run network inspect --socket /path/supervisor.sock
 ~~~
 
+The inspect response also includes `operation_recovery_health`, whose
+`network_entries_skipped` counter surfaces degraded startup recovery without
+classifying unrelated historical state as a violation by the active operation.
+
+Stable per-operation locks remain under
+`GENSEE_HOME/network-operation-locks/OPERATION_ID.lock` after archival. Unlinking
+a held lock would recreate the identity race by allowing a second inode for the
+same operation. These lock files must therefore be pruned only by the same
+future retention transaction that removes the corresponding forensic archive,
+after the retention policy makes operation-ID reuse impossible.
+
 Revoke a mediator lease immediately for new requests and redirect hops:
 
 ~~~console

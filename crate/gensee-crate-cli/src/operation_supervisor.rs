@@ -482,6 +482,12 @@ impl OperationSupervisor {
         Ok(self.record.envelope.clone())
     }
 
+    pub(crate) fn network_recovery_skipped_entry_count(&mut self) -> io::Result<u64> {
+        let _lock = OperationRecordLock::acquire(&self.lock_path)?;
+        self.reload()?;
+        Ok(self.record.network_recovery_skipped_entry_count)
+    }
+
     pub(crate) fn attestation(&mut self) -> io::Result<OperationAttestation> {
         let _lock = OperationRecordLock::acquire(&self.lock_path)?;
         self.reload()?;
