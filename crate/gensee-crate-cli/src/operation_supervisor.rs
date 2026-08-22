@@ -923,6 +923,20 @@ impl OperationSupervisor {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn record_persisted_violation(
+        &mut self,
+        kind: &str,
+        detail: &str,
+    ) -> io::Result<()> {
+        let _lock = OperationRecordLock::acquire(&self.lock_path)?;
+        self.reload()?;
+        let now = unix_millis()?;
+        self.record_violation_at(kind, detail, now);
+        self.record.updated_at_ms = now;
+        self.persist()
+    }
+
     fn record_violation(&mut self, kind: &str, detail: &str) -> io::Result<()> {
         let now = unix_millis()?;
         self.record_violation_at(kind, detail, now);
