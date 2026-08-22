@@ -145,6 +145,11 @@ pub(crate) struct ManagedOperationRecord {
     pub denied_boundary_effect_count: u64,
     #[serde(default)]
     pub network_usage: OperationNetworkUsage,
+    /// Entries from earlier network operations that startup recovery could not
+    /// validate. This is diagnostic telemetry, not a violation by the current
+    /// operation.
+    #[serde(default)]
+    pub network_recovery_skipped_entry_count: u64,
     #[serde(default)]
     pub violations: Vec<OperationViolation>,
     pub started_at_ms: u64,
@@ -390,6 +395,7 @@ impl OperationSupervisor {
                 boundary_effect_count: 0,
                 denied_boundary_effect_count: 0,
                 network_usage: OperationNetworkUsage::default(),
+                network_recovery_skipped_entry_count: 0,
                 violations: Vec::new(),
                 started_at_ms: now,
                 updated_at_ms: now,
@@ -924,15 +930,17 @@ impl OperationSupervisor {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    pub(crate) fn record_persisted_violation(
+    pub(crate) fn record_network_recovery_skipped_entries(
         &mut self,
-        kind: &str,
-        detail: &str,
+        skipped_entries: usize,
     ) -> io::Result<()> {
         let _lock = OperationRecordLock::acquire(&self.lock_path)?;
         self.reload()?;
         let now = unix_millis()?;
-        self.record_violation_at(kind, detail, now);
+        self.record.network_recovery_skipped_entry_count = self
+            .record
+            .network_recovery_skipped_entry_count
+            .saturating_add(u64::try_from(skipped_entries).unwrap_or(u64::MAX));
         self.record.updated_at_ms = now;
         self.persist()
     }
@@ -1377,6 +1385,7 @@ mod tests {
             boundary_effect_count: 0,
             denied_boundary_effect_count: 0,
             network_usage: OperationNetworkUsage::default(),
+            network_recovery_skipped_entry_count: 0,
             violations: Vec::new(),
             started_at_ms: 1,
             updated_at_ms: 1,

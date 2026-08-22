@@ -434,7 +434,15 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     let root = network_operation_root(&config.operation_id)?;
     create_restrictive_dir_all(&root)?;
     #[cfg(unix)]
-    let _operation_lock = NetworkOperationLock::acquire(&root.join("supervisor.lock"))?;
+    let _identity_lock = NetworkOperationLock::acquire(&network_operation_identity_lock_path(
+        &state_root,
+        &config.operation_id,
+    )?)?;
+    // Keep taking the legacy in-directory lock while old supervisors may
+    // still exist. The stable identity lock above is outside the directory
+    // that terminal cleanup renames, so exclusion survives archival.
+    #[cfg(unix)]
+    let _legacy_operation_lock = NetworkOperationLock::acquire(&root.join("supervisor.lock"))?;
     let socket_path = root.join("supervisor.sock");
     let record_path = root.join("record.json");
     let event_log_path = root.join("effects.jsonl");
@@ -2816,6 +2824,28 @@ fn network_operation_root(operation_id: &str) -> io::Result<PathBuf> {
         .join(operation_id))
 }
 
+#[cfg(any(unix, test))]
+fn network_operation_identity_lock_path(
+    state_root: &Path,
+    operation_id: &str,
+) -> io::Result<PathBuf> {
+    if !safe_network_token(operation_id) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "invalid network operation id",
+        ));
+    }
+    let lock_root = state_root.join("network-operation-locks");
+    create_restrictive_dir_all(&lock_root)?;
+    if !fs::symlink_metadata(&lock_root)?.file_type().is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "network operation identity lock root is not a directory",
+        ));
+    }
+    Ok(lock_root.join(format!("{operation_id}.lock")))
+}
+
 fn validate_stored_network_record(record: &NetworkOperationRecord) -> io::Result<()> {
     let subject_count =
         usize::from(record.root_pid.is_some()) + usize::from(record.source_address.is_some());
@@ -2904,13 +2934,7 @@ fn record_network_boundary_recovery_report(
     report: NetworkBoundaryRecoveryReport,
 ) -> io::Result<()> {
     if report.skipped_entries > 0 {
-        operation.record_persisted_violation(
-            "network_boundary_recovery_entries_skipped",
-            &format!(
-                "startup recovery skipped {} unrelated network operation entries",
-                report.skipped_entries
-            ),
-        )?;
+        operation.record_network_recovery_skipped_entries(report.skipped_entries)?;
     }
     Ok(())
 }
@@ -3068,7 +3092,16 @@ fn archive_reaped_network_operation(
         }
         Err(error) => return Err(error),
     }
-    let _lock = match NetworkOperationLock::acquire(&operation_root.join("supervisor.lock")) {
+    let _identity_lock = match NetworkOperationLock::acquire(&network_operation_identity_lock_path(
+        state_root,
+        operation_id,
+    )?) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let _legacy_lock = match NetworkOperationLock::acquire(&operation_root.join("supervisor.lock"))
+    {
         Ok(lock) => lock,
         Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
@@ -3107,9 +3140,27 @@ fn archive_reaped_network_operation(
     match fs::symlink_metadata(&archived_operation_root) {
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Ok(_) => {
+            // Preserve both records without leaving a terminal operation in
+            // the hot recovery set forever. A collision should be exceptional
+            // for single-use operation ids, so make it explicit in the
+            // forensic name rather than overwriting either side.
+            for attempt in 0..1_024_u16 {
+                let collision_root = archive_root.join(format!(
+                    "{operation_id}.collision.{}.{}.{attempt}",
+                    record.source_run_id, record.updated_at_ms
+                ));
+                match fs::symlink_metadata(&collision_root) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        fs::rename(&operation_root, collision_root)?;
+                        return Ok(true);
+                    }
+                    Ok(_) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
             return Err(io::Error::new(
                 ErrorKind::AlreadyExists,
-                "network operation archive identity already exists",
+                "network operation archive collision namespace is exhausted",
             ));
         }
         Err(error) => return Err(error),
@@ -3125,7 +3176,15 @@ fn retry_and_reap_terminal_network_boundary_for_operation(
     expected_source_run_id: &str,
 ) -> io::Result<bool> {
     let root = state_root.join("network-operations").join(operation_id);
-    let _lock = match NetworkOperationLock::acquire(&root.join("supervisor.lock")) {
+    let _identity_lock = match NetworkOperationLock::acquire(&network_operation_identity_lock_path(
+        state_root,
+        operation_id,
+    )?) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let _legacy_lock = match NetworkOperationLock::acquire(&root.join("supervisor.lock")) {
         Ok(lock) => lock,
         Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
         Err(error) => return Err(error),
@@ -3155,7 +3214,15 @@ pub(crate) fn reap_terminal_network_boundary_for_operation(
     if !record_path.exists() {
         return Ok(true);
     }
-    let _lock = match NetworkOperationLock::acquire(&root.join("supervisor.lock")) {
+    let _identity_lock = match NetworkOperationLock::acquire(&network_operation_identity_lock_path(
+        state_root,
+        operation_id,
+    )?) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let _legacy_lock = match NetworkOperationLock::acquire(&root.join("supervisor.lock")) {
         Ok(lock) => lock,
         Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
         Err(error) => return Err(error),
@@ -3698,6 +3765,9 @@ mod tests {
             )
             .unwrap();
         }
+        let preexisting_archive = root.join("network-operations-archive/op_reaped");
+        fs::create_dir_all(&preexisting_archive).unwrap();
+        fs::write(preexisting_archive.join("sentinel"), "preserve me").unwrap();
 
         let mut visited = Vec::new();
         let report = visit_pending_network_boundary_recovery_with(
@@ -3731,7 +3801,24 @@ mod tests {
         assert!(!network_root.join("op_reaped").exists());
         let archive_root = root.join("network-operations-archive");
         assert!(archive_root.join("op_zgood/record.json").is_file());
-        assert!(archive_root.join("op_reaped/record.json").is_file());
+        assert_eq!(
+            fs::read_to_string(archive_root.join("op_reaped/sentinel")).unwrap(),
+            "preserve me"
+        );
+        let collision = fs::read_dir(&archive_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("op_reaped.collision.run_op_reaped.")
+            })
+            .expect("colliding terminal record should be preserved under a unique forensic name");
+        assert!(collision.path().join("record.json").is_file());
+        assert!(root
+            .join("network-operation-locks/op_reaped.lock")
+            .is_file());
         let stale: NetworkOperationRecord = serde_json::from_str(
             &fs::read_to_string(archive_root.join("op_zgood/record.json")).unwrap(),
         )
@@ -3742,7 +3829,52 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_skip_count_is_persisted_on_the_current_operation() {
+    fn stable_identity_lock_excludes_archival_across_directory_rename() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-archive-lock-test-{}",
+            Uuid::new_v4()
+        ));
+        let operation_id = "op_locked";
+        let source_run_id = "run_locked";
+        let operation_root = root.join("network-operations").join(operation_id);
+        fs::create_dir_all(&operation_root).unwrap();
+        let template_root = root.join("template");
+        let mut record = lock_supervisor(&test_supervisor(
+            &template_root,
+            NetworkBoundaryPolicy::default(),
+        ))
+        .unwrap()
+        .record
+        .clone();
+        record.operation_id = operation_id.to_string();
+        record.source_run_id = source_run_id.to_string();
+        record.active_table_name = None;
+        record.terminal_boundary_reaped_at_ms = Some(1);
+        write_atomic_nofollow(
+            &operation_root.join("record.json"),
+            &serde_json::to_vec_pretty(&record).unwrap(),
+            0o600,
+        )
+        .unwrap();
+
+        let identity_lock = NetworkOperationLock::acquire(
+            &network_operation_identity_lock_path(&root, operation_id).unwrap(),
+        )
+        .unwrap();
+        assert!(!archive_reaped_network_operation(&root, operation_id, source_run_id).unwrap());
+        assert!(operation_root.is_dir());
+        drop(identity_lock);
+
+        assert!(archive_reaped_network_operation(&root, operation_id, source_run_id).unwrap());
+        assert!(!operation_root.exists());
+        assert!(root
+            .join("network-operations-archive/op_locked/record.json")
+            .is_file());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn startup_recovery_skip_count_is_informational_on_the_current_operation() {
         let root = env::temp_dir().join(format!(
             "gensee-network-recovery-report-test-{}",
             Uuid::new_v4()
@@ -3765,10 +3897,12 @@ mod tests {
         )
         .unwrap();
         let attestation = operation.attestation().unwrap();
-        assert!(attestation.violations.iter().any(|violation| {
-            violation.kind == "network_boundary_recovery_entries_skipped"
-                && violation.detail.contains("2 unrelated")
-        }));
+        assert!(attestation.violations.is_empty());
+        let persisted: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("operations/op_current/record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["network_recovery_skipped_entry_count"], 2);
         drop(operation);
         fs::remove_dir_all(root).ok();
     }
