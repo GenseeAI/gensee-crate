@@ -1,19 +1,20 @@
 use super::*;
 use gensee_crate_rules::capability::{
     Capability, CapabilityRequest, EffectManifest, EffectTelemetryCoverage, EffectViolation,
-    ExecutionBoundary, FileChangeEffect, FileChangeKind, FileEntryKind, FileOperationKind,
-    FilesystemReadCoverage, ProcessEffect, PromotionOutput, PromotionReceipt, TelemetryCoverage,
+    FileChangeEffect, FileChangeKind, FileEntryKind, FileOperationKind, FilesystemReadCoverage,
+    ProcessEffect, PromotionOutput, PromotionReceipt, TelemetryCoverage,
     CAPABILITY_REQUEST_SCHEMA_VERSION, EFFECT_MANIFEST_SCHEMA_VERSION,
 };
 use gensee_crate_rules::capability_broker::BrokerResourceKind;
 use gensee_crate_rules::capability_broker::{BrokerDelivery, BrokerGatewayEffectKind, BrokerLease};
 use gensee_crate_rules::capability_policy::{
-    CapabilityPolicyDecision, CapabilityPolicyEngine, MediationBoundary, PolicyEvaluationContext,
+    ApprovalRequirement, CapabilityDecision, CapabilityExecutor, CapabilityPolicyDecision,
+    CapabilityPolicyEngine, MediationBoundary, PolicyEvaluationContext, PromotionRequirement,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-const CELL_LEASE_SCHEMA_VERSION: u32 = 1;
-const CELL_FORENSICS_SCHEMA_VERSION: u32 = 1;
+const CELL_LEASE_SCHEMA_VERSION: u32 = 2;
+const CELL_FORENSICS_SCHEMA_VERSION: u32 = 2;
 const CELL_FORENSICS_SIGNATURE_DOMAIN: &str = "capability-cell-forensics-v1";
 const CELL_PROMOTION_SIGNATURE_DOMAIN: &str = "capability-cell-promotion-v1";
 // Leave time for the host-control bridge to return the result and reap the
@@ -29,6 +30,7 @@ struct CapabilityCellLease {
     cell_id: String,
     source_run_id: String,
     request: CapabilityRequest,
+    policy_decision: CapabilityDecision,
     command: Vec<String>,
     issued_at_ms: u64,
     expires_at_ms: u64,
@@ -66,6 +68,7 @@ struct CapabilityCellForensicsClaims {
     lease_id: String,
     source_run_id: String,
     request_digest: String,
+    policy_decision_digest: String,
     command_digest: String,
     input_snapshot_digest: String,
     output_snapshot_digest: String,
@@ -104,6 +107,7 @@ struct CapabilityCellRecord {
     lease_id: String,
     source_run_id: String,
     request: CapabilityRequest,
+    policy_decision: CapabilityDecision,
     command: Vec<String>,
     #[serde(default)]
     broker_lease_ids: Vec<String>,
@@ -466,7 +470,7 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
                 format!("invalid capability request: {error}"),
             )
         })?;
-    validate_cell_request_for_issue(&request)?;
+    let mut policy_decision = validate_cell_request_for_issue(&request)?;
     let ttl_seconds = arg_value(options, "--ttl-seconds")
         .map(|value| {
             value.parse::<u64>().map_err(|_| {
@@ -483,6 +487,7 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
             format!("lease TTL must be between 1 and {CELL_LEASE_MAX_TTL_SECONDS} seconds"),
         ));
     }
+    policy_decision.lease_delta.ttl_seconds = ttl_seconds;
 
     let issued_at_ms = unix_millis()?;
     let lease_id = format!("lease_{}", Uuid::new_v4().simple());
@@ -494,6 +499,7 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
         cell_id: cell_id.clone(),
         source_run_id,
         request,
+        policy_decision,
         command,
         issued_at_ms,
         expires_at_ms: issued_at_ms.saturating_add(ttl_seconds.saturating_mul(1_000)),
@@ -522,8 +528,8 @@ pub(crate) fn tclone_capability_lease(args: Vec<OsString>) -> io::Result<()> {
                 "cell_id": lease.cell_id,
                 "source_run_id": lease.source_run_id,
                 "expires_at_ms": lease.expires_at_ms,
-                "execution_boundary": lease.request.execution_boundary,
-                "authorization_state": "pending_mediation",
+                "policy_decision": lease.policy_decision,
+                "authorization_state": "planned",
             }))?
         );
     } else {
@@ -597,20 +603,11 @@ pub(crate) fn tclone_capability_cell(args: Vec<OsString>) -> io::Result<()> {
     }
 }
 
-fn validate_cell_request_for_issue(request: &CapabilityRequest) -> io::Result<()> {
+fn validate_cell_request_for_issue(request: &CapabilityRequest) -> io::Result<CapabilityDecision> {
     if request.schema_version != CAPABILITY_REQUEST_SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unsupported capability request schema version",
-        ));
-    }
-    if request.execution_boundary != ExecutionBoundary::IsolatedCell
-        || !request.source_must_not_execute
-        || !request.inspect_before_commit
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "cell requests must require isolated execution and inspect-before-commit",
         ));
     }
     if request.capabilities.is_empty()
@@ -675,19 +672,32 @@ fn validate_cell_request_for_issue(request: &CapabilityRequest) -> io::Result<()
         request,
         &PolicyEvaluationContext {
             active_mediators: active_issue_mediators,
+            attachable_mediators: vec![
+                MediationBoundary::NetworkBoundary,
+                MediationBoundary::SecretBroker,
+                MediationBoundary::WorkloadIdentityBroker,
+                MediationBoundary::CloudApiGateway,
+                MediationBoundary::ExternalApiGateway,
+                MediationBoundary::BrowserAutomationGateway,
+                MediationBoundary::DatabaseProxy,
+                MediationBoundary::OutputPromotionTransaction,
+            ],
             locally_authorized_capabilities: Vec::new(),
-            isolated_cell_available: true,
+            locally_leaseable_capabilities: Vec::new(),
+            trusted_mediator_available: false,
+            fresh_cell_available: true,
+            live_fork_available: false,
             approval_staging_available: false,
+            effect_brokerable: false,
+            requires_staged_effects: true,
+            effects_inseparable_from_runtime: false,
         },
     );
-    let pending_only_on_attachable_mediators = decision.decision == CapabilityPolicyDecision::Deny
-        && !decision.reason_codes.is_empty()
-        && decision
-            .reason_codes
-            .iter()
-            .all(|reason| reason == "mandatory_mediator_missing");
-    if decision.decision != CapabilityPolicyDecision::DelegateToIsolatedCell
-        && !pending_only_on_attachable_mediators
+    if decision.decision != CapabilityPolicyDecision::Plan
+        || decision.executor != Some(CapabilityExecutor::FreshCell)
+        || decision.approval != ApprovalRequirement::None
+        || (cell_request_requires_attested_promotion(request)
+            && decision.promotion != PromotionRequirement::TransactionalPromotion)
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -697,14 +707,23 @@ fn validate_cell_request_for_issue(request: &CapabilityRequest) -> io::Result<()
             ),
         ));
     }
-    Ok(())
+    Ok(decision)
 }
 
 fn validate_cell_request_for_execution(
     lease: &CapabilityCellLease,
     now_ms: u64,
 ) -> io::Result<Vec<BrokerLease>> {
-    validate_cell_request_for_issue(&lease.request)?;
+    let issued_decision = validate_cell_request_for_issue(&lease.request)?;
+    if issued_decision.executor != lease.policy_decision.executor
+        || issued_decision.approval != lease.policy_decision.approval
+        || issued_decision.promotion != lease.policy_decision.promotion
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "stored cell execution plan does not match current trusted policy",
+        ));
+    }
     let broker_leases = super::capability_broker::active_attached_broker_leases(
         &lease.broker_lease_ids,
         &lease.source_run_id,
@@ -754,12 +773,22 @@ fn validate_cell_request_for_execution(
         &lease.request,
         &PolicyEvaluationContext {
             active_mediators,
+            attachable_mediators: Vec::new(),
             locally_authorized_capabilities: Vec::new(),
-            isolated_cell_available: true,
+            locally_leaseable_capabilities: Vec::new(),
+            trusted_mediator_available: false,
+            fresh_cell_available: true,
+            live_fork_available: false,
             approval_staging_available: false,
+            effect_brokerable: false,
+            requires_staged_effects: true,
+            effects_inseparable_from_runtime: false,
         },
     );
-    if decision.decision != CapabilityPolicyDecision::DelegateToIsolatedCell {
+    if decision.decision != CapabilityPolicyDecision::Plan
+        || decision.executor != Some(CapabilityExecutor::FreshCell)
+        || !decision.lease_delta.mediators.is_empty()
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -1434,6 +1463,7 @@ fn execute_capability_cell(
         lease_id: lease.lease_id.clone(),
         source_run_id: source.run_id.clone(),
         request: lease.request.clone(),
+        policy_decision: lease.policy_decision.clone(),
         command: lease.command.clone(),
         broker_lease_ids: lease.broker_lease_ids.clone(),
         container_name,
@@ -2317,6 +2347,7 @@ fn persist_capability_cell_forensics(
         lease_id: lease.lease_id.clone(),
         source_run_id: source.run_id.clone(),
         request_digest: digest_serialized(&lease.request)?,
+        policy_decision_digest: digest_serialized(&lease.policy_decision)?,
         command_digest: digest_serialized(&lease.command)?,
         input_snapshot_digest,
         output_snapshot_digest,
@@ -2372,6 +2403,7 @@ fn verify_capability_cell_forensics(
         || replay_plan.request != record.request
         || replay_plan.command != record.command
         || claims.request_digest != digest_serialized(&record.request)?
+        || claims.policy_decision_digest != digest_serialized(&record.policy_decision)?
         || claims.command_digest != digest_serialized(&record.command)?
         || claims.input_snapshot_digest != digest_cell_snapshot(&cell_root.join("input"))?
         || claims.output_snapshot_digest != digest_cell_snapshot(&cell_root.join("output"))?
@@ -2561,7 +2593,7 @@ fn replay_capability_cell(args: Vec<OsString>) -> io::Result<()> {
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let (_, replay_plan) =
         verify_capability_cell_forensics(&original_record, &original_manifest, &original_root)?;
-    validate_cell_request_for_issue(&replay_plan.request)?;
+    let mut policy_decision = validate_cell_request_for_issue(&replay_plan.request)?;
     let ttl_seconds = arg_value(&args, "--ttl-seconds")
         .map(|value| {
             value.parse::<u64>().map_err(|_| {
@@ -2578,6 +2610,7 @@ fn replay_capability_cell(args: Vec<OsString>) -> io::Result<()> {
             "replay lease TTL must be positive",
         ));
     }
+    policy_decision.lease_delta.ttl_seconds = ttl_seconds;
     let issued_at_ms = unix_millis()?;
     let lease_id = format!("lease_{}", Uuid::new_v4().simple());
     let cell_id = format!("cell_{}", Uuid::new_v4().simple());
@@ -2588,6 +2621,7 @@ fn replay_capability_cell(args: Vec<OsString>) -> io::Result<()> {
         cell_id: cell_id.clone(),
         source_run_id: source.run_id.clone(),
         request: replay_plan.request.clone(),
+        policy_decision,
         command: replay_plan.command.clone(),
         issued_at_ms,
         expires_at_ms: issued_at_ms.saturating_add(ttl_seconds.saturating_mul(1_000)),
@@ -2889,13 +2923,13 @@ fn validate_promotion_evidence(
             "cell identity, source, or successful completion evidence does not match",
         ));
     }
-    if !record.request.inspect_before_commit
+    if !cell_request_requires_attested_promotion(&record.request)
         || !promotion_telemetry_is_complete(&record.request, &manifest.telemetry_coverage)
         || !manifest.violations.is_empty()
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "promotion requires inspect-before-commit, complete relevant effect telemetry, authenticated evidence, and zero violations",
+            "promotion requires a policy-derived cell promotion plan, complete relevant effect telemetry, authenticated evidence, and zero violations",
         ));
     }
     let actual_before = collect_cell_snapshot(&cell_root.join("input"))?;
@@ -2924,6 +2958,19 @@ fn validate_promotion_evidence(
         ));
     }
     Ok(())
+}
+
+fn cell_request_requires_attested_promotion(request: &CapabilityRequest) -> bool {
+    request.effect_scope != gensee_crate_rules::capability::EffectScope::ReadOnly
+        && request.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::FilesystemWrite
+                    | Capability::FilesystemMetadata
+                    | Capability::DestructiveFilesystem
+                    | Capability::OutputPromotion
+            )
+        })
 }
 
 fn promotion_telemetry_is_complete(
@@ -3502,7 +3549,6 @@ mod tests {
             schema_version: CAPABILITY_REQUEST_SCHEMA_VERSION,
             operation_class: "workspace_mutation".to_string(),
             effect_scope: EffectScope::ReversibleLocal,
-            execution_boundary: ExecutionBoundary::IsolatedCell,
             capabilities: vec![
                 Capability::FilesystemRead,
                 Capability::FilesystemWrite,
@@ -3514,9 +3560,11 @@ mod tests {
                 ..CapabilityScope::default()
             },
             lease_ttl_seconds: 300,
-            source_must_not_execute: true,
-            inspect_before_commit: true,
         }
+    }
+
+    fn policy_decision_for(request: &CapabilityRequest) -> CapabilityDecision {
+        validate_cell_request_for_issue(request).unwrap()
     }
 
     fn source_record() -> TcloneRunRecord {
@@ -3659,6 +3707,7 @@ mod tests {
             operation_id: "op_dot".to_string(),
             cell_id: "cell_dot".to_string(),
             source_run_id: "run_1".to_string(),
+            policy_decision: policy_decision_for(&request),
             request,
             command: vec!["true".to_string()],
             issued_at_ms: 1,
@@ -3751,6 +3800,7 @@ mod tests {
             operation_id: "op_one".to_string(),
             cell_id: "cell_one".to_string(),
             source_run_id: "run_one".to_string(),
+            policy_decision: policy_decision_for(&request()),
             request: request(),
             command: vec!["true".to_string()],
             issued_at_ms: 100,
@@ -3788,6 +3838,7 @@ mod tests {
             operation_id: "op_one".to_string(),
             cell_id: "cell_one".to_string(),
             source_run_id: "run_one".to_string(),
+            policy_decision: policy_decision_for(&request()),
             request: request(),
             command: vec!["true".to_string()],
             issued_at_ms: 100,
@@ -3852,7 +3903,7 @@ mod tests {
         env::set_var("GENSEE_HOME", &root);
         let socket = root.join("api.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
-        let mut gateway_request = CapabilityRequest::isolated(
+        let mut gateway_request = CapabilityRequest::new(
             "read_repository_metadata",
             EffectScope::ReadOnly,
             vec![
@@ -3877,6 +3928,7 @@ mod tests {
             operation_id: "op_gateway".to_string(),
             cell_id: "cell_gateway".to_string(),
             source_run_id: "run_gateway".to_string(),
+            policy_decision: policy_decision_for(&gateway_request),
             request: gateway_request,
             command: vec!["true".to_string()],
             issued_at_ms: 100,
@@ -4006,6 +4058,7 @@ mod tests {
             operation_id: "op_1".to_string(),
             cell_id: "cell_1".to_string(),
             source_run_id: "run_1".to_string(),
+            policy_decision: policy_decision_for(&request),
             request,
             command: vec!["cargo".to_string(), "check".to_string()],
             issued_at_ms: 1,
@@ -4125,6 +4178,7 @@ mod tests {
             operation_id: "op_network".to_string(),
             cell_id: "cell_network".to_string(),
             source_run_id: "run_1".to_string(),
+            policy_decision: policy_decision_for(&request),
             request,
             command: vec!["cargo".to_string(), "check".to_string()],
             issued_at_ms: 1,
@@ -4352,6 +4406,7 @@ mod tests {
             operation_id: "op_1".to_string(),
             cell_id: "cell_1".to_string(),
             source_run_id: "run_1".to_string(),
+            policy_decision: policy_decision_for(&manifest_request),
             request: manifest_request,
             command: vec!["cargo".to_string(), "check".to_string()],
             issued_at_ms: 1,
@@ -4419,6 +4474,7 @@ mod tests {
             operation_id: "op_runtime".to_string(),
             cell_id: "cell_runtime".to_string(),
             source_run_id: "run_1".to_string(),
+            policy_decision: policy_decision_for(&request()),
             request: request(),
             command: vec!["cargo".to_string(), "check".to_string()],
             issued_at_ms: 1,
@@ -4495,6 +4551,7 @@ mod tests {
             operation_id: "op_1".to_string(),
             cell_id: "cell_1".to_string(),
             source_run_id: "run_1".to_string(),
+            policy_decision: policy_decision_for(&request()),
             request: request(),
             command: vec!["cargo".to_string(), "check".to_string()],
             issued_at_ms: 1,
@@ -4548,6 +4605,7 @@ mod tests {
             lease_id: "lease_1".to_string(),
             source_run_id: "run_1".to_string(),
             request: lease.request.clone(),
+            policy_decision: lease.policy_decision.clone(),
             command: lease.command.clone(),
             broker_lease_ids: Vec::new(),
             container_name: "cell".to_string(),
@@ -4674,6 +4732,9 @@ mod tests {
         std::os::unix::fs::symlink("../../outside", output.join("escape")).unwrap();
         let mut cell_request = request();
         cell_request.scope.read_paths.clear();
+        cell_request
+            .capabilities
+            .retain(|capability| *capability != Capability::FilesystemRead);
         cell_request.scope.write_paths = vec![".".to_string()];
         let lease = CapabilityCellLease {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
@@ -4681,6 +4742,7 @@ mod tests {
             operation_id: "op_1".to_string(),
             cell_id: "cell_1".to_string(),
             source_run_id: "run_1".to_string(),
+            policy_decision: policy_decision_for(&cell_request),
             request: cell_request,
             command: vec!["true".to_string()],
             issued_at_ms: 1,

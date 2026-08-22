@@ -7438,14 +7438,12 @@ fn fork_suggestion_message_uses_current_run_id_when_available() {
         finding.evidence["capability_request"]["operation_class"],
         "dependency_graph_change"
     );
-    assert_eq!(
-        finding.evidence["capability_request"]["execution_boundary"],
-        "isolated_cell"
-    );
-    assert_eq!(
-        finding.evidence["capability_request"]["source_must_not_execute"],
-        true
-    );
+    assert!(finding.evidence["capability_request"]
+        .get("execution_boundary")
+        .is_none());
+    assert!(finding.evidence["capability_request"]
+        .get("source_must_not_execute")
+        .is_none());
     assert!(finding.evidence["capability_request"]["capabilities"]
         .as_array()
         .unwrap()
@@ -7461,7 +7459,7 @@ fn external_mutation_requires_brokered_commit_capabilities() {
     let request = &finding.evidence["capability_request"];
 
     assert_eq!(request["effect_scope"], "external");
-    assert_eq!(request["execution_boundary"], "brokered_commit");
+    assert!(request.get("execution_boundary").is_none());
     assert!(request["capabilities"]
         .as_array()
         .unwrap()

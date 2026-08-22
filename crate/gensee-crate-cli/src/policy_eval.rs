@@ -308,7 +308,7 @@ impl ForkSuggestionReason {
 
     fn capability_request(self) -> CapabilityRequest {
         match self {
-            Self::DependencyUpgrade => CapabilityRequest::isolated(
+            Self::DependencyUpgrade => CapabilityRequest::new(
                 "dependency_graph_change",
                 EffectScope::ReversibleLocal,
                 vec![
@@ -319,7 +319,7 @@ impl ForkSuggestionReason {
                 ],
             ),
             Self::SchemaMigration | Self::DestructiveDatabaseCommand => {
-                CapabilityRequest::brokered(
+                CapabilityRequest::external(
                     "external_data_mutation",
                     vec![
                         Capability::NetworkEgress,
@@ -328,7 +328,7 @@ impl ForkSuggestionReason {
                     ],
                 )
             }
-            Self::DestructiveLocalDatabaseCommand => CapabilityRequest::isolated(
+            Self::DestructiveLocalDatabaseCommand => CapabilityRequest::new(
                 "destructive_local_database_mutation",
                 EffectScope::IrreversibleLocal,
                 vec![
@@ -337,12 +337,12 @@ impl ForkSuggestionReason {
                     Capability::ProcessExecution,
                 ],
             ),
-            Self::LargeRefactor | Self::LockfileChange => CapabilityRequest::isolated(
+            Self::LargeRefactor | Self::LockfileChange => CapabilityRequest::new(
                 "workspace_mutation",
                 EffectScope::ReversibleLocal,
                 vec![Capability::FilesystemWrite, Capability::ProcessExecution],
             ),
-            Self::DestructiveFileCleanup => CapabilityRequest::isolated(
+            Self::DestructiveFileCleanup => CapabilityRequest::new(
                 "destructive_workspace_mutation",
                 EffectScope::IrreversibleLocal,
                 vec![
@@ -351,7 +351,7 @@ impl ForkSuggestionReason {
                     Capability::ProcessExecution,
                 ],
             ),
-            Self::TestStrategyChange => CapabilityRequest::isolated(
+            Self::TestStrategyChange => CapabilityRequest::new(
                 "broad_process_execution",
                 EffectScope::ReversibleLocal,
                 vec![Capability::FilesystemWrite, Capability::ProcessExecution],
@@ -397,11 +397,9 @@ fn build_fork_suggestion_finding(
     let reason = fork_suggestion_reason(command, subjects)?;
     let capability_request = reason.capability_request();
     let name_hint = reason.name_hint();
-    let requires_broker =
-        capability_request.execution_boundary == ExecutionBoundary::BrokeredCommit;
-    let requires_irreversible_isolation = capability_request.execution_boundary
-        == ExecutionBoundary::IsolatedCell
-        && capability_request.effect_scope == EffectScope::IrreversibleLocal
+    let requires_broker = capability_request.effect_scope == EffectScope::External;
+    let requires_irreversible_isolation = capability_request.effect_scope
+        == EffectScope::IrreversibleLocal
         && !current_run_is_tclone_fork(current_run_id);
     let message = if requires_broker {
         format!(
@@ -524,7 +522,7 @@ pub(crate) fn fork_suggestion_prompt_finding(
     let reason = fork_suggestion_reason_for_prompt(&prompt)?;
     let capability_request = reason.capability_request();
     let name_hint = reason.name_hint();
-    let message = if capability_request.execution_boundary == ExecutionBoundary::BrokeredCommit {
+    let message = if capability_request.effect_scope == EffectScope::External {
         format!(
             "This request has external effects ({reason}) and needs a brokered commit rather than a workspace fork. Explain that execution remains blocked until a broker can enforce the declared target, identity, and effect scope.",
             reason = reason.label()
@@ -3063,7 +3061,9 @@ mod matcher_tests {
             );
             let request = reason.capability_request();
             assert_eq!(request.effect_scope, EffectScope::IrreversibleLocal);
-            assert_eq!(request.execution_boundary, ExecutionBoundary::IsolatedCell);
+            assert!(request
+                .capabilities
+                .contains(&Capability::DestructiveFilesystem));
             assert_eq!(
                 request.capabilities,
                 vec![
@@ -3086,10 +3086,7 @@ mod matcher_tests {
             assert_eq!(reason, ForkSuggestionReason::DestructiveDatabaseCommand);
             let request = reason.capability_request();
             assert_eq!(request.effect_scope, EffectScope::External);
-            assert_eq!(
-                request.execution_boundary,
-                ExecutionBoundary::BrokeredCommit
-            );
+            assert!(request.capabilities.contains(&Capability::ExternalMutation));
         }
     }
 

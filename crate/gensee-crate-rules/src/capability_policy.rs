@@ -5,7 +5,7 @@
 //! mandatory mediator is missing.
 
 use crate::capability::{
-    Capability, CapabilityRequest, EffectScope, ExecutionBoundary, FileOperationKind,
+    Capability, CapabilityRequest, EffectScope, FileOperationKind,
     CAPABILITY_REQUEST_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -30,15 +30,53 @@ pub enum MediationBoundary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityPolicyDecision {
-    AllowLocally,
-    DelegateToIsolatedCell,
-    StageForApproval,
+    Plan,
     Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityExecutor {
+    CurrentOperation,
+    TrustedMediator,
+    FreshCell,
+    LiveFork,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRequirement {
+    None,
+    BeforeExecution,
+    BeforePromotion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionRequirement {
+    None,
+    AttestBeforeReturn,
+    TransactionalPromotion,
+    ExternalCommitReceipt,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityLeaseDelta {
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub mediators: Vec<MediationBoundary>,
+    pub ttl_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityDecision {
     pub decision: CapabilityPolicyDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<CapabilityExecutor>,
+    pub lease_delta: CapabilityLeaseDelta,
+    pub approval: ApprovalRequirement,
+    pub promotion: PromotionRequirement,
     pub reason_codes: Vec<String>,
     pub required_mediators: Vec<MediationBoundary>,
     pub missing_mediators: Vec<MediationBoundary>,
@@ -52,9 +90,27 @@ pub struct PolicyEvaluationContext {
     #[serde(default)]
     pub active_mediators: Vec<MediationBoundary>,
     #[serde(default)]
+    pub attachable_mediators: Vec<MediationBoundary>,
+    #[serde(default)]
     pub locally_authorized_capabilities: Vec<Capability>,
-    pub isolated_cell_available: bool,
+    /// Capabilities whose exact requested resource scope was independently
+    /// checked by a trusted backend and can be attached and revoked in the
+    /// current operation. This is not a capability-type wildcard.
+    #[serde(default)]
+    pub locally_leaseable_capabilities: Vec<Capability>,
+    pub trusted_mediator_available: bool,
+    pub fresh_cell_available: bool,
+    pub live_fork_available: bool,
     pub approval_staging_available: bool,
+    /// Trusted classification that the effect can be performed completely by
+    /// a mediator rather than executing the requester with added authority.
+    pub effect_brokerable: bool,
+    /// Trusted classification that effects must be staged outside the current
+    /// operation even when its ambient capability types appear sufficient.
+    pub requires_staged_effects: bool,
+    /// A trusted runtime observation. The requester cannot use this bit to
+    /// force a fork or evade one.
+    pub effects_inseparable_from_runtime: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,92 +153,134 @@ impl CapabilityPolicyEngine {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
+        let attachable = context
+            .attachable_mediators
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let missing_mediators = required_mediators
             .iter()
             .copied()
-            .filter(|boundary| !active.contains(boundary))
+            .filter(|boundary| !active.contains(boundary) && !attachable.contains(boundary))
             .collect::<Vec<_>>();
         if !missing_mediators.is_empty() {
-            reasons.push("mandatory_mediator_missing".to_string());
+            reasons.push("mandatory_mediator_unavailable".to_string());
         }
         if !reasons.is_empty() {
-            reasons.sort();
-            reasons.dedup();
-            return CapabilityDecision {
-                decision: CapabilityPolicyDecision::Deny,
-                reason_codes: reasons,
-                required_mediators,
-                missing_mediators,
-            };
-        }
-
-        if requires_approval(request) {
-            let (decision, reason) = if context.approval_staging_available {
-                (
-                    CapabilityPolicyDecision::StageForApproval,
-                    "irreversible_or_external_effect_requires_approval",
-                )
-            } else {
-                (
-                    CapabilityPolicyDecision::Deny,
-                    "approval_staging_unavailable",
-                )
-            };
-            return CapabilityDecision {
-                decision,
-                reason_codes: vec![reason.to_string()],
-                required_mediators,
-                missing_mediators,
-            };
-        }
-
-        let requires_cell = request.execution_boundary == ExecutionBoundary::IsolatedCell
-            || request.source_must_not_execute
-            || request.capabilities.iter().any(|capability| {
-                matches!(
-                    capability,
-                    Capability::PrivilegedExecution | Capability::UntrustedCodeExecution
-                )
-            });
-        if requires_cell {
-            let (decision, reason) = if context.isolated_cell_available {
-                (
-                    CapabilityPolicyDecision::DelegateToIsolatedCell,
-                    "source_authority_is_insufficient",
-                )
-            } else {
-                (CapabilityPolicyDecision::Deny, "isolated_cell_unavailable")
-            };
-            return CapabilityDecision {
-                decision,
-                reason_codes: vec![reason.to_string()],
-                required_mediators,
-                missing_mediators,
-            };
+            return denied_decision(reasons, required_mediators, missing_mediators);
         }
 
         let locally_authorized = request
             .capabilities
             .iter()
             .all(|capability| context.locally_authorized_capabilities.contains(capability));
-        let (decision, reason) = if locally_authorized {
-            (
-                CapabilityPolicyDecision::AllowLocally,
-                "within_local_capability_envelope",
+        let local_delta = request
+            .capabilities
+            .iter()
+            .copied()
+            .filter(|capability| !context.locally_authorized_capabilities.contains(capability))
+            .collect::<Vec<_>>();
+        let locally_leaseable = local_delta
+            .iter()
+            .all(|capability| context.locally_leaseable_capabilities.contains(capability));
+        let requires_untrusted_boundary = request.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::PrivilegedExecution
+                    | Capability::UntrustedCodeExecution
+                    | Capability::DestructiveFilesystem
             )
-        } else if context.isolated_cell_available {
+        });
+
+        let (executor, reason) = if request.effect_scope == EffectScope::External {
+            if context.trusted_mediator_available {
+                (
+                    CapabilityExecutor::TrustedMediator,
+                    "external_effect_is_brokered",
+                )
+            } else {
+                return denied_decision(
+                    vec!["trusted_mediator_unavailable".to_string()],
+                    required_mediators,
+                    missing_mediators,
+                );
+            }
+        } else if context.effect_brokerable && context.trusted_mediator_available {
             (
-                CapabilityPolicyDecision::DelegateToIsolatedCell,
-                "local_capability_envelope_exceeded",
+                CapabilityExecutor::TrustedMediator,
+                "effect_is_safely_brokerable",
             )
+        } else if context.effects_inseparable_from_runtime {
+            if context.live_fork_available {
+                (
+                    CapabilityExecutor::LiveFork,
+                    "effects_require_live_runtime_fork",
+                )
+            } else {
+                return denied_decision(
+                    vec!["live_fork_required_but_unavailable".to_string()],
+                    required_mediators,
+                    missing_mediators,
+                );
+            }
+        } else if requires_untrusted_boundary || context.requires_staged_effects {
+            let Some(selected) = select_staged_executor(context) else {
+                return denied_decision(
+                    vec!["isolated_executor_unavailable".to_string()],
+                    required_mediators,
+                    missing_mediators,
+                );
+            };
+            selected
+        } else if locally_authorized {
+            (
+                CapabilityExecutor::CurrentOperation,
+                "within_current_capability_envelope",
+            )
+        } else if locally_leaseable {
+            (
+                CapabilityExecutor::CurrentOperation,
+                "bounded_delta_is_locally_leaseable",
+            )
+        } else if let Some(selected) = select_staged_executor(context) {
+            selected
         } else {
-            (
-                CapabilityPolicyDecision::Deny,
-                "local_capability_envelope_exceeded_and_no_cell_available",
-            )
+            return denied_decision(
+                vec!["no_executor_can_bound_requested_effects".to_string()],
+                required_mediators,
+                missing_mediators,
+            );
         };
+
+        let promotion = promotion_requirement(request, executor);
+        let approval = approval_requirement(request, executor, promotion);
+        if approval != ApprovalRequirement::None && !context.approval_staging_available {
+            return denied_decision(
+                vec!["approval_staging_unavailable".to_string()],
+                required_mediators,
+                missing_mediators,
+            );
+        }
+        let capabilities = if executor == CapabilityExecutor::CurrentOperation {
+            local_delta
+        } else {
+            request.capabilities.clone()
+        };
+        let mediators = required_mediators
+            .iter()
+            .copied()
+            .filter(|boundary| !active.contains(boundary))
+            .collect();
         CapabilityDecision {
-            decision,
+            decision: CapabilityPolicyDecision::Plan,
+            executor: Some(executor),
+            lease_delta: CapabilityLeaseDelta {
+                capabilities,
+                mediators,
+                ttl_seconds: request.lease_ttl_seconds,
+            },
+            approval,
+            promotion,
             reason_codes: vec![reason.to_string()],
             required_mediators,
             missing_mediators,
@@ -213,24 +311,6 @@ impl CapabilityPolicyEngine {
             }
         }
         reasons.extend(scope_validation_reasons(request));
-        if request.inspect_before_commit
-            && request.scope.output_promotions.is_empty()
-            && request.scope.write_paths.is_empty()
-            && request.scope.file_operations.iter().all(|operation| {
-                matches!(
-                    operation.operation,
-                    FileOperationKind::Read | FileOperationKind::Execute
-                )
-            })
-            && request.effect_scope != EffectScope::ReadOnly
-        {
-            reasons.push("promotion_scope_missing".to_string());
-        }
-        if request.execution_boundary == ExecutionBoundary::BrokeredCommit
-            && request.effect_scope != EffectScope::External
-        {
-            reasons.push("brokered_commit_requires_external_effect_scope".to_string());
-        }
         reasons
     }
 
@@ -507,28 +587,108 @@ fn is_safe_relative_selector(value: &str) -> bool {
         .all(|component| !component.is_empty() && component != "..")
 }
 
-fn requires_approval(request: &CapabilityRequest) -> bool {
-    let irreversible_local_is_contained = request.effect_scope == EffectScope::IrreversibleLocal
-        && request.execution_boundary == ExecutionBoundary::IsolatedCell
-        && request.source_must_not_execute
-        && request.inspect_before_commit;
-    request.execution_boundary == ExecutionBoundary::BrokeredCommit
-        || request.effect_scope == EffectScope::External
-        || (request.effect_scope == EffectScope::IrreversibleLocal
-            && !irreversible_local_is_contained)
+fn select_staged_executor(
+    context: &PolicyEvaluationContext,
+) -> Option<(CapabilityExecutor, &'static str)> {
+    if context.fresh_cell_available {
+        Some((
+            CapabilityExecutor::FreshCell,
+            "effect_requires_staged_isolated_execution",
+        ))
+    } else if context.live_fork_available {
+        Some((
+            CapabilityExecutor::LiveFork,
+            "fresh_cell_unavailable_live_fork_selected",
+        ))
+    } else {
+        None
+    }
+}
+
+fn promotion_requirement(
+    request: &CapabilityRequest,
+    executor: CapabilityExecutor,
+) -> PromotionRequirement {
+    if request.effect_scope == EffectScope::External {
+        return PromotionRequirement::ExternalCommitReceipt;
+    }
+    let isolated = matches!(
+        executor,
+        CapabilityExecutor::FreshCell | CapabilityExecutor::LiveFork
+    );
+    let has_workspace_effects = request.capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            Capability::FilesystemWrite
+                | Capability::FilesystemMetadata
+                | Capability::DestructiveFilesystem
+                | Capability::OutputPromotion
+        )
+    });
+    if isolated && has_workspace_effects {
+        PromotionRequirement::TransactionalPromotion
+    } else if isolated {
+        PromotionRequirement::AttestBeforeReturn
+    } else {
+        PromotionRequirement::None
+    }
+}
+
+fn approval_requirement(
+    request: &CapabilityRequest,
+    executor: CapabilityExecutor,
+    promotion: PromotionRequirement,
+) -> ApprovalRequirement {
+    let external_or_irreversible = request.effect_scope == EffectScope::External
         || request.capabilities.iter().any(|capability| {
             matches!(
                 capability,
-                Capability::ExternalMutation
-                    | Capability::IrreversibleEffect
-                    | Capability::OutputPromotion
+                Capability::ExternalMutation | Capability::IrreversibleEffect
             )
         })
         || request
             .scope
             .external_applications
             .iter()
-            .any(|application| application.irreversible)
+            .any(|application| application.irreversible);
+    if external_or_irreversible {
+        return ApprovalRequirement::BeforeExecution;
+    }
+    if request.capabilities.contains(&Capability::OutputPromotion)
+        || (request.effect_scope == EffectScope::IrreversibleLocal
+            && !matches!(
+                executor,
+                CapabilityExecutor::FreshCell | CapabilityExecutor::LiveFork
+            ))
+    {
+        return ApprovalRequirement::BeforePromotion;
+    }
+    if request.effect_scope == EffectScope::IrreversibleLocal
+        && promotion != PromotionRequirement::TransactionalPromotion
+    {
+        ApprovalRequirement::BeforeExecution
+    } else {
+        ApprovalRequirement::None
+    }
+}
+
+fn denied_decision(
+    mut reason_codes: Vec<String>,
+    required_mediators: Vec<MediationBoundary>,
+    missing_mediators: Vec<MediationBoundary>,
+) -> CapabilityDecision {
+    reason_codes.sort();
+    reason_codes.dedup();
+    CapabilityDecision {
+        decision: CapabilityPolicyDecision::Deny,
+        executor: None,
+        lease_delta: CapabilityLeaseDelta::default(),
+        approval: ApprovalRequirement::None,
+        promotion: PromotionRequirement::None,
+        reason_codes,
+        required_mediators,
+        missing_mediators,
+    }
 }
 
 fn capability_wire_name(capability: Capability) -> String {
@@ -557,22 +717,26 @@ mod tests {
     fn context(mediators: Vec<MediationBoundary>) -> PolicyEvaluationContext {
         PolicyEvaluationContext {
             active_mediators: mediators,
+            attachable_mediators: Vec::new(),
             locally_authorized_capabilities: Vec::new(),
-            isolated_cell_available: true,
+            locally_leaseable_capabilities: Vec::new(),
+            trusted_mediator_available: true,
+            fresh_cell_available: true,
+            live_fork_available: true,
             approval_staging_available: true,
+            effect_brokerable: false,
+            requires_staged_effects: false,
+            effects_inseparable_from_runtime: false,
         }
     }
 
     #[test]
     fn read_only_scoped_operation_can_be_allowed_locally() {
-        let mut request = CapabilityRequest::isolated(
+        let mut request = CapabilityRequest::new(
             "read_source",
             EffectScope::ReadOnly,
             vec![Capability::FilesystemRead, Capability::ProcessExecution],
         );
-        request.execution_boundary = ExecutionBoundary::Source;
-        request.source_must_not_execute = false;
-        request.inspect_before_commit = false;
         request.scope.read_paths = vec!["src".to_string()];
         let mut context = context(vec![
             MediationBoundary::FilesystemBoundary,
@@ -582,12 +746,75 @@ mod tests {
 
         let decision = CapabilityPolicyEngine::default().evaluate(&request, &context);
 
-        assert_eq!(decision.decision, CapabilityPolicyDecision::AllowLocally);
+        assert_eq!(decision.decision, CapabilityPolicyDecision::Plan);
+        assert_eq!(
+            decision.executor,
+            Some(CapabilityExecutor::CurrentOperation)
+        );
+        assert!(decision.lease_delta.capabilities.is_empty());
+    }
+
+    #[test]
+    fn bounded_network_delta_is_a_current_operation_lease_plan() {
+        let mut request = CapabilityRequest::new(
+            "fetch_artifact",
+            EffectScope::ReadOnly,
+            vec![Capability::NetworkEgress, Capability::ProcessExecution],
+        );
+        request.scope.network_destinations = vec![NetworkDestinationScope {
+            destination: "203.0.113.8/32".to_string(),
+            protocol: "tcp".to_string(),
+            ports: vec![443],
+        }];
+        let mut evaluation_context = context(vec![MediationBoundary::ProcessCgroup]);
+        evaluation_context.attachable_mediators = vec![MediationBoundary::NetworkBoundary];
+        evaluation_context.locally_authorized_capabilities = vec![Capability::ProcessExecution];
+        evaluation_context.locally_leaseable_capabilities = vec![Capability::NetworkEgress];
+
+        let decision = CapabilityPolicyEngine::default().evaluate(&request, &evaluation_context);
+
+        assert_eq!(decision.decision, CapabilityPolicyDecision::Plan);
+        assert_eq!(
+            decision.executor,
+            Some(CapabilityExecutor::CurrentOperation)
+        );
+        assert_eq!(
+            decision.lease_delta.capabilities,
+            vec![Capability::NetworkEgress]
+        );
+        assert_eq!(
+            decision.lease_delta.mediators,
+            vec![MediationBoundary::NetworkBoundary]
+        );
+        assert_eq!(decision.approval, ApprovalRequirement::None);
+        assert_eq!(decision.promotion, PromotionRequirement::None);
+    }
+
+    #[test]
+    fn brokerable_read_selects_mediator_without_changing_approval_or_promotion() {
+        let mut request = CapabilityRequest::new(
+            "read_http_artifact",
+            EffectScope::ReadOnly,
+            vec![Capability::NetworkEgress],
+        );
+        request.scope.network_destinations = vec![NetworkDestinationScope {
+            destination: "203.0.113.8/32".to_string(),
+            protocol: "tcp".to_string(),
+            ports: vec![80],
+        }];
+        let mut evaluation_context = context(vec![MediationBoundary::NetworkBoundary]);
+        evaluation_context.effect_brokerable = true;
+
+        let decision = CapabilityPolicyEngine::default().evaluate(&request, &evaluation_context);
+
+        assert_eq!(decision.executor, Some(CapabilityExecutor::TrustedMediator));
+        assert_eq!(decision.approval, ApprovalRequirement::None);
+        assert_eq!(decision.promotion, PromotionRequirement::None);
     }
 
     #[test]
     fn untrusted_operation_delegates_to_a_cell() {
-        let mut request = CapabilityRequest::isolated(
+        let mut request = CapabilityRequest::new(
             "build_untrusted_source",
             EffectScope::ReversibleLocal,
             vec![
@@ -607,15 +834,12 @@ mod tests {
             ]),
         );
 
-        assert_eq!(
-            decision.decision,
-            CapabilityPolicyDecision::DelegateToIsolatedCell
-        );
+        assert_eq!(decision.executor, Some(CapabilityExecutor::FreshCell));
     }
 
     #[test]
     fn contained_irreversible_local_effect_delegates_without_approval_staging() {
-        let mut request = CapabilityRequest::isolated(
+        let mut request = CapabilityRequest::new(
             "destructive_workspace_mutation",
             EffectScope::IrreversibleLocal,
             vec![
@@ -637,19 +861,17 @@ mod tests {
 
         let decision = CapabilityPolicyEngine::default().evaluate(&request, &evaluation_context);
 
+        assert_eq!(decision.executor, Some(CapabilityExecutor::FreshCell));
+        assert_eq!(decision.approval, ApprovalRequirement::None);
         assert_eq!(
-            decision.decision,
-            CapabilityPolicyDecision::DelegateToIsolatedCell
-        );
-        assert_eq!(
-            decision.reason_codes,
-            vec!["source_authority_is_insufficient"]
+            decision.promotion,
+            PromotionRequirement::TransactionalPromotion
         );
     }
 
     #[test]
-    fn uncontained_irreversible_local_effect_still_requires_approval() {
-        let mut request = CapabilityRequest::isolated(
+    fn requester_cannot_force_irreversible_work_into_current_operation() {
+        let mut request = CapabilityRequest::new(
             "destructive_workspace_mutation",
             EffectScope::IrreversibleLocal,
             vec![
@@ -658,9 +880,6 @@ mod tests {
                 Capability::ProcessExecution,
             ],
         );
-        request.execution_boundary = ExecutionBoundary::Source;
-        request.source_must_not_execute = false;
-        request.inspect_before_commit = false;
         request.scope.file_operations = vec![FileOperationScope {
             path: "target/cache".to_string(),
             operation: FileOperationKind::Delete,
@@ -675,15 +894,38 @@ mod tests {
             ]),
         );
 
+        assert_eq!(decision.executor, Some(CapabilityExecutor::FreshCell));
+        assert_eq!(decision.approval, ApprovalRequirement::None);
+    }
+
+    #[test]
+    fn inseparable_runtime_effect_selects_live_fork_independently_of_promotion() {
+        let mut request = CapabilityRequest::new(
+            "live_refactor",
+            EffectScope::ReversibleLocal,
+            vec![Capability::FilesystemWrite, Capability::ProcessExecution],
+        );
+        request.scope.write_paths = vec!["src".to_string()];
+        let mut evaluation_context = context(vec![
+            MediationBoundary::FilesystemBoundary,
+            MediationBoundary::ProcessCgroup,
+        ]);
+        evaluation_context.locally_authorized_capabilities = request.capabilities.clone();
+        evaluation_context.effects_inseparable_from_runtime = true;
+
+        let decision = CapabilityPolicyEngine::default().evaluate(&request, &evaluation_context);
+
+        assert_eq!(decision.executor, Some(CapabilityExecutor::LiveFork));
+        assert_eq!(decision.approval, ApprovalRequirement::None);
         assert_eq!(
-            decision.decision,
-            CapabilityPolicyDecision::StageForApproval
+            decision.promotion,
+            PromotionRequirement::TransactionalPromotion
         );
     }
 
     #[test]
     fn external_database_mutation_stages_for_approval() {
-        let mut request = CapabilityRequest::brokered(
+        let mut request = CapabilityRequest::external(
             "apply_migration",
             vec![Capability::DatabaseAccess, Capability::ExternalMutation],
         );
@@ -707,15 +949,17 @@ mod tests {
             ]),
         );
 
+        assert_eq!(decision.executor, Some(CapabilityExecutor::TrustedMediator));
+        assert_eq!(decision.approval, ApprovalRequirement::BeforeExecution);
         assert_eq!(
-            decision.decision,
-            CapabilityPolicyDecision::StageForApproval
+            decision.promotion,
+            PromotionRequirement::ExternalCommitReceipt
         );
     }
 
     #[test]
     fn missing_mandatory_network_boundary_denies() {
-        let mut request = CapabilityRequest::isolated(
+        let mut request = CapabilityRequest::new(
             "download_artifact",
             EffectScope::ReversibleLocal,
             vec![Capability::NetworkEgress, Capability::ProcessExecution],
@@ -737,7 +981,7 @@ mod tests {
 
     #[test]
     fn secret_material_cannot_be_used_as_a_broker_handle() {
-        let mut request = CapabilityRequest::isolated(
+        let mut request = CapabilityRequest::new(
             "call_repository",
             EffectScope::ReadOnly,
             vec![Capability::SecretUse, Capability::ProcessExecution],
@@ -763,7 +1007,7 @@ mod tests {
 
     #[test]
     fn dangerous_kernel_authority_is_denied_even_with_mediation() {
-        let mut request = CapabilityRequest::isolated(
+        let mut request = CapabilityRequest::new(
             "load_kernel_module",
             EffectScope::IrreversibleLocal,
             vec![Capability::Syscall, Capability::LinuxCapability],
@@ -783,7 +1027,7 @@ mod tests {
     #[test]
     fn nontransactional_output_promotion_is_denied() {
         let mut request =
-            CapabilityRequest::brokered("promote_build_output", vec![Capability::OutputPromotion]);
+            CapabilityRequest::external("promote_build_output", vec![Capability::OutputPromotion]);
         request.scope.output_promotions = vec![OutputPromotionScope {
             path: "dist/app".to_string(),
             destination: "release".to_string(),
@@ -802,7 +1046,7 @@ mod tests {
 
     #[test]
     fn browser_cloud_and_identity_scopes_require_every_gateway() {
-        let mut request = CapabilityRequest::brokered(
+        let mut request = CapabilityRequest::external(
             "publish_cloud_console_change",
             vec![
                 Capability::CloudIam,
