@@ -12,6 +12,8 @@ use gensee_crate_rules::network_boundary::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+#[cfg(any(target_os = "linux", test))]
+use std::collections::VecDeque;
 use std::io::{BufReader, ErrorKind};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
@@ -21,6 +23,7 @@ use std::os::unix::{
     fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     io::AsRawFd,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use url::Url;
 use uuid::Uuid;
@@ -34,6 +37,35 @@ const DEFAULT_MAX_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CREDENTIAL_HEADER_BYTES: u64 = 16 * 1024;
 const NETWORK_POLL_INTERVAL_MS: u64 = 100;
 const NETWORK_USAGE_POLL_INTERVAL_MS: u64 = 1_000;
+const MAX_IN_FLIGHT_CONTROL_CONNECTIONS: usize = 64;
+const MAX_IN_FLIGHT_HTTP_CONNECTIONS: usize = 128;
+const PROXY_BODY_READ_CHUNK_BYTES: usize = 16 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_OBSERVED_ATTEMPT_TRACES: usize = 4_096;
+#[cfg(any(target_os = "linux", test))]
+const MAX_DETAILED_FAULTS_PER_SECOND: u32 = 64;
+const MAX_NETWORK_EVIDENCE_LOG_BYTES: u64 = 64 * 1024 * 1024;
+
+struct ConnectionPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_connection(in_flight: &Arc<AtomicUsize>, limit: usize) -> Option<ConnectionPermit> {
+    in_flight
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < limit).then_some(current + 1)
+        })
+        .ok()?;
+    Some(ConnectionPermit {
+        in_flight: Arc::clone(in_flight),
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +144,12 @@ struct NetworkOperationRecord {
     #[serde(default)]
     usage: OperationNetworkUsage,
     #[serde(default)]
+    suppressed_fault_count: u64,
+    #[serde(default)]
+    evidence_rotation_count: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_boundary_reaped_at_ms: Option<u64>,
+    #[serde(default)]
     counter_snapshot: BTreeMap<String, (u64, u64)>,
     #[serde(default)]
     revoked_http_mediator_leases: BTreeSet<String>,
@@ -143,7 +181,15 @@ struct NetworkSupervisorResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     record: Option<NetworkOperationRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_recovery_health: Option<OperationRecoveryHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationRecoveryHealth {
+    network_entries_skipped: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,16 +275,39 @@ struct NetworkSupervisor {
     attempt_monitor: Option<gensee_crate_linux::LinuxNetworkAttemptMonitor>,
     #[cfg(any(target_os = "linux", test))]
     observed_attempt_traces: BTreeSet<String>,
+    #[cfg(any(target_os = "linux", test))]
+    observed_attempt_trace_order: VecDeque<String>,
+    #[cfg(any(target_os = "linux", test))]
+    fault_rate_window_started_at_ms: u64,
+    #[cfg(any(target_os = "linux", test))]
+    detailed_faults_in_window: u32,
+    #[cfg(any(target_os = "linux", test))]
+    fault_rate_violation_recorded_in_window: bool,
+    #[cfg(any(target_os = "linux", test))]
+    dedupe_eviction_recorded: bool,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct NetworkRuntimeCleanup {
+    supervisor: Arc<Mutex<NetworkSupervisor>>,
+    owns_operation_lifecycle: bool,
     table_names: Arc<Mutex<Vec<String>>>,
-    cgroup_path: Option<PathBuf>,
+    terminal_deny_plan: gensee_crate_linux::LinuxNftablesPlan,
+    state_root: PathBuf,
+    record_path: PathBuf,
+    operation_id: String,
+    source_run_id: String,
+    dry_run: bool,
 }
 
 #[cfg(unix)]
 struct NetworkOperationLock(fs::File);
+
+#[cfg(unix)]
+struct NetworkOperationLocks {
+    _identity: NetworkOperationLock,
+    _legacy: NetworkOperationLock,
+}
 
 #[cfg(unix)]
 impl NetworkOperationLock {
@@ -260,6 +329,26 @@ impl NetworkOperationLock {
 }
 
 #[cfg(unix)]
+impl NetworkOperationLocks {
+    fn acquire(state_root: &Path, operation_root: &Path, operation_id: &str) -> io::Result<Self> {
+        // The order is part of the migration protocol. The stable lock keeps
+        // the operation identity exclusive across directory renames; the
+        // legacy lock excludes supervisors launched before stable locks were
+        // introduced. Do not remove the legacy half until a versioned state-
+        // root migration can prove those supervisors no longer exist.
+        let identity = NetworkOperationLock::acquire(&network_operation_identity_lock_path(
+            state_root,
+            operation_id,
+        )?)?;
+        let legacy = NetworkOperationLock::acquire(&operation_root.join("supervisor.lock"))?;
+        Ok(Self {
+            _identity: identity,
+            _legacy: legacy,
+        })
+    }
+}
+
+#[cfg(unix)]
 impl Drop for NetworkOperationLock {
     fn drop(&mut self) {
         let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
@@ -268,15 +357,61 @@ impl Drop for NetworkOperationLock {
 
 impl Drop for NetworkRuntimeCleanup {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(names) = self.table_names.lock() {
-                for name in names.iter() {
-                    let _ = gensee_crate_linux::delete_nftables_table_if_exists(name);
+        // A standalone boundary daemon creates the operation record itself,
+        // so it must also make that lifecycle terminal. When the record was
+        // opened from an existing runner, that runner remains the only owner
+        // allowed to finish the operation. An implicit daemon teardown has no
+        // authenticated success handshake, so fail closed without inventing a
+        // child-process exit code.
+        if self.owns_operation_lifecycle {
+            if let Ok(mut state) = self.supervisor.lock() {
+                if let Some(operation) = state.operation.as_mut() {
+                    let _ = operation.finish(None, false);
                 }
             }
-            if let Some(path) = self.cgroup_path.as_deref() {
-                let _ = gensee_crate_linux::remove_agent_cgroup(path);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if self.dry_run {
+                return;
+            }
+            // Never tear down the only enforcement generation while the
+            // operation may still be running. A deterministic terminal deny
+            // generation permits old normal generations to be removed. If
+            // installing it fails, retain the normal generations unless the
+            // durable operation record proves the subject is already released.
+            let terminal_installed =
+                gensee_crate_linux::apply_nftables_script(&self.terminal_deny_plan.script).is_ok();
+            let subject_released =
+                crate::operation_supervisor::terminal_operation_subject_is_released_at(
+                    &self.state_root,
+                    &self.operation_id,
+                    &self.source_run_id,
+                )
+                .unwrap_or(false);
+            if terminal_installed || subject_released {
+                let mut exact_tables_deleted = true;
+                if let Ok(names) = self.table_names.lock() {
+                    for name in names.iter() {
+                        exact_tables_deleted &=
+                            gensee_crate_linux::delete_nftables_table_if_exists(name).is_ok();
+                    }
+                } else {
+                    exact_tables_deleted = false;
+                }
+                if subject_released {
+                    exact_tables_deleted &= gensee_crate_linux::delete_nftables_table_if_exists(
+                        &self.terminal_deny_plan.table_name,
+                    )
+                    .is_ok();
+                    if exact_tables_deleted {
+                        let _ = mark_terminal_network_boundary_reaped(
+                            &self.record_path,
+                            &self.operation_id,
+                            &self.source_run_id,
+                        );
+                    }
+                }
             }
         }
     }
@@ -323,10 +458,18 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         ));
     }
 
+    let state_root = default_root()?;
+    #[cfg(target_os = "linux")]
+    let recovery_report = if dry_run {
+        NetworkBoundaryRecoveryReport::default()
+    } else {
+        recover_pending_terminal_network_boundaries(&state_root)?
+    };
     let root = network_operation_root(&config.operation_id)?;
     create_restrictive_dir_all(&root)?;
     #[cfg(unix)]
-    let _operation_lock = NetworkOperationLock::acquire(&root.join("supervisor.lock"))?;
+    let _operation_locks =
+        NetworkOperationLocks::acquire(&state_root, &root, &config.operation_id)?;
     let socket_path = root.join("supervisor.sock");
     let record_path = root.join("record.json");
     let event_log_path = root.join("effects.jsonl");
@@ -341,21 +484,13 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
                     format!("cannot reconcile prior network operation record: {error}"),
                 )
             })?;
-        if previous.schema_version != NETWORK_SUPERVISOR_SCHEMA_VERSION
-            || previous.operation_id != config.operation_id
+        validate_stored_network_record(&previous)?;
+        if previous.operation_id != config.operation_id
             || previous.source_run_id != config.source_run_id
             || previous.root_pid != config.root_pid
             || previous.source_address != config.source_address
             || previous.http_mediator_lease_id != config.proxy.lease_id
             || previous.http_mediator_expires_at_ms != config.proxy.expires_at_ms
-            || previous
-                .revoked_http_mediator_leases
-                .iter()
-                .any(|lease_id| !safe_network_token(lease_id))
-            || previous
-                .active_table_name
-                .as_deref()
-                .is_some_and(|name| !safe_nft_table_name(name))
         {
             return Err(io::Error::new(
                 ErrorKind::PermissionDenied,
@@ -387,6 +522,15 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
             .map_or_else(OperationNetworkUsage::default, |record| {
                 record.usage.clone()
             }),
+        suppressed_fault_count: previous
+            .as_ref()
+            .map_or(0, |record| record.suppressed_fault_count),
+        evidence_rotation_count: previous.as_ref().map_or_else(BTreeMap::new, |record| {
+            record.evidence_rotation_count.clone()
+        }),
+        terminal_boundary_reaped_at_ms: previous
+            .as_ref()
+            .and_then(|record| record.terminal_boundary_reaped_at_ms),
         counter_snapshot: previous
             .as_ref()
             .map_or_else(BTreeMap::new, |record| record.counter_snapshot.clone()),
@@ -418,6 +562,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         None
     };
     let counter_snapshot = record.counter_snapshot.clone();
+    let terminal_deny_plan = terminal_deny_plan_for_record(&record)?.nftables;
     #[cfg(target_os = "linux")]
     let attempt_monitor = if dry_run {
         None
@@ -448,33 +593,41 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         network: config.envelope.clone(),
         ..OperationCapabilityEnvelope::default()
     };
-    let mut operation = match OperationSupervisor::open(&config.operation_id, &config.source_run_id)
-    {
-        Ok(operation) => operation,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            if let Some(path) = cgroup_path.as_deref() {
-                OperationSupervisor::prepare(
-                    &config.operation_id,
-                    &config.source_run_id,
-                    "network_boundary",
-                    operation_envelope,
-                    Some(path),
-                )?
-            } else {
-                OperationSupervisor::prepare_external_subject(
-                    &config.operation_id,
-                    &config.source_run_id,
-                    "network_boundary",
-                    operation_envelope,
-                )?
+    let (mut operation, owns_operation_lifecycle) =
+        match OperationSupervisor::open(&config.operation_id, &config.source_run_id) {
+            Ok(operation) => (operation, false),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if cgroup_path.is_some() {
+                    (
+                        OperationSupervisor::prepare(
+                            &config.operation_id,
+                            &config.source_run_id,
+                            "network_boundary",
+                            operation_envelope,
+                            None,
+                        )?,
+                        true,
+                    )
+                } else {
+                    (
+                        OperationSupervisor::prepare_external_subject(
+                            &config.operation_id,
+                            &config.source_run_id,
+                            "network_boundary",
+                            operation_envelope,
+                        )?,
+                        true,
+                    )
+                }
             }
-        }
-        Err(error) => return Err(error),
-    };
+            Err(error) => return Err(error),
+        };
+    #[cfg(target_os = "linux")]
+    record_network_boundary_recovery_report(&mut operation, recovery_report)?;
     operation.update_network_envelope(config.envelope.clone())?;
     let supervisor = Arc::new(Mutex::new(NetworkSupervisor {
         record,
-        record_path,
+        record_path: record_path.clone(),
         event_log_path,
         counter_log_path,
         fault_log_path,
@@ -490,14 +643,38 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         attempt_monitor,
         #[cfg(any(target_os = "linux", test))]
         observed_attempt_traces: BTreeSet::new(),
+        #[cfg(any(target_os = "linux", test))]
+        observed_attempt_trace_order: VecDeque::new(),
+        #[cfg(any(target_os = "linux", test))]
+        fault_rate_window_started_at_ms: now_ms,
+        #[cfg(any(target_os = "linux", test))]
+        detailed_faults_in_window: 0,
+        #[cfg(any(target_os = "linux", test))]
+        fault_rate_violation_recorded_in_window: false,
+        #[cfg(any(target_os = "linux", test))]
+        dedupe_eviction_recorded: false,
     }));
     let _cleanup = NetworkRuntimeCleanup {
+        supervisor: Arc::clone(&supervisor),
+        owns_operation_lifecycle,
         table_names: Arc::clone(&table_names),
-        cgroup_path,
+        terminal_deny_plan: terminal_deny_plan.clone(),
+        state_root,
+        record_path: record_path.clone(),
+        operation_id: config.operation_id.clone(),
+        source_run_id: config.source_run_id.clone(),
+        dry_run,
     };
     {
         let mut state = lock_supervisor(&supervisor)?;
         state.reconcile_expired_and_apply(&table_names)?;
+        if !dry_run {
+            // A previous daemon exit may have left the deterministic terminal
+            // deny generation behind. The new normal generation is already
+            // installed, so deleting the terminal table now preserves
+            // continuous enforcement without preventing supervised recovery.
+            gensee_crate_linux::delete_nftables_table_if_exists(&terminal_deny_plan.table_name)?;
+        }
         if let Some(root_pid) = config.root_pid {
             state
                 .operation
@@ -538,43 +715,74 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
             socket_path.display(),
             local_proxy
         );
+        let control_in_flight = Arc::new(AtomicUsize::new(0));
+        let http_in_flight = Arc::new(AtomicUsize::new(0));
 
         loop {
-            match unix_listener.accept() {
-                Ok((stream, _)) => {
-                    if !dry_run && peer_effective_uid(&stream)? != 0 {
-                        eprintln!(
-                            "gensee: rejected non-root boundary control peer for operation={}",
-                            config.operation_id
-                        );
-                        continue;
+            for _ in 0..MAX_IN_FLIGHT_CONTROL_CONNECTIONS {
+                match unix_listener.accept() {
+                    Ok((stream, _)) => {
+                        if !dry_run && peer_effective_uid(&stream)? != 0 {
+                            eprintln!(
+                                "gensee: rejected non-root boundary control peer for operation={}",
+                                config.operation_id
+                            );
+                            continue;
+                        }
+                        let Some(permit) = try_acquire_connection(
+                            &control_in_flight,
+                            MAX_IN_FLIGHT_CONTROL_CONNECTIONS,
+                        ) else {
+                            eprintln!(
+                                "gensee: rejected boundary control connection above in-flight limit for operation={}",
+                                config.operation_id
+                            );
+                            continue;
+                        };
+                        let supervisor = Arc::clone(&supervisor);
+                        let tables = Arc::clone(&table_names);
+                        thread::spawn(move || {
+                            let _permit = permit;
+                            if let Err(error) = handle_supervisor_stream(stream, supervisor, tables)
+                            {
+                                eprintln!("gensee: network supervisor request failed: {error}");
+                            }
+                        });
                     }
-                    let supervisor = Arc::clone(&supervisor);
-                    let tables = Arc::clone(&table_names);
-                    thread::spawn(move || {
-                        if let Err(error) = handle_supervisor_stream(stream, supervisor, tables) {
-                            eprintln!("gensee: network supervisor request failed: {error}");
-                        }
-                    });
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
             }
-            match proxy_listener.accept() {
-                Ok((stream, peer)) => {
-                    let supervisor = Arc::clone(&supervisor);
-                    let tables = Arc::clone(&table_names);
-                    let proxy = config.proxy.clone();
-                    thread::spawn(move || {
-                        if let Err(error) =
-                            handle_http_proxy_connection(stream, peer, supervisor, tables, proxy)
-                        {
-                            eprintln!("gensee: HTTP capability gateway request failed: {error}");
-                        }
-                    });
+            for _ in 0..MAX_IN_FLIGHT_HTTP_CONNECTIONS {
+                match proxy_listener.accept() {
+                    Ok((mut stream, peer)) => {
+                        let Some(permit) =
+                            try_acquire_connection(&http_in_flight, MAX_IN_FLIGHT_HTTP_CONNECTIONS)
+                        else {
+                            let _ = write_proxy_error(
+                                &mut stream,
+                                503,
+                                "HTTP capability gateway is at its in-flight limit",
+                            );
+                            continue;
+                        };
+                        let supervisor = Arc::clone(&supervisor);
+                        let tables = Arc::clone(&table_names);
+                        let proxy = config.proxy.clone();
+                        thread::spawn(move || {
+                            let _permit = permit;
+                            if let Err(error) = handle_http_proxy_connection(
+                                stream, peer, supervisor, tables, proxy,
+                            ) {
+                                eprintln!(
+                                    "gensee: HTTP capability gateway request failed: {error}"
+                                );
+                            }
+                        });
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
             }
             {
                 let mut state = lock_supervisor(&supervisor)?;
@@ -1189,6 +1397,7 @@ impl NetworkSupervisor {
                 self.attempt_monitor = None;
             }
         }
+        let suppressed_fault_count_before = self.record.suppressed_fault_count;
         for attempt in attempts {
             let trace_key = format!(
                 "{}:{}:{}:{}:{}",
@@ -1204,16 +1413,45 @@ impl NetworkSupervisor {
             if !self.observed_attempt_traces.insert(trace_key.clone()) {
                 continue;
             }
-            if self.observed_attempt_traces.len() > 4096 {
-                self.observed_attempt_traces.clear();
-                self.observed_attempt_traces.insert(trace_key.clone());
-                if let Some(operation) = self.operation.as_mut() {
-                    operation.record_boundary_violation(
-                        "network_attempt_dedupe_limit_reached",
-                        "kernel network attempt deduplication reached its bounded limit",
-                    )?;
+            self.observed_attempt_trace_order
+                .push_back(trace_key.clone());
+            if self.observed_attempt_traces.len() > MAX_OBSERVED_ATTEMPT_TRACES {
+                if let Some(evicted) = self.observed_attempt_trace_order.pop_front() {
+                    self.observed_attempt_traces.remove(&evicted);
+                }
+                if !self.dedupe_eviction_recorded {
+                    self.dedupe_eviction_recorded = true;
+                    if let Some(operation) = self.operation.as_mut() {
+                        operation.record_boundary_violation(
+                            "network_attempt_dedupe_eviction_started",
+                            "kernel network-attempt deduplication began bounded oldest-first eviction",
+                        )?;
+                    }
                 }
             }
+            let observed_at_ms = unix_millis()?;
+            if observed_at_ms.saturating_sub(self.fault_rate_window_started_at_ms) >= 1_000 {
+                self.record.updated_at_ms = observed_at_ms;
+                self.persist()?;
+                self.fault_rate_window_started_at_ms = observed_at_ms;
+                self.detailed_faults_in_window = 0;
+                self.fault_rate_violation_recorded_in_window = false;
+            }
+            if self.detailed_faults_in_window >= MAX_DETAILED_FAULTS_PER_SECOND {
+                self.record.suppressed_fault_count =
+                    self.record.suppressed_fault_count.saturating_add(1);
+                if !self.fault_rate_violation_recorded_in_window {
+                    self.fault_rate_violation_recorded_in_window = true;
+                    if let Some(operation) = self.operation.as_mut() {
+                        operation.record_boundary_violation(
+                            "network_attempt_fault_rate_limited",
+                            "additional denied network attempts were counted after the detailed evidence rate limit",
+                        )?;
+                    }
+                }
+                continue;
+            }
+            self.detailed_faults_in_window = self.detailed_faults_in_window.saturating_add(1);
             let subject = if let Some(source_address) = self.record.source_address.clone() {
                 CapabilityFaultSubject::NetworkPeer { source_address }
             } else if let Some((pid, start_time_ticks)) = self
@@ -1252,7 +1490,7 @@ impl NetworkSupervisor {
                     port: attempt.port,
                 },
                 requested_ttl_seconds: self.record.policy.max_in_place_lease_ttl_seconds,
-                observed_at_ms: unix_millis()?,
+                observed_at_ms,
             };
             let (resolution, effect) = self.resolve_fault(&fault, table_names)?;
             self.append_fault_evidence(&fault, &resolution)?;
@@ -1260,40 +1498,47 @@ impl NetworkSupervisor {
                 self.append_effect(effect)?;
             }
         }
+        if self.record.suppressed_fault_count != suppressed_fault_count_before {
+            self.record.updated_at_ms = unix_millis()?;
+            self.persist()?;
+        }
         Ok(())
     }
 
-    fn append_counter_evidence(&self, evidence: &NetworkCounterEvidenceRecord) -> io::Result<()> {
-        let mut file = open_owner_append_nofollow(&self.counter_log_path)?;
-        serde_json::to_writer(&mut file, evidence)?;
-        file.write_all(b"\n")?;
-        file.sync_data()
+    fn append_counter_evidence(
+        &mut self,
+        evidence: &NetworkCounterEvidenceRecord,
+    ) -> io::Result<()> {
+        if append_bounded_json_line(&self.counter_log_path, evidence, true)? {
+            self.record_evidence_rotation("counters")?;
+        }
+        Ok(())
     }
 
     fn append_fault_evidence(
-        &self,
+        &mut self,
         fault: &CapabilityFault,
         resolution: &CapabilityFaultResolution,
     ) -> io::Result<()> {
-        let mut file = open_owner_append_nofollow(&self.fault_log_path)?;
-        serde_json::to_writer(
-            &mut file,
+        if append_bounded_json_line(
+            &self.fault_log_path,
             &CapabilityFaultEvidenceRecord {
                 schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
                 fault: fault.clone(),
                 resolution: resolution.clone(),
                 received_at_ms: unix_millis()?,
             },
-        )?;
-        file.write_all(b"\n")?;
-        file.sync_data()
+            true,
+        )? {
+            self.record_evidence_rotation("faults")?;
+        }
+        Ok(())
     }
 
     fn append_effect(&mut self, effect: &NetworkEffectRecord) -> io::Result<()> {
-        let mut file = open_owner_append_nofollow(&self.event_log_path)?;
-        serde_json::to_writer(&mut file, effect)?;
-        file.write_all(b"\n")?;
-        file.sync_data()?;
+        if append_bounded_json_line(&self.event_log_path, effect, true)? {
+            self.record_evidence_rotation("effects")?;
+        }
         if let Some(operation) = self.operation.as_mut() {
             operation.record_network_effect(&effect.event, &effect.decision)?;
         }
@@ -1301,14 +1546,13 @@ impl NetworkSupervisor {
     }
 
     fn append_http_mediator_audit(
-        &self,
+        &mut self,
         request: &ParsedProxyRequest,
         disposition: &str,
         reason_code: &str,
     ) -> io::Result<()> {
-        let mut file = open_owner_append_nofollow(&self.mediator_log_path)?;
-        serde_json::to_writer(
-            &mut file,
+        if append_bounded_json_line(
+            &self.mediator_log_path,
             &HttpMediatorAuditRecord {
                 schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
                 operation_id: self.record.operation_id.clone(),
@@ -1326,9 +1570,32 @@ impl NetworkSupervisor {
                 reason_code: reason_code.to_string(),
                 observed_at_ms: unix_millis()?,
             },
-        )?;
-        file.write_all(b"\n")?;
-        file.sync_data()
+            true,
+        )? {
+            self.record_evidence_rotation("http_mediator")?;
+        }
+        Ok(())
+    }
+
+    fn record_evidence_rotation(&mut self, log_kind: &str) -> io::Result<()> {
+        // Rotation means the retained evidence is incomplete. Treat it as an
+        // attestation violation intentionally so a capacity-only truncation
+        // cannot be promoted or used as a clean live-fork parent.
+        let count = self
+            .record
+            .evidence_rotation_count
+            .entry(log_kind.to_string())
+            .or_default();
+        *count = count.saturating_add(1);
+        self.record.updated_at_ms = unix_millis()?;
+        self.persist()?;
+        if let Some(operation) = self.operation.as_mut() {
+            operation.record_boundary_violation(
+                "network_evidence_log_rotated",
+                &format!("{log_kind} evidence exceeded its retained log bound"),
+            )?;
+        }
+        Ok(())
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -1355,11 +1622,19 @@ fn handle_supervisor_stream(
         NetworkSupervisorRequest::Inspect => {
             let mut state = lock_supervisor(&supervisor)?;
             state.sample_usage()?;
+            let network_entries_skipped = state
+                .operation
+                .as_mut()
+                .ok_or_else(|| io::Error::other("operation supervisor unavailable"))?
+                .network_recovery_skipped_entry_count()?;
             NetworkSupervisorResponse {
                 ok: true,
                 decision: None,
                 resolution: None,
                 record: Some(state.record.clone()),
+                operation_recovery_health: Some(OperationRecoveryHealth {
+                    network_entries_skipped,
+                }),
                 error: None,
             }
         }
@@ -1376,6 +1651,7 @@ fn handle_supervisor_stream(
                         decision: None,
                         resolution: Some(resolution),
                         record: None,
+                        operation_recovery_health: None,
                         error: None,
                     }
                 }
@@ -1390,6 +1666,7 @@ fn handle_supervisor_stream(
                         decision: None,
                         resolution: Some(resolution),
                         record: None,
+                        operation_recovery_health: None,
                         error: Some(error.to_string()),
                     }
                 }
@@ -1406,6 +1683,7 @@ fn handle_supervisor_stream(
                     decision: None,
                     resolution: None,
                     record: Some(state.record.clone()),
+                    operation_recovery_health: None,
                     error: None,
                 }
             } else {
@@ -1414,6 +1692,7 @@ fn handle_supervisor_stream(
                     decision: None,
                     resolution: None,
                     record: None,
+                    operation_recovery_health: None,
                     error: Some(
                         "HTTP mediator lease does not belong to this operation".to_string(),
                     ),
@@ -1450,6 +1729,7 @@ fn handle_supervisor_stream(
                         decision: Some(decision),
                         resolution: None,
                         record: None,
+                        operation_recovery_health: None,
                         error: None,
                     }
                 }
@@ -1458,6 +1738,7 @@ fn handle_supervisor_stream(
                     decision: None,
                     resolution: None,
                     record: None,
+                    operation_recovery_health: None,
                     error: Some(error.to_string()),
                 },
             }
@@ -1498,7 +1779,7 @@ fn handle_http_proxy_connection(
     };
     let now_ms = unix_millis()?;
     {
-        let state = lock_supervisor(&supervisor)?;
+        let mut state = lock_supervisor(&supervisor)?;
         if !http_mediator_is_active(&state, &config, now_ms) {
             state.append_http_mediator_audit(&request, "deny", "http_mediator_lease_inactive")?;
             write_proxy_error(
@@ -1596,8 +1877,17 @@ fn execute_mediated_http(
                 ));
             }
         }
+        // Client-originated headers are scoped to the URL authority the
+        // client requested. A cross-origin redirect is a new audience; only
+        // mediator-owned headers (including an independently scoped brokered
+        // credential) may cross it.
+        let hop_headers = if same_http_origin(&request.url, &current_url) {
+            request.headers.as_slice()
+        } else {
+            &[]
+        };
         let request_digest =
-            mediated_http_request_digest(&method, &current_url, &request.headers, &request.body);
+            mediated_http_request_digest(&method, &current_url, hop_headers, &request.body);
         let (address, event, decision) = authorize_mediated_http_hop(
             &supervisor,
             &method,
@@ -1697,7 +1987,7 @@ fn execute_mediated_http(
             &method,
             &current_url,
             address,
-            &request.headers,
+            hop_headers,
             &request.body,
             credential.as_ref(),
             config,
@@ -1769,6 +2059,26 @@ fn authorize_mediated_http_hop(
         io::Error::new(ErrorKind::InvalidData, "HTTP authority has no usable port")
     })?;
     let addresses = resolve_authority(host, port)?;
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "HTTP authority did not resolve",
+        ));
+    }
+    authorize_mediated_http_addresses(supervisor, method, url, request_digest, lease_id, addresses)
+}
+
+/// Authorize the complete resolver answer as one effect. Keeping this logic
+/// separate makes the all-address fail-closed invariant directly testable
+/// without relying on mutable external DNS.
+fn authorize_mediated_http_addresses(
+    supervisor: &Arc<Mutex<NetworkSupervisor>>,
+    method: &str,
+    url: &Url,
+    request_digest: &str,
+    lease_id: Option<String>,
+    addresses: Vec<SocketAddr>,
+) -> io::Result<(SocketAddr, NetworkBoundaryEvent, NetworkBoundaryDecision)> {
     if addresses.is_empty() {
         return Err(io::Error::new(
             ErrorKind::NotFound,
@@ -1998,6 +2308,12 @@ fn credential_applies_to_url(credential: &HttpCredentialInjection, target: &Url)
     })
 }
 
+fn same_http_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
 fn url_is_within_prefix(target: &Url, prefix: &Url) -> bool {
     target.scheme() == prefix.scheme()
         && target.host_str() == prefix.host_str()
@@ -2186,8 +2502,20 @@ fn read_proxy_request(
             "HTTP mediator body size does not fit this host",
         )
     })?;
-    request.body.resize(body_len, 0);
-    stream.read_exact(&mut request.body)?;
+    let mut remaining = body_len;
+    while remaining > 0 {
+        let mut chunk = [0u8; PROXY_BODY_READ_CHUNK_BYTES];
+        let read_limit = remaining.min(chunk.len());
+        let count = stream.read(&mut chunk[..read_limit])?;
+        if count == 0 {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "proxy request body ended before its declared length",
+            ));
+        }
+        request.body.extend_from_slice(&chunk[..count]);
+        remaining -= count;
+    }
     Ok(request)
 }
 
@@ -2334,6 +2662,7 @@ fn write_proxy_error(stream: &mut TcpStream, status: u16, message: &str) -> io::
         405 => "Method Not Allowed",
         413 => "Content Too Large",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
         _ => "Denied",
     };
     let body = format!("gensee network boundary: {message}\n");
@@ -2536,6 +2865,444 @@ fn network_operation_root(operation_id: &str) -> io::Result<PathBuf> {
         .join(operation_id))
 }
 
+#[cfg(any(unix, test))]
+fn network_operation_identity_lock_path(
+    state_root: &Path,
+    operation_id: &str,
+) -> io::Result<PathBuf> {
+    if !safe_network_token(operation_id) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "invalid network operation id",
+        ));
+    }
+    let lock_root = state_root.join("network-operation-locks");
+    create_restrictive_dir_all(&lock_root)?;
+    if !fs::symlink_metadata(&lock_root)?.file_type().is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "network operation identity lock root is not a directory",
+        ));
+    }
+    Ok(lock_root.join(format!("{operation_id}.lock")))
+}
+
+fn validate_stored_network_record(record: &NetworkOperationRecord) -> io::Result<()> {
+    let subject_count =
+        usize::from(record.root_pid.is_some()) + usize::from(record.source_address.is_some());
+    if record.schema_version != NETWORK_SUPERVISOR_SCHEMA_VERSION
+        || record.policy.schema_version != NETWORK_BOUNDARY_SCHEMA_VERSION
+        || !safe_network_token(&record.operation_id)
+        || !safe_network_token(&record.source_run_id)
+        || subject_count != 1
+        || record.root_pid == Some(0)
+        || record
+            .source_address
+            .as_deref()
+            .is_some_and(|address| address.parse::<IpAddr>().is_err())
+        || record
+            .active_table_name
+            .as_deref()
+            .is_some_and(|name| !safe_nft_table_name(name))
+        || record
+            .revoked_http_mediator_leases
+            .iter()
+            .any(|lease_id| !safe_network_token(lease_id))
+        || record
+            .evidence_rotation_count
+            .keys()
+            .any(|kind| !safe_network_token(kind))
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "stored network operation record is not safe to reconcile",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn terminal_boundary_table_names(record: &NetworkOperationRecord) -> io::Result<BTreeSet<String>> {
+    validate_stored_network_record(record)?;
+    let terminal_table = terminal_deny_plan_for_record(record)?.nftables.table_name;
+    let mut tables = record
+        .active_table_name
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    tables.insert(terminal_table);
+    Ok(tables)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn mark_terminal_network_boundary_reaped(
+    record_path: &Path,
+    operation_id: &str,
+    expected_source_run_id: &str,
+) -> io::Result<()> {
+    let mut record: NetworkOperationRecord =
+        serde_json::from_str(&read_nofollow_to_string(record_path)?).map_err(|error| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("cannot finalize terminal network operation record: {error}"),
+            )
+        })?;
+    validate_stored_network_record(&record)?;
+    if record.operation_id != operation_id || record.source_run_id != expected_source_run_id {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "terminal network boundary identity changed during cleanup",
+        ));
+    }
+    let now = unix_millis()?;
+    record.active_table_name = None;
+    record.terminal_boundary_reaped_at_ms = Some(now);
+    record.updated_at_ms = now;
+    write_atomic_nofollow(record_path, &serde_json::to_vec_pretty(&record)?, 0o600)
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct NetworkBoundaryRecoveryReport {
+    recovered: usize,
+    archived: usize,
+    skipped_entries: usize,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn record_network_boundary_recovery_report(
+    operation: &mut OperationSupervisor,
+    report: NetworkBoundaryRecoveryReport,
+) -> io::Result<()> {
+    if report.skipped_entries > 0 {
+        operation.record_network_recovery_skipped_entries(report.skipped_entries)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn visit_pending_network_boundary_recovery_with(
+    state_root: &Path,
+    mut recover: impl FnMut(&NetworkOperationRecord, &Path) -> io::Result<bool>,
+    mut archive: impl FnMut(&NetworkOperationRecord, &Path) -> io::Result<bool>,
+) -> io::Result<NetworkBoundaryRecoveryReport> {
+    let root = state_root.join("network-operations");
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(NetworkBoundaryRecoveryReport::default());
+        }
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "network operation recovery root is not a directory",
+        ));
+    }
+
+    let mut report = NetworkBoundaryRecoveryReport::default();
+    for entry in fs::read_dir(&root)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                report.skipped_entries = report.skipped_entries.saturating_add(1);
+                continue;
+            }
+        };
+        let is_directory = match entry.file_type() {
+            Ok(file_type) => file_type.is_dir(),
+            Err(_) => {
+                report.skipped_entries = report.skipped_entries.saturating_add(1);
+                continue;
+            }
+        };
+        if !is_directory {
+            continue;
+        }
+        let operation_id = match entry.file_name().into_string() {
+            Ok(operation_id) => operation_id,
+            Err(_) => {
+                report.skipped_entries = report.skipped_entries.saturating_add(1);
+                continue;
+            }
+        };
+        if !safe_network_token(&operation_id) {
+            report.skipped_entries = report.skipped_entries.saturating_add(1);
+            continue;
+        }
+        let record_path = entry.path().join("record.json");
+        let record_metadata = match fs::symlink_metadata(&record_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(_) => {
+                report.skipped_entries = report.skipped_entries.saturating_add(1);
+                continue;
+            }
+        };
+        if !record_metadata.file_type().is_file() {
+            report.skipped_entries = report.skipped_entries.saturating_add(1);
+            continue;
+        }
+        let contents = match read_nofollow_to_string(&record_path) {
+            Ok(contents) => contents,
+            Err(_) => {
+                report.skipped_entries = report.skipped_entries.saturating_add(1);
+                continue;
+            }
+        };
+        let record: NetworkOperationRecord = match serde_json::from_str(&contents) {
+            Ok(record) => record,
+            Err(_) => {
+                report.skipped_entries = report.skipped_entries.saturating_add(1);
+                continue;
+            }
+        };
+        if validate_stored_network_record(&record).is_err() || record.operation_id != operation_id {
+            report.skipped_entries = report.skipped_entries.saturating_add(1);
+            continue;
+        }
+
+        let ready_to_archive = if record.terminal_boundary_reaped_at_ms.is_some() {
+            true
+        } else {
+            match recover(&record, &record_path) {
+                Ok(true) => {
+                    report.recovered = report.recovered.saturating_add(1);
+                    true
+                }
+                Ok(false) => false,
+                Err(_) => {
+                    report.skipped_entries = report.skipped_entries.saturating_add(1);
+                    false
+                }
+            }
+        };
+        if ready_to_archive {
+            match archive(&record, &record_path) {
+                Ok(true) => report.archived = report.archived.saturating_add(1),
+                Ok(false) => {}
+                Err(_) => {
+                    report.skipped_entries = report.skipped_entries.saturating_add(1);
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(target_os = "linux")]
+fn recover_pending_terminal_network_boundaries(
+    state_root: &Path,
+) -> io::Result<NetworkBoundaryRecoveryReport> {
+    visit_pending_network_boundary_recovery_with(
+        state_root,
+        |record, _| {
+            retry_and_reap_terminal_network_boundary_for_operation(
+                state_root,
+                &record.operation_id,
+                &record.source_run_id,
+            )
+        },
+        |record, _| {
+            archive_reaped_network_operation(
+                state_root,
+                &record.operation_id,
+                &record.source_run_id,
+            )
+        },
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn archive_reaped_network_operation(
+    state_root: &Path,
+    operation_id: &str,
+    expected_source_run_id: &str,
+) -> io::Result<bool> {
+    let active_root = state_root.join("network-operations");
+    let operation_root = active_root.join(operation_id);
+    match fs::symlink_metadata(&operation_root) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "reaped network operation is not a directory",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    let _operation_locks =
+        match NetworkOperationLocks::acquire(state_root, &operation_root, operation_id) {
+            Ok(locks) => locks,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+    let record_path = operation_root.join("record.json");
+    let record: NetworkOperationRecord =
+        serde_json::from_str(&read_nofollow_to_string(&record_path)?).map_err(|error| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("cannot archive reaped network operation record: {error}"),
+            )
+        })?;
+    validate_stored_network_record(&record)?;
+    if record.operation_id != operation_id
+        || record.source_run_id != expected_source_run_id
+        || record.terminal_boundary_reaped_at_ms.is_none()
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "network operation is not safe to archive",
+        ));
+    }
+
+    // Preserve the complete operation directory for forensics, but move it
+    // outside the hot recovery scan once its subject and policy are reaped.
+    let archive_root = state_root.join("network-operations-archive");
+    create_restrictive_dir_all(&archive_root)?;
+    if !fs::symlink_metadata(&archive_root)?.file_type().is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "network operation archive root is not a directory",
+        ));
+    }
+    let archived_operation_root = archive_root.join(operation_id);
+    match fs::symlink_metadata(&archived_operation_root) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Ok(_) => {
+            // Preserve both records without leaving a terminal operation in
+            // the hot recovery set forever. A collision should be exceptional
+            // for single-use operation ids, so make it explicit in the
+            // forensic name rather than overwriting either side.
+            for attempt in 0..1_024_u16 {
+                let collision_root = archive_root.join(format!(
+                    "{operation_id}.collision.{}.{}.{attempt}",
+                    record.source_run_id, record.updated_at_ms
+                ));
+                match fs::symlink_metadata(&collision_root) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        fs::rename(&operation_root, collision_root)?;
+                        return Ok(true);
+                    }
+                    Ok(_) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            return Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                "network operation archive collision namespace is exhausted",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    fs::rename(&operation_root, &archived_operation_root)?;
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn retry_and_reap_terminal_network_boundary_for_operation(
+    state_root: &Path,
+    operation_id: &str,
+    expected_source_run_id: &str,
+) -> io::Result<bool> {
+    let root = state_root.join("network-operations").join(operation_id);
+    let _operation_locks = match NetworkOperationLocks::acquire(state_root, &root, operation_id) {
+        Ok(locks) => locks,
+        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !crate::operation_supervisor::retry_terminal_operation_subject_release_at(
+        state_root,
+        operation_id,
+        expected_source_run_id,
+    )? {
+        return Ok(false);
+    }
+    reap_terminal_network_boundary_while_locked(state_root, operation_id, expected_source_run_id)
+}
+
+/// Reaps policy for one exact operation only after its durable lifecycle
+/// record says the operation is terminal and its subject has been released.
+/// A live supervisor lock or incomplete subject teardown leaves the terminal
+/// deny generation intact.
+#[cfg(target_os = "linux")]
+pub(crate) fn reap_terminal_network_boundary_for_operation(
+    state_root: &Path,
+    operation_id: &str,
+    expected_source_run_id: &str,
+) -> io::Result<bool> {
+    let root = state_root.join("network-operations").join(operation_id);
+    let record_path = root.join("record.json");
+    if !record_path.exists() {
+        return Ok(true);
+    }
+    let _operation_locks = match NetworkOperationLocks::acquire(state_root, &root, operation_id) {
+        Ok(locks) => locks,
+        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    reap_terminal_network_boundary_while_locked(state_root, operation_id, expected_source_run_id)
+}
+
+/// Reaps one exact terminal boundary while its network-supervisor lock is
+/// already held by the caller. This supports startup recovery without dropping
+/// the lock between validating the stale record and deleting its tables.
+#[cfg(target_os = "linux")]
+fn reap_terminal_network_boundary_while_locked(
+    state_root: &Path,
+    operation_id: &str,
+    expected_source_run_id: &str,
+) -> io::Result<bool> {
+    let root = state_root.join("network-operations").join(operation_id);
+    let record_path = root.join("record.json");
+    if !record_path.exists() {
+        return Ok(true);
+    }
+    let record: NetworkOperationRecord =
+        serde_json::from_str(&read_nofollow_to_string(&record_path)?).map_err(|error| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("cannot inspect terminal network operation record: {error}"),
+            )
+        })?;
+    validate_stored_network_record(&record)?;
+    if record.operation_id != operation_id || record.source_run_id != expected_source_run_id {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "terminal network boundary identity does not match the operation",
+        ));
+    }
+    if record.terminal_boundary_reaped_at_ms.is_some() {
+        return Ok(true);
+    }
+    if !crate::operation_supervisor::terminal_operation_subject_is_released_at(
+        state_root,
+        operation_id,
+        expected_source_run_id,
+    )? {
+        return Ok(false);
+    }
+    for table in terminal_boundary_table_names(&record)? {
+        gensee_crate_linux::delete_nftables_table_if_exists(&table)?;
+    }
+    mark_terminal_network_boundary_reaped(&record_path, operation_id, expected_source_run_id)?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn reap_terminal_network_boundary_for_operation(
+    _state_root: &Path,
+    _operation_id: &str,
+    _expected_source_run_id: &str,
+) -> io::Result<bool> {
+    Ok(true)
+}
+
 fn safe_network_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -2588,10 +3355,73 @@ fn open_owner_append_nofollow(path: &Path) -> io::Result<fs::File> {
     Ok(file)
 }
 
+fn append_bounded_json_line<T: Serialize>(path: &Path, value: &T, sync: bool) -> io::Result<bool> {
+    append_bounded_json_line_with_limit(path, value, sync, MAX_NETWORK_EVIDENCE_LOG_BYTES)
+}
+
+fn append_bounded_json_line_with_limit<T: Serialize>(
+    path: &Path,
+    value: &T,
+    sync: bool,
+    max_bytes: u64,
+) -> io::Result<bool> {
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    if max_bytes == 0 || line.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "network evidence record exceeds its bounded log size",
+        ));
+    }
+    let mut rotated = false;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "network evidence log is not a regular non-symlink file",
+                ));
+            }
+            if metadata.len().saturating_add(line.len() as u64) > max_bytes {
+                let file_name = path.file_name().ok_or_else(|| {
+                    io::Error::new(ErrorKind::InvalidInput, "network evidence path has no name")
+                })?;
+                let mut rotated_name = file_name.to_os_string();
+                rotated_name.push(".1");
+                fs::rename(path, path.with_file_name(rotated_name))?;
+                rotated = true;
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut file = open_owner_append_nofollow(path)?;
+    file.write_all(&line)?;
+    if sync {
+        file.sync_data()?;
+    }
+    Ok(rotated)
+}
+
 fn network_plan_for_record(
     record: &NetworkOperationRecord,
 ) -> io::Result<gensee_crate_linux::LinuxNetworkEnforcementPlan> {
     let session = format!("{}_{}", record.operation_id, record.generation);
+    network_plan_for_record_with_session(record, session)
+}
+
+fn terminal_deny_plan_for_record(
+    record: &NetworkOperationRecord,
+) -> io::Result<gensee_crate_linux::LinuxNetworkEnforcementPlan> {
+    let mut terminal = record.clone();
+    terminal.envelope.grants.clear();
+    network_plan_for_record_with_session(&terminal, format!("{}_terminal", record.operation_id))
+}
+
+fn network_plan_for_record_with_session(
+    record: &NetworkOperationRecord,
+    session: String,
+) -> io::Result<gensee_crate_linux::LinuxNetworkEnforcementPlan> {
     let mut config = gensee_crate_linux::LinuxNetworkEnforcementConfig::new(
         session,
         gensee_crate_linux::LinuxNetworkPolicy {
@@ -2776,6 +3606,9 @@ mod tests {
                 active_table_name: None,
                 generation: 0,
                 usage: OperationNetworkUsage::default(),
+                suppressed_fault_count: 0,
+                evidence_rotation_count: BTreeMap::new(),
+                terminal_boundary_reaped_at_ms: None,
                 counter_snapshot: BTreeMap::new(),
                 revoked_http_mediator_leases: BTreeSet::new(),
                 http_mediator_lease_id: None,
@@ -2799,7 +3632,319 @@ mod tests {
             attempt_monitor: None,
             #[cfg(any(target_os = "linux", test))]
             observed_attempt_traces: BTreeSet::new(),
+            #[cfg(any(target_os = "linux", test))]
+            observed_attempt_trace_order: VecDeque::new(),
+            #[cfg(any(target_os = "linux", test))]
+            fault_rate_window_started_at_ms: 1,
+            #[cfg(any(target_os = "linux", test))]
+            detailed_faults_in_window: 0,
+            #[cfg(any(target_os = "linux", test))]
+            fault_rate_violation_recorded_in_window: false,
+            #[cfg(any(target_os = "linux", test))]
+            dedupe_eviction_recorded: false,
         }))
+    }
+
+    #[test]
+    fn in_flight_connection_limit_releases_capacity_on_drop() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let first = try_acquire_connection(&in_flight, 1).expect("first connection is admitted");
+        assert!(try_acquire_connection(&in_flight, 1).is_none());
+        drop(first);
+        assert!(try_acquire_connection(&in_flight, 1).is_some());
+    }
+
+    #[test]
+    fn terminal_cleanup_generation_is_deny_only_and_deterministic() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-terminal-cleanup-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let mut record = lock_supervisor(&supervisor).unwrap().record.clone();
+        record
+            .envelope
+            .grants
+            .push(gensee_crate_rules::network_boundary::NetworkEndpointGrant {
+                destination: "8.8.8.8".to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![443],
+                expires_at_ms: None,
+                lease_id: None,
+            });
+        let normal = network_plan_for_record(&record).unwrap().nftables;
+        let terminal = terminal_deny_plan_for_record(&record).unwrap().nftables;
+        assert_ne!(terminal.table_name, normal.table_name);
+        assert!(terminal.table_name.contains("terminal"));
+        assert!(terminal.destinations.is_empty());
+        assert!(terminal.endpoint_counters.is_empty());
+        assert!(terminal
+            .block_counters
+            .iter()
+            .any(|counter| counter.reason
+                == gensee_crate_linux::LinuxNetworkBlockReason::DefaultReject));
+        assert_eq!(
+            terminal,
+            terminal_deny_plan_for_record(&record).unwrap().nftables
+        );
+        record.active_table_name = Some(normal.table_name.clone());
+        assert_eq!(
+            terminal_boundary_table_names(&record).unwrap(),
+            BTreeSet::from([normal.table_name, terminal.table_name])
+        );
+    }
+
+    #[test]
+    fn standalone_boundary_cleanup_finishes_the_operation_it_owns() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-owned-lifecycle-test-{}",
+            Uuid::new_v4()
+        ));
+        let operation_root = root.join("operation-state");
+        let mut operation = OperationSupervisor::prepare_external_subject_at(
+            &operation_root,
+            "op_1",
+            "run_1",
+            "network_boundary",
+            OperationCapabilityEnvelope::default(),
+        )
+        .unwrap();
+        operation.activate_external_subject().unwrap();
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        {
+            let mut state = lock_supervisor(&supervisor).unwrap();
+            state.operation = Some(operation);
+        }
+        let terminal_deny_plan = {
+            let state = lock_supervisor(&supervisor).unwrap();
+            terminal_deny_plan_for_record(&state.record)
+                .unwrap()
+                .nftables
+        };
+        let cleanup = NetworkRuntimeCleanup {
+            supervisor: Arc::clone(&supervisor),
+            owns_operation_lifecycle: true,
+            table_names: Arc::new(Mutex::new(Vec::new())),
+            terminal_deny_plan,
+            state_root: operation_root.clone(),
+            record_path: root.join("record.json"),
+            operation_id: "op_1".to_string(),
+            source_run_id: "run_1".to_string(),
+            dry_run: true,
+        };
+
+        drop(cleanup);
+
+        let record: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(operation_root.join("operations/op_1/record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["state"], "failed");
+        assert!(record["exit_code"].is_null());
+        assert!(record["finished_at_ms"].is_number());
+        assert!(record["cgroup"]["path"].as_str().unwrap().is_empty());
+        assert_eq!(record["violations"].as_array().unwrap().len(), 0);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn startup_recovery_skips_invalid_entries_and_archives_every_valid_reaped_operation() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-recovery-sweep-test-{}",
+            Uuid::new_v4()
+        ));
+        let network_root = root.join("network-operations");
+        fs::create_dir_all(&network_root).unwrap();
+        let template_root = root.join("template");
+        let template = lock_supervisor(&test_supervisor(
+            &template_root,
+            NetworkBoundaryPolicy::default(),
+        ))
+        .unwrap()
+        .record
+        .clone();
+
+        for (operation_id, reaped_at, schema_version) in [
+            ("op_zgood", None, NETWORK_SUPERVISOR_SCHEMA_VERSION),
+            ("op_reaped", Some(1), NETWORK_SUPERVISOR_SCHEMA_VERSION),
+            ("op_abad", None, NETWORK_SUPERVISOR_SCHEMA_VERSION - 1),
+        ] {
+            let operation_root = network_root.join(operation_id);
+            fs::create_dir_all(&operation_root).unwrap();
+            let mut record = template.clone();
+            record.schema_version = schema_version;
+            record.operation_id = operation_id.to_string();
+            record.source_run_id = format!("run_{operation_id}");
+            record.active_table_name = Some(format!("gensee_{operation_id}"));
+            record.terminal_boundary_reaped_at_ms = reaped_at;
+            write_atomic_nofollow(
+                &operation_root.join("record.json"),
+                &serde_json::to_vec_pretty(&record).unwrap(),
+                0o600,
+            )
+            .unwrap();
+        }
+        let preexisting_archive = root.join("network-operations-archive/op_reaped");
+        fs::create_dir_all(&preexisting_archive).unwrap();
+        fs::write(preexisting_archive.join("sentinel"), "preserve me").unwrap();
+
+        let mut visited = Vec::new();
+        let report = visit_pending_network_boundary_recovery_with(
+            &root,
+            |record, record_path| {
+                visited.push(record.operation_id.clone());
+                mark_terminal_network_boundary_reaped(
+                    record_path,
+                    &record.operation_id,
+                    &record.source_run_id,
+                )?;
+                Ok(true)
+            },
+            |record, _| {
+                archive_reaped_network_operation(&root, &record.operation_id, &record.source_run_id)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report,
+            NetworkBoundaryRecoveryReport {
+                recovered: 1,
+                archived: 2,
+                skipped_entries: 1,
+            }
+        );
+        assert_eq!(visited, vec!["op_zgood"]);
+        assert!(network_root.join("op_abad/record.json").is_file());
+        assert!(!network_root.join("op_zgood").exists());
+        assert!(!network_root.join("op_reaped").exists());
+        let archive_root = root.join("network-operations-archive");
+        assert!(archive_root.join("op_zgood/record.json").is_file());
+        assert_eq!(
+            fs::read_to_string(archive_root.join("op_reaped/sentinel")).unwrap(),
+            "preserve me"
+        );
+        let collision = fs::read_dir(&archive_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("op_reaped.collision.run_op_reaped.")
+            })
+            .expect("colliding terminal record should be preserved under a unique forensic name");
+        assert!(collision.path().join("record.json").is_file());
+        assert!(root
+            .join("network-operation-locks/op_reaped.lock")
+            .is_file());
+        let stale: NetworkOperationRecord = serde_json::from_str(
+            &fs::read_to_string(archive_root.join("op_zgood/record.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(stale.terminal_boundary_reaped_at_ms.is_some());
+        assert!(stale.active_table_name.is_none());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stable_identity_lock_excludes_archival_across_directory_rename() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-archive-lock-test-{}",
+            Uuid::new_v4()
+        ));
+        let operation_id = "op_locked";
+        let source_run_id = "run_locked";
+        let operation_root = root.join("network-operations").join(operation_id);
+        fs::create_dir_all(&operation_root).unwrap();
+        let template_root = root.join("template");
+        let mut record = lock_supervisor(&test_supervisor(
+            &template_root,
+            NetworkBoundaryPolicy::default(),
+        ))
+        .unwrap()
+        .record
+        .clone();
+        record.operation_id = operation_id.to_string();
+        record.source_run_id = source_run_id.to_string();
+        record.active_table_name = None;
+        record.terminal_boundary_reaped_at_ms = Some(1);
+        write_atomic_nofollow(
+            &operation_root.join("record.json"),
+            &serde_json::to_vec_pretty(&record).unwrap(),
+            0o600,
+        )
+        .unwrap();
+
+        let identity_lock = NetworkOperationLock::acquire(
+            &network_operation_identity_lock_path(&root, operation_id).unwrap(),
+        )
+        .unwrap();
+        assert!(!archive_reaped_network_operation(&root, operation_id, source_run_id).unwrap());
+        assert!(operation_root.is_dir());
+        drop(identity_lock);
+
+        assert!(archive_reaped_network_operation(&root, operation_id, source_run_id).unwrap());
+        assert!(!operation_root.exists());
+        assert!(root
+            .join("network-operations-archive/op_locked/record.json")
+            .is_file());
+        assert!(!archive_reaped_network_operation(&root, operation_id, source_run_id).unwrap());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn inspect_response_surfaces_informational_recovery_health() {
+        let response = NetworkSupervisorResponse {
+            ok: true,
+            decision: None,
+            resolution: None,
+            record: None,
+            operation_recovery_health: Some(OperationRecoveryHealth {
+                network_entries_skipped: 3,
+            }),
+            error: None,
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            value["operation_recovery_health"]["network_entries_skipped"],
+            3
+        );
+    }
+
+    #[test]
+    fn startup_recovery_skip_count_is_informational_on_the_current_operation() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-recovery-report-test-{}",
+            Uuid::new_v4()
+        ));
+        let mut operation = OperationSupervisor::prepare_external_subject_at(
+            &root,
+            "op_current",
+            "run_current",
+            "network_boundary",
+            OperationCapabilityEnvelope::default(),
+        )
+        .unwrap();
+
+        record_network_boundary_recovery_report(
+            &mut operation,
+            NetworkBoundaryRecoveryReport {
+                skipped_entries: 2,
+                ..NetworkBoundaryRecoveryReport::default()
+            },
+        )
+        .unwrap();
+        let attestation = operation.attestation().unwrap();
+        assert!(attestation.violations.is_empty());
+        assert_eq!(operation.network_recovery_skipped_entry_count().unwrap(), 2);
+        let persisted: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("operations/op_current/record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["network_recovery_skipped_entry_count"], 2);
+        drop(operation);
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -2821,6 +3966,81 @@ mod tests {
         ] {
             assert!(!client_header_is_forwarded(stripped));
         }
+    }
+
+    #[test]
+    fn numeric_loopback_url_forms_normalize_before_boundary_authorization() {
+        for authority in ["2130706433", "0x7f000001", "017700000001"] {
+            let request =
+                format!("GET http://{authority}/artifact HTTP/1.1\r\nHost: ignored.test\r\n\r\n");
+            let parsed = parse_proxy_request_bytes(request.as_bytes()).unwrap();
+            assert_eq!(
+                parsed.url.host_str(),
+                Some("127.0.0.1"),
+                "numeric host form {authority} was not canonicalized"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_audience_is_origin_port_and_path_segment_exact() {
+        let credential = HttpCredentialInjection {
+            handle_id: "credential_1".to_string(),
+            header_name: "Authorization".to_string(),
+            value_file: "/not/read/by-this-test".to_string(),
+            allowed_url_prefixes: vec!["https://artifacts.example:8443/repository".to_string()],
+        };
+        for allowed in [
+            "https://artifacts.example:8443/repository",
+            "https://artifacts.example:8443/repository/item",
+        ] {
+            assert!(credential_applies_to_url(
+                &credential,
+                &Url::parse(allowed).unwrap()
+            ));
+        }
+        for outside in [
+            "https://artifacts.example/repository/item",
+            "http://artifacts.example:8443/repository/item",
+            "https://artifacts.example:8443/repository-evil/item",
+            "https://artifacts.example.evil:8443/repository/item",
+        ] {
+            assert!(
+                !credential_applies_to_url(&credential, &Url::parse(outside).unwrap()),
+                "credential escaped to {outside}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_restricted_dns_answer_denies_the_entire_brokered_effect() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let supervisor = test_supervisor(
+            &root,
+            NetworkBoundaryPolicy {
+                http_gateway_available: true,
+                ..NetworkBoundaryPolicy::default()
+            },
+        );
+        let result = authorize_mediated_http_addresses(
+            &supervisor,
+            "GET",
+            &Url::parse("https://artifacts.example/object").unwrap(),
+            "sha256:test-request",
+            None,
+            vec![
+                SocketAddr::from(([8, 8, 8, 8], 443)),
+                SocketAddr::from(([127, 0, 0, 1], 443)),
+            ],
+        );
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied
+        ));
+        let effects = fs::read_to_string(root.join("effects.jsonl")).unwrap();
+        assert_eq!(effects.lines().count(), 2);
+        assert!(effects.contains("http_effect_has_trusted_mediator"));
+        assert!(effects.contains("restricted_destination"));
     }
 
     #[test]
@@ -2880,6 +4100,56 @@ mod tests {
         symlink(&target, &link).unwrap();
         assert!(open_owner_append_nofollow(&link).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn network_evidence_log_rotates_at_its_hard_size_bound() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("effects.jsonl");
+        let first = serde_json::json!({"record": "a".repeat(32)});
+        let second = serde_json::json!({"record": "b".repeat(32)});
+        assert!(!append_bounded_json_line_with_limit(&path, &first, false, 64).unwrap());
+        assert!(append_bounded_json_line_with_limit(&path, &second, false, 64).unwrap());
+        assert!(fs::read_to_string(root.join("effects.jsonl.1"))
+            .unwrap()
+            .contains(&"a".repeat(32)));
+        assert!(fs::read_to_string(&path).unwrap().contains(&"b".repeat(32)));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn evidence_rotation_is_explicit_in_network_and_operation_records() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let operation_root = root.join("trusted-operation-state");
+        fs::create_dir_all(&operation_root).unwrap();
+        let operation = OperationSupervisor::prepare_at(
+            &operation_root,
+            "op_1",
+            "run_1",
+            "network_boundary",
+            OperationCapabilityEnvelope::default(),
+            None,
+        )
+        .unwrap();
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let mut state = supervisor.lock().unwrap();
+        state.operation = Some(operation);
+        state.record_evidence_rotation("effects").unwrap();
+        assert_eq!(
+            state.record.evidence_rotation_count.get("effects"),
+            Some(&1)
+        );
+        let attestation = state.operation.as_mut().unwrap().attestation().unwrap();
+        assert!(attestation.violations.iter().any(|violation| {
+            violation.kind == "network_evidence_log_rotated"
+                && violation.detail.contains("effects evidence")
+        }));
+        drop(state);
+        let persisted: NetworkOperationRecord =
+            serde_json::from_str(&fs::read_to_string(root.join("record.json")).unwrap()).unwrap();
+        assert_eq!(persisted.evidence_rotation_count.get("effects"), Some(&1));
         fs::remove_dir_all(root).ok();
     }
 
@@ -2986,7 +4256,11 @@ mod tests {
     fn in_place_lease_is_attached_then_removed_on_expiry() {
         let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
         let policy = NetworkBoundaryPolicy {
-            in_place_lease_destinations: vec!["8.8.8.8".to_string()],
+            in_place_lease_scopes: vec![gensee_crate_rules::network_boundary::NetworkLeaseScope {
+                destination: "8.8.8.8".to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![443],
+            }],
             ..NetworkBoundaryPolicy::default()
         };
         let supervisor = test_supervisor(&root, policy);
@@ -3023,7 +4297,11 @@ mod tests {
     fn generic_network_fault_retries_only_after_a_scoped_lease_is_active() {
         let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
         let policy = NetworkBoundaryPolicy {
-            in_place_lease_destinations: vec!["8.8.8.8".to_string()],
+            in_place_lease_scopes: vec![gensee_crate_rules::network_boundary::NetworkLeaseScope {
+                destination: "8.8.8.8".to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![443],
+            }],
             ..NetworkBoundaryPolicy::default()
         };
         let supervisor = test_supervisor(&root, policy);
@@ -3056,10 +4334,60 @@ mod tests {
     }
 
     #[test]
+    fn fault_outside_the_exact_port_scope_cannot_trigger_authority_growth() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let policy = NetworkBoundaryPolicy {
+            in_place_lease_scopes: vec![gensee_crate_rules::network_boundary::NetworkLeaseScope {
+                destination: "8.8.8.8".to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![443],
+            }],
+            ..NetworkBoundaryPolicy::default()
+        };
+        let supervisor = test_supervisor(&root, policy);
+        let mut state = supervisor.lock().unwrap();
+        state.record.root_pid = None;
+        state.record.source_address = Some("10.88.0.12".to_string());
+        let fault = CapabilityFault {
+            schema_version: gensee_crate_rules::capability_fault::CAPABILITY_FAULT_SCHEMA_VERSION,
+            fault_id: "fault_network_wrong_port".to_string(),
+            operation_id: "op_1".to_string(),
+            source_run_id: "run_1".to_string(),
+            subject: CapabilityFaultSubject::NetworkPeer {
+                source_address: "10.88.0.12".to_string(),
+            },
+            effect: BoundaryEffectObservation::NetworkConnect {
+                destination: "8.8.8.8".to_string(),
+                protocol: "tcp".to_string(),
+                port: 8443,
+            },
+            requested_ttl_seconds: 5,
+            observed_at_ms: 1,
+        };
+        let (resolution, effect) = state
+            .resolve_fault(&fault, &Arc::new(Mutex::new(Vec::new())))
+            .unwrap();
+        assert_eq!(resolution.action, CapabilityFaultAction::Deny);
+        assert!(!resolution.retry_allowed);
+        assert!(resolution.lease_id.is_none());
+        assert!(state.record.envelope.grants.is_empty());
+        let effect = effect.expect("denied attempts remain in effect evidence");
+        assert_eq!(
+            effect.decision.disposition,
+            NetworkBoundaryDisposition::Deny
+        );
+        assert!(effect.decision.lease.is_none());
+    }
+
+    #[test]
     fn kernel_observed_unknown_endpoint_becomes_one_typed_fault_and_scoped_lease() {
         let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
         let policy = NetworkBoundaryPolicy {
-            in_place_lease_destinations: vec!["8.8.8.8".to_string()],
+            in_place_lease_scopes: vec![gensee_crate_rules::network_boundary::NetworkLeaseScope {
+                destination: "8.8.8.8".to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![443],
+            }],
             ..NetworkBoundaryPolicy::default()
         };
         let supervisor = test_supervisor(&root, policy);
@@ -3117,6 +4445,94 @@ mod tests {
         let faults = fs::read_to_string(root.join("faults.jsonl")).unwrap();
         assert!(faults.contains("restricted_destination"));
         assert!(faults.contains("\"retry_allowed\":false"));
+    }
+
+    #[test]
+    fn kernel_attempt_evidence_and_deduplication_are_bounded_under_flood() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let mut state = supervisor.lock().unwrap();
+        state.record.root_pid = None;
+        state.record.source_address = Some("10.88.0.12".to_string());
+        // A future synthetic boundary makes this test independent of host
+        // scheduling and guarantees one deterministic rate window.
+        state.fault_rate_window_started_at_ms = u64::MAX;
+        let attempts = (0..=MAX_OBSERVED_ATTEMPT_TRACES)
+            .map(|index| gensee_crate_linux::LinuxNetworkAttemptEvent {
+                trace_id: format!("trace_flood_{index}"),
+                table_name: "gensee_op_1_hash_1".to_string(),
+                chain_name: "egress".to_string(),
+                destination: "127.0.0.1".to_string(),
+                protocol: gensee_crate_linux::LinuxNetworkProtocol::Tcp,
+                port: 8080,
+            })
+            .collect();
+        state
+            .process_kernel_network_attempts(attempts, 0, false, &Arc::new(Mutex::new(Vec::new())))
+            .unwrap();
+        assert_eq!(
+            state.observed_attempt_traces.len(),
+            MAX_OBSERVED_ATTEMPT_TRACES
+        );
+        assert_eq!(
+            state.observed_attempt_trace_order.len(),
+            MAX_OBSERVED_ATTEMPT_TRACES
+        );
+        assert!(state.dedupe_eviction_recorded);
+        assert_eq!(
+            state.record.suppressed_fault_count,
+            (MAX_OBSERVED_ATTEMPT_TRACES + 1 - MAX_DETAILED_FAULTS_PER_SECOND as usize) as u64
+        );
+        let suppressed_fault_count = state.record.suppressed_fault_count;
+        drop(state);
+        let persisted: NetworkOperationRecord =
+            serde_json::from_str(&fs::read_to_string(root.join("record.json")).unwrap()).unwrap();
+        assert_eq!(persisted.suppressed_fault_count, suppressed_fault_count);
+        assert_eq!(
+            fs::read_to_string(root.join("faults.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            MAX_DETAILED_FAULTS_PER_SECOND as usize
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("effects.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            MAX_DETAILED_FAULTS_PER_SECOND as usize
+        );
+    }
+
+    #[test]
+    fn sensor_loss_records_violations_without_inventing_endpoint_authority() {
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let operation_root = root.join("trusted-operation-state");
+        fs::create_dir_all(&operation_root).unwrap();
+        let operation = OperationSupervisor::prepare_at(
+            &operation_root,
+            "op_1",
+            "run_1",
+            "hidden_path_test",
+            OperationCapabilityEnvelope::default(),
+            None,
+        )
+        .unwrap();
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let mut state = supervisor.lock().unwrap();
+        state.operation = Some(operation);
+        state
+            .process_kernel_network_attempts(Vec::new(), 7, true, &Arc::new(Mutex::new(Vec::new())))
+            .unwrap();
+        assert!(state.record.envelope.grants.is_empty());
+        let attestation = state.operation.as_mut().unwrap().attestation().unwrap();
+        let violation_kinds = attestation
+            .violations
+            .iter()
+            .map(|violation| violation.kind.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(violation_kinds.contains("network_attempt_event_loss"));
+        assert!(violation_kinds.contains("network_attempt_sensor_stopped"));
     }
 
     #[test]
@@ -3323,6 +4739,84 @@ mod tests {
         assert!(effects.contains("credential_handle_1"));
         assert!(!effects.contains("super-secret-value"));
         assert!(!effects.contains("do-not-log"));
+    }
+
+    #[test]
+    fn client_headers_do_not_cross_redirect_origins() {
+        let redirected = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirected_address = redirected.local_addr().unwrap();
+        let redirected_worker = thread::spawn(move || {
+            let (mut stream, _) = redirected.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            String::from_utf8_lossy(&request[..count]).to_string()
+        });
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_worker = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{redirected_address}/artifact\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request[..count]).to_string()
+        });
+
+        let root = env::temp_dir().join(format!("gensee-network-test-{}", Uuid::new_v4()));
+        let policy = NetworkBoundaryPolicy {
+            http_gateway_available: true,
+            ..NetworkBoundaryPolicy::default()
+        };
+        let supervisor = test_supervisor(&root, policy);
+        {
+            let mut state = supervisor.lock().unwrap();
+            for address in [origin_address, redirected_address] {
+                state.record.envelope.grants.push(
+                    gensee_crate_rules::network_boundary::NetworkEndpointGrant {
+                        destination: address.ip().to_string(),
+                        protocol: NetworkProtocol::Tcp,
+                        ports: vec![address.port()],
+                        expires_at_ms: None,
+                        lease_id: None,
+                    },
+                );
+            }
+        }
+        let response = execute_mediated_http(
+            ParsedProxyRequest {
+                method: "GET".to_string(),
+                url: Url::parse(&format!("http://{origin_address}/artifact")).unwrap(),
+                headers: vec![("X-Private-Context".to_string(), "secret".to_string())],
+                declared_body_bytes: 0,
+                body: Vec::new(),
+            },
+            supervisor,
+            &HttpGatewayConfig {
+                listen: "127.0.0.1:0".to_string(),
+                client_address: "127.0.0.1".to_string(),
+                max_request_bytes: 1024,
+                max_response_bytes: 1024,
+                max_redirects: 1,
+                connect_timeout_seconds: 1,
+                io_timeout_seconds: 1,
+                lease_id: None,
+                expires_at_ms: None,
+                credential: None,
+                gateway_id: None,
+                commit_token_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        let first_request = origin_worker.join().unwrap().to_ascii_lowercase();
+        let second_request = redirected_worker.join().unwrap().to_ascii_lowercase();
+        assert!(first_request.contains("x-private-context: secret"));
+        assert!(!second_request.contains("x-private-context"));
     }
 
     #[test]

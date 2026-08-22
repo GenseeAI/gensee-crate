@@ -14,6 +14,8 @@ const PROCESS_EVENT_EXIT: u32 = 0x8000_0000;
 const NETLINK_MESSAGE_OVERRUN: u16 = 4;
 #[cfg(target_os = "linux")]
 const MAX_DATAGRAMS_PER_DRAIN: usize = 1_024;
+#[cfg(target_os = "linux")]
+const MAX_REJECTED_NETLINK_DATAGRAMS: u64 = 32;
 
 /// A loss-detecting process lifecycle event emitted by the Linux process
 /// connector. PIDs are from the initial PID namespace, matching Podman's
@@ -62,6 +64,10 @@ pub struct LinuxProcessEventSensor {
     fd: std::os::fd::RawFd,
     #[cfg(target_os = "linux")]
     port_id: u32,
+    #[cfg(target_os = "linux")]
+    // Lifetime-cumulative by design: a correctly addressed non-kernel
+    // datagram is integrity-attack evidence, not routine transient noise.
+    rejected_sender_count: u64,
 }
 
 impl LinuxProcessEventSensor {
@@ -89,7 +95,7 @@ impl LinuxProcessEventSensor {
         }
         #[cfg(target_os = "linux")]
         {
-            platform::drain_events(self.fd)
+            platform::drain_events(self.fd, &mut self.rejected_sender_count)
         }
     }
 }
@@ -249,6 +255,12 @@ mod platform {
     const SUBSCRIPTION_SEQUENCE: u32 = 1;
     const RECEIVE_BUFFER_BYTES: libc::c_int = 4 * 1024 * 1024;
     const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(1);
+    const NETLINK_PORT_BIND_ATTEMPTS: usize = 8;
+
+    enum ReceivedDatagram {
+        Kernel(Vec<u8>),
+        RejectedSender,
+    }
 
     pub(super) fn open_sensor() -> io::Result<LinuxProcessEventSensor> {
         let fd = unsafe {
@@ -277,25 +289,48 @@ mod platform {
             let mut local: libc::sockaddr_nl = unsafe { mem::zeroed() };
             local.nl_family = libc::AF_NETLINK as libc::sa_family_t;
             local.nl_groups = CONNECTOR_INDEX_PROCESS;
-            let bound = unsafe {
-                libc::bind(
-                    fd,
-                    &local as *const _ as *const libc::sockaddr,
-                    mem::size_of_val(&local) as libc::socklen_t,
-                )
-            };
-            if bound < 0 {
-                return Err(io::Error::last_os_error());
+            // Do not expose the host process ID as the netlink address. A
+            // randomized nonzero port id makes blind cross-operation spoofing
+            // materially harder while kernel provenance remains nl_pid == 0.
+            let mut requested_port_id = None;
+            for attempt in 0..NETLINK_PORT_BIND_ATTEMPTS {
+                let candidate = random_netlink_port_id()?;
+                local.nl_pid = candidate;
+                let bound = unsafe {
+                    libc::bind(
+                        fd,
+                        &local as *const _ as *const libc::sockaddr,
+                        mem::size_of_val(&local) as libc::socklen_t,
+                    )
+                };
+                if bound == 0 {
+                    requested_port_id = Some(candidate);
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AddrInUse
+                    || attempt + 1 == NETLINK_PORT_BIND_ATTEMPTS
+                {
+                    return Err(error);
+                }
             }
+            let requested_port_id = requested_port_id.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "could not reserve a randomized process-connector port id",
+                )
+            })?;
             let mut length = mem::size_of_val(&local) as libc::socklen_t;
             let named = unsafe {
                 libc::getsockname(fd, &mut local as *mut _ as *mut libc::sockaddr, &mut length)
             };
-            if named < 0 || local.nl_pid == 0 {
+            if named < 0 || local.nl_pid != requested_port_id {
                 return Err(if named < 0 {
                     io::Error::last_os_error()
                 } else {
-                    io::Error::other("kernel did not assign a process-connector port id")
+                    io::Error::other(
+                        "kernel process-connector port id differs from the requested address",
+                    )
                 });
             }
             send_subscription(
@@ -304,10 +339,12 @@ mod platform {
                 PROCESS_MULTICAST_LISTEN,
                 SUBSCRIPTION_SEQUENCE,
             )?;
-            wait_for_subscription_ack(fd, SUBSCRIPTION_SEQUENCE)?;
+            let mut rejected_sender_count = 0;
+            wait_for_subscription_ack(fd, SUBSCRIPTION_SEQUENCE, &mut rejected_sender_count)?;
             Ok(LinuxProcessEventSensor {
                 fd,
                 port_id: local.nl_pid,
+                rejected_sender_count,
             })
         })();
         if result.is_err() {
@@ -316,11 +353,21 @@ mod platform {
         result
     }
 
-    pub(super) fn drain_events(fd: RawFd) -> io::Result<Vec<LinuxProcessEvent>> {
+    pub(super) fn drain_events(
+        fd: RawFd,
+        rejected_sender_count: &mut u64,
+    ) -> io::Result<Vec<LinuxProcessEvent>> {
         let mut events = Vec::new();
         for _ in 0..MAX_DATAGRAMS_PER_DRAIN {
-            let Some(data) = receive_datagram(fd)? else {
+            let Some(datagram) = receive_datagram(fd)? else {
                 return Ok(events);
+            };
+            let data = match datagram {
+                ReceivedDatagram::Kernel(data) => data,
+                ReceivedDatagram::RejectedSender => {
+                    register_rejected_sender(rejected_sender_count)?;
+                    continue;
+                }
             };
             for message in parse_connector_datagram(&data)? {
                 if let Some(error) = message.acknowledgement_error {
@@ -340,7 +387,11 @@ mod platform {
         ))
     }
 
-    fn wait_for_subscription_ack(fd: RawFd, expected_sequence: u32) -> io::Result<()> {
+    fn wait_for_subscription_ack(
+        fd: RawFd,
+        expected_sequence: u32,
+        rejected_sender_count: &mut u64,
+    ) -> io::Result<()> {
         let deadline = Instant::now() + SUBSCRIPTION_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -367,8 +418,15 @@ mod platform {
             if polled == 0 {
                 continue;
             }
-            let Some(data) = receive_datagram(fd)? else {
+            let Some(datagram) = receive_datagram(fd)? else {
                 continue;
+            };
+            let data = match datagram {
+                ReceivedDatagram::Kernel(data) => data,
+                ReceivedDatagram::RejectedSender => {
+                    register_rejected_sender(rejected_sender_count)?;
+                    continue;
+                }
             };
             for message in parse_connector_datagram(&data)? {
                 if message.sequence == expected_sequence && message.acknowledgement == 1 {
@@ -389,18 +447,30 @@ mod platform {
         }
     }
 
-    fn receive_datagram(fd: RawFd) -> io::Result<Option<Vec<u8>>> {
+    fn receive_datagram(fd: RawFd) -> io::Result<Option<ReceivedDatagram>> {
         let mut buffer = vec![0u8; 64 * 1024];
         let received = loop {
+            let mut source: libc::sockaddr_nl = unsafe { mem::zeroed() };
+            let mut source_len = mem::size_of_val(&source) as libc::socklen_t;
             let received = unsafe {
-                libc::recv(
+                libc::recvfrom(
                     fd,
                     buffer.as_mut_ptr() as *mut libc::c_void,
                     buffer.len(),
                     libc::MSG_DONTWAIT,
+                    &mut source as *mut _ as *mut libc::sockaddr,
+                    &mut source_len,
                 )
             };
             if received >= 0 {
+                // NETLINK_CONNECTOR multicast and acknowledgement messages
+                // are kernel-authored only when sockaddr_nl.nl_pid is zero.
+                // Local processes can unicast to this sensor's public port id,
+                // so parsing before checking provenance would let them forge
+                // process lineage or stop the sensor with a fake error ack.
+                if !kernel_netlink_sender(&source, source_len) {
+                    return Ok(Some(ReceivedDatagram::RejectedSender));
+                }
                 break received;
             }
             let error = io::Error::last_os_error();
@@ -419,7 +489,68 @@ mod platform {
             ));
         }
         buffer.truncate(received as usize);
-        Ok(Some(buffer))
+        Ok(Some(ReceivedDatagram::Kernel(buffer)))
+    }
+
+    pub(super) fn kernel_netlink_sender(
+        source: &libc::sockaddr_nl,
+        source_len: libc::socklen_t,
+    ) -> bool {
+        source_len as usize >= mem::size_of::<libc::sockaddr_nl>()
+            && source.nl_family == libc::AF_NETLINK as libc::sa_family_t
+            && source.nl_pid == 0
+    }
+
+    pub(super) fn register_rejected_sender(rejected_sender_count: &mut u64) -> io::Result<()> {
+        // Do not decay this counter: every correctly addressed userspace
+        // datagram demonstrates knowledge of the random socket address and is
+        // therefore cumulative evidence that telemetry integrity is at risk.
+        *rejected_sender_count = rejected_sender_count.saturating_add(1);
+        if *rejected_sender_count >= MAX_REJECTED_NETLINK_DATAGRAMS {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "process-connector rejected {} non-kernel datagrams; telemetry integrity is compromised",
+                    *rejected_sender_count
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn random_netlink_port_id() -> io::Result<u32> {
+        loop {
+            let mut bytes = [0u8; mem::size_of::<u32>()];
+            let mut filled = 0;
+            while filled < bytes.len() {
+                let received = unsafe {
+                    libc::getrandom(
+                        bytes.as_mut_ptr().add(filled) as *mut libc::c_void,
+                        bytes.len() - filled,
+                        0,
+                    )
+                };
+                if received < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if received == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "kernel randomness returned no netlink port-id bytes",
+                    ));
+                }
+                filled += received as usize;
+            }
+            let port_id = u32::from_ne_bytes(bytes);
+            if port_id != 0 {
+                return Ok(port_id);
+            }
+        }
     }
 
     fn send_subscription(fd: RawFd, port_id: u32, operation: u32, sequence: u32) -> io::Result<()> {
@@ -582,5 +713,35 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("event loss"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepts_only_kernel_netlink_provenance() {
+        let mut source: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        source.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        let full_len = std::mem::size_of_val(&source) as libc::socklen_t;
+        assert!(platform::kernel_netlink_sender(&source, full_len));
+
+        source.nl_pid = 42;
+        assert!(!platform::kernel_netlink_sender(&source, full_len));
+        source.nl_pid = 0;
+        source.nl_family = libc::AF_INET as libc::sa_family_t;
+        assert!(!platform::kernel_netlink_sender(&source, full_len));
+        source.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        assert!(!platform::kernel_netlink_sender(&source, full_len - 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forged_netlink_senders_are_counted_before_failing_closed() {
+        let mut rejected = 0;
+        for expected in 1..MAX_REJECTED_NETLINK_DATAGRAMS {
+            platform::register_rejected_sender(&mut rejected).unwrap();
+            assert_eq!(rejected, expected);
+        }
+        let error = platform::register_rejected_sender(&mut rejected).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains(&rejected.to_string()));
     }
 }

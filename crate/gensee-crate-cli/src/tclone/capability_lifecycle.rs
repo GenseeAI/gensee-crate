@@ -215,7 +215,10 @@ pub(crate) fn attest_parent_for_live_fork(
         || attestation.root_pid != Some(expected_root_pid)
         || attestation.root_start_time_ticks.is_none()
         || !attestation.root_identity_active
-        || attestation.boundary_effect_count != 0
+        || !boundary_effect_history_is_fork_clean(
+            attestation.boundary_effect_count,
+            attestation.denied_boundary_effect_count,
+        )
         || !attestation.violations.is_empty()
         || !attestation.envelope.leases.is_empty()
         || !attestation
@@ -339,7 +342,10 @@ pub(crate) fn attest_live_fork_for_promotion(
         || parent_attestation.root_pid != Some(expected_parent_root_pid)
         || parent_attestation.root_start_time_ticks.is_none()
         || !parent_attestation.root_identity_active
-        || parent_attestation.boundary_effect_count != 0
+        || !boundary_effect_history_is_fork_clean(
+            parent_attestation.boundary_effect_count,
+            parent_attestation.denied_boundary_effect_count,
+        )
         || !parent_attestation.violations.is_empty()
         || !parent_attestation.envelope.leases.is_empty()
         || parent_attestation.envelope.capabilities != lifecycle.inherited_capabilities
@@ -362,7 +368,10 @@ pub(crate) fn attest_live_fork_for_promotion(
         || attestation.root_pid != Some(expected_root_pid)
         || attestation.root_start_time_ticks.is_none()
         || !attestation.root_identity_active
-        || attestation.boundary_effect_count != 0
+        || !boundary_effect_history_is_fork_clean(
+            attestation.boundary_effect_count,
+            attestation.denied_boundary_effect_count,
+        )
         || !attestation.violations.is_empty()
         || attestation.envelope.capabilities != lifecycle.inherited_capabilities
         || !attestation
@@ -389,6 +398,10 @@ pub(crate) fn attest_live_fork_for_promotion(
         ));
     }
     Ok(())
+}
+
+fn boundary_effect_history_is_fork_clean(total: u64, denied: u64) -> bool {
+    total == denied
 }
 
 #[cfg(test)]
@@ -426,5 +439,14 @@ mod tests {
         let mut envelope = parent_envelope();
         envelope.active_mediators.clear();
         assert!(plan_same_authority_live_fork("op_parent", "op_child", &envelope, 42).is_err());
+    }
+
+    #[test]
+    fn denied_boundary_attempt_does_not_poison_same_authority_fork_history() {
+        assert!(boundary_effect_history_is_fork_clean(0, 0));
+        assert!(boundary_effect_history_is_fork_clean(1, 1));
+        assert!(boundary_effect_history_is_fork_clean(8, 8));
+        assert!(!boundary_effect_history_is_fork_clean(1, 0));
+        assert!(!boundary_effect_history_is_fork_clean(8, 7));
     }
 }
