@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 import SystemExtensions
@@ -37,7 +38,7 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
             case .activating:
                 "macOS is validating and activating the bundled system extension."
             case .awaitingApproval:
-                "Approve Gensee Crate in System Settings → Privacy & Security, then return here."
+                "In System Settings, open General → Login Items & Extensions → Endpoint Security Extensions and enable Gensee Crate, then return here."
             case .active:
                 "The system sensor is running. Process, file, and authorization evidence is available in the console."
             case .deactivating:
@@ -78,13 +79,19 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
     }
 
     @Published private(set) var state: State = .checking
+    @Published private(set) var approvalSettingsFallbackMessage: String?
     private var attemptedAutomaticUpgrade = false
+
+    var guidanceDetail: String {
+        approvalSettingsFallbackMessage ?? state.detail
+    }
 
     var isRunningFromApplications: Bool {
         Bundle.main.bundleURL.path.hasPrefix("/Applications/")
     }
 
     func refreshStatus() {
+        approvalSettingsFallbackMessage = nil
         state = .checking
         let request = OSSystemExtensionRequest.propertiesRequest(
             forExtensionWithIdentifier: Self.extensionIdentifier,
@@ -95,6 +102,7 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
     }
 
     func activate() {
+        approvalSettingsFallbackMessage = nil
         guard isRunningFromApplications else {
             state = .failed("Gensee Crate must run from /Applications before macOS can activate its extension.")
             return
@@ -110,6 +118,7 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
     }
 
     func deactivate() {
+        approvalSettingsFallbackMessage = nil
         state = .deactivating
         let request = OSSystemExtensionRequest.deactivationRequest(
             forExtensionWithIdentifier: Self.extensionIdentifier,
@@ -117,6 +126,21 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
         )
         request.delegate = self
         OSSystemExtensionManager.shared.submitRequest(request)
+    }
+
+    @discardableResult
+    func openApprovalSettings() -> Bool {
+        approvalSettingsFallbackMessage = nil
+        let candidates = [
+            "x-apple.systempreferences:com.apple.LoginItems-Settings.extension",
+            "x-apple.systempreferences:com.apple.LoginItems-Settings",
+        ]
+        for candidate in candidates {
+            guard let url = URL(string: candidate) else { continue }
+            if NSWorkspace.shared.open(url) { return true }
+        }
+        approvalSettingsFallbackMessage = "Gensee Crate could not open System Settings automatically. Open System Settings → General → Login Items & Extensions → Endpoint Security Extensions and enable Gensee Crate."
+        return false
     }
 }
 
@@ -131,6 +155,7 @@ extension EndpointSecurityExtensionManager: OSSystemExtensionRequestDelegate {
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
         state = .awaitingApproval
+        openApprovalSettings()
     }
 
     func request(_ request: OSSystemExtensionRequest, didFinishWithResult result: OSSystemExtensionRequest.Result) {

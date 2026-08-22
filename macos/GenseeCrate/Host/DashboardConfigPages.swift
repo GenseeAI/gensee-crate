@@ -1060,7 +1060,7 @@ struct DashboardSettingsPage: View {
                 Image(systemName: extensionManager.state.symbolName).foregroundStyle(extensionManager.state.tint)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(extensionManager.state.title).font(.system(size: 12, weight: .semibold))
-                    Text(extensionManager.state.detail).font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text(extensionManager.guidanceDetail).font(.system(size: 10)).foregroundStyle(.secondary)
                 }
             }
             Divider()
@@ -1128,6 +1128,11 @@ struct DashboardSettingsPage: View {
             }
             HStack {
                 Button("Full Disk Access") { model.openFullDiskAccess() }
+                if extensionManager.state == .awaitingApproval {
+                    Button("Extension Approval") {
+                        extensionManager.openApprovalSettings()
+                    }
+                }
                 Button("Reconnect") {
                     sensor.start()
                     sensor.reconnect()
@@ -1143,7 +1148,7 @@ struct DashboardSettingsPage: View {
 
     private var endpointSensorMessage: String? {
         guard extensionManager.state == .active else {
-            return extensionManager.state.detail
+            return extensionManager.guidanceDetail
         }
         if !sensor.health.connected {
             return "The Endpoint Security extension is installed, but the app is not connected to its sensor. Click Reconnect. If it remains disconnected, enable Full Disk Access for Gensee Crate and try again."

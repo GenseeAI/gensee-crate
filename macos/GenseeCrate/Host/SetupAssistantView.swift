@@ -264,11 +264,13 @@ struct SetupAssistantView: View {
             permissionRow(
                 number: 1,
                 title: "Endpoint Security extension",
-                detail: extensionManager.state.detail,
+                detail: extensionManager.guidanceDetail,
                 ready: extensionManager.state == .active
             ) {
                 if extensionManager.state == .awaitingApproval {
-                    Button("Open Privacy & Security") { model.openPrivacyAndSecurity() }
+                    Button("Open Login Items & Extensions") {
+                        extensionManager.openApprovalSettings()
+                    }
                 } else {
                     Button(extensionManager.state == .active ? "Enabled" : "Install & Enable") {
                         extensionManager.activate()
@@ -487,10 +489,24 @@ struct SetupAssistantView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
             if step < stepTitles.count - 1 {
-                Button("Continue") { step += 1 }
+                Button(step == 3 && !enableableHarnesses.isEmpty ? "Enable Installed & Continue" : "Continue") {
+                    if step == 3 && !enableableHarnesses.isEmpty {
+                        Task {
+                            isEnablingAll = true
+                            await model.enableAllInstalledIntegrations()
+                            isEnablingAll = false
+                            step += 1
+                        }
+                    } else {
+                        step += 1
+                    }
+                }
                     .buttonStyle(.borderedProminent)
                     .tint(.dashboardRed)
-                    .disabled(step == 1 && (isPreparing || !model.localRuntimePrepared))
+                    .disabled(
+                        (step == 1 && (isPreparing || !model.localRuntimePrepared))
+                            || isEnablingAll
+                    )
             } else {
                 Button("Finish Setup") {
                     Task {
@@ -509,7 +525,8 @@ struct SetupAssistantView: View {
 
     private var enableableHarnesses: [IntegrationDescriptor] {
         model.integrations.filter {
-            $0.installed && $0.supportsDirectHooks && (!$0.configured || $0.requiresRepair)
+            $0.installed && $0.supportsDirectHooks
+                && (!$0.configured || $0.requiresRepair || $0.awaitingVerification)
         }
     }
 

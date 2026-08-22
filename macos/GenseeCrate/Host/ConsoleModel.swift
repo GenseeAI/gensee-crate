@@ -1177,6 +1177,10 @@ final class ConsoleModel: ObservableObject {
                 await repairIntegration(provider)
             } else if !integration.configured {
                 await setIntegrationEnabled(provider, enabled: true)
+            } else if integration.awaitingVerification,
+                      HarnessActivationGuidance.requiresInteractiveHookApproval(provider: provider)
+            {
+                openCodexHookReview(automatically: true)
             }
         }
     }
@@ -1296,7 +1300,16 @@ final class ConsoleModel: ObservableObject {
                 return
             }
 
-            let shellCommand = CodexHookReviewScript.shellCommand(codexURL: codexURL)
+            let reviewScriptURL: URL
+            do {
+                reviewScriptURL = try CodexHookReviewScript.writeTemporaryScript(
+                    codexURL: codexURL
+                )
+            } catch {
+                errorMessage = "Could not prepare Codex hook review: \(error.localizedDescription)"
+                return
+            }
+            let shellCommand = CodexHookReviewScript.shellCommand(scriptURL: reviewScriptURL)
             let appleScriptSource = CodexHookReviewLauncher.appleScriptSource(
                 shellCommand: shellCommand
             )
@@ -1304,6 +1317,7 @@ final class ConsoleModel: ObservableObject {
             guard let appleScript = NSAppleScript(source: appleScriptSource),
                   appleScript.executeAndReturnError(&executionError) != nil
             else {
+                try? FileManager.default.removeItem(at: reviewScriptURL)
                 if CodexHookReviewLauncher.isAutomationPermissionError(executionError) {
                     openAutomationPrivacy()
                     errorMessage = "Gensee Crate needs permission to control Terminal. In System Settings → Privacy & Security → Automation, allow Gensee Crate to use Terminal, then try again."

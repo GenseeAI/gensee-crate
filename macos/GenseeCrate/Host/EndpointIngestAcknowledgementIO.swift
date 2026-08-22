@@ -19,6 +19,78 @@ enum EndpointIngestBatchPolicy {
     }
 }
 
+struct EndpointEvidenceContinuityIssue: Equatable {
+    let unavailableEventCount: UInt64
+    let sensorRestarted: Bool
+    let fingerprint: String
+
+    var title: String { "Incomplete Endpoint Security evidence" }
+
+    var summary: String {
+        if unavailableEventCount > 0 {
+            return "\(unavailableEventCount.formatted()) event\(unavailableEventCount == 1 ? "" : "s") were not retained"
+        }
+        return "The Endpoint Security sensor restarted"
+    }
+
+    var detail: String {
+        if unavailableEventCount > 0 {
+            let restartSuffix = sensorRestarted ? " The sensor also restarted during that interval." : ""
+            return "\(unavailableEventCount.formatted()) Endpoint Security event\(unavailableEventCount == 1 ? " was" : "s were") not retained while Gensee Crate was closed or unable to drain the sensor. Evidence for that interval is incomplete.\(restartSuffix)"
+        }
+        return "The Endpoint Security sensor restarted while Gensee Crate was closed. Evidence for that interval may be incomplete."
+    }
+}
+
+enum EndpointEvidenceContinuityPolicy {
+    static func issue(
+        persistedBootID: String,
+        currentBootID: String,
+        persistedCursor: UInt64,
+        oldestCursor: UInt64,
+        nextCursor: UInt64,
+        persistedKernelDrops: UInt64?,
+        currentKernelDrops: UInt64
+    ) -> EndpointEvidenceContinuityIssue? {
+        guard !persistedBootID.isEmpty, !currentBootID.isEmpty, persistedCursor > 0 else {
+            return nil
+        }
+
+        let bootChanged = persistedBootID != currentBootID
+        let sensorRewound = !bootChanged && nextCursor <= persistedCursor
+        let sensorRestarted = bootChanged || sensorRewound
+
+        let overwrittenEvents: UInt64
+        if sensorRestarted || oldestCursor <= persistedCursor {
+            overwrittenEvents = 0
+        } else {
+            overwrittenEvents = oldestCursor - persistedCursor - 1
+        }
+
+        let newKernelDrops: UInt64
+        if !bootChanged,
+           let persistedKernelDrops,
+           currentKernelDrops >= persistedKernelDrops
+        {
+            newKernelDrops = currentKernelDrops - persistedKernelDrops
+        } else {
+            newKernelDrops = 0
+        }
+
+        let unavailableEventCount = overwrittenEvents + newKernelDrops
+        guard unavailableEventCount > 0 || sensorRestarted else { return nil }
+        return EndpointEvidenceContinuityIssue(
+            unavailableEventCount: unavailableEventCount,
+            sensorRestarted: sensorRestarted,
+            fingerprint: [
+                persistedBootID,
+                currentBootID,
+                String(persistedCursor),
+            ].joined(separator: ":")
+        )
+    }
+}
+
 enum EndpointIngestAcknowledgementIO {
     static func write(_ data: Data, to handle: FileHandle, timeout: TimeInterval) throws {
         let deadline = ProcessInfo.processInfo.systemUptime + timeout

@@ -119,6 +119,7 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
     private func refreshStatusItem() {
         guard let button = statusItem?.button else { return }
         let count = actionableReviews.count
+        let continuityIssue = model?.endpointSensor.health.launchContinuityIssue
         let mark = NSImage(named: "MenuBarEye") ?? NSImage(
             systemSymbolName: "eye.circle",
             accessibilityDescription: "Gensee Crate"
@@ -131,10 +132,13 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
         button.title = ""
         button.attributedTitle = NSAttributedString(string: "")
         installAttentionBadge(on: button)
-        attentionBadge?.isHidden = count == 0
-        button.toolTip = count == 0
-            ? "Gensee Crate — all agents clear"
-            : "Gensee Crate — \(count) request\(count == 1 ? "" : "s") to review"
+        attentionBadge?.isHidden = count == 0 && continuityIssue == nil
+        let liveStatus = count == 0
+            ? "all agents clear"
+            : "\(count) request\(count == 1 ? "" : "s") to review"
+        button.toolTip = continuityIssue == nil
+            ? "Gensee Crate — \(liveStatus)"
+            : "Gensee Crate — \(liveStatus); incomplete OS evidence"
         button.setAccessibilityLabel(button.toolTip ?? "Gensee Crate")
     }
 
@@ -182,6 +186,28 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
         )
         status.target = self
         menu.addItem(status)
+
+        if let issue = model?.endpointSensor.health.launchContinuityIssue {
+            let gap = NSMenuItem(
+                title: "Incomplete evidence — \(issue.summary.lowercased())",
+                action: #selector(openStatus(_:)),
+                keyEquivalent: ""
+            )
+            gap.target = self
+            gap.image = NSImage(
+                systemSymbolName: "exclamationmark.triangle",
+                accessibilityDescription: "Incomplete evidence"
+            )
+            menu.addItem(gap)
+
+            let acknowledge = NSMenuItem(
+                title: "Mark Evidence Gap Reviewed",
+                action: #selector(acknowledgeEvidenceGap(_:)),
+                keyEquivalent: ""
+            )
+            acknowledge.target = self
+            menu.addItem(acknowledge)
+        }
         menu.addItem(.separator())
 
         if actionable.isEmpty {
@@ -207,11 +233,36 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
                 menu.addItem(item)
             }
         }
+
+        menu.addItem(.separator())
+
+        let settings = NSMenuItem(
+            title: "Settings…",
+            action: #selector(openSettings(_:)),
+            keyEquivalent: ","
+        )
+        settings.target = self
+        settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        menu.addItem(settings)
+
+        let quit = NSMenuItem(
+            title: "Quit Gensee Crate",
+            action: #selector(quitGensee(_:)),
+            keyEquivalent: "q"
+        )
+        quit.target = self
+        quit.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
+        menu.addItem(quit)
     }
 
     @objc private func openReview(_ sender: NSMenuItem) {
         guard let requestID = (sender.representedObject as? NSNumber)?.int64Value else { return }
         openReviewQueue(requestID: requestID)
+    }
+
+    @objc private func acknowledgeEvidenceGap(_ sender: NSMenuItem) {
+        model?.endpointSensor.acknowledgeLaunchContinuityIssue()
+        refreshStatusItem()
     }
 
     @objc private func openStatus(_ sender: NSMenuItem) {
@@ -224,6 +275,10 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
 
     @objc private func openSettings(_ sender: NSMenuItem) {
         openGensee(destination: .settings, requestID: nil)
+    }
+
+    @objc private func quitGensee(_ sender: NSMenuItem) {
+        NSApp.terminate(nil)
     }
 
     private func openReviewQueue(requestID: Int64?) {
