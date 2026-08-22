@@ -9,7 +9,7 @@ fi
 release_version="${1:-}"
 if [ -z "$release_version" ]; then
   echo "Usage: NOTARYTOOL_PROFILE=<keychain-profile> $0 <version>" >&2
-  echo "Example: NOTARYTOOL_PROFILE=gensee-crate $0 0.3.0" >&2
+  echo "Example: NOTARYTOOL_PROFILE=gensee-crate $0 0.3.1" >&2
   exit 1
 fi
 release_version="${release_version#v}"

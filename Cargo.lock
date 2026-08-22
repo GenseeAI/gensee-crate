@@ -233,14 +233,14 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-attribution"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gensee-crate-core",
 ]
 
 [[package]]
 name = "gensee-crate-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gensee-crate-attribution",
  "gensee-crate-config-audit",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-config-audit"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "percent-encoding",
  "serde",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-db"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gensee-crate-core",
  "rusqlite",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-linux"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gensee-crate-core",
  "libc",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-macos"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gensee-crate-core",
  "serde",
@@ -312,11 +312,11 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-ml"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "gensee-crate-rules"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "gensee-crate-core",
  "serde",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-store"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chacha20poly1305",
  "gensee-crate-core",
