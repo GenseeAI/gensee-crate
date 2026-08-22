@@ -4,11 +4,19 @@
 </h1>
 
 <p align="center">
-  <strong>Let your coding agents run unattended. Review the result in 60 seconds.</strong>
+  <strong>Keep agent work moving. Keep authority and effects under control.</strong>
 </p>
 
 <p align="center">
-  Gensee Crate is a local control center for Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, and <a href="https://github.com/omnigent-ai/omnigent" target="_blank">Omnigent</a>. It lets agents keep moving within your boundaries, catches risky behavior while they work, and turns each completed task into a concise, evidence-backed review: what ran, what changed, which tests were attempted, and what needs attention. On Linux, agents can also work inside a disposable full-workspace fork that you merge, keep, or discard after review.
+  Gensee Crate is an open-source control layer for AI coding agents. On a
+  developer laptop, it reviews completed work, surfaces scope drift, creates
+  recovery points, and audits the configuration that can influence an agent.
+  On a self-hosted Linux environment, it adds disposable workspace forks,
+  scoped capabilities, short-lived leases, host-side observation, and
+  evidence-gated promotion. Both deployment paths use the same policy and
+  evidence model: connect what the user asked for to the authority the agent
+  received, the effects that occurred, and the changes that were allowed to
+  persist.
 </p>
 
 <p align="center">
@@ -19,9 +27,9 @@
 </p>
 
 <p align="center">
-  <a href="https://www.gensee.ai">gensee.ai</a>
+  <a href="https://www.gensee.ai/">gensee.ai</a>
   ·
-  <a href="https://crate-docs.gensee.ai">Docs</a>
+  <a href="https://crate-docs.gensee.ai/">Docs</a>
   ·
   <a href="https://www.gensee.ai/discord">Join Discord</a>
   ·
@@ -29,494 +37,189 @@
 </p>
 
 <p align="center">
-  <img src="docs/gensee-crate-defense-in-depth.png" alt="Gensee Crate transactional runtime and defense-in-depth architecture" />
-</p>
-
-<p align="center">
-  Need company-enforced rules, credential and identity controls, and oversight
-  across a distributed fleet of developer endpoints?
+  Need customization or enterprise solutions?
   <a href="https://www.gensee.ai/contact.html">Contact GenseeAI</a>.
 </p>
 
 ---
 
-## Why Gensee Crate?
+## Why Gensee Crate
 
-Gensee Crate helps you:
+- **Review decisions, not agent transcripts.** Personal directs your attention
+  to scope drift, failed verification, blocked work, and other exceptions while
+  keeping clean completions quiet.
+- **Explore risky work without risking the source environment.** Team can fork
+  a complete Linux workspace, run one or several approaches, and let a human
+  merge, promote, or discard the result.
+- **Make agent authority explainable.** Gensee connects intent, policy,
+  capability decisions, process and file effects, evidence, cleanup, and the
+  final persistence decision.
 
-- **Come back to an answer, not a transcript.** The macOS Control Center turns a
-  completed agent task into a short review of commands, mutation paths,
-  observed test runs, duration, and policy findings. Optional quiet
-  notifications tell you when substantial work is ready.
-- **Spend less time supervising agents.** Deterministic boundaries run before
-  supported tools and OS operations, so you can step away without approving
-  every low-risk command and focus your attention on exceptions and outcomes.
-- **Run risky agent work transactionally.** Launch an agent in a disposable
-  runtime, fork the full workspace for speculative changes, then merge, keep
-  working, or discard the fork after review.
-- **Keep untrusted changes out of the main workspace.** Summaries and diffs show
-  what changed and what tests ran before a fork is allowed to merge back.
-- **Enforce policy before risky tools run.** A deterministic, configurable [policy](docs/policy.md) can allow, ask, or
-  deny secret reads, destructive ops, out-of-workspace writes, cloud-metadata
-  access, control-plane writes, dangerous executable content, and more.
-- **Watch what your agent actually does.** Capture prompts, tool calls, files
-  read and written, commands run, packages touched, network targets reached,
-  hook intent, alerts, and timeline context in one local store.
-- **Trace provenance across sessions.** Lineage graphs link prompts,
-  tool calls, filesystem effects, artifacts, alerts, and review verdicts so long-horizon safety issues such as memory poisoning, policy bypass, and data exfiltration can be understood and contained.
-- **Seamless integration with your current workflow.** Run `gensee watch` beside an
-  agent, launch an agent with `gensee run`, or use the tclone runtime for
-  full-workspace fork, merge, and rollback flows. Manage policy with
-  `gensee policy` and inspect activity in the local dashboard.
-- **Review agent configuration before a run.** Use
-  [`gensee audit config`](docs/config-audit.md) to statically inventory Codex
-  permissions, privacy settings, MCP servers, skills, hooks, plugins, command
-  rules, and instruction files without executing them.
+## Benchmark results
 
-## Preliminary Benchmark Results
-
-Preliminary AgentCanary benchmark results show Gensee Crate improving defense
-rate across memory poisoning, long-horizon, and prompt-injection threat types
-with low runtime overhead.
+Preliminary AgentCanary results show Gensee Crate improving defense rate across
+memory-poisoning, long-horizon, and prompt-injection threat types with low
+runtime overhead.
 
 ![Preliminary AgentCanary benchmark results](docs/images/preliminary-agentcanary-benchmark.png)
 
-## Quick start
+## Gensee Crate Personal
 
-### 1. Install
+<details>
+<summary><strong>Local protection and review for your laptop</strong></summary>
 
-On macOS, the [signed app download](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)
-includes the Gensee backend and SQLite support. Its first-launch assistant
-first offers an unmistakably synthetic, write-free demo, then lets you start
-with Fast and progress to Review or Sensitive protection. The real setup
-prepares `~/.gensee`, establishes smart recovery and a configuration-audit
-baseline before Apple permissions, scans all six supported
-harnesses, and verifies a real hook event before reporting protection. It does
-not require Homebrew, Rust, jq, Xcode Command Line Tools, or a separate SQLite
-installation.
+### What it is
 
-For the command-line/source installation, use:
+Gensee Crate Personal is a local-first macOS app and CLI for individual
+developers using Codex, Claude Code, Cursor, GitHub Copilot, Antigravity, or
+Omnigent. Your policy, agent events, reviews, and feedback remain in your local
+Gensee store.
 
-One command installs Gensee Crate and checks or installs its command-line
-prerequisites on macOS. At the end, the installer can configure supported agent
-hooks for active safety policy enforcement, lets you choose `GENSEE_HOME`, and
-lets you keep the bundled default policy or create an editable local policy:
+### What it adds
+
+- A **Review Queue** that groups work by request and shows what needs attention.
+- **Scope-drift detection** that compares declared tool intent with file
+  mutations independently observed by macOS Endpoint Security.
+- **Smart recovery points** before risky Git-workspace changes, with restore
+  actions in the review.
+- **Configuration audit** for instructions, skills, MCP servers, hooks,
+  permissions, plugins, command rules, and other inputs that can change agent
+  behavior.
+- Local policy enforcement, actionable findings, verification freshness,
+  activity highlights, notifications, and a menu-bar summary.
+
+### Download the macOS app
+
+**[⬇️ Download Gensee Crate Personal for macOS](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)**
+
+The signed app bundles the Gensee backend and SQLite support. It does not
+require Homebrew, Rust, Xcode, `jq`, or a separate SQLite installation. See the
+**[Gensee Crate Personal for macOS guide](macos/GenseeCrate/README.md)** for
+installation, first-run setup, Apple approvals, harness protection, and local
+troubleshooting.
+
+### See it in use
+
+<p align="center">
+  <img src="docs/images/personal/gensee-crate-personal-overview.png" alt="Gensee Crate Personal overview showing work that needs review and recent activity" width="900" />
+</p>
+<p align="center"><em>Start with the work that needs you; clean completions remain available without creating noise.</em></p>
+
+<p align="center">
+  <img src="docs/images/personal/gensee-crate-personal-review-queue.png" alt="Gensee Crate Personal Review Queue showing scope drift, findings, and a recovery point" width="900" />
+</p>
+<p align="center"><em>Review scope drift, evidence, affected files, verification freshness, and the recovery point in one request-scoped view.</em></p>
+
+<p align="center">
+  <img src="docs/images/personal/gensee-crate-personal-config-audit.png" alt="Gensee Crate Personal configuration audit with prioritized Codex findings" width="900" />
+</p>
+<p align="center"><em>Audit static agent configuration without running it.</em></p>
+
+### Use the CLI instead
+
+Install the CLI and initialize the local store:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | bash
+export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 ```
 
-During an interactive install, choose the native dashboard prompt to provision
-its Tauri and frontend dependencies. For a non-interactive install, add
-`GENSEE_CONFIGURE_DASHBOARD=1`. This requires Node.js 18+; on Linux it also
-installs the WebKitGTK development packages required by Tauri.
-
-For non-interactive installs that should configure Claude Code, Codex, and
-Antigravity hooks:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_CLAUDE=1 GENSEE_CONFIGURE_CODEX=1 GENSEE_CONFIGURE_ANTIGRAVITY=1 GENSEE_CONFIGURE_DASHBOARD=1 bash
-```
-
-To configure VS Code / GitHub Copilot hooks, use the VS Code toggle. VS Code
-also loads Claude-compatible hook settings; when both Gensee integrations are
-installed, Gensee suppresses an imported Claude invocation only after observing
-the matching native VS Code invocation for the same session, event, and tool:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | GENSEE_CONFIGURE_VSCODE=1 bash
-```
-
-<details>
-<summary>Prefer to install manually?</summary>
-
-Install platform prerequisites first.
-
-On macOS:
-
-```bash
-xcode-select --install
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-
-brew install jq
-```
-
-On Ubuntu/Debian Linux:
-
-```bash
-sudo apt update
-sudo apt install -y build-essential pkg-config libssl-dev jq nftables git
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-```
-
-Build the CLI from source:
-
-```bash
-git clone https://github.com/GenseeAI/gensee-crate.git
-cd gensee-crate
-cargo build -p gensee-crate-cli
-```
-
-The binary is now at `target/debug/gensee`. For convenience, either add that
-directory to your `PATH`, or install `gensee` globally:
-
-```bash
-cargo install --path crate/gensee-crate-cli   # puts `gensee` on PATH
-```
-
-Gensee stores its local state under `~/.gensee` by default. Set `GENSEE_HOME` to
-override it, and use the **same** `GENSEE_HOME` for `watch`, hooks, `run`,
-`timeline`, and the dashboard so the signals appear together. `GENSEE_HOME` is
-the Gensee data store, not the agent project/workspace folder:
-
-```bash
-export GENSEE_HOME="$HOME/.gensee"
-```
-
-For hook-based agents, there are two paths to keep straight:
-
-- `GENSEE_HOME`: where Gensee records hooks, alerts, timelines, policies, and
-  dashboard data. Use the same value across Claude Code, Codex, Antigravity,
-  VS Code, Omnigent sidecars, `gensee watch`, `gensee timeline`, and the
-  dashboard when you want one combined view.
-- agent workspace/config path: where the agent looks for its hook settings.
-  Claude Code uses `~/.claude/settings.json`, Codex uses `~/.codex/hooks.json`,
-  Antigravity defaults to global `~/.gemini/config/hooks.json`, and VS Code uses
-  `~/.copilot/hooks/gensee.json`. Antigravity also supports workspace-local
-  `.agents/hooks.json` when you pass `--hooks`.
-
-Avoid pointing `GENSEE_HOME` at the project workspace root. A repo-local store
-such as `$PWD/.gensee-dev` is convenient for development, while
-`$HOME/.gensee-<agent>` is better for long-running sidecars such as Omnigent so
-Gensee does not watch its own store writes.
-
-The local store can include redacted prompts, commands, paths, policy alerts,
-and lineage data. Fresh telemetry stores are encrypted at rest by default with a
-local key in `$GENSEE_HOME/gensee.key`. Keep that key private and do not share
-it with store snapshots; sharing the key and store together gives readers access
-to the telemetry. Existing plaintext development stores remain readable rather
-than breaking hooks; move or remove the old `GENSEE_HOME` to start a fresh
-encrypted store. Set `GENSEE_STORE_ENCRYPTION=0` only for local debugging
-stores.
-
-</details>
-
-<details>
-<summary>Toolchain and prerequisites (if the installer reports a missing tool)</summary>
-
-- macOS and Linux for the stable v0.2 path. Linux host controls include `/proc`
-  process attribution, fanotify sensitive-path enforcement, seccomp launcher
-  profiles, and cgroup/nftables network controls.
-- Claude Code, Codex, Antigravity, or VS Code / GitHub Copilot for hook-based
-  enforcement. Other agents are planned.
-- Rust toolchain (`cargo`) and `jq`.
-- On Linux: build tools, `pkg-config`, OpenSSL headers, `nftables`, and `git`.
-
-Install the required command-line tools on macOS:
-
-```bash
-xcode-select --install
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-
-brew install jq
-```
-
-Install the required command-line tools on Ubuntu/Debian Linux:
-
-```bash
-sudo apt update
-sudo apt install -y build-essential pkg-config libssl-dev jq nftables git
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-```
-
-</details>
-
-<details>
-<summary>Configure agent hooks manually</summary>
-
-To capture prompt/tool intent and enforce the [safety policy](docs/policy.md),
-configure your agent's hooks to call the matching `gensee hook` endpoint. The
-installer offers Claude Code, Codex, Antigravity, Cursor, and opt-in VS Code
-setup. To run the setup step later for Claude Code:
-
-```bash
-gensee setup claude-code --gensee-home "$GENSEE_HOME"
-```
-
-If your team requires Claude Code traffic to pass through an inspecting LLM
-gateway, configure that during the same setup step:
-
-```bash
-gensee setup claude-code \
-  --gensee-home "$GENSEE_HOME" \
-  --anthropic-base-url https://llm-gateway.example.com \
-  --anthropic-auth-token "$GATEWAY_TOKEN"
-```
-
-For local screening/blocking, start the bundled gateway and point Claude Code at
-it:
-
-```bash
-GENSEE_HOME="$GENSEE_HOME" \
-GENSEE_BIN="$PWD/target/debug/gensee" \
-GENSEE_GATEWAY_TOKEN="local-gateway-token" \
-ANTHROPIC_UPSTREAM_API_KEY="$ANTHROPIC_API_KEY" \
-node scripts/anthropic_gateway.mjs
-
-./target/debug/gensee setup claude-code \
-  --gensee-home "$GENSEE_HOME" \
-  --anthropic-base-url http://127.0.0.1:8787 \
-  --anthropic-auth-token local-gateway-token
-```
-
-Or for Codex:
+Configure the harnesses you use:
 
 ```bash
 gensee setup codex --gensee-home "$GENSEE_HOME"
+gensee setup claude-code --gensee-home "$GENSEE_HOME"
 ```
 
-Or for global Antigravity hooks:
+Run an agent through Gensee when you want an explicit managed session:
 
 ```bash
-gensee setup antigravity --gensee-home "$GENSEE_HOME"
+gensee run -- codex
+# or
+gensee run -- claude
 ```
 
-Or for VS Code / GitHub Copilot:
+Inspect the results:
 
 ```bash
-gensee setup vscode --gensee-home "$GENSEE_HOME"
-```
-
-VS Code also loads `~/.claude/settings.json`. Configure the dedicated VS Code
-provider when you need its native tool-name parsing, and avoid installing both
-providers for the same VS Code sessions so the hook does not run twice.
-
-Or for Cursor:
-
-```bash
-gensee setup cursor --gensee-home "$GENSEE_HOME"
-```
-
-For workspace-local Antigravity hooks instead, pass an explicit workspace hook
-path:
-
-```bash
-gensee setup antigravity \
-  --gensee-home "$GENSEE_HOME" \
-  --hooks /path/to/workspace/.agents/hooks.json
-```
-
-If you are running from a source checkout instead of an installed binary:
-
-```bash
-./target/debug/gensee setup claude-code --gensee-home "$GENSEE_HOME"
-./target/debug/gensee setup codex --gensee-home "$GENSEE_HOME"
-./target/debug/gensee setup antigravity --gensee-home "$GENSEE_HOME"
-./target/debug/gensee setup vscode --gensee-home "$GENSEE_HOME"
-./target/debug/gensee setup cursor --gensee-home "$GENSEE_HOME"
-```
-
-To disable a configured hook integration without disturbing any unrelated
-harness settings or hooks, pass `--disable`:
-
-```bash
-gensee setup codex --disable
-gensee setup claude-code --disable
-gensee setup antigravity --disable
-gensee setup vscode --disable
-gensee setup cursor --disable
-```
-
-The native app's **Repair** action reruns setup with its active event store and
-embedded backend. For Claude Code, the equivalent explicit CLI repair also
-reenables globally disabled hooks:
-
-```bash
-gensee setup claude-code --repair --gensee-home "$GENSEE_HOME"
-```
-
-The setup commands merge Gensee into the previous hook settings, update
-`~/.claude/settings.json`, `~/.codex/hooks.json`, or
-`~/.gemini/config/hooks.json` or `~/.cursor/hooks.json`, or write
-`~/.copilot/hooks/gensee.json` by default. They use the absolute path to the
-`gensee` binary you invoked. Existing non-Gensee commands in the same event are
-preserved; stale or duplicate Gensee commands are replaced with one current
-entry. Setup rejects malformed hook structures without writing the file, and
-atomically updates and backs up a config only when its contents change. Fully
-restart Claude Code, Antigravity, or Cursor
-after changing their hook config. VS Code reloads hook files automatically.
-Open `/hooks` in Codex to review and trust the hook
-command before testing enforcement. Full manual config and what gets recorded
-(plus redaction details) are in
-[`docs/claude-code-hooks.md`](docs/claude-code-hooks.md),
-[`docs/codex-support.md`](docs/codex-support.md),
-[`docs/antigravity-support.md`](docs/antigravity-support.md),
-[`docs/vscode-support.md`](docs/vscode-support.md), and
-[`docs/cursor-support.md`](docs/cursor-support.md).
-
-</details>
-
-<details>
-<summary>Updating to a new release</summary>
-
-Rerun the installer to update `gensee` in place:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | bash
-```
-
-If you installed from a source checkout, pull the latest changes and reinstall:
-
-```bash
-git pull --ff-only
-cargo install --path crate/gensee-crate-cli --force
-```
-
-</details>
-
-### 2. Run
-
-Choose the section for your operating system. Each path can combine hooks,
-sidecar watching, and managed `gensee run` launches.
-
-<details>
-<summary>macOS</summary>
-
-**Hooks only.** Agent requests and tool calls are checked by Gensee policy after
-Step 1 setup. No extra command needs to keep running.
-
-**Watch.** Observe workspace file effects. The native Gensee Crate app
-independently ingests signed Endpoint Security process and file events:
-
-```bash
-gensee watch # optional flags: --workspace --watch-root --duration-seconds
-gensee policy set watch.system_events endpoint-security
-```
-
-Build and install [`macos/GenseeCrate`](macos/GenseeCrate), approve its bundled
-system extension, and grant Gensee Crate Full Disk Access. `eslogger` remains an
-optional manual diagnostic backend. The app's Harnesses page detects Codex,
-Claude Code, Antigravity, Cursor, GitHub Copilot, and Omnigent. Installed
-direct-hook harnesses can be enabled or disabled with explicit protection
-actions; unavailable harnesses stay visible but muted. Enabled hooks are also
-checked for full event coverage and the app's active event-store/backend paths;
-stale or incomplete integrations show **Needs repair** with a one-click safe
-repair. See the
-[native macOS security console](docs/macos-app.md) guide. Its **Daily
-Highlight** page combines today's summary with rolling-year heatmaps for agent
-turns, tool calls, alerts, and supported transcript token totals. On the
-**Harnesses** page, **Audit Config** on Codex and GitHub Copilot runs the shared
-OSS auditor and presents a saved baseline, configuration drift, findings,
-evidence, inventory, source provenance, and manual checks inline; unsupported
-harness auditors are marked **Coming soon**.
-Each hook-capable harness includes **Smart recovery points** with **Auto**,
-**Ask**, and **Off** modes. The default **Auto** mode creates one Git-backed
-recovery point before the first risky or mutating tool call in a request.
-Created recovery points and their **Restore** action appear in **Review Queue**;
-every restore first creates a rescue point. Recovery points preserve the real
-staging index and ignored files, but they are a workspace recovery aid rather
-than the process, database, and remote-side-effect isolation provided by Linux
-tclone.
-
-The macOS app's default workflow is decision-first: **Review Queue** classifies
-completed requests as Verified, Review recommended, Needs attention, or
-Incomplete evidence; promotes file changes that Endpoint Security observed
-outside declared tool intent; identifies sensitive control-plane and memory
-targets; flags tests or builds that ran before a later mutation; and groups
-related low-level findings into one decision. **Watchlist** carries those
-persistent and cross-session targets forward, while its relationship graph is
-available as provenance detail. A menu-bar status window keeps sensor health,
-pending reviews, and the latest request visible without opening the full app.
-
-**Run.** Launch the agent as a child of Gensee. `--sandbox mac` uses
-`sandbox-exec` and can stage workspace writes for review.
-
-```bash
-gensee run -- claude # or: gensee run -- codex
-gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude
-```
-
-For orchestration frameworks such as Omnigent, use the same outer safety layer:
-
-```bash
-gensee watch --workspace . --watch-root ~/.omnigent
-gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml
-```
-
-</details>
-
-<details>
-<summary>Linux</summary>
-
-**Hooks only.** Agent requests and tool calls are checked by Gensee policy after
-Step 1 setup. No extra command needs to keep running.
-
-**Environment config.** Linux host controls include `/proc` process attribution,
-fanotify sensitive-path permission enforcement, seccomp launcher profiles, and
-cgroup/nftables network controls. Kernel-owned controls need `sudo`; supervised
-launches and seccomp-only launches can usually run without it.
-
-For Node/npm-installed agents such as Codex or Claude Code, preserve `PATH` so
-the agent shim can still find `node`, and preserve `HOME`/`GENSEE_HOME` so
-Gensee and the agent use the expected user config:
-
-```bash
-export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
-alias gensee-sudo='sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=$GENSEE_HOME" gensee'
-```
-
-Add those two lines to `~/.bashrc`, `~/.zshrc`, or your shell profile to make
-them permanent. Because these commands preserve `HOME` while running privileged
-controls, a root-launched agent may create root-owned files in your home
-directory.
-
-Inspect Linux host capabilities and enabled controls:
-
-```bash
+gensee audit codex
+gensee run list --json
+gensee timeline --latest
 gensee status --json
 ```
 
-**Watch.** Attach to an already-running agent process tree:
+The desktop app is the recommended macOS experience. The CLI remains useful
+for automation, terminals, and Linux workstations. See [Claude Code hook
+setup](docs/claude-code-hooks.md), [policy](docs/policy.md), [configuration
+audit](docs/config-audit.md), and [run and sandbox modes](docs/run-and-sandbox.md)
+for the complete command-line workflow.
 
-```bash
-gensee watch --pid <agent-root-pid>
+</details>
+
+## Gensee Crate Team
+
+<details>
+<summary><strong>Self-hosted agent infrastructure for remote Linux environments</strong></summary>
+
+### What it is
+
+Gensee Crate Team is the self-hosted path for small teams and businesses that
+want to operate their own Gensee deployment and agent environments. Agents run
+on a prepared remote Linux host rather than developer laptops. The team keeps
+control of its source, policy, credentials, runtime, evidence, and lifecycle
+decisions.
+
+### What it adds
+
+The operating principle is simple:
+
+```text
+intent
+  → capability decision
+  → lease, mediator, cell, or workspace fork
+  → observed effects
+  → merge, promote, or discard
+  → revocation and cleanup
 ```
 
-**Run.** Launch the agent as a child of Gensee with Linux host controls:
+- **Transactional workspace forks.** `tclone` creates low-latency,
+  whole-workspace forks for one or several approaches. Each fork can be
+  inspected and tested before a human merges it, promotes it, or discards it.
+- **Bounded authority.** Request-scoped capability decisions and short-lived
+  leases limit filesystem, network, repository, workload-identity, database,
+  and external-action authority.
+- **Credentials stay on the host.** The capability broker owns credential
+  material and gives cells opaque lease IDs, scoped handles, or trusted gateway
+  endpoints instead of broad secrets.
+- **Independent evidence.** Host observation, process lineage, effect
+  manifests, replay plans, promotion receipts, and cleanup journals make it
+  possible to explain what occurred and whether it stayed within the granted
+  authority.
+- **Promotion is a policy decision.** Manifest violations, incomplete evidence,
+  failed cleanup, expired authority, or missing commit tokens can prevent work
+  from becoming durable.
+
+The strongest end-to-end enforcement today is in tclone capability cells and
+network mediation. Additional capability backends are under active development;
+see the [roadmap](docs/roadmap.md) for the current boundary.
+
+### Install on a Linux host
+
+Install Gensee Crate:
 
 ```bash
-gensee-sudo run --sandbox linux -- codex
-```
-
-If testing from a source build, use the same pattern with the debug binary:
-
-```bash
-sudo env "PATH=$PATH" "HOME=$HOME" "GENSEE_HOME=${GENSEE_HOME:-$HOME/.gensee}" \
-  ./target/debug/gensee run --sandbox linux -- codex
-```
-
-For orchestration frameworks such as Omnigent, use the same outer safety layer:
-
-```bash
-gensee watch --workspace . --watch-root ~/.omnigent
-gensee-sudo run --sandbox linux -- omnigent run path/to/agent.yaml
-```
-
-**Tclone runtime.** On a prepared
-[GenseeAI/os4agent](https://github.com/GenseeAI/os4agent) tclone host, launch
-an agent in cloneable container storage and fork it from another terminal.
-Tclone provides low-latency full-workspace forking for AI agents:
-
-```bash
+curl -fsSL https://raw.githubusercontent.com/GenseeAI/gensee-crate/main/scripts/install_oss.sh | bash
 export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
+```
+
+Then prepare the remote host with the tclone-enabled
+[`os4agent`](https://github.com/GenseeAI/os4agent) runtime, rootful Podman with
+`btrfs`, and a tclone image. Follow the [tclone host setup](docs/tclone.md)
+rather than copying host-storage settings between machines.
+
+After host preparation, define the wrapper used by the tclone workflow:
+
+```bash
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
 export GENSEE_TCLONE_IMAGE="${GENSEE_TCLONE_IMAGE:-localhost/gensee-tclone-webtop:tmux}"
 export GENSEE_TCLONE_AUTHORITY_ROOT="${GENSEE_TCLONE_AUTHORITY_ROOT:-/var/lib/gensee-boundary}"
@@ -525,231 +228,86 @@ export TMPDIR="$GENSEE_TMP_ROOT"
 sudo install -d -o root -g root -m 0700 "$GENSEE_TCLONE_AUTHORITY_ROOT"
 # Optional: set this when os4agent uses a dedicated btrfs rootful Podman store.
 # export CONTAINERS_STORAGE_CONF="$GENSEE_HOME/tclone-btrfs-storage.conf"
-alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "TMPDIR=$TMPDIR" "GENSEE_TMP_ROOT=$GENSEE_TMP_ROOT" "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_AUTHORITY_ROOT=$GENSEE_TCLONE_AUTHORITY_ROOT" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
 
-gensee-tclone run --runtime tclone -- codex
-gensee-tclone run list              # source id is under "Tclone containers"
-gensee-tclone run list --json       # agent-facing completion polling
-gensee-tclone run fork <source-run-id> --copies 2 --name try-upgrade --approach 'minimal compatible upgrade' --approach 'aggressive latest-version upgrade' --attach tmux:right --json
-gensee-tclone run attach <fork-id> --tmux right
-gensee-tclone run send <fork-id> -- 'Run cargo test and fix failures'
-gensee-tclone run exec <fork-id> -- bash -lc 'cargo test'
-gensee-tclone run diff <fork-id> [--json]
-gensee-tclone run summary <fork-id> --json
-gensee-tclone run compare <parallel-fork-id> --json
-gensee-tclone run choose <parallel-fork-id> <--merge|--promote|--discard-all>
-gensee-tclone run merge <fork-id> --into <source-run-id>   # default: --git
-gensee-tclone run switch <fork-id>                         # promote fork; end old source
+alias gensee-tclone='sudo env \
+  PATH="$PATH" HOME="$HOME" TERM="${TERM:-}" TMUX="${TMUX:-}" \
+  GENSEE_HOME="$GENSEE_HOME" \
+  GENSEE_TCLONE_PODMAN="$GENSEE_TCLONE_PODMAN" \
+  GENSEE_TCLONE_IMAGE="$GENSEE_TCLONE_IMAGE" \
+  GENSEE_TCLONE_AUTHORITY_ROOT="$GENSEE_TCLONE_AUTHORITY_ROOT" \
+  CONTAINERS_STORAGE_CONF="${CONTAINERS_STORAGE_CONF:-}" \
+  GENSEE_TMP_ROOT="$GENSEE_TMP_ROOT" TMPDIR="$TMPDIR" \
+  gensee'
 ```
 
-Before launching the source, verify the host setup from the same shell:
+### Run and fork agent work
+
+Start the source agent in the prepared runtime:
 
 ```bash
-sudo env "PATH=$PATH" "HOME=$HOME" "TMPDIR=$TMPDIR" \
-  "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
-  "$GENSEE_TCLONE_PODMAN" info --format '{{.Store.GraphRoot}} {{.Store.GraphDriverName}}'
-ls -l /dev/vma_cherrypick /dev/criu_capbypass /dev/reparent /dev/pkey_state
+gensee-tclone run --runtime tclone -- codex
 ```
 
-The Podman storage driver must be `btrfs`; an `overlay` driver on a btrfs disk
-is not enough for tclone snapshots. The tclone image must be loaded or pulled
-into the same Podman store selected by `CONTAINERS_STORAGE_CONF`. Keep
-`GENSEE_TMP_ROOT` outside the workspace, or a later launch can recursively copy
-Gensee's own staging tree and fail with `File name too long`.
+Create one fork or compare multiple approaches:
 
-Named parallel groups use stable indexed container names when available
-(`try-upgrade-0`, `try-upgrade-1`). If an unresolved older run still owns those
-names, Gensee automatically falls back to a timestamped prefix for the new group
-instead of failing the fork request. Panes form a vertical stack to the right of
-the source.
-Codex assigns the repeated approaches in order, compares the completed diffs
-and tests, recommends a winner, and—only after approval—merges or promotes that
-winner while discarding the other group members. The recommendation is a
-smallest-passing-diff heuristic, not a correctness judgment, and should be
-presented as a suggestion rather than an automatic choice.
+```bash
+gensee-tclone run list --json
 
-Codex should mediate fork resolution: summarize the fork in chat, offer merge,
-promote-to-main-and-end-source, and discard choices, and run the selected
-lifecycle command only after explicit user approval. For container-mediated lifecycle commands, the
-host bridge enforces a matching, unconsumed choice recorded by a later
-`UserPromptSubmit` hook; failed or stalled fork tasks cannot be merged.
+gensee-tclone run fork <source-run-id> \
+  --copies 2 \
+  --name try-upgrade \
+  --approach 'minimal compatible upgrade' \
+  --approach 'aggressive latest-version upgrade' \
+  --attach tmux:right \
+  --json
+```
 
-The tclone launcher also prints the source id directly:
-`gensee: fork from another terminal with: gensee run fork run_...`.
-Agent hooks also record fork suggestions for exploratory requests and commands
-such as dependency upgrades, migrations, broad refactors, lockfile changes,
-destructive cleanup, and database resets. In Codex tclone source runs, matching
-user prompts add fork guidance before planning; matching source commands are
-blocked as a backstop so the risky work happens in a fork first.
-Irreversible local operations are blocked with high severity across providers
-until execution is inside a disposable tclone fork; observe-only deployments
-can explicitly downgrade the stable capability-delegation rule in policy.
-Async fork JSON includes `status_command`; poll it immediately and keep retrying
-that same command while `status=running`. The active status poll is intentionally
-inherited by the live clone so the forked Codex turn can stop source
-orchestration and continue the original approved task. Async agent forks ignore
-`GENSEE_TCLONE_WAIT_QUIET_FOR_FORK` because waiting for an idle source is
-incompatible with cloning the active turn. The source must not resend the prompt.
-A transient
-capability-rotation, empty-success, or checkpoint-interrupted response uses
-`status=running` and `transient=true`; retry the same status command rather than
-creating another fork. Running status JSON includes recent log lines so agents
-can report quiet-wait or clone progress. JSON status polls use a short
-control-bridge timeout so a response inherited by the clone cannot leave the
-source agent stuck waiting. If the fork inherits a source `fork-status` poll,
-Gensee tells that pane to stop source orchestration, continue the original task,
-then summarize and offer merge, promote-to-main-and-end-source, or discard. The fork may run only
-its own approved lifecycle action against its direct source. `run send` remains
-available for later follow-up prompts and marks those prompts queued before tmux
-input. Fork creation does not report success until the child has received its
-authoritative fork context.
-Use a tclone image with `tmux` for reliable `gensee run attach`. From inside a
-host tmux session, `--attach tmux:right` opens the forked live agent in a new
-pane. The attach pane re-enters `gensee run attach`, so use the same wrapper for
-`run`, `list`, `fork`, `attach`, `send`, `exec`, `merge`, `switch`, and cleanup.
-If you rebuild or reinstall `gensee`, start a fresh source; already-running
-sources keep their old host-control process in memory. Without tmux,
-`gensee run shell` still opens a new shell but does not reconnect to the live
-agent UI. Use `gensee run exec <fork-id> -- <command>` for non-interactive,
-container-scoped commands in a fork, or `gensee run send <fork-id> -- <prompt>`
-to visibly send work into the forked agent pane.
+### Examine results and decide what persists
+
+```bash
+gensee-tclone run summary <fork-id> --json
+gensee-tclone run diff <fork-id> --json
+gensee-tclone run compare <parallel-fork-id> --json
+
+# After an explicit human decision:
+gensee-tclone run choose <parallel-fork-id> --merge
+# or: --promote
+# or: --discard-all
+```
+
+Use `gensee timeline`, `gensee status --json`, and the local [Gensee
+dashboard](docs/dashboard.md) to examine policy decisions, runtime evidence,
+effects, cleanup, and promotion outcomes. The [tclone guide](docs/tclone.md) and
+[capability broker guide](docs/capability-broker.md) describe the complete host,
+lease, mediation, and lifecycle model.
 
 </details>
 
-See [`docs/watch.md`](docs/watch.md),
-[`docs/run-and-sandbox.md`](docs/run-and-sandbox.md), and
-[`docs/linux.md`](docs/linux.md) for the full options. See
-[`docs/tclone.md`](docs/tclone.md) for cloneable container runtime workflows.
-
-### 3. Examine results
-
-**CLI.** Inspect what happened at any time:
-
-```bash
-gensee audit codex # review local Codex configuration and extensions
-gensee run list   # list guarded run sessions and staged workspaces
-gensee timeline   # show prompts, tool intent, file effects, and policy decisions
-```
-
-**Dashboard.** Open the local native dashboard for a view of the same store:
-
-The local dashboard reads the same `GENSEE_HOME` store as `watch`, hooks, and
-`timeline`. It shows live agent activity, policy decisions, alerts, file and
-request lineage, and the active policy document; users can record review
-verdicts and edit validated policy settings in the desktop application.
-
-Install dependencies once, then launch from the repository checkout:
-
-```bash
-npm install --prefix dashboards --legacy-peer-deps
-cargo install tauri-cli --version "^2" --locked
-cd dashboards
-GENSEE_HOME="$HOME/.gensee" cargo tauri dev
-```
-
-This opens a native desktop window backed by the Rust core. No TCP server
-is started; all data access goes through Tauri IPC.
-
-See [`dashboards/README.md`](dashboards/README.md) for requirements, store setup,
-and policy editing notes.
-
-The activity overview summarizes agent sessions, request and event volume,
-seven-day activity, recent high-risk findings, and the complete alert severity
-mix in one local surface.
-
-![Gensee Crate activity and security overview](docs/images/dashboard-activity.png)
-
-Timeline expands each agent session into requests and tool calls. Parallel and
-sequential work, execution durations, affected files, and policy outcomes stay
-connected to the original task.
-
-![Gensee Crate agent tool-call timeline](docs/images/dashboard-agent-timeline.png)
-
-Transactional environments retain their dependency structure as well as their
-chronology. The dependency view makes fork fan-out, validated merge origins,
-discarded experiments, and the active environment explicit.
-
-![Gensee Crate transactional environment dependency graph](docs/images/dashboard-transaction-dependencies.png)
-
-Artifact lineage connects operational guidance and reproduced evidence to code,
-tests, release workflows, and protected deployment targets, with risk state and
-authorship visible at each node.
-
-![Gensee Crate artifact lineage graph](docs/images/dashboard-lineage.png)
-
-### 4. Manage policy
-
-Use `gensee policy` or the dashboard UI to inspect, initialize, validate, and
-edit the active policy document without copying files by hand:
-
-```bash
-gensee policy path
-gensee policy setup
-gensee policy validate "$GENSEE_HOME/policy.json"
-```
-
-`gensee policy setup` walks through the same dashboard-style policy settings,
-artifact definitions, and decision rules. Use it to tune resource limits,
-network egress, runtime, enforcement, watch system events, allowlisted paths,
-what counts as executable/memory/skill/control-plane artifacts, and whether
-each safety rule denies, asks, or allows.
-
-Use `gensee policy print-default` to inspect the bundled default policy. The
-guided setup flow writes the user policy to `$GENSEE_HOME/policy.json`, which is
-auto-loaded by the hook, CLI, and dashboard when `GENSEE_POLICY_FILE` is unset.
-You can also point `GENSEE_POLICY_FILE` at a custom policy path; see
-[`docs/policy.md`](docs/policy.md) for the full policy workflow.
-
 ## Roadmap
 
-Gensee Crate supports macOS and Linux today, with Claude Code, Codex,
-Antigravity, Cursor, and VS Code / GitHub Copilot hook support, local policy
-enforcement, staged workspace runs, local telemetry, and a native desktop
-dashboard. Next directions include:
+- **Personal:** richer verification results, more harness integrations, quieter
+  request-level decisions, and broader independent network evidence.
+- **Team:** more capability adapters and trusted mediators, a generalized
+  dispatcher across effect domains, stronger remote evidence export, and
+  counterfactual replay before policy changes.
+- **Both:** keep deterministic policy and evidence portable while making the
+  default workflow require less supervision—not more.
 
-- **Linux system enforcement:** eBPF telemetry, Landlock/AppArmor profile
-  generation, daemon-owned fanotify lifecycle, and richer per-attempt
-  attribution.
-- **Transactional Linux runtimes:** initial tclone launch/fork/shell/diff/keep
-  support is available; next work is post-fork hook rebind, policy-controlled
-  rollback, and multi-fork lifecycle management.
-- **Endpoint Security-based macOS defense:** process and file observation plus
-  managed-agent authorization are available; network visibility remains a
-  separate Network Extension or packet-sensor direction.
-- **Sandbox support:** stronger `gensee run` confinement, staged writes, and
-  speculative or transactional execution for risky agent actions.
-- **ML-based policy and rules:** learning from controlled traces, blocked
-  actions, and bypass attempts to improve risk scoring and policy suggestions.
-- **Integrations:** support for more agents and security tooling, including
-  ChatGPT, Gemini, Omnigent, CrowdStrike, LLM gateways, MCP servers, and
-  audit/security workflow exports.
-
-See [`docs/roadmap.md`](docs/roadmap.md) for more detail.
+Follow the detailed [project roadmap](docs/roadmap.md) and [open
+issues](https://github.com/GenseeAI/gensee-crate/issues) for current work.
 
 ## Documentation
 
-Full docs live in [`docs/`](docs/README.md):
+- [Gensee Crate Personal for macOS](macos/GenseeCrate/README.md)
+- [Architecture](docs/architecture.md)
+- [Policy](docs/policy.md)
+- [Claude Code hooks](docs/claude-code-hooks.md)
+- [Configuration audit](docs/config-audit.md)
+- [Run and sandbox modes](docs/run-and-sandbox.md)
+- [Linux controls](docs/linux.md)
+- [tclone transactional runtime](docs/tclone.md)
+- [Capability broker and leases](docs/capability-broker.md)
+- [Dashboard](docs/dashboard.md)
+- [Roadmap](docs/roadmap.md)
 
-- [Architecture](docs/architecture.md) — the v0.2 runtime, workspace crates, and roadmap.
-- [Roadmap](docs/roadmap.md) — current host controls and planned sandbox, sensor, ML policy, and integration work.
-- [Linux host support](docs/linux.md) — `/proc` monitoring, fanotify
-  sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress
-  controls, and the Linux enforcement plan.
-- [Tclone runtime integration](docs/tclone.md) — launch agents in cloneable Linux
-  containers, fork live source containers, inspect diffs, merge/switch results,
-  and clean up forks.
-- [`gensee watch`](docs/watch.md) — sidecar filesystem and system-event audit, backends, and watch roots.
-- [`gensee run` and the macOS sandbox](docs/run-and-sandbox.md) — managed launch and staged workspaces.
-- [`gensee policy`](docs/gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.
-- [`gensee audit config`](docs/config-audit.md) — static Codex security and
-  privacy review with human and versioned JSON output.
-- [Claude Code hooks](docs/claude-code-hooks.md) — wiring Claude Code prompts and tool intent into Gensee.
-- [Codex hooks](docs/codex-support.md) — wiring Codex prompts and tool intent into Gensee.
-- [Antigravity support](docs/antigravity-support.md) — wiring Antigravity hooks and `.agents` customizations into Gensee.
-- [VS Code / GitHub Copilot hooks](docs/vscode-support.md) — wiring VS Code agent hooks and native tool intent into Gensee.
-- [Cursor hooks](docs/cursor-support.md) — wiring Cursor prompts, tools, shell commands, and lifecycle events into Gensee.
-- [Omnigent integration](integrations/omnigent/README.md) — thin sidecar/managed-run support and the deeper policy-bridge plan.
-- [Safety policy](docs/policy.md) — the data-driven allow/ask/deny engine and `gensee policy` workflow.
-- [Native macOS security console](docs/macos-app.md) — manage the Endpoint Security extension, policy modes, and harness protection.
-- [SQLite lineage graph](docs/lineage-graph.md) — the provenance schema and example queries.
-- [Endpoint Security sensor](docs/endpoint-security.md) — signed macOS process/file observation and managed-tree authorization.
+Gensee Crate is available under the [Apache 2.0 license](LICENSE).

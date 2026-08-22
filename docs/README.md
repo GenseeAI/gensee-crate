@@ -1,12 +1,14 @@
 # Gensee Crate documentation
 
-Local-first runtime security for AI agents. Start with the project
-[README](https://github.com/GenseeAI/gensee-crate#readme) for the overview and
-quick start, then dive into the topic guides below.
+Gensee Crate is an open-source control layer for AI coding agents. Start with
+[Gensee Crate Personal](personal.md) for local laptop protection and review, or
+[Gensee Crate Team](team.md) for self-hosted remote Linux agent environments.
 
 ## Guides
 
-- [Architecture](architecture.md) — the v0.2 runtime, workspace crates, and roadmap.
+- [Gensee Crate Personal](personal.md) — local review, recovery points, configuration audit, and optional independent macOS verification.
+- [Gensee Crate Team](team.md) — disposable workspace forks, scoped capabilities, host-owned credentials, and evidence-gated promotion.
+- [Architecture](architecture.md) — shared policy and evidence model, workspace crates, and security boundaries.
 - [Roadmap](roadmap.md) — current host controls and planned sandbox, sensor, ML policy, and integration work.
 - [Linux host support](linux.md) — `/proc` process attribution, fanotify sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress controls, and Linux capability planning.
 - [Tclone runtime integration](tclone.md) — launch agents in cloneable Linux containers, fork live source containers, inspect diffs, keep workspaces, and discard forks.
@@ -26,7 +28,7 @@ quick start, then dive into the topic guides below.
 - [Omnigent integration](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/omnigent) — thin `watch`/`run` support and the deeper policy-bridge plan.
 - [Safety policy](policy.md) — the data-driven allow/ask/deny policy engine and how to customize it.
 - [Dashboard](dashboard.md) — run the cross-platform React/Tauri inspector for activity, lineage, policy, and transactions.
-- [Native macOS security console](macos-app.md) — manage the Endpoint Security extension, policy modes, and harness protection.
+- [Gensee Crate Personal for macOS](macos-app.md) — install the app, connect harnesses, review work, create recovery points, audit configuration, and add optional Endpoint Security verification.
 - [SQLite lineage graph](lineage-graph.md) — the provenance schema, example queries, and what Gensee can flag today.
 - [Endpoint Security sensor](endpoint-security.md) — signed macOS process/file observation and managed-tree authorization.
 
