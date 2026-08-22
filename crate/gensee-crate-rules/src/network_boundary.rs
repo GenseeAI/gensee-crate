@@ -80,8 +80,16 @@ pub struct NetworkBoundaryPolicy {
     pub max_in_place_lease_ttl_seconds: u64,
     #[serde(default)]
     pub http_gateway_available: bool,
+    /// Exact HTTP methods the trusted mediator may execute. The default is
+    /// read-only; trusted policy must opt into every mutating method.
+    #[serde(default = "default_http_gateway_methods")]
+    pub http_gateway_methods: Vec<String>,
     #[serde(default = "default_prefer_http_gateway")]
     pub prefer_http_gateway: bool,
+}
+
+fn default_http_gateway_methods() -> Vec<String> {
+    vec!["GET".to_string(), "HEAD".to_string()]
 }
 
 fn default_prefer_http_gateway() -> bool {
@@ -118,6 +126,7 @@ impl Default for NetworkBoundaryPolicy {
             in_place_lease_protocols: vec![NetworkProtocol::Tcp],
             max_in_place_lease_ttl_seconds: 60,
             http_gateway_available: false,
+            http_gateway_methods: default_http_gateway_methods(),
             prefer_http_gateway: true,
         }
     }
@@ -175,7 +184,7 @@ pub fn decide_network_boundary(
     }
 
     let brokerable = matches!(&event.effect, NetworkEffectKind::Http { method, .. }
-        if matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD"));
+        if policy.http_gateway_methods.iter().any(|allowed| allowed == &method.to_ascii_uppercase()));
     if brokerable && policy.http_gateway_available && policy.prefer_http_gateway {
         return NetworkBoundaryDecision {
             disposition: NetworkBoundaryDisposition::BrokerHttp,
@@ -249,6 +258,10 @@ fn validate_event(
         .iter()
         .chain(&policy.in_place_lease_destinations)
         .any(|cidr| !valid_cidr(cidr))
+        || policy
+            .http_gateway_methods
+            .iter()
+            .any(|method| !valid_http_mediator_method(method))
     {
         return Err("invalid_network_boundary_policy");
     }
@@ -257,6 +270,16 @@ fn validate_event(
         .parse::<IpAddr>()
         .map(normalize_ip)
         .map_err(|_| "network_effect_requires_resolved_ip")
+}
+
+fn valid_http_mediator_method(method: &str) -> bool {
+    !method.is_empty()
+        && method.len() <= 32
+        && method != "CONNECT"
+        && method != "TRACE"
+        && method
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte == b'-')
 }
 
 fn valid_cidr(cidr: &str) -> bool {
@@ -446,6 +469,40 @@ mod tests {
             &policy,
         );
         assert_eq!(decision.disposition, NetworkBoundaryDisposition::BrokerHttp);
+    }
+
+    #[test]
+    fn mutating_http_is_brokered_only_when_explicitly_in_policy() {
+        let post = event(
+            "8.8.8.8",
+            NetworkEffectKind::Http {
+                method: "POST".to_string(),
+                authority: "api.example".to_string(),
+            },
+        );
+        let default_policy = NetworkBoundaryPolicy {
+            http_gateway_available: true,
+            ..NetworkBoundaryPolicy::default()
+        };
+        assert_eq!(
+            decide_network_boundary(
+                &post,
+                &NetworkCapabilityEnvelope::default(),
+                &default_policy,
+            )
+            .disposition,
+            NetworkBoundaryDisposition::Deny
+        );
+        let opt_in_policy = NetworkBoundaryPolicy {
+            http_gateway_available: true,
+            http_gateway_methods: vec!["GET".to_string(), "HEAD".to_string(), "POST".to_string()],
+            ..NetworkBoundaryPolicy::default()
+        };
+        assert_eq!(
+            decide_network_boundary(&post, &NetworkCapabilityEnvelope::default(), &opt_in_policy,)
+                .disposition,
+            NetworkBoundaryDisposition::BrokerHttp
+        );
     }
 
     #[test]

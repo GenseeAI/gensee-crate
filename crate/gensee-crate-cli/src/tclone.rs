@@ -11,6 +11,7 @@ use uuid::Uuid;
 mod capability_cell;
 pub(crate) use capability_cell::{tclone_capability_cell, tclone_capability_lease};
 mod capability_broker;
+pub(crate) use capability_broker::consume_external_commit_token_for_gateway;
 pub(crate) use capability_broker::tclone_capability_broker;
 
 #[cfg(unix)]
