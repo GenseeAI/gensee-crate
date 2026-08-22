@@ -86,10 +86,6 @@ enum EndpointEvidenceContinuityPolicy {
                 persistedBootID,
                 currentBootID,
                 String(persistedCursor),
-                String(oldestCursor),
-                String(nextCursor),
-                String(persistedKernelDrops ?? 0),
-                String(currentKernelDrops),
             ].joined(separator: ":")
         )
     }

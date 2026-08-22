@@ -264,7 +264,7 @@ struct SetupAssistantView: View {
             permissionRow(
                 number: 1,
                 title: "Endpoint Security extension",
-                detail: extensionManager.state.detail,
+                detail: extensionManager.guidanceDetail,
                 ready: extensionManager.state == .active
             ) {
                 if extensionManager.state == .awaitingApproval {

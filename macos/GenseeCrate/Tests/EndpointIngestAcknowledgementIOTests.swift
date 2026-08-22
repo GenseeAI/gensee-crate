@@ -92,10 +92,10 @@ final class EndpointIngestAcknowledgementIOTests: XCTestCase {
             persistedBootID: "boot-a",
             currentBootID: "boot-a",
             persistedCursor: 100,
-            oldestCursor: 125,
-            nextCursor: 500,
+            oldestCursor: 180,
+            nextCursor: 900,
             persistedKernelDrops: 4,
-            currentKernelDrops: 7
+            currentKernelDrops: 12
         )
         let newerGap = EndpointEvidenceContinuityPolicy.issue(
             persistedBootID: "boot-a",
