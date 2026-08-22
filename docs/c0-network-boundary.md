@@ -101,12 +101,26 @@ baseline grant can deliberately reach a local gateway or model service even
 when its address falls in a restricted CIDR. Restricted destinations remain
 ineligible for newly issued authority.
 
-Start the supervisor as a privileged host process:
+Install the operation config as a root-owned mode-0600 file and create a
+root-owned mode-0700 authority root. Start the per-operation privileged boundary
+daemon with an explicit state root:
 
 ~~~console
-sudo env GENSEE_HOME=/var/lib/gensee \
-  gensee run network serve --config operation.json
+sudo install -d -o root -g root -m 0700 /var/lib/gensee-boundary
+sudo install -d -o root -g root -m 0755 /etc/gensee/operations
+sudo install -o root -g root -m 0600 operation.json /etc/gensee/operations/op_agent_fetch.json
+sudo gensee boundary-daemon \
+  --state-root /var/lib/gensee-boundary \
+  --config /etc/gensee/operations/op_agent_fetch.json
 ~~~
+
+The daemon rejects ambient `GENSEE_HOME`, non-root execution, symlinked paths,
+configuration or state writable by another principal, and any writable or
+non-root-owned path ancestor. Its Unix control socket is root-only and every
+connection is independently authenticated with Linux `SO_PEERCRED`; filesystem
+mode is not treated as the only identity check. Workloads interact with the
+HTTP mediator only from the exact configured network address. Kernel boundary
+adapters submit capability faults over the authenticated control channel.
 
 The control socket and evidence are retained under
 GENSEE_HOME/network-operations/OPERATION_ID as supervisor.sock, record.json,
@@ -159,6 +173,8 @@ timeout and remaining lease lifetime, but is not yet actively interrupted by a
 revocation event. Active socket cancellation belongs in the privileged daemon
 transport.
 
-The supervisor currently runs as its invoking host principal. Moving authority,
-signing, nftables state, and evidence into a differently privileged daemon
-remains necessary before host-user compromise is in scope.
+The boundary daemon now owns policy state, nftables/cgroup mutation, broker
+signing material, credential handles, revocation, and evidence outside the
+workload principal. Its HTTP parser and transport still run in the same daemon
+process; splitting untrusted response parsing into a separately confined worker
+would reduce the host-side implementation attack surface further.
