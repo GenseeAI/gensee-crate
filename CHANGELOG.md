@@ -11,6 +11,25 @@ changes.
 Use this section for user-visible changes after the initial open-source
 release.
 
+## 0.3.1 - 2026-08-21
+
+### Changed
+
+- Added Settings and Quit commands to the menu-bar app so users can open the
+  configuration screen directly or stop Gensee Crate completely.
+- Setup now opens harness hook approval only after configuration succeeds and
+  provides visible manual guidance when macOS cannot open the required System
+  Settings pane automatically.
+
+### Fixed
+
+- Fixed large requests timing out while loading complete request evidence in
+  Review Queue.
+- Fixed setup audit results that reported findings without a way to inspect
+  them.
+- Fixed acknowledged Endpoint Security evidence-gap warnings resurfacing after
+  reconnects because volatile ring-buffer measurements changed.
+
 ## 0.3.0 - 2026-08-20
 
 ### Added
