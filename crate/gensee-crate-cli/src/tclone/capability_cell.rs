@@ -3930,6 +3930,9 @@ mod tests {
     fn source_record() -> TcloneRunRecord {
         TcloneRunRecord {
             run_id: "run_1".to_string(),
+            operation_id: None,
+            operation_state_root: None,
+            capability_lifecycle: None,
             parent_run_id: None,
             role: "source".to_string(),
             status: "running".to_string(),

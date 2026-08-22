@@ -46,8 +46,11 @@ evidence remains in `network-operations/OPERATION_ID/effects.jsonl`.
 ## Security boundary
 
 This supervisor establishes durable identity and coordination; it does not by
-itself make an unprivileged CLI a trusted reference monitor. A privileged
-daemon still needs to own cgroups, nftables, lease expiry after client crashes,
-authenticated effect evidence, and termination of every surviving descendant.
-Fresh cells and live Tclone forks must also join this same lifecycle instead of
-creating parallel, unrelated records.
+itself make an unprivileged CLI a trusted reference monitor. The network
+boundary daemon owns network authority and signing. Fresh cells and new live
+Tclone sources/forks now join the same operation lifecycle; Tclone requires an
+explicit root-owned authority root and rejects live-fork authority deltas.
+Tclone orchestration still runs in the root CLI rather than the long-lived
+boundary daemon, and complete descendant termination, inherited-authority
+rebind, and non-network mediation remain required before live forks can expand
+authority.

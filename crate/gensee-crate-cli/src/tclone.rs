@@ -13,6 +13,7 @@ pub(crate) use capability_cell::{tclone_capability_cell, tclone_capability_lease
 mod capability_broker;
 pub(crate) use capability_broker::consume_external_commit_token_for_gateway;
 pub(crate) use capability_broker::tclone_capability_broker;
+mod capability_lifecycle;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
@@ -150,6 +151,12 @@ static TCLONE_HOST_FILE_TIMEOUT_CLAMP_WARNING: OnceLock<()> = OnceLock::new();
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct TcloneRunRecord {
     pub(crate) run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) operation_state_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capability_lifecycle: Option<capability_lifecycle::TcloneCapabilityLifecycle>,
     pub(crate) parent_run_id: Option<String>,
     pub(crate) role: String,
     pub(crate) status: String,
@@ -4130,11 +4137,23 @@ fn run_tclone_agent_inner(
         .map(|arg| arg.to_string_lossy().to_string())
         .collect::<Vec<_>>();
 
+    // Prepare the operation cgroup before the container exists. If startup
+    // fails, the later-declared container cleanup runs before this guard tries
+    // to close and remove the operation cgroup.
+    let operation_state_root = capability_lifecycle::tclone_authority_root()?;
+    let mut source_operation = capability_lifecycle::TcloneOperationGuard::prepare_source(
+        &operation_state_root,
+        operation_id,
+        &run_id,
+    )?;
     let output = run_command_capture(&podman, &create_args)?;
     let container_id = output.lines().next().map(str::trim).map(str::to_string);
     let cleanup_guard = TcloneContainerCleanup::new(&podman, &source_container);
     let source_record = TcloneRunRecord {
         run_id: run_id.clone(),
+        operation_id: Some(operation_id.to_string()),
+        operation_state_root: Some(operation_state_root.to_string_lossy().to_string()),
+        capability_lifecycle: None,
         parent_run_id: None,
         role: "source".to_string(),
         status: "preparing".to_string(),
@@ -4170,6 +4189,8 @@ fn run_tclone_agent_inner(
         &podman,
         &[OsString::from("start"), OsString::from(&source_container)],
     )?;
+    let root_pid = inspect_container_pid(&podman, &source_container)?;
+    source_operation.activate(root_pid)?;
     write_tclone_run_context(&podman, &source_record)?;
     start_tclone_agent_session(&podman, &source_container, &container_agent_cmd)?;
     let _container_file_control = if env_flag(TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV) {
@@ -4190,8 +4211,6 @@ fn run_tclone_agent_inner(
         no_attach,
         tclone_agent_ready_timeout(no_attach),
     )?;
-    let root_pid = inspect_container_pid(&podman, &source_container).unwrap_or(0);
-
     let store = EventStore::default_local()?;
     store.append_session(&AgentSession {
         session_id: run_id.clone(),
@@ -4224,6 +4243,7 @@ fn run_tclone_agent_inner(
         Some(json!({ "status": "running", "container_name": source_container })),
     );
     cleanup_guard.disarm();
+    source_operation.leave_running();
 
     eprintln!(
         "gensee: started tclone run {run_id} source_container={source_container} workspace={}",
@@ -4365,6 +4385,14 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
     let result: io::Result<()> = (|| {
         let podman = tclone_podman();
         ensure_tclone_container_exists(&podman, &source)?;
+        let source_root_pid = inspect_container_pid(&podman, &source.container_name)?;
+        let source_operation_state_root = source
+            .operation_state_root
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::other("tclone source has no operation state root"))?;
+        let (source_operation_id, source_envelope) =
+            capability_lifecycle::attest_parent_for_live_fork(&source, source_root_pid)?;
         timing.mark("ensure_source_exists");
         let forked_at_ms = unix_millis()?;
         let prefix = choose_tclone_fork_name_prefix(
@@ -4417,6 +4445,21 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 let run_id = prepared_contexts.contexts[index].run_id.clone();
                 let container_name = clone.name.clone();
                 let root_pid = clone.pid;
+                let child_operation_id = format!("op_{}", Uuid::new_v4().simple());
+                let mut child_operation = capability_lifecycle::TcloneOperationGuard::prepare_fork(
+                    &source_operation_state_root,
+                    &child_operation_id,
+                    &run_id,
+                    source_envelope.capabilities.clone(),
+                )?;
+                child_operation.activate(root_pid)?;
+                let child_envelope = child_operation.envelope_snapshot()?;
+                let capability_lifecycle = capability_lifecycle::plan_same_authority_live_fork(
+                    &source_operation_id,
+                    &child_operation_id,
+                    &child_envelope,
+                    unix_millis()?,
+                )?;
                 // Podman's tfork metadata emits cloneRootfsList[i], the same
                 // absolute merged rootfs path installed in the clone config.
                 // It is therefore the mountpoint to match in mountinfo.
@@ -4451,6 +4494,9 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 timing.mark("append_session");
                 let fork_record = TcloneRunRecord {
                     run_id: run_id.clone(),
+                    operation_id: Some(child_operation_id.clone()),
+                    operation_state_root: source.operation_state_root.clone(),
+                    capability_lifecycle: Some(capability_lifecycle.clone()),
                     parent_run_id: Some(source.run_id.clone()),
                     role: "fork".to_string(),
                     status: "running".to_string(),
@@ -4481,7 +4527,9 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                     updated_at_ms: observed_at,
                     exit_code: None,
                 };
+                write_tclone_run_context(&podman, &fork_record)?;
                 append_tclone_record(&fork_record)?;
+                child_operation.leave_running();
                 timing.mark("append_run_record");
                 timing.mark("clone_context_preinstalled");
                 if let Some(handoff) = source_handoff.as_ref() {
@@ -5728,6 +5776,9 @@ fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
 fn tclone_run_context_payload(record: &TcloneRunRecord, capability: &str) -> Value {
     json!({
         "run_id": &record.run_id,
+        "operation_id": &record.operation_id,
+        "operation_state_root": &record.operation_state_root,
+        "capability_lifecycle": &record.capability_lifecycle,
         "role": &record.role,
         "source_run_id": record.parent_run_id.as_deref().unwrap_or(&record.run_id),
         "workspace": &record.container_workspace,
@@ -8069,6 +8120,7 @@ pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
     let result = (|| {
         let podman = tclone_podman();
         ensure_tclone_container_exists(&podman, &fork)?;
+        let fork_root_pid = inspect_container_pid(&podman, &fork.container_name)?;
         let switched_at_ms = unix_millis()?;
         let parent_run_id = fork.parent_run_id.as_deref().ok_or_else(|| {
             io::Error::new(
@@ -8086,6 +8138,15 @@ pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
                 ),
             ));
         }
+        ensure_tclone_container_exists(&podman, &previous_source)?;
+        let previous_source_root_pid =
+            inspect_container_pid(&podman, &previous_source.container_name)?;
+        capability_lifecycle::attest_live_fork_for_promotion(
+            &fork,
+            &previous_source,
+            fork_root_pid,
+            previous_source_root_pid,
+        )?;
 
         let mut retired_source = previous_source.clone();
         retired_source.status = "switched-away".to_string();
@@ -8093,7 +8154,9 @@ pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
         let switched = switched_tclone_source_record(fork.clone(), switched_at_ms)?;
         append_tclone_records_atomically(&[retired_source, switched.clone()])?;
 
-        if let Err(error) = write_tclone_run_context(&podman, &switched) {
+        if let Err(error) = rotate_tclone_host_control_capability(&switched.run_id)
+            .and_then(|_| write_tclone_run_context(&podman, &switched))
+        {
             let failure = io::Error::new(
                 error.kind(),
                 format!("could not promote fork context to source: {error}"),
@@ -8117,6 +8180,14 @@ pub(crate) fn tclone_switch(args: Vec<OsString>) -> io::Result<()> {
             let failure = io::Error::new(
                 error.kind(),
                 format!("could not reset promoted source lifecycle state: {error}"),
+            );
+            let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
+            return Err(tclone_switch_error_with_rollback(failure, rollback));
+        }
+        if let Err(error) = revoke_tclone_host_control_capability(&previous_source.run_id) {
+            let failure = io::Error::new(
+                error.kind(),
+                format!("could not revoke the retired source capability: {error}"),
             );
             let rollback = rollback_tclone_switch(&podman, &previous_source, &fork, true);
             return Err(tclone_switch_error_with_rollback(failure, rollback));
@@ -8165,11 +8236,17 @@ fn rollback_tclone_switch(
     fork: &TcloneRunRecord,
     restore_context: bool,
 ) -> io::Result<()> {
-    let context_error = if restore_context {
-        write_tclone_run_context(podman, fork).err()
-    } else {
-        None
-    };
+    let context_error = restore_context
+        .then(|| {
+            // A failed promotion may have rotated the fork identity and
+            // revoked the source identity. Rebind both sides before restoring
+            // the authoritative lifecycle records.
+            rotate_tclone_host_control_capability(&previous_source.run_id)?;
+            write_tclone_run_context(podman, previous_source)?;
+            rotate_tclone_host_control_capability(&fork.run_id)?;
+            write_tclone_run_context(podman, fork)
+        })
+        .and_then(Result::err);
     let state_error =
         append_tclone_records_atomically(&[previous_source.clone(), fork.clone()]).err();
     match (context_error, state_error) {
@@ -8608,7 +8685,21 @@ impl TcloneContainerRemoval {
 
 fn remove_tclone_container(record: &TcloneRunRecord) -> io::Result<TcloneContainerRemoval> {
     let podman = tclone_podman();
-    remove_tclone_container_by_name(&podman, &record.container_name)
+    let mut operation = if record.operation_id.is_some() {
+        // Authenticate the host lifecycle record before removing the
+        // container. A forged or stale user-visible run record must not turn
+        // cleanup into an unaudited destructive partial success.
+        Some(capability_lifecycle::open_tclone_operation(record)?)
+    } else {
+        None
+    };
+    let removal = remove_tclone_container_by_name(&podman, &record.container_name)?;
+    // The container is gone before the operation is closed, so its cgroup can
+    // be proven empty and removed instead of being abandoned with descendants.
+    if let Some(operation) = operation.as_mut() {
+        operation.finish(Some(record.exit_code.unwrap_or(0)), false)?;
+    }
+    Ok(removal)
 }
 
 fn remove_tclone_container_by_name(
@@ -10873,6 +10964,9 @@ mod tests {
     fn test_record(run_id: &str, status: &str) -> TcloneRunRecord {
         TcloneRunRecord {
             run_id: run_id.to_string(),
+            operation_id: None,
+            operation_state_root: None,
+            capability_lifecycle: None,
             parent_run_id: None,
             role: "source".to_string(),
             status: status.to_string(),

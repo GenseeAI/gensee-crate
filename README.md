@@ -222,13 +222,20 @@ After host preparation, define the wrapper used by the tclone workflow:
 ```bash
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
 export GENSEE_TCLONE_IMAGE="${GENSEE_TCLONE_IMAGE:-localhost/gensee-tclone-webtop:tmux}"
+export GENSEE_TCLONE_AUTHORITY_ROOT="${GENSEE_TCLONE_AUTHORITY_ROOT:-/var/lib/gensee-boundary}"
 export GENSEE_TMP_ROOT="${GENSEE_TMP_ROOT:-/tmp}"
 export TMPDIR="$GENSEE_TMP_ROOT"
+sudo install -d -o root -g root -m 0700 "$GENSEE_TCLONE_AUTHORITY_ROOT"
+# Optional: set this when os4agent uses a dedicated btrfs rootful Podman store.
+# export CONTAINERS_STORAGE_CONF="$GENSEE_HOME/tclone-btrfs-storage.conf"
 
 alias gensee-tclone='sudo env \
-  PATH="$PATH" HOME="$HOME" GENSEE_HOME="$GENSEE_HOME" \
+  PATH="$PATH" HOME="$HOME" TERM="${TERM:-}" TMUX="${TMUX:-}" \
+  GENSEE_HOME="$GENSEE_HOME" \
   GENSEE_TCLONE_PODMAN="$GENSEE_TCLONE_PODMAN" \
   GENSEE_TCLONE_IMAGE="$GENSEE_TCLONE_IMAGE" \
+  GENSEE_TCLONE_AUTHORITY_ROOT="$GENSEE_TCLONE_AUTHORITY_ROOT" \
+  CONTAINERS_STORAGE_CONF="${CONTAINERS_STORAGE_CONF:-}" \
   GENSEE_TMP_ROOT="$GENSEE_TMP_ROOT" TMPDIR="$TMPDIR" \
   gensee'
 ```

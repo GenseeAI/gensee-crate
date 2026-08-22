@@ -84,6 +84,20 @@ pub(crate) struct OperationViolation {
     pub observed_at_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OperationAttestation {
+    pub operation_id: String,
+    pub source_run_id: String,
+    pub state: OperationState,
+    pub root_pid: Option<u32>,
+    pub root_start_time_ticks: Option<u64>,
+    pub root_identity_active: bool,
+    pub cgroup_state: OperationCgroupState,
+    pub envelope: OperationCapabilityEnvelope,
+    pub boundary_effect_count: u64,
+    pub violations: Vec<OperationViolation>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OperationNetworkUsage {
@@ -206,7 +220,27 @@ impl OperationSupervisor {
         envelope: OperationCapabilityEnvelope,
         adopted_cgroup_path: Option<&Path>,
     ) -> io::Result<Self> {
+        let state_root = default_root()?;
+        Self::prepare_at(
+            &state_root,
+            operation_id,
+            source_run_id,
+            action_class,
+            envelope,
+            adopted_cgroup_path,
+        )
+    }
+
+    pub(crate) fn prepare_at(
+        state_root: &Path,
+        operation_id: impl Into<String>,
+        source_run_id: impl Into<String>,
+        action_class: impl Into<String>,
+        envelope: OperationCapabilityEnvelope,
+        adopted_cgroup_path: Option<&Path>,
+    ) -> io::Result<Self> {
         Self::prepare_inner(
+            state_root,
             operation_id,
             source_run_id,
             action_class,
@@ -222,7 +256,9 @@ impl OperationSupervisor {
         action_class: impl Into<String>,
         envelope: OperationCapabilityEnvelope,
     ) -> io::Result<Self> {
+        let state_root = default_root()?;
         Self::prepare_inner(
+            &state_root,
             operation_id,
             source_run_id,
             action_class,
@@ -233,6 +269,7 @@ impl OperationSupervisor {
     }
 
     fn prepare_inner(
+        state_root: &Path,
         operation_id: impl Into<String>,
         source_run_id: impl Into<String>,
         action_class: impl Into<String>,
@@ -252,7 +289,7 @@ impl OperationSupervisor {
                 "operation identity and action class must be bounded tokens",
             ));
         }
-        let root = operation_record_root(&operation_id)?;
+        let root = operation_record_root_at(state_root, &operation_id)?;
         create_restrictive_dir_all(&root)?;
         let record_path = root.join("record.json");
         let lock_path = root.join("record.lock");
@@ -329,7 +366,16 @@ impl OperationSupervisor {
     }
 
     pub(crate) fn open(operation_id: &str, expected_source_run_id: &str) -> io::Result<Self> {
-        let root = operation_record_root(operation_id)?;
+        let state_root = default_root()?;
+        Self::open_at(&state_root, operation_id, expected_source_run_id)
+    }
+
+    pub(crate) fn open_at(
+        state_root: &Path,
+        operation_id: &str,
+        expected_source_run_id: &str,
+    ) -> io::Result<Self> {
+        let root = operation_record_root_at(state_root, operation_id)?;
         let record_path = root.join("record.json");
         let lock_path = root.join("record.lock");
         let _lock = OperationRecordLock::acquire(&lock_path)?;
@@ -349,6 +395,55 @@ impl OperationSupervisor {
 
     pub(crate) fn operation_id(&self) -> &str {
         &self.record.operation_id
+    }
+
+    pub(crate) fn envelope_snapshot(&mut self) -> io::Result<OperationCapabilityEnvelope> {
+        let _lock = OperationRecordLock::acquire(&self.lock_path)?;
+        self.reload()?;
+        let now = unix_millis()?;
+        self.record
+            .envelope
+            .leases
+            .retain(|lease| lease.expires_at_ms > now);
+        self.record.updated_at_ms = now;
+        self.persist()?;
+        Ok(self.record.envelope.clone())
+    }
+
+    pub(crate) fn attestation(&mut self) -> io::Result<OperationAttestation> {
+        let _lock = OperationRecordLock::acquire(&self.lock_path)?;
+        self.reload()?;
+        self.refresh_lineage_in_memory()?;
+        let now = unix_millis()?;
+        self.record
+            .envelope
+            .leases
+            .retain(|lease| lease.expires_at_ms > now);
+        self.record.updated_at_ms = now;
+        self.persist()?;
+        let root_identity_active = self
+            .record
+            .root_pid
+            .zip(self.record.root_start_time_ticks)
+            .is_some_and(|(root_pid, root_start_time_ticks)| {
+                self.record.process_lineage.iter().any(|identity| {
+                    identity.pid == root_pid
+                        && identity.start_time_ticks == root_start_time_ticks
+                        && identity.active
+                })
+            });
+        Ok(OperationAttestation {
+            operation_id: self.record.operation_id.clone(),
+            source_run_id: self.record.source_run_id.clone(),
+            state: self.record.state,
+            root_pid: self.record.root_pid,
+            root_start_time_ticks: self.record.root_start_time_ticks,
+            root_identity_active,
+            cgroup_state: self.record.cgroup.state,
+            envelope: self.record.envelope.clone(),
+            boundary_effect_count: self.record.boundary_effect_count,
+            violations: self.record.violations.clone(),
+        })
     }
 
     pub(crate) fn cgroup_path(&self) -> Option<&Path> {
@@ -750,14 +845,14 @@ fn normalize_envelope(mut envelope: OperationCapabilityEnvelope) -> OperationCap
     envelope
 }
 
-fn operation_record_root(operation_id: &str) -> io::Result<PathBuf> {
+fn operation_record_root_at(state_root: &Path, operation_id: &str) -> io::Result<PathBuf> {
     if !safe_operation_token(operation_id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unsafe operation id",
         ));
     }
-    Ok(default_root()?.join("operations").join(operation_id))
+    Ok(state_root.join("operations").join(operation_id))
 }
 
 fn safe_operation_token(value: &str) -> bool {

@@ -10,11 +10,13 @@ full-workspace forking for AI agents.
 export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
 export GENSEE_TCLONE_IMAGE="${GENSEE_TCLONE_IMAGE:-localhost/gensee-tclone-webtop:tmux}"
+export GENSEE_TCLONE_AUTHORITY_ROOT="${GENSEE_TCLONE_AUTHORITY_ROOT:-/var/lib/gensee-boundary}"
 export GENSEE_TMP_ROOT="${GENSEE_TMP_ROOT:-/tmp}"
 export TMPDIR="$GENSEE_TMP_ROOT"
+sudo install -d -o root -g root -m 0700 "$GENSEE_TCLONE_AUTHORITY_ROOT"
 # Optional: point at a dedicated rootful Podman store whose storage driver is btrfs.
 # export CONTAINERS_STORAGE_CONF="$GENSEE_HOME/tclone-btrfs-storage.conf"
-alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "TMPDIR=$TMPDIR" "GENSEE_TMP_ROOT=$GENSEE_TMP_ROOT" "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "TMPDIR=$TMPDIR" "GENSEE_TMP_ROOT=$GENSEE_TMP_ROOT" "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_AUTHORITY_ROOT=$GENSEE_TCLONE_AUTHORITY_ROOT" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" gensee'
 
 gensee-tclone run --runtime tclone -- codex
 ```
@@ -231,6 +233,50 @@ Bounded, fully revocable deltas may stay in the current operation. Unresolved
 scopes, excessive leases, unavailable mediators
 or executors, unbounded network grants, raw secret material, policy-denied
 kernel authority, and unavailable required approval staging fail closed.
+
+### Live Tclone capability lifecycle
+
+Capability-supervised Tclone must run as root and uses a root-controlled
+authority root rather than the user's writable `GENSEE_HOME`:
+
+```console
+sudo install -d -o root -g root -m 0700 /var/lib/gensee-boundary
+export GENSEE_TCLONE_AUTHORITY_ROOT=/var/lib/gensee-boundary
+```
+
+The configured path must be absolute, root-owned, mode 0700, non-symlinked,
+and have only root-controlled ancestors. The default is
+`/var/lib/gensee-boundary`. Preserve this variable in the `sudo env` Tclone
+wrapper. Operation policy, lineage, cgroup state, and promotion attestations are
+read from this authority root; the ordinary event store may remain in the
+user-selected `GENSEE_HOME`.
+
+New long-lived Tclone sources now reserve an operation record and cgroup before
+their container is created. The container root is attached before the agent
+session starts. A live fork receives a new operation id and cgroup, and Gensee
+re-evaluates the trusted capability policy after attachment. Admission requires
+the `live_fork` executor, an active process/cgroup mediator, and an empty
+authority delta. The child may inherit only the capability classes already
+recorded for its parent operation; this path never issues a new lease or
+attaches a broker.
+
+This is intentionally a same-authority lifecycle, not an authority-expanding
+cell. Tclone still copies process memory and container configuration, so its
+host record explicitly marks inherited ambient authority as unattested and
+keeps `authority_expansion_allowed=false`. Work that needs additional network,
+identity, secret, kernel, cloud, database, browser, or external-application
+authority must use a fresh capability cell or trusted mediator until the live
+clone backend can prove that inherited authority was stripped and rebound.
+
+`gensee run switch` now verifies both parent and child operation identities,
+active cgroup attachment, process identity, an empty lease set, zero recorded
+boundary effects, and zero operation violations. It also verifies the stored
+trusted `live_fork` decision and empty authority delta. The promoted identity is
+rotated, the old source capability is revoked, and container removal closes the
+old operation and cgroup. A failed transition rotates and restores both
+identities before restoring lifecycle records. These checks attest lifecycle
+integrity only; they do not claim complete filesystem, network, or secret
+telemetry for live forks.
 
 The orchestrator must declare mediators active for the specific operation;
 installation on the host is not enough. Boundaries include process/cgroup,
@@ -659,10 +705,11 @@ closed before a worker thread is allocated.
 
 ## Current Limitations
 
-- Long-lived `--runtime tclone` sources and live forks remain separate from
-  `--sandbox linux`; Linux fanotify and general session cgroup/nftables controls
-  are not yet applied to those containers by `gensee run`. Fresh capability
-  cells do apply their operation-scoped cgroup/nftables policy.
+- Long-lived `--runtime tclone` sources and live forks now join the operation
+  supervisor and receive distinct cgroups. They remain separate from
+  `--sandbox linux`: fanotify, Landlock, and operation-scoped nftables policy
+  are not yet applied to those containers. Fresh capability cells do apply the
+  complete cell cgroup/nftables and filesystem policy.
 - Fresh capability cells are a fail-closed confinement boundary. Long-lived
   Tclone sources and live forks are not: they currently run with unconfined
   seccomp/AppArmor settings required by live-clone bring-up, and copied
