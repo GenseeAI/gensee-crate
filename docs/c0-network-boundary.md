@@ -29,6 +29,22 @@ allowlist. Everything else is rejected. Gensee installs each new policy
 generation before deleting the old one, making both grant and revocation
 transitions fail closed. A supervisor timer removes expired leases.
 
+For black-box TCP/UDP, the kernel marks every rejected packet for nftables
+trace before returning the reject verdict. A bounded, loss-reporting host sensor
+accepts only packet traces from the collision-resistant table identity for this
+operation, extracts the resolved destination/protocol/port, and creates the same
+typed capability fault used by explicit integrations. Restricted or unbounded
+destinations remain denied. A policy-approved bounded delta installs a scoped
+lease; a later application retry can then succeed. The rejected syscall itself
+is never changed into an allow after the fact.
+
+The sensor starts before the policy is installed. On local-process activation,
+Gensee installs the policy against the empty cgroup before attaching the process
+tree, eliminating an attach-before-policy ambient network window. Trace channel
+loss or monitor exit becomes an operation violation; hard deny remains active
+and Gensee does not infer missing endpoint authority. Privileged nft execution
+uses a root-owned absolute system binary with an empty inherited environment.
+
 The HTTP mediator accepts one configured client IP. It supports absolute HTTP
 and HTTPS requests without exposing a CONNECT tunnel. For every hop it resolves
 the authority, authorizes every returned address, pins the upstream socket to
@@ -162,10 +178,12 @@ gensee run network revoke-http --socket /path/supervisor.sock --lease lease_http
 ## Current boundary
 
 The HTTP gateway is automatic because proxy requests arrive before the external
-effect. Direct black-box connect attempts still need a mandatory system
-boundary adapter to produce the generic fault and arrange a retry. The CLI
-validates that protocol and installs or revokes the lease, but cannot pause an
-arbitrary in-flight syscall or force an opaque program to retry.
+effect. Direct black-box connect attempts are now mandatorily rejected and
+converted to typed faults by the kernel trace path without workload cooperation.
+The CLI can install or revoke a lease for a subsequent retry, but cannot pause
+an arbitrary in-flight syscall or force an opaque program to retry. Programs
+that do not retry must be run through a mediator or in a staged child/fork whose
+supervisor can replay the operation explicitly.
 
 Explicit mediator revocation prevents new requests and redirect hops. A request
 already blocked in upstream I/O is bounded by the lesser of its configured I/O

@@ -30,10 +30,13 @@ pub use network::{
     default_agent_cgroup_path, delete_nftables_table, delete_nftables_table_if_exists,
     plan_nftables_policy, read_nftables_block_events, read_nftables_endpoint_events,
     remove_agent_cgroup, validate_nftables_plan_for_apply, LinuxCgroupAttachPlan,
-    LinuxNetworkBlockEvent, LinuxNetworkBlockReason, LinuxNetworkEndpointEvent,
-    LinuxNetworkEnforcementConfig, LinuxNetworkEnforcementPlan, LinuxNftablesBlockCounter,
-    LinuxNftablesDestination, LinuxNftablesEndpointCounter, LinuxNftablesPlan,
+    LinuxNetworkAttemptEvent, LinuxNetworkBlockEvent, LinuxNetworkBlockReason,
+    LinuxNetworkEndpointEvent, LinuxNetworkEnforcementConfig, LinuxNetworkEnforcementPlan,
+    LinuxNftablesBlockCounter, LinuxNftablesDestination, LinuxNftablesEndpointCounter,
+    LinuxNftablesPlan,
 };
+#[cfg(target_os = "linux")]
+pub use network::{start_nftables_attempt_monitor, LinuxNetworkAttemptMonitor};
 pub use policy::{
     DangerousSyscallPolicy, LinuxEnforcementComponent, LinuxEnforcementMode, LinuxEnforcementPlan,
     LinuxNetworkEndpoint, LinuxNetworkMode, LinuxNetworkPolicy, LinuxNetworkProtocol, LinuxPolicy,
