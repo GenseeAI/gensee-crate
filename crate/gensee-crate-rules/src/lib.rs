@@ -3,6 +3,7 @@ use gensee_crate_core::{AgentEvent, EventKind};
 pub mod capability;
 pub mod capability_broker;
 pub mod capability_policy;
+pub mod network_boundary;
 pub mod policy;
 
 #[derive(Debug, Clone)]

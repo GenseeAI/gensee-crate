@@ -1542,7 +1542,7 @@ fn revoke_tclone_host_control_capability(run_id: &str) -> io::Result<()> {
     }
 }
 
-fn create_restrictive_dir_all(path: &Path) -> io::Result<()> {
+pub(crate) fn create_restrictive_dir_all(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
@@ -1573,7 +1573,7 @@ fn read_nofollow_to_string(path: &Path) -> io::Result<String> {
     Ok(text)
 }
 
-fn write_atomic_nofollow(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+pub(crate) fn write_atomic_nofollow(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
