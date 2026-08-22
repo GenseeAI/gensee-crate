@@ -1004,13 +1004,15 @@ fn attempt_terminal_subject_release_with(
     if record.cgroup.path.is_empty() || record.cgroup.state == OperationCgroupState::Released {
         return Ok(true);
     }
-    if !matches!(
-        record.cgroup.state,
-        OperationCgroupState::Prepared | OperationCgroupState::Attached
-    ) {
-        return Ok(false);
-    }
     if record.cgroup.owned_by_supervisor {
+        if !matches!(
+            record.cgroup.state,
+            OperationCgroupState::Prepared
+                | OperationCgroupState::Attached
+                | OperationCgroupState::Unavailable
+        ) {
+            return Ok(false);
+        }
         match remove_owned_cgroup(Path::new(&record.cgroup.path)) {
             Ok(()) => {
                 record.cgroup.state = OperationCgroupState::Released;
@@ -1025,6 +1027,12 @@ fn attempt_terminal_subject_release_with(
             Err(error) => Err(error),
         }
     } else {
+        if !matches!(
+            record.cgroup.state,
+            OperationCgroupState::Prepared | OperationCgroupState::Attached
+        ) {
+            return Ok(false);
+        }
         match fs::symlink_metadata(&record.cgroup.path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 // The runner that adopted this cgroup tears it down before
@@ -1332,6 +1340,39 @@ mod tests {
         assert_eq!(record.cgroup.state, OperationCgroupState::Released);
         assert!(terminal_operation_subject_is_released(&record));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn unavailable_owned_cgroup_is_still_removed_during_terminal_recovery() {
+        let mut record = ManagedOperationRecord {
+            schema_version: OPERATION_RECORD_SCHEMA_VERSION,
+            operation_id: "op_unavailable_release".to_string(),
+            source_run_id: "run_unavailable_release".to_string(),
+            action_class: "test".to_string(),
+            state: OperationState::Failed,
+            root_pid: None,
+            root_start_time_ticks: None,
+            cgroup: OperationCgroupRecord {
+                path: "/sys/fs/cgroup/gensee/op_unavailable_release".to_string(),
+                state: OperationCgroupState::Unavailable,
+                owned_by_supervisor: true,
+                error: Some("creation or attachment failed".to_string()),
+            },
+            envelope: OperationCapabilityEnvelope::default(),
+            process_lineage: Vec::new(),
+            boundary_effect_count: 0,
+            denied_boundary_effect_count: 0,
+            network_usage: OperationNetworkUsage::default(),
+            violations: Vec::new(),
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            finished_at_ms: Some(1),
+            exit_code: None,
+        };
+
+        assert!(attempt_terminal_subject_release_with(&mut record, |_| Ok(())).unwrap());
+        assert_eq!(record.cgroup.state, OperationCgroupState::Released);
+        assert!(record.cgroup.error.is_none());
     }
 
     #[test]

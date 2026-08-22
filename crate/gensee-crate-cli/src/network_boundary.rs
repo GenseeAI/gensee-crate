@@ -425,6 +425,10 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     }
 
     let state_root = default_root()?;
+    #[cfg(target_os = "linux")]
+    if !dry_run {
+        recover_pending_terminal_network_boundaries(&state_root)?;
+    }
     let root = network_operation_root(&config.operation_id)?;
     create_restrictive_dir_all(&root)?;
     #[cfg(unix)]
@@ -460,27 +464,6 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     } else {
         None
     };
-    #[cfg(target_os = "linux")]
-    if !dry_run && previous.is_some() {
-        // A prior finish may have made the lifecycle terminal while cgroup
-        // deletion returned EBUSY. Retry that exact subject release before
-        // normal startup rejects terminal lifecycle reuse. Keep the network
-        // operation lock held so no replacement policy generation can race
-        // exact terminal-table cleanup.
-        let subject_released =
-            crate::operation_supervisor::retry_terminal_operation_subject_release_at(
-                &state_root,
-                &config.operation_id,
-                &config.source_run_id,
-            )?;
-        if subject_released {
-            reap_terminal_network_boundary_while_locked(
-                &state_root,
-                &config.operation_id,
-                &config.source_run_id,
-            )?;
-        }
-    }
     let now_ms = unix_millis()?;
     let started_at_ms = previous
         .as_ref()
@@ -2876,7 +2859,7 @@ fn terminal_boundary_table_names(record: &NetworkOperationRecord) -> io::Result<
     Ok(tables)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn mark_terminal_network_boundary_reaped(
     record_path: &Path,
     operation_id: &str,
@@ -2901,6 +2884,108 @@ fn mark_terminal_network_boundary_reaped(
     record.terminal_boundary_reaped_at_ms = Some(now);
     record.updated_at_ms = now;
     write_atomic_nofollow(record_path, &serde_json::to_vec_pretty(&record)?, 0o600)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn visit_pending_network_boundary_recovery_with(
+    state_root: &Path,
+    mut recover: impl FnMut(&NetworkOperationRecord, &Path) -> io::Result<bool>,
+) -> io::Result<usize> {
+    let root = state_root.join("network-operations");
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "network operation recovery root is not a directory",
+        ));
+    }
+
+    let mut recovered = 0usize;
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let operation_id = entry.file_name().into_string().map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "network operation recovery found a non-UTF-8 directory name",
+            )
+        })?;
+        if !safe_network_token(&operation_id) {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "network operation recovery found an invalid operation id",
+            ));
+        }
+        let record_path = entry.path().join("record.json");
+        let record_metadata = match fs::symlink_metadata(&record_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !record_metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "network operation recovery record is not a regular file",
+            ));
+        }
+        let record: NetworkOperationRecord =
+            serde_json::from_str(&read_nofollow_to_string(&record_path)?).map_err(|error| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("cannot inspect network operation recovery record: {error}"),
+                )
+            })?;
+        validate_stored_network_record(&record)?;
+        if record.operation_id != operation_id {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "network operation recovery directory does not match its record identity",
+            ));
+        }
+        if record.terminal_boundary_reaped_at_ms.is_none() && recover(&record, &record_path)? {
+            recovered = recovered.saturating_add(1);
+        }
+    }
+    Ok(recovered)
+}
+
+#[cfg(target_os = "linux")]
+fn recover_pending_terminal_network_boundaries(state_root: &Path) -> io::Result<usize> {
+    visit_pending_network_boundary_recovery_with(state_root, |record, _| {
+        retry_and_reap_terminal_network_boundary_for_operation(
+            state_root,
+            &record.operation_id,
+            &record.source_run_id,
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn retry_and_reap_terminal_network_boundary_for_operation(
+    state_root: &Path,
+    operation_id: &str,
+    expected_source_run_id: &str,
+) -> io::Result<bool> {
+    let root = state_root.join("network-operations").join(operation_id);
+    let _lock = match NetworkOperationLock::acquire(&root.join("supervisor.lock")) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !crate::operation_supervisor::retry_terminal_operation_subject_release_at(
+        state_root,
+        operation_id,
+        expected_source_run_id,
+    )? {
+        return Ok(false);
+    }
+    reap_terminal_network_boundary_while_locked(state_root, operation_id, expected_source_run_id)
 }
 
 /// Reaps policy for one exact operation only after its durable lifecycle
@@ -3421,6 +3506,63 @@ mod tests {
         assert!(record["finished_at_ms"].is_number());
         assert!(record["cgroup"]["path"].as_str().unwrap().is_empty());
         assert_eq!(record["violations"].as_array().unwrap().len(), 0);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn startup_recovery_visits_stale_unreaped_operations_without_reinvoking_their_ids() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-recovery-sweep-test-{}",
+            Uuid::new_v4()
+        ));
+        let network_root = root.join("network-operations");
+        fs::create_dir_all(&network_root).unwrap();
+        let template_root = root.join("template");
+        let template = lock_supervisor(&test_supervisor(
+            &template_root,
+            NetworkBoundaryPolicy::default(),
+        ))
+        .unwrap()
+        .record
+        .clone();
+
+        for (operation_id, reaped_at) in [("op_stale", None), ("op_reaped", Some(1))] {
+            let operation_root = network_root.join(operation_id);
+            fs::create_dir_all(&operation_root).unwrap();
+            let mut record = template.clone();
+            record.operation_id = operation_id.to_string();
+            record.source_run_id = format!("run_{operation_id}");
+            record.active_table_name = Some(format!("gensee_{operation_id}"));
+            record.terminal_boundary_reaped_at_ms = reaped_at;
+            write_atomic_nofollow(
+                &operation_root.join("record.json"),
+                &serde_json::to_vec_pretty(&record).unwrap(),
+                0o600,
+            )
+            .unwrap();
+        }
+
+        let mut visited = Vec::new();
+        let recovered =
+            visit_pending_network_boundary_recovery_with(&root, |record, record_path| {
+                visited.push(record.operation_id.clone());
+                mark_terminal_network_boundary_reaped(
+                    record_path,
+                    &record.operation_id,
+                    &record.source_run_id,
+                )?;
+                Ok(true)
+            })
+            .unwrap();
+
+        assert_eq!(recovered, 1);
+        assert_eq!(visited, vec!["op_stale"]);
+        let stale: NetworkOperationRecord = serde_json::from_str(
+            &fs::read_to_string(network_root.join("op_stale/record.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(stale.terminal_boundary_reaped_at_ms.is_some());
+        assert!(stale.active_table_name.is_none());
         fs::remove_dir_all(root).ok();
     }
 
