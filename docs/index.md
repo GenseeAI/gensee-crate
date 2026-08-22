@@ -3,53 +3,48 @@ layout: home
 
 hero:
   name: Gensee Crate
-  text: Full-stack, long-horizon runtime safety<br>for AI coding agents.
-  tagline: Gensee Crate watches system events,<br>requests, tool calls, skills, and memory<br>behind Claude Code, Codex, Antigravity, Cursor, GitHub Copilot, and Omnigent.
+  text: Keep agent work moving.<br>Keep authority and effects under control.
+  tagline: Review agent work on your Mac, or run self-hosted agent infrastructure with disposable workspaces, scoped authority, and evidence-gated promotion.
   image:
     src: /gensee-crate-defense-in-depth.png
-    alt: Gensee Crate defense-in-depth architecture
+    alt: Gensee Crate control and evidence architecture
   actions:
     - theme: brand
-      text: Get Started
-      link: /architecture
+      text: Gensee Crate Personal
+      link: /personal
     - theme: alt
-      text: Safety Policy
-      link: /policy
+      text: Gensee Crate Team
+      link: /team
+    - theme: alt
+      text: Download for macOS
+      link: https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg
     - theme: alt
       text: GitHub
       link: https://github.com/GenseeAI/gensee-crate
 
 features:
-  - title: Observe What Agents Do
-    details: Capture prompts, tool intent, commands, files, network targets, alerts, and timeline context in a local store.
-    link: /watch
-    linkText: Run the sidecar
-  - title: Enforce Before Risky Tools Run
-    details: Apply configurable allow, ask, and deny decisions for secrets, destructive operations, control-plane writes, suspicious artifacts, and Linux fanotify file events.
-    link: /policy
-    linkText: Read the policy model
-  - title: Launch With Extra Containment
-    details: Use managed macOS sandboxing and staged workspace review when you want Gensee to launch the agent.
-    link: /run-and-sandbox
-    linkText: Use gensee run
-  - title: Connect Agent Surfaces
-    details: Wire Claude Code, Codex, Antigravity, Cursor, and GitHub Copilot hooks into the same timeline, with managed-launch coverage for Omnigent.
-    link: /vscode-support
-    linkText: Configure integrations
-  - title: Protect Linux Hosts
-    details: Inspect Linux capabilities, monitor direct agent process trees through /proc, enforce sensitive-path access with fanotify, launch agents under seccomp, and plan cgroup-scoped nftables egress controls.
-    link: /linux
-    linkText: Explore Linux support
-  - title: Trace Long-Horizon Behavior
-    details: Link prompts, tool calls, file effects, artifacts, alerts, and review verdicts for post-run inspection.
-    link: /lineage-graph
-    linkText: Explore lineage
-  - title: Inspect The Local Dashboard
-    details: Review live activity, lineage, policy decisions, alerts, and policy edits against the same endpoint store.
-    link: /dashboard
-    linkText: Open dashboard docs
-  - title: Protect macOS Agents
-    details: Use the native SwiftUI console to manage the signed Endpoint Security extension, policy mode, and protection for six supported harnesses.
-    link: /macos-app
-    linkText: Open macOS app docs
+  - title: Personal — review what needs a decision
+    details: One local Review Queue for scope drift, stale or failed verification, risky actions, affected files, and recovery points across supported coding agents.
+    link: /personal
+    linkText: Protect your laptop
+  - title: Team — isolate before effects persist
+    details: Fork complete Linux workspaces, grant short-lived scoped capabilities, observe effects from the host, and let a human merge, promote, or discard the result.
+    link: /team
+    linkText: Operate remote agents
+  - title: Audit what can influence an agent
+    details: Review instructions, skills, MCP servers, hooks, permissions, plugins, and command rules without executing them.
+    link: /config-audit
+    linkText: Open Config Audit
+  - title: Connect intent to observed effects
+    details: Use one policy and evidence model to relate the request, granted authority, tool intent, process and file activity, findings, cleanup, and persistence decision.
+    link: /architecture
+    linkText: Understand the architecture
+  - title: Recover local work
+    details: Create a private Git-backed recovery point before risky workspace changes and restore it from the matching request review.
+    link: /macos-app#smart-recovery-points
+    linkText: Learn about recovery points
+  - title: Bound remote authority
+    details: Keep credentials on the host and give isolated cells opaque leases, scoped handles, or mediated gateways instead of broad secrets.
+    link: /capability-broker
+    linkText: Explore capabilities and leases
 ---

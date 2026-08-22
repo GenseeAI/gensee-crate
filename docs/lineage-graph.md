@@ -169,5 +169,6 @@ key the agent cannot reach or shipped to an append-only / off-box sink (planned)
 - Prompt injection, malicious tool output, exfiltration, and cross-session
   attack chains can be surfaced as graph patterns, but the defense rules are
   still early and mostly deterministic.
-- Automatic rollback, merge-back review, deny-default policies, and container
-  confinement are future work.
+- Recovery points and tclone merge/promote/discard workflows are available.
+  Broader rollback for databases, remote actions, ignored files, and effects
+  outside a selected workspace remains future work.

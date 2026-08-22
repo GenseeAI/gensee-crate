@@ -2,7 +2,7 @@ import { defineConfig } from 'vitepress'
 
 export default defineConfig({
   title: 'Gensee Crate',
-  description: 'Local-first runtime security for AI coding agents.',
+  description: 'Control agent work on developer laptops and self-hosted Linux environments.',
   lang: 'en-US',
   cleanUrls: true,
   lastUpdated: true,
@@ -15,7 +15,7 @@ export default defineConfig({
       'meta',
       {
         property: 'og:description',
-        content: 'Local-first runtime security for AI coding agents.'
+        content: 'Control agent work on developer laptops and self-hosted Linux environments.'
       }
     ]
   ],
@@ -31,8 +31,9 @@ export default defineConfig({
       provider: 'local'
     },
     nav: [
-      { text: 'Guide', link: '/architecture' },
-      { text: 'Policy', link: '/policy' },
+      { text: 'Personal', link: '/personal' },
+      { text: 'Team', link: '/team' },
+      { text: 'Architecture', link: '/architecture' },
       { text: 'GitHub', link: 'https://github.com/GenseeAI/gensee-crate' },
       { text: 'GenseeAI', link: 'https://www.gensee.ai' }
     ],
@@ -41,20 +42,30 @@ export default defineConfig({
         text: 'Start',
         items: [
           { text: 'Overview', link: '/' },
+          { text: 'Gensee Crate Personal', link: '/personal' },
+          { text: 'Gensee Crate Team', link: '/team' },
           { text: 'Architecture', link: '/architecture' },
           { text: 'Roadmap', link: '/roadmap' }
         ]
       },
       {
-        text: 'Protect A Run',
+        text: 'Personal',
         items: [
-          { text: 'gensee watch', link: '/watch' },
-          { text: 'gensee run', link: '/run-and-sandbox' },
-          { text: 'Linux Host Support', link: '/linux' },
-          { text: 'Tclone Runtime', link: '/tclone' },
+          { text: 'macOS App', link: '/macos-app' },
           { text: 'Config Audit', link: '/config-audit' },
-          { text: 'Policy CLI', link: '/gensee-policy' },
-          { text: 'Safety Policy', link: '/policy' }
+          { text: 'Safety Policy', link: '/policy' },
+          { text: 'gensee watch', link: '/watch' },
+          { text: 'gensee run', link: '/run-and-sandbox' }
+        ]
+      },
+      {
+        text: 'Team',
+        items: [
+          { text: 'Tclone Runtime', link: '/tclone' },
+          { text: 'Capability Broker', link: '/capability-broker' },
+          { text: 'Linux Host Support', link: '/linux' },
+          { text: 'Managed Run Modes', link: '/run-and-sandbox' },
+          { text: 'Policy CLI', link: '/gensee-policy' }
         ]
       },
       {
@@ -68,10 +79,9 @@ export default defineConfig({
         ]
       },
       {
-        text: 'Data And Lineage',
+        text: 'Evidence And Operations',
         items: [
           { text: 'Dashboard', link: '/dashboard' },
-          { text: 'macOS Security Console', link: '/macos-app' },
           { text: 'SQLite Lineage Graph', link: '/lineage-graph' },
           { text: 'Endpoint Security', link: '/endpoint-security' }
         ]

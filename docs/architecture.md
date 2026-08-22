@@ -1,8 +1,16 @@
 # Architecture
 
-Gensee Crate is a local-first runtime security layer for AI coding agents. The
-current v0.2 release supports native macOS and Linux controls, agent hooks, and
-transactional tclone environments across six workflows:
+Gensee Crate is an open-source control layer for AI coding agents. It has two
+deployment paths built on the same deterministic policy and evidence model:
+
+- **[Gensee Crate Personal](personal.md)** reviews local agent work, creates
+  recovery points, audits configuration, and can independently verify supported
+  process and file activity on macOS.
+- **[Gensee Crate Team](team.md)** runs agents on prepared Linux hosts with
+  disposable workspace forks, scoped capabilities, short-lived leases,
+  host-owned credentials, and evidence-gated promotion.
+
+The current implementation exposes these core workflows:
 
 - `gensee watch` — sidecar audit of workspace effects and macOS system events
   for users who do not want Gensee launching their agent. See [watch.md](watch.md).
@@ -16,11 +24,12 @@ transactional tclone environments across six workflows:
   `$GENSEE_HOME/policy.json`, validate policy files, walk through
   dashboard-style setup, and edit supported configuration keys with `get`/`set`.
   See [policy.md](policy.md).
-- `dashboards/` — native timeline, lineage, policy, transaction, and review UI
-  (React + Tauri) backed by the same `GENSEE_HOME` store as the CLI. See
+- `dashboards/` — the React + Tauri evidence inspector backed by the same
+  `GENSEE_HOME` store as the CLI. See
   [dashboard.md](dashboard.md).
-- `macos/GenseeCrate` — SwiftUI security console for the signed Endpoint
-  Security extension, sensor policy, and installed harness protection. It
+- `macos/GenseeCrate` — the Gensee Crate Personal SwiftUI app for request
+  review, recovery points, Config Audit, the signed Endpoint Security
+  extension, sensor policy, and installed harness protection. It
   embeds the monorepo's `gensee` CLI rather than implementing a separate
   backend. See [macos-app.md](macos-app.md).
 
@@ -108,5 +117,6 @@ the old `GENSEE_HOME` to start a fresh encrypted store. Set
   to policy-managed Linux runs. The long-running daemon, recursive
   suffix-pattern coverage, eBPF telemetry, Landlock/AppArmor generation, and
   prompt/speculation brokers are still future work.
-- Automatic rollback, merge-back review, deny-default policies, and container
-  confinement are future work.
+- Recovery points and tclone merge/promote/discard workflows are available.
+  Broader automatic rollback for databases, remote actions, ignored files, and
+  effects outside a selected workspace remains future work.
