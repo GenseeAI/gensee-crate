@@ -86,6 +86,7 @@ impl RuntimeMode {
 #[derive(Debug, Clone)]
 pub(crate) struct RunConfig {
     pub(crate) runtime: RuntimeMode,
+    pub(crate) observe_only: bool,
     pub(crate) sandbox: SandboxMode,
     pub(crate) profile: String,
     pub(crate) workspace_mode: WorkspaceMode,
@@ -102,6 +103,7 @@ pub(crate) struct RunConfig {
 impl RunConfig {
     pub(crate) fn parse(args: Vec<OsString>) -> io::Result<Self> {
         let mut runtime = RuntimeMode::Local;
+        let mut observe_only = run_env_flag("GENSEE_OBSERVE_ONLY");
         let mut sandbox = SandboxMode::None;
         let mut profile = "observe".to_string();
         let mut workspace_mode = WorkspaceMode::Direct;
@@ -146,6 +148,9 @@ impl RunConfig {
                             io::Error::new(io::ErrorKind::InvalidInput, "missing --runtime value")
                         })?;
                     runtime = RuntimeMode::from_str(value)?;
+                }
+                Some("--observe-only") => {
+                    observe_only = true;
                 }
                 Some("--profile") => {
                     index += 1;
@@ -282,7 +287,14 @@ impl RunConfig {
         if agent_cmd.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: gensee run [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... [--max-runtime-seconds N] -- <agent> [args...]",
+                "usage: gensee run [--runtime local|tclone] [--observe-only] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... [--max-runtime-seconds N] -- <agent> [args...]",
+            ));
+        }
+
+        if observe_only && runtime != RuntimeMode::Tclone {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--observe-only is currently supported only with --runtime tclone",
             ));
         }
 
@@ -319,6 +331,7 @@ impl RunConfig {
         let workspace = workspace.unwrap_or(env::current_dir()?);
         Ok(Self {
             runtime,
+            observe_only,
             sandbox,
             profile,
             workspace_mode,
@@ -332,6 +345,15 @@ impl RunConfig {
             agent_cmd,
         })
     }
+}
+
+fn run_env_flag(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {

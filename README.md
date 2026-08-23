@@ -248,6 +248,14 @@ Start the source agent in the prepared runtime:
 gensee-tclone run --runtime tclone -- codex
 ```
 
+For a passive baseline with no in-container Gensee hooks or control channel,
+launch Tclone in observe-only mode. Host lifecycle/cgroup attribution remains
+available for external collectors, and the resulting source cannot be forked:
+
+```bash
+gensee-tclone run --runtime tclone --observe-only -- codex
+```
+
 Create one fork or compare multiple approaches:
 
 ```bash

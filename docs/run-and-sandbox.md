@@ -176,6 +176,18 @@ alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX
 gensee-tclone run --runtime tclone -- codex
 ```
 
+Use `--observe-only` for a passive Tclone baseline that disables copied agent
+hooks before launch and omits Gensee's in-container binary, policy state,
+observer socket, host-control channel, and fork capability:
+
+```bash
+gensee-tclone run --runtime tclone --observe-only -- codex
+```
+
+The host still records lifecycle and operation-cgroup attribution for passive
+collectors. Observe-only sources cannot be forked. See [Tclone Runtime
+Integration](tclone.md) for the complete guarantees and limitations.
+
 From another terminal, fork and inspect the running source container:
 
 ```bash

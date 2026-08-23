@@ -21,6 +21,27 @@ alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX
 gensee-tclone run --runtime tclone -- codex
 ```
 
+For passive experiment collection, use the explicit observe-only mode:
+
+```bash
+gensee-tclone run --runtime tclone --observe-only -- codex
+```
+
+`--observe-only` is a Tclone-only launch mode. Gensee sanitizes the copied
+agent configuration before the container starts so Codex, Claude Code, or
+Gemini/Antigravity hooks are disabled from the first agent process. It does not
+copy `GENSEE_HOME`, inject the Gensee executable, mount the hook-observer or
+host-control channels, or issue an in-container run-control capability. This
+version of the Gensee CLI also treats `setup` and `hook` as no-ops while
+`GENSEE_OBSERVE_ONLY=1` is present. Observe-only runs cannot be forked.
+
+The host still records the source lifecycle, operation cgroup, container PID,
+and observe-only provenance. Passive host collectors such as Falco can use that
+cgroup attribution without placing policy decisions in the agent path. This
+mode does not itself add network or filesystem confinement; those boundaries
+remain properties of the container and host experiment setup. Set
+`GENSEE_OBSERVE_ONLY=1` on the host as an alternative to passing the flag.
+
 The host-side Gensee process owns container orchestration. It prepares a source
 container with the workspace, detected agent config such as `CODEX_HOME`,
 `CLAUDE_CONFIG_DIR`, or Antigravity's `GEMINI_HOME`, and `GENSEE_HOME`, then
@@ -672,6 +693,11 @@ The current integration is host-owned:
 - host Gensee records source/fork lineage in `$GENSEE_HOME/tclone-runs.jsonl`
 - in-container hooks and policy config are copied in with the agent config
 - forked containers can be inspected, copied out, or discarded from the host
+
+Observe-only sources are the exception to the in-container control path: they
+retain host-owned lifecycle and cgroup attribution but receive no Gensee hooks,
+observer socket, host-control mount, or capability. They therefore cannot ask
+Gensee to fork, lease authority, broker an effect, or promote output.
 
 Container-to-host control uses a per-run capability in the run context. Requests
 are signed, short-lived, and replay-protected. A source capability may fork that
