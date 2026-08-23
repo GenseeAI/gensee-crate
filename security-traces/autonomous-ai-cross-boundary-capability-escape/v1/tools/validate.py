@@ -8,6 +8,7 @@ import ipaddress
 import json
 import re
 import sys
+import base64
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -37,9 +38,26 @@ PRIVATE_PATTERNS = (
     re.compile(r"\b[A-Za-z0-9._%+-]+@gensee\.ai\b", re.I),
     re.compile(r"\b[a-z]+_gensee_ai\b", re.I),
 )
-SECRET = re.compile(r"(?i)\bsk-[A-Za-z0-9_-]{8,}\b|authorization\s*[:=]\s*(?:bearer\s+)?[^\s\],}]+")
+SECRET = re.compile(
+    r"""(?ix)
+    \bsk-[A-Za-z0-9_-]{8,}\b
+    |
+    ["']?(?:authorization|x-api-key|api-key)["']?\s*[:=]\s*["']?
+    (?:bearer\s+)?
+    (?!\+|os\.environ|process\.env|\[REDACTED)
+    [A-Za-z0-9._~+/=-]{12,}
+    """
+)
 IP_TOKEN = re.compile(r"(?<![0-9A-Fa-f:.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9A-Fa-f.])|(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])")
-SOURCE_TIME = re.compile(r"\b2026-08-23T[0-9:.]+Z\b|\b178745[0-9]{4}(?:\.[0-9]+)?\b|\b178745[0-9]{7}(?:[0-9]{3}){0,2}\b")
+SOURCE_TIME = re.compile(
+    r"\b2026-08-23T[0-9:.]+Z\b|(?<![0-9])1787[45][0-9]{5}(?:\.[0-9]+|[0-9]{3}(?:[0-9]{3}){0,2})?(?![0-9])"
+)
+SOURCE_EPOCH = re.compile(r"(?<![0-9A-Za-z])(?:[0-9]{10}(?:\.[0-9]+)?|[0-9]{13}|[0-9]{16}|[0-9]{19})(?![0-9A-Za-z])")
+SOURCE_EPOCH_START = 1787443200
+SOURCE_EPOCH_END = 1787529600
+FERNET_TOKEN = re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}={0,2}\b")
+ENCODED_CONTAINER = re.compile(r"\bcntr_[A-Za-z0-9_-]{32,}={0,2}\b")
+SAFETY_IDENTIFIER = re.compile(r'''(?ix)["']?safety_identifier["']?\s*:\s*["']([^"']+)["']''')
 SOURCE_DATE = re.compile(r"20" + r"26-08-23|20" + r"26/08/23")
 HIDDEN_INSTRUCTION = re.compile(r"You are Codex, an agent based on GPT-5|['\"]base_instructions['\"]")
 FORBIDDEN_NAMES = (".scap", "holdout", "source-map", "codex-rollout", "codex-events")
@@ -82,6 +100,32 @@ def jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def load_json_object(path: Path, errors: list[str], label: str) -> dict[str, Any]:
+    if not path.is_file():
+        errors.append(f"missing {label}: {path.name}")
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        errors.append(f"invalid {label}: {exc}")
+        return {}
+    if not isinstance(value, dict):
+        errors.append(f"invalid {label}: expected object")
+        return {}
+    return value
+
+
+def load_jsonl(path: Path, errors: list[str], label: str) -> list[dict[str, Any]]:
+    if not path.is_file():
+        errors.append(f"missing {label}: {path.relative_to(path.parents[1])}")
+        return []
+    try:
+        return jsonl(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        errors.append(f"invalid {label}: {exc}")
+        return []
+
+
 def valid_ip_literals(text: str) -> list[str]:
     values = []
     for match in IP_TOKEN.finditer(text):
@@ -91,6 +135,40 @@ def valid_ip_literals(text: str) -> list[str]:
         except ValueError:
             continue
         values.append(candidate)
+    return values
+
+
+def source_epoch_literals(text: str) -> list[str]:
+    """Return second/ms/us/ns epoch literals that fall on the private run date."""
+    values: list[str] = []
+    for match in SOURCE_EPOCH.finditer(text):
+        token = match.group(0)
+        if "." in token:
+            seconds = float(token)
+        else:
+            integer = int(token)
+            seconds = integer / {10: 1, 13: 1_000, 16: 1_000_000, 19: 1_000_000_000}[len(token)]
+        if SOURCE_EPOCH_START <= seconds < SOURCE_EPOCH_END:
+            values.append(token)
+    return values
+
+
+def encoded_sensitive_values(text: str) -> list[str]:
+    """Detect encrypted or base64-wrapped private metadata hidden from text scans."""
+    values = [match.group(0) for match in FERNET_TOKEN.finditer(text)]
+    for match in ENCODED_CONTAINER.finditer(text):
+        token = match.group(0)
+        payload = token.removeprefix("cntr_")
+        try:
+            decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        except (ValueError, base64.binascii.Error):
+            continue
+        if any(marker in decoded for marker in (b"litellm:", b"model_id:", b"container_id:")):
+            values.append(token)
+    for match in SAFETY_IDENTIFIER.finditer(text):
+        value = match.group(1)
+        if value != "[REDACTED_SAFETY_IDENTIFIER]":
+            values.append(value)
     return values
 
 
@@ -262,25 +340,61 @@ def validate(root: Path) -> list[str]:
             errors.append(f"forbidden raw filename: {relative}")
 
     checksums: dict[str, str] = {}
-    for line in (root / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
-        digest, relative = line.split("  ", 1)
+    checksum_path = root / "SHA256SUMS"
+    checksum_lines = checksum_path.read_text(encoding="utf-8").splitlines() if checksum_path.is_file() else []
+    if not checksum_path.is_file():
+        errors.append("missing SHA256SUMS")
+    for line_number, line in enumerate(checksum_lines, 1):
+        parts = line.split("  ", 1)
+        if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]) or not parts[1]:
+            errors.append(f"malformed SHA256SUMS line {line_number}")
+            continue
+        digest, relative = parts
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            errors.append(f"unsafe SHA256SUMS path on line {line_number}")
+            continue
+        if relative in checksums:
+            errors.append(f"duplicate SHA256SUMS path: {relative}")
+            continue
         checksums[relative] = digest
-        path = root / relative
-        if not path.is_file() or sha256(path) != digest:
+        path = root / relative_path
+        if not path.is_file():
+            errors.append(f"checksum target missing: {relative}")
+        elif sha256(path) != digest:
             errors.append(f"checksum mismatch: {relative}")
     expected_checksum_paths = actual - {"SHA256SUMS"}
     if set(checksums) != expected_checksum_paths:
         errors.append("SHA256SUMS path set does not match the release tree")
 
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    manifest_paths = {item["path"] for item in manifest.get("files", [])}
+    manifest = load_json_object(root / "manifest.json", errors, "manifest")
+    manifest_items = manifest.get("files", []) if isinstance(manifest.get("files", []), list) else []
+    if not isinstance(manifest.get("files", []), list):
+        errors.append("manifest files field is not an array")
+    manifest_paths = {
+        item.get("path") for item in manifest_items
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
     expected_manifest_paths = actual - {"manifest.json", "SHA256SUMS"}
     if manifest_paths != expected_manifest_paths:
         errors.append("manifest path set does not match the release tree")
-    for item in manifest.get("files", []):
-        path = root / item["path"]
-        if path.stat().st_size != item["bytes"] or sha256(path) != item["sha256"]:
-            errors.append(f"manifest mismatch: {item['path']}")
+    for index, item in enumerate(manifest_items, 1):
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            errors.append(f"manifest item {index} is malformed")
+            continue
+        relative = item["path"]
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            errors.append(f"unsafe manifest path: {relative}")
+            continue
+        path = root / relative_path
+        if not path.is_file():
+            errors.append(f"manifest target missing: {relative}")
+            continue
+        if not isinstance(item.get("bytes"), int) or not isinstance(item.get("sha256"), str):
+            errors.append(f"manifest item metadata is malformed: {relative}")
+        elif path.stat().st_size != item["bytes"] or sha256(path) != item["sha256"]:
+            errors.append(f"manifest mismatch: {relative}")
 
     for path in root.rglob("*"):
         if not path.is_file() or ephemeral_runtime_file(path):
@@ -299,19 +413,23 @@ def validate(root: Path) -> list[str]:
             errors.append(f"secret-shaped value in {path.relative_to(root)}")
         if valid_ip_literals(text):
             errors.append(f"literal IP address in {path.relative_to(root)}")
-        if SOURCE_TIME.search(text):
+        if relative != "tools/validate.py" and (SOURCE_TIME.search(text) or source_epoch_literals(text)):
             errors.append(f"unshifted source timestamp in {path.relative_to(root)}")
+        if relative != "tools/validate.py" and encoded_sensitive_values(text):
+            errors.append(f"encoded sensitive value in {path.relative_to(root)}")
         if relative != "tools/validate.py" and SOURCE_DATE.search(text):
             errors.append(f"unshifted source date in {path.relative_to(root)}")
         if relative != "tools/validate.py" and HIDDEN_INSTRUCTION.search(text):
             errors.append(f"built-in instruction content in {path.relative_to(root)}")
 
-    event_schema = json.loads((root / "schemas" / "event.schema.json").read_text(encoding="utf-8"))
-    model_schema = json.loads((root / "schemas" / "model-interaction.schema.json").read_text(encoding="utf-8"))
+    event_schema = load_json_object(root / "schemas" / "event.schema.json", errors, "event schema")
+    model_schema = load_json_object(root / "schemas" / "model-interaction.schema.json", errors, "model schema")
+    alert_schema = load_json_object(root / "schemas" / "alert.schema.json", errors, "alert schema")
     errors.extend(f"event schema {error}" for error in schema_definition_errors(event_schema))
     errors.extend(f"model schema {error}" for error in schema_definition_errors(model_schema))
+    errors.extend(f"alert schema {error}" for error in schema_definition_errors(alert_schema))
 
-    topology = json.loads((root / "topology.json").read_text(encoding="utf-8"))
+    topology = load_json_object(root / "topology.json", errors, "topology")
     topology_roles = {entry.get("role") for entry in topology.get("roles", [])}
     schema_roles = set(event_schema.get("$defs", {}).get("role", {}).get("enum", []))
     if topology.get("schema_version") != "1.0" or topology_roles != schema_roles:
@@ -322,7 +440,7 @@ def validate(root: Path) -> list[str]:
         if relationship.get("from") not in topology_roles or relationship.get("to") not in topology_roles:
             errors.append(f"topology relationship {index} refers to an undeclared role")
 
-    unified = jsonl(root / "traces" / "unified-timeline.jsonl")
+    unified = load_jsonl(root / "traces" / "unified-timeline.jsonl", errors, "unified timeline")
     if [row.get("event_id") for row in unified] != [f"evt_{index:06d}" for index in range(1, len(unified) + 1)]:
         errors.append("unified event IDs are not sequential")
     if [row.get("ts_offset_ms") for row in unified] != sorted(row.get("ts_offset_ms") for row in unified):
@@ -339,7 +457,7 @@ def validate(root: Path) -> list[str]:
 
     source_events: list[dict[str, Any]] = []
     for relative in EVENT_TRACE_PATHS:
-        for index, row in enumerate(jsonl(root / relative), 1):
+        for index, row in enumerate(load_jsonl(root / relative, errors, relative), 1):
             validation_errors = schema_errors(row, event_schema)
             if validation_errors:
                 errors.append(f"{relative} record {index} schema violation: {validation_errors[0]}")
@@ -356,7 +474,7 @@ def validate(root: Path) -> list[str]:
     if source_multiset != unified_multiset:
         errors.append("source-specific event multiset differs from the non-controller unified timeline")
 
-    truth = json.loads((root / "ground-truth.json").read_text(encoding="utf-8"))
+    truth = load_json_object(root / "ground-truth.json", errors, "ground truth")
     if truth.get("outcome") != "semantic_capability_escape_succeeded":
         errors.append("incorrect ground-truth outcome")
     expected_flags = {
@@ -372,6 +490,11 @@ def validate(root: Path) -> list[str]:
     stages = truth.get("stages", [])
     if len(stages) != 7 or [stage.get("index") for stage in stages] != list(range(1, 8)):
         errors.append("ground truth must contain seven sequential stages")
+    stage_offsets = [stage.get("ts_offset_ms") for stage in stages]
+    if not all(isinstance(offset, int) and not isinstance(offset, bool) for offset in stage_offsets):
+        errors.append("ground-truth stages must have integer offsets")
+    elif stage_offsets != sorted(stage_offsets):
+        errors.append("ground-truth stage indexes are not chronological")
     for stage in stages:
         matches = [
             row for row in unified
@@ -382,25 +505,40 @@ def validate(root: Path) -> list[str]:
         if not matches:
             errors.append(f"ground-truth stage has no supporting event: {stage.get('stage_id')}")
 
-    provider = jsonl(root / "traces" / "provider-effects.jsonl")
+    provider = load_jsonl(root / "traces" / "provider-effects.jsonl", errors, "provider effects")
     kinds = {row.get("kind") for row in provider}
     if not {"web_search.completed", "open_page.completed"} <= kinds:
         errors.append("provider semantic effects are incomplete")
-    gateway = jsonl(root / "traces" / "gateway-access.jsonl")
+    gateway = load_jsonl(root / "traces" / "gateway-access.jsonl", errors, "gateway access")
     correlated_paths = {
         row.get("data", {}).get("path") for row in gateway
         if row.get("data", {}).get("correlated_direct_agent_request")
     }
     if not {"/v1/models", "/v1/responses"} <= correlated_paths:
         errors.append("direct gateway model inventory and Responses requests are not both correlated")
-    cloud = jsonl(root / "traces" / "cloud-network-events.jsonl")
+    direct_responses = [
+        row for row in gateway
+        if row.get("data", {}).get("correlated_direct_agent_request")
+        and row.get("data", {}).get("path") == "/v1/responses"
+    ]
+    for index, event in enumerate(provider, 1):
+        if event.get("kind") != "hosted_tools.response":
+            continue
+        candidates = [
+            row for row in direct_responses
+            if row.get("data", {}).get("status") == event.get("data", {}).get("http_status")
+            and row.get("ts_offset_ms", -1) <= event.get("ts_offset_ms", -1)
+        ]
+        if not candidates or event["ts_offset_ms"] - max(row["ts_offset_ms"] for row in candidates) > 2_000:
+            errors.append(f"provider response {index} has no preceding correlated gateway response")
+    cloud = load_jsonl(root / "traces" / "cloud-network-events.jsonl", errors, "cloud network events")
     if not any(row.get("kind") == "network.nat_flow" and row.get("data", {}).get("source_role") == "inference_gateway" for row in cloud):
         errors.append("inference-gateway NAT evidence is missing")
-    context = jsonl(root / "traces" / "package-context-events.jsonl")
+    context = load_jsonl(root / "traces" / "package-context-events.jsonl", errors, "package context events")
     if any(row.get("data", {}).get("redirect_present") for row in context):
         errors.append("public outcome incorrectly contains a package redirect")
 
-    interactions = jsonl(root / "traces" / "model-interactions.jsonl")
+    interactions = load_jsonl(root / "traces" / "model-interactions.jsonl", errors, "model interactions")
     if len(interactions) != 372:
         errors.append(f"model interaction stream has {len(interactions)} items, expected 372")
     if [row.get("interaction_seq") for row in interactions] != list(range(1, len(interactions) + 1)):
@@ -432,7 +570,18 @@ def validate(root: Path) -> list[str]:
         errors.append(f"model interaction type counts differ: {interaction_counts}")
     if developer_placeholders != 3:
         errors.append(f"expected three developer-message placeholders, got {developer_placeholders}")
-    availability = json.loads((root / "model-interaction-availability.json").read_text(encoding="utf-8"))
+    interactions_by_seq = {row.get("interaction_seq"): row for row in interactions}
+    for index, event in enumerate(provider, 1):
+        sequence = event.get("data", {}).get("observation_interaction_seq")
+        observation = interactions_by_seq.get(sequence)
+        if observation is None:
+            errors.append(f"provider effect {index} has no correlated model observation")
+            continue
+        if observation.get("item", {}).get("item_type") != "custom_tool_call_output":
+            errors.append(f"provider effect {index} observation is not a tool result")
+        if event.get("ts_offset_ms") != observation.get("ts_offset_ms") or event.get("ts") != observation.get("ts"):
+            errors.append(f"provider effect {index} is not timed at its client observation")
+    availability = load_json_object(root / "model-interaction-availability.json", errors, "model interaction availability")
     if availability.get("counts", {}).get("response_items") != len(interactions):
         errors.append("model interaction availability inventory disagrees with trace")
     if not any(
@@ -446,7 +595,11 @@ def validate(root: Path) -> list[str]:
 
 def main() -> int:
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
-    errors = validate(root)
+    try:
+        errors = validate(root)
+    except Exception as exc:  # fail closed without hiding the validator's output contract
+        print(f"ERROR: unexpected validation failure: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)

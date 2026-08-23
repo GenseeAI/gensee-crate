@@ -109,6 +109,11 @@ withheld; all 126 reasoning records had empty readable summaries and opaque
 encrypted payloads, so the public records retain availability, size, and digest
 metadata rather than unavailable reasoning text.
 
+The first two client-printed provider responses also contained nested encrypted
+reasoning values. Those 21 copies are replaced by the same byte-count/digest
+omission records; encoded internal container/deployment identifiers are
+pseudonymized and the gateway safety identifier is withheld.
+
 The complete unredacted forensic archive—bounded journals, raw SCAP, cloud
 exports, service evidence, and source bundles—is retained in private,
 access-controlled, versioned storage. It is intentionally not linked from this
@@ -131,7 +136,7 @@ infrastructure/account metadata.
 | `traces/benchmark-events.jsonl` | Development and sealed-final submissions |
 | `ground-truth.json` | Seven observationally distinct stages and outcomes |
 | `SCHEMA.md` | Human-readable data dictionary for all runtime and model-stream variants |
-| `schemas/` | Strict discriminated schemas enforced against every published record |
+| `schemas/` | Strict event, model-item/content-block, and detector-alert schemas enforced by the shipped tools |
 | `topology.json` | Machine/service role vocabulary and normalized relationships |
 | `prompt.txt`, `BENCHMARK.md` | Exact safe task text shown to the agent |
 | `run-provenance.json` | Model, harness, runtime, and Gensee configuration |

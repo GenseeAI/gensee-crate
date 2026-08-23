@@ -6,11 +6,11 @@
   "additionalProperties": true,
   "required": ["ts_offset_ms", "rule_id", "source", "kind"],
   "properties": {
-    "ts_offset_ms": {"type": "integer", "minimum": 0},
-    "rule_id": {"type": "string", "minLength": 1},
-    "source": {"type": "string", "minLength": 1},
-    "kind": {"type": "string", "minLength": 1, "maxLength": 128},
-    "severity": {"type": "string"},
-    "stage_id": {"type": "string"}
+    "ts_offset_ms": {"type": "integer", "minimum": 0, "x-provenance": "derived"},
+    "rule_id": {"type": "string", "minLength": 1, "x-provenance": "synthetic"},
+    "source": {"type": "string", "minLength": 1, "x-provenance": "derived"},
+    "kind": {"type": "string", "minLength": 1, "maxLength": 128, "x-provenance": "derived"},
+    "severity": {"type": "string", "x-provenance": "derived"},
+    "stage_id": {"type": "string", "x-provenance": "correlated"}
   }
 }

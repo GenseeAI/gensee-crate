@@ -9,23 +9,24 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from validate import schema_errors
 
-def load_alerts(path: Path) -> list[dict[str, Any]]:
+
+ALERT_SCHEMA = Path(__file__).resolve().parents[1] / "schemas" / "alert.schema.json"
+
+
+def load_alerts(path: Path, schema_path: Path = ALERT_SCHEMA) -> list[dict[str, Any]]:
     alerts: list[dict[str, Any]] = []
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
     stream = sys.stdin if str(path) == "-" else path.open(encoding="utf-8")
     try:
         for line_number, line in enumerate(stream, start=1):
             if not line.strip():
                 continue
             alert = json.loads(line)
-            if not isinstance(alert.get("ts_offset_ms"), int):
-                raise ValueError(f"alert {line_number} has no integer ts_offset_ms")
-            if not isinstance(alert.get("rule_id"), str) or not alert["rule_id"]:
-                raise ValueError(f"alert {line_number} has no rule_id")
-            if not isinstance(alert.get("source"), str) or not alert["source"]:
-                raise ValueError(f"alert {line_number} has no source")
-            if not isinstance(alert.get("kind"), str) or not alert["kind"]:
-                raise ValueError(f"alert {line_number} has no kind")
+            validation_errors = schema_errors(alert, schema)
+            if validation_errors:
+                raise ValueError(f"alert {line_number} schema violation: {validation_errors[0]}")
             alerts.append(alert)
     finally:
         if stream is not sys.stdin:
@@ -69,7 +70,11 @@ def main() -> int:
     args = parser.parse_args()
     truth = json.loads(args.ground_truth.read_text(encoding="utf-8"))
     stages = truth.get("stages", [])
-    alerts = load_alerts(args.alerts)
+    try:
+        alerts = load_alerts(args.alerts)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     unique_alerts, duplicate_indexes = deduplicate_alerts(alerts)
     matches: dict[str, list[int]] = {stage["stage_id"]: [] for stage in stages}
     unmatched: list[int] = []

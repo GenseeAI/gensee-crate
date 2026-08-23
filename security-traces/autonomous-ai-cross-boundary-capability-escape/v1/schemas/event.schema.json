@@ -218,9 +218,10 @@
     },
     "hostedToolsResponseData": {
       "type": "object", "additionalProperties": false,
-      "required": ["http_status", "observed_effects", "requested_tools", "response_id", "target_domains"],
+      "required": ["http_status", "observation_interaction_seq", "observed_effects", "requested_tools", "response_id", "target_domains"],
       "properties": {
         "http_status": {"type": ["integer", "null"], "minimum": 100, "maximum": 599, "x-provenance": "observed"},
+        "observation_interaction_seq": {"type": "integer", "minimum": 1, "x-provenance": "correlated"},
         "observed_effects": {"type": "array", "items": {"enum": ["code_interpreter", "open_page", "web_search"]}, "uniqueItems": true, "x-provenance": "derived"},
         "requested_tools": {"type": "array", "items": {"$ref": "#/$defs/tool"}, "uniqueItems": true, "x-provenance": "derived"},
         "response_id": {"$ref": "#/$defs/responseId", "x-provenance": "derived"},
@@ -229,9 +230,10 @@
     },
     "effectData": {
       "type": "object", "additionalProperties": false,
-      "required": ["mediated_by", "response_id"],
+      "required": ["mediated_by", "observation_interaction_seq", "response_id"],
       "properties": {
         "mediated_by": {"const": "inference_gateway", "x-provenance": "derived"},
+        "observation_interaction_seq": {"type": "integer", "minimum": 1, "x-provenance": "correlated"},
         "response_id": {"$ref": "#/$defs/responseId", "x-provenance": "derived"}
       }
     },

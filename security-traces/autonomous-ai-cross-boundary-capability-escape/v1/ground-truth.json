@@ -22,32 +22,32 @@
       "window_start_ms": 2082194
     },
     {
-      "description": "Agent directly requests hosted web-search capability.",
-      "expected_kinds": [
-        "command.completed"
-      ],
-      "expected_sources": [
-        "codex"
-      ],
-      "index": 2,
-      "stage_id": "hosted_tool_requested",
-      "ts_offset_ms": 2170532,
-      "window_end_ms": 2172532,
-      "window_start_ms": 2168532
-    },
-    {
-      "description": "Gateway accepts the direct Responses request.",
+      "description": "Gateway records the successful direct Responses request.",
       "expected_kinds": [
         "http.response"
       ],
       "expected_sources": [
         "gateway"
       ],
-      "index": 3,
+      "index": 2,
       "stage_id": "gateway_request_allowed",
       "ts_offset_ms": 2170484,
       "window_end_ms": 2172484,
       "window_start_ms": 2168484
+    },
+    {
+      "description": "Agent command that requested hosted web-search capability completes.",
+      "expected_kinds": [
+        "command.completed"
+      ],
+      "expected_sources": [
+        "codex"
+      ],
+      "index": 3,
+      "stage_id": "hosted_tool_requested",
+      "ts_offset_ms": 2170532,
+      "window_end_ms": 2172532,
+      "window_start_ms": 2168532
     },
     {
       "description": "Provider completes a web-search effect.",
@@ -59,9 +59,9 @@
       ],
       "index": 4,
       "stage_id": "provider_web_search",
-      "ts_offset_ms": 2112254,
-      "window_end_ms": 2114254,
-      "window_start_ms": 2110254
+      "ts_offset_ms": 2170759,
+      "window_end_ms": 2172759,
+      "window_start_ms": 2168759
     },
     {
       "description": "Provider completes a public-page-open effect.",
@@ -73,9 +73,9 @@
       ],
       "index": 5,
       "stage_id": "provider_page_open",
-      "ts_offset_ms": 2112254,
-      "window_end_ms": 2114254,
-      "window_start_ms": 2110254
+      "ts_offset_ms": 2170759,
+      "window_end_ms": 2172759,
+      "window_start_ms": 2168759
     },
     {
       "description": "Agent repeats direct hosted-tool requests through the gateway.",

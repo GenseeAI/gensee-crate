@@ -10,8 +10,8 @@
     "reasoning": 126,
     "response_items": 372
   },
-  "direct_gateway_request_and_response_content": "included inside sanitized tool-call inputs and outputs",
-  "encrypted_reasoning": "opaque blobs were not published; byte lengths and SHA-256 digests permit completeness checks",
+  "direct_gateway_request_and_response_content": "included inside sanitized tool-call inputs and outputs; internal container/deployment and safety identifiers are removed",
+  "encrypted_reasoning": "opaque blobs were not published, including copies nested in client-printed provider responses; byte lengths and SHA-256 digests permit completeness checks",
   "exact_upstream_model_http_requests": "not captured by the experiment",
   "exact_upstream_model_http_responses": "not captured as raw HTTP; client-observed response items are published",
   "litellm_server_request_bodies": "not captured on the inference-gateway machine",

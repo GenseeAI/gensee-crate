@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import base64
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,9 +42,70 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(trace_validate.schema_errors(message, schema))
 
     def test_schema_properties_have_provenance(self) -> None:
-        for name in ("event.schema.json", "model-interaction.schema.json"):
+        for name in ("alert.schema.json", "event.schema.json", "model-interaction.schema.json"):
             schema = json.loads((ROOT / "schemas" / name).read_text())
             self.assertEqual(trace_validate.schema_definition_errors(schema), [])
+
+    def test_sensitive_value_guards(self) -> None:
+        bearer = '"authorization": "Bearer ' + "eyJhbGciOiJIUzI1NiJ9.abc.def" + '"'
+        api_key = "{'x-api-key':'" + "gk-live-9f3a2b7c1d" + "'}"
+        self.assertIsNotNone(trace_validate.SECRET.search(bearer))
+        self.assertIsNotNone(trace_validate.SECRET.search(api_key))
+        self.assertIsNone(trace_validate.SECRET.search("{'Authorization':'Bearer '+os.environ['LITELLM_API_KEY']}"))
+        for suffix in ("7019", "4899", "7019000", "7019.123"):
+            value = "178748" + suffix
+            self.assertIsNotNone(trace_validate.SOURCE_TIME.search(value))
+            self.assertEqual(trace_validate.source_epoch_literals(value), [value])
+        fernet = "gAAA" + "AA" + "A" * 40
+        encoded = base64.urlsafe_b64encode(b"litellm:model_id:private;container_id:private").decode().rstrip("=")
+        self.assertTrue(trace_validate.encoded_sensitive_values(fernet))
+        self.assertTrue(trace_validate.encoded_sensitive_values("cntr_" + encoded))
+
+    def test_provider_effects_use_client_observation_time(self) -> None:
+        interactions = {
+            row["interaction_seq"]: row
+            for row in (json.loads(line) for line in (ROOT / "traces/model-interactions.jsonl").read_text().splitlines())
+        }
+        for line in (ROOT / "traces/provider-effects.jsonl").read_text().splitlines():
+            event = json.loads(line)
+            observation = interactions[event["data"]["observation_interaction_seq"]]
+            self.assertEqual(event["ts_offset_ms"], observation["ts_offset_ms"])
+            self.assertEqual(event["ts"], observation["ts"])
+
+    def test_score_rejects_alert_schema_violations(self) -> None:
+        invalid_alerts = (
+            {"ts_offset_ms": True, "rule_id": "bad", "source": "codex", "kind": "command.completed"},
+            {"ts_offset_ms": -1, "rule_id": "bad", "source": "codex", "kind": "command.completed"},
+            {"ts_offset_ms": 1, "rule_id": "bad", "source": "codex", "kind": "x" * 129},
+        )
+        for alert in invalid_alerts:
+            with self.subTest(alert=alert), tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as stream:
+                stream.write(json.dumps(alert) + "\n")
+                path = Path(stream.name)
+            try:
+                result = self.run_tool("tools/score.py", "ground-truth.json", str(path))
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("schema violation", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+            finally:
+                path.unlink(missing_ok=True)
+
+    def test_validator_reports_malformed_indexes_without_tracebacks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            copy = Path(directory) / "corpus"
+            shutil.copytree(ROOT, copy, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
+            checksum = copy / "SHA256SUMS"
+            checksum.write_text("malformed\n" + checksum.read_text())
+            missing = copy / "traces/provider-effects.jsonl"
+            missing.unlink()
+            result = subprocess.run(
+                [sys.executable, str(copy / "tools/validate.py"), str(copy)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("malformed SHA256SUMS line", result.stderr)
+            self.assertIn("manifest target missing: traces/provider-effects.jsonl", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
 
     def test_replay_count(self) -> None:
         result = self.run_tool("tools/replay.py", "traces/unified-timeline.jsonl")

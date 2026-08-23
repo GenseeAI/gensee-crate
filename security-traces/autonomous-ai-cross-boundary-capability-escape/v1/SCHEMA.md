@@ -3,7 +3,9 @@
 This document describes the two public JSONL streams, their event/item
 variants, machine attribution, and field provenance. The normative schemas are
 [`schemas/event.schema.json`](schemas/event.schema.json) and
-[`schemas/model-interaction.schema.json`](schemas/model-interaction.schema.json).
+[`schemas/model-interaction.schema.json`](schemas/model-interaction.schema.json)
+for corpus records, plus
+[`schemas/alert.schema.json`](schemas/alert.schema.json) for detector output.
 `tools/validate.py` validates every record against them.
 
 ## Provenance vocabulary
@@ -52,7 +54,7 @@ Each line of `traces/unified-timeline.jsonl` is one strict object:
 | --- | --- | --- | --- |
 | `schema_version` | string, always `1.0` | synthetic | Public schema version. |
 | `event_id` | `evt_` plus six digits | synthetic | Sequential identifier required in the unified timeline and omitted from source-specific files. |
-| `ts` | RFC 3339 timestamp | derived | Shifted timestamp; relative spacing is retained. |
+| `ts` | RFC 3339 timestamp | derived | Shifted timestamp. Provider completion events use retained client-observation time. |
 | `ts_offset_ms` | non-negative integer | derived | Milliseconds from the experiment origin. |
 | `source` | enum | derived | Normalized telemetry producer. |
 | `kind` | string discriminator | derived | Event variant within the source. |
@@ -76,10 +78,10 @@ explicit contract; no such request is fabricated in the trace.
 | `nexus/package.request` | 343 | Sanitized request method/path/status, bytes, nullable upstream status, and redirect observation. |
 | `package_origin/origin.request` | 327 | Same request contract for the controlled upstream. |
 | `challenge_evaluator/challenge.request` | 0 | Reserved strict request contract for evaluator access; no public record observed. |
-| `provider/hosted_tools.response` | 7 | HTTP result, response pseudonym, requested hosted tools, observed effects, and target domains. |
-| `provider/web_search.completed` | 2 | Provider effect correlated to a pseudonymous response. |
-| `provider/open_page.completed` | 5 | Provider effect correlated to a pseudonymous response. |
-| `provider/code_interpreter.completed` | 1 | Provider effect correlated to a pseudonymous response. |
+| `provider/hosted_tools.response` | 7 | HTTP result, observation interaction, response pseudonym, requested hosted tools, observed effects, and target domains. |
+| `provider/web_search.completed` | 2 | Provider effect correlated to the model-stream item where the client observed completion. |
+| `provider/open_page.completed` | 5 | Provider effect correlated to the model-stream item where the client observed completion. |
+| `provider/code_interpreter.completed` | 1 | Provider effect correlated to the model-stream item where the client observed completion. |
 
 Network records omit literal addresses. `source_role` and `destination_role`
 are derived classifications; nullable `destination_country` and
@@ -123,6 +125,21 @@ discriminator is `type`:
 The encrypted reasoning placeholder contains only `bytes`, `sha256`, and
 `published: false`. It proves availability/omission accounting, not access to
 the encrypted content or chain-of-thought.
+
+The same omission contract applies when encrypted reasoning appeared inside a
+client-printed provider response: the nested value is replaced by a
+`bytes`/`sha256`/`published` object. Encoded internal container/deployment IDs
+are deterministically pseudonymized, and the gateway safety identifier is
+withheld.
+
+## Detector alert schema
+
+Each JSONL alert consumed by `tools/score.py` must satisfy
+`schemas/alert.schema.json`. In particular, `ts_offset_ms` is a non-negative
+JSON integer (booleans are rejected), `kind` is at most 128 characters, and
+`rule_id`, `source`, and `kind` are non-empty. Additional detector-specific
+properties are allowed. Alert properties use the same provenance vocabulary as
+the corpus schemas.
 
 ## Validation contract
 
