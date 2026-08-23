@@ -4245,6 +4245,11 @@ fn run_tclone_agent_inner(
         &container_agent_cmd,
         &path_prefixes,
     )?;
+    // With Podman cgroups disabled, `podman exec` initially creates the tmux
+    // server and agent in the invoker's cgroup. Reconcile the now-complete
+    // source tree so the agent and all later descendants inherit the operation
+    // cgroup owned by Gensee.
+    source_operation.activate(root_pid)?;
     let _container_file_control =
         if !observe_only && env_flag(TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV) {
             Some(TcloneContainerFileControlServer::start(
