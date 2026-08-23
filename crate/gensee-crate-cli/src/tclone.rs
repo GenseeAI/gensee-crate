@@ -4070,10 +4070,7 @@ fn run_tclone_agent_inner(
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
-    if observe_only {
-        create_args.push(OsString::from("-e"));
-        create_args.push(OsString::from("GENSEE_OBSERVE_ONLY=1"));
-    } else {
+    if !observe_only {
         create_args.push(OsString::from("-e"));
         create_args.push(OsString::from(format!(
             "GENSEE_HOME={container_home}/.gensee"
@@ -5837,10 +5834,7 @@ fn tclone_exec_split(args: &[OsString]) -> io::Result<(&[OsString], &[OsString])
 
 fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
     if record.observe_only {
-        return [
-            ("HOME", record.container_home.as_str()),
-            ("GENSEE_OBSERVE_ONLY", "1"),
-        ]
+        return [("HOME", record.container_home.as_str())]
         .into_iter()
         .flat_map(|(key, value)| {
             [
@@ -14143,7 +14137,16 @@ gensee async job job_1: exited status=0
 
         let env_args = tclone_run_exec_env_args(&record);
 
-        assert!(env_args.contains(&OsString::from("GENSEE_OBSERVE_ONLY=1")));
+        assert_eq!(
+            env_args,
+            vec![
+                OsString::from("-e"),
+                OsString::from("HOME=/home/gensee"),
+            ]
+        );
+        assert!(!env_args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("GENSEE_")));
         assert!(!env_args
             .iter()
             .any(|arg| arg.to_string_lossy().starts_with("GENSEE_HOME=")));
