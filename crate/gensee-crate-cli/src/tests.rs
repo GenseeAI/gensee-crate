@@ -6926,9 +6926,38 @@ fn run_config_parses_tclone_runtime() {
     .unwrap();
 
     assert_eq!(config.runtime, RuntimeMode::Tclone);
+    assert!(!config.observe_only);
     assert_eq!(config.sandbox, SandboxMode::None);
     assert_eq!(config.workspace, PathBuf::from("/repo"));
     assert_eq!(config.agent_cmd, vec![OsString::from("codex")]);
+}
+
+#[test]
+fn run_config_parses_tclone_observe_only_mode() {
+    let config = RunConfig::parse(vec![
+        OsString::from("--runtime"),
+        OsString::from("tclone"),
+        OsString::from("--observe-only"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap();
+
+    assert_eq!(config.runtime, RuntimeMode::Tclone);
+    assert!(config.observe_only);
+}
+
+#[test]
+fn run_config_rejects_observe_only_for_local_runtime() {
+    let error = RunConfig::parse(vec![
+        OsString::from("--observe-only"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("only with --runtime tclone"));
 }
 
 #[test]
