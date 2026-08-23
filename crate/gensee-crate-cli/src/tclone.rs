@@ -66,6 +66,7 @@ const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
 const TCLONE_CONTAINER_GENSEE_PATH: &str = "/usr/local/bin/gensee";
 const TCLONE_NODE_MOUNT_PATH: &str = "/opt/gensee-host-node";
 const TCLONE_NODE_BIN_MOUNT_PATH: &str = "/opt/gensee-host-node-bin";
+const TCLONE_AGENT_RELEASE_PATH: &str = "/tmp/gensee-agent-release";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
 const TCLONE_SOURCE_FORK_HANDOFF_FILE: &str = "source-fork-handoff.json";
@@ -4250,6 +4251,7 @@ fn run_tclone_agent_inner(
     // source tree so the agent and all later descendants inherit the operation
     // cgroup owned by Gensee.
     source_operation.activate(root_pid)?;
+    release_tclone_agent_session(&podman, &source_container)?;
     let _container_file_control =
         if !observe_only && env_flag(TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV) {
             Some(TcloneContainerFileControlServer::start(
@@ -10294,9 +10296,12 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
 fn tclone_agent_start_script(agent_cmd: &[OsString], path_prefixes: &[String]) -> String {
     let command = shell_join(agent_cmd);
     let path_export = tclone_path_export(path_prefixes);
-    let pane_command = format!("{path_export}; exec {command}");
+    let release_path = shell_quote(TCLONE_AGENT_RELEASE_PATH);
+    let pane_command = format!(
+        "while [ ! -e {release_path} ]; do sleep 0.05; done; rm -f {release_path}; {path_export}; exec {command}"
+    );
     format!(
-        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\n{path_export}\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\nagent_pid=$!\nsleep 2\nif ! kill -0 \"$agent_pid\" 2>/dev/null; then\n  printf 'gensee agent exited during startup\\n' >> \"$log\"\n  cat \"$log\" >&2\n  exit 127\nfi\nprintf 'gensee agent started without tmux pid=%s\\n' \"$agent_pid\" >> \"$log\" 2>&1\n",
+        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\n{path_export}\nlog=/tmp/gensee-agent-start.log\nrm -f {release_path}\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\nagent_pid=$!\nsleep 2\nif ! kill -0 \"$agent_pid\" 2>/dev/null; then\n  printf 'gensee agent exited during startup\\n' >> \"$log\"\n  cat \"$log\" >&2\n  exit 127\nfi\nprintf 'gensee agent started without tmux pid=%s\\n' \"$agent_pid\" >> \"$log\" 2>&1\n",
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
@@ -10309,6 +10314,22 @@ fn tclone_agent_start_script(agent_cmd: &[OsString], path_prefixes: &[String]) -
         shell_quote(&command),
         shell_quote(&pane_command)
     )
+}
+
+fn release_tclone_agent_session(podman: &OsString, container_name: &str) -> io::Result<()> {
+    let status = Command::new(podman)
+        .arg("exec")
+        .arg(container_name)
+        .arg("touch")
+        .arg(TCLONE_AGENT_RELEASE_PATH)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "tclone agent release exited with status {status}"
+        )))
+    }
 }
 
 fn tclone_path_export(toolchain_paths: &[String]) -> String {
@@ -14502,6 +14523,9 @@ gensee async job job_1: exited status=0
         assert!(script
             .contains("export PATH='/usr/libexec:/opt/host-node/bin':\"${PATH:-/usr/local/sbin"));
         assert!(script.matches("/usr/libexec:/opt/host-node/bin").count() >= 2);
+        assert!(script.contains("gensee-agent-release"));
+        assert!(script.contains("sleep 0.05"));
+        assert!(script.contains("rm -f"));
         assert!(script.contains("exit 0"));
         assert!(!script.contains("exec sleep infinity"));
         assert!(!script.contains("while :; do"));
