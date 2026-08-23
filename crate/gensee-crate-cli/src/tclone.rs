@@ -12562,14 +12562,21 @@ mod tests {
         let _guard = tclone_test_env_lock();
         let root = temp_tree("run-context-override");
         let context_path = root.join("context.json");
-        fs::write(&context_path, r#"{"run_id":"override-run"}"#).unwrap();
+        fs::write(
+            &context_path,
+            r#"{"run_id":"override-run","role":"source"}"#,
+        )
+        .unwrap();
         let old_context = env::var_os("GENSEE_TCLONE_CONTEXT_PATH");
         let old_run_id = env::var_os("GENSEE_RUN_ID");
         env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
         env::set_var("GENSEE_RUN_ID", "stale-source-run");
 
         assert_eq!(read_tclone_run_context().unwrap()["run_id"], "override-run");
-        assert_eq!(tclone_context_run_id().as_deref(), Some("override-run"));
+        assert_eq!(
+            current_tclone_context_run_id().as_deref(),
+            Some("override-run")
+        );
         let hook = build_hook_event(
             r#"{"session_id":"agent-session","hook_event_name":"PreToolUse"}"#,
             PROVIDER_CODEX,
