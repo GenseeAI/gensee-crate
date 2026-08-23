@@ -4047,6 +4047,11 @@ fn run_tclone_agent_inner(
         OsString::from("--entrypoint"),
         OsString::from(TCLONE_CONTAINER_INIT_PATH),
         OsString::from("--log-driver=k8s-file"),
+        // The operation supervisor owns the Tclone process tree's cgroup.
+        // Leaving Podman's systemd cgroup enabled gives the same processes two
+        // competing owners: once the supervisor moves the tree, systemd may
+        // reap the empty libpod scope before the first `podman exec`.
+        OsString::from("--cgroups=disabled"),
         OsString::from("--security-opt"),
         OsString::from("seccomp=unconfined"),
         OsString::from("--security-opt"),
