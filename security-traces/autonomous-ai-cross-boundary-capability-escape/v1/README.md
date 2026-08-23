@@ -51,6 +51,49 @@ python3 tools/replay.py traces/unified-timeline.jsonl --speed 1 --source gateway
 
 Replay is offline-only. It never executes recorded commands or opens sockets.
 
+## Full public trace
+
+The complete public derivative is split into two coordinated streams so large
+model payloads are not duplicated in the normalized runtime timeline:
+
+- [Full normalized system/runtime timeline](traces/unified-timeline.jsonl) —
+  9,041 time-ordered events.
+- [Full recoverable client-side model stream](traces/model-interactions.jsonl) —
+  372 model input/output items with sanitized message, tool-call, and tool-result
+  content plus reasoning-availability metadata.
+
+The normalized timeline contains 9,040 events from the source-specific public
+trace files plus one independent controller confirmation. The 372 model items
+are intentionally separate and are not counted again in that total.
+
+### Captured event and message inventory
+
+| Public artifact | Captured types | Records |
+| --- | --- | ---: |
+| `cloud-network-events.jsonl` | 4,564 VPC flows; 3,089 firewall events; 470 NAT flows | 8,123 |
+| `package-context-events.jsonl` | 343 package/Nexus requests; 327 package-origin requests | 670 |
+| `gateway-access.jsonl` | Gateway HTTP responses with method, path, status, and direct-request correlation | 123 |
+| `codex-commands.jsonl` | Sanitized completed command records | 69 |
+| `falco-relevant-events.jsonl` | Selected runtime process/network signals | 35 |
+| `provider-effects.jsonl` | 7 hosted-tool responses; 5 page opens; 2 web searches; 1 code-interpreter completion | 15 |
+| `benchmark-events.jsonl` | Accepted development/final submissions | 3 |
+| `gensee-events.jsonl` | Observe-only policy activation and session summary | 2 |
+| Controller event | Independent boundary-escape confirmation | 1 |
+| **Normalized timeline total** | All preceding normalized records | **9,041** |
+| `model-interactions.jsonl` | 126 reasoning records; 115 tool calls; 114 tool results; 17 messages | **372** |
+
+The 17 message records comprise three developer-message placeholders, two user
+messages, and twelve assistant messages. All three developer contents were
+withheld; all 126 reasoning records had empty readable summaries and opaque
+encrypted payloads, so the public records retain availability, size, and digest
+metadata rather than unavailable reasoning text.
+
+The complete unredacted forensic archive—bounded journals, raw SCAP, cloud
+exports, service evidence, and source bundles—is retained in private,
+access-controlled, versioned storage. It is intentionally not linked from this
+public repository because it contains credential-bearing records and private
+infrastructure/account metadata.
+
 ## Contents
 
 | Path | Purpose |
