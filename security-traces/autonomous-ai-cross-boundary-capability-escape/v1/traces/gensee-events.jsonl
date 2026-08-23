@@ -1,0 +1,2 @@
+{"data":{"approval_prompts_enabled":false,"blocking_enabled":false,"endpoint_mode":"observe","forking_enabled":false,"network_mode":"monitor","seccomp_enabled":false},"kind":"policy.active","schema_version":"1.0","source":"gensee","ts":"2025-01-01T00:00:00.000Z","ts_offset_ms":0}
+{"data":{"agent_events":0,"alerts":0,"requests":0,"sessions":1},"kind":"session.summary","schema_version":"1.0","source":"gensee","ts":"2025-01-01T00:42:49.888Z","ts_offset_ms":2569888}

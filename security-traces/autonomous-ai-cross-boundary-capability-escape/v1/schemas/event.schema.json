@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/GenseeAI/gensee-crate/security-traces/schemas/capability-escape-event-v1.json",
+  "title": "Gensee capability-escape trace event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "ts", "ts_offset_ms", "source", "kind", "data"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "event_id": {"type": "string", "pattern": "^evt_[0-9]{6}$"},
+    "ts": {"type": "string", "format": "date-time"},
+    "ts_offset_ms": {"type": "integer", "minimum": 0},
+    "source": {
+      "enum": ["benchmark", "challenge_evaluator", "codex", "controller", "falco", "gateway", "gcp", "gensee", "nexus", "package_origin", "provider"]
+    },
+    "kind": {"type": "string", "minLength": 1, "maxLength": 128},
+    "data": {"type": "object"}
+  }
+}

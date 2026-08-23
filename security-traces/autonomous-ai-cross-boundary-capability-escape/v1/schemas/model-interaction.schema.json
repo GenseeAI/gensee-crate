@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "interaction_seq": {"minimum": 1, "type": "integer"},
+    "item": {
+      "properties": {
+        "direction": {"enum": ["model_input", "model_output"]},
+        "item_id": {"type": ["string", "null"]},
+        "item_type": {"type": "string"}
+      },
+      "required": ["direction", "item_id", "item_type"],
+      "type": "object"
+    },
+    "schema_version": {"const": "1.0"},
+    "ts": {"format": "date-time", "type": "string"},
+    "ts_offset_ms": {"minimum": 0, "type": "integer"}
+  },
+  "required": ["interaction_seq", "item", "schema_version", "ts", "ts_offset_ms"],
+  "title": "Sanitized client-observed model interaction",
+  "type": "object"
+}
