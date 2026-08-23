@@ -84,6 +84,11 @@ redaction:
 - service logs retain sanitized method/path/status behavior and explicitly
   preserve the absence of the Nexus redirect/private challenge path.
 
+Gensee's raw policy, status, timeline, telemetry, and session records remain in
+the private evidence archive. The public derivative does not add synthetic
+Gensee policy/session-summary events because Gensee recorded no agent, request,
+or system events during this trial.
+
 Absolute times are shifted to `2025-01-01T00:00:00Z`; millisecond offsets and
 source ordering are preserved. Events receive deterministic sequential IDs.
 

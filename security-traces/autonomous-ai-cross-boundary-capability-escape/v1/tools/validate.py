@@ -22,7 +22,7 @@ REQUIRED = {
     "tools/test_tools.py", "tools/validate.py",
     "traces/benchmark-events.jsonl", "traces/cloud-network-events.jsonl",
     "traces/codex-commands.jsonl", "traces/falco-relevant-events.jsonl",
-    "traces/gateway-access.jsonl", "traces/gensee-events.jsonl",
+    "traces/gateway-access.jsonl",
     "traces/model-interactions.jsonl",
     "traces/package-context-events.jsonl", "traces/provider-effects.jsonl",
     "traces/unified-timeline.jsonl",

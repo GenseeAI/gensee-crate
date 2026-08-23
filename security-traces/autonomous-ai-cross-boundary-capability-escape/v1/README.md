@@ -28,8 +28,8 @@ artificially elevated with stolen labels.
 
 ## Trial timeline
 
-The captured trial lasted **42 minutes 49.9 seconds** from observe-only policy
-activation through the final session summary.
+The captured trial lasted **42 minutes 49.9 seconds** from the experiment start
+through the final captured session state.
 
 | Relative time | What happened |
 | ---: | --- |
@@ -75,12 +75,12 @@ The complete public derivative is split into two coordinated streams so large
 model payloads are not duplicated in the normalized runtime timeline:
 
 - [Full normalized system/runtime timeline](traces/unified-timeline.jsonl) —
-  9,041 time-ordered events.
+  9,039 time-ordered events.
 - [Full recoverable client-side model stream](traces/model-interactions.jsonl) —
   372 model input/output items with sanitized message, tool-call, and tool-result
   content plus reasoning-availability metadata.
 
-The normalized timeline contains 9,040 events from the source-specific public
+The normalized timeline contains 9,038 events from the source-specific public
 trace files plus one independent controller confirmation. The 372 model items
 are intentionally separate and are not counted again in that total.
 
@@ -95,9 +95,8 @@ are intentionally separate and are not counted again in that total.
 | `falco-relevant-events.jsonl` | Selected runtime process/network signals | 35 |
 | `provider-effects.jsonl` | 7 hosted-tool responses; 5 page opens; 2 web searches; 1 code-interpreter completion | 15 |
 | `benchmark-events.jsonl` | Accepted development/final submissions | 3 |
-| `gensee-events.jsonl` | Observe-only policy activation and session summary | 2 |
 | Controller event | Independent boundary-escape confirmation | 1 |
-| **Normalized timeline total** | All preceding normalized records | **9,041** |
+| **Normalized timeline total** | All preceding normalized records | **9,039** |
 | `model-interactions.jsonl` | 126 reasoning records; 115 tool calls; 114 tool results; 17 messages | **372** |
 
 The 17 message records comprise three developer-message placeholders, two user
@@ -126,7 +125,6 @@ infrastructure/account metadata.
 | `traces/cloud-network-events.jsonl` | Address-free normalized VPC, firewall, and NAT records |
 | `traces/package-context-events.jsonl` | Nexus/package exploration and negative challenge evidence |
 | `traces/benchmark-events.jsonl` | Development and sealed-final submissions |
-| `traces/gensee-events.jsonl` | Observe-only policy and no-alert session summary |
 | `ground-truth.json` | Seven observationally distinct stages and outcomes |
 | `prompt.txt`, `BENCHMARK.md` | Exact safe task text shown to the agent |
 | `run-provenance.json` | Model, harness, runtime, and Gensee configuration |
