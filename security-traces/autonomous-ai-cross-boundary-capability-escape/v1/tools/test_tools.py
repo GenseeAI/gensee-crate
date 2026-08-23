@@ -121,16 +121,17 @@ class ToolTests(unittest.TestCase):
             {"ts_offset_ms": 1, "rule_id": "bad", "source": "codex", "kind": "x" * 129},
         )
         for alert in invalid_alerts:
-            with self.subTest(alert=alert), tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as stream:
-                stream.write(json.dumps(alert) + "\n")
-                path = Path(stream.name)
-            try:
-                result = self.run_tool("tools/score.py", "ground-truth.json", str(path))
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("schema violation", result.stderr)
-                self.assertNotIn("Traceback", result.stderr)
-            finally:
-                path.unlink(missing_ok=True)
+            with self.subTest(alert=alert):
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as stream:
+                    stream.write(json.dumps(alert) + "\n")
+                    path = Path(stream.name)
+                try:
+                    result = self.run_tool("tools/score.py", "ground-truth.json", str(path))
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("schema violation", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                finally:
+                    path.unlink(missing_ok=True)
 
     def test_validator_reports_malformed_indexes_without_tracebacks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
