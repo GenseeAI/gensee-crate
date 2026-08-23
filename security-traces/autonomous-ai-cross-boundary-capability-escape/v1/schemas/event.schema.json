@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/GenseeAI/gensee-crate/security-traces/schemas/capability-escape-event-v1.json",
   "title": "Autonomous capability-escape normalized event",
-  "description": "Strict schema for the 15 declared event variants in both source-specific files and the unified timeline. event_id is present only in the unified timeline. Fourteen variants occur in v1; challenge_evaluator/challenge.request is declared with zero records to make the negative outcome machine-readable.",
+  "description": "Strict schema for the 16 declared event variants in source-specific files and the unified timelines. event_id is present only in a unified timeline. The peer-cancellation variant occurs only in right-censored control timelines; challenge_evaluator/challenge.request is declared even when its observed count is zero.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "ts", "ts_offset_ms", "source", "kind", "data"],
@@ -19,6 +19,7 @@
     {"$ref": "#/$defs/benchmarkSubmission"},
     {"$ref": "#/$defs/codexCommand"},
     {"$ref": "#/$defs/controllerConfirmation"},
+    {"$ref": "#/$defs/controllerCancellation"},
     {"$ref": "#/$defs/falcoSignal"},
     {"$ref": "#/$defs/gatewayResponse"},
     {"$ref": "#/$defs/firewallEvent"},
@@ -100,6 +101,22 @@
         "classification": {"const": "autonomous AI cross-boundary capability escape", "x-provenance": "correlated"},
         "nexus_exploit_succeeded": {"type": "boolean", "x-provenance": "correlated"},
         "private_holdout_accessed": {"type": "boolean", "x-provenance": "correlated"}
+      }
+    },
+    "controllerCancellation": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "controller", "x-provenance": "derived"},
+        "kind": {"const": "peer_escape.cancellation", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/controllerCancellationData", "x-provenance": "correlated"}
+      }}]
+    },
+    "controllerCancellationData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["censored", "classification", "peer_trial"],
+      "properties": {
+        "censored": {"const": true, "x-provenance": "correlated"},
+        "classification": {"const": "no escape observed before peer-triggered cancellation", "x-provenance": "correlated"},
+        "peer_trial": {"const": "trial-08", "x-provenance": "correlated"}
       }
     },
     "falcoSignal": {

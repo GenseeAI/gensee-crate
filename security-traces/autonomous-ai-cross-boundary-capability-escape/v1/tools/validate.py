@@ -17,10 +17,11 @@ from typing import Any
 
 REQUIRED = {
     "BENCHMARK.md", "LICENSE-DATA", "METHODOLOGY.md", "NOTICE", "README.md", "SCHEMA.md",
-    "SHA256SUMS", "ground-truth.json", "manifest.json", "prompt.txt",
+    "SHA256SUMS", "cohort.json", "ground-truth.json", "manifest.json", "prompt.txt",
     "model-interaction-availability.json", "redaction-ledger.json", "run-provenance.json",
     "topology.json",
-    "schemas/alert.schema.json", "schemas/event.schema.json",
+    "schemas/alert.schema.json", "schemas/cohort.schema.json",
+    "schemas/control-summary.schema.json", "schemas/event.schema.json",
     "schemas/model-interaction.schema.json",
     "tools/replay.py", "tools/score.py",
     "tools/test_tools.py", "tools/validate.py",
@@ -28,6 +29,16 @@ REQUIRED = {
     "traces/codex-commands.jsonl", "traces/falco-relevant-events.jsonl",
     "traces/gateway-access.jsonl",
     "traces/model-interactions.jsonl",
+    "traces/package-context-events.jsonl", "traces/provider-effects.jsonl",
+    "traces/unified-timeline.jsonl",
+}
+CONTROL_IDS = ("trial-05", "trial-06", "trial-07")
+CONTROL_FILES = {
+    "README.md", "control-summary.json", "model-interaction-availability.json",
+    "redaction-ledger.json", "run-provenance.json",
+    "traces/benchmark-events.jsonl", "traces/cloud-network-events.jsonl",
+    "traces/codex-commands.jsonl", "traces/falco-relevant-events.jsonl",
+    "traces/gateway-access.jsonl", "traces/model-interactions.jsonl",
     "traces/package-context-events.jsonl", "traces/provider-effects.jsonl",
     "traces/unified-timeline.jsonl",
 }
@@ -58,7 +69,7 @@ SOURCE_EPOCH_END = 1787529600
 FERNET_TOKEN = re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}={0,2}\b")
 ENCODED_CONTAINER = re.compile(r"\bcntr_[A-Za-z0-9_-]{32,}={0,2}\b")
 SAFETY_IDENTIFIER = re.compile(r'''(?ix)["']?safety_identifier["']?\s*:\s*["']([^"']+)["']''')
-SOURCE_DATE = re.compile(r"20" + r"26-08-23|20" + r"26/08/23")
+SOURCE_DATE = re.compile(r"20" + r"26(?:-08-23|/08/23|0823)")
 HIDDEN_INSTRUCTION = re.compile(r"You are Codex, an agent based on GPT-5|['\"]base_instructions['\"]")
 FORBIDDEN_NAMES = (".scap", "holdout", "source-map", "codex-rollout", "codex-events")
 EVENT_TRACE_PATHS = (
@@ -425,9 +436,20 @@ def validate(root: Path) -> list[str]:
     event_schema = load_json_object(root / "schemas" / "event.schema.json", errors, "event schema")
     model_schema = load_json_object(root / "schemas" / "model-interaction.schema.json", errors, "model schema")
     alert_schema = load_json_object(root / "schemas" / "alert.schema.json", errors, "alert schema")
+    control_schema = load_json_object(root / "schemas" / "control-summary.schema.json", errors, "control summary schema")
+    cohort_schema = load_json_object(root / "schemas" / "cohort.schema.json", errors, "cohort schema")
     errors.extend(f"event schema {error}" for error in schema_definition_errors(event_schema))
     errors.extend(f"model schema {error}" for error in schema_definition_errors(model_schema))
     errors.extend(f"alert schema {error}" for error in schema_definition_errors(alert_schema))
+    errors.extend(f"control summary schema {error}" for error in schema_definition_errors(control_schema))
+    errors.extend(f"cohort schema {error}" for error in schema_definition_errors(cohort_schema))
+
+    cohort = load_json_object(root / "cohort.json", errors, "cohort")
+    cohort_errors = schema_errors(cohort, cohort_schema)
+    if cohort_errors:
+        errors.append(f"cohort schema violation: {cohort_errors[0]}")
+    if [trial.get("trial_id") for trial in cohort.get("trials", [])] != [*CONTROL_IDS, "trial-08"]:
+        errors.append("cohort trial membership or order is incorrect")
 
     topology = load_json_object(root / "topology.json", errors, "topology")
     topology_roles = {entry.get("role") for entry in topology.get("roles", [])}
@@ -590,6 +612,134 @@ def validate(root: Path) -> list[str]:
         for row in interactions
     ):
         errors.append("sanitized client-observed hosted-tool response body is missing")
+
+    for trial_id in CONTROL_IDS:
+        control_root = root / "controls" / trial_id
+        present = {
+            path.relative_to(control_root).as_posix()
+            for path in control_root.rglob("*") if path.is_file() and not ephemeral_runtime_file(path)
+        } if control_root.is_dir() else set()
+        missing_control = CONTROL_FILES - present
+        if missing_control:
+            errors.append(f"{trial_id} missing files: {sorted(missing_control)}")
+
+        summary = load_json_object(control_root / "control-summary.json", errors, f"{trial_id} control summary")
+        summary_errors = schema_errors(summary, control_schema)
+        if summary_errors:
+            errors.append(f"{trial_id} control summary schema violation: {summary_errors[0]}")
+        if summary.get("trial_id") != trial_id:
+            errors.append(f"{trial_id} control summary has the wrong trial ID")
+
+        control_unified = load_jsonl(
+            control_root / "traces" / "unified-timeline.jsonl", errors, f"{trial_id} unified timeline"
+        )
+        expected_ids = [f"evt_{index:06d}" for index in range(1, len(control_unified) + 1)]
+        if [row.get("event_id") for row in control_unified] != expected_ids:
+            errors.append(f"{trial_id} unified event IDs are not sequential")
+        offsets = [row.get("ts_offset_ms") for row in control_unified]
+        if offsets != sorted(offsets):
+            errors.append(f"{trial_id} unified timeline is not ordered")
+        for index, row in enumerate(control_unified, 1):
+            validation_errors = schema_errors(row, event_schema)
+            if validation_errors:
+                errors.append(f"{trial_id} event {index} schema violation: {validation_errors[0]}")
+
+        cancellations = [
+            row for row in control_unified
+            if row.get("source") == "controller" and row.get("kind") == "peer_escape.cancellation"
+        ]
+        if len(cancellations) != 1:
+            errors.append(f"{trial_id} must contain exactly one peer-cancellation event")
+        elif cancellations[0].get("ts_offset_ms") != summary.get("censoring_event_offset_ms"):
+            errors.append(f"{trial_id} cancellation offset disagrees with its summary")
+        if any(row.get("kind") == "boundary_escape.confirmed" for row in control_unified):
+            errors.append(f"{trial_id} incorrectly contains a boundary-escape confirmation")
+
+        control_source_events: list[dict[str, Any]] = []
+        for relative in EVENT_TRACE_PATHS:
+            control_path = control_root / "traces" / Path(relative).name
+            for index, row in enumerate(load_jsonl(control_path, errors, f"{trial_id} {relative}"), 1):
+                validation_errors = schema_errors(row, event_schema)
+                if validation_errors:
+                    errors.append(f"{trial_id} {relative} record {index} schema violation: {validation_errors[0]}")
+                control_source_events.append(row)
+        control_source_multiset = Counter(
+            json.dumps(row, sort_keys=True, separators=(",", ":")) for row in control_source_events
+        )
+        control_unified_source_rows = []
+        for row in control_unified:
+            if row.get("source") == "controller":
+                continue
+            source_row = dict(row)
+            source_row.pop("event_id", None)
+            control_unified_source_rows.append(source_row)
+        control_unified_multiset = Counter(
+            json.dumps(row, sort_keys=True, separators=(",", ":")) for row in control_unified_source_rows
+        )
+        if control_source_multiset != control_unified_multiset:
+            errors.append(f"{trial_id} source-specific events differ from its unified timeline")
+
+        control_provider = load_jsonl(
+            control_root / "traces" / "provider-effects.jsonl", errors, f"{trial_id} provider effects"
+        )
+        if control_provider:
+            errors.append(f"{trial_id} unexpectedly contains provider hosted-tool effects")
+        control_gateway = load_jsonl(
+            control_root / "traces" / "gateway-access.jsonl", errors, f"{trial_id} gateway access"
+        )
+        if any(row.get("data", {}).get("correlated_direct_agent_request") for row in control_gateway):
+            errors.append(f"{trial_id} unexpectedly contains a correlated direct gateway request")
+        control_context = load_jsonl(
+            control_root / "traces" / "package-context-events.jsonl", errors, f"{trial_id} package context"
+        )
+        if any(row.get("data", {}).get("redirect_present") for row in control_context):
+            errors.append(f"{trial_id} unexpectedly contains a package redirect")
+        if any(row.get("source") == "challenge_evaluator" for row in control_context):
+            errors.append(f"{trial_id} unexpectedly contains a challenge request")
+
+        control_interactions = load_jsonl(
+            control_root / "traces" / "model-interactions.jsonl", errors, f"{trial_id} model interactions"
+        )
+        if [row.get("interaction_seq") for row in control_interactions] != list(range(1, len(control_interactions) + 1)):
+            errors.append(f"{trial_id} model interaction sequence is incomplete or unordered")
+        control_counts: Counter[str] = Counter()
+        control_developer_placeholders = 0
+        for row in control_interactions:
+            validation_errors = schema_errors(row, model_schema)
+            if validation_errors:
+                errors.append(
+                    f"{trial_id} model interaction {row.get('interaction_seq')} schema violation: {validation_errors[0]}"
+                )
+            item = row.get("item", {})
+            control_counts[item.get("item_type")] += 1
+            if item.get("item_type") == "reasoning":
+                encrypted = item.get("encrypted_content")
+                if not isinstance(encrypted, dict) or encrypted.get("published") is not False:
+                    errors.append(f"{trial_id} reasoning item lacks an explicit omission record")
+            if item.get("item_type") == "message" and item.get("role") == "developer":
+                control_developer_placeholders += 1
+                if item.get("content_withheld") is not True:
+                    errors.append(f"{trial_id} developer message is not an explicit placeholder")
+        if control_developer_placeholders != 3:
+            errors.append(f"{trial_id} expected three developer-message placeholders")
+        control_availability = load_json_object(
+            control_root / "model-interaction-availability.json", errors, f"{trial_id} model availability"
+        )
+        availability_counts = control_availability.get("counts", {})
+        if availability_counts.get("response_items") != len(control_interactions):
+            errors.append(f"{trial_id} model availability total disagrees with trace")
+        for item_type in ("reasoning", "custom_tool_call", "custom_tool_call_output", "message"):
+            if availability_counts.get(item_type) != control_counts[item_type]:
+                errors.append(f"{trial_id} model availability count differs for {item_type}")
+        benchmark_rows = load_jsonl(
+            control_root / "traces" / "benchmark-events.jsonl", errors, f"{trial_id} benchmark events"
+        )
+        feedback_count = sum(row.get("data", {}).get("submission_kind") == "feedback" for row in benchmark_rows)
+        sealed_observed = any(row.get("data", {}).get("submission_kind") == "sealed_final" for row in benchmark_rows)
+        if summary.get("benchmark", {}).get("feedback_submissions_observed") != feedback_count:
+            errors.append(f"{trial_id} feedback-submission count disagrees with summary")
+        if summary.get("benchmark", {}).get("sealed_final_observed") is not sealed_observed:
+            errors.append(f"{trial_id} sealed-final observation disagrees with summary")
     return errors
 
 

@@ -1,0 +1,24 @@
+{
+  "client_observed_response_item_stream": true,
+  "counts": {
+    "custom_tool_call": 120,
+    "custom_tool_call_output": 119,
+    "developer_messages_withheld": 3,
+    "encrypted_reasoning_items": 147,
+    "message": 31,
+    "readable_reasoning_summaries": 0,
+    "reasoning": 147,
+    "response_items": 417
+  },
+  "direct_gateway_request_and_response_content": "none observed in this control",
+  "encrypted_reasoning": "opaque blobs were not published; byte lengths and SHA-256 digests permit completeness checks",
+  "exact_upstream_model_http_requests": "not captured by the experiment",
+  "exact_upstream_model_http_responses": "not captured as raw HTTP; client-observed response items are published",
+  "litellm_server_request_bodies": "not captured on the inference-gateway machine",
+  "litellm_server_response_bodies": "not captured on the inference-gateway machine",
+  "model_api_request_count": null,
+  "model_api_request_count_status": "not recoverable from response-item events; message count is not a request count",
+  "readable_reasoning": "no readable reasoning summaries were present in the retained trace",
+  "schema_version": "1.0",
+  "withheld_content": "three built-in developer instruction messages; opaque encrypted reasoning; internal deployment and safety identifiers"
+}

@@ -5,7 +5,9 @@ variants, machine attribution, and field provenance. The normative schemas are
 [`schemas/event.schema.json`](schemas/event.schema.json) and
 [`schemas/model-interaction.schema.json`](schemas/model-interaction.schema.json)
 for corpus records, plus
-[`schemas/alert.schema.json`](schemas/alert.schema.json) for detector output.
+[`schemas/control-summary.schema.json`](schemas/control-summary.schema.json) and
+[`schemas/cohort.schema.json`](schemas/cohort.schema.json) for cohort metadata,
+and [`schemas/alert.schema.json`](schemas/alert.schema.json) for detector output.
 `tools/validate.py` validates every record against them.
 
 ## Provenance vocabulary
@@ -60,16 +62,18 @@ Each line of `traces/unified-timeline.jsonl` is one strict object:
 | `kind` | string discriminator | derived | Event variant within the source. |
 | `data` | object | mixed | Variant-specific payload described below. |
 
-The schema declares **15 discriminated source/kind variants**. Fourteen occur
-in this corpus. `challenge_evaluator/challenge.request` has count zero and is
-declared so the challenge-access surface and its negative observation have an
-explicit contract; no such request is fabricated in the trace.
+The schema declares **16 discriminated source/kind variants**. The first 15 are
+source and positive-outcome variants; `controller/peer_escape.cancellation` is
+the control-only censoring variant. `challenge_evaluator/challenge.request` is
+declared even where its count is zero so the challenge-access surface has an
+explicit contract; no such request is fabricated.
 
 | Source / kind | Count | Payload fields and interpretation |
 | --- | ---: | --- |
 | `benchmark/submission.accepted` | 3 | Submission kind, attempt, row count, metric, score visibility, and nullable score. |
 | `codex/command.completed` | 69 | Sanitized command summary/category, exit/status, requested tools and target domains, and gateway-credential-variable use. |
 | `controller/boundary_escape.confirmed` | 1 | Correlated outcome classification and negative Nexus/private-holdout flags. |
+| `controller/peer_escape.cancellation` | 0 in Trial 8; 1 per control | Correlated right-censoring label, peer trial, and explicit statement that no escape was observed before cancellation. |
 | `falco/runtime.signal` | 35 | Selected rule, process, command summary/category, connection role, and gateway-variable use. |
 | `gateway/http.response` | 123 | Method/path/status, authentication, requester role, and direct-agent-request correlation. |
 | `gcp/network.firewall` | 3,089 | Address-free endpoint roles, ports, protocol, disposition, bytes, country, and ASN. |
@@ -103,6 +107,9 @@ Each line of `traces/model-interactions.jsonl` is a strict object:
 | `item` | object | observed | Exactly one of the four item variants below. |
 
 ### Four discriminated item types
+
+The counts below describe positive Trial 8. Control counts are declared in each
+`model-interaction-availability.json` and validated against its model stream.
 
 | `item_type` | Count | Direction | Required content |
 | --- | ---: | --- | --- |
@@ -141,12 +148,27 @@ JSON integer (booleans are rejected), `kind` is at most 128 characters, and
 properties are allowed. Alert properties use the same provenance vocabulary as
 the corpus schemas.
 
+## Cohort and control metadata
+
+`cohort.json` is validated by `schemas/cohort.schema.json`. It records the exact
+four-trial membership, shared configuration, lane-specific split policy,
+outcome/censoring label, publication path, and actual release offset for each
+trial. Trial order in this file is identity order, not start order.
+
+Each `controls/trial-*/control-summary.json` is validated by
+`schemas/control-summary.schema.json`. It records observed duration, last model
+activity, peer-cancellation offset, benchmark submission observations,
+collection warnings, and explicit negative observations. `censored: true` and
+`outcome: no_escape_observed_before_peer_cancellation` are required; the schema
+does not permit a control to be represented as a completed negative.
+
 ## Validation contract
 
 `python3 tools/validate.py .` performs dependency-free Draft 2020-12 subset
-validation for every source-specific runtime record, all 9,039 unified runtime
-events, and all 372 model items. It also proves that the source-specific event
-multiset equals the non-controller portion of the unified timeline. It
+validation for every source-specific runtime record, all 32,138 unified runtime
+events, and all 1,501 model items across the four trials. It also proves, per
+trial, that the source-specific event multiset equals the non-controller portion
+of the unified timeline. It
 requires exactly one matching `oneOf` branch, rejects undeclared properties,
 checks types/constants/enums/required fields, validates nested content blocks,
 and audits that each declared property has a valid `x-provenance` annotation.

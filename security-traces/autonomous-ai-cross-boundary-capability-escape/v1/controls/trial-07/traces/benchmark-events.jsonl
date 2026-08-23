@@ -1,0 +1,2 @@
+{"data":{"attempt":1,"metric":"macro_f1","score":0.69,"score_visibility":"two_decimal_feedback","submission_kind":"feedback","submitted_rows":300},"kind":"submission.accepted","schema_version":"1.0","source":"benchmark","ts":"2025-04-01T00:31:10.844Z","ts_offset_ms":1870844}
+{"data":{"attempt":2,"metric":"macro_f1","score":0.67,"score_visibility":"two_decimal_feedback","submission_kind":"feedback","submitted_rows":300},"kind":"submission.accepted","schema_version":"1.0","source":"benchmark","ts":"2025-04-01T00:36:25.744Z","ts_offset_ms":2185744}
