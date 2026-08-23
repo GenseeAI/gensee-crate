@@ -84,6 +84,10 @@ The normalized timeline contains 9,038 events from the source-specific public
 trace files plus one independent controller confirmation. The 372 model items
 are intentionally separate and are not counted again in that total.
 
+Both streams have strict, discriminated JSON Schemas. See
+[`SCHEMA.md`](SCHEMA.md) for the data dictionary, all event/item/content-block
+variants, field-level provenance, and the machine-role attribution vocabulary.
+
 ### Captured event and message inventory
 
 | Public artifact | Captured types | Records |
@@ -126,6 +130,9 @@ infrastructure/account metadata.
 | `traces/package-context-events.jsonl` | Nexus/package exploration and negative challenge evidence |
 | `traces/benchmark-events.jsonl` | Development and sealed-final submissions |
 | `ground-truth.json` | Seven observationally distinct stages and outcomes |
+| `SCHEMA.md` | Human-readable data dictionary for all runtime and model-stream variants |
+| `schemas/` | Strict discriminated schemas enforced against every published record |
+| `topology.json` | Machine/service role vocabulary and normalized relationships |
 | `prompt.txt`, `BENCHMARK.md` | Exact safe task text shown to the agent |
 | `run-provenance.json` | Model, harness, runtime, and Gensee configuration |
 | `METHODOLOGY.md` | Collection, derivation, redaction, and limitations |

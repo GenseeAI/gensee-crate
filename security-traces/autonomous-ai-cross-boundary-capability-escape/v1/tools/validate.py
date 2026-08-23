@@ -8,14 +8,17 @@ import ipaddress
 import json
 import re
 import sys
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
 REQUIRED = {
-    "BENCHMARK.md", "LICENSE-DATA", "METHODOLOGY.md", "NOTICE", "README.md",
+    "BENCHMARK.md", "LICENSE-DATA", "METHODOLOGY.md", "NOTICE", "README.md", "SCHEMA.md",
     "SHA256SUMS", "ground-truth.json", "manifest.json", "prompt.txt",
     "model-interaction-availability.json", "redaction-ledger.json", "run-provenance.json",
+    "topology.json",
     "schemas/alert.schema.json", "schemas/event.schema.json",
     "schemas/model-interaction.schema.json",
     "tools/replay.py", "tools/score.py",
@@ -40,6 +43,19 @@ SOURCE_TIME = re.compile(r"\b2026-08-23T[0-9:.]+Z\b|\b178745[0-9]{4}(?:\.[0-9]+)
 SOURCE_DATE = re.compile(r"20" + r"26-08-23|20" + r"26/08/23")
 HIDDEN_INSTRUCTION = re.compile(r"You are Codex, an agent based on GPT-5|['\"]base_instructions['\"]")
 FORBIDDEN_NAMES = (".scap", "holdout", "source-map", "codex-rollout", "codex-events")
+EVENT_TRACE_PATHS = (
+    "traces/benchmark-events.jsonl", "traces/cloud-network-events.jsonl",
+    "traces/codex-commands.jsonl", "traces/falco-relevant-events.jsonl",
+    "traces/gateway-access.jsonl", "traces/package-context-events.jsonl",
+    "traces/provider-effects.jsonl",
+)
+PROVENANCE_VALUES = {"observed", "derived", "correlated", "synthetic"}
+SCHEMA_KEYWORDS = {
+    "$defs", "$id", "$ref", "$schema", "additionalProperties", "allOf", "const",
+    "dependentRequired", "description", "enum", "format", "items", "maxItems",
+    "maxLength", "maximum", "minItems", "minLength", "minimum", "oneOf", "pattern",
+    "properties", "required", "title", "type", "uniqueItems", "x-provenance",
+}
 
 
 def ephemeral_runtime_file(path: Path) -> bool:
@@ -76,6 +92,154 @@ def valid_ip_literals(text: str) -> list[str]:
             continue
         values.append(candidate)
     return values
+
+
+def schema_type_matches(value: Any, expected: str) -> bool:
+    """Return JSON type compatibility without treating bool as an integer."""
+    return {
+        "array": isinstance(value, list),
+        "boolean": isinstance(value, bool),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "null": value is None,
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "object": isinstance(value, dict),
+        "string": isinstance(value, str),
+    }.get(expected, False)
+
+
+def resolve_local_ref(root_schema: dict[str, Any], reference: str) -> dict[str, Any]:
+    if not reference.startswith("#/"):
+        raise ValueError(f"only local schema references are supported: {reference}")
+    value: Any = root_schema
+    for raw_token in reference[2:].split("/"):
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        value = value[token]
+    if not isinstance(value, dict):
+        raise ValueError(f"schema reference is not an object: {reference}")
+    return value
+
+
+def schema_errors(
+    value: Any,
+    schema: dict[str, Any],
+    root_schema: dict[str, Any] | None = None,
+    path: str = "$",
+) -> list[str]:
+    """Validate the JSON Schema subset used by the publication schemas."""
+    root_schema = root_schema or schema
+    errors: list[str] = []
+
+    if "$ref" in schema:
+        try:
+            target = resolve_local_ref(root_schema, schema["$ref"])
+        except (KeyError, TypeError, ValueError) as exc:
+            return [f"{path}: invalid $ref: {exc}"]
+        errors.extend(schema_errors(value, target, root_schema, path))
+
+    for child in schema.get("allOf", []):
+        errors.extend(schema_errors(value, child, root_schema, path))
+
+    if "oneOf" in schema:
+        branch_errors = [schema_errors(value, child, root_schema, path) for child in schema["oneOf"]]
+        matches = sum(not branch for branch in branch_errors)
+        if matches != 1:
+            detail = "; ".join(
+                f"branch {index + 1}: {branch[0] if branch else 'matched'}"
+                for index, branch in enumerate(branch_errors)
+            )
+            errors.append(f"{path}: oneOf matched {matches} branches ({detail})")
+
+    expected_types = schema.get("type")
+    if expected_types is not None:
+        if isinstance(expected_types, str):
+            expected_types = [expected_types]
+        if not any(schema_type_matches(value, expected) for expected in expected_types):
+            errors.append(f"{path}: expected type {expected_types}, got {type(value).__name__}")
+            return errors
+
+    if "const" in schema and value != schema["const"]:
+        errors.append(f"{path}: expected constant {schema['const']!r}, got {value!r}")
+    if "enum" in schema and value not in schema["enum"]:
+        errors.append(f"{path}: value {value!r} is not in enum")
+
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        for name in required:
+            if name not in value:
+                errors.append(f"{path}: missing required property {name!r}")
+        properties = schema.get("properties", {})
+        for name, child_value in value.items():
+            if name in properties:
+                errors.extend(schema_errors(child_value, properties[name], root_schema, f"{path}.{name}"))
+            elif schema.get("additionalProperties") is False:
+                errors.append(f"{path}: undeclared property {name!r}")
+            elif isinstance(schema.get("additionalProperties"), dict):
+                errors.extend(schema_errors(child_value, schema["additionalProperties"], root_schema, f"{path}.{name}"))
+        for trigger, dependents in schema.get("dependentRequired", {}).items():
+            if trigger in value:
+                for dependent in dependents:
+                    if dependent not in value:
+                        errors.append(f"{path}: {trigger!r} requires {dependent!r}")
+
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0):
+            errors.append(f"{path}: array has fewer than {schema['minItems']} items")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errors.append(f"{path}: array has more than {schema['maxItems']} items")
+        if schema.get("uniqueItems"):
+            rendered = [json.dumps(item, sort_keys=True, separators=(",", ":")) for item in value]
+            if len(rendered) != len(set(rendered)):
+                errors.append(f"{path}: array items are not unique")
+        if isinstance(schema.get("items"), dict):
+            for index, item in enumerate(value):
+                errors.extend(schema_errors(item, schema["items"], root_schema, f"{path}[{index}]"))
+
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0):
+            errors.append(f"{path}: string is shorter than {schema['minLength']}")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            errors.append(f"{path}: string is longer than {schema['maxLength']}")
+        if "pattern" in schema and re.search(schema["pattern"], value) is None:
+            errors.append(f"{path}: string does not match {schema['pattern']!r}")
+        if schema.get("format") == "date-time":
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    raise ValueError("timezone is required")
+            except ValueError:
+                errors.append(f"{path}: invalid date-time {value!r}")
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            errors.append(f"{path}: number is below minimum {schema['minimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            errors.append(f"{path}: number is above maximum {schema['maximum']}")
+    return errors
+
+
+def schema_definition_errors(schema: dict[str, Any], path: str = "$") -> list[str]:
+    """Reject unsupported keywords and properties without provenance labels."""
+    errors: list[str] = []
+    unknown = set(schema) - SCHEMA_KEYWORDS
+    if unknown:
+        errors.append(f"{path}: unsupported schema keywords: {sorted(unknown)}")
+    if "x-provenance" in schema and schema["x-provenance"] not in PROVENANCE_VALUES:
+        errors.append(f"{path}: invalid x-provenance value {schema['x-provenance']!r}")
+    for name, child in schema.get("properties", {}).items():
+        child_path = f"{path}.properties.{name}"
+        if child.get("x-provenance") not in PROVENANCE_VALUES:
+            errors.append(f"{child_path}: property lacks a valid x-provenance annotation")
+        errors.extend(schema_definition_errors(child, child_path))
+    for name, child in schema.get("$defs", {}).items():
+        errors.extend(schema_definition_errors(child, f"{path}.$defs.{name}"))
+    for keyword in ("allOf", "oneOf"):
+        for index, child in enumerate(schema.get(keyword, [])):
+            errors.extend(schema_definition_errors(child, f"{path}.{keyword}[{index}]"))
+    if isinstance(schema.get("items"), dict):
+        errors.extend(schema_definition_errors(schema["items"], f"{path}.items"))
+    if isinstance(schema.get("additionalProperties"), dict):
+        errors.extend(schema_definition_errors(schema["additionalProperties"], f"{path}.additionalProperties"))
+    return errors
 
 
 def validate(root: Path) -> list[str]:
@@ -142,6 +306,22 @@ def validate(root: Path) -> list[str]:
         if relative != "tools/validate.py" and HIDDEN_INSTRUCTION.search(text):
             errors.append(f"built-in instruction content in {path.relative_to(root)}")
 
+    event_schema = json.loads((root / "schemas" / "event.schema.json").read_text(encoding="utf-8"))
+    model_schema = json.loads((root / "schemas" / "model-interaction.schema.json").read_text(encoding="utf-8"))
+    errors.extend(f"event schema {error}" for error in schema_definition_errors(event_schema))
+    errors.extend(f"model schema {error}" for error in schema_definition_errors(model_schema))
+
+    topology = json.loads((root / "topology.json").read_text(encoding="utf-8"))
+    topology_roles = {entry.get("role") for entry in topology.get("roles", [])}
+    schema_roles = set(event_schema.get("$defs", {}).get("role", {}).get("enum", []))
+    if topology.get("schema_version") != "1.0" or topology_roles != schema_roles:
+        errors.append("topology role vocabulary differs from the event schema")
+    if len(topology.get("roles", [])) != len(topology_roles):
+        errors.append("topology contains duplicate role declarations")
+    for index, relationship in enumerate(topology.get("relationships", []), 1):
+        if relationship.get("from") not in topology_roles or relationship.get("to") not in topology_roles:
+            errors.append(f"topology relationship {index} refers to an undeclared role")
+
     unified = jsonl(root / "traces" / "unified-timeline.jsonl")
     if [row.get("event_id") for row in unified] != [f"evt_{index:06d}" for index in range(1, len(unified) + 1)]:
         errors.append("unified event IDs are not sequential")
@@ -153,6 +333,28 @@ def validate(root: Path) -> list[str]:
             errors.append(f"event {index} has invalid keys")
         if row.get("schema_version") != "1.0" or not isinstance(row.get("data"), dict):
             errors.append(f"event {index} has invalid schema values")
+        validation_errors = schema_errors(row, event_schema)
+        if validation_errors:
+            errors.append(f"event {index} schema violation: {validation_errors[0]}")
+
+    source_events: list[dict[str, Any]] = []
+    for relative in EVENT_TRACE_PATHS:
+        for index, row in enumerate(jsonl(root / relative), 1):
+            validation_errors = schema_errors(row, event_schema)
+            if validation_errors:
+                errors.append(f"{relative} record {index} schema violation: {validation_errors[0]}")
+            source_events.append(row)
+    source_multiset = Counter(json.dumps(row, sort_keys=True, separators=(",", ":")) for row in source_events)
+    unified_source_rows = []
+    for row in unified:
+        if row.get("source") == "controller":
+            continue
+        source_row = dict(row)
+        source_row.pop("event_id", None)
+        unified_source_rows.append(source_row)
+    unified_multiset = Counter(json.dumps(row, sort_keys=True, separators=(",", ":")) for row in unified_source_rows)
+    if source_multiset != unified_multiset:
+        errors.append("source-specific event multiset differs from the non-controller unified timeline")
 
     truth = json.loads((root / "ground-truth.json").read_text(encoding="utf-8"))
     if truth.get("outcome") != "semantic_capability_escape_succeeded":
@@ -206,6 +408,9 @@ def validate(root: Path) -> list[str]:
     interaction_counts: dict[str, int] = {}
     developer_placeholders = 0
     for row in interactions:
+        validation_errors = schema_errors(row, model_schema)
+        if validation_errors:
+            errors.append(f"model interaction {row.get('interaction_seq')} schema violation: {validation_errors[0]}")
         item = row.get("item", {})
         item_type = item.get("item_type")
         interaction_counts[item_type] = interaction_counts.get(item_type, 0) + 1

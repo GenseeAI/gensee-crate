@@ -1,22 +1,168 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gensee.ai/schemas/autonomous-ai-cross-boundary-capability-escape/v1/model-interaction.schema.json",
+  "title": "Public model-interaction record",
+  "description": "A strict schema for the complete retained client-side model stream. Each item matches exactly one of four item kinds.",
+  "type": "object",
   "additionalProperties": false,
+  "required": ["schema_version", "interaction_seq", "ts", "ts_offset_ms", "item"],
   "properties": {
-    "interaction_seq": {"minimum": 1, "type": "integer"},
+    "schema_version": {"const": "1.0", "x-provenance": "synthetic"},
+    "interaction_seq": {"type": "integer", "minimum": 1, "x-provenance": "synthetic"},
+    "ts": {"type": "string", "format": "date-time", "x-provenance": "derived"},
+    "ts_offset_ms": {"type": "integer", "minimum": 0, "x-provenance": "derived"},
     "item": {
-      "properties": {
-        "direction": {"enum": ["model_input", "model_output"]},
-        "item_id": {"type": ["string", "null"]},
-        "item_type": {"type": "string"}
-      },
-      "required": ["direction", "item_id", "item_type"],
-      "type": "object"
-    },
-    "schema_version": {"const": "1.0"},
-    "ts": {"format": "date-time", "type": "string"},
-    "ts_offset_ms": {"minimum": 0, "type": "integer"}
+      "oneOf": [
+        {"$ref": "#/$defs/messageItem"},
+        {"$ref": "#/$defs/reasoningItem"},
+        {"$ref": "#/$defs/toolCallItem"},
+        {"$ref": "#/$defs/toolOutputItem"}
+      ],
+      "x-provenance": "observed"
+    }
   },
-  "required": ["interaction_seq", "item", "schema_version", "ts", "ts_offset_ms"],
-  "title": "Sanitized client-observed model interaction",
-  "type": "object"
+  "$defs": {
+    "identifier": {"type": "string", "pattern": "^(?:item|call|turn)_[0-9a-f]{16}$"},
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turn_id"],
+      "dependentRequired": {
+        "create_ts": ["create_ts_offset_ms"],
+        "create_ts_offset_ms": ["create_ts"]
+      },
+      "properties": {
+        "turn_id": {"$ref": "#/$defs/identifier", "x-provenance": "derived"},
+        "create_ts": {"type": "string", "format": "date-time", "x-provenance": "derived"},
+        "create_ts_offset_ms": {"type": "integer", "minimum": 0, "x-provenance": "derived"}
+      }
+    },
+    "inputTextBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "text"],
+      "properties": {
+        "type": {"const": "input_text", "x-provenance": "observed"},
+        "text": {"type": "string", "x-provenance": "observed"}
+      }
+    },
+    "outputTextBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "text"],
+      "properties": {
+        "type": {"const": "output_text", "x-provenance": "observed"},
+        "text": {"type": "string", "x-provenance": "observed"}
+      }
+    },
+    "redactedContentBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "reason"],
+      "properties": {
+        "type": {"const": "redacted_content", "x-provenance": "synthetic"},
+        "reason": {"const": "built_in_harness_instruction", "x-provenance": "derived"}
+      }
+    },
+    "userMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "item_type", "direction", "role", "content", "metadata"],
+      "properties": {
+        "item_id": {"$ref": "#/$defs/identifier", "x-provenance": "derived"},
+        "item_type": {"const": "message", "x-provenance": "observed"},
+        "direction": {"const": "model_input", "x-provenance": "derived"},
+        "role": {"const": "user", "x-provenance": "observed"},
+        "content": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/inputTextBlock"}, "x-provenance": "observed"},
+        "metadata": {"$ref": "#/$defs/metadata", "x-provenance": "derived"}
+      }
+    },
+    "developerMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "item_type", "direction", "role", "content", "content_withheld", "metadata"],
+      "properties": {
+        "item_id": {"$ref": "#/$defs/identifier", "x-provenance": "derived"},
+        "item_type": {"const": "message", "x-provenance": "observed"},
+        "direction": {"const": "model_input", "x-provenance": "derived"},
+        "role": {"const": "developer", "x-provenance": "observed"},
+        "content": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/redactedContentBlock"}, "x-provenance": "synthetic"},
+        "content_withheld": {"const": true, "x-provenance": "derived"},
+        "metadata": {"$ref": "#/$defs/metadata", "x-provenance": "derived"}
+      }
+    },
+    "assistantMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "item_type", "direction", "role", "phase", "content", "metadata"],
+      "properties": {
+        "item_id": {"$ref": "#/$defs/identifier", "x-provenance": "derived"},
+        "item_type": {"const": "message", "x-provenance": "observed"},
+        "direction": {"const": "model_output", "x-provenance": "derived"},
+        "role": {"const": "assistant", "x-provenance": "observed"},
+        "phase": {"const": "commentary", "x-provenance": "observed"},
+        "content": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/outputTextBlock"}, "x-provenance": "observed"},
+        "metadata": {"$ref": "#/$defs/metadata", "x-provenance": "derived"}
+      }
+    },
+    "messageItem": {
+      "oneOf": [
+        {"$ref": "#/$defs/userMessage"},
+        {"$ref": "#/$defs/developerMessage"},
+        {"$ref": "#/$defs/assistantMessage"}
+      ]
+    },
+    "encryptedContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bytes", "published", "sha256"],
+      "properties": {
+        "bytes": {"type": "integer", "minimum": 0, "x-provenance": "derived"},
+        "published": {"const": false, "x-provenance": "synthetic"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "x-provenance": "derived"}
+      }
+    },
+    "reasoningItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "item_type", "direction", "reasoning_summary", "reasoning_summary_available", "encrypted_content", "metadata"],
+      "properties": {
+        "item_id": {"$ref": "#/$defs/identifier", "x-provenance": "derived"},
+        "item_type": {"const": "reasoning", "x-provenance": "observed"},
+        "direction": {"const": "model_output", "x-provenance": "derived"},
+        "reasoning_summary": {"type": "array", "maxItems": 0, "x-provenance": "observed"},
+        "reasoning_summary_available": {"const": false, "x-provenance": "derived"},
+        "encrypted_content": {"$ref": "#/$defs/encryptedContent", "x-provenance": "derived"},
+        "metadata": {"$ref": "#/$defs/metadata", "x-provenance": "derived"}
+      }
+    },
+    "toolCallItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "item_type", "direction", "call_id", "name", "status", "input", "metadata"],
+      "properties": {
+        "item_id": {"$ref": "#/$defs/identifier", "x-provenance": "derived"},
+        "item_type": {"const": "custom_tool_call", "x-provenance": "observed"},
+        "direction": {"const": "model_output", "x-provenance": "derived"},
+        "call_id": {"$ref": "#/$defs/identifier", "x-provenance": "derived"},
+        "name": {"const": "exec", "x-provenance": "observed"},
+        "status": {"const": "completed", "x-provenance": "observed"},
+        "input": {"type": "string", "x-provenance": "observed"},
+        "metadata": {"$ref": "#/$defs/metadata", "x-provenance": "derived"}
+      }
+    },
+    "toolOutputItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "item_type", "direction", "call_id", "output", "metadata"],
+      "properties": {
+        "item_id": {"$ref": "#/$defs/identifier", "x-provenance": "derived"},
+        "item_type": {"const": "custom_tool_call_output", "x-provenance": "observed"},
+        "direction": {"const": "model_input", "x-provenance": "derived"},
+        "call_id": {"$ref": "#/$defs/identifier", "x-provenance": "derived"},
+        "output": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/inputTextBlock"}, "x-provenance": "observed"},
+        "metadata": {"$ref": "#/$defs/metadata", "x-provenance": "derived"}
+      }
+    }
+  }
 }

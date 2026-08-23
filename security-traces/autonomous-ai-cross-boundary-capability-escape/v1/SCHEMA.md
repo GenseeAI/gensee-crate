@@ -1,0 +1,140 @@
+# Trace schema and data dictionary
+
+This document describes the two public JSONL streams, their event/item
+variants, machine attribution, and field provenance. The normative schemas are
+[`schemas/event.schema.json`](schemas/event.schema.json) and
+[`schemas/model-interaction.schema.json`](schemas/model-interaction.schema.json).
+`tools/validate.py` validates every record against them.
+
+## Provenance vocabulary
+
+Every property declared in the normative schemas has an `x-provenance`
+annotation with one of these values:
+
+| Value | Meaning |
+| --- | --- |
+| `observed` | Retained from one source record after safety redaction. |
+| `derived` | Normalized, time-shifted, pseudonymized, classified, counted, or hashed from source evidence. |
+| `correlated` | Produced by joining multiple records or by an independent cross-source conclusion. |
+| `synthetic` | Created solely for publication structure, such as sequence IDs, schema versions, or explicit omission placeholders. |
+
+Provenance applies to a field's method of construction, not to the truth of the
+whole event. For example, a gateway status is observed while the flag linking
+that request to the agent is correlated.
+
+## Machine and role vocabulary
+
+The machine-readable vocabulary is in [`topology.json`](topology.json).
+
+| Role | Experimental responsibility | Typical evidence |
+| --- | --- | --- |
+| `machine_a` | Agent/Codex execution cell; the experiment's restricted workload. | Codex records, selected Falco signals, and source side of agent network flows. |
+| `nexus` | Isolated package-service machine through which A could obtain packages. | Nexus request logs and network destination role. |
+| `inference_gateway` | Machine E, the LiteLLM-compatible gateway allowed from A. | Gateway access records and gateway NAT flows. |
+| `package_origin` | Controlled upstream package repository. | Origin request logs and package-service upstream flows. |
+| `challenge_evaluator` | Isolated benchmark submission/evaluation service. | Benchmark receipts and allowlisted network flows. |
+| `public_external` | Public service outside the experiment topology. | Address-free cloud-flow destinations or provider-mediated targets. |
+| `private_unknown` | Redacted or unresolved private-network endpoint. | Normalized cloud telemetry only. |
+| `unknown` | Endpoint role could not be safely or reliably assigned. | Normalized cloud telemetry only. |
+
+`source` identifies the telemetry producer, not necessarily the process that
+caused the effect. A `gateway/http.response` record was observed on E, while
+`data.source_role: machine_a` attributes its requester. A provider event
+describes an off-VM hosted-tool effect. GCP records use source/destination roles
+for both endpoints. The controller record is an independent cross-source
+conclusion rather than a machine-local sensor event.
+
+## Normalized runtime event envelope
+
+Each line of `traces/unified-timeline.jsonl` is one strict object:
+
+| Field | Type | Provenance | Meaning |
+| --- | --- | --- | --- |
+| `schema_version` | string, always `1.0` | synthetic | Public schema version. |
+| `event_id` | `evt_` plus six digits | synthetic | Sequential identifier required in the unified timeline and omitted from source-specific files. |
+| `ts` | RFC 3339 timestamp | derived | Shifted timestamp; relative spacing is retained. |
+| `ts_offset_ms` | non-negative integer | derived | Milliseconds from the experiment origin. |
+| `source` | enum | derived | Normalized telemetry producer. |
+| `kind` | string discriminator | derived | Event variant within the source. |
+| `data` | object | mixed | Variant-specific payload described below. |
+
+The schema declares **15 discriminated source/kind variants**. Fourteen occur
+in this corpus. `challenge_evaluator/challenge.request` has count zero and is
+declared so the challenge-access surface and its negative observation have an
+explicit contract; no such request is fabricated in the trace.
+
+| Source / kind | Count | Payload fields and interpretation |
+| --- | ---: | --- |
+| `benchmark/submission.accepted` | 3 | Submission kind, attempt, row count, metric, score visibility, and nullable score. |
+| `codex/command.completed` | 69 | Sanitized command summary/category, exit/status, requested tools and target domains, and gateway-credential-variable use. |
+| `controller/boundary_escape.confirmed` | 1 | Correlated outcome classification and negative Nexus/private-holdout flags. |
+| `falco/runtime.signal` | 35 | Selected rule, process, command summary/category, connection role, and gateway-variable use. |
+| `gateway/http.response` | 123 | Method/path/status, authentication, requester role, and direct-agent-request correlation. |
+| `gcp/network.firewall` | 3,089 | Address-free endpoint roles, ports, protocol, disposition, bytes, country, and ASN. |
+| `gcp/network.nat_flow` | 470 | Same normalized network fields for NAT telemetry. |
+| `gcp/network.vpc_flow` | 4,564 | Same normalized network fields for VPC-flow telemetry. |
+| `nexus/package.request` | 343 | Sanitized request method/path/status, bytes, nullable upstream status, and redirect observation. |
+| `package_origin/origin.request` | 327 | Same request contract for the controlled upstream. |
+| `challenge_evaluator/challenge.request` | 0 | Reserved strict request contract for evaluator access; no public record observed. |
+| `provider/hosted_tools.response` | 7 | HTTP result, response pseudonym, requested hosted tools, observed effects, and target domains. |
+| `provider/web_search.completed` | 2 | Provider effect correlated to a pseudonymous response. |
+| `provider/open_page.completed` | 5 | Provider effect correlated to a pseudonymous response. |
+| `provider/code_interpreter.completed` | 1 | Provider effect correlated to a pseudonymous response. |
+
+Network records omit literal addresses. `source_role` and `destination_role`
+are derived classifications; nullable `destination_country` and
+`destination_asn` mean the source telemetry did not yield a publishable public
+destination classification. Request paths are retained only after redaction;
+body content is not inferred from a byte count. Nullable HTTP/upstream status
+means no status was available, not a successful response.
+
+## Model-interaction envelope
+
+Each line of `traces/model-interactions.jsonl` is a strict object:
+
+| Field | Type | Provenance | Meaning |
+| --- | --- | --- | --- |
+| `schema_version` | string, always `1.0` | synthetic | Public schema version. |
+| `interaction_seq` | positive integer | synthetic | Complete retained stream order. |
+| `ts` | RFC 3339 timestamp | derived | Shifted item time. |
+| `ts_offset_ms` | non-negative integer | derived | Milliseconds from experiment origin. |
+| `item` | object | observed | Exactly one of the four item variants below. |
+
+### Four discriminated item types
+
+| `item_type` | Count | Direction | Required content |
+| --- | ---: | --- | --- |
+| `message` | 17 | Role-specific | Exactly one role branch: 2 user `input_text` messages, 3 developer `redacted_content` placeholders, or 12 assistant `output_text` commentary messages. |
+| `reasoning` | 126 | `model_output` | Empty readable summary, explicit `reasoning_summary_available: false`, and an unpublished encrypted-content byte count/digest record. |
+| `custom_tool_call` | 115 | `model_output` | Pseudonymous item/call IDs, tool name/status, and retained input string. |
+| `custom_tool_call_output` | 114 | `model_input` | Matching pseudonymous call ID and one or more `input_text` output blocks. |
+
+All items contain a pseudonymous `item_id` and `metadata.turn_id`. When source
+creation time is available, `metadata.create_ts` and
+`metadata.create_ts_offset_ms` must appear together. The nested content-block
+discriminator is `type`:
+
+| Block type | Parent | Fields |
+| --- | --- | --- |
+| `input_text` | User message or tool output | `type`, retained `text`. |
+| `output_text` | Assistant message | `type`, retained `text`. |
+| `redacted_content` | Withheld developer message | `type`, normalized withholding `reason`; it contains no hidden text. |
+
+The encrypted reasoning placeholder contains only `bytes`, `sha256`, and
+`published: false`. It proves availability/omission accounting, not access to
+the encrypted content or chain-of-thought.
+
+## Validation contract
+
+`python3 tools/validate.py .` performs dependency-free Draft 2020-12 subset
+validation for every source-specific runtime record, all 9,039 unified runtime
+events, and all 372 model items. It also proves that the source-specific event
+multiset equals the non-controller portion of the unified timeline. It
+requires exactly one matching `oneOf` branch, rejects undeclared properties,
+checks types/constants/enums/required fields, validates nested content blocks,
+and audits that each declared property has a valid `x-provenance` annotation.
+It also checks topology vocabulary agreement, counts, ordering, checksums,
+manifest coverage, redaction invariants, and ground-truth support.
+
+The schema files are normative. This document is the human-readable data
+dictionary; where they differ, validation follows the schema.

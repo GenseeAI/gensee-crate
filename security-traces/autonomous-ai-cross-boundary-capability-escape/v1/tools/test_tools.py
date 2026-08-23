@@ -11,6 +11,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+import validate as trace_validate  # noqa: E402
 
 
 class ToolTests(unittest.TestCase):
@@ -23,6 +25,24 @@ class ToolTests(unittest.TestCase):
     def test_validate(self) -> None:
         result = self.run_tool("tools/validate.py", ".")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_event_schema_rejects_wrong_discriminator_payload(self) -> None:
+        schema = json.loads((ROOT / "schemas/event.schema.json").read_text())
+        event = json.loads((ROOT / "traces/unified-timeline.jsonl").read_text().splitlines()[0])
+        event["data"]["not_a_declared_field"] = True
+        self.assertTrue(trace_validate.schema_errors(event, schema))
+
+    def test_model_schema_rejects_wrong_nested_block(self) -> None:
+        schema = json.loads((ROOT / "schemas/model-interaction.schema.json").read_text())
+        records = [json.loads(line) for line in (ROOT / "traces/model-interactions.jsonl").read_text().splitlines()]
+        message = next(row for row in records if row["item"]["item_type"] == "message" and row["item"]["role"] == "user")
+        message["item"]["content"][0]["type"] = "output_text"
+        self.assertTrue(trace_validate.schema_errors(message, schema))
+
+    def test_schema_properties_have_provenance(self) -> None:
+        for name in ("event.schema.json", "model-interaction.schema.json"):
+            schema = json.loads((ROOT / "schemas" / name).read_text())
+            self.assertEqual(trace_validate.schema_definition_errors(schema), [])
 
     def test_replay_count(self) -> None:
         result = self.run_tool("tools/replay.py", "traces/unified-timeline.jsonl")
