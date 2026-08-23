@@ -365,7 +365,12 @@ fn attribute_falco_event_to_tclone(
                 .get("output_fields")
                 .and_then(|fields| falco_string(fields, &["container.name"]))
         });
-    let matched = records.iter().rev().find(|record| {
+    // Tclone's operation cgroup is deliberately named from the operation id.
+    // With the Falco container plugin that identity can appear as the
+    // 12-character `container.id` (for example `source_b722d`) rather than the
+    // Podman container id.  Accept either identity, but only when it resolves
+    // to one current run.  Ambiguous truncated prefixes stay unattributed.
+    let mut candidates = records.iter().rev().filter(|record| {
         container_name
             .as_deref()
             .is_some_and(|name| name == record.container_name)
@@ -374,8 +379,13 @@ fn attribute_falco_event_to_tclone(
                     .container_id
                     .as_deref()
                     .is_some_and(|known| container_ids_match(id, known))
+                    || record
+                        .operation_id
+                        .as_deref()
+                        .is_some_and(|known| container_ids_match(id, known))
             })
     });
+    let matched = candidates.next().filter(|_| candidates.next().is_none());
 
     if let Some(record) = matched {
         let object = value.as_object_mut().ok_or_else(|| {
@@ -574,6 +584,48 @@ mod tests {
         assert_eq!(attributed["session_id"], "run_fork_1");
         assert_eq!(attributed["tclone_role"], "fork");
         assert_eq!(attributed["tclone_parent_run_id"], "run_source_1");
+    }
+
+    #[test]
+    fn attributes_tclone_operation_cgroup_identity_to_unique_run() {
+        let (mut event, mut raw) = system_event_and_value_from_falco_line(
+            r#"{"output_fields":{"evt.type":"execve","container.id":"source_b722d"}}"#,
+            1,
+            None,
+        )
+        .unwrap();
+        let mut record = tclone_record(None, "gensee-tclone-src-run-source-1");
+        record.run_id = "run_source_1".to_string();
+        record.role = "source".to_string();
+        record.parent_run_id = None;
+        record.operation_id = Some("source_b722d80f-e024-43f0-b5d8-d20ad844f783".to_string());
+
+        attribute_falco_event_to_tclone(&mut event, &mut raw, &[record]).unwrap();
+
+        let attributed = serde_json::from_str::<Value>(&event.raw_json).unwrap();
+        assert_eq!(attributed["session_id"], "run_source_1");
+        assert_eq!(attributed["tclone_role"], "source");
+        assert_eq!(attributed["tclone_parent_run_id"], Value::Null);
+    }
+
+    #[test]
+    fn ambiguous_tclone_operation_cgroup_identity_stays_unattributed() {
+        let (mut event, mut raw) = system_event_and_value_from_falco_line(
+            r#"{"output_fields":{"evt.type":"execve","container.id":"source_b722d"}}"#,
+            1,
+            None,
+        )
+        .unwrap();
+        let mut first = tclone_record(None, "one");
+        first.operation_id = Some("source_b722d80f-e024-43f0-b5d8-d20ad844f783".to_string());
+        let mut second = tclone_record(None, "two");
+        second.run_id = "run_fork_2".to_string();
+        second.operation_id = Some("source_b722d999-1111-2222-3333-444444444444".to_string());
+
+        attribute_falco_event_to_tclone(&mut event, &mut raw, &[first, second]).unwrap();
+
+        let attributed = serde_json::from_str::<Value>(&event.raw_json).unwrap();
+        assert!(attributed.get("session_id").is_none());
     }
 
     #[test]
