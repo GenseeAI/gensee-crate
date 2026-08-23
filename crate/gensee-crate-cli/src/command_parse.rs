@@ -361,7 +361,7 @@ pub(crate) fn build_hook_event_with_tclone_context(
 ) -> io::Result<AgentHookEvent> {
     let observed_at_ms = unix_millis()?;
 
-    let Some(value) = serde_json::from_str::<Value>(payload)
+    let Some(mut value) = serde_json::from_str::<Value>(payload)
         .ok()
         .map(|mut value| {
             redact_value(&mut value);
@@ -389,6 +389,12 @@ pub(crate) fn build_hook_event_with_tclone_context(
             raw_json: redact_text(payload),
         });
     };
+    let run_id = tclone_context_run_id
+        .map(ToString::to_string)
+        .or_else(current_tclone_context_run_id)
+        .or_else(|| env::var("GENSEE_RUN_ID").ok())
+        .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok());
+    record_hook_run_id(&mut value, run_id.as_deref());
 
     if provider == PROVIDER_ANTIGRAVITY {
         return build_antigravity_hook_event(value, observed_at_ms, tclone_context_run_id);
@@ -439,6 +445,24 @@ pub(crate) fn build_hook_event_with_tclone_context(
         observed_at_ms,
         raw_json: serde_json::to_string(&value).map_err(io::Error::other)?,
     })
+}
+
+fn record_hook_run_id(value: &mut Value, run_id: Option<&str>) {
+    let Some(run_id) = run_id.filter(|run_id| !run_id.trim().is_empty()) else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let gensee = object.entry("gensee").or_insert_with(|| json!({}));
+    if let Some(gensee) = gensee.as_object_mut() {
+        gensee.insert("run_id".to_string(), Value::String(run_id.to_string()));
+    } else {
+        object.insert(
+            "gensee_run_id".to_string(),
+            Value::String(run_id.to_string()),
+        );
+    }
 }
 
 fn build_antigravity_hook_event(

@@ -1,0 +1,16 @@
+[Unit]
+Description=Gensee Falco system-event collector for Machine A
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=GENSEE_HOME=/home/yiying_gensee_ai/.gensee
+ExecStartPre=/sbin/modprobe falco
+ExecStart=/opt/falco-0.44.1/usr/bin/falco -c /etc/falco/gensee-machine-a.yaml -r /etc/falco/gensee-machine-a-rules.yaml
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

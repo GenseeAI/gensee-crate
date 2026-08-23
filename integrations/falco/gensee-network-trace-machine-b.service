@@ -1,0 +1,14 @@
+[Unit]
+Description=Bounded packet-metadata trace for the Artifactory escape lab
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/install -d -o tcpdump -g adm -m 0750 /var/log/gensee-lab-network
+ExecStart=/usr/bin/tcpdump -i any -nn -U -s 96 -C 16 -W 8 -w /var/log/gensee-lab-network/artifactory.pcap tcp and ( host 10.40.0.2 or port 8082 )
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

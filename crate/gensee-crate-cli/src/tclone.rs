@@ -60,7 +60,10 @@ const TCLONE_HOST_TMUX_RUN_OPTION: &str = "@gensee_run_id";
 const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
 const TCLONE_WAIT_QUIET_FOR_FORK_ENV: &str = "GENSEE_TCLONE_WAIT_QUIET_FOR_FORK";
 const TCLONE_FORK_TIMING_ENV: &str = "GENSEE_TCLONE_FORK_TIMING";
+const TCLONE_NETWORK_ENV: &str = "GENSEE_TCLONE_NETWORK";
+const TCLONE_FORWARD_ENV_ENV: &str = "GENSEE_TCLONE_FORWARD_ENV";
 const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
+const TCLONE_CONTAINER_GENSEE_PATH: &str = "/usr/local/bin/gensee";
 const TCLONE_NODE_MOUNT_PATH: &str = "/opt/gensee-host-node";
 const TCLONE_NODE_BIN_MOUNT_PATH: &str = "/opt/gensee-host-node-bin";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
@@ -179,6 +182,8 @@ pub(crate) struct TcloneRunRecord {
     pub(crate) container_workspace: String,
     pub(crate) container_home: String,
     pub(crate) agent_cmd: Vec<String>,
+    #[serde(default)]
+    pub(crate) path_prefixes: Vec<String>,
     #[serde(default)]
     pub(crate) fork_base_git_head: Option<String>,
     #[serde(default)]
@@ -4012,7 +4017,8 @@ fn run_tclone_agent_inner(
     )?;
     if let Ok(current_exe) = env::current_exe() {
         if current_exe.exists() {
-            let destination = seed_root.join("usr/local/bin/gensee");
+            let destination =
+                seed_root.join(container_relative_path(TCLONE_CONTAINER_GENSEE_PATH)?);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -4056,6 +4062,18 @@ fn run_tclone_agent_inner(
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
+    if let Some(network) = tclone_network()? {
+        create_args.push(OsString::from("--network"));
+        create_args.push(OsString::from(network));
+    }
+    for name in tclone_forward_env_names()? {
+        if env::var_os(&name).is_some() {
+            // Passing only the name asks Podman to copy the value from its
+            // environment without placing credentials in the process argv.
+            create_args.push(OsString::from("-e"));
+            create_args.push(OsString::from(name));
+        }
+    }
     if let Some(host_observer_socket) = host_observer_socket {
         create_args.push(OsString::from("-v"));
         create_args.push(OsString::from(format!(
@@ -4123,13 +4141,6 @@ fn run_tclone_agent_inner(
             "CARGO_HOME={container_home}/.cargo"
         )));
     }
-    if !path_prefixes.is_empty() {
-        create_args.push(OsString::from("-e"));
-        create_args.push(OsString::from(format!(
-            "PATH={}",
-            tclone_container_path(&path_prefixes)
-        )));
-    }
     create_args.push(OsString::from(&image));
     create_args.push(OsString::from("idle"));
     let agent_cmd_strings = container_agent_cmd
@@ -4147,7 +4158,11 @@ fn run_tclone_agent_inner(
         &run_id,
     )?;
     let output = run_command_capture(&podman, &create_args)?;
-    let container_id = output.lines().next().map(str::trim).map(str::to_string);
+    let container_id = output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.len() >= 12 && line.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_string);
     let cleanup_guard = TcloneContainerCleanup::new(&podman, &source_container);
     let source_record = TcloneRunRecord {
         run_id: run_id.clone(),
@@ -4171,6 +4186,7 @@ fn run_tclone_agent_inner(
         container_workspace: container_workspace.clone(),
         container_home: container_home.clone(),
         agent_cmd: agent_cmd_strings.clone(),
+        path_prefixes: path_prefixes.clone(),
         fork_base_git_head: None,
         fork_base_overlay_lowerdir: None,
         fork_overlay_upperdir: None,
@@ -4192,7 +4208,12 @@ fn run_tclone_agent_inner(
     let root_pid = inspect_container_pid(&podman, &source_container)?;
     source_operation.activate(root_pid)?;
     write_tclone_run_context(&podman, &source_record)?;
-    start_tclone_agent_session(&podman, &source_container, &container_agent_cmd)?;
+    start_tclone_agent_session(
+        &podman,
+        &source_container,
+        &container_agent_cmd,
+        &path_prefixes,
+    )?;
     let _container_file_control = if env_flag(TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV) {
         Some(TcloneContainerFileControlServer::start(
             &podman,
@@ -4516,6 +4537,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                     container_workspace: source.container_workspace.clone(),
                     container_home: source.container_home.clone(),
                     agent_cmd: source.agent_cmd.clone(),
+                    path_prefixes: source.path_prefixes.clone(),
                     fork_base_git_head: fork_base_git_head.clone(),
                     fork_base_overlay_lowerdir: overlay_layers
                         .as_ref()
@@ -5651,7 +5673,7 @@ pub(crate) fn tclone_run_exec(args: Vec<OsString>) -> io::Result<()> {
         .arg(&record.container_workspace)
         .args(tclone_run_exec_env_args(&record))
         .arg(&record.container_name)
-        .args(command_args);
+        .args(tclone_run_exec_command_args(&record, command_args));
     if exec_json {
         let output = command.output()?;
         println!(
@@ -5771,6 +5793,23 @@ fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
         ]
     })
     .collect()
+}
+
+fn tclone_run_exec_command_args(
+    record: &TcloneRunRecord,
+    command_args: &[OsString],
+) -> Vec<OsString> {
+    let mut wrapped = vec![
+        OsString::from("sh"),
+        OsString::from("-c"),
+        OsString::from(format!(
+            "{}; exec \"$@\"",
+            tclone_path_export(&record.path_prefixes)
+        )),
+        OsString::from("gensee-run-exec"),
+    ];
+    wrapped.extend_from_slice(command_args);
+    wrapped
 }
 
 fn tclone_run_context_payload(record: &TcloneRunRecord, capability: &str) -> Value {
@@ -10074,7 +10113,7 @@ fn find_tclone_record(target: &str) -> io::Result<TcloneRunRecord> {
         })
 }
 
-fn tclone_state_path() -> io::Result<PathBuf> {
+pub(crate) fn tclone_state_path() -> io::Result<PathBuf> {
     Ok(default_root()?.join("tclone-runs.jsonl"))
 }
 
@@ -10168,21 +10207,30 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
     }
 }
 
-fn tclone_agent_start_script(agent_cmd: &[OsString]) -> String {
+fn tclone_agent_start_script(agent_cmd: &[OsString], path_prefixes: &[String]) -> String {
     let command = shell_join(agent_cmd);
+    let path_export = tclone_path_export(path_prefixes);
+    let pane_command = format!("{path_export}; exec {command}");
     format!(
-        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\nagent_pid=$!\nsleep 2\nif ! kill -0 \"$agent_pid\" 2>/dev/null; then\n  printf 'gensee agent exited during startup\\n' >> \"$log\"\n  cat \"$log\" >&2\n  exit 127\nfi\nprintf 'gensee agent started without tmux pid=%s\\n' \"$agent_pid\" >> \"$log\"\n",
+        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\n{path_export}\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\nagent_pid=$!\nsleep 2\nif ! kill -0 \"$agent_pid\" 2>/dev/null; then\n  printf 'gensee agent exited during startup\\n' >> \"$log\"\n  cat \"$log\" >&2\n  exit 127\nfi\nprintf 'gensee agent started without tmux pid=%s\\n' \"$agent_pid\" >> \"$log\" 2>&1\n",
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
-        shell_quote(&format!("exec {command}")),
+        shell_quote(&pane_command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
-        shell_quote(&format!("exec {command}"))
+        shell_quote(&pane_command)
+    )
+}
+
+fn tclone_path_export(toolchain_paths: &[String]) -> String {
+    format!(
+        "export PATH={}:\"${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}\"",
+        shell_quote(&tclone_container_path_prefix(toolchain_paths))
     )
 }
 
@@ -10190,8 +10238,9 @@ fn start_tclone_agent_session(
     podman: &OsString,
     container_name: &str,
     agent_cmd: &[OsString],
+    path_prefixes: &[String],
 ) -> io::Result<()> {
-    let script = tclone_agent_start_script(agent_cmd);
+    let script = tclone_agent_start_script(agent_cmd, path_prefixes);
     let status = Command::new(podman)
         .arg("exec")
         .arg(container_name)
@@ -10222,14 +10271,9 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn tclone_container_path(toolchain_paths: &[String]) -> String {
-    let mut entries = vec!["/usr/local/sbin".to_string(), "/usr/local/bin".to_string()];
+fn tclone_container_path_prefix(toolchain_paths: &[String]) -> String {
+    let mut entries = vec!["/usr/libexec".to_string()];
     entries.extend(toolchain_paths.iter().cloned());
-    entries.extend(
-        ["/usr/sbin", "/usr/bin", "/sbin", "/bin"]
-            .into_iter()
-            .map(str::to_string),
-    );
     entries.join(":")
 }
 
@@ -10341,7 +10385,7 @@ fn rewrite_tclone_codex_hooks(
     };
 
     let gensee_home = PathBuf::from(format!("{container_home}/.gensee"));
-    let command = codex_hook_command(&gensee_home, Path::new("/usr/local/bin/gensee"));
+    let command = codex_hook_command(&gensee_home, Path::new(TCLONE_CONTAINER_GENSEE_PATH));
     apply_codex_hook_settings(&mut root, &command)?;
 
     if let Some(parent) = hooks_path.parent() {
@@ -10380,7 +10424,7 @@ fn install_tclone_host_path_compatibility(
                 ),
             )
         })?)?;
-        symlink_or_copy_marker("/usr/local/bin/gensee", &seed_gensee)?;
+        symlink_or_copy_marker(TCLONE_CONTAINER_GENSEE_PATH, &seed_gensee)?;
     }
     Ok(())
 }
@@ -10598,6 +10642,74 @@ fn tclone_podman() -> OsString {
     env::var_os("GENSEE_TCLONE_PODMAN")
         .or_else(|| env::var_os("PODMAN_TFORK"))
         .unwrap_or_else(|| OsString::from("podman"))
+}
+
+fn tclone_network() -> io::Result<Option<String>> {
+    let Some(value) = env::var_os(TCLONE_NETWORK_ENV) else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{TCLONE_NETWORK_ENV} must be valid UTF-8"),
+        )
+    })?;
+    parse_tclone_network(&value)
+}
+
+fn parse_tclone_network(value: &str) -> io::Result<Option<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{TCLONE_NETWORK_ENV} contains unsupported characters: {value}"),
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn tclone_forward_env_names() -> io::Result<Vec<String>> {
+    let Some(value) = env::var_os(TCLONE_FORWARD_ENV_ENV) else {
+        return Ok(Vec::new());
+    };
+    let value = value.into_string().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{TCLONE_FORWARD_ENV_ENV} must be valid UTF-8"),
+        )
+    })?;
+    parse_tclone_forward_env_names(&value)
+}
+
+fn parse_tclone_forward_env_names(value: &str) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for raw in value.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let mut bytes = name.bytes();
+        let valid_start = bytes
+            .next()
+            .map(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            .unwrap_or(false);
+        if !valid_start || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{TCLONE_FORWARD_ENV_ENV} contains invalid environment name: {name}"),
+            ));
+        }
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
 }
 
 fn tclone_host_observer_socket(gensee_home: &Path) -> Option<PathBuf> {
@@ -10984,6 +11096,7 @@ mod tests {
             container_workspace: "/workspace".to_string(),
             container_home: "/home/gensee".to_string(),
             agent_cmd: vec!["codex".to_string()],
+            path_prefixes: Vec::new(),
             fork_base_git_head: None,
             fork_base_overlay_lowerdir: None,
             fork_overlay_upperdir: None,
@@ -12449,15 +12562,38 @@ mod tests {
         let _guard = tclone_test_env_lock();
         let root = temp_tree("run-context-override");
         let context_path = root.join("context.json");
-        fs::write(&context_path, r#"{"run_id":"override-run"}"#).unwrap();
+        fs::write(
+            &context_path,
+            r#"{"run_id":"override-run","role":"source"}"#,
+        )
+        .unwrap();
         let old_context = env::var_os("GENSEE_TCLONE_CONTEXT_PATH");
+        let old_run_id = env::var_os("GENSEE_RUN_ID");
         env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+        env::set_var("GENSEE_RUN_ID", "stale-source-run");
 
         assert_eq!(read_tclone_run_context().unwrap()["run_id"], "override-run");
+        assert_eq!(
+            current_tclone_context_run_id().as_deref(),
+            Some("override-run")
+        );
+        let hook = build_hook_event(
+            r#"{"session_id":"agent-session","hook_event_name":"PreToolUse"}"#,
+            PROVIDER_CODEX,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&hook.raw_json).unwrap()["gensee"]["run_id"],
+            "override-run"
+        );
 
         match old_context {
             Some(value) => env::set_var("GENSEE_TCLONE_CONTEXT_PATH", value),
             None => env::remove_var("GENSEE_TCLONE_CONTEXT_PATH"),
+        }
+        match old_run_id {
+            Some(value) => env::set_var("GENSEE_RUN_ID", value),
+            None => env::remove_var("GENSEE_RUN_ID"),
         }
         fs::remove_dir_all(root).ok();
     }
@@ -12612,12 +12748,12 @@ mod tests {
         let hook = TcloneQuietProcess {
             pid: 2171,
             stat: "S".to_string(),
-            command: "/usr/local/bin/gensee hook codex".to_string(),
+            command: format!("{TCLONE_CONTAINER_GENSEE_PATH} hook codex"),
         };
         let status = TcloneQuietProcess {
             pid: 2172,
             stat: "S".to_string(),
-            command: "/usr/local/bin/gensee run fork-status job_1 --json".to_string(),
+            command: format!("{TCLONE_CONTAINER_GENSEE_PATH} run fork-status job_1 --json"),
         };
 
         assert!(!tclone_is_transient_fork_process(&hook));
@@ -13742,6 +13878,34 @@ gensee async job job_1: exited status=0
         assert!(env_args.contains(&OsString::from("GENSEE_RUN_ID=run_1_fork_0")));
         assert!(env_args.contains(&OsString::from("AGENT_SHIELD_SESSION_ID=run_1_fork_0")));
         assert!(env_args.contains(&OsString::from("GENSEE_WORKSPACE=/workspace")));
+        assert!(!env_args
+            .iter()
+            .any(|arg| { arg.to_str().is_some_and(|value| value.starts_with("PATH=")) }));
+    }
+
+    #[test]
+    fn tclone_run_exec_prepends_gensee_without_clobbering_image_path() {
+        let mut record = test_record("run_1", "running");
+        record.path_prefixes = vec![
+            "/opt/host-node/bin".to_string(),
+            "/opt/host-cargo/bin".to_string(),
+        ];
+        let command_args = vec![
+            OsString::from("gensee"),
+            OsString::from("run"),
+            OsString::from("summary"),
+        ];
+
+        let wrapped = tclone_run_exec_command_args(&record, &command_args);
+
+        assert_eq!(wrapped[0], "sh");
+        assert_eq!(wrapped[1], "-c");
+        let script = wrapped[2].to_string_lossy();
+        assert!(script.contains(
+            "export PATH='/usr/libexec:/opt/host-node/bin:/opt/host-cargo/bin':\"${PATH:-"
+        ));
+        assert!(script.contains("exec \"$@\""));
+        assert_eq!(&wrapped[4..], command_args.as_slice());
     }
 
     #[test]
@@ -14081,17 +14245,23 @@ gensee async job job_1: exited status=0
 
     #[test]
     fn tclone_agent_start_script_wraps_command_in_tmux_when_available() {
-        let script = tclone_agent_start_script(&[
-            OsString::from("codex"),
-            OsString::from("--prompt"),
-            OsString::from("don't panic"),
-        ]);
+        let script = tclone_agent_start_script(
+            &[
+                OsString::from("codex"),
+                OsString::from("--prompt"),
+                OsString::from("don't panic"),
+            ],
+            &["/opt/host-node/bin".to_string()],
+        );
 
         assert!(script.contains("tmux new-session -d -s 'gensee-agent'"));
         assert!(script.contains("codex"));
         assert!(script.contains("--prompt"));
         assert!(script.contains("don"));
         assert!(script.contains("panic"));
+        assert!(script
+            .contains("export PATH='/usr/libexec:/opt/host-node/bin':\"${PATH:-/usr/local/sbin"));
+        assert!(script.matches("/usr/libexec:/opt/host-node/bin").count() >= 2);
         assert!(script.contains("exit 0"));
         assert!(!script.contains("exec sleep infinity"));
         assert!(!script.contains("while :; do"));
@@ -14099,16 +14269,17 @@ gensee async job job_1: exited status=0
 
     #[test]
     fn tclone_container_path_prefers_container_local_gensee() {
-        let path = tclone_container_path(&[
+        let path = tclone_container_path_prefix(&[
             "/home/yiying/.nvm/versions/node/v24.18.0/bin".to_string(),
             "/home/yiying/.cargo/bin".to_string(),
         ]);
         let entries = path.split(':').collect::<Vec<_>>();
 
-        assert_eq!(entries[0], "/usr/local/sbin");
-        assert_eq!(entries[1], "/usr/local/bin");
+        assert_eq!(entries[0], "/usr/libexec");
+        assert_eq!(entries[1], "/home/yiying/.nvm/versions/node/v24.18.0/bin");
+        assert_eq!(entries[2], "/home/yiying/.cargo/bin");
         assert!(
-            entries.iter().position(|entry| *entry == "/usr/local/bin")
+            entries.iter().position(|entry| *entry == "/usr/libexec")
                 < entries
                     .iter()
                     .position(|entry| *entry == "/home/yiying/.cargo/bin")
@@ -14219,7 +14390,9 @@ gensee async job job_1: exited status=0
 
         assert!(seed.join("home/gensee/.codex/hooks.json").exists());
         let hooks = fs::read_to_string(seed.join("home/gensee/.codex/hooks.json")).unwrap();
-        assert!(hooks.contains("GENSEE_HOME=/home/gensee/.gensee /usr/local/bin/gensee hook codex"));
+        assert!(hooks.contains(&format!(
+            "GENSEE_HOME=/home/gensee/.gensee {TCLONE_CONTAINER_GENSEE_PATH} hook codex"
+        )));
         assert!(!hooks.contains("/home/yiying/.cargo/bin/gensee hook codex"));
         assert_eq!(
             fs::read_link(seed.join(host_home.strip_prefix("/").unwrap())).unwrap(),
@@ -14237,7 +14410,7 @@ gensee async job job_1: exited status=0
                 )
             )
             .unwrap(),
-            PathBuf::from("/usr/local/bin/gensee")
+            PathBuf::from(TCLONE_CONTAINER_GENSEE_PATH)
         );
         assert_eq!(
             fs::read_link(seed.join(gensee_home.strip_prefix("/").unwrap())).unwrap(),
@@ -14681,6 +14854,25 @@ gensee async job job_1: exited status=0
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 
         fs::remove_dir_all(run_root).ok();
+    }
+
+    #[test]
+    fn tclone_runtime_options_parse_network_and_forwarded_environment() {
+        assert_eq!(parse_tclone_network(" host ").unwrap(), Some("host".into()));
+        assert_eq!(
+            parse_tclone_network("bridge:lab_1").unwrap(),
+            Some("bridge:lab_1".into())
+        );
+        assert_eq!(parse_tclone_network("  ").unwrap(), None);
+        assert!(parse_tclone_network("host --privileged").is_err());
+
+        assert_eq!(
+            parse_tclone_forward_env_names("LITELLM_API_KEY, ARTIFACTORY_URL,LITELLM_API_KEY")
+                .unwrap(),
+            vec!["LITELLM_API_KEY", "ARTIFACTORY_URL"]
+        );
+        assert!(parse_tclone_forward_env_names("OK,BAD-NAME").is_err());
+        assert!(parse_tclone_forward_env_names("1BAD").is_err());
     }
 
     #[test]
