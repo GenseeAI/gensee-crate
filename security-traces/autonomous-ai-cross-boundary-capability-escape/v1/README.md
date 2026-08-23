@@ -143,7 +143,8 @@ metadata rather than unavailable reasoning text.
 The first two client-printed provider responses also contained nested encrypted
 reasoning values. Those 21 copies are replaced by the same byte-count/digest
 omission records; encoded internal container/deployment identifiers are
-pseudonymized and the gateway safety identifier is withheld.
+pseudonymized, raw hosted-tool item identifiers are replaced with stable public
+identifiers, and the gateway safety identifier is withheld.
 
 The complete unredacted forensic archive—bounded journals, raw SCAP, cloud
 exports, service evidence, and source bundles—is retained in private,

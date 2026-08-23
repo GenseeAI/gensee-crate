@@ -136,8 +136,8 @@ the encrypted content or chain-of-thought.
 The same omission contract applies when encrypted reasoning appeared inside a
 client-printed provider response: the nested value is replaced by a
 `bytes`/`sha256`/`published` object. Encoded internal container/deployment IDs
-are deterministically pseudonymized, and the gateway safety identifier is
-withheld.
+and raw hosted-tool item IDs are deterministically pseudonymized, and the
+gateway safety identifier is withheld.
 
 ## Detector alert schema
 
@@ -174,6 +174,12 @@ checks types/constants/enums/required fields, validates nested content blocks,
 and audits that each declared property has a valid `x-provenance` annotation.
 It also checks topology vocabulary agreement, counts, ordering, checksums,
 manifest coverage, redaction invariants, and ground-truth support.
+For retained provider payloads it rejects raw hosted-tool/container identifier
+shapes without assuming an encoding, rejects any string-valued nested
+`encrypted_content`, and reconciles all 21 nested omission records with the
+redaction ledger. It also requires the exact provider-effect inventory and a
+one-to-one, status- and time-bounded join between the seven direct Responses
+gateway events and seven hosted-tool response observations.
 
 The schema files are normative. This document is the human-readable data
 dictionary; where they differ, validation follows the schema.

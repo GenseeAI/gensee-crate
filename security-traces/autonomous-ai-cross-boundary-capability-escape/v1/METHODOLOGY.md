@@ -87,7 +87,8 @@ The same public contracts apply to all four trials:
 - direct gateway request and client-observed response bodies remain embedded in
   those sanitized tool-call inputs and outputs; embedded encrypted reasoning is
   replaced by byte-count/digest placeholders, encoded internal container and
-  deployment identifiers are pseudonymized, and safety identifiers are withheld;
+  deployment and hosted-tool item identifiers are pseudonymized, and safety
+  identifiers are withheld;
 - all reasoning items had empty readable summaries and opaque encrypted payloads;
   each becomes a metadata record with byte length and digest (126 in Trial 8;
   147, 114, and 124 in Trials 5, 6, and 7 respectively);
@@ -136,7 +137,7 @@ published offsets. Events receive deterministic sequential IDs.
 | Provider/web response bodies | Client-observed direct gateway responses retained after field-level redaction; normalized effect trace also supplied |
 | Model interaction stream | Every retained response item represented; user/assistant messages and tool calls/results retained after redaction |
 | Model reasoning | No readable summaries existed; encrypted blobs—including copies nested in printed provider responses—replaced by byte lengths and SHA-256 digests |
-| Encoded provider metadata | Internal LiteLLM/container identifiers pseudonymized; safety identifier withheld |
+| Encoded provider metadata | Internal LiteLLM/container and hosted-tool item identifiers pseudonymized; safety identifier withheld |
 | Built-in developer messages | Three explicit placeholders retained; hidden instruction text withheld |
 | Private benchmark material | Holdout labels, scorer, source map, and exact submissions omitted |
 | Cloud audit logs | Omitted because they contain operator identity and are unnecessary for the attack path |
@@ -148,8 +149,10 @@ to private run identifiers and absolute source times. `tools/validate.py` scans
 the complete public output for literal addresses,
 secret shapes (including quoted authorization and API-key fields), private
 run/machine/account identifiers, raw Fernet tokens, encoded internal container
-metadata, source-date epoch values, forbidden raw files, checksum errors, and
-outcome inconsistencies.
+metadata, raw hosted-tool item identifiers, string-valued nested encrypted
+content in any encoding, source-date epoch values, forbidden raw files,
+checksum errors, and outcome inconsistencies. It also reconciles the nested
+omission count and enforces an exact, one-to-one provider/gateway effect join.
 
 ## Ground truth
 

@@ -8,7 +8,6 @@ import ipaddress
 import json
 import re
 import sys
-import base64
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -67,7 +66,16 @@ SOURCE_EPOCH = re.compile(r"(?<![0-9A-Za-z])(?:[0-9]{10}(?:\.[0-9]+)?|[0-9]{13}|
 SOURCE_EPOCH_START = 1787443200
 SOURCE_EPOCH_END = 1787529600
 FERNET_TOKEN = re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}={0,2}\b")
-ENCODED_CONTAINER = re.compile(r"\bcntr_[A-Za-z0-9_-]{32,}={0,2}\b")
+RAW_PROVIDER_IDENTIFIER = re.compile(
+    r"\b(?:cntr_[A-Za-z0-9_-]{20,}|(?:ci|ws)_[0-9a-f]{32,})\b",
+    re.I,
+)
+STRING_ENCRYPTED_CONTENT = re.compile(
+    r'''(?ix)(?:\\?["'])encrypted_content(?:\\?["'])\s*:\s*(?:\\?["'])'''
+)
+NESTED_ENCRYPTED_OMISSION = re.compile(
+    r'''(?ix)["']encrypted_content["']\s*:\s*\{\s*["']bytes["']\s*:'''
+)
 SAFETY_IDENTIFIER = re.compile(r'''(?ix)["']?safety_identifier["']?\s*:\s*["']([^"']+)["']''')
 SOURCE_DATE = re.compile(r"20" + r"26(?:-08-23|/08/23|0823)")
 HIDDEN_INSTRUCTION = re.compile(r"You are Codex, an agent based on GPT-5|['\"]base_instructions['\"]")
@@ -165,22 +173,90 @@ def source_epoch_literals(text: str) -> list[str]:
 
 
 def encoded_sensitive_values(text: str) -> list[str]:
-    """Detect encrypted or base64-wrapped private metadata hidden from text scans."""
+    """Detect raw encrypted content and provider identifiers without assuming an encoding."""
     values = [match.group(0) for match in FERNET_TOKEN.finditer(text)]
-    for match in ENCODED_CONTAINER.finditer(text):
-        token = match.group(0)
-        payload = token.removeprefix("cntr_")
-        try:
-            decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
-        except (ValueError, base64.binascii.Error):
-            continue
-        if any(marker in decoded for marker in (b"litellm:", b"model_id:", b"container_id:")):
-            values.append(token)
+    values.extend(match.group(0) for match in RAW_PROVIDER_IDENTIFIER.finditer(text))
+    values.extend(match.group(0) for match in STRING_ENCRYPTED_CONTENT.finditer(text))
     for match in SAFETY_IDENTIFIER.finditer(text):
         value = match.group(1)
         if value != "[REDACTED_SAFETY_IDENTIFIER]":
             values.append(value)
     return values
+
+
+def string_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [text for item in value for text in string_values(item)]
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in string_values(item)]
+    return []
+
+
+def nested_encrypted_omission_count(interactions: list[dict[str, Any]]) -> int:
+    return sum(
+        len(NESTED_ENCRYPTED_OMISSION.findall(text))
+        for row in interactions
+        for text in string_values(row.get("item", {}))
+    )
+
+
+EXPECTED_PROVIDER_KIND_COUNTS = Counter({
+    "hosted_tools.response": 7,
+    "open_page.completed": 5,
+    "web_search.completed": 2,
+    "code_interpreter.completed": 1,
+})
+
+
+def provider_gateway_errors(
+    provider: list[dict[str, Any]], gateway: list[dict[str, Any]]
+) -> list[str]:
+    """Enforce exact provider effects and a one-to-one hosted-response/gateway join."""
+    errors: list[str] = []
+    kind_counts = Counter(row.get("kind") for row in provider)
+    if kind_counts != EXPECTED_PROVIDER_KIND_COUNTS:
+        errors.append(f"provider effect kind counts differ: {dict(kind_counts)}")
+
+    hosted = [row for row in provider if row.get("kind") == "hosted_tools.response"]
+    direct_responses = [
+        row for row in gateway
+        if row.get("data", {}).get("correlated_direct_agent_request")
+        and row.get("data", {}).get("path") == "/v1/responses"
+    ]
+    if len(direct_responses) != 7:
+        errors.append(f"direct Responses gateway count is {len(direct_responses)}, expected 7")
+
+    unmatched = set(range(len(direct_responses)))
+    for index, event in enumerate(sorted(hosted, key=lambda row: row.get("ts_offset_ms", -1)), 1):
+        candidates = [
+            gateway_index for gateway_index in unmatched
+            if direct_responses[gateway_index].get("data", {}).get("status") == event.get("data", {}).get("http_status")
+            and 0 <= event.get("ts_offset_ms", -1) - direct_responses[gateway_index].get("ts_offset_ms", -1) <= 2_000
+        ]
+        if not candidates:
+            errors.append(f"provider response {index} has no unique preceding correlated gateway response")
+            continue
+        nearest = min(
+            candidates,
+            key=lambda gateway_index: event["ts_offset_ms"] - direct_responses[gateway_index]["ts_offset_ms"],
+        )
+        unmatched.remove(nearest)
+    if unmatched:
+        errors.append(f"{len(unmatched)} direct Responses gateway events have no hosted-response match")
+
+    expected_effects: Counter[tuple[int, str]] = Counter()
+    for event in hosted:
+        for effect in event.get("data", {}).get("observed_effects", []):
+            expected_effects[(event.get("ts_offset_ms"), f"{effect}.completed")] += 1
+    actual_effects = Counter(
+        (event.get("ts_offset_ms"), event.get("kind"))
+        for event in provider if event.get("kind") != "hosted_tools.response"
+    )
+    if actual_effects != expected_effects:
+        errors.append("provider completed effects differ from hosted-response observations")
+    return errors
 
 
 def schema_type_matches(value: Any, expected: str) -> bool:
@@ -406,6 +482,15 @@ def validate(root: Path) -> list[str]:
             errors.append(f"manifest item metadata is malformed: {relative}")
         elif path.stat().st_size != item["bytes"] or sha256(path) != item["sha256"]:
             errors.append(f"manifest mismatch: {relative}")
+    coverage = manifest.get("coverage", {})
+    if set(coverage) != {"positive_trial", "controls", "totals"}:
+        errors.append("manifest coverage has an invalid shape")
+    if coverage.get("positive_trial", {}).get("trial_id") != "trial-08":
+        errors.append("manifest positive-trial coverage is invalid")
+    if set(coverage.get("controls", {})) != set(CONTROL_IDS):
+        errors.append("manifest control coverage is incomplete")
+    if coverage.get("totals") != {"model_interactions": 1501, "trials": 4, "unified_events": 32138}:
+        errors.append("manifest coverage totals are invalid")
 
     for path in root.rglob("*"):
         if not path.is_file() or ephemeral_runtime_file(path):
@@ -528,9 +613,6 @@ def validate(root: Path) -> list[str]:
             errors.append(f"ground-truth stage has no supporting event: {stage.get('stage_id')}")
 
     provider = load_jsonl(root / "traces" / "provider-effects.jsonl", errors, "provider effects")
-    kinds = {row.get("kind") for row in provider}
-    if not {"web_search.completed", "open_page.completed"} <= kinds:
-        errors.append("provider semantic effects are incomplete")
     gateway = load_jsonl(root / "traces" / "gateway-access.jsonl", errors, "gateway access")
     correlated_paths = {
         row.get("data", {}).get("path") for row in gateway
@@ -538,21 +620,7 @@ def validate(root: Path) -> list[str]:
     }
     if not {"/v1/models", "/v1/responses"} <= correlated_paths:
         errors.append("direct gateway model inventory and Responses requests are not both correlated")
-    direct_responses = [
-        row for row in gateway
-        if row.get("data", {}).get("correlated_direct_agent_request")
-        and row.get("data", {}).get("path") == "/v1/responses"
-    ]
-    for index, event in enumerate(provider, 1):
-        if event.get("kind") != "hosted_tools.response":
-            continue
-        candidates = [
-            row for row in direct_responses
-            if row.get("data", {}).get("status") == event.get("data", {}).get("http_status")
-            and row.get("ts_offset_ms", -1) <= event.get("ts_offset_ms", -1)
-        ]
-        if not candidates or event["ts_offset_ms"] - max(row["ts_offset_ms"] for row in candidates) > 2_000:
-            errors.append(f"provider response {index} has no preceding correlated gateway response")
+    errors.extend(provider_gateway_errors(provider, gateway))
     cloud = load_jsonl(root / "traces" / "cloud-network-events.jsonl", errors, "cloud network events")
     if not any(row.get("kind") == "network.nat_flow" and row.get("data", {}).get("source_role") == "inference_gateway" for row in cloud):
         errors.append("inference-gateway NAT evidence is missing")
@@ -606,6 +674,13 @@ def validate(root: Path) -> list[str]:
     availability = load_json_object(root / "model-interaction-availability.json", errors, "model interaction availability")
     if availability.get("counts", {}).get("response_items") != len(interactions):
         errors.append("model interaction availability inventory disagrees with trace")
+    ledger = load_json_object(root / "redaction-ledger.json", errors, "redaction ledger")
+    nested_omissions = nested_encrypted_omission_count(interactions)
+    ledger_nested_omissions = ledger.get("replacement_counts", {}).get("embedded_encrypted_reasoning_blobs")
+    if nested_omissions != 21 or ledger_nested_omissions != nested_omissions:
+        errors.append(
+            f"nested encrypted-reasoning omission count differs: trace={nested_omissions}, ledger={ledger_nested_omissions}"
+        )
     if not any(
         row.get("item", {}).get("item_type") == "custom_tool_call_output"
         and "web_search_call" in json.dumps(row.get("item", {}))

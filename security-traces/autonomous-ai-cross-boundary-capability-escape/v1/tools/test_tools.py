@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import base64
 from pathlib import Path
 import shutil
 import subprocess
@@ -73,9 +72,20 @@ class ToolTests(unittest.TestCase):
             self.assertIsNotNone(trace_validate.SOURCE_TIME.search(value))
             self.assertEqual(trace_validate.source_epoch_literals(value), [value])
         fernet = "gAAA" + "AA" + "A" * 40
-        encoded = base64.urlsafe_b64encode(b"litellm:model_id:private;container_id:private").decode().rstrip("=")
         self.assertTrue(trace_validate.encoded_sensitive_values(fernet))
-        self.assertTrue(trace_validate.encoded_sensitive_values("cntr_" + encoded))
+        self.assertTrue(trace_validate.encoded_sensitive_values("cntr_" + "6a8a633cabcdef0123456789abcdef"))
+        self.assertTrue(trace_validate.encoded_sensitive_values("ci_" + "0b980489e1eff30b006a8a633fde3887d1a99378fa83973286"))
+        encrypted_key = "encrypted_" + "content"
+        self.assertTrue(trace_validate.encoded_sensitive_values(f'{{"{encrypted_key}":"kms:v1:opaque-value"}}'))
+        self.assertTrue(trace_validate.encoded_sensitive_values(f'{{\\"{encrypted_key}\\":\\"kms:v1:opaque-value\\"}}'))
+        self.assertFalse(trace_validate.encoded_sensitive_values(f'{{"{encrypted_key}":{{"bytes":42,"published":false}}}}'))
+
+    def test_nested_encrypted_omission_inventory(self) -> None:
+        interactions = [json.loads(line) for line in (ROOT / "traces/model-interactions.jsonl").read_text().splitlines()]
+        ledger = json.loads((ROOT / "redaction-ledger.json").read_text())
+        observed = trace_validate.nested_encrypted_omission_count(interactions)
+        self.assertEqual(observed, 21)
+        self.assertEqual(observed, ledger["replacement_counts"]["embedded_encrypted_reasoning_blobs"])
 
     def test_provider_effects_use_client_observation_time(self) -> None:
         interactions = {
@@ -87,6 +97,22 @@ class ToolTests(unittest.TestCase):
             observation = interactions[event["data"]["observation_interaction_seq"]]
             self.assertEqual(event["ts_offset_ms"], observation["ts_offset_ms"])
             self.assertEqual(event["ts"], observation["ts"])
+
+    def test_provider_gateway_join_rejects_duplicate_and_dropped_effects(self) -> None:
+        provider = [json.loads(line) for line in (ROOT / "traces/provider-effects.jsonl").read_text().splitlines()]
+        gateway = [json.loads(line) for line in (ROOT / "traces/gateway-access.jsonl").read_text().splitlines()]
+        self.assertEqual(trace_validate.provider_gateway_errors(provider, gateway), [])
+
+        duplicated = provider + [next(row for row in provider if row["kind"] == "hosted_tools.response")]
+        duplicate_errors = trace_validate.provider_gateway_errors(duplicated, gateway)
+        self.assertTrue(any("kind counts differ" in error for error in duplicate_errors))
+        self.assertTrue(any("no unique preceding" in error for error in duplicate_errors))
+
+        dropped = list(provider)
+        dropped.remove(next(row for row in dropped if row["kind"] == "web_search.completed"))
+        dropped_errors = trace_validate.provider_gateway_errors(dropped, gateway)
+        self.assertTrue(any("kind counts differ" in error for error in dropped_errors))
+        self.assertIn("provider completed effects differ from hosted-response observations", dropped_errors)
 
     def test_score_rejects_alert_schema_violations(self) -> None:
         invalid_alerts = (

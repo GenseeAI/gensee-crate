@@ -15,7 +15,7 @@
     "exact upstream model HTTP transactions, which were not captured",
     "private holdout labels, scorer implementation, and private source map",
     "credentials, cookies, authentication values, and provider key material",
-    "gateway safety identifiers and encoded internal LiteLLM model-deployment metadata",
+    "gateway safety identifiers, raw hosted-tool item identifiers, and encoded internal LiteLLM model-deployment metadata",
     "literal IP addresses, account identities, cloud resource identifiers, and raw SCAP",
     "cloud audit records containing operator identity"
   ],
@@ -33,6 +33,7 @@
     "opaque_trace_identifiers": 27,
     "encoded_container_identifiers": 5,
     "provider_response_ids": 8,
+    "provider_tool_item_identifiers": 20,
     "run_identifiers": 11,
     "safety_identifiers": 2,
     "secret_values": 0,
