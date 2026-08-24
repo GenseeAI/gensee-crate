@@ -18,6 +18,7 @@ bench = []
 bench-breakdown = ["bench"]
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 gensee-crate-attribution = { path = "../gensee-crate-attribution" }
 gensee-crate-core = { path = "../gensee-crate-core" }
 gensee-crate-config-audit = { path = "../gensee-crate-config-audit" }

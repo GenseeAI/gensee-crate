@@ -1,10 +1,15 @@
 use super::*;
+use chrono::DateTime;
+use std::collections::BTreeSet;
 use std::fmt;
 
 const FALCO_SOURCE: &str = "linux-falco";
 const MIN_CONTAINER_ID_PREFIX_LEN: usize = 12;
 const FALCO_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const FALCO_RETENTION_POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const EARLIEST_PLAUSIBLE_FALCO_TIMESTAMP_MS: u64 = 946_684_800_000;
+const LATEST_TEST_FALLBACK_FALCO_TIMESTAMP_MS: u64 = 4_102_444_800_000;
+const FALCO_FUTURE_CLOCK_SKEW_MS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Default)]
 struct TcloneRunRegistryCache {
@@ -323,6 +328,7 @@ fn falco_system_event_from_value(
     let gensee = json!({
         "schema_version": 1,
         "collector": "falco",
+        "ingested_at_ms": observed_at_ms,
         "event_id": falco_string(&fields, &["evt.num", "evt_num"]),
         "event_type_source": event_type_source,
         "rule": value.get("rule").cloned().unwrap_or(Value::Null),
@@ -350,7 +356,7 @@ fn falco_system_event_from_value(
         source: FALCO_SOURCE.to_string(),
         event_type,
         event_kind,
-        observed_at_ms: falco_event_time_ms(&fields).unwrap_or(observed_at_ms),
+        observed_at_ms: falco_event_time_ms(&fields, observed_at_ms).unwrap_or(observed_at_ms),
         pid: falco_u32(&fields, &["proc.pid", "thread.tid"]),
         ppid: falco_u32(&fields, &["proc.ppid"]),
         process_name: falco_string(&fields, &["proc.name", "proc.pname"]),
@@ -393,27 +399,50 @@ fn container_id_from_cgroups(cgroups: &str) -> Option<String> {
         .max_by_key(|candidate| candidate.len())
 }
 
-fn falco_event_time_ms(fields: &Value) -> Option<u64> {
+fn falco_event_time_ms(fields: &Value, ingested_at_ms: u64) -> Option<u64> {
     // Falco has emitted its wall-clock timestamp under several JSON field
     // names across versions and output modes. These fields are nanoseconds
     // since the Unix epoch, despite the `iso8601` name used by some outputs.
     // Prefer the rawtime spelling, then accept the compatible aliases so
     // replay and live ingestion retain the event clock instead of stdin
     // arrival time.
-    falco_string(
-        fields,
-        &[
-            "evt.rawtime",
-            "evt_rawtime",
-            "evt.time",
-            "evt_time",
-            "evt.time.iso8601",
-            "evt_time_iso8601",
-        ],
-    )
-    .and_then(|value| value.parse::<u64>().ok())
-    .map(|nanoseconds| nanoseconds / 1_000_000)
-    .filter(|milliseconds| *milliseconds > 0)
+    for key in [
+        "evt.rawtime",
+        "evt_rawtime",
+        "evt.time",
+        "evt_time",
+        "evt.time.iso8601",
+        "evt_time_iso8601",
+    ] {
+        let Some(value) = falco_scalar_string(fields, key) else {
+            continue;
+        };
+        let milliseconds = value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|nanoseconds| nanoseconds / 1_000_000)
+            .or_else(|| {
+                DateTime::parse_from_rfc3339(value.trim())
+                    .ok()
+                    .and_then(|timestamp| u64::try_from(timestamp.timestamp_millis()).ok())
+            });
+        if milliseconds
+            .is_some_and(|timestamp| plausible_falco_timestamp_ms(timestamp, ingested_at_ms))
+        {
+            return milliseconds;
+        }
+    }
+    None
+}
+
+fn plausible_falco_timestamp_ms(timestamp_ms: u64, ingested_at_ms: u64) -> bool {
+    let latest = if ingested_at_ms >= EARLIEST_PLAUSIBLE_FALCO_TIMESTAMP_MS {
+        ingested_at_ms.saturating_add(FALCO_FUTURE_CLOCK_SKEW_MS)
+    } else {
+        LATEST_TEST_FALLBACK_FALCO_TIMESTAMP_MS
+    };
+    (EARLIEST_PLAUSIBLE_FALCO_TIMESTAMP_MS..=latest).contains(&timestamp_ms)
 }
 
 fn falco_event_type(value: &Value, fields: &Value) -> (String, &'static str) {
@@ -431,63 +460,80 @@ fn falco_event_type(value: &Value, fields: &Value) -> (String, &'static str) {
 }
 
 fn falco_event_type_from_rule_metadata(value: &Value) -> Option<&'static str> {
-    let tags = value
+    let categories = value
         .get("tags")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    let has_tag = |expected: &str| tags.iter().any(|tag| tag == expected);
+        .filter_map(activity_category)
+        .collect::<BTreeSet<_>>();
 
-    // Prefer explicit rule tags. They describe the observation category but
-    // cannot recover the original syscall, so use broad, honest event types.
-    if has_tag("process") {
-        return Some("process_observation");
-    }
-    if has_tag("filesystem") || has_tag("file") {
-        return Some("file_access");
-    }
-    if has_tag("network") {
-        return Some("network_activity");
-    }
-    if has_tag("ipc") {
-        return Some("ipc_activity");
-    }
-    if has_tag("syscall") {
-        return Some("syscall_activity");
-    }
-    if has_tag("capture") {
-        return Some("capture_state");
+    // Tags are authoritative only when their complete set maps to one honest
+    // observation category (or the explicitly supported network+IPC union).
+    if !categories.is_empty() {
+        return event_type_for_categories(&categories);
     }
 
-    let rule = value
+    let words = value
         .get("rule")
         .and_then(Value::as_str)?
-        .to_ascii_lowercase();
-    if rule.contains("metrics snapshot") {
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if words.windows(2).any(|pair| pair == ["metrics", "snapshot"]) {
         return Some("metrics_snapshot");
     }
-    if rule.contains("process") {
-        return Some("process_observation");
+    let categories = words
+        .iter()
+        .filter_map(|word| activity_category(word))
+        .collect::<BTreeSet<_>>();
+    event_type_for_categories(&categories)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ActivityCategory {
+    Process,
+    File,
+    Network,
+    Ipc,
+    Syscall,
+    Capture,
+}
+
+fn activity_category(value: &str) -> Option<ActivityCategory> {
+    match value.to_ascii_lowercase().as_str() {
+        "process" => Some(ActivityCategory::Process),
+        "file" | "filesystem" => Some(ActivityCategory::File),
+        "network" => Some(ActivityCategory::Network),
+        "ipc" => Some(ActivityCategory::Ipc),
+        "syscall" => Some(ActivityCategory::Syscall),
+        "capture" => Some(ActivityCategory::Capture),
+        _ => None,
     }
-    if rule.contains("file") || rule.contains("filesystem") {
-        return Some("file_access");
+}
+
+fn event_type_for_categories(categories: &BTreeSet<ActivityCategory>) -> Option<&'static str> {
+    if categories.len() == 2
+        && categories.contains(&ActivityCategory::Network)
+        && categories.contains(&ActivityCategory::Ipc)
+    {
+        return Some("network_ipc_activity");
     }
-    if rule.contains("network") {
-        return Some("network_activity");
+    match categories
+        .iter()
+        .copied()
+        .next()
+        .filter(|_| categories.len() == 1)?
+    {
+        ActivityCategory::Process => Some("process_observation"),
+        ActivityCategory::File => Some("file_access"),
+        ActivityCategory::Network => Some("network_activity"),
+        ActivityCategory::Ipc => Some("ipc_activity"),
+        ActivityCategory::Syscall => Some("syscall_activity"),
+        ActivityCategory::Capture => Some("capture_state"),
     }
-    if rule.contains("ipc") {
-        return Some("ipc_activity");
-    }
-    if rule.contains("syscall") {
-        return Some("syscall_activity");
-    }
-    if rule.contains("capture") {
-        return Some("capture_state");
-    }
-    None
 }
 
 fn attribute_falco_event_to_tclone(
@@ -576,6 +622,7 @@ fn classify_falco_event(event_type: &str, fields: &Value) -> String {
         "process_observation" => "ProcessObservation".to_string(),
         "file_access" => "FileAccess".to_string(),
         "network_activity" => "NetworkActivity".to_string(),
+        "network_ipc_activity" => "NetworkIpcActivity".to_string(),
         "ipc_activity" => "IpcActivity".to_string(),
         "metrics_snapshot" => "TelemetryMetric".to_string(),
         "capture_state" => "CollectorState".to_string(),
@@ -596,14 +643,16 @@ fn falco_network_destination(fields: &Value) -> Option<String> {
 }
 
 fn falco_string(value: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        let value = value.get(*key).and_then(|value| match value {
-            Value::String(value) => Some(value.clone()),
-            Value::Number(value) => Some(value.to_string()),
-            _ => None,
-        })?;
-        (!value.trim().is_empty() && !matches!(value.trim(), "<NA>" | "<N/A>")).then_some(value)
-    })
+    keys.iter().find_map(|key| falco_scalar_string(value, key))
+}
+
+fn falco_scalar_string(value: &Value, key: &str) -> Option<String> {
+    let value = value.get(key).and_then(|value| match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    })?;
+    (!value.trim().is_empty() && !matches!(value.trim(), "<NA>" | "<N/A>")).then_some(value)
 }
 
 fn falco_u32(value: &Value, keys: &[&str]) -> Option<u32> {
@@ -670,6 +719,10 @@ mod tests {
             serde_json::from_str::<Value>(&event.raw_json).unwrap()["gensee"]["event_type_source"],
             "falco_field"
         );
+        assert_eq!(
+            serde_json::from_str::<Value>(&event.raw_json).unwrap()["gensee"]["ingested_at_ms"],
+            123
+        );
     }
 
     #[test]
@@ -704,6 +757,32 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_aliases_are_parsed_independently_and_accept_rfc3339() {
+        let event = system_event_from_falco_line(
+            r#"{"output_fields":{"evt.rawtime":"not-a-clock","evt.time":"2024-04-05T19:34:38.250Z","evt.type":"open"}}"#,
+            1_712_345_679_000,
+            None,
+        )
+        .unwrap();
+        assert_eq!(event.observed_at_ms, 1_712_345_678_250);
+    }
+
+    #[test]
+    fn implausible_timestamp_magnitudes_fall_back_to_ingestion_time() {
+        for timestamp in ["1712345678", "1712345678123", "9999999999999999999"] {
+            let line = json!({
+                "output_fields": {
+                    "evt.rawtime": timestamp,
+                    "evt.type": "open"
+                }
+            })
+            .to_string();
+            let event = system_event_from_falco_line(&line, 1_712_345_679_000, None).unwrap();
+            assert_eq!(event.observed_at_ms, 1_712_345_679_000, "{timestamp}");
+        }
+    }
+
+    #[test]
     fn derives_broad_event_types_from_rule_metadata() {
         let process = system_event_from_falco_line(
             r#"{"rule":"Container Process Lifecycle","tags":["observe_only","process"],"output_fields":{"evt.time":1712345678123456789,"proc.pid":42}}"#,
@@ -723,8 +802,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(network.event_type, "network_activity");
-        assert_eq!(network.event_kind, "NetworkActivity");
+        assert_eq!(network.event_type, "network_ipc_activity");
+        assert_eq!(network.event_kind, "NetworkIpcActivity");
 
         let metrics = system_event_from_falco_line(
             r#"{"rule":"Falco internal: metrics snapshot","output_fields":{"evt.time":1712345678123456789}}"#,
@@ -734,6 +813,26 @@ mod tests {
         .unwrap();
         assert_eq!(metrics.event_type, "metrics_snapshot");
         assert_eq!(metrics.event_kind, "TelemetryMetric");
+    }
+
+    #[test]
+    fn conflicting_tags_and_substring_names_do_not_claim_a_category() {
+        let conflict = system_event_from_falco_line(
+            r#"{"rule":"Mixed observation","tags":["network","process"],"output_fields":{}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(conflict.event_type, "unknown");
+        assert_eq!(conflict.event_kind, "Syscall");
+
+        let profile = system_event_from_falco_line(
+            r#"{"rule":"Modify shell profile","output_fields":{}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(profile.event_type, "unknown");
     }
 
     #[test]
