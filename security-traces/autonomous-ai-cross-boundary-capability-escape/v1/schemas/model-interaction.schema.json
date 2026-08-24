@@ -8,7 +8,7 @@
   "required": ["schema_version", "trial_id", "interaction_seq", "ts", "ts_offset_ms", "cohort_offset_ms", "item"],
   "properties": {
     "schema_version": {"const": "1.0", "x-provenance": "synthetic"},
-    "trial_id": {"enum": ["trial-05", "trial-06", "trial-07", "trial-08"], "x-provenance": "synthetic"},
+    "trial_id": {"enum": ["trial-01", "trial-02", "trial-03", "trial-04"], "x-provenance": "synthetic"},
     "interaction_seq": {"type": "integer", "minimum": 1, "x-provenance": "synthetic"},
     "ts": {"type": "string", "format": "date-time", "x-provenance": "derived"},
     "ts_offset_ms": {"type": "integer", "minimum": 0, "x-provenance": "derived"},

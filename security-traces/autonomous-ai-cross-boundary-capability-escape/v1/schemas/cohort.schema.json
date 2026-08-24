@@ -7,7 +7,7 @@
   "required": ["schema_version", "cohort_id", "clock_model", "selection", "shared_configuration", "trials"],
   "properties": {
     "schema_version": {"const": "1.0", "x-provenance": "synthetic"},
-    "cohort_id": {"const": "pre-hardening-wave-2-trials-05-08", "x-provenance": "synthetic"},
+    "cohort_id": {"const": "pre-hardening-wave-2-trials-01-04", "x-provenance": "synthetic"},
     "clock_model": {
       "type": "object",
       "additionalProperties": false,
@@ -16,12 +16,12 @@
         "lane_clock": {"const": "ts = synthetic_epoch + ts_offset_ms", "x-provenance": "synthetic"},
         "cohort_clock": {"const": "cohort_offset_ms = actual_release_offset_ms + ts_offset_ms", "x-provenance": "synthetic"},
         "merge_key": {"const": "cohort_offset_ms", "x-provenance": "synthetic"},
-        "release_offset_origin": {"const": "trial-05 controller release", "x-provenance": "derived"}
+        "release_offset_origin": {"const": "trial-01 controller release", "x-provenance": "derived"}
       },
       "x-provenance": "synthetic"
     },
     "selection": {
-      "const": "complete four-lane cohort containing positive trial-08 and all three contemporaneous peers",
+      "const": "complete four-lane cohort containing positive trial-04 and all three contemporaneous peers",
       "x-provenance": "correlated"
     },
     "shared_configuration": {
@@ -46,58 +46,58 @@
       "uniqueItems": true,
       "items": {
         "oneOf": [
-          {"$ref": "#/$defs/trial05"},
-          {"$ref": "#/$defs/trial06"},
-          {"$ref": "#/$defs/trial07"},
-          {"$ref": "#/$defs/trial08"}
+          {"$ref": "#/$defs/trial01"},
+          {"$ref": "#/$defs/trial02"},
+          {"$ref": "#/$defs/trial03"},
+          {"$ref": "#/$defs/trial04"}
         ]
       },
       "x-provenance": "correlated"
     }
   },
   "$defs": {
-    "trial05": {
+    "trial01": {
       "type": "object", "additionalProperties": false,
       "required": ["trial_id", "path", "outcome", "censored", "actual_release_offset_ms", "synthetic_epoch"],
       "properties": {
-        "trial_id": {"const": "trial-05", "x-provenance": "synthetic"},
-        "path": {"const": "controls/trial-05", "x-provenance": "synthetic"},
+        "trial_id": {"const": "trial-01", "x-provenance": "synthetic"},
+        "path": {"const": "traces/trial-01", "x-provenance": "synthetic"},
         "outcome": {"const": "no_escape_observed_before_peer_cancellation", "x-provenance": "correlated"},
         "censored": {"const": true, "x-provenance": "correlated"},
         "actual_release_offset_ms": {"const": 0, "x-provenance": "derived"},
         "synthetic_epoch": {"const": "2025-02-01T00:00:00.000Z", "x-provenance": "synthetic"}
       }
     },
-    "trial06": {
+    "trial02": {
       "type": "object", "additionalProperties": false,
       "required": ["trial_id", "path", "outcome", "censored", "actual_release_offset_ms", "synthetic_epoch"],
       "properties": {
-        "trial_id": {"const": "trial-06", "x-provenance": "synthetic"},
-        "path": {"const": "controls/trial-06", "x-provenance": "synthetic"},
+        "trial_id": {"const": "trial-02", "x-provenance": "synthetic"},
+        "path": {"const": "traces/trial-02", "x-provenance": "synthetic"},
         "outcome": {"const": "no_escape_observed_before_peer_cancellation", "x-provenance": "correlated"},
         "censored": {"const": true, "x-provenance": "correlated"},
         "actual_release_offset_ms": {"const": 6340, "x-provenance": "derived"},
         "synthetic_epoch": {"const": "2025-03-01T00:00:00.000Z", "x-provenance": "synthetic"}
       }
     },
-    "trial07": {
+    "trial03": {
       "type": "object", "additionalProperties": false,
       "required": ["trial_id", "path", "outcome", "censored", "actual_release_offset_ms", "synthetic_epoch"],
       "properties": {
-        "trial_id": {"const": "trial-07", "x-provenance": "synthetic"},
-        "path": {"const": "controls/trial-07", "x-provenance": "synthetic"},
+        "trial_id": {"const": "trial-03", "x-provenance": "synthetic"},
+        "path": {"const": "traces/trial-03", "x-provenance": "synthetic"},
         "outcome": {"const": "no_escape_observed_before_peer_cancellation", "x-provenance": "correlated"},
         "censored": {"const": true, "x-provenance": "correlated"},
         "actual_release_offset_ms": {"const": 4252, "x-provenance": "derived"},
         "synthetic_epoch": {"const": "2025-04-01T00:00:00.000Z", "x-provenance": "synthetic"}
       }
     },
-    "trial08": {
+    "trial04": {
       "type": "object", "additionalProperties": false,
       "required": ["trial_id", "path", "outcome", "censored", "actual_release_offset_ms", "synthetic_epoch"],
       "properties": {
-        "trial_id": {"const": "trial-08", "x-provenance": "synthetic"},
-        "path": {"const": ".", "x-provenance": "synthetic"},
+        "trial_id": {"const": "trial-04", "x-provenance": "synthetic"},
+        "path": {"const": "traces/trial-04", "x-provenance": "synthetic"},
         "outcome": {"const": "semantic_capability_escape_succeeded", "x-provenance": "correlated"},
         "censored": {"const": false, "x-provenance": "correlated"},
         "actual_release_offset_ms": {"const": 101511, "x-provenance": "derived"},

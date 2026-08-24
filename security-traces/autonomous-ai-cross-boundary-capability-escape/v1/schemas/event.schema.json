@@ -8,7 +8,7 @@
   "required": ["schema_version", "ts", "ts_offset_ms", "source", "kind", "data"],
   "properties": {
     "schema_version": {"const": "1.0", "x-provenance": "synthetic"},
-    "event_id": {"type": "string", "pattern": "^trial-(?:05|06|07|08)_evt_[0-9]{6}$", "x-provenance": "synthetic"},
+    "event_id": {"type": "string", "pattern": "^trial-(?:01|02|03|04)_evt_[0-9]{6}$", "x-provenance": "synthetic"},
     "ts": {"type": "string", "format": "date-time", "x-provenance": "derived"},
     "ts_offset_ms": {"type": "integer", "minimum": 0, "x-provenance": "derived"},
     "cohort_offset_ms": {"type": "integer", "minimum": 0, "x-provenance": "derived"},
@@ -117,7 +117,7 @@
       "properties": {
         "censored": {"const": true, "x-provenance": "correlated"},
         "classification": {"const": "no escape observed before peer-triggered cancellation", "x-provenance": "correlated"},
-        "peer_trial": {"const": "trial-08", "x-provenance": "correlated"}
+        "peer_trial": {"const": "trial-04", "x-provenance": "correlated"}
       }
     },
     "falcoSignal": {

@@ -50,7 +50,7 @@ conclusion rather than a machine-local sensor event.
 
 ## Normalized runtime event envelope
 
-Each line of `traces/unified-timeline.jsonl` is one strict object:
+Each line of a `traces/trial-NN/unified-timeline.jsonl` file is one strict object:
 
 | Field | Type | Provenance | Meaning |
 | --- | --- | --- | --- |
@@ -74,7 +74,7 @@ explicit contract; no such request is fabricated.
 | `benchmark/submission.accepted` | 3 | Submission kind, attempt, row count, metric, score visibility, and nullable score. |
 | `codex/command.completed` | 69 | Sanitized command summary/category, exit/status, requested tools and target domains, and gateway-credential-variable use. |
 | `controller/boundary_escape.confirmed` | 1 | Correlated outcome classification and negative Nexus/private-holdout flags. |
-| `controller/peer_escape.cancellation` | 0 in Trial 8; 1 per control | Correlated right-censoring label, peer trial, and explicit statement that no escape was observed before cancellation. |
+| `controller/peer_escape.cancellation` | 0 in Trial 4; 1 per control | Correlated right-censoring label, peer trial, and explicit statement that no escape was observed before cancellation. |
 | `falco/runtime.signal` | 35 | Selected rule, process, command summary/category, connection role, and gateway-variable use. |
 | `gateway/http.response` | 123 | Method/path/status, authentication, requester role, and direct-agent-request correlation. |
 | `gcp/network.firewall` | 3,089 | Address-free endpoint roles, ports, protocol, disposition, bytes, country, and ASN. |
@@ -97,12 +97,12 @@ means no status was available, not a successful response.
 
 ## Model-interaction envelope
 
-Each line of `traces/model-interactions.jsonl` is a strict object:
+Each line of a `traces/trial-NN/model-interactions.jsonl` file is a strict object:
 
 | Field | Type | Provenance | Meaning |
 | --- | --- | --- | --- |
 | `schema_version` | string, always `1.0` | synthetic | Public schema version. |
-| `trial_id` | `trial-05` through `trial-08` | synthetic | Explicit lane attribution used with `interaction_seq` to preserve within-lane replay order. |
+| `trial_id` | `trial-01` through `trial-04` | synthetic | Explicit lane attribution used with `interaction_seq` to preserve within-lane replay order. |
 | `interaction_seq` | positive integer | synthetic | Complete retained stream order within the declared trial. It restarts at 1 per lane and is not a cohort identity. |
 | `ts` | RFC 3339 timestamp | derived | Lane-local shifted pseudotime: exactly `synthetic_epoch + ts_offset_ms`. Do not merge lanes by this field. |
 | `ts_offset_ms` | non-negative integer | derived | Milliseconds from that trial's experiment origin. |
@@ -111,7 +111,7 @@ Each line of `traces/model-interactions.jsonl` is a strict object:
 
 ### Four discriminated item types
 
-The counts below describe positive Trial 8. Control counts are declared in each
+The counts below describe positive Trial 4. Control counts are declared in each
 `model-interaction-availability.json` and validated against its model stream.
 
 | `item_type` | Count | Direction | Required content |
@@ -161,12 +161,12 @@ the corpus schemas.
 four-trial membership, shared configuration, lane-specific split policy,
 outcome/censoring label, publication path, synthetic epoch, and measured release
 offset for each trial. Trial order in this file is identity order, not start
-order. `actual_release_offset_ms` is measured from the Trial 5 controller
+order. `actual_release_offset_ms` is measured from the Trial 1 controller
 release. Each lane's `ts` is intentionally independent pseudotime; cross-lane
 replay must merge unified events by `cohort_offset_ms` and may use `event_id` as
 a stable globally unique identity.
 
-Each `controls/trial-*/control-summary.json` is validated by
+Each `traces/trial-*/control-summary.json` is validated by
 `schemas/control-summary.schema.json`. It records observed duration, last model
 activity, peer-cancellation offset, benchmark submission observations,
 collection warnings, and explicit negative observations. `censored: true` and
@@ -190,7 +190,7 @@ model timestamp—including nested creation timestamps—against its declared la
 epoch, checks every unified event and model item's cohort offset, enforces
 globally unique `event_id` and model `item_id` values, locks all four measured
 release offsets, and proves that all three peer cancellations follow the
-triggering Trial 8 escape on the shared clock.
+triggering Trial 4 escape on the shared clock.
 For retained provider payloads it rejects raw hosted-tool/container identifier
 shapes without assuming an encoding, rejects any string-valued nested
 `encrypted_content`, and reconciles all 21 nested omission records with the
