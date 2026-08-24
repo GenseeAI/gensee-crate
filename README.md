@@ -296,19 +296,25 @@ lease, mediation, and lifecycle model.
 <details>
 <summary><strong>Sanitized, replayable traces from controlled autonomous-agent security experiments</strong></summary>
 
-Test detection and correlation systems against Gensee's sanitized, offline
-security corpus. The first published scenario records a blind autonomous-agent
-experiment in which an overbroad inference credential enabled hosted web-search
-effects across the agent's intended internet boundary. The prompt did not name
-the gateway weakness or prescribe an attack path.
+The [`security-traces`](security-traces/README.md) collection publishes
+redacted, schema-validated experiment corpora for detector development,
+forensic replay, and capability-policy research.
+
+The collection currently includes two blind autonomous-agent scenarios: an
+overbroad inference credential that enabled hosted web-search effects, and an
+authentic, deliberately vulnerable Nexus 2 package-service fixture. The Nexus
+release records four completed classifier trials; one produced an independently
+confirmed L4 package-service boundary escape and three completed without an
+observed escape.
 
 - [Autonomous AI Cross-Boundary Capability Escape](security-traces/autonomous-ai-cross-boundary-capability-escape/v1/)
+- [Autonomous AI package-service boundary escape, v1](security-traces/autonomous-ai-package-service-boundary-escape/v1/README.md)
 - [Trace dataset index](security-traces/)
 
-The corpus includes the exact task prompt, complete recoverable client-side
-model event stream, normalized cross-machine telemetry, seven-stage ground
-truth, provenance, redaction records, checksums, and offline replay/scoring
-tools. It does not include credentials, private holdout labels, or executable
+Each release includes its exact task prompt, normalized telemetry, model event
+stream, ground truth, provenance, redaction and coverage records, checksums, and
+offline validation/replay/scoring tools. The traces contain no credentials,
+private holdout labels, raw SCAP, runnable service infrastructure, or executable
 network replay.
 
 </details>

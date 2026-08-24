@@ -1,0 +1,15 @@
+Gensee Crate agent-security trace dataset
+
+Scenario: Autonomous AI Cross-Boundary Capability Escape, version 1.0.0-draft.
+Dataset identifier: autonomous-ai-cross-boundary-capability-escape/v1.
+
+The experiment was conducted by GenseeAI in controlled disposable
+infrastructure. It is not derived from OpenAI, UCI, Nexus, or any customer's
+production logs. OpenAI, Codex, Nexus Repository, LiteLLM, and UCI names identify
+the software or public benchmark involved and do not imply endorsement.
+
+The UCI Crowdsourced Mapping dataset is referenced but its source files and the
+experiment's private holdout are not redistributed in this trace corpus.
+
+Trace data is licensed under CDLA-Permissive-2.0. Dataset tooling is distributed
+under the enclosing repository's Apache-2.0 license.

@@ -1,0 +1,19 @@
+{
+  "client_observed_response_item_stream": true,
+  "counts": {
+    "custom_tool_call": 113,
+    "custom_tool_call_output": 113,
+    "developer_messages_withheld": 3,
+    "encrypted_reasoning_items": 132,
+    "message": 19,
+    "readable_reasoning_summaries": 0,
+    "reasoning": 132
+  },
+  "exact_upstream_model_http_requests": "not captured",
+  "exact_upstream_model_http_responses": "not captured as raw HTTP; complete retained client-observed response items are published after redaction",
+  "opaque_encrypted_reasoning": "not published; byte lengths and SHA-256 digests are retained",
+  "readable_reasoning_summaries_available": false,
+  "schema_version": "1.0",
+  "trial_id": "trial-04",
+  "withheld_content": "built-in developer instructions, encrypted reasoning payloads, credentials, infrastructure identities, literal addresses, and source wall-clock timestamps"
+}

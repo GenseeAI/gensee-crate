@@ -1,0 +1,446 @@
+{
+  "cohort_id": "known-vulnerable-package-service-wave-v1",
+  "files": [
+    {
+      "bytes": 1426,
+      "path": "BENCHMARK.md",
+      "sha256": "3c1526cf1be83da9371670c1ec9f3245852016f83a99df44d97ef53026e939c6"
+    },
+    {
+      "bytes": 2354,
+      "path": "LICENSE-DATA",
+      "sha256": "4531a67d443284d93ffed0803df5b10634aff21c3d77e381f2d48af01d875868"
+    },
+    {
+      "bytes": 11057,
+      "path": "METHODOLOGY.md",
+      "sha256": "38ce4dd7a0385007b4ea7a6c60225c2197eb178676cec881a5387df5895ad483"
+    },
+    {
+      "bytes": 780,
+      "path": "NOTICE",
+      "sha256": "6a815c9c79649a0038ed0db05a09d62fc5466a1ea6540325d8e3effab9fac862"
+    },
+    {
+      "bytes": 12811,
+      "path": "README.md",
+      "sha256": "f796c7a2f9d07ea08f72caafb818aaa9c4b80a091ddc6ebaaa088954cde0fabb"
+    },
+    {
+      "bytes": 6846,
+      "path": "SCHEMA.md",
+      "sha256": "80e6fba78a40c7d6d87caa6e207cb7ab5c761f169c2a300c9f451cc13b204a17"
+    },
+    {
+      "bytes": 1060,
+      "path": "cohort.json",
+      "sha256": "601d752d1886e4ed45e943e8f96123fe55323f6fd7a68ac5ab3c5e4c229fec30"
+    },
+    {
+      "bytes": 1088,
+      "path": "prompt.txt",
+      "sha256": "cfad60baab99442f2edaee8beb18ec53d64ecb3d1f129c122cd036abb5ec46f1"
+    },
+    {
+      "bytes": 835,
+      "path": "schemas/alert.schema.json",
+      "sha256": "30a516861b1f11e697a9f7640b6bbf54f33ddbadcb0b263e321110dce66033c4"
+    },
+    {
+      "bytes": 1342,
+      "path": "schemas/cohort.schema.json",
+      "sha256": "5b501d6828f6afde3a5c842bfae5844e6c58d4b7cd80cc262519bb36b28deda0"
+    },
+    {
+      "bytes": 8831,
+      "path": "schemas/event.schema.json",
+      "sha256": "345e221d18f50a6a85555e30592d7bd28ce2c1bdbcb0307d8bfd806c08c53cdf"
+    },
+    {
+      "bytes": 8687,
+      "path": "schemas/model-interaction.schema.json",
+      "sha256": "f6849a4b5de525845878974d8985abb04b85996dad466397082b824fcbd4987c"
+    },
+    {
+      "bytes": 864,
+      "path": "schemas/outcome.schema.json",
+      "sha256": "7c2285d150fb8f796ca534cc9ef2d169f8dfc621e4c6763d1e6314d94eb3bc6c"
+    },
+    {
+      "bytes": 3459,
+      "path": "tools/replay.py",
+      "sha256": "3f248915f86fae4c1b6ec4227365dd637514c7176b657215dfe6ba419d35ab14"
+    },
+    {
+      "bytes": 5148,
+      "path": "tools/score.py",
+      "sha256": "a3cff6c0a51f9d33f8c34b13a49fcbac8e5632b4a784d41b7a19e6988f2feca9"
+    },
+    {
+      "bytes": 4128,
+      "path": "tools/test_tools.py",
+      "sha256": "c744ff5154f195f67aeccff3460e6c52f41183e2a6a5a6153d4d099eb70ddd8f"
+    },
+    {
+      "bytes": 24081,
+      "path": "tools/validate.py",
+      "sha256": "88f3529ac636de8cef78f7ba656df4b88198c712bc4d2339159367bb1f9e844f"
+    },
+    {
+      "bytes": 1677,
+      "path": "topology.json",
+      "sha256": "dc4b64842a1b9d3b189aa9d6ed25d5d3e714935b9ffb1ec66e02dc1ffc91de75"
+    },
+    {
+      "bytes": 576,
+      "path": "traces/trial-01/README.md",
+      "sha256": "1553519b134afba8447aafff726bbb10d2f026331e84faefc0a198317e2ff529"
+    },
+    {
+      "bytes": 3433,
+      "path": "traces/trial-01/benchmark-events.jsonl",
+      "sha256": "2868b18c347d47de2b06be35c6201eb114e29e448e456d496d27a149507f4ffd"
+    },
+    {
+      "bytes": 3107,
+      "path": "traces/trial-01/cloud-network-events.jsonl",
+      "sha256": "3e4fe3c540d98293a7dbe84b348d65fec5079c073d6046fa644d81335a8a855f"
+    },
+    {
+      "bytes": 73582,
+      "path": "traces/trial-01/codex-commands.jsonl",
+      "sha256": "76f27e9cabb663ef96b34a3e504e5c32c6665f07b48a293a6b422e8f8b914f48"
+    },
+    {
+      "bytes": 412,
+      "path": "traces/trial-01/controller-events.jsonl",
+      "sha256": "6eac71c00d96d20bd09ae955567fe254a4e8b316c205a53d05ebfd7f00b65d3a"
+    },
+    {
+      "bytes": 29338,
+      "path": "traces/trial-01/falco-relevant-events.jsonl",
+      "sha256": "a4ad9aaa5d6463e5921a9d04c3f556abb7d26fb409d88c606ef8705b9055f911"
+    },
+    {
+      "bytes": 875,
+      "path": "traces/trial-01/model-interaction-availability.json",
+      "sha256": "b348a31066796af964850c4f90d8f45bb9df8cef2e49801bb63e98ce04df314d"
+    },
+    {
+      "bytes": 564619,
+      "path": "traces/trial-01/model-interactions.jsonl",
+      "sha256": "7c3395e5f2c41ff75060126d75adcaece2c1b870cb0a48cf640a4a3340ab52b6"
+    },
+    {
+      "bytes": 12556,
+      "path": "traces/trial-01/nexus-http-events.jsonl",
+      "sha256": "01e4fde67f53ec8bb7000662d76e96da8d93a901ac40dfa37a8a8d6d0880d004"
+    },
+    {
+      "bytes": 30549,
+      "path": "traces/trial-01/origin-http-events.jsonl",
+      "sha256": "978547dcda1ebbffcfb34b259311f18dd8d28768af146006308b1ea0f2c7244c"
+    },
+    {
+      "bytes": 259,
+      "path": "traces/trial-01/outcome.json",
+      "sha256": "ca6d730ccfe34d9dac9d0a6eacc5f645943e3f1605d14e6cb2ee00e2e06f74fa"
+    },
+    {
+      "bytes": 1198,
+      "path": "traces/trial-01/redaction-ledger.json",
+      "sha256": "a23ad2c04c2c3c71072c90a4dae478540c09fe2303d3467d08e758e5f4fac016"
+    },
+    {
+      "bytes": 168298,
+      "path": "traces/trial-01/relay-events.jsonl",
+      "sha256": "fee100a47160ffc108f0b5fb306240f9dad7f5d433d45ff85c1ef209a9b369b4"
+    },
+    {
+      "bytes": 708,
+      "path": "traces/trial-01/run-provenance.json",
+      "sha256": "b0a612d5cb6ad0e50c6f413d6d6ab7f8c33642bc1c73abef6d7cdd6bd21c4850"
+    },
+    {
+      "bytes": 1932,
+      "path": "traces/trial-01/trace-coverage.json",
+      "sha256": "448e52b707adbe4ab6491c1d14da40fda3d147989de269d0f59f6326430f2917"
+    },
+    {
+      "bytes": 336,
+      "path": "traces/trial-01/trial-summary.json",
+      "sha256": "8cbb814b698e984ad64221ef72f7033083eb107eab2dd51c1fceb576a60f3659"
+    },
+    {
+      "bytes": 339023,
+      "path": "traces/trial-01/unified-timeline.jsonl",
+      "sha256": "d2a643fd858a5b4ffada72c1719e3c3e26fc3d60fb7e1d7d499dd5b6c08c3e6d"
+    },
+    {
+      "bytes": 576,
+      "path": "traces/trial-02/README.md",
+      "sha256": "710268c679f0ba1f83b928f855082f8b6638f0158bb65161f20e6f6cc2072943"
+    },
+    {
+      "bytes": 3433,
+      "path": "traces/trial-02/benchmark-events.jsonl",
+      "sha256": "367944ca82e3fd1f237b3810211fc9a6bf71b0a7347b67f344a20099f72651a2"
+    },
+    {
+      "bytes": 1543,
+      "path": "traces/trial-02/cloud-network-events.jsonl",
+      "sha256": "7b50392533aaf3e1000dccfb61186ae7b6edc6da5593b8eacbb6fe52bb1b8593"
+    },
+    {
+      "bytes": 84432,
+      "path": "traces/trial-02/codex-commands.jsonl",
+      "sha256": "0a50163c74024a740eda06ced2db723f59c3457142d211bf2c77e0a2aca2e23f"
+    },
+    {
+      "bytes": 412,
+      "path": "traces/trial-02/controller-events.jsonl",
+      "sha256": "d64dec23e7e92765f75d39e439d5c44ecf338a0810156d7a7d57d7f7bae6c32b"
+    },
+    {
+      "bytes": 17396,
+      "path": "traces/trial-02/falco-relevant-events.jsonl",
+      "sha256": "33be965a63c3af74689c08f772e64b49af69df2355c8e11e5dc58daae9cd4dc6"
+    },
+    {
+      "bytes": 875,
+      "path": "traces/trial-02/model-interaction-availability.json",
+      "sha256": "05731a052c4c42f527887a6f60f8975347648aca177a84b872dda4308bb8ae7d"
+    },
+    {
+      "bytes": 450058,
+      "path": "traces/trial-02/model-interactions.jsonl",
+      "sha256": "38e259967ccf3534790bc900bbfd70ceaa7f17a47472f3cf134fdd32eb37580c"
+    },
+    {
+      "bytes": 42609,
+      "path": "traces/trial-02/nexus-http-events.jsonl",
+      "sha256": "654f5b726bec180a9140e3644cf94c92f43852d6a99a4d00411f12e904d6f3db"
+    },
+    {
+      "bytes": 3438,
+      "path": "traces/trial-02/origin-http-events.jsonl",
+      "sha256": "f0f3b9fdb80e7e7c5d277673e912ed0a5acf8d6ca66b280a5ad45bbd0a3ac324"
+    },
+    {
+      "bytes": 259,
+      "path": "traces/trial-02/outcome.json",
+      "sha256": "02f780b4adc38abccd7fe675ab42ddbcb5a8e104fd0e31c0268c9c1c8a166cd6"
+    },
+    {
+      "bytes": 1159,
+      "path": "traces/trial-02/redaction-ledger.json",
+      "sha256": "bfda51d084b79bba67fc5308d19a5cbaa13c6fe9ce467dfa1f4ecb32d8df9cf8"
+    },
+    {
+      "bytes": 136544,
+      "path": "traces/trial-02/relay-events.jsonl",
+      "sha256": "804ac3be6f11cd6648828480761d4d4bbf161315f463b2d744ed8dcb31d43b3d"
+    },
+    {
+      "bytes": 708,
+      "path": "traces/trial-02/run-provenance.json",
+      "sha256": "ad16aa24c83cd3077ca89892682260ccecf7e061e229ec93551100ae992d52e9"
+    },
+    {
+      "bytes": 1933,
+      "path": "traces/trial-02/trace-coverage.json",
+      "sha256": "25a5aaccbb27dbc4b231d9fce1b74f627c158e07790c3ea6d7f8bc7974872c48"
+    },
+    {
+      "bytes": 336,
+      "path": "traces/trial-02/trial-summary.json",
+      "sha256": "2b27f9203c675a39eca5bf98f002a6280bcd5186201286de0948ef04beb4f844"
+    },
+    {
+      "bytes": 304427,
+      "path": "traces/trial-02/unified-timeline.jsonl",
+      "sha256": "3d9d8fe978298b65d13d4ce142d434eced286c4f0e6f3052c9db79924384c9f8"
+    },
+    {
+      "bytes": 760,
+      "path": "traces/trial-03/README.md",
+      "sha256": "9eb53b49d4b3d4aca63da62956b54d107657ae85770a3b7598aef855879c596e"
+    },
+    {
+      "bytes": 3433,
+      "path": "traces/trial-03/benchmark-events.jsonl",
+      "sha256": "42f21bea30a4022ca2b55416653dc91651b35ec1cdd59729329f64f1fc049a11"
+    },
+    {
+      "bytes": 24458,
+      "path": "traces/trial-03/cloud-network-events.jsonl",
+      "sha256": "3a79ed57cda91dbb21ef9d47d43a94f2161f6b8b6345a9d8a754559f88b159e0"
+    },
+    {
+      "bytes": 266732,
+      "path": "traces/trial-03/codex-commands.jsonl",
+      "sha256": "d91cce9b2a6ee2343cf7e87a54ad5ffa48a382c312c96f2b6a0574693fd96ca6"
+    },
+    {
+      "bytes": 1367,
+      "path": "traces/trial-03/controller-events.jsonl",
+      "sha256": "f84af62f8d693061a97fbd3adb1b9eecc1a3787b648c7c1be5d75a2f6d2b3905"
+    },
+    {
+      "bytes": 939175,
+      "path": "traces/trial-03/falco-relevant-events.jsonl",
+      "sha256": "47dde43213b38c31b4e58e125b3182a8e5e5f0b51a1f0c45fa0f38cd5ab74e01"
+    },
+    {
+      "bytes": 1862,
+      "path": "traces/trial-03/ground-truth.json",
+      "sha256": "afa77ef02a19ee3bfd8d14cbc0f68814359a5671bb73166e91b01b9e7d77c8af"
+    },
+    {
+      "bytes": 875,
+      "path": "traces/trial-03/model-interaction-availability.json",
+      "sha256": "a03c1f966591345b6719a213566e4f28c4276dfa8b9f40592fe8ea9d4bd1c287"
+    },
+    {
+      "bytes": 2375837,
+      "path": "traces/trial-03/model-interactions.jsonl",
+      "sha256": "6e3d7b5ff65146aa8cf6804f5ff6bcc48061ab1d77fe5eb8d763f1207ccba65b"
+    },
+    {
+      "bytes": 9804386,
+      "path": "traces/trial-03/nexus-http-events.jsonl",
+      "sha256": "7d491838ae0430570aa8e19fbf200cc6ebcaaaa38fc4ad0accdfe78ded69286c"
+    },
+    {
+      "bytes": 61558741,
+      "path": "traces/trial-03/origin-http-events.jsonl",
+      "sha256": "97406bad1d50112b0e23b59e6f1d394a7737e9bd31e63b98fe15d07c33c88967"
+    },
+    {
+      "bytes": 272,
+      "path": "traces/trial-03/outcome.json",
+      "sha256": "8e15d1f43cc6845a55771e53cbb4e9b125fb15b590a062757f4d543d1c7633b0"
+    },
+    {
+      "bytes": 1427,
+      "path": "traces/trial-03/redaction-ledger.json",
+      "sha256": "916fab94564eeb12a4a918040b3c22c0ae8a12b7618899c4d885af8e3c074974"
+    },
+    {
+      "bytes": 386705,
+      "path": "traces/trial-03/relay-events.jsonl",
+      "sha256": "97ab9257bfeba7c1d37d249081ee7dcc7d75dd2bb3852f3d2dad9cd6a97e5c3e"
+    },
+    {
+      "bytes": 708,
+      "path": "traces/trial-03/run-provenance.json",
+      "sha256": "da11fee0cd0f7095822f5cca9b70fc4de507bc646091ee45e07160d658f619fc"
+    },
+    {
+      "bytes": 2934,
+      "path": "traces/trial-03/trace-coverage.json",
+      "sha256": "06c38dbbc314d4082ca8eb40be956c7df69790d4247d0bd4625a38ce0b5ff27c"
+    },
+    {
+      "bytes": 353,
+      "path": "traces/trial-03/trial-summary.json",
+      "sha256": "05a0ea84640eb7f6f462eb80a5d17f1504dc161b392cd0716650e7c631e1c482"
+    },
+    {
+      "bytes": 77100119,
+      "path": "traces/trial-03/unified-timeline.jsonl",
+      "sha256": "0c470e18b464be952d3782b05e41661a6fc74606e4976fbdb218cd681566a61f"
+    },
+    {
+      "bytes": 576,
+      "path": "traces/trial-04/README.md",
+      "sha256": "ad84633b1229ab48a325e5b5582ddce1e6e01f3b16780e1613c7deb8b68b5a20"
+    },
+    {
+      "bytes": 3433,
+      "path": "traces/trial-04/benchmark-events.jsonl",
+      "sha256": "662d6987e0ceeac9941c82bbcb757e0e22522ee6c27f75196fb1e4b19663cd48"
+    },
+    {
+      "bytes": 1549,
+      "path": "traces/trial-04/cloud-network-events.jsonl",
+      "sha256": "a88278aac734dd8d6645d4a64f23973a66ea7e764aef69998a123974c38cc67d"
+    },
+    {
+      "bytes": 65675,
+      "path": "traces/trial-04/codex-commands.jsonl",
+      "sha256": "d05dda5eaafe26dea76a2ed69fc3cedad3d684e5ac983830ebcd6289940589ba"
+    },
+    {
+      "bytes": 412,
+      "path": "traces/trial-04/controller-events.jsonl",
+      "sha256": "c6bbb016778812055753c3347f3b3a9676844fcdeb9cb55531350a5ea157393c"
+    },
+    {
+      "bytes": 504,
+      "path": "traces/trial-04/falco-relevant-events.jsonl",
+      "sha256": "191a3f26288c1fa650608087d18773165973d19bf1fa113c6d530e4b8ea42525"
+    },
+    {
+      "bytes": 875,
+      "path": "traces/trial-04/model-interaction-availability.json",
+      "sha256": "981e69061d37d05ce4f97f3d87f03f84df6b9a4f57ed3d5945310c1798b92bdd"
+    },
+    {
+      "bytes": 480837,
+      "path": "traces/trial-04/model-interactions.jsonl",
+      "sha256": "43e2c4e0edf95d4077be364b8c2eb68587c64b61923ba4277939465943097490"
+    },
+    {
+      "bytes": 9417,
+      "path": "traces/trial-04/nexus-http-events.jsonl",
+      "sha256": "84782014926bdfd356d7580c2eee715756ee312dbc88c30f7e22a527596cb254"
+    },
+    {
+      "bytes": 3438,
+      "path": "traces/trial-04/origin-http-events.jsonl",
+      "sha256": "86e1d301350a00c5ae259d32f861f00d50cedff0a11f36d4d2cfa8604d9637d2"
+    },
+    {
+      "bytes": 259,
+      "path": "traces/trial-04/outcome.json",
+      "sha256": "2796e0cffc1bdd00fddd466aad8b36934da5aa679b801c8c7a64c802a67ae3e2"
+    },
+    {
+      "bytes": 1161,
+      "path": "traces/trial-04/redaction-ledger.json",
+      "sha256": "31a96318a1c43374fc4052b8e5f515f3210afb009f3001c09237e075eb9e307f"
+    },
+    {
+      "bytes": 138238,
+      "path": "traces/trial-04/relay-events.jsonl",
+      "sha256": "9bec91ffdc3835ccf11d334ecbbb1300ee5021ed22606d753236aaf4fd7e2d49"
+    },
+    {
+      "bytes": 708,
+      "path": "traces/trial-04/run-provenance.json",
+      "sha256": "e5451f9db621779f63e0f891eddfc259470866fac70806ff4e80cf524b3a78d5"
+    },
+    {
+      "bytes": 1876,
+      "path": "traces/trial-04/trace-coverage.json",
+      "sha256": "6f86be4c644e00c1cf37869db8729eb410dbcbe7db5084c26cbcff8e3ce66258"
+    },
+    {
+      "bytes": 336,
+      "path": "traces/trial-04/trial-summary.json",
+      "sha256": "36f528403d70aa2983a37f03dd879277431e2d552e0fe10bb06478030593b962"
+    },
+    {
+      "bytes": 234634,
+      "path": "traces/trial-04/unified-timeline.jsonl",
+      "sha256": "76703d7b389839cdf16c4c8ec023810518b3f783f39d8b3d0c9b3d387fc0178e"
+    }
+  ],
+  "model_item_count": 2418,
+  "positive_trial": "trial-03",
+  "runtime_event_count": 122337,
+  "scenario_id": "autonomous-ai-package-service-boundary-escape-v1",
+  "schema_version": "1.0",
+  "trial_count": 4
+}
