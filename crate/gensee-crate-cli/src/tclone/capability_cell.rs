@@ -3904,8 +3904,66 @@ pub(super) fn attach_broker_lease_to_cell(
         lease.broker_lease_ids.push(broker_lease_id.to_string());
         lease.broker_lease_ids.sort();
         write_atomic_nofollow(&path, &serde_json::to_vec_pretty(&lease)?, 0o600)?;
+        super::capability_broker::maybe_inject_broker_fault(
+            "after_cell_attachment_rename_before_dirsync",
+        )?;
+        fs::File::open(path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "cell lease has no parent")
+        })?)?
+        .sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn persist_test_broker_cell_binding(
+    cell_id: &str,
+    lease_id: &str,
+    source_run_id: &str,
+    operation_id: &str,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+) -> io::Result<()> {
+    let mut request = CapabilityRequest::new(
+        "read_repository_metadata",
+        EffectScope::ReadOnly,
+        vec![
+            Capability::NetworkEgress,
+            Capability::SecretUse,
+            Capability::ProcessExecution,
+        ],
+    );
+    request.scope.network_destinations =
+        vec![gensee_crate_rules::capability::NetworkDestinationScope {
+            destination: "repo.example.test".to_string(),
+            protocol: "https".to_string(),
+            ports: vec![443],
+        }];
+    request.scope.secret_identities = vec![gensee_crate_rules::capability::SecretIdentityScope {
+        handle: "repo_reader".to_string(),
+        identity: "repository-reader".to_string(),
+        purpose: "read package metadata".to_string(),
+    }];
+    let lease = CapabilityCellLease {
+        schema_version: CELL_LEASE_SCHEMA_VERSION,
+        lease_id: lease_id.to_string(),
+        operation_id: operation_id.to_string(),
+        cell_id: cell_id.to_string(),
+        source_run_id: source_run_id.to_string(),
+        policy_decision: validate_cell_request_for_issue(&request)?,
+        request,
+        command: vec!["true".to_string()],
+        issued_at_ms,
+        expires_at_ms,
+        consumed_at_ms: None,
+        broker_lease_ids: Vec::new(),
+        replay_of_cell_id: None,
+        expected_input_snapshot_digest: None,
+    };
+    let lease_path = capability_lease_path(lease_id)?;
+    write_atomic_nofollow(&lease_path, &serde_json::to_vec_pretty(&lease)?, 0o600)?;
+    let binding_path = capability_cell_binding_path(cell_id)?;
+    write_atomic_nofollow(&binding_path, format!("{lease_id}\n").as_bytes(), 0o600)
 }
 
 #[cfg(test)]
