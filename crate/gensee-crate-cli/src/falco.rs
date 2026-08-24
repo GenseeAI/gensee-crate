@@ -299,9 +299,7 @@ fn falco_system_event_from_value(
         .get("output_fields")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let event_type = falco_string(&fields, &["evt.type", "evt_type"])
-        .or_else(|| falco_string(&value, &["event_type"]))
-        .unwrap_or_else(|| "unknown".to_string());
+    let (event_type, event_type_source) = falco_event_type(&value, &fields);
     let event_kind = classify_falco_event(&event_type, &fields);
     let file_path = falco_string(
         &fields,
@@ -326,6 +324,7 @@ fn falco_system_event_from_value(
         "schema_version": 1,
         "collector": "falco",
         "event_id": falco_string(&fields, &["evt.num", "evt_num"]),
+        "event_type_source": event_type_source,
         "rule": value.get("rule").cloned().unwrap_or(Value::Null),
         "priority": value.get("priority").cloned().unwrap_or(Value::Null),
         "host": host,
@@ -395,12 +394,100 @@ fn container_id_from_cgroups(cgroups: &str) -> Option<String> {
 }
 
 fn falco_event_time_ms(fields: &Value) -> Option<u64> {
-    // evt.rawtime is Falco's wall-clock event timestamp in nanoseconds. Using
-    // it instead of stdin arrival time preserves ordering across collectors.
-    falco_string(fields, &["evt.rawtime", "evt_rawtime"])
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|nanoseconds| nanoseconds / 1_000_000)
-        .filter(|milliseconds| *milliseconds > 0)
+    // Falco has emitted its wall-clock timestamp under several JSON field
+    // names across versions and output modes. These fields are nanoseconds
+    // since the Unix epoch, despite the `iso8601` name used by some outputs.
+    // Prefer the rawtime spelling, then accept the compatible aliases so
+    // replay and live ingestion retain the event clock instead of stdin
+    // arrival time.
+    falco_string(
+        fields,
+        &[
+            "evt.rawtime",
+            "evt_rawtime",
+            "evt.time",
+            "evt_time",
+            "evt.time.iso8601",
+            "evt_time_iso8601",
+        ],
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .map(|nanoseconds| nanoseconds / 1_000_000)
+    .filter(|milliseconds| *milliseconds > 0)
+}
+
+fn falco_event_type(value: &Value, fields: &Value) -> (String, &'static str) {
+    if let Some(event_type) = falco_string(fields, &["evt.type", "evt_type"])
+        .or_else(|| falco_string(value, &["event_type"]))
+    {
+        return (event_type, "falco_field");
+    }
+
+    if let Some(event_type) = falco_event_type_from_rule_metadata(value) {
+        return (event_type.to_string(), "rule_metadata");
+    }
+
+    ("unknown".to_string(), "fallback")
+}
+
+fn falco_event_type_from_rule_metadata(value: &Value) -> Option<&'static str> {
+    let tags = value
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let has_tag = |expected: &str| tags.iter().any(|tag| tag == expected);
+
+    // Prefer explicit rule tags. They describe the observation category but
+    // cannot recover the original syscall, so use broad, honest event types.
+    if has_tag("process") {
+        return Some("process_observation");
+    }
+    if has_tag("filesystem") || has_tag("file") {
+        return Some("file_access");
+    }
+    if has_tag("network") {
+        return Some("network_activity");
+    }
+    if has_tag("ipc") {
+        return Some("ipc_activity");
+    }
+    if has_tag("syscall") {
+        return Some("syscall_activity");
+    }
+    if has_tag("capture") {
+        return Some("capture_state");
+    }
+
+    let rule = value
+        .get("rule")
+        .and_then(Value::as_str)?
+        .to_ascii_lowercase();
+    if rule.contains("metrics snapshot") {
+        return Some("metrics_snapshot");
+    }
+    if rule.contains("process") {
+        return Some("process_observation");
+    }
+    if rule.contains("file") || rule.contains("filesystem") {
+        return Some("file_access");
+    }
+    if rule.contains("network") {
+        return Some("network_activity");
+    }
+    if rule.contains("ipc") {
+        return Some("ipc_activity");
+    }
+    if rule.contains("syscall") {
+        return Some("syscall_activity");
+    }
+    if rule.contains("capture") {
+        return Some("capture_state");
+    }
+    None
 }
 
 fn attribute_falco_event_to_tclone(
@@ -486,6 +573,12 @@ fn classify_falco_event(event_type: &str, fields: &Value) -> String {
         "connect" => "NetworkConnect".to_string(),
         "accept" | "accept4" => "NetworkAccept".to_string(),
         "bind" | "listen" | "socket" => "NetworkSocket".to_string(),
+        "process_observation" => "ProcessObservation".to_string(),
+        "file_access" => "FileAccess".to_string(),
+        "network_activity" => "NetworkActivity".to_string(),
+        "ipc_activity" => "IpcActivity".to_string(),
+        "metrics_snapshot" => "TelemetryMetric".to_string(),
+        "capture_state" => "CollectorState".to_string(),
         _ => "Syscall".to_string(),
     }
 }
@@ -573,6 +666,86 @@ mod tests {
             serde_json::from_str::<Value>(&event.raw_json).unwrap()["gensee"]["event_id"],
             "99"
         );
+        assert_eq!(
+            serde_json::from_str::<Value>(&event.raw_json).unwrap()["gensee"]["event_type_source"],
+            "falco_field"
+        );
+    }
+
+    #[test]
+    fn accepts_falco_timestamp_aliases_as_nanoseconds() {
+        for (field, timestamp) in [
+            ("evt.time", "1712345678123456789"),
+            ("evt_time", "1712345678123456789"),
+            ("evt.time.iso8601", "1712345678123456789"),
+            ("evt_time_iso8601", "1712345678123456789"),
+        ] {
+            let line = json!({
+                "output_fields": {
+                    field: timestamp,
+                    "evt.type": "open"
+                }
+            })
+            .to_string();
+            let event = system_event_from_falco_line(&line, 123, None).unwrap();
+            assert_eq!(event.observed_at_ms, 1_712_345_678_123, "{field}");
+        }
+    }
+
+    #[test]
+    fn rawtime_takes_precedence_over_timestamp_aliases() {
+        let event = system_event_from_falco_line(
+            r#"{"output_fields":{"evt.rawtime":"1712345678123456789","evt.time":"1812345678123456789","evt.type":"open"}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(event.observed_at_ms, 1_712_345_678_123);
+    }
+
+    #[test]
+    fn derives_broad_event_types_from_rule_metadata() {
+        let process = system_event_from_falco_line(
+            r#"{"rule":"Container Process Lifecycle","tags":["observe_only","process"],"output_fields":{"evt.time":1712345678123456789,"proc.pid":42}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(process.event_type, "process_observation");
+        assert_eq!(process.event_kind, "ProcessObservation");
+        assert_eq!(process.observed_at_ms, 1_712_345_678_123);
+        let raw = serde_json::from_str::<Value>(&process.raw_json).unwrap();
+        assert_eq!(raw["gensee"]["event_type_source"], "rule_metadata");
+
+        let network = system_event_from_falco_line(
+            r#"{"rule":"Container Network And IPC","tags":["network","ipc"],"output_fields":{"fd.name":"198.51.100.10:443"}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(network.event_type, "network_activity");
+        assert_eq!(network.event_kind, "NetworkActivity");
+
+        let metrics = system_event_from_falco_line(
+            r#"{"rule":"Falco internal: metrics snapshot","output_fields":{"evt.time":1712345678123456789}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(metrics.event_type, "metrics_snapshot");
+        assert_eq!(metrics.event_kind, "TelemetryMetric");
+    }
+
+    #[test]
+    fn explicit_event_type_takes_precedence_over_rule_metadata() {
+        let event = system_event_from_falco_line(
+            r#"{"rule":"Container Process Lifecycle","tags":["process"],"output_fields":{"evt.type":"connect"}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(event.event_type, "connect");
+        assert_eq!(event.event_kind, "NetworkConnect");
     }
 
     #[test]

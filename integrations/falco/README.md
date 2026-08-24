@@ -9,6 +9,13 @@ built-in cgroup field and matches it to the local Tclone registry, attaching
 the event to the corresponding source or fork run. This avoids a dependency on
 Falco's optional container metadata plugin.
 
+The bridge preserves Falco's event clock from the numeric nanosecond fields
+`evt.rawtime`, `evt.time`, or `evt.time.iso8601` (including their underscore
+aliases). If a custom rule omits `evt.type`, Gensee derives only a broad event
+category from the rule's standard tags or name and records
+`gensee.event_type_source = "rule_metadata"`; it does not claim to have
+recovered the missing syscall.
+
 This is a capture layer, not a claim that Tclone is a confinement boundary.
 The supplied `gensee-tclone-rules.yaml` rule pack records:
 
