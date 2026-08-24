@@ -23,6 +23,7 @@ gensee-crate-core = { path = "../gensee-crate-core" }
 gensee-crate-config-audit = { path = "../gensee-crate-config-audit" }
 gensee-crate-linux = { path = "../gensee-crate-linux" }
 gensee-crate-macos = { path = "../gensee-crate-macos" }
+gensee-crate-replay = { path = "../gensee-crate-replay" }
 gensee-crate-rules = { path = "../gensee-crate-rules" }
 gensee-crate-store = { path = "../gensee-crate-store" }
 hmac = "0.12"

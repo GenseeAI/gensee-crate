@@ -3,6 +3,7 @@ members = [
     "crate/gensee-crate-core",
     "crate/gensee-crate-attribution",
     "crate/gensee-crate-rules",
+    "crate/gensee-crate-replay",
     "crate/gensee-crate-store",
     "crate/gensee-crate-macos",
     "crate/gensee-crate-linux",

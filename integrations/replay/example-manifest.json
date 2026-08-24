@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "replay_id": "example_replay",
+  "max_out_of_order_ms": 60000,
+  "max_record_bytes": 8388608,
+  "max_buffered_events": 1000000,
+  "sources": [
+    {
+      "id": "host_events",
+      "path": "fixtures/host-events.jsonl",
+      "format": "jsonl",
+      "clock": {
+        "kind": "numeric",
+        "pointers": [
+          "/output_fields/evt.rawtime",
+          "/output_fields/evt.time",
+          "/output_fields/evt.time.iso8601"
+        ],
+        "unit": "nanoseconds"
+      },
+      "fields": {
+        "category": "/rule",
+        "destination": "/output_fields/fd.name",
+        "pid": "/output_fields/proc.pid"
+      }
+    },
+    {
+      "id": "service_requests",
+      "path": "fixtures/service-requests.jsonl",
+      "format": "jsonl",
+      "clock": {
+        "kind": "rfc3339",
+        "pointers": ["/timestamp"]
+      },
+      "fields": {
+        "action": "/action",
+        "request_id": "/request_id",
+        "status": "/status"
+      }
+    },
+    {
+      "id": "agent_sequence",
+      "path": "fixtures/agent-events.jsonl",
+      "format": "jsonl",
+      "clock": { "kind": "sequence" },
+      "fields": {
+        "event_type": "/type"
+      }
+    }
+  ]
+}

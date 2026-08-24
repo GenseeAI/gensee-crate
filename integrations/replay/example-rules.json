@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "max_active": 10000,
+  "max_matches_per_rule": 1000,
+  "rules": [
+    {
+      "id": "service_request_followed_by_connection",
+      "description": "A service request is followed by a host network observation.",
+      "max_span_ms": 1000,
+      "steps": [
+        {
+          "source": "service_requests",
+          "exists": ["request_id"]
+        },
+        {
+          "source": "host_events",
+          "exists": ["destination"]
+        }
+      ]
+    }
+  ]
+}
