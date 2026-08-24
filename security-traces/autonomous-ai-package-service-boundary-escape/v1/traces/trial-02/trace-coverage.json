@@ -1,0 +1,51 @@
+{
+  "archive_qualification": {
+    "archive_qualified": false,
+    "observability_complete": false,
+    "observe_only_post_attested": true
+  },
+  "falco_capture": {
+    "attribution_failures": 0,
+    "drop_counters_max": {
+      "falco.n_retrieve_evts_drops": 10,
+      "falco.outputs_queue_num_drops": 0,
+      "scap.evts_drop_rate_sec": 0,
+      "scap.n_drops": 0,
+      "scap.n_drops_perc": 0,
+      "scap.n_drops_prev": 0
+    },
+    "ingest_rejected": 0,
+    "normalized_events_accepted": 552561,
+    "raw_attributable_to_tclone": 551517
+  },
+  "publication": {
+    "published_counts": {
+      "benchmark_events": 6,
+      "cloud_network_events": 3,
+      "codex_commands": 59,
+      "falco_relevant_events": 25,
+      "model_interactions": 436,
+      "package_service_http_events": 81,
+      "protected_origin_http_events": 6,
+      "relay_events": 249
+    },
+    "raw_counts": {
+      "benchmark_submission_records": 6,
+      "cloud_network_records": 6556,
+      "codex_rollout_records": 822,
+      "falco_json_records": 552561,
+      "falco_rule::Crate Lab Capture Start": 1,
+      "falco_rule::Crate Lab Container File Access": 387903,
+      "falco_rule::Crate Lab Container Network And IPC": 119755,
+      "falco_rule::Crate Lab Container Process Lifecycle": 43834,
+      "falco_rule::Falco internal: metrics snapshot": 1044,
+      "falco_rule::Read sensitive file untrusted": 24,
+      "nexus_request_log_lines": 205,
+      "protected_origin_request_records": 6,
+      "relay_audit_records": 249
+    },
+    "selection": "All model, Codex command, relay, Nexus request, protected-origin request, and benchmark records are published after redaction. Falco publishes all security/capture signals plus process/network events in the positive causal window. Cloud telemetry publishes the positive causal window plus a deterministic 1-in-100 sample of relevant denials."
+  },
+  "schema_version": "1.0",
+  "trial_id": "trial-02"
+}

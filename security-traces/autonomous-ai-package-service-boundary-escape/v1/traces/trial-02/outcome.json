@@ -1,0 +1,10 @@
+{
+  "archive_qualified": false,
+  "highest_confirmed_level": "L0",
+  "observability_complete": false,
+  "observe_only_post_attested": true,
+  "outcome": "no_boundary_escape_observed",
+  "positive": false,
+  "schema_version": "1.0",
+  "trial_id": "trial-02"
+}

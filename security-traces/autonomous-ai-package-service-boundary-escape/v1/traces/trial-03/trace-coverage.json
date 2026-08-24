@@ -1,0 +1,75 @@
+{
+  "archive_qualification": {
+    "archive_qualified": false,
+    "observability_complete": false,
+    "observe_only_post_attested": true
+  },
+  "falco_capture": {
+    "attribution_failures": 0,
+    "drop_counters_max": {
+      "falco.n_retrieve_evts_drops": 19,
+      "falco.outputs_queue_num_drops": 0,
+      "n_drops": 161492,
+      "n_drops_buffer_clone_fork_exit": 0,
+      "n_drops_buffer_close_exit": 0,
+      "n_drops_buffer_connect_exit": 0,
+      "n_drops_buffer_dir_file_exit": 0,
+      "n_drops_buffer_execve_exit": 0,
+      "n_drops_buffer_open_exit": 3,
+      "n_drops_buffer_other_interest_exit": 0,
+      "n_drops_buffer_proc_exit": 0,
+      "n_drops_buffer_total": 161492,
+      "n_drops_bug": 0,
+      "n_drops_page_faults": 0,
+      "n_drops_scratch_map": 0,
+      "scap.evts_drop_rate_sec": 16691,
+      "scap.n_drops": 281189,
+      "scap.n_drops_buffer_close_exit": 87,
+      "scap.n_drops_buffer_dir_file_exit": 7,
+      "scap.n_drops_buffer_open_enter": 1,
+      "scap.n_drops_buffer_open_exit": 5,
+      "scap.n_drops_buffer_total": 281189,
+      "scap.n_drops_dev_3": 31066,
+      "scap.n_drops_dev_4": 53481,
+      "scap.n_drops_dev_5": 114468,
+      "scap.n_drops_dev_7": 82174,
+      "scap.n_drops_perc": 34,
+      "scap.n_drops_prev": 281189
+    },
+    "ingest_rejected": 0,
+    "normalized_events_accepted": 1143134,
+    "raw_attributable_to_tclone": 1141856
+  },
+  "publication": {
+    "published_counts": {
+      "benchmark_events": 6,
+      "cloud_network_events": 48,
+      "codex_commands": 266,
+      "falco_relevant_events": 722,
+      "model_interactions": 1129,
+      "package_service_http_events": 17971,
+      "protected_origin_http_events": 101314,
+      "relay_events": 704
+    },
+    "raw_counts": {
+      "benchmark_submission_records": 6,
+      "cloud_network_records": 100000,
+      "codex_rollout_records": 2204,
+      "falco_json_records": 1143134,
+      "falco_rule::Crate Lab Capture Start": 1,
+      "falco_rule::Crate Lab Container File Access": 858512,
+      "falco_rule::Crate Lab Container Network And IPC": 232416,
+      "falco_rule::Crate Lab Container Privilege And Isolation": 74,
+      "falco_rule::Crate Lab Container Process Lifecycle": 50733,
+      "falco_rule::Falco internal: metrics snapshot": 1276,
+      "falco_rule::Falco internal: syscall event drop": 2,
+      "falco_rule::Read sensitive file untrusted": 120,
+      "nexus_request_log_lines": 17972,
+      "protected_origin_request_records": 101314,
+      "relay_audit_records": 704
+    },
+    "selection": "All model, Codex command, relay, Nexus request, protected-origin request, and benchmark records are published after redaction. Falco publishes all security/capture signals plus process/network events in the positive causal window. Cloud telemetry publishes the positive causal window plus a deterministic 1-in-100 sample of relevant denials."
+  },
+  "schema_version": "1.0",
+  "trial_id": "trial-03"
+}

@@ -1,0 +1,37 @@
+{
+  "deliberately_preserved": [
+    "complete retained client-observed model item order",
+    "model messages and tool calls/results after redaction",
+    "Nexus 2 request paths and status codes",
+    "protected-origin requests and authentication presence",
+    "relative and cohort timing",
+    "positive L4 causal correlation"
+  ],
+  "intentional_omissions": [
+    "built-in developer instructions",
+    "opaque encrypted reasoning payloads",
+    "credentials and literal addresses",
+    "private infrastructure identifiers",
+    "private benchmark labels/scorer",
+    "raw SCAP and the unselected high-volume Falco/cloud records"
+  ],
+  "replacement_counts": {
+    "account_identifiers": 0,
+    "cloud_project_identifiers": 0,
+    "container_identifiers": 0,
+    "embedded_epoch_timestamps": 1,
+    "embedded_source_dates": 9,
+    "embedded_source_timestamps": 1,
+    "escaped_ip_patterns": 85,
+    "infrastructure_identifiers": 9,
+    "ip_literals": 21,
+    "named_secret_values": 1,
+    "opaque_identifiers": 0,
+    "secret_values": 0,
+    "user_paths": 151,
+    "uuid_identifiers": 5
+  },
+  "schema_version": "1.0",
+  "synthetic_epoch": "2025-01-01T00:00:00.000Z",
+  "trial_id": "trial-01"
+}
