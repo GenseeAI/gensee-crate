@@ -1,10 +1,15 @@
 use super::*;
+use chrono::DateTime;
+use std::collections::BTreeSet;
 use std::fmt;
 
 const FALCO_SOURCE: &str = "linux-falco";
 const MIN_CONTAINER_ID_PREFIX_LEN: usize = 12;
 const FALCO_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const FALCO_RETENTION_POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const EARLIEST_PLAUSIBLE_FALCO_TIMESTAMP_MS: u64 = 946_684_800_000;
+const LATEST_TEST_FALLBACK_FALCO_TIMESTAMP_MS: u64 = 4_102_444_800_000;
+const FALCO_FUTURE_CLOCK_SKEW_MS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Default)]
 struct TcloneRunRegistryCache {
@@ -299,9 +304,7 @@ fn falco_system_event_from_value(
         .get("output_fields")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let event_type = falco_string(&fields, &["evt.type", "evt_type"])
-        .or_else(|| falco_string(&value, &["event_type"]))
-        .unwrap_or_else(|| "unknown".to_string());
+    let (event_type, event_type_source) = falco_event_type(&value, &fields);
     let event_kind = classify_falco_event(&event_type, &fields);
     let file_path = falco_string(
         &fields,
@@ -325,7 +328,9 @@ fn falco_system_event_from_value(
     let gensee = json!({
         "schema_version": 1,
         "collector": "falco",
+        "ingested_at_ms": observed_at_ms,
         "event_id": falco_string(&fields, &["evt.num", "evt_num"]),
+        "event_type_source": event_type_source,
         "rule": value.get("rule").cloned().unwrap_or(Value::Null),
         "priority": value.get("priority").cloned().unwrap_or(Value::Null),
         "host": host,
@@ -351,7 +356,7 @@ fn falco_system_event_from_value(
         source: FALCO_SOURCE.to_string(),
         event_type,
         event_kind,
-        observed_at_ms: falco_event_time_ms(&fields).unwrap_or(observed_at_ms),
+        observed_at_ms: falco_event_time_ms(&fields, observed_at_ms).unwrap_or(observed_at_ms),
         pid: falco_u32(&fields, &["proc.pid", "thread.tid"]),
         ppid: falco_u32(&fields, &["proc.ppid"]),
         process_name: falco_string(&fields, &["proc.name", "proc.pname"]),
@@ -394,13 +399,141 @@ fn container_id_from_cgroups(cgroups: &str) -> Option<String> {
         .max_by_key(|candidate| candidate.len())
 }
 
-fn falco_event_time_ms(fields: &Value) -> Option<u64> {
-    // evt.rawtime is Falco's wall-clock event timestamp in nanoseconds. Using
-    // it instead of stdin arrival time preserves ordering across collectors.
-    falco_string(fields, &["evt.rawtime", "evt_rawtime"])
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|nanoseconds| nanoseconds / 1_000_000)
-        .filter(|milliseconds| *milliseconds > 0)
+fn falco_event_time_ms(fields: &Value, ingested_at_ms: u64) -> Option<u64> {
+    // Falco has emitted its wall-clock timestamp under several JSON field
+    // names across versions and output modes. These fields are nanoseconds
+    // since the Unix epoch, despite the `iso8601` name used by some outputs.
+    // Prefer the rawtime spelling, then accept the compatible aliases so
+    // replay and live ingestion retain the event clock instead of stdin
+    // arrival time.
+    for key in [
+        "evt.rawtime",
+        "evt_rawtime",
+        "evt.time",
+        "evt_time",
+        "evt.time.iso8601",
+        "evt_time_iso8601",
+    ] {
+        let Some(value) = falco_scalar_string(fields, key) else {
+            continue;
+        };
+        let milliseconds = value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|nanoseconds| nanoseconds / 1_000_000)
+            .or_else(|| {
+                DateTime::parse_from_rfc3339(value.trim())
+                    .ok()
+                    .and_then(|timestamp| u64::try_from(timestamp.timestamp_millis()).ok())
+            });
+        if milliseconds
+            .is_some_and(|timestamp| plausible_falco_timestamp_ms(timestamp, ingested_at_ms))
+        {
+            return milliseconds;
+        }
+    }
+    None
+}
+
+fn plausible_falco_timestamp_ms(timestamp_ms: u64, ingested_at_ms: u64) -> bool {
+    let latest = if ingested_at_ms >= EARLIEST_PLAUSIBLE_FALCO_TIMESTAMP_MS {
+        ingested_at_ms.saturating_add(FALCO_FUTURE_CLOCK_SKEW_MS)
+    } else {
+        LATEST_TEST_FALLBACK_FALCO_TIMESTAMP_MS
+    };
+    (EARLIEST_PLAUSIBLE_FALCO_TIMESTAMP_MS..=latest).contains(&timestamp_ms)
+}
+
+fn falco_event_type(value: &Value, fields: &Value) -> (String, &'static str) {
+    if let Some(event_type) = falco_string(fields, &["evt.type", "evt_type"])
+        .or_else(|| falco_string(value, &["event_type"]))
+    {
+        return (event_type, "falco_field");
+    }
+
+    if let Some(event_type) = falco_event_type_from_rule_metadata(value) {
+        return (event_type.to_string(), "rule_metadata");
+    }
+
+    ("unknown".to_string(), "fallback")
+}
+
+fn falco_event_type_from_rule_metadata(value: &Value) -> Option<&'static str> {
+    let categories = value
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(activity_category)
+        .collect::<BTreeSet<_>>();
+
+    // Tags are authoritative only when their complete set maps to one honest
+    // observation category (or the explicitly supported network+IPC union).
+    if !categories.is_empty() {
+        return event_type_for_categories(&categories);
+    }
+
+    let words = value
+        .get("rule")
+        .and_then(Value::as_str)?
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if words.windows(2).any(|pair| pair == ["metrics", "snapshot"]) {
+        return Some("metrics_snapshot");
+    }
+    let categories = words
+        .iter()
+        .filter_map(|word| activity_category(word))
+        .collect::<BTreeSet<_>>();
+    event_type_for_categories(&categories)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ActivityCategory {
+    Process,
+    File,
+    Network,
+    Ipc,
+    Syscall,
+    Capture,
+}
+
+fn activity_category(value: &str) -> Option<ActivityCategory> {
+    match value.to_ascii_lowercase().as_str() {
+        "process" => Some(ActivityCategory::Process),
+        "file" | "filesystem" => Some(ActivityCategory::File),
+        "network" => Some(ActivityCategory::Network),
+        "ipc" => Some(ActivityCategory::Ipc),
+        "syscall" => Some(ActivityCategory::Syscall),
+        "capture" => Some(ActivityCategory::Capture),
+        _ => None,
+    }
+}
+
+fn event_type_for_categories(categories: &BTreeSet<ActivityCategory>) -> Option<&'static str> {
+    if categories.len() == 2
+        && categories.contains(&ActivityCategory::Network)
+        && categories.contains(&ActivityCategory::Ipc)
+    {
+        return Some("network_ipc_activity");
+    }
+    match categories
+        .iter()
+        .copied()
+        .next()
+        .filter(|_| categories.len() == 1)?
+    {
+        ActivityCategory::Process => Some("process_observation"),
+        ActivityCategory::File => Some("file_access"),
+        ActivityCategory::Network => Some("network_activity"),
+        ActivityCategory::Ipc => Some("ipc_activity"),
+        ActivityCategory::Syscall => Some("syscall_activity"),
+        ActivityCategory::Capture => Some("capture_state"),
+    }
 }
 
 fn attribute_falco_event_to_tclone(
@@ -486,6 +619,13 @@ fn classify_falco_event(event_type: &str, fields: &Value) -> String {
         "connect" => "NetworkConnect".to_string(),
         "accept" | "accept4" => "NetworkAccept".to_string(),
         "bind" | "listen" | "socket" => "NetworkSocket".to_string(),
+        "process_observation" => "ProcessObservation".to_string(),
+        "file_access" => "FileAccess".to_string(),
+        "network_activity" => "NetworkActivity".to_string(),
+        "network_ipc_activity" => "NetworkIpcActivity".to_string(),
+        "ipc_activity" => "IpcActivity".to_string(),
+        "metrics_snapshot" => "TelemetryMetric".to_string(),
+        "capture_state" => "CollectorState".to_string(),
         _ => "Syscall".to_string(),
     }
 }
@@ -503,14 +643,16 @@ fn falco_network_destination(fields: &Value) -> Option<String> {
 }
 
 fn falco_string(value: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        let value = value.get(*key).and_then(|value| match value {
-            Value::String(value) => Some(value.clone()),
-            Value::Number(value) => Some(value.to_string()),
-            _ => None,
-        })?;
-        (!value.trim().is_empty() && !matches!(value.trim(), "<NA>" | "<N/A>")).then_some(value)
-    })
+    keys.iter().find_map(|key| falco_scalar_string(value, key))
+}
+
+fn falco_scalar_string(value: &Value, key: &str) -> Option<String> {
+    let value = value.get(key).and_then(|value| match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    })?;
+    (!value.trim().is_empty() && !matches!(value.trim(), "<NA>" | "<N/A>")).then_some(value)
 }
 
 fn falco_u32(value: &Value, keys: &[&str]) -> Option<u32> {
@@ -573,6 +715,136 @@ mod tests {
             serde_json::from_str::<Value>(&event.raw_json).unwrap()["gensee"]["event_id"],
             "99"
         );
+        assert_eq!(
+            serde_json::from_str::<Value>(&event.raw_json).unwrap()["gensee"]["event_type_source"],
+            "falco_field"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&event.raw_json).unwrap()["gensee"]["ingested_at_ms"],
+            123
+        );
+    }
+
+    #[test]
+    fn accepts_falco_timestamp_aliases_as_nanoseconds() {
+        for (field, timestamp) in [
+            ("evt.time", "1712345678123456789"),
+            ("evt_time", "1712345678123456789"),
+            ("evt.time.iso8601", "1712345678123456789"),
+            ("evt_time_iso8601", "1712345678123456789"),
+        ] {
+            let line = json!({
+                "output_fields": {
+                    field: timestamp,
+                    "evt.type": "open"
+                }
+            })
+            .to_string();
+            let event = system_event_from_falco_line(&line, 123, None).unwrap();
+            assert_eq!(event.observed_at_ms, 1_712_345_678_123, "{field}");
+        }
+    }
+
+    #[test]
+    fn rawtime_takes_precedence_over_timestamp_aliases() {
+        let event = system_event_from_falco_line(
+            r#"{"output_fields":{"evt.rawtime":"1712345678123456789","evt.time":"1812345678123456789","evt.type":"open"}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(event.observed_at_ms, 1_712_345_678_123);
+    }
+
+    #[test]
+    fn timestamp_aliases_are_parsed_independently_and_accept_rfc3339() {
+        let event = system_event_from_falco_line(
+            r#"{"output_fields":{"evt.rawtime":"not-a-clock","evt.time":"2024-04-05T19:34:38.250Z","evt.type":"open"}}"#,
+            1_712_345_679_000,
+            None,
+        )
+        .unwrap();
+        assert_eq!(event.observed_at_ms, 1_712_345_678_250);
+    }
+
+    #[test]
+    fn implausible_timestamp_magnitudes_fall_back_to_ingestion_time() {
+        for timestamp in ["1712345678", "1712345678123", "9999999999999999999"] {
+            let line = json!({
+                "output_fields": {
+                    "evt.rawtime": timestamp,
+                    "evt.type": "open"
+                }
+            })
+            .to_string();
+            let event = system_event_from_falco_line(&line, 1_712_345_679_000, None).unwrap();
+            assert_eq!(event.observed_at_ms, 1_712_345_679_000, "{timestamp}");
+        }
+    }
+
+    #[test]
+    fn derives_broad_event_types_from_rule_metadata() {
+        let process = system_event_from_falco_line(
+            r#"{"rule":"Container Process Lifecycle","tags":["observe_only","process"],"output_fields":{"evt.time":1712345678123456789,"proc.pid":42}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(process.event_type, "process_observation");
+        assert_eq!(process.event_kind, "ProcessObservation");
+        assert_eq!(process.observed_at_ms, 1_712_345_678_123);
+        let raw = serde_json::from_str::<Value>(&process.raw_json).unwrap();
+        assert_eq!(raw["gensee"]["event_type_source"], "rule_metadata");
+
+        let network = system_event_from_falco_line(
+            r#"{"rule":"Container Network And IPC","tags":["network","ipc"],"output_fields":{"fd.name":"198.51.100.10:443"}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(network.event_type, "network_ipc_activity");
+        assert_eq!(network.event_kind, "NetworkIpcActivity");
+
+        let metrics = system_event_from_falco_line(
+            r#"{"rule":"Falco internal: metrics snapshot","output_fields":{"evt.time":1712345678123456789}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(metrics.event_type, "metrics_snapshot");
+        assert_eq!(metrics.event_kind, "TelemetryMetric");
+    }
+
+    #[test]
+    fn conflicting_tags_and_substring_names_do_not_claim_a_category() {
+        let conflict = system_event_from_falco_line(
+            r#"{"rule":"Mixed observation","tags":["network","process"],"output_fields":{}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(conflict.event_type, "unknown");
+        assert_eq!(conflict.event_kind, "Syscall");
+
+        let profile = system_event_from_falco_line(
+            r#"{"rule":"Modify shell profile","output_fields":{}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(profile.event_type, "unknown");
+    }
+
+    #[test]
+    fn explicit_event_type_takes_precedence_over_rule_metadata() {
+        let event = system_event_from_falco_line(
+            r#"{"rule":"Container Process Lifecycle","tags":["process"],"output_fields":{"evt.type":"connect"}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        assert_eq!(event.event_type, "connect");
+        assert_eq!(event.event_kind, "NetworkConnect");
     }
 
     #[test]

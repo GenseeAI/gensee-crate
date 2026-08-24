@@ -7140,6 +7140,45 @@ mod tests {
     }
 
     #[test]
+    fn falco_retention_ages_replayed_events_from_ingestion_time() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-falco-historical-retention-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_system_event(&SystemEvent {
+                source: "linux-falco".to_string(),
+                event_type: "execve".to_string(),
+                event_kind: "ProcessExec".to_string(),
+                observed_at_ms: 1,
+                pid: Some(42),
+                ppid: Some(1),
+                process_name: Some("sh".to_string()),
+                executable_path: Some("/bin/sh".to_string()),
+                file_path: None,
+                command_line: Some("sh -c true".to_string()),
+                raw_json: r#"{"gensee":{"ingested_at_ms":10000}}"#.to_string(),
+            })
+            .unwrap();
+
+        let pruned = store
+            .prune_falco_retention_with_budget(10_000, 0, 100, 100, Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(pruned, 0);
+        assert_eq!(
+            store
+                .list_native_system_events(None, None, i64::MIN, i64::MAX, 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn unattributed_falco_events_are_capture_only() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-store-test-falco-capture-only-{}",

@@ -522,6 +522,7 @@ pub(crate) fn timeline_system_events(
 pub(crate) fn stored_system_event_for_timeline(
     stored: gensee_crate_store::StoredSystemEvent,
 ) -> io::Result<SystemEvent> {
+    let is_falco = stored.source == "linux-falco";
     let mut event = match stored.source.as_str() {
         "linux-falco" => {
             system_event_from_persisted_falco_line(&stored.raw_json, stored.observed_at_ms)?
@@ -537,7 +538,12 @@ pub(crate) fn stored_system_event_for_timeline(
         }
     };
     event.source = stored.source;
-    event.event_type = stored.event_type;
+    // Always re-derive both Falco fields from the same raw record. Older rows
+    // may contain `unknown`, and classification can evolve; mixing a stored
+    // type with a newly derived kind would make the pair internally false.
+    if !is_falco {
+        event.event_type = stored.event_type;
+    }
     event.observed_at_ms = stored.observed_at_ms;
     event.pid = stored.pid.or(event.pid);
     event.raw_json = stored.raw_json;
@@ -690,6 +696,50 @@ mod native_system_event_tests {
             Some("203.0.113.10:443")
         );
         assert_eq!(event.raw_json, raw_json);
+    }
+
+    #[test]
+    fn legacy_unknown_falco_type_stays_consistent_with_rederived_kind() {
+        let stored = StoredSystemEvent {
+            event_id: 1,
+            source: "linux-falco".to_string(),
+            event_type: "unknown".to_string(),
+            observed_at_ms: 123,
+            pid: Some(42),
+            raw_json: json!({
+                "rule": "Container Process Lifecycle",
+                "tags": ["process"],
+                "output_fields": {"proc.pid": 42}
+            })
+            .to_string(),
+        };
+
+        let event = stored_system_event_for_timeline(stored).unwrap();
+
+        assert_eq!(event.event_type, "process_observation");
+        assert_eq!(event.event_kind, "ProcessObservation");
+    }
+
+    #[test]
+    fn changed_falco_classification_rederives_type_and_kind_together() {
+        let stored = StoredSystemEvent {
+            event_id: 1,
+            source: "linux-falco".to_string(),
+            event_type: "network_activity".to_string(),
+            observed_at_ms: 123,
+            pid: Some(42),
+            raw_json: json!({
+                "rule": "Container Network And IPC",
+                "tags": ["network", "ipc"],
+                "output_fields": {"proc.pid": 42}
+            })
+            .to_string(),
+        };
+
+        let event = stored_system_event_for_timeline(stored).unwrap();
+
+        assert_eq!(event.event_type, "network_ipc_activity");
+        assert_eq!(event.event_kind, "NetworkIpcActivity");
     }
 
     #[test]

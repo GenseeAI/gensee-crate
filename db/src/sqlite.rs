@@ -1506,7 +1506,10 @@ impl SqliteStore {
                  FROM system_events
                  WHERE source = ?1
                    AND (
-                       ts < ?2 OR event_id <= COALESCE((
+                       COALESCE(
+                           CAST(json_extract(args, '$.gensee.ingested_at_ms') AS INTEGER),
+                           ts
+                       ) < ?2 OR event_id <= COALESCE((
                            SELECT event_id
                            FROM system_events
                            WHERE source = ?1
