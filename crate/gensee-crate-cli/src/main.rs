@@ -97,6 +97,8 @@ mod checkpoint;
 pub(crate) use checkpoint::*;
 mod network_boundary;
 pub(crate) use network_boundary::*;
+mod effect_transaction;
+pub(crate) use effect_transaction::*;
 mod operation_supervisor;
 pub(crate) use operation_supervisor::*;
 mod operation_boundary;
@@ -5425,7 +5427,7 @@ pub(crate) fn print_usage() {
         "GENERIC OPERATION BOUNDARY:\n  gensee boundary validate --contract <contract.json> [--json]\n  gensee boundary audit --contract <contract.json> [--json]\n  sudo gensee boundary run --contract <contract.json> [--workspace <dir>] [--manifest <manifest.json>] -- <command> [args...]\n"
     );
     println!(
-        "CAPABILITY FAULTS AND C0 NETWORK:\n  sudo gensee boundary-daemon --state-root <root> --config <operation.json>\n  gensee run fault --socket <path> --fault <fault.json>\n  gensee run network serve --state-root <root> --config <operation.json> [--dry-run]\n  gensee run network event --socket <path> --event <event.json>\n  sudo gensee run network transaction-begin --socket <path> --transaction <id> --operation <id> --effect <effect> --ttl-seconds <n>\n  sudo gensee run network transaction-activate|transaction-revoke|transaction-end --socket <path> --transaction <id> --operation <id>\n  gensee run network inspect --socket <path>\n"
+        "CAPABILITY FAULTS AND C0 NETWORK:\n  sudo gensee boundary-daemon --state-root <root> --config <operation.json>\n  gensee run fault --socket <path> --fault <fault.json>\n  gensee run network serve --state-root <root> --config <operation.json> [--dry-run]\n  gensee run network event --socket <path> --event <event.json>\n  sudo gensee run network transaction-begin --socket <path> --transaction <id> --operation <id> --effect <effect> --ttl-seconds <n>\n  sudo gensee run network transaction-activate|transaction-revoke|transaction-end --socket <path> --transaction <id> --operation <id>\n  sudo gensee run network transaction-execute --config <coordinator.json> --request <effect.json> --transaction <id>\n  gensee run network inspect --socket <path>\n"
     );
     println!(
         "CAPABILITY CELLS:\n  gensee run lease issue <source-run-id> --request <request.json> -- <command> [args...]\n  gensee run cell <source-run-id> --lease <lease-id> [--json]\n  gensee run cell inspect <cell-id> [--json]\n  gensee run cell replay <cell-id> --source <running-source-id> [--ttl-seconds N] [--json]\n  gensee run cell promote <cell-id> --into <source-run-id> --path <path> [--path <path>...] [--dry-run] [--json]\n\nCAPABILITY BROKER (HOST ONLY):\n  gensee run broker adapter register --config <adapter.json> [--replace]\n  gensee run broker adapter inspect <adapter-id> [--json]\n  gensee run broker lease issue --request <broker-request.json> [--json]\n  gensee run broker lease inspect <lease-id> [--json]\n  gensee run broker lease revoke <lease-id> [--json]\n  gensee run broker lease revoke-expired [--json]\n  gensee run broker commit consume <token-id> --gateway <id> --target <target> --action <action> --request-digest <sha256:...> [--json]\n"

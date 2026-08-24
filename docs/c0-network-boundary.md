@@ -163,6 +163,104 @@ sudo gensee run network transaction-revoke \
   --transaction http_tx_1 --operation op_agent_fetch
 ~~~
 
+For an untrusted caller, prefer the trusted coordinator instead of exposing
+those lifecycle controls. The coordinator accepts one explicit structured
+effect request. It does not watch traffic or infer intent. Its root-owned config
+fixes the supervisor socket, operation and effect classes, TTL, executor label,
+executable, and full argv template:
+
+~~~json
+{
+  "schema_version": 1,
+  "executor_label": "mediated_worker",
+  "supervisor_socket": "/var/lib/gensee-boundary/network-operations/op_agent_fetch/supervisor.sock",
+  "operation_id": "op_agent_fetch",
+  "operation_class": "document_lookup",
+  "effect": "external_http_read",
+  "ttl_seconds": 60,
+  "command": {
+    "executable": "/usr/local/libexec/gensee-mediated-worker",
+    "args": [
+      "--request-json", "{effect_request_json}"
+    ],
+    "environment": {},
+    "working_directory": "/"
+  }
+}
+~~~
+
+The request is a bounded JSON object. It may carry application values, but it
+cannot change the root-owned effect class, mediator scope, TTL, executable, or
+argv shape. Domain semantics remain the responsibility of the configured
+trusted executor:
+
+~~~json
+{
+  "schema_version": 1,
+  "request_id": "http_tx_123",
+  "operation_class": "document_lookup",
+  "parameters": {
+    "document_id": "doc_123",
+    "query": "summary"
+  }
+}
+~~~
+
+Run the coordinator from the trusted host integration:
+
+~~~console
+sudo gensee run network transaction-execute \
+  --config /etc/gensee/effect-coordinator.json \
+  --request /run/gensee/requests/effect-123.json \
+  --transaction http_tx_123
+~~~
+
+The supervisor installs active authority in one durable `start` transition,
+then the coordinator launches the exact configured argv without a shell. It
+ends the transaction only after exit status zero and revokes it after a
+non-zero exit, child signal, spawn error, `SIGINT`, or `SIGTERM`. A coordinator
+`SIGKILL` or host crash cannot execute cleanup; the root-owned TTL remains the
+fail-closed upper bound in that case. The config and executable must be
+root-owned non-symlinks with root-controlled ancestry. The request replaces one
+whole argv element, so request text cannot add flags or select another
+executable. The coordinator clears ambient environment variables before
+launching the configured command. If the `start` response is lost after a
+possible durable commit, the coordinator immediately issues a best-effort
+revocation for the same transaction before returning the transport error.
+
+The intended same-machine topology uses **two distinct execution identities**:
+
+- The initiating workload is attached only to its own network. It has no route to the HTTP
+  mediator address and no access to the root-only supervisor socket.
+- The mediated worker has a fixed, non-spoofable identity. Its raw egress is
+  deny-by-default; the only allowed destination is the mediator, whose
+  `proxy.client_address` is that identity.
+- The host coordinator owns lifecycle control. Neither untrusted identity can change
+  the operation, effect, TTL, URL scopes, request budgets, or command template.
+
+This separation is a deployment invariant, not something inferred from the
+process name. An operator should give the agent only a narrow request API that
+invokes this one root-owned config, not general `sudo gensee` or `podman exec`.
+
+The portable integration tests use a fake Unix supervisor and harmless exact
+commands to verify start/end, start/revoke, spawn failure, child crash, and
+signal cancellation. A rootful Podman topology test should additionally:
+
+1. create isolated initiating and mediated execution subjects;
+2. prove the initiating subject cannot connect to the mediator or supervisor
+   before, during, or after an effect transaction;
+3. prove the mediated subject cannot connect directly to approved or
+   unapproved external endpoints;
+4. execute one structured effect request and prove only the configured mediated
+   subject can use the mediator during the active TTL;
+5. kill the child/coordinator and prove revocation or TTL expiry removes access;
+6. retain `http-transactions.jsonl`, `http-mediator.jsonl`, and `effects.jsonl`
+   as the test evidence bundle.
+
+That rootful topology is intentionally an opt-in host test because ordinary CI
+does not provide the privileged network namespaces and firewall ownership it
+must validate.
+
 Control peers are authenticated with `SO_PEERCRED` exactly like other boundary
 administration. Transaction IDs are one-use. The requested TTL starts at
 `transaction-begin`, giving the prepared state a root-owned deadline as well as

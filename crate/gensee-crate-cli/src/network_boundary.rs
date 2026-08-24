@@ -258,6 +258,12 @@ enum NetworkSupervisorRequest {
         effect: String,
         ttl_seconds: u64,
     },
+    StartHttpTransaction {
+        transaction_id: String,
+        operation_id: String,
+        effect: String,
+        ttl_seconds: u64,
+    },
     ActivateHttpTransaction {
         transaction_id: String,
         operation_id: String,
@@ -566,10 +572,11 @@ pub(crate) fn handle_c0_network(args: Vec<OsString>) -> io::Result<()> {
         Some("transaction-activate") => activate_http_transaction(&args[1..]),
         Some("transaction-revoke") => revoke_http_transaction(&args[1..]),
         Some("transaction-end") => end_http_transaction(&args[1..]),
+        Some("transaction-execute") => run_effect_transaction(&args[1..]),
         Some("inspect") => inspect_network_supervisor(&args[1..]),
         _ => Err(io::Error::new(
             ErrorKind::InvalidInput,
-            "usage: gensee run network <serve --state-root ROOT --config FILE [--dry-run]|event --socket PATH --event FILE|fault --socket PATH --fault FILE|revoke-http --socket PATH --lease ID|transaction-begin --socket PATH --transaction ID --operation ID --effect EFFECT --ttl-seconds N|transaction-activate|transaction-revoke|transaction-end --socket PATH --transaction ID --operation ID|inspect --socket PATH>",
+            "usage: gensee run network <serve --state-root ROOT --config FILE [--dry-run]|event --socket PATH --event FILE|fault --socket PATH --fault FILE|revoke-http --socket PATH --lease ID|transaction-begin --socket PATH --transaction ID --operation ID --effect EFFECT --ttl-seconds N|transaction-activate|transaction-revoke|transaction-end --socket PATH --transaction ID --operation ID|transaction-execute --config FILE --request FILE --transaction ID|inspect --socket PATH>",
         )),
     }
 }
@@ -1356,6 +1363,81 @@ impl NetworkSupervisor {
         self.append_committed_http_transaction_audit(
             transaction_id,
             "activate",
+            "allow",
+            "http_transaction_active",
+        );
+        Ok(())
+    }
+
+    /// Install an active transaction with one durable state commit. Coordinators
+    /// use this transition so no command can observe an intermediate prepared
+    /// transaction and a failed activation cannot strand prepared authority.
+    fn start_http_transaction(
+        &mut self,
+        transaction_id: &str,
+        operation_id: &str,
+        effect: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        let Some(policy) = self.http_transaction_policy.as_ref() else {
+            return Err("http_transaction_policy_unavailable".to_string());
+        };
+        if !safe_network_token(transaction_id)
+            || operation_id != self.record.operation_id
+            || effect != policy.effect
+            || ttl_seconds == 0
+            || ttl_seconds > policy.max_ttl_seconds
+        {
+            return Err("http_transaction_request_outside_policy".to_string());
+        }
+        if self
+            .record
+            .used_http_transaction_ids
+            .contains(transaction_id)
+        {
+            return Err("http_transaction_id_replayed".to_string());
+        }
+        if self
+            .record
+            .http_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                matches!(
+                    transaction.status,
+                    HttpTransactionStatus::Prepared | HttpTransactionStatus::Active
+                )
+            })
+        {
+            return Err("http_transaction_already_in_progress".to_string());
+        }
+        let now_ms = unix_millis().map_err(|error| error.to_string())?;
+        let prior_record = self.record.clone();
+        self.record
+            .used_http_transaction_ids
+            .insert(transaction_id.to_string());
+        self.record.http_transaction = Some(HttpTransactionRecord {
+            transaction_id: transaction_id.to_string(),
+            operation_id: operation_id.to_string(),
+            effect: effect.to_string(),
+            status: HttpTransactionStatus::Active,
+            ttl_seconds,
+            activated_at_ms: Some(now_ms),
+            expires_at_ms: Some(now_ms.saturating_add(ttl_seconds.saturating_mul(1_000))),
+            requests: 0,
+            request_bytes: 0,
+            response_bytes: 0,
+            response_reservation: None,
+            generation: 1,
+            updated_at_ms: now_ms,
+        });
+        self.record.updated_at_ms = now_ms;
+        if let Err(error) = self.persist() {
+            self.record = prior_record;
+            return Err(error.to_string());
+        }
+        self.append_committed_http_transaction_audit(
+            transaction_id,
+            "start",
             "allow",
             "http_transaction_active",
         );
@@ -2192,6 +2274,17 @@ fn handle_supervisor_stream(
             let result =
                 state.begin_http_transaction(&transaction_id, &operation_id, &effect, ttl_seconds);
             http_transaction_control_response(&mut state, &transaction_id, "begin", result)?
+        }
+        NetworkSupervisorRequest::StartHttpTransaction {
+            transaction_id,
+            operation_id,
+            effect,
+            ttl_seconds,
+        } => {
+            let mut state = lock_supervisor(&supervisor)?;
+            let result =
+                state.start_http_transaction(&transaction_id, &operation_id, &effect, ttl_seconds);
+            http_transaction_control_response(&mut state, &transaction_id, "start", result)?
         }
         NetworkSupervisorRequest::ActivateHttpTransaction {
             transaction_id,
@@ -3816,15 +3909,26 @@ fn send_supervisor_request(
     let socket = network_arg_value(args, "--socket")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "missing --socket"))?;
+    let parsed = exchange_supervisor_request(&socket, request)?;
+    println!("{}", serde_json::to_string_pretty(&parsed)?);
+    supervisor_response_result(parsed)
+}
+
+#[cfg(unix)]
+fn exchange_supervisor_request(
+    socket: &Path,
+    request: &NetworkSupervisorRequest,
+) -> io::Result<NetworkSupervisorResponse> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
     let response = read_bounded_supervisor_line(BufReader::new(stream))?;
-    let parsed: NetworkSupervisorResponse = serde_json::from_str(&response)
-        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-    println!("{}", serde_json::to_string_pretty(&parsed)?);
+    serde_json::from_str(&response).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
+}
+
+fn supervisor_response_result(parsed: NetworkSupervisorResponse) -> io::Result<()> {
     if parsed.ok {
         Ok(())
     } else {
@@ -3834,6 +3938,47 @@ fn send_supervisor_request(
                 .unwrap_or_else(|| "network request failed".to_string()),
         ))
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn start_supervised_http_transaction(
+    socket: &Path,
+    transaction_id: &str,
+    operation_id: &str,
+    effect: &str,
+    ttl_seconds: u64,
+) -> io::Result<()> {
+    let response = exchange_supervisor_request(
+        socket,
+        &NetworkSupervisorRequest::StartHttpTransaction {
+            transaction_id: transaction_id.to_string(),
+            operation_id: operation_id.to_string(),
+            effect: effect.to_string(),
+            ttl_seconds,
+        },
+    )?;
+    supervisor_response_result(response)
+}
+
+#[cfg(unix)]
+pub(crate) fn finish_supervised_http_transaction(
+    socket: &Path,
+    transaction_id: &str,
+    operation_id: &str,
+    success: bool,
+) -> io::Result<()> {
+    let request = if success {
+        NetworkSupervisorRequest::EndHttpTransaction {
+            transaction_id: transaction_id.to_string(),
+            operation_id: operation_id.to_string(),
+        }
+    } else {
+        NetworkSupervisorRequest::RevokeHttpTransaction {
+            transaction_id: transaction_id.to_string(),
+            operation_id: operation_id.to_string(),
+        }
+    };
+    supervisor_response_result(exchange_supervisor_request(socket, &request)?)
 }
 
 #[cfg(not(unix))]
@@ -3887,7 +4032,11 @@ fn prepare_privileged_boundary_environment(
 }
 
 #[cfg(unix)]
-fn validate_root_owned_path(path: &Path, directory: bool, owner_only: bool) -> io::Result<()> {
+pub(crate) fn validate_root_owned_path(
+    path: &Path,
+    directory: bool,
+    owner_only: bool,
+) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -4403,7 +4552,7 @@ pub(crate) fn reap_terminal_network_boundary_for_operation(
     Ok(true)
 }
 
-fn safe_network_token(value: &str) -> bool {
+pub(crate) fn safe_network_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
@@ -4860,6 +5009,64 @@ mod tests {
             );
         }
         assert!(reserve_http_transaction_hop(&supervisor, &proxy, &url, 0).is_err());
+    }
+
+    #[test]
+    fn transaction_start_persists_active_authority_in_one_transition() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-start-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        install_transaction_policy(&supervisor, &policy);
+
+        supervisor
+            .lock()
+            .unwrap()
+            .start_http_transaction("tx_coordinator", "op_1", "external_http_read", 30)
+            .unwrap();
+
+        let persisted: NetworkOperationRecord =
+            serde_json::from_str(&fs::read_to_string(root.join("record.json")).unwrap()).unwrap();
+        let transaction = persisted.http_transaction.unwrap();
+        assert_eq!(transaction.status, HttpTransactionStatus::Active);
+        assert_eq!(transaction.generation, 1);
+        assert!(transaction.activated_at_ms.is_some());
+        assert_eq!(
+            supervisor
+                .lock()
+                .unwrap()
+                .start_http_transaction("tx_coordinator", "op_1", "external_http_read", 30,)
+                .unwrap_err(),
+            "http_transaction_id_replayed"
+        );
+    }
+
+    #[test]
+    fn transaction_start_persistence_failure_exposes_no_authority() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-start-persist-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        install_transaction_policy(&supervisor, &policy);
+        let failing_record_path = root.join("record-path-is-a-directory");
+        fs::create_dir(&failing_record_path).unwrap();
+        supervisor.lock().unwrap().record_path = failing_record_path;
+
+        assert!(supervisor
+            .lock()
+            .unwrap()
+            .start_http_transaction("tx_no_authority", "op_1", "external_http_read", 30,)
+            .is_err());
+        let state = supervisor.lock().unwrap();
+        assert!(state.record.http_transaction.is_none());
+        assert!(!state
+            .record
+            .used_http_transaction_ids
+            .contains("tx_no_authority"));
     }
 
     #[test]
