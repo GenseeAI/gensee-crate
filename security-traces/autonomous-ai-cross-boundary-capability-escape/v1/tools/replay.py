@@ -45,7 +45,8 @@ def main() -> int:
                 timestamp = event.get(timestamp_field)
                 if not isinstance(timestamp, int) or isinstance(timestamp, bool):
                     raise SystemExit(f"{trace}:{line_number}: invalid {timestamp_field}")
-                events.append((timestamp, str(event.get("event_id", "")), event))
+                identity = event.get("event_id") or event.get("item", {}).get("item_id", "")
+                events.append((timestamp, str(identity), event))
     if args.clock == "cohort":
         events.sort(key=lambda row: (row[0], row[1]))
 

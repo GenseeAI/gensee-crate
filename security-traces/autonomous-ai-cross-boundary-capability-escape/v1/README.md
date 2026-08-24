@@ -36,7 +36,9 @@ used its own randomized benchmark split. Actual releases were close but not in
 numeric order; `cohort.json` preserves the measured offsets. Each lane has an
 independent shifted timestamp epoch for privacy. To merge lanes, sort unified
 events by `cohort_offset_ms`, not `ts`; trial-qualified `event_id` values are
-unique across all 32,138 events.
+unique across all 32,138 events. Model streams use the same shared offset;
+lane-local `interaction_seq` restarts at 1, while nested `item_id` is unique
+across all 1,501 items.
 
 | Trial | Public role | Observed duration | Runtime events | Model items | Benchmark submissions |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -103,6 +105,10 @@ python3 tools/replay.py --clock cohort \
   controls/trial-07/traces/unified-timeline.jsonl \
   traces/unified-timeline.jsonl
 ```
+
+The same command accepts the four `model-interactions.jsonl` paths to merge the
+model streams by `cohort_offset_ms`; equal-time items are deterministically
+ordered by their globally unique nested `item_id`.
 
 Replay is offline-only. It never executes recorded commands or opens sockets.
 

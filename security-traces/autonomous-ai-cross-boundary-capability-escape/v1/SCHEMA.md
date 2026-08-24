@@ -102,10 +102,11 @@ Each line of `traces/model-interactions.jsonl` is a strict object:
 | Field | Type | Provenance | Meaning |
 | --- | --- | --- | --- |
 | `schema_version` | string, always `1.0` | synthetic | Public schema version. |
-| `interaction_seq` | positive integer | synthetic | Complete retained stream order. |
-| `ts` | RFC 3339 timestamp | derived | Shifted item time. |
-| `ts_offset_ms` | non-negative integer | derived | Milliseconds from experiment origin. |
-| `item` | object | observed | Exactly one of the four item variants below. |
+| `interaction_seq` | positive integer | synthetic | Complete retained stream order within one trial. It restarts at 1 per lane and is not a cohort identity. |
+| `ts` | RFC 3339 timestamp | derived | Lane-local shifted pseudotime: exactly `synthetic_epoch + ts_offset_ms`. Do not merge lanes by this field. |
+| `ts_offset_ms` | non-negative integer | derived | Milliseconds from that trial's experiment origin. |
+| `cohort_offset_ms` | non-negative integer | derived | Shared merge coordinate: `actual_release_offset_ms + ts_offset_ms`. Sort this field to merge model streams. |
+| `item` | object | observed | Exactly one of the four item variants below; nested `item_id` is the cohort-global identity. |
 
 ### Four discriminated item types
 
@@ -119,9 +120,11 @@ The counts below describe positive Trial 8. Control counts are declared in each
 | `custom_tool_call` | 115 | `model_output` | Pseudonymous item/call IDs, tool name/status, and retained input string. |
 | `custom_tool_call_output` | 114 | `model_input` | Matching pseudonymous call ID and one or more `input_text` output blocks. |
 
-All items contain a pseudonymous `item_id` and `metadata.turn_id`. When source
-creation time is available, `metadata.create_ts` and
-`metadata.create_ts_offset_ms` must appear together. The nested content-block
+All items contain a pseudonymous `item_id` and `metadata.turn_id`. The validator
+requires all 1,501 `item_id` values to be globally unique across the cohort.
+When source creation time is available, `metadata.create_ts` and
+`metadata.create_ts_offset_ms` must appear together and must satisfy the same
+lane-epoch equation as the outer item timestamp. The nested content-block
 discriminator is `type`:
 
 | Block type | Parent | Fields |
@@ -180,10 +183,11 @@ and audits that each declared property has a valid `x-provenance` annotation.
 It also checks topology vocabulary agreement, counts, ordering, checksums,
 manifest coverage, redaction invariants, and ground-truth support. The validator
 loads every redaction ledger and run-provenance file, checks every event and
-model timestamp against its declared lane epoch, checks every unified event's
-cohort offset and globally unique ID, locks all four measured release offsets,
-and proves that all three peer cancellations follow the triggering Trial 8
-escape on the shared clock.
+model timestamp—including nested creation timestamps—against its declared lane
+epoch, checks every unified event and model item's cohort offset, enforces
+globally unique `event_id` and model `item_id` values, locks all four measured
+release offsets, and proves that all three peer cancellations follow the
+triggering Trial 8 escape on the shared clock.
 For retained provider payloads it rejects raw hosted-tool/container identifier
 shapes without assuming an encoding, rejects any string-valued nested
 `encrypted_content`, and reconciles all 21 nested omission records with the

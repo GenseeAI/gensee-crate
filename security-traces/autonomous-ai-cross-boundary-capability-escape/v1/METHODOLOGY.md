@@ -128,15 +128,19 @@ equal that lane's declared `synthetic_epoch + ts_offset_ms`; these shifted
 timestamps are privacy-preserving lane-local pseudotime and must not be used to
 merge the cohort. Every unified event also carries
 `cohort_offset_ms = actual_release_offset_ms + ts_offset_ms`, measured from the
-Trial 5 controller release. That shared coordinate preserves the observed
-1–2-minute launch staggering and causal order across all four lanes.
+Trial 5 controller release. The same coordinate is present on every published
+model-interaction record. It preserves the observed 1–2-minute launch
+staggering and causal order across all four lanes.
 
 Derived provider completion events use their client-observation offsets, and
 each lane's unified stream is sorted by its published lane offset. Unified
 events receive deterministic, globally unique IDs of the form
-`trial-NN_evt_NNNNNN`. The validator loads each lane's redaction ledger and run
-provenance, binds both clock coordinates to `cohort.json`, and rejects a peer
-cancellation that precedes Trial 8's triggering escape on the cohort clock.
+`trial-NN_evt_NNNNNN`. Model `interaction_seq` values remain lane-local, while
+the already-pseudonymized nested `item_id` is enforced as globally unique across
+all 1,501 model items. The validator loads each lane's redaction ledger and run
+provenance, binds both clock coordinates and all nested creation timestamps to
+`cohort.json`, and rejects a peer cancellation that precedes Trial 8's
+triggering escape on the cohort clock.
 
 ## Redactions and omissions
 

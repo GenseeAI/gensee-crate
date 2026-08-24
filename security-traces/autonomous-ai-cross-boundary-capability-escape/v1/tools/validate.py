@@ -272,9 +272,10 @@ def clock_coordinate_errors(
 
 
 def interaction_clock_errors(
-    rows: list[dict[str, Any]], trial_id: str, synthetic_epoch: str, label: str
+    rows: list[dict[str, Any]], trial_id: str, synthetic_epoch: str,
+    release_offset_ms: int, label: str,
 ) -> list[str]:
-    """Bind model-item timestamps, including optional creation time, to lane pseudotime."""
+    """Bind model-item lane and cohort time, including optional nested creation time."""
     errors: list[str] = []
     epoch = parse_timestamp(synthetic_epoch)
     if epoch is None:
@@ -284,7 +285,11 @@ def interaction_clock_errors(
         timestamp = parse_timestamp(row.get("ts"))
         if not isinstance(offset, int) or isinstance(offset, bool) or timestamp != epoch + timedelta(milliseconds=offset):
             errors.append(f"{label} record {index} timestamp disagrees with its lane epoch and offset")
-        metadata = row.get("metadata", {})
+        expected_cohort_offset = release_offset_ms + offset if isinstance(offset, int) and not isinstance(offset, bool) else None
+        if row.get("cohort_offset_ms") != expected_cohort_offset:
+            errors.append(f"{label} record {index} has an invalid cohort offset")
+        item = row.get("item", {})
+        metadata = item.get("metadata", {}) if isinstance(item, dict) else {}
         create_offset = metadata.get("create_ts_offset_ms") if isinstance(metadata, dict) else None
         create_timestamp = parse_timestamp(metadata.get("create_ts")) if isinstance(metadata, dict) else None
         if create_offset is not None or create_timestamp is not None:
@@ -295,6 +300,22 @@ def interaction_clock_errors(
             ):
                 errors.append(f"{label} record {index} creation timestamp disagrees with its lane epoch and offset")
     return errors
+
+
+def model_identity_errors(
+    interactions: dict[str, list[dict[str, Any]]]
+) -> list[str]:
+    """Require item_id to identify one model item globally across the cohort."""
+    item_ids = []
+    for rows in interactions.values():
+        for row in rows:
+            item = row.get("item", {})
+            item_ids.append(item.get("item_id") if isinstance(item, dict) else None)
+    if any(not isinstance(item_id, str) for item_id in item_ids):
+        return ["a cohort model item lacks a valid item_id"]
+    if len(item_ids) != len(set(item_ids)):
+        return ["model item_id values are not globally unique across the cohort"]
+    return []
 
 
 def cohort_metadata_errors(cohort: dict[str, Any]) -> list[str]:
@@ -802,7 +823,8 @@ def validate(root: Path) -> list[str]:
 
     interactions = load_jsonl(root / "traces" / "model-interactions.jsonl", errors, "model interactions")
     errors.extend(interaction_clock_errors(
-        interactions, "trial-08", positive_spec["synthetic_epoch"], "trial-08 model interactions"
+        interactions, "trial-08", positive_spec["synthetic_epoch"],
+        positive_spec["actual_release_offset_ms"], "trial-08 model interactions"
     ))
     if len(interactions) != 372:
         errors.append(f"model interaction stream has {len(interactions)} items, expected 372")
@@ -863,6 +885,7 @@ def validate(root: Path) -> list[str]:
         errors.append("sanitized client-observed hosted-tool response body is missing")
 
     cohort_timelines = {"trial-08": unified}
+    cohort_interactions = {"trial-08": interactions}
     for trial_id in CONTROL_IDS:
         control_root = root / "controls" / trial_id
         trial_spec = EXPECTED_COHORT_TRIALS[trial_id]
@@ -974,8 +997,10 @@ def validate(root: Path) -> list[str]:
             control_root / "traces" / "model-interactions.jsonl", errors, f"{trial_id} model interactions"
         )
         errors.extend(interaction_clock_errors(
-            control_interactions, trial_id, trial_spec["synthetic_epoch"], f"{trial_id} model interactions"
+            control_interactions, trial_id, trial_spec["synthetic_epoch"],
+            trial_spec["actual_release_offset_ms"], f"{trial_id} model interactions"
         ))
+        cohort_interactions[trial_id] = control_interactions
         if [row.get("interaction_seq") for row in control_interactions] != list(range(1, len(control_interactions) + 1)):
             errors.append(f"{trial_id} model interaction sequence is incomplete or unordered")
         control_counts: Counter[str] = Counter()
@@ -1018,6 +1043,7 @@ def validate(root: Path) -> list[str]:
             errors.append(f"{trial_id} sealed-final observation disagrees with summary")
 
     errors.extend(cohort_identity_and_causality_errors(cohort_timelines))
+    errors.extend(model_identity_errors(cohort_interactions))
     return errors
 
 

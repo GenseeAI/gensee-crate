@@ -126,6 +126,72 @@ class ToolTests(unittest.TestCase):
             trace_validate.cohort_identity_and_causality_errors(reversed_causality),
         )
 
+    def test_model_clock_creation_time_and_global_identity_contract(self) -> None:
+        cohort = json.loads((ROOT / "cohort.json").read_text())
+        specs = {row["trial_id"]: row for row in cohort["trials"]}
+        roots = {
+            "trial-05": ROOT / "controls/trial-05",
+            "trial-06": ROOT / "controls/trial-06",
+            "trial-07": ROOT / "controls/trial-07",
+            "trial-08": ROOT,
+        }
+        streams = {}
+        for trial_id, trial_root in roots.items():
+            rows = [
+                json.loads(line)
+                for line in (trial_root / "traces/model-interactions.jsonl").read_text().splitlines()
+            ]
+            streams[trial_id] = rows
+            spec = specs[trial_id]
+            self.assertEqual(
+                trace_validate.interaction_clock_errors(
+                    rows, trial_id, spec["synthetic_epoch"], spec["actual_release_offset_ms"], trial_id
+                ),
+                [],
+            )
+        self.assertEqual(trace_validate.model_identity_errors(streams), [])
+        self.assertEqual(sum(len(rows) for rows in streams.values()), 1501)
+
+        bad_creation_time = deepcopy([
+            next(row for row in streams["trial-08"] if "create_ts" in row["item"]["metadata"])
+        ])
+        bad_creation_time[0]["item"]["metadata"]["create_ts"] = "2099-12-31T00:00:00.000Z"
+        self.assertTrue(any(
+            "creation timestamp" in error
+            for error in trace_validate.interaction_clock_errors(
+                bad_creation_time, "trial-08", specs["trial-08"]["synthetic_epoch"],
+                specs["trial-08"]["actual_release_offset_ms"], "trial-08",
+            )
+        ))
+
+        bad_creation_offset = deepcopy(bad_creation_time)
+        bad_creation_offset[0]["item"]["metadata"]["create_ts"] = streams["trial-08"][0]["item"]["metadata"]["create_ts"]
+        bad_creation_offset[0]["item"]["metadata"]["create_ts_offset_ms"] = 999_999_999
+        self.assertTrue(any(
+            "creation timestamp" in error
+            for error in trace_validate.interaction_clock_errors(
+                bad_creation_offset, "trial-08", specs["trial-08"]["synthetic_epoch"],
+                specs["trial-08"]["actual_release_offset_ms"], "trial-08",
+            )
+        ))
+
+        bad_cohort_offset = deepcopy(streams["trial-06"][:1])
+        bad_cohort_offset[0]["cohort_offset_ms"] -= 1
+        self.assertTrue(any(
+            "invalid cohort offset" in error
+            for error in trace_validate.interaction_clock_errors(
+                bad_cohort_offset, "trial-06", specs["trial-06"]["synthetic_epoch"],
+                specs["trial-06"]["actual_release_offset_ms"], "trial-06",
+            )
+        ))
+
+        duplicate_identity = deepcopy(streams)
+        duplicate_identity["trial-06"][0]["item"]["item_id"] = duplicate_identity["trial-05"][0]["item"]["item_id"]
+        self.assertIn(
+            "model item_id values are not globally unique across the cohort",
+            trace_validate.model_identity_errors(duplicate_identity),
+        )
+
     def test_sensitive_value_guards(self) -> None:
         bearer = '"authorization": "Bearer ' + "eyJhbGciOiJIUzI1NiJ9.abc.def" + '"'
         api_key = "{'x-api-key':'" + "gk-live-9f3a2b7c1d" + "'}"
@@ -241,6 +307,17 @@ class ToolTests(unittest.TestCase):
             sorted(row["cohort_offset_ms"] for row in rows),
         )
         self.assertEqual(len({row["event_id"] for row in rows}), len(rows))
+
+        model_paths = [path.replace("unified-timeline", "model-interactions") for path in paths]
+        model_result = self.run_tool("tools/replay.py", "--clock", "cohort", *model_paths)
+        self.assertEqual(model_result.returncode, 0, model_result.stderr)
+        model_rows = [json.loads(line) for line in model_result.stdout.splitlines()]
+        self.assertEqual(len(model_rows), 1501)
+        self.assertEqual(
+            [row["cohort_offset_ms"] for row in model_rows],
+            sorted(row["cohort_offset_ms"] for row in model_rows),
+        )
+        self.assertEqual(len({row["item"]["item_id"] for row in model_rows}), len(model_rows))
 
     def test_score_all_stages(self) -> None:
         truth = json.loads((ROOT / "ground-truth.json").read_text())
