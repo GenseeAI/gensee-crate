@@ -1,6 +1,6 @@
 use chrono::DateTime;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use gensee_crate_core::redact_value;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -279,6 +279,36 @@ struct ActiveCorrelation {
     last_fields: BTreeMap<String, Value>,
 }
 
+struct StagingDirectory {
+    path: PathBuf,
+    active: bool,
+}
+
+impl StagingDirectory {
+    fn create(path: PathBuf) -> io::Result<Self> {
+        fs::create_dir(&path)?;
+        Ok(Self { path, active: true })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn commit(mut self, output: &Path) -> io::Result<()> {
+        fs::rename(&self.path, output)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for StagingDirectory {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 fn default_max_out_of_order_ms() -> u64 {
     DEFAULT_MAX_OUT_OF_ORDER_MS
 }
@@ -316,30 +346,21 @@ pub fn build_bundle(
     }
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
-    let staging = parent.join(format!(
+    let staging = StagingDirectory::create(parent.join(format!(
         ".gensee-replay-{}-{}",
         std::process::id(),
         now_ms()?
-    ));
-    fs::create_dir(&staging)?;
-    let result = build_bundle_in_staging(
+    )))?;
+    let mut report = build_bundle_in_staging(
         &manifest,
         &manifest_bytes,
         manifest_path,
-        &staging,
+        staging.path(),
         signing_key_path,
-    );
-    match result {
-        Ok(mut report) => {
-            fs::rename(&staging, output)?;
-            report.bundle = output.display().to_string();
-            Ok(report)
-        }
-        Err(error) => {
-            let _ = fs::remove_dir_all(&staging);
-            Err(error)
-        }
-    }
+    )?;
+    staging.commit(output)?;
+    report.bundle = output.display().to_string();
+    Ok(report)
 }
 
 fn build_bundle_in_staging(
@@ -778,7 +799,6 @@ fn normalize_source(
     let mut events_emitted = 0_u64;
     let mut sequence_events = 0_u64;
     let mut max_seen = 0_u64;
-    let mut last_input_timestamp = None;
     let mut last_emitted_timestamp = None;
     let mut first_timestamp = None;
     let mut last_timestamp = None;
@@ -795,16 +815,26 @@ fn normalize_source(
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let mut record: Value = serde_json::from_slice(&line).map_err(|error| {
+        let record: Value = serde_json::from_slice(&line).map_err(|error| {
             invalid_data(format!(
                 "source {} record {} is invalid JSON: {error}",
                 source.id, record_number
             ))
         })?;
-        let fields = select_and_redact_fields(&record, &source.fields);
+        let timestamp_ns = match &source.clock {
+            ClockSpec::Sequence => None,
+            clock => Some(extract_timestamp_ns(&record, clock).ok_or_else(|| {
+                invalid_data(format!(
+                    "source {} record {} has no valid timestamp",
+                    source.id, record_number
+                ))
+            })?),
+        };
+        let mut redacted_record = record;
+        redact_value(&mut redacted_record);
+        let fields = select_and_redact_fields(&redacted_record, &source.fields);
         let included_record = if source.include_record {
-            redact_value(&mut record);
-            Some(record.clone())
+            Some(redacted_record)
         } else {
             None
         };
@@ -821,20 +851,12 @@ fn normalize_source(
                 )?;
                 sequence_events += 1;
             }
-            clock => {
-                let timestamp_ns = extract_timestamp_ns(&record, clock).ok_or_else(|| {
-                    invalid_data(format!(
-                        "source {} record {} has no valid timestamp",
-                        source.id, record_number
-                    ))
-                })?;
-                if let Some(previous) = last_input_timestamp {
-                    if timestamp_ns < previous {
-                        regressions += 1;
-                        maximum_regression = maximum_regression.max(previous - timestamp_ns);
-                    }
+            _ => {
+                let timestamp_ns = timestamp_ns.expect("timed clocks set a timestamp");
+                if timestamp_ns < max_seen {
+                    regressions += 1;
+                    maximum_regression = maximum_regression.max(max_seen - timestamp_ns);
                 }
-                last_input_timestamp = Some(timestamp_ns);
                 max_seen = max_seen.max(timestamp_ns);
                 if heap.len() >= max_buffered_events {
                     return Err(invalid_data(format!(
@@ -1045,7 +1067,7 @@ fn open_source_reader(path: &Path, format: SourceFormat) -> io::Result<Box<dyn B
     let file = File::open(path)?;
     match format {
         SourceFormat::Jsonl => Ok(Box::new(BufReader::new(file))),
-        SourceFormat::JsonlGzip => Ok(Box::new(BufReader::new(GzDecoder::new(file)))),
+        SourceFormat::JsonlGzip => Ok(Box::new(BufReader::new(MultiGzDecoder::new(file)))),
     }
 }
 
@@ -1102,11 +1124,10 @@ fn read_bounded_line(
         if available.is_empty() {
             return Ok(output.len());
         }
-        let consumed = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |index| index + 1);
-        if output.len().saturating_add(consumed) > maximum_bytes {
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let payload_bytes = newline.unwrap_or(consumed);
+        if output.len().saturating_add(payload_bytes) > maximum_bytes {
             return Err(invalid_data(format!(
                 "JSONL record exceeds the {maximum_bytes}-byte limit"
             )));
@@ -1492,6 +1513,38 @@ mod tests {
     }
 
     #[test]
+    fn reads_every_member_of_concatenated_gzip_jsonl() {
+        let root = temp_root("multi-gzip");
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("requests.jsonl.gz");
+        for (timestamp, append) in [
+            ("2024-04-05T19:34:38.250Z", false),
+            ("2024-04-05T19:34:39.250Z", true),
+        ] {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(append)
+                .truncate(!append)
+                .open(&input)
+                .unwrap();
+            let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            writeln!(encoder, "{{\"timestamp\":\"{timestamp}\",\"status\":200}}").unwrap();
+            encoder.finish().unwrap();
+        }
+        let mut value = manifest("requests.jsonl.gz");
+        value.sources[0].format = SourceFormat::JsonlGzip;
+        value.sources[0].clock = ClockSpec::Rfc3339 {
+            pointers: vec!["/timestamp".to_string()],
+        };
+        let manifest_path = root.join("manifest.json");
+        write_pretty_json(&manifest_path, &value).unwrap();
+        let report = build_bundle(&manifest_path, &root.join("bundle"), None).unwrap();
+        assert_eq!(report.timeline_events, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn bounded_reorder_fails_when_an_event_arrives_too_late() {
         let root = temp_root("late");
         fs::create_dir_all(&root).unwrap();
@@ -1544,6 +1597,73 @@ mod tests {
         let line = fs::read_to_string(bundle.join("timeline.jsonl")).unwrap();
         assert!(!line.contains("secret-value"));
         assert!(line.contains("<redacted>"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn renamed_selected_secrets_use_the_source_key_redaction_floor() {
+        let root = temp_root("renamed-secret");
+        fs::create_dir_all(&root).unwrap();
+        write(
+            &root.join("events.jsonl"),
+            "{\"api_key\":\"hunter2-internal\",\"output_fields\":{\"evt.time\":1000000}}\n",
+        );
+        let mut value = manifest("events.jsonl");
+        value.sources[0].fields = BTreeMap::from([("k".to_string(), "/api_key".to_string())]);
+        let manifest_path = root.join("manifest.json");
+        write_pretty_json(&manifest_path, &value).unwrap();
+        let bundle = root.join("bundle");
+        build_bundle(&manifest_path, &bundle, None).unwrap();
+        let line = fs::read_to_string(bundle.join("timeline.jsonl")).unwrap();
+        assert!(!line.contains("hunter2-internal"));
+        assert!(line.contains("<redacted>"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regression_coverage_uses_the_high_watermark() {
+        let root = temp_root("regression-watermark");
+        fs::create_dir_all(&root).unwrap();
+        write(
+            &root.join("events.jsonl"),
+            concat!(
+                "{\"output_fields\":{\"evt.time\":100}}\n",
+                "{\"output_fields\":{\"evt.time\":300}}\n",
+                "{\"output_fields\":{\"evt.time\":200}}\n",
+                "{\"output_fields\":{\"evt.time\":250}}\n"
+            ),
+        );
+        let manifest_path = root.join("manifest.json");
+        write_pretty_json(&manifest_path, &manifest("events.jsonl")).unwrap();
+        let bundle = root.join("bundle");
+        build_bundle(&manifest_path, &bundle, None).unwrap();
+        let coverage: CoverageReport = read_json(&bundle.join("coverage.json")).unwrap();
+        assert_eq!(coverage.sources[0].input_timestamp_regressions, 2);
+        assert_eq!(coverage.sources[0].maximum_input_regression_ns, 100);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn record_limit_excludes_the_jsonl_newline() {
+        let mut reader = BufReader::new(io::Cursor::new(b"1234\n12345\n"));
+        let mut line = Vec::new();
+        assert_eq!(read_bounded_line(&mut reader, &mut line, 4).unwrap(), 5);
+        assert_eq!(line, b"1234\n");
+        assert!(read_bounded_line(&mut reader, &mut line, 4).is_err());
+    }
+
+    #[test]
+    fn failed_staging_commit_removes_sensitive_directory() {
+        let root = temp_root("staging-cleanup");
+        fs::create_dir_all(&root).unwrap();
+        let staging_path = root.join(".gensee-replay-staging");
+        let staging = StagingDirectory::create(staging_path.clone()).unwrap();
+        write(&staging_path.join("timeline.jsonl"), "sensitive\n");
+        let occupied_output = root.join("bundle");
+        fs::create_dir(&occupied_output).unwrap();
+        write(&occupied_output.join("existing"), "occupied\n");
+        assert!(staging.commit(&occupied_output).is_err());
+        assert!(!staging_path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
