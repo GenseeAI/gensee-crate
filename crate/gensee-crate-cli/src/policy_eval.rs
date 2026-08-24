@@ -573,14 +573,24 @@ fn fork_suggestion_severity(event: &AgentHookEvent, current_run_id: Option<&str>
 }
 
 pub(crate) fn current_tclone_run_id_for_event(_event: &AgentHookEvent) -> Option<String> {
-    crate::tclone::current_tclone_context_run_id().or_else(inherited_tclone_source_run_id)
+    // `current_tclone_context_run_id` already returns the inherited source ID
+    // when no injected context exists. If a context exists but authentication
+    // fails it deliberately returns None; do not turn that fail-closed result
+    // back into the stale CRIU-inherited source identity here.
+    crate::tclone::cached_authenticated_tclone_context_run_id()
+        .or_else(crate::tclone::cached_authenticated_managed_run_id)
+        .or_else(|| {
+            // Managed host runs carry an operation ID. Their ambient run ID is
+            // only a hint until the local process tree or daemon socket peer
+            // has been authenticated and cached for this hook request.
+            env::var_os("GENSEE_OPERATION_ID")
+                .is_none()
+                .then(crate::tclone::current_tclone_context_run_id)
+                .flatten()
+        })
 }
 
-fn inherited_tclone_source_run_id() -> Option<String> {
-    let run_id = env::var("GENSEE_RUN_ID").ok()?;
-    validated_inherited_tclone_source_run_id(&run_id)
-}
-
+#[cfg(test)]
 fn validated_inherited_tclone_source_run_id(run_id: &str) -> Option<String> {
     let run_id = run_id.trim();
     (!run_id.is_empty() && !run_id.contains("_fork_")).then(|| run_id.to_string())

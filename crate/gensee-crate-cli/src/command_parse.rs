@@ -342,11 +342,16 @@ pub(crate) fn compatibility_payload_provider(payload: &str) -> Option<&'static s
 fn effective_hook_session_id(
     tclone_context_run_id: Option<&str>,
     provider_session_id: Option<String>,
+    allow_ambient_identity: bool,
 ) -> Option<String> {
     tclone_context_run_id
         .map(ToString::to_string)
         .or(provider_session_id)
-        .or_else(|| env::var("AGENT_SHIELD_SESSION_ID").ok())
+        .or_else(|| {
+            allow_ambient_identity
+                .then(|| env::var("AGENT_SHIELD_SESSION_ID").ok())
+                .flatten()
+        })
 }
 
 #[cfg(any(test, feature = "bench"))]
@@ -359,9 +364,25 @@ pub(crate) fn build_hook_event_with_tclone_context(
     provider: &str,
     tclone_context_run_id: Option<&str>,
 ) -> io::Result<AgentHookEvent> {
+    build_hook_event_with_context_policy(payload, provider, tclone_context_run_id, true)
+}
+
+pub(crate) fn build_unattributed_hook_event(
+    payload: &str,
+    provider: &str,
+) -> io::Result<AgentHookEvent> {
+    build_hook_event_with_context_policy(payload, provider, None, false)
+}
+
+fn build_hook_event_with_context_policy(
+    payload: &str,
+    provider: &str,
+    tclone_context_run_id: Option<&str>,
+    allow_ambient_identity: bool,
+) -> io::Result<AgentHookEvent> {
     let observed_at_ms = unix_millis()?;
 
-    let Some(value) = serde_json::from_str::<Value>(payload)
+    let Some(mut value) = serde_json::from_str::<Value>(payload)
         .ok()
         .map(|mut value| {
             redact_value(&mut value);
@@ -371,7 +392,11 @@ pub(crate) fn build_hook_event_with_tclone_context(
         // Unparseable payload: keep only a redacted raw copy, no structured fields.
         return Ok(AgentHookEvent {
             provider: provider.to_string(),
-            session_id: effective_hook_session_id(tclone_context_run_id, None),
+            session_id: effective_hook_session_id(
+                tclone_context_run_id,
+                None,
+                allow_ambient_identity,
+            ),
             hook_event_name: None,
             cwd: current_dir_string(),
             transcript_path: None,
@@ -389,17 +414,42 @@ pub(crate) fn build_hook_event_with_tclone_context(
             raw_json: redact_text(payload),
         });
     };
+    // An explicit authenticated Tclone context also becomes the effective
+    // session. Without one, preserve the provider session while separately
+    // stamping a source run only when the context resolver says no injected
+    // context failed authentication.
+    let run_id = tclone_context_run_id.map(ToString::to_string).or_else(|| {
+        allow_ambient_identity
+            .then(current_tclone_context_run_id)
+            .flatten()
+    });
+    record_hook_run_id(&mut value, run_id.as_deref());
 
     if provider == PROVIDER_ANTIGRAVITY {
-        return build_antigravity_hook_event(value, observed_at_ms, tclone_context_run_id);
+        return build_antigravity_hook_event(
+            value,
+            observed_at_ms,
+            tclone_context_run_id,
+            allow_ambient_identity,
+        );
     }
 
     if provider == PROVIDER_VSCODE {
-        return build_vscode_hook_event(value, observed_at_ms, tclone_context_run_id);
+        return build_vscode_hook_event(
+            value,
+            observed_at_ms,
+            tclone_context_run_id,
+            allow_ambient_identity,
+        );
     }
 
     if provider == PROVIDER_CURSOR {
-        return build_cursor_hook_event(value, observed_at_ms, tclone_context_run_id);
+        return build_cursor_hook_event(
+            value,
+            observed_at_ms,
+            tclone_context_run_id,
+            allow_ambient_identity,
+        );
     }
 
     let hook_event_name = v_str(&value, "hook_event_name");
@@ -419,7 +469,11 @@ pub(crate) fn build_hook_event_with_tclone_context(
 
     Ok(AgentHookEvent {
         provider: provider.to_string(),
-        session_id: effective_hook_session_id(tclone_context_run_id, v_str(&value, "session_id")),
+        session_id: effective_hook_session_id(
+            tclone_context_run_id,
+            v_str(&value, "session_id"),
+            allow_ambient_identity,
+        ),
         hook_event_name,
         cwd: v_str(&value, "cwd").or_else(current_dir_string),
         transcript_path: v_str(&value, "transcript_path"),
@@ -441,10 +495,29 @@ pub(crate) fn build_hook_event_with_tclone_context(
     })
 }
 
+fn record_hook_run_id(value: &mut Value, run_id: Option<&str>) {
+    let Some(run_id) = run_id.filter(|run_id| !run_id.trim().is_empty()) else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let gensee = object.entry("gensee").or_insert_with(|| json!({}));
+    if let Some(gensee) = gensee.as_object_mut() {
+        gensee.insert("run_id".to_string(), Value::String(run_id.to_string()));
+    } else {
+        object.insert(
+            "gensee_run_id".to_string(),
+            Value::String(run_id.to_string()),
+        );
+    }
+}
+
 fn build_antigravity_hook_event(
     value: Value,
     observed_at_ms: u64,
     tclone_context_run_id: Option<&str>,
+    allow_ambient_identity: bool,
 ) -> io::Result<AgentHookEvent> {
     let hook_event_name = antigravity_event_name(&value);
     let tool_call = value.get("toolCall");
@@ -481,6 +554,7 @@ fn build_antigravity_hook_event(
         session_id: effective_hook_session_id(
             tclone_context_run_id,
             v_str(&value, "conversationId").or_else(|| v_str(&value, "session_id")),
+            allow_ambient_identity,
         ),
         hook_event_name,
         cwd,
@@ -525,6 +599,7 @@ fn build_vscode_hook_event(
     value: Value,
     observed_at_ms: u64,
     tclone_context_run_id: Option<&str>,
+    allow_ambient_identity: bool,
 ) -> io::Result<AgentHookEvent> {
     let hook_event_name = v_str(&value, "hook_event_name");
     let tool_input_command = v_nested_str(&value, "tool_input", "command");
@@ -532,7 +607,11 @@ fn build_vscode_hook_event(
 
     Ok(AgentHookEvent {
         provider: PROVIDER_VSCODE.to_string(),
-        session_id: effective_hook_session_id(tclone_context_run_id, v_str(&value, "session_id")),
+        session_id: effective_hook_session_id(
+            tclone_context_run_id,
+            v_str(&value, "session_id"),
+            allow_ambient_identity,
+        ),
         hook_event_name,
         cwd: v_str(&value, "cwd").or_else(current_dir_string),
         transcript_path: v_str(&value, "transcript_path"),
@@ -572,6 +651,7 @@ fn build_cursor_hook_event(
     value: Value,
     observed_at_ms: u64,
     tclone_context_run_id: Option<&str>,
+    allow_ambient_identity: bool,
 ) -> io::Result<AgentHookEvent> {
     let raw_event_name = v_str(&value, "hook_event_name");
     // Map Cursor camelCase event names to the PascalCase names expected by the
@@ -632,6 +712,7 @@ fn build_cursor_hook_event(
         session_id: effective_hook_session_id(
             tclone_context_run_id,
             v_str(&value, "conversation_id").or_else(|| v_str(&value, "session_id")),
+            allow_ambient_identity,
         ),
         hook_event_name,
         cwd,

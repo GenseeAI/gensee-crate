@@ -1,5 +1,7 @@
 use crate::*;
 
+const TIMELINE_NATIVE_SYSTEM_EVENT_LIMIT: usize = 5_000;
+
 pub(crate) fn list_runs(args: Vec<OsString>) -> io::Result<()> {
     let store = EventStore::default_local()?;
     let mut sessions = compact_sessions(store.list_sessions()?);
@@ -79,7 +81,24 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
     let hooks = store.list_hook_events()?;
     let observations = store.list_process_observations()?;
     let file_intents = store.list_file_intents()?;
-    let mut system_events = store.list_system_events()?;
+    let native_retention = Policy::load_current()
+        .document()
+        .endpoint_security
+        .raw_event_retention_hours;
+    let now_ms = unix_millis()?;
+    let native_min_ms = now_ms.saturating_sub(native_retention.saturating_mul(60 * 60 * 1_000));
+    let agent_session_id = timeline_agent_session_id(&filter, &sessions, &hooks);
+    let native_session_id = agent_session_id.as_deref().map(|session_id| {
+        latest_hook_run_id_for_session(&hooks, session_id).unwrap_or_else(|| session_id.to_string())
+    });
+    let mut system_events = timeline_system_events(
+        &store,
+        native_session_id.as_deref(),
+        filter.path_filter(),
+        i64::try_from(native_min_ms).unwrap_or(i64::MAX),
+        i64::try_from(now_ms).unwrap_or(i64::MAX),
+        TIMELINE_NATIVE_SYSTEM_EVENT_LIMIT,
+    )?;
     let mut workspace_effects = store.list_workspace_effects()?;
     let mut alerts = store.list_alerts()?;
     let mut user_prompts = compact_user_prompts(&hooks);
@@ -93,15 +112,19 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
         &alerts,
     );
 
-    filter.apply(TimelineCollections {
-        sessions: &mut sessions,
-        user_prompts: &mut user_prompts,
-        assistant_responses: &mut assistant_responses,
-        tool_calls: &mut tool_calls,
-        system_events: &mut system_events,
-        workspace_effects: &mut workspace_effects,
-        alerts: &mut alerts,
-    });
+    filter.apply(
+        TimelineCollections {
+            sessions: &mut sessions,
+            user_prompts: &mut user_prompts,
+            assistant_responses: &mut assistant_responses,
+            tool_calls: &mut tool_calls,
+            system_events: &mut system_events,
+            workspace_effects: &mut workspace_effects,
+            alerts: &mut alerts,
+        },
+        agent_session_id.as_deref(),
+        native_session_id.as_deref(),
+    );
     let agent_refusals = derive_agent_refusals(&user_prompts, &assistant_responses);
 
     if sessions.is_empty()
@@ -169,7 +192,6 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
             }
         }
     }
-
     if !workspace_effects.is_empty() {
         println!("Workspace effects");
         for effect in workspace_effects.iter().rev().take(40).rev() {
@@ -434,6 +456,537 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn timeline_system_events(
+    store: &EventStore,
+    session_id: Option<&str>,
+    path_contains: Option<&str>,
+    min_observed_at_ms: i64,
+    max_observed_at_ms: i64,
+    limit: usize,
+) -> io::Result<Vec<SystemEvent>> {
+    let mut events = store.list_system_events()?;
+    let mut keys = events
+        .iter()
+        .filter_map(|event| system_event_dedup_key(event, None))
+        .collect::<HashSet<_>>();
+    let mut legacy_payloads = HashMap::<_, usize>::new();
+    for event in &events {
+        if system_event_id(event).is_none() {
+            *legacy_payloads
+                .entry(system_event_payload_dedup_key(event))
+                .or_default() += 1;
+        }
+    }
+    let native_query_limit = limit.saturating_add(1);
+    let mut stored_events = store.list_native_system_events(
+        session_id,
+        path_contains,
+        min_observed_at_ms,
+        max_observed_at_ms,
+        native_query_limit,
+    )?;
+    if stored_events.len() > limit {
+        eprintln!(
+            "gensee: native timeline results were limited to the newest {limit} matching events"
+        );
+        stored_events.remove(0);
+    }
+    for stored in stored_events {
+        let sqlite_event_id = stored.event_id;
+        match stored_system_event_for_timeline(stored) {
+            Ok(event) => {
+                if system_event_id(&event).is_none()
+                    && consume_legacy_payload(
+                        &mut legacy_payloads,
+                        &system_event_payload_dedup_key(&event),
+                    )
+                {
+                    continue;
+                }
+                if keys.insert(
+                    system_event_dedup_key(&event, Some(sqlite_event_id))
+                        .expect("SQLite system events always have a row id"),
+                ) {
+                    events.push(event);
+                }
+            }
+            Err(error) => {
+                eprintln!("gensee: skipping unreadable SQLite system event: {error}");
+            }
+        }
+    }
+    events.sort_by_key(|event| event.observed_at_ms);
+    Ok(events)
+}
+
+pub(crate) fn stored_system_event_for_timeline(
+    stored: gensee_crate_store::StoredSystemEvent,
+) -> io::Result<SystemEvent> {
+    let mut event = match stored.source.as_str() {
+        "linux-falco" => {
+            system_event_from_persisted_falco_line(&stored.raw_json, stored.observed_at_ms)?
+        }
+        "macos-endpoint-security" => {
+            EndpointSecurityEvent::parse(&stored.raw_json)?.into_system_event()?
+        }
+        source => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported native system event source `{source}`"),
+            ));
+        }
+    };
+    event.source = stored.source;
+    event.event_type = stored.event_type;
+    event.observed_at_ms = stored.observed_at_ms;
+    event.pid = stored.pid.or(event.pid);
+    event.raw_json = stored.raw_json;
+    Ok(event)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SystemEventDedupId {
+    Collector(String),
+    Sqlite(i64),
+}
+
+fn system_event_dedup_key(
+    event: &SystemEvent,
+    sqlite_event_id: Option<i64>,
+) -> Option<(String, u64, Option<u32>, SystemEventDedupId)> {
+    let event_id = system_event_id(event)
+        .map(SystemEventDedupId::Collector)
+        .or_else(|| sqlite_event_id.map(SystemEventDedupId::Sqlite))?;
+    Some((
+        event.source.clone(),
+        event.observed_at_ms,
+        event.pid,
+        event_id,
+    ))
+}
+
+fn system_event_payload_dedup_key(event: &SystemEvent) -> (String, u64, Option<u32>, String) {
+    let payload_hash = Sha256::digest(event.raw_json.as_bytes());
+    (
+        event.source.clone(),
+        event.observed_at_ms,
+        event.pid,
+        format!("{payload_hash:x}"),
+    )
+}
+
+fn consume_legacy_payload<K: Eq + std::hash::Hash>(
+    payloads: &mut HashMap<K, usize>,
+    key: &K,
+) -> bool {
+    let Some(count) = payloads.get_mut(key) else {
+        return false;
+    };
+    *count -= 1;
+    if *count == 0 {
+        payloads.remove(key);
+    }
+    true
+}
+
+fn system_event_id(event: &SystemEvent) -> Option<String> {
+    let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+    let event_id = [
+        value.get("event_id"),
+        value.pointer("/gensee/event_id"),
+        value.pointer("/output_fields/evt.num"),
+        value.pointer("/output_fields/evt_num"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|event_id| match event_id {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    });
+    event_id
+}
+
+#[cfg(test)]
+mod native_system_event_tests {
+    use super::*;
+    use gensee_crate_store::StoredSystemEvent;
+
+    fn tool_call(session_id: Option<&str>, run_id: Option<&str>) -> AgentToolCall {
+        let raw_json = run_id
+            .map(|run_id| json!({"gensee": {"run_id": run_id}}).to_string())
+            .unwrap_or_else(|| "{}".to_string());
+        let hook = AgentHookEvent {
+            provider: "codex".to_string(),
+            session_id: session_id.map(ToString::to_string),
+            hook_event_name: Some("PreToolUse".to_string()),
+            cwd: Some("/workspace".to_string()),
+            transcript_path: None,
+            tool_name: Some("Bash".to_string()),
+            tool_use_id: Some("tool-1".to_string()),
+            tool_input_command: Some("true".to_string()),
+            tool_input_description: None,
+            tool_response_stdout: None,
+            tool_response_stderr: None,
+            tool_response_interrupted: None,
+            duration_ms: None,
+            permission_mode: None,
+            effort_level: None,
+            observed_at_ms: 100,
+            raw_json,
+        };
+        let mut call = AgentToolCall::from_hook(&hook);
+        call.post_observed_at_ms = Some(200);
+        call
+    }
+
+    fn attributed_event(run_id: &str) -> SystemEvent {
+        SystemEvent {
+            source: "linux-falco".to_string(),
+            event_type: "execve".to_string(),
+            event_kind: "ProcessExec".to_string(),
+            observed_at_ms: 150,
+            pid: Some(42),
+            ppid: Some(1),
+            process_name: Some("sh".to_string()),
+            executable_path: Some("/bin/sh".to_string()),
+            file_path: None,
+            command_line: Some("sh -c true".to_string()),
+            raw_json: json!({"session_id": run_id, "event_id": "falco-1"}).to_string(),
+        }
+    }
+
+    #[test]
+    fn rehydrates_sqlite_falco_events() {
+        let raw_json = json!({
+            "session_id": "run_1",
+            "output_fields": {
+                "evt.type": "connect",
+                "proc.pid": 42,
+                "proc.name": "curl",
+                "fd.rip": "203.0.113.10",
+                "fd.rport": 443
+            },
+            "gensee": { "network_dest": "203.0.113.10:443" }
+        })
+        .to_string();
+        let stored = StoredSystemEvent {
+            event_id: 1,
+            source: "linux-falco".to_string(),
+            event_type: "connect".to_string(),
+            observed_at_ms: 123,
+            pid: Some(42),
+            raw_json: raw_json.clone(),
+        };
+
+        let event = stored_system_event_for_timeline(stored).unwrap();
+
+        assert_eq!(event.source, "linux-falco");
+        assert_eq!(event.event_kind, "NetworkConnect");
+        assert_eq!(event.process_name.as_deref(), Some("curl"));
+        assert_eq!(system_event_session_id(&event).as_deref(), Some("run_1"));
+        assert_eq!(
+            system_event_network_dest(&event).as_deref(),
+            Some("203.0.113.10:443")
+        );
+        assert_eq!(event.raw_json, raw_json);
+    }
+
+    #[test]
+    fn loads_falco_from_sqlite_without_jsonl_mirror() {
+        let root = std::env::temp_dir().join(format!(
+            "gensee-timeline-native-system-events-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let store = EventStore::new(&root).unwrap();
+        let event = system_event_from_falco_line(
+            r#"{"output_fields":{"evt.type":"connect","proc.pid":42,"proc.name":"curl","fd.rip":"203.0.113.10","fd.rport":443}}"#,
+            123,
+            None,
+        )
+        .unwrap();
+        store.append_system_event(&event).unwrap();
+
+        assert!(store.list_system_events().unwrap().is_empty());
+        let events = timeline_system_events(&store, None, None, i64::MIN, i64::MAX, 100).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, "linux-falco");
+        assert_eq!(events[0].event_kind, "NetworkConnect");
+        assert_eq!(
+            system_event_network_dest(&events[0]).as_deref(),
+            Some("203.0.113.10:443")
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn session_query_filters_before_native_event_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "gensee-timeline-native-session-limit-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let store = EventStore::new(&root).unwrap();
+        let first = attributed_event("run_1");
+        let mut newer = attributed_event("run_2");
+        newer.observed_at_ms = 200;
+        newer.raw_json = json!({"session_id": "run_2", "event_id": "falco-2"}).to_string();
+        store.append_system_event(&first).unwrap();
+        store.append_system_event(&newer).unwrap();
+
+        let events =
+            timeline_system_events(&store, Some("run_1"), None, i64::MIN, i64::MAX, 1).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            system_event_session_id(&events[0]).as_deref(),
+            Some("run_1")
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn path_query_filters_before_native_event_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "gensee-timeline-native-path-limit-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let store = EventStore::new(&root).unwrap();
+        let mut matching = attributed_event("run_1");
+        matching.file_path = Some("/workspace/target.txt".to_string());
+        matching.raw_json = json!({
+            "session_id": "run_1",
+            "event_id": "falco-target",
+            "output_fields": {"fd.name": "/workspace/target.txt"}
+        })
+        .to_string();
+        let mut newer = attributed_event("run_2");
+        newer.observed_at_ms = 200;
+        newer.file_path = Some("/workspace/noise.txt".to_string());
+        newer.raw_json = json!({
+            "session_id": "run_2",
+            "event_id": "falco-noise",
+            "output_fields": {"fd.name": "/workspace/noise.txt"}
+        })
+        .to_string();
+        store.append_system_event(&matching).unwrap();
+        store.append_system_event(&newer).unwrap();
+
+        let events =
+            timeline_system_events(&store, None, Some("target.txt"), i64::MIN, i64::MAX, 1)
+                .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].file_path.as_deref(),
+            Some("/workspace/target.txt")
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reads_endpoint_security_session_attribution() {
+        let raw_json = json!({
+            "schema_version": 1,
+            "event_id": "event-1",
+            "boot_id": "boot-1",
+            "observed_at_ms": 123,
+            "event_type": "write",
+            "action": "notify",
+            "actor": {
+                "pid": 42,
+                "ppid": 1,
+                "executable_path": "/bin/sh"
+            },
+            "file": { "path": "/workspace/out.txt" },
+            "attribution": { "session_id": "run_1" }
+        })
+        .to_string();
+        let stored = StoredSystemEvent {
+            event_id: 1,
+            source: "macos-endpoint-security".to_string(),
+            event_type: "write".to_string(),
+            observed_at_ms: 123,
+            pid: Some(42),
+            raw_json,
+        };
+        let event = stored_system_event_for_timeline(stored).unwrap();
+
+        assert_eq!(event.event_kind, "file_mutation");
+        assert_eq!(event.file_path.as_deref(), Some("/workspace/out.txt"));
+        assert_eq!(system_event_session_id(&event).as_deref(), Some("run_1"));
+    }
+
+    #[test]
+    fn dedup_uses_compact_event_identity_instead_of_raw_payload() {
+        let first = attributed_event("run_1");
+        let mut second = first.clone();
+        second.raw_json =
+            json!({"session_id": "run_1", "event_id": "falco-1", "extra": true}).to_string();
+
+        assert_eq!(
+            system_event_dedup_key(&first, None),
+            system_event_dedup_key(&second, None)
+        );
+    }
+
+    #[test]
+    fn sqlite_row_id_keeps_pre_event_id_falco_events_distinct() {
+        let mut first = attributed_event("run_1");
+        first.raw_json = json!({"session_id": "run_1"}).to_string();
+        let second = first.clone();
+
+        assert_ne!(
+            system_event_dedup_key(&first, Some(10)),
+            system_event_dedup_key(&second, Some(11))
+        );
+    }
+
+    #[test]
+    fn legacy_jsonl_payload_suppresses_only_its_sqlite_mirror() {
+        let root = std::env::temp_dir().join(format!(
+            "gensee-timeline-native-legacy-dedup-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let store = EventStore::new(&root).unwrap();
+        let mut event = attributed_event("run_1");
+        event.raw_json = json!({"session_id": "run_1"}).to_string();
+        fs::write(
+            store.system_events_path(),
+            format!("{}\n", serde_json::to_string(&event).unwrap()),
+        )
+        .unwrap();
+        store.append_system_event(&event).unwrap();
+        store.append_system_event(&event).unwrap();
+
+        let events = timeline_system_events(&store, None, None, i64::MIN, i64::MAX, 100).unwrap();
+
+        assert_eq!(events.len(), 2);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn correlation_falls_back_to_time_without_a_recorded_run_id() {
+        let call = tool_call(None, None);
+        assert!(same_system_event_tool_call(
+            &call,
+            &attributed_event("run_1")
+        ));
+    }
+
+    #[test]
+    fn correlation_uses_tclone_run_id_instead_of_agent_session_uuid() {
+        let call = tool_call(Some("agent-session-uuid"), Some("run_1"));
+        assert!(same_system_event_tool_call(
+            &call,
+            &attributed_event("run_1")
+        ));
+        assert!(!same_system_event_tool_call(
+            &call,
+            &attributed_event("run_2")
+        ));
+    }
+
+    #[test]
+    fn native_session_prefilter_translates_agent_session_to_run_id() {
+        let hook = AgentHookEvent {
+            provider: "codex".to_string(),
+            session_id: Some("agent-session-uuid".to_string()),
+            hook_event_name: Some("PreToolUse".to_string()),
+            cwd: None,
+            transcript_path: None,
+            tool_name: Some("Bash".to_string()),
+            tool_use_id: Some("tool-1".to_string()),
+            tool_input_command: None,
+            tool_input_description: None,
+            tool_response_stdout: None,
+            tool_response_stderr: None,
+            tool_response_interrupted: None,
+            duration_ms: None,
+            permission_mode: None,
+            effort_level: None,
+            observed_at_ms: 100,
+            raw_json: json!({"gensee": {"run_id": "run_1"}}).to_string(),
+        };
+        let session = AgentSession {
+            session_id: "agent-session-uuid".to_string(),
+            agent_binary: "codex".to_string(),
+            root_pid: 1,
+            cwd: "/workspace".to_string(),
+            repo_path: None,
+            mode: None,
+            workspace_mode: None,
+            original_workspace: None,
+            staged_workspace: None,
+            sandbox_profile: None,
+            sandbox_profile_path: None,
+            started_at_ms: 50,
+            ended_at_ms: Some(200),
+            exit_code: Some(0),
+        };
+
+        let explicit_agent_session_id = timeline_agent_session_id(
+            &TimelineFilter::Session("agent-session-uuid".to_string()),
+            std::slice::from_ref(&session),
+            std::slice::from_ref(&hook),
+        );
+        assert_eq!(
+            explicit_agent_session_id.as_deref(),
+            Some("agent-session-uuid")
+        );
+        assert_eq!(
+            latest_hook_run_id_for_session(
+                std::slice::from_ref(&hook),
+                explicit_agent_session_id.as_deref().unwrap(),
+            )
+            .as_deref(),
+            Some("run_1")
+        );
+        assert_eq!(
+            timeline_agent_session_id(&TimelineFilter::Latest, &[session], &[hook]).as_deref(),
+            Some("agent-session-uuid")
+        );
+    }
+
+    #[test]
+    fn explicit_session_filter_keeps_events_for_mapped_run_id() {
+        let mut sessions = Vec::new();
+        let mut prompts = Vec::new();
+        let mut responses = Vec::new();
+        // The compacted tool-call view can contain a stale/different run ID.
+        // Rendering must use the same resolved ID that constrained the SQL query.
+        let mut tool_calls = vec![tool_call(Some("agent-session-uuid"), Some("run_2"))];
+        let mut system_events = vec![attributed_event("run_1"), attributed_event("run_2")];
+        let mut workspace_effects = Vec::new();
+        let mut alerts = Vec::new();
+
+        TimelineFilter::Session("agent-session-uuid".to_string()).apply(
+            TimelineCollections {
+                sessions: &mut sessions,
+                user_prompts: &mut prompts,
+                assistant_responses: &mut responses,
+                tool_calls: &mut tool_calls,
+                system_events: &mut system_events,
+                workspace_effects: &mut workspace_effects,
+                alerts: &mut alerts,
+            },
+            Some("agent-session-uuid"),
+            Some("run_1"),
+        );
+
+        assert_eq!(system_events.len(), 1);
+        assert_eq!(
+            system_event_session_id(&system_events[0]).as_deref(),
+            Some("run_1")
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum TimelineFilter {
     All,
@@ -450,6 +1003,42 @@ struct TimelineCollections<'a> {
     system_events: &'a mut Vec<SystemEvent>,
     workspace_effects: &'a mut Vec<WorkspaceEffect>,
     alerts: &'a mut Vec<AlertRecord>,
+}
+
+fn timeline_agent_session_id(
+    filter: &TimelineFilter,
+    sessions: &[AgentSession],
+    hooks: &[AgentHookEvent],
+) -> Option<String> {
+    match filter {
+        TimelineFilter::Session(session_id) => Some(session_id.clone()),
+        TimelineFilter::Latest => {
+            let session_candidates = sessions.iter().map(|session| {
+                (
+                    session.ended_at_ms.unwrap_or(session.started_at_ms),
+                    session.session_id.clone(),
+                )
+            });
+            let hook_candidates = hooks.iter().filter_map(|hook| {
+                let session_id = hook.session_id.clone().or_else(|| hook_run_id(hook))?;
+                Some((hook.observed_at_ms, session_id))
+            });
+            session_candidates
+                .chain(hook_candidates)
+                .max_by_key(|(observed_at_ms, _)| *observed_at_ms)
+                .map(|(_, session_id)| session_id)
+        }
+        TimelineFilter::All | TimelineFilter::Path(_) => None,
+    }
+}
+
+fn latest_hook_run_id_for_session(hooks: &[AgentHookEvent], session_id: &str) -> Option<String> {
+    hooks
+        .iter()
+        .filter(|hook| hook.session_id.as_deref() == Some(session_id))
+        .filter_map(|hook| Some((hook.observed_at_ms, hook_run_id(hook)?)))
+        .max_by_key(|(observed_at_ms, _)| *observed_at_ms)
+        .map(|(_, run_id)| run_id)
 }
 
 impl TimelineFilter {
@@ -474,38 +1063,40 @@ impl TimelineFilter {
         }
     }
 
-    fn apply(&self, collections: TimelineCollections<'_>) {
+    fn apply(
+        &self,
+        collections: TimelineCollections<'_>,
+        selected_agent_session_id: Option<&str>,
+        selected_native_session_id: Option<&str>,
+    ) {
         match self {
             Self::All => {}
             Self::Latest => {
-                let Some(session_id) = latest_agent_session_id(
-                    collections.sessions,
-                    collections.user_prompts,
-                    collections.assistant_responses,
-                    collections.tool_calls,
-                ) else {
+                let Some(session_id) = selected_agent_session_id.map(ToString::to_string) else {
                     return;
                 };
+                let system_event_session_id = selected_native_session_id.unwrap_or(&session_id);
                 keep_prompt_session(collections.user_prompts, &session_id);
                 keep_response_session(collections.assistant_responses, &session_id);
                 keep_session(collections.tool_calls, &session_id);
                 collections
                     .sessions
                     .retain(|session| session.session_id == session_id);
-                keep_system_event_session(collections.system_events, &session_id);
+                keep_system_event_session(collections.system_events, system_event_session_id);
                 collections
                     .workspace_effects
                     .retain(|effect| effect.session_id.as_deref() == Some(session_id.as_str()));
                 keep_alert_sessions(collections.alerts, &session_id);
             }
             Self::Session(session_id) => {
+                let system_event_session_id = selected_native_session_id.unwrap_or(session_id);
                 keep_prompt_session(collections.user_prompts, session_id);
                 keep_response_session(collections.assistant_responses, session_id);
                 keep_session(collections.tool_calls, session_id);
                 collections
                     .sessions
                     .retain(|session| session.session_id == *session_id);
-                keep_system_event_session(collections.system_events, session_id);
+                keep_system_event_session(collections.system_events, system_event_session_id);
                 collections
                     .workspace_effects
                     .retain(|effect| effect.session_id.as_deref() == Some(session_id.as_str()));
@@ -535,6 +1126,13 @@ impl TimelineFilter {
         }
     }
 
+    fn path_filter(&self) -> Option<&str> {
+        match self {
+            Self::Path(path) => Some(path),
+            Self::All | Self::Latest | Self::Session(_) => None,
+        }
+    }
+
     pub(crate) fn shows_standalone_system_events(&self) -> bool {
         matches!(
             self,
@@ -543,6 +1141,7 @@ impl TimelineFilter {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn latest_agent_session_id(
     sessions: &[AgentSession],
     user_prompts: &[AgentUserPrompt],
@@ -585,7 +1184,9 @@ pub(crate) fn keep_response_session(
 }
 
 pub(crate) fn keep_session(tool_calls: &mut Vec<AgentToolCall>, session_id: &str) {
-    tool_calls.retain(|call| call.session_id.as_deref() == Some(session_id));
+    tool_calls.retain(|call| {
+        call.session_id.as_deref() == Some(session_id) || call.run_id.as_deref() == Some(session_id)
+    });
 }
 
 pub(crate) fn keep_alert_sessions(alerts: &mut Vec<AlertRecord>, session_id: &str) {
@@ -672,17 +1273,19 @@ pub(crate) fn system_event_matches_path(event: &SystemEvent, path: &str) -> bool
 }
 
 pub(crate) fn system_event_session_id(event: &SystemEvent) -> Option<String> {
-    serde_json::from_str::<Value>(&event.raw_json)
-        .ok()?
-        .get("session_id")?
+    let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+    value
+        .get("session_id")
+        .or_else(|| value.pointer("/attribution/session_id"))?
         .as_str()
         .map(str::to_string)
 }
 
 pub(crate) fn system_event_network_dest(event: &SystemEvent) -> Option<String> {
-    serde_json::from_str::<Value>(&event.raw_json)
-        .ok()?
-        .get("network_dest")?
+    let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+    value
+        .get("network_dest")
+        .or_else(|| value.pointer("/gensee/network_dest"))?
         .as_str()
         .map(str::to_string)
 }
@@ -886,6 +1489,7 @@ pub(crate) fn looks_like_agent_refusal(response: &str) -> bool {
 #[derive(Debug, Clone)]
 pub(crate) struct AgentToolCall {
     pub(crate) session_id: Option<String>,
+    pub(crate) run_id: Option<String>,
     pub(crate) tool_use_id: Option<String>,
     pub(crate) tool_name: Option<String>,
     pub(crate) cwd: Option<String>,
@@ -911,6 +1515,7 @@ impl AgentToolCall {
     fn from_hook(hook: &AgentHookEvent) -> Self {
         let mut call = Self {
             session_id: hook.session_id.clone(),
+            run_id: hook_run_id(hook),
             tool_use_id: hook.tool_use_id.clone(),
             tool_name: hook.tool_name.clone(),
             cwd: hook.cwd.clone(),
@@ -937,6 +1542,7 @@ impl AgentToolCall {
 
     fn merge_hook(&mut self, hook: &AgentHookEvent) {
         fill_missing(&mut self.session_id, &hook.session_id);
+        fill_missing(&mut self.run_id, &hook_run_id(hook));
         fill_missing(&mut self.tool_use_id, &hook.tool_use_id);
         fill_missing(&mut self.tool_name, &hook.tool_name);
         fill_missing(&mut self.cwd, &hook.cwd);
@@ -1171,7 +1777,23 @@ pub(crate) fn same_file_intent_tool_call(call: &AgentToolCall, intent: &FileInte
 }
 
 pub(crate) fn same_system_event_tool_call(call: &AgentToolCall, event: &SystemEvent) -> bool {
+    if let (Some(event_run_id), Some(call_run_id)) =
+        (system_event_session_id(event), call.run_id.as_deref())
+    {
+        if call_run_id != event_run_id.as_str() {
+            return false;
+        }
+    }
     observed_at_inside_tool_window(call, event.observed_at_ms)
+}
+
+fn hook_run_id(hook: &AgentHookEvent) -> Option<String> {
+    let value = serde_json::from_str::<Value>(&hook.raw_json).ok()?;
+    value
+        .pointer("/gensee/run_id")
+        .or_else(|| value.get("gensee_run_id"))?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 pub(crate) fn same_workspace_effect_tool_call(

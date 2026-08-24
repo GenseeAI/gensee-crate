@@ -655,10 +655,16 @@ fn recovery_workspace_follows_leading_cd_into_git_repository() {
 }
 
 fn daemon_request(payload: &str, provider: &str) -> String {
+    let response_mode = match daemon_response_mode(&build_hook_event(payload, provider).unwrap()) {
+        DaemonResponseMode::Required => "required",
+        DaemonResponseMode::Optional => "optional",
+        DaemonResponseMode::FireAndForget => "fire_and_forget",
+    };
     json!({
         "gensee_daemon_protocol": 1,
         "provider": provider,
         "payload": payload,
+        "response_mode": response_mode,
     })
     .to_string()
 }
@@ -4010,24 +4016,101 @@ fn daemon_request_envelope_preserves_codex_provider() {
     let payload = pretool_bash_payload("s1", "/repo", "ls");
     let request = daemon_request(&payload, PROVIDER_CODEX);
 
-    let (parsed_payload, provider, tclone_context_run_id) = daemon_request_parts(&request).unwrap();
+    let DaemonHookRequest {
+        payload: parsed_payload,
+        provider,
+        tclone_context_run_id,
+        tclone_context_capability,
+        managed_run_id,
+        managed_operation_id,
+        response_mode,
+    } = daemon_request_parts(&request).unwrap();
 
     assert_eq!(provider, PROVIDER_CODEX);
     assert_eq!(parsed_payload, payload);
     assert!(tclone_context_run_id.is_none());
+    assert!(tclone_context_capability.is_none());
+    assert!(managed_run_id.is_none());
+    assert!(managed_operation_id.is_none());
+    assert_eq!(response_mode, DaemonResponseMode::Required);
 
     let request = json!({
         "gensee_daemon_protocol": 1,
         "provider": PROVIDER_CODEX,
         "payload": payload,
+        "response_mode": "required",
         "tclone_context_run_id": "run_source_fork_1_0",
+        "tclone_context_capability": "capability-1",
     })
     .to_string();
-    let (_, _, tclone_context_run_id) = daemon_request_parts(&request).unwrap();
+    let DaemonHookRequest {
+        tclone_context_run_id,
+        tclone_context_capability,
+        managed_run_id,
+        managed_operation_id,
+        ..
+    } = daemon_request_parts(&request).unwrap();
     assert_eq!(
         tclone_context_run_id.as_deref(),
         Some("run_source_fork_1_0")
     );
+    assert_eq!(tclone_context_capability.as_deref(), Some("capability-1"));
+    assert!(managed_run_id.is_none());
+    assert!(managed_operation_id.is_none());
+
+    let request = json!({
+        "gensee_daemon_protocol": 1,
+        "provider": PROVIDER_CODEX,
+        "payload": payload,
+        "response_mode": "required",
+        "managed_run_id": "run_managed_1",
+        "managed_operation_id": "op_managed_1",
+    })
+    .to_string();
+    let DaemonHookRequest {
+        tclone_context_run_id,
+        tclone_context_capability,
+        managed_run_id,
+        managed_operation_id,
+        ..
+    } = daemon_request_parts(&request).unwrap();
+    assert!(tclone_context_run_id.is_none());
+    assert!(tclone_context_capability.is_none());
+    assert_eq!(managed_run_id.as_deref(), Some("run_managed_1"));
+    assert_eq!(managed_operation_id.as_deref(), Some("op_managed_1"));
+
+    let conflicting_contexts = json!({
+        "gensee_daemon_protocol": 1,
+        "provider": PROVIDER_CODEX,
+        "payload": payload,
+        "response_mode": "required",
+        "tclone_context_run_id": "run_source_fork_1_0",
+        "tclone_context_capability": "capability-1",
+        "managed_run_id": "run_managed_1",
+        "managed_operation_id": "op_managed_1",
+    })
+    .to_string();
+    assert!(daemon_request_parts(&conflicting_contexts).is_err());
+
+    let incomplete_managed_identity = json!({
+        "gensee_daemon_protocol": 1,
+        "provider": PROVIDER_CODEX,
+        "payload": payload,
+        "response_mode": "required",
+        "managed_run_id": "run_managed_1",
+    })
+    .to_string();
+    assert!(daemon_request_parts(&incomplete_managed_identity).is_err());
+
+    let missing_capability = json!({
+        "gensee_daemon_protocol": 1,
+        "provider": PROVIDER_CODEX,
+        "payload": payload,
+        "response_mode": "required",
+        "tclone_context_run_id": "run_source_fork_1_0",
+    })
+    .to_string();
+    assert!(daemon_request_parts(&missing_capability).is_err());
 }
 
 #[test]
@@ -4049,6 +4132,15 @@ fn daemon_request_rejects_unwrapped_or_missing_provider() {
     })
     .to_string();
     assert!(daemon_request_parts(&unsupported_provider).is_err());
+
+    let invalid_response_mode = json!({
+        "gensee_daemon_protocol": 1,
+        "provider": PROVIDER_CODEX,
+        "payload": "{}",
+        "response_mode": "sometimes",
+    })
+    .to_string();
+    assert!(daemon_request_parts(&invalid_response_mode).is_err());
 }
 
 #[test]
@@ -7654,13 +7746,16 @@ fn codex_fork_context_marker_overrides_stale_source_run_env() {
     env::set_var("GENSEE_RUN_ID", "run_123");
     let (store, workspace) = temp_store_and_workspace("codex-fork-context-marker");
     let marker = workspace.join("gensee-run-context.json");
+    let fork_run_id = "run_123_fork_456_0";
+    let capability = rotate_tclone_host_control_capability(fork_run_id).unwrap();
     fs::write(
         &marker,
         json!({
-            "run_id": "run_123_fork_456_0",
+            "run_id": fork_run_id,
             "role": "fork",
             "source_run_id": "run_123",
             "workspace": workspace,
+            "host_control_capability": capability,
         })
         .to_string(),
     )
@@ -7682,6 +7777,7 @@ fn codex_fork_context_marker_overrides_stale_source_run_env() {
     }));
     env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
     env::remove_var("GENSEE_RUN_ID");
+    fs::remove_dir_all(gensee_tmp_root().unwrap().join(fork_run_id)).ok();
     std::fs::remove_dir_all(workspace).ok();
 }
 
@@ -7711,6 +7807,43 @@ fn inherited_fork_run_id_does_not_exempt_irreversible_local_mutation() {
     env::remove_var("GENSEE_RUN_ID");
     std::fs::remove_dir_all(workspace).ok();
     drop(store);
+}
+
+#[test]
+fn managed_ambient_run_id_requires_authenticated_process_proof() {
+    let _guard = telemetry_test_lock();
+    env::set_var("GENSEE_RUN_ID", "run_managed_1");
+    env::set_var("GENSEE_OPERATION_ID", "op_managed_1");
+    let (_store, workspace) = temp_store_and_workspace("managed-run-proof");
+    env::set_var(
+        "GENSEE_TCLONE_CONTEXT_PATH",
+        workspace.join("missing-run-context.json"),
+    );
+    clear_cached_authenticated_tclone_context();
+    clear_cached_authenticated_managed_run();
+    let payload = pretool_bash_payload("provider-session", workspace.to_str().unwrap(), "true");
+    let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<Value>(&event.raw_json)
+            .unwrap()
+            .pointer("/gensee/run_id"),
+        Some(&json!("run_managed_1")),
+        "the ambient value remains only a client-side hint before authentication"
+    );
+    assert!(current_tclone_run_id_for_event(&event).is_none());
+
+    cache_authenticated_managed_run("run_managed_1");
+    assert_eq!(
+        current_tclone_run_id_for_event(&event).as_deref(),
+        Some("run_managed_1")
+    );
+
+    clear_cached_authenticated_managed_run();
+    env::remove_var("GENSEE_TCLONE_CONTEXT_PATH");
+    env::remove_var("GENSEE_OPERATION_ID");
+    env::remove_var("GENSEE_RUN_ID");
+    fs::remove_dir_all(workspace).ok();
 }
 
 #[test]
