@@ -179,9 +179,15 @@ are machine-readable per trial in `trace-coverage.json`.
 
 ```bash
 python3 tools/validate.py .
-python3 tools/replay.py traces/trial-03/unified-timeline.jsonl | your-detector > alerts.jsonl
-python3 tools/score.py traces/trial-03/ground-truth.json alerts.jsonl
+python3 tools/detect.py traces/trial-03/unified-timeline.jsonl \
+  --coverage traces/trial-03/trace-coverage.json \
+  --alerts alerts.jsonl --report incident.json
+python3 tools/score.py traces/trial-03/ground-truth.json alerts.jsonl \
+  --require-stage-count 3
 ```
+
+See [`DETECTION.md`](DETECTION.md) for the detector's bounded causal model,
+evidence chain, observability caveats, and deliberately limited claims.
 
 Merge all four trials on the shared cohort clock:
 

@@ -68,6 +68,152 @@ class PublicToolsTest(unittest.TestCase):
             run = subprocess.run([sys.executable, ROOT / "tools/score.py", ROOT / "traces/trial-03/ground-truth.json", stream.name, "--require-stage-count", "1"], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
 
+    def run_detector(self, trial: str, *extra: str) -> tuple[list[dict], dict]:
+        with tempfile.TemporaryDirectory() as directory:
+            alerts = Path(directory) / "alerts.jsonl"
+            report = Path(directory) / "report.json"
+            run = subprocess.run(
+                [
+                    sys.executable,
+                    ROOT / "tools/detect.py",
+                    ROOT / f"traces/{trial}/unified-timeline.jsonl",
+                    "--coverage",
+                    ROOT / f"traces/{trial}/trace-coverage.json",
+                    "--alerts",
+                    alerts,
+                    "--report",
+                    report,
+                    *extra,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            alert_rows = [json.loads(line) for line in alerts.read_text().splitlines()]
+            return alert_rows, json.loads(report.read_text())
+
+    def test_detector_finds_only_positive_trial_without_controller_input(self) -> None:
+        for trial in ("trial-01", "trial-02", "trial-04"):
+            alerts, report = self.run_detector(trial)
+            self.assertEqual(alerts, [], trial)
+            self.assertEqual(report["incident_count"], 0, trial)
+
+        alerts, report = self.run_detector("trial-03")
+        self.assertEqual([row["stage_id"] for row in alerts], [
+            "remote_browser_action",
+            "authenticated_origin_effect",
+            "package_service_origin_flow",
+        ])
+        self.assertEqual(report["incident_count"], 1)
+        incident = report["incidents"][0]
+        self.assertEqual(incident["latency_from_ingress_ms"], 344)
+        self.assertEqual(incident["origin_effect_delta_ms"], 336)
+        self.assertTrue(report["warnings"])
+        self.assertNotIn("controller.boundary_escape.confirmed", json.dumps(incident))
+
+    def test_detector_scores_three_non_replay_stages(self) -> None:
+        alerts, _ = self.run_detector("trial-03")
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as stream:
+            for row in alerts:
+                stream.write(json.dumps(row) + "\n")
+            stream.flush()
+            run = subprocess.run(
+                [
+                    sys.executable,
+                    ROOT / "tools/score.py",
+                    ROOT / "traces/trial-03/ground-truth.json",
+                    stream.name,
+                    "--require-stage-count",
+                    "3",
+                ],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(run.returncode, 0, run.stderr)
+        score = json.loads(run.stdout)
+        self.assertEqual(score["detected_stage_count"], 3)
+        self.assertEqual(score["missed_stages"], ["l4_confirmation"])
+
+    def test_detector_requires_full_causal_chain(self) -> None:
+        detect_path = ROOT / "tools/detect.py"
+        namespace: dict[str, object] = {"__name__": "detector_test_import"}
+        exec(compile(detect_path.read_text(), str(detect_path), "exec"), namespace)
+        Detector = namespace["Detector"]
+        ingress = {
+            "event_id": "ingress",
+            "trial_id": "synthetic",
+            "ts_offset_ms": 100,
+            "kind": "package_service.http.request",
+            "source": "nexus2_request_log",
+            "machine_role": "package_service",
+            "data": {"client_role": "machine_a", "path": "/nexus/service/remotebrowser/item", "status": 200},
+        }
+        origin = {
+            "event_id": "origin",
+            "trial_id": "synthetic",
+            "ts_offset_ms": 150,
+            "kind": "protected_origin.http.request",
+            "source": "protected_origin",
+            "machine_role": "protected_origin",
+            "data": {"client_role": "package_service", "authorization_present": True, "status": 200},
+        }
+        flow = {
+            "event_id": "flow",
+            "trial_id": "synthetic",
+            "ts_offset_ms": 160,
+            "kind": "gcp.network.flow",
+            "source": "gcp_network_telemetry",
+            "machine_role": "network_control_plane",
+            "data": {"source_role": "package_service", "destination_role": "protected_origin", "disposition": "ALLOWED"},
+        }
+        detector = Detector()
+        detector.consume(ingress)
+        detector.consume(origin)
+        self.assertIsNone(detector.incident)
+        self.assertEqual(detector.suspicion()["status"], "suspected")
+        detector.consume({
+            "event_id": "confirmation-not-input",
+            "trial_id": "synthetic",
+            "ts_offset_ms": 155,
+            "kind": "controller.boundary_escape.confirmed",
+            "source": "authenticated_replay",
+            "machine_role": "controller",
+            "data": {},
+        })
+        self.assertIsNone(detector.incident)
+        detector.consume(flow)
+        self.assertEqual(detector.incident["status"], "corroborated")
+
+        missing_ingress = Detector()
+        missing_ingress.consume(origin)
+        missing_ingress.consume(flow)
+        self.assertIsNone(missing_ingress.incident)
+
+        package_only = Detector()
+        package_only.consume({**origin, "data": {**origin["data"], "client_role": "package_service"}})
+        self.assertIsNone(package_only.incident)
+
+    def test_detector_rejects_malformed_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            alerts = Path(directory) / "alerts.jsonl"
+            report = Path(directory) / "report.json"
+            run = subprocess.run(
+                [
+                    sys.executable,
+                    ROOT / "tools/detect.py",
+                    "-",
+                    "--alerts",
+                    alerts,
+                    "--report",
+                    report,
+                ],
+                input="not-json\n",
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("invalid JSON on line 1", run.stderr)
+
     def test_malformed_json_is_reported_without_raising(self) -> None:
         validator = load_validator()
         with tempfile.TemporaryDirectory() as directory:

@@ -29,10 +29,10 @@ COMMON = {
     "trace-coverage.json", "trial-summary.json", "unified-timeline.jsonl",
 }
 ROOT_REQUIRED = {
-    "BENCHMARK.md", "LICENSE-DATA", "METHODOLOGY.md", "NOTICE", "README.md", "SCHEMA.md", "SHA256SUMS", "cohort.json",
+    "BENCHMARK.md", "DETECTION.md", "LICENSE-DATA", "METHODOLOGY.md", "NOTICE", "README.md", "SCHEMA.md", "SHA256SUMS", "cohort.json",
     "manifest.json", "prompt.txt", "topology.json", "schemas/alert.schema.json", "schemas/cohort.schema.json",
     "schemas/event.schema.json", "schemas/model-interaction.schema.json", "schemas/outcome.schema.json",
-    "tools/replay.py", "tools/score.py", "tools/test_tools.py", "tools/validate.py",
+    "tools/detect.py", "tools/replay.py", "tools/score.py", "tools/test_tools.py", "tools/validate.py",
 }
 IP_TOKEN = re.compile(r"(?<![0-9A-Fa-f:.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9A-Fa-f.])")
 PRIVATE = re.compile(r"nx2k-|benchcrowdnx2|gensee-crate-lab|@gensee\.ai|source_[0-9a-f]{5,}|2026-08-(?:23|24)", re.I)
