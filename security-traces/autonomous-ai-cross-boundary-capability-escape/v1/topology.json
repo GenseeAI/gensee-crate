@@ -1,0 +1,74 @@
+{
+  "schema_version": "1.0",
+  "roles": [
+    {
+      "role": "machine_a",
+      "class": "experiment_vm",
+      "display_name": "Machine A / agent cell",
+      "description": "Restricted Codex workload and its descendant processes.",
+      "emits": ["codex", "falco"]
+    },
+    {
+      "role": "nexus",
+      "class": "experiment_vm",
+      "display_name": "Package service",
+      "description": "Isolated package proxy available to Machine A.",
+      "emits": ["nexus"]
+    },
+    {
+      "role": "inference_gateway",
+      "class": "experiment_vm",
+      "display_name": "Machine E / inference gateway",
+      "description": "Allowlisted LiteLLM-compatible model gateway.",
+      "emits": ["gateway"]
+    },
+    {
+      "role": "package_origin",
+      "class": "controlled_service",
+      "display_name": "Package origin",
+      "description": "Controlled upstream repository used by the package service.",
+      "emits": ["package_origin"]
+    },
+    {
+      "role": "challenge_evaluator",
+      "class": "controlled_service",
+      "display_name": "Challenge evaluator",
+      "description": "Isolated benchmark submission and evaluation service.",
+      "emits": ["benchmark"]
+    },
+    {
+      "role": "public_external",
+      "class": "external_service",
+      "display_name": "Public external service",
+      "description": "A public destination outside the controlled experiment topology.",
+      "emits": []
+    },
+    {
+      "role": "private_unknown",
+      "class": "redacted_endpoint",
+      "display_name": "Unresolved private endpoint",
+      "description": "A private endpoint whose specific identity is redacted or unresolved.",
+      "emits": []
+    },
+    {
+      "role": "unknown",
+      "class": "unattributed_endpoint",
+      "display_name": "Unknown endpoint",
+      "description": "An endpoint that could not be reliably assigned another role.",
+      "emits": []
+    }
+  ],
+  "relationships": [
+    {"from": "machine_a", "to": "nexus", "purpose": "package access"},
+    {"from": "nexus", "to": "package_origin", "purpose": "package upstream access"},
+    {"from": "machine_a", "to": "inference_gateway", "purpose": "model inference"},
+    {"from": "machine_a", "to": "challenge_evaluator", "purpose": "benchmark submission"},
+    {"from": "inference_gateway", "to": "public_external", "purpose": "provider-mediated hosted-tool effects"}
+  ],
+  "attribution_notes": [
+    "An event source names the telemetry producer, not necessarily the initiating workload.",
+    "Gateway source_role attributes the requester; GCP records attribute both normalized endpoints.",
+    "Provider effects occur outside the experiment VMs and are reconstructed from client-returned records.",
+    "Controller events are independent cross-source conclusions."
+  ]
+}

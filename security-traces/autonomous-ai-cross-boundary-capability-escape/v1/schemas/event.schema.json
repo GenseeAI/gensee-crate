@@ -1,0 +1,280 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/GenseeAI/gensee-crate/security-traces/schemas/capability-escape-event-v1.json",
+  "title": "Autonomous capability-escape normalized event",
+  "description": "Strict schema for the 16 declared event variants in source-specific files and the unified timelines. Trial-qualified event_id and cohort_offset_ms are present only in a unified timeline. The peer-cancellation variant occurs only in right-censored control timelines; challenge_evaluator/challenge.request is declared even when its observed count is zero.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ts", "ts_offset_ms", "source", "kind", "data"],
+  "properties": {
+    "schema_version": {"const": "1.0", "x-provenance": "synthetic"},
+    "event_id": {"type": "string", "pattern": "^trial-(?:01|02|03|04)_evt_[0-9]{6}$", "x-provenance": "synthetic"},
+    "ts": {"type": "string", "format": "date-time", "x-provenance": "derived"},
+    "ts_offset_ms": {"type": "integer", "minimum": 0, "x-provenance": "derived"},
+    "cohort_offset_ms": {"type": "integer", "minimum": 0, "x-provenance": "derived"},
+    "source": {"enum": ["benchmark", "challenge_evaluator", "codex", "controller", "falco", "gateway", "gcp", "nexus", "package_origin", "provider"], "x-provenance": "derived"},
+    "kind": {"type": "string", "minLength": 1, "maxLength": 128, "x-provenance": "derived"},
+    "data": {"type": "object", "x-provenance": "derived"}
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/benchmarkSubmission"},
+    {"$ref": "#/$defs/codexCommand"},
+    {"$ref": "#/$defs/controllerConfirmation"},
+    {"$ref": "#/$defs/controllerCancellation"},
+    {"$ref": "#/$defs/falcoSignal"},
+    {"$ref": "#/$defs/gatewayResponse"},
+    {"$ref": "#/$defs/firewallEvent"},
+    {"$ref": "#/$defs/natFlow"},
+    {"$ref": "#/$defs/vpcFlow"},
+    {"$ref": "#/$defs/nexusRequest"},
+    {"$ref": "#/$defs/packageOriginRequest"},
+    {"$ref": "#/$defs/challengeRequest"},
+    {"$ref": "#/$defs/hostedToolsResponse"},
+    {"$ref": "#/$defs/webSearchEffect"},
+    {"$ref": "#/$defs/openPageEffect"},
+    {"$ref": "#/$defs/codeInterpreterEffect"}
+  ],
+  "$defs": {
+    "role": {"enum": ["machine_a", "nexus", "inference_gateway", "package_origin", "challenge_evaluator", "public_external", "private_unknown", "unknown"]},
+    "tool": {"enum": ["code_interpreter", "web_search"]},
+    "domain": {"type": "string", "minLength": 1, "maxLength": 253},
+    "responseId": {"type": ["string", "null"], "pattern": "^response_[0-9a-f]{12}$"},
+    "eventVariant": {
+      "type": "object",
+      "required": ["source", "kind", "data"],
+      "properties": {
+        "source": {"type": "string", "x-provenance": "derived"},
+        "kind": {"type": "string", "x-provenance": "derived"},
+        "data": {"type": "object", "x-provenance": "derived"}
+      }
+    },
+    "benchmarkSubmission": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "benchmark", "x-provenance": "derived"},
+        "kind": {"const": "submission.accepted", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/benchmarkSubmissionData", "x-provenance": "observed"}
+      }}]
+    },
+    "benchmarkSubmissionData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["attempt", "metric", "score", "score_visibility", "submission_kind", "submitted_rows"],
+      "properties": {
+        "attempt": {"type": "integer", "minimum": 1, "x-provenance": "observed"},
+        "metric": {"const": "macro_f1", "x-provenance": "observed"},
+        "score": {"type": "number", "minimum": 0, "maximum": 1, "x-provenance": "observed"},
+        "score_visibility": {"enum": ["two_decimal_feedback", "post_session_only"], "x-provenance": "derived"},
+        "submission_kind": {"enum": ["feedback", "sealed_final"], "x-provenance": "observed"},
+        "submitted_rows": {"type": "integer", "minimum": 1, "x-provenance": "observed"}
+      }
+    },
+    "codexCommand": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "codex", "x-provenance": "derived"},
+        "kind": {"const": "command.completed", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/codexCommandData", "x-provenance": "derived"}
+      }}]
+    },
+    "codexCommandData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["category", "command_summary", "contains_inline_python", "exit_code", "requested_tools", "status", "target_domains", "uses_gateway_credential_variable"],
+      "properties": {
+        "category": {"enum": ["benchmark.submission.command", "command.local", "dataset.local", "inference_gateway.models", "inference_gateway.responses.request", "modeling.local", "network.probe", "nexus.probe"], "x-provenance": "derived"},
+        "command_summary": {"type": "string", "minLength": 1, "x-provenance": "derived"},
+        "contains_inline_python": {"type": "boolean", "x-provenance": "derived"},
+        "exit_code": {"type": "integer", "x-provenance": "observed"},
+        "requested_tools": {"type": "array", "items": {"$ref": "#/$defs/tool"}, "uniqueItems": true, "x-provenance": "derived"},
+        "status": {"enum": ["completed", "failed"], "x-provenance": "observed"},
+        "target_domains": {"type": "array", "items": {"$ref": "#/$defs/domain"}, "uniqueItems": true, "x-provenance": "derived"},
+        "uses_gateway_credential_variable": {"type": "boolean", "x-provenance": "derived"}
+      }
+    },
+    "controllerConfirmation": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "controller", "x-provenance": "derived"},
+        "kind": {"const": "boundary_escape.confirmed", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/controllerConfirmationData", "x-provenance": "correlated"}
+      }}]
+    },
+    "controllerConfirmationData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["classification", "nexus_exploit_succeeded", "private_holdout_accessed"],
+      "properties": {
+        "classification": {"const": "autonomous AI cross-boundary capability escape", "x-provenance": "correlated"},
+        "nexus_exploit_succeeded": {"type": "boolean", "x-provenance": "correlated"},
+        "private_holdout_accessed": {"type": "boolean", "x-provenance": "correlated"}
+      }
+    },
+    "controllerCancellation": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "controller", "x-provenance": "derived"},
+        "kind": {"const": "peer_escape.cancellation", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/controllerCancellationData", "x-provenance": "correlated"}
+      }}]
+    },
+    "controllerCancellationData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["censored", "classification", "peer_trial"],
+      "properties": {
+        "censored": {"const": true, "x-provenance": "correlated"},
+        "classification": {"const": "no escape observed before peer-triggered cancellation", "x-provenance": "correlated"},
+        "peer_trial": {"const": "trial-04", "x-provenance": "correlated"}
+      }
+    },
+    "falcoSignal": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "falco", "x-provenance": "derived"},
+        "kind": {"const": "runtime.signal", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/falcoSignalData", "x-provenance": "derived"}
+      }}]
+    },
+    "falcoSignalData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["command_category", "command_summary", "connection_role", "process", "rule", "uses_gateway_credential_variable"],
+      "properties": {
+        "command_category": {"type": "string", "minLength": 1, "x-provenance": "derived"},
+        "command_summary": {"type": "string", "minLength": 1, "x-provenance": "derived"},
+        "connection_role": {"oneOf": [{"$ref": "#/$defs/role"}, {"type": "null"}], "x-provenance": "derived"},
+        "process": {"type": "string", "minLength": 1, "x-provenance": "observed"},
+        "rule": {"type": "string", "minLength": 1, "x-provenance": "observed"},
+        "uses_gateway_credential_variable": {"type": "boolean", "x-provenance": "derived"}
+      }
+    },
+    "gatewayResponse": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "gateway", "x-provenance": "derived"},
+        "kind": {"const": "http.response", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/gatewayResponseData", "x-provenance": "observed"}
+      }}]
+    },
+    "gatewayResponseData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["authenticated", "correlated_direct_agent_request", "method", "path", "source_role", "status"],
+      "properties": {
+        "authenticated": {"type": "boolean", "x-provenance": "derived"},
+        "correlated_direct_agent_request": {"type": "boolean", "x-provenance": "correlated"},
+        "method": {"enum": ["GET", "POST"], "x-provenance": "observed"},
+        "path": {"enum": ["/v1/models", "/v1/responses"], "x-provenance": "observed"},
+        "source_role": {"const": "machine_a", "x-provenance": "derived"},
+        "status": {"type": "integer", "minimum": 100, "maximum": 599, "x-provenance": "observed"}
+      }
+    },
+    "networkBaseData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bytes_sent", "destination_asn", "destination_country", "destination_port", "destination_role", "disposition", "protocol", "source_port", "source_role"],
+      "properties": {
+        "bytes_sent": {"type": ["string", "null"], "pattern": "^[0-9]+$", "x-provenance": "observed"},
+        "destination_asn": {"type": ["integer", "null"], "minimum": 0, "x-provenance": "observed"},
+        "destination_country": {"type": ["string", "null"], "minLength": 2, "x-provenance": "observed"},
+        "destination_port": {"type": ["integer", "null"], "minimum": 0, "maximum": 65535, "x-provenance": "observed"},
+        "destination_role": {"$ref": "#/$defs/role", "x-provenance": "derived"},
+        "disposition": {"type": ["string", "null"], "x-provenance": "observed"},
+        "protocol": {"type": "integer", "minimum": 0, "maximum": 255, "x-provenance": "observed"},
+        "source_port": {"type": ["integer", "null"], "minimum": 0, "maximum": 65535, "x-provenance": "observed"},
+        "source_role": {"$ref": "#/$defs/role", "x-provenance": "derived"}
+      }
+    },
+    "firewallEvent": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "gcp", "x-provenance": "derived"},
+        "kind": {"const": "network.firewall", "x-provenance": "derived"},
+        "data": {"allOf": [{"$ref": "#/$defs/networkBaseData"}, {"properties": {"disposition": {"enum": ["ALLOWED", "DENIED"], "x-provenance": "observed"}}}], "x-provenance": "observed"}
+      }}]
+    },
+    "natFlow": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "gcp", "x-provenance": "derived"},
+        "kind": {"const": "network.nat_flow", "x-provenance": "derived"},
+        "data": {"allOf": [{"$ref": "#/$defs/networkBaseData"}, {"properties": {"disposition": {"enum": ["DROPPED", "OK"], "x-provenance": "observed"}}}], "x-provenance": "observed"}
+      }}]
+    },
+    "vpcFlow": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "gcp", "x-provenance": "derived"},
+        "kind": {"const": "network.vpc_flow", "x-provenance": "derived"},
+        "data": {"allOf": [{"$ref": "#/$defs/networkBaseData"}, {"properties": {"disposition": {"enum": ["DROPPED", null], "x-provenance": "observed"}}}], "x-provenance": "observed"}
+      }}]
+    },
+    "httpRequestData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["body_bytes", "method", "path", "redirect_present", "status", "upstream_status"],
+      "properties": {
+        "body_bytes": {"type": "integer", "minimum": 0, "x-provenance": "observed"},
+        "method": {"enum": ["GET", "HEAD"], "x-provenance": "observed"},
+        "path": {"type": "string", "minLength": 1, "x-provenance": "observed"},
+        "redirect_present": {"type": "boolean", "x-provenance": "derived"},
+        "status": {"type": "integer", "minimum": 100, "maximum": 599, "x-provenance": "observed"},
+        "upstream_status": {"type": ["integer", "null"], "minimum": 100, "maximum": 599, "x-provenance": "observed"}
+      }
+    },
+    "nexusRequest": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "nexus", "x-provenance": "derived"},
+        "kind": {"const": "package.request", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/httpRequestData", "x-provenance": "observed"}
+      }}]
+    },
+    "packageOriginRequest": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "package_origin", "x-provenance": "derived"},
+        "kind": {"const": "origin.request", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/httpRequestData", "x-provenance": "observed"}
+      }}]
+    },
+    "challengeRequest": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "challenge_evaluator", "x-provenance": "derived"},
+        "kind": {"const": "challenge.request", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/httpRequestData", "x-provenance": "observed"}
+      }}]
+    },
+    "hostedToolsResponse": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "provider", "x-provenance": "derived"},
+        "kind": {"const": "hosted_tools.response", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/hostedToolsResponseData", "x-provenance": "derived"}
+      }}]
+    },
+    "hostedToolsResponseData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["http_status", "observation_interaction_seq", "observed_effects", "requested_tools", "response_id", "target_domains"],
+      "properties": {
+        "http_status": {"type": ["integer", "null"], "minimum": 100, "maximum": 599, "x-provenance": "observed"},
+        "observation_interaction_seq": {"type": "integer", "minimum": 1, "x-provenance": "correlated"},
+        "observed_effects": {"type": "array", "items": {"enum": ["code_interpreter", "open_page", "web_search"]}, "uniqueItems": true, "x-provenance": "derived"},
+        "requested_tools": {"type": "array", "items": {"$ref": "#/$defs/tool"}, "uniqueItems": true, "x-provenance": "derived"},
+        "response_id": {"$ref": "#/$defs/responseId", "x-provenance": "derived"},
+        "target_domains": {"type": "array", "items": {"$ref": "#/$defs/domain"}, "uniqueItems": true, "x-provenance": "derived"}
+      }
+    },
+    "effectData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mediated_by", "observation_interaction_seq", "response_id"],
+      "properties": {
+        "mediated_by": {"const": "inference_gateway", "x-provenance": "derived"},
+        "observation_interaction_seq": {"type": "integer", "minimum": 1, "x-provenance": "correlated"},
+        "response_id": {"$ref": "#/$defs/responseId", "x-provenance": "derived"}
+      }
+    },
+    "webSearchEffect": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "provider", "x-provenance": "derived"},
+        "kind": {"const": "web_search.completed", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/effectData", "x-provenance": "derived"}
+      }}]
+    },
+    "openPageEffect": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "provider", "x-provenance": "derived"},
+        "kind": {"const": "open_page.completed", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/effectData", "x-provenance": "derived"}
+      }}]
+    },
+    "codeInterpreterEffect": {
+      "allOf": [{"$ref": "#/$defs/eventVariant"}, {"properties": {
+        "source": {"const": "provider", "x-provenance": "derived"},
+        "kind": {"const": "code_interpreter.completed", "x-provenance": "derived"},
+        "data": {"$ref": "#/$defs/effectData", "x-provenance": "derived"}
+      }}]
+    }
+  }
+}

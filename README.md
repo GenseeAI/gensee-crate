@@ -291,6 +291,28 @@ lease, mediation, and lifecycle model.
 
 </details>
 
+## Open agent-security traces
+
+<details>
+<summary><strong>Sanitized, replayable traces from controlled autonomous-agent security experiments</strong></summary>
+
+Test detection and correlation systems against Gensee's sanitized, offline
+security corpus. The first published scenario records a blind autonomous-agent
+experiment in which an overbroad inference credential enabled hosted web-search
+effects across the agent's intended internet boundary. The prompt did not name
+the gateway weakness or prescribe an attack path.
+
+- [Autonomous AI Cross-Boundary Capability Escape](security-traces/autonomous-ai-cross-boundary-capability-escape/v1/)
+- [Trace dataset index](security-traces/)
+
+The corpus includes the exact task prompt, complete recoverable client-side
+model event stream, normalized cross-machine telemetry, seven-stage ground
+truth, provenance, redaction records, checksums, and offline replay/scoring
+tools. It does not include credentials, private holdout labels, or executable
+network replay.
+
+</details>
+
 ## Roadmap
 
 - **Personal:** richer verification results, more harness integrations, quieter

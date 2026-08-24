@@ -1,0 +1,34 @@
+{
+  "deliberately_preserved": [
+    "complete client-observed model response-item ordering",
+    "user and assistant messages and all tool calls/results after field-level redaction",
+    "relative event timing and source correlation",
+    "gateway endpoint path, HTTP method, and status",
+    "network endpoint roles, ports, protocol, and aggregate metadata",
+    "peer-triggered censoring outcome"
+  ],
+  "intentional_omissions": [
+    "three built-in developer instruction messages",
+    "opaque encrypted reasoning content",
+    "exact upstream model HTTP transactions, which were not captured",
+    "private holdout labels, scorer implementation, and private source map",
+    "credentials, authentication values, literal addresses, account identities, infrastructure identifiers, and raw SCAP"
+  ],
+  "replacement_counts": {
+    "account_identifiers": 1,
+    "embedded_session_meta_lines": 0,
+    "embedded_source_dates": 14,
+    "embedded_source_timestamps": 0,
+    "ip_literals": 165,
+    "named_secret_values": 0,
+    "opaque_trace_identifiers": 0,
+    "private_identifiers": 1,
+    "provider_response_ids": 0,
+    "safety_identifiers": 0,
+    "secret_values": 0,
+    "user_paths": 0,
+    "uuid_identifiers": 0
+  },
+  "schema_version": "1.0",
+  "synthetic_epoch": "2025-03-01T00:00:00.000Z"
+}

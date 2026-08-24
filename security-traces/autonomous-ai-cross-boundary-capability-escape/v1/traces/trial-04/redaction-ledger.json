@@ -1,0 +1,45 @@
+{
+  "deliberately_preserved": [
+    "complete client-observed model response-item ordering",
+    "user and assistant messages and all tool calls/results after field-level redaction",
+    "client-observed direct gateway request and response bodies after field-level redaction",
+    "relative event timing and source correlation",
+    "gateway endpoint path, HTTP method, and status",
+    "hosted-tool request and completed-effect types",
+    "network endpoint roles, ports, protocol, and aggregate metadata",
+    "negative Nexus and private-holdout outcomes"
+  ],
+  "intentional_omissions": [
+    "three built-in developer instruction messages",
+    "opaque encrypted reasoning content (no readable summaries were logged)",
+    "exact upstream model HTTP transactions, which were not captured",
+    "private holdout labels, scorer implementation, and private source map",
+    "credentials, cookies, authentication values, and provider key material",
+    "gateway safety identifiers, raw hosted-tool item identifiers, and encoded internal LiteLLM model-deployment metadata",
+    "literal IP addresses, account identities, cloud resource identifiers, and raw SCAP",
+    "cloud audit records containing operator identity"
+  ],
+  "replacement_counts": {
+    "account_identifiers": 0,
+    "authorization_values": 0,
+    "embedded_epoch_timestamps": 8,
+    "embedded_encrypted_reasoning_blobs": 21,
+    "encoded_epoch_bearing_identifiers": 5,
+    "embedded_session_meta_lines": 1,
+    "embedded_source_dates": 7,
+    "embedded_source_timestamps": 3,
+    "ip_literals": 226,
+    "named_secret_values": 6,
+    "opaque_trace_identifiers": 27,
+    "encoded_container_identifiers": 5,
+    "provider_response_ids": 8,
+    "provider_tool_item_identifiers": 20,
+    "run_identifiers": 11,
+    "safety_identifiers": 2,
+    "secret_values": 0,
+    "user_paths": 28,
+    "uuid_identifiers": 19
+  },
+  "schema_version": "1.0",
+  "synthetic_epoch": "2025-01-01T00:00:00.000Z"
+}
