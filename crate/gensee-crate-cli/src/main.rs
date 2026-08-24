@@ -99,6 +99,8 @@ mod network_boundary;
 pub(crate) use network_boundary::*;
 mod operation_supervisor;
 pub(crate) use operation_supervisor::*;
+mod falco;
+pub(crate) use falco::*;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -3632,9 +3634,10 @@ pub(crate) fn handle_ingest(args: Vec<OsString>) -> io::Result<()> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("eslogger") => ingest_eslogger(),
         Some("endpoint-security") => ingest_endpoint_security(),
+        Some("falco") => ingest_falco(args[1..].to_vec()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee ingest eslogger|endpoint-security",
+            "usage: gensee ingest eslogger|endpoint-security|falco [--host <name>]",
         )),
     }
 }
@@ -4057,6 +4060,16 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 pruned_system_events = pruned.system_events;
                 pruned_low_severity_alerts = pruned.low_severity_alerts;
             }
+            // Keep a source-specific Falco retention backstop in a process that
+            // remains available when the Falco collector or pipe is down.
+            if let Err(error) = store.prune_falco_retention_if_due(
+                unix_millis()?,
+                60_000,
+                recording.raw_event_retention_hours,
+                recording.max_raw_events,
+            ) {
+                eprintln!("gensee endpoint ingest: Falco retention backstop failed: {error}");
+            }
             // An ingest commit is outside authorization latency and can safely
             // advance one throttled artifact-visibility migration batch.
             if let Err(error) = store.migrate_artifact_dashboard_visibility_if_due(
@@ -4446,6 +4459,8 @@ fn endpoint_alert_evidence(
 }
 
 pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
+    clear_cached_authenticated_tclone_context();
+    clear_cached_authenticated_managed_run();
     let mut payload = String::new();
     io::stdin().read_to_string(&mut payload)?;
 
@@ -4487,27 +4502,162 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
         }
     };
 
-    let tclone_context_run_id = current_tclone_context_run_id();
-    let event = build_hook_event_with_tclone_context(
-        &payload,
-        effective_provider,
-        tclone_context_run_id.as_deref(),
-    )?;
-    let session_registration = hook_session_registration(&event);
+    let (tclone_context_credentials, invalid_tclone_context) =
+        match current_tclone_observation_credentials() {
+            Ok(credentials) => (credentials, false),
+            Err(error) => {
+                if tclone_observer_debug_enabled() {
+                    eprintln!("gensee hook: invalid tclone run context: {error}");
+                }
+                (None, true)
+            }
+        };
+    let tclone_context_run_id = tclone_context_credentials
+        .as_ref()
+        .map(|(run_id, _)| run_id.clone())
+        .or_else(|| {
+            (!invalid_tclone_context)
+                .then(current_tclone_context_run_id)
+                .flatten()
+        });
+    let managed_operation_id = tclone_context_credentials
+        .is_none()
+        .then(|| {
+            env::var("GENSEE_OPERATION_ID")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| tclone_is_safe_token(value))
+        })
+        .flatten();
+    let mut event = if invalid_tclone_context {
+        build_unattributed_hook_event(&payload, effective_provider)?
+    } else {
+        build_hook_event_with_tclone_context(
+            &payload,
+            effective_provider,
+            tclone_context_credentials
+                .as_ref()
+                .map(|(run_id, _)| run_id.as_str()),
+        )?
+    };
+
+    if let Some((run_id, capability)) = tclone_context_credentials.as_ref() {
+        // A Tclone context is agent-writable, so authenticate it at a host
+        // boundary before local policy evaluation. When the observer is live,
+        // its authenticated append doubles as the mirror: one boundary round
+        // trip per hook instead of separate identity and observation calls.
+        let mut mirrored = false;
+        let authenticated = match authenticate_and_mirror_tclone_hook_observation(
+            &event, run_id, capability,
+        ) {
+            Ok(()) => {
+                cache_authenticated_tclone_context(run_id, capability);
+                mirrored = true;
+                true
+            }
+            Err(observer_error) => {
+                match authenticate_tclone_context_via_host_control(run_id, capability) {
+                    Ok(()) => {
+                        cache_authenticated_tclone_context(run_id, capability);
+                        true
+                    }
+                    Err(control_error) => {
+                        if tclone_observer_debug_enabled() {
+                            eprintln!(
+                                "gensee hook: rejected tclone context for {run_id}: host observer ({observer_error}); host control ({control_error})"
+                            );
+                        }
+                        false
+                    }
+                }
+            }
+        };
+        if !authenticated {
+            // Do not fall back to the stale source identity inherited by a
+            // live-cloned fork. Preserve the event locally without a Gensee
+            // run attribution so it cannot be falsely correlated.
+            event = build_unattributed_hook_event(&payload, effective_provider)?;
+        }
+
+        let store = EventStore::default_local()?;
+        if let Some(registration) = hook_session_registration(&event) {
+            store.append_session(&registration)?;
+        }
+        if let Some(decision_json) = process_hook_event(&payload, &event, &store)? {
+            print!("{decision_json}");
+        }
+        if authenticated && !mirrored {
+            // The observer may have been transiently unavailable while the
+            // signed host-control bridge still authenticated the context.
+            mirror_tclone_hook_observation(&event);
+        }
+        return Ok(());
+    }
+
+    if invalid_tclone_context {
+        // A malformed context must stay unattributed and must not reach a
+        // daemon as client-asserted identity. Preserve local handling.
+        let store = EventStore::default_local()?;
+        if let Some(registration) = hook_session_registration(&event) {
+            store.append_session(&registration)?;
+        }
+        if let Some(decision_json) = process_hook_event(&payload, &event, &store)? {
+            print!("{decision_json}");
+        }
+        return Ok(());
+    }
+
+    let mut session_registration = hook_session_registration(&event);
 
     // Fast path: if the warm daemon is up, hand off over its socket — PreToolUse
     // waits for the decision (warm eval, no per-call store open), observational
-    // events fire-and-forget off the critical path. Falls through to the
-    // in-process path if the daemon is unreachable, so enforcement never
-    // silently disappears.
-    if dispatch_via_daemon(
-        &payload,
-        &event,
-        session_registration.as_ref(),
-        tclone_context_run_id.as_deref(),
-    ) {
-        mirror_tclone_hook_observation(&event);
+    // events fire-and-forget off the critical path. An ambient managed-run ID
+    // is only a hint: the daemon binds the kernel-authenticated peer lineage to
+    // the operation record's stable root PID generation before using it. Falls
+    // through to the same authenticated in-process check if the daemon is
+    // unreachable, so enforcement and attribution never silently disappear.
+    let managed_identity = tclone_context_run_id
+        .as_deref()
+        .zip(managed_operation_id.as_deref());
+    if (tclone_context_run_id.is_none() || managed_identity.is_some())
+        && dispatch_via_daemon(
+            &payload,
+            &event,
+            session_registration.as_ref(),
+            None,
+            None,
+            managed_identity.map(|(run_id, _)| run_id),
+            managed_identity.map(|(_, operation_id)| operation_id),
+        )
+    {
         return Ok(());
+    }
+
+    if let Some(run_id) = tclone_context_run_id.as_deref() {
+        let authentication = managed_operation_id
+            .as_deref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "managed hook is missing GENSEE_OPERATION_ID",
+                )
+            })
+            .and_then(|operation_id| authenticate_current_managed_run(run_id, operation_id));
+        match authentication {
+            Ok(()) => cache_authenticated_managed_run(run_id),
+            Err(error) => {
+                if tclone_observer_debug_enabled() {
+                    eprintln!(
+                        "gensee hook: recording managed run hint {run_id} without attribution: {error}"
+                    );
+                }
+                // The daemon and local fallback use the same process-generation
+                // proof. A forged or stale ambient run ID may still be recorded
+                // as unattributed activity, but can never claim the managed run.
+                event = build_unattributed_hook_event(&payload, effective_provider)?;
+                session_registration = hook_session_registration(&event);
+            }
+        }
     }
 
     let store = EventStore::default_local()?;
@@ -4517,8 +4667,13 @@ pub(crate) fn handle_agent_hook(provider: &str) -> io::Result<()> {
     if let Some(decision_json) = process_hook_event(&payload, &event, &store)? {
         print!("{decision_json}");
     }
-    mirror_tclone_hook_observation(&event);
     Ok(())
+}
+
+fn tclone_observer_debug_enabled() -> bool {
+    env::var("GENSEE_TCLONE_HOST_OBSERVER_DEBUG")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -4652,6 +4807,14 @@ pub(crate) fn process_hook_event(
             recording.low_severity_retention_hours,
         ) {
             eprintln!("gensee hook: retention maintenance failed: {error}");
+        }
+        if let Err(error) = store.prune_falco_retention_if_due(
+            event.observed_at_ms,
+            60_000,
+            recording.raw_event_retention_hours,
+            recording.max_raw_events,
+        ) {
+            eprintln!("gensee hook: Falco retention backstop failed: {error}");
         }
         if let Err(error) = store.migrate_artifact_dashboard_visibility_if_due(
             event.observed_at_ms,
@@ -5215,4 +5378,5 @@ pub(crate) fn print_usage() {
     println!(
         "AUDIT:\n  gensee audit codex [--workspace <path>] [--json] [--fail-on <level>]\n  gensee audit vscode [--workspace <path>] [--vscode-profile <id>] [--json] [--fail-on <level>]\n  gensee audit <codex-cli|github-copilot-vscode|vscode-agent-host> [OPTIONS]\n"
     );
+    println!("SYSTEM EVENT INGEST:\n  gensee ingest falco [--host <name>] < falco.jsonl\n");
 }

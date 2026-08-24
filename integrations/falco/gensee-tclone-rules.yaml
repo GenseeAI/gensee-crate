@@ -1,0 +1,63 @@
+- rule: Gensee Tclone Process Execution
+  desc: Record process execution inside a container for trajectory reconstruction.
+  condition: >
+    evt.type in (execve, execveat) and evt.dir=< and thread.cgroups contains "libpod"
+  output: >
+    gensee process exec evt_num=%evt.num evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
+    proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
+    user_uid=%user.uid cgroups=%thread.cgroups evt_args=%evt.args
+  priority: NOTICE
+  tags: [gensee, trajectory, process]
+
+- rule: Gensee Tclone Workspace File Open
+  desc: Record reads and opens under the Tclone workspace.
+  condition: >
+    evt.type in (open, openat, openat2, creat) and evt.dir=< and thread.cgroups contains "libpod" and
+    fd.name startswith /workspace
+  output: >
+    gensee workspace file open evt_num=%evt.num evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
+    proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
+    file_path=%fd.name open_flags=%evt.arg.flags cgroups=%thread.cgroups evt_args=%evt.args
+  priority: INFORMATIONAL
+  tags: [gensee, trajectory, file]
+
+- rule: Gensee Tclone File Mutation
+  desc: Record successful file mutation syscalls inside a container.
+  condition: >
+    evt.type in (unlink, unlinkat, rename, renameat, renameat2, mkdir, mkdirat,
+    rmdir, link, linkat, symlink, symlinkat, truncate, ftruncate, chmod, fchmod,
+    fchmodat, chown, fchown, fchownat) and evt.dir=< and thread.cgroups contains "libpod"
+  output: >
+    gensee file mutation evt_num=%evt.num evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
+    proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
+    file_path=%fd.name path=%evt.arg.path name=%evt.arg.name oldpath=%evt.arg.oldpath
+    filename=%evt.arg.filename pathname=%evt.arg.pathname target=%evt.arg.target linkpath=%evt.arg.linkpath
+    cgroups=%thread.cgroups evt_args=%evt.args
+  priority: INFORMATIONAL
+  tags: [gensee, trajectory, file, mutation]
+
+- rule: Gensee Tclone Network Connection
+  desc: Record container network connection attempts with socket context.
+  condition: >
+    evt.type in (connect, accept, accept4, bind, listen) and evt.dir=< and thread.cgroups contains "libpod"
+  output: >
+    gensee network evt_num=%evt.num evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
+    proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
+    fd_name=%fd.name source_ip=%fd.sip source_port=%fd.sport remote_ip=%fd.rip
+    remote_port=%fd.rport cgroups=%thread.cgroups evt_args=%evt.args
+  priority: NOTICE
+  tags: [gensee, trajectory, network]
+
+- rule: Gensee Tclone High Risk Syscall
+  desc: Record high-risk kernel, namespace, tracing, and privilege syscalls.
+  condition: >
+    evt.type in (ptrace, process_vm_readv, process_vm_writev, bpf, init_module,
+    finit_module, delete_module, mount, umount2, pivot_root, unshare, setns,
+    setuid, setgid, setreuid, setregid, setresuid, setresgid) and evt.dir=< and
+    thread.cgroups contains "libpod"
+  output: >
+    gensee high risk syscall evt_num=%evt.num evt_rawtime=%evt.rawtime evt_type=%evt.type proc_pid=%proc.pid proc_ppid=%proc.ppid
+    proc_name=%proc.name proc_exepath=%proc.exepath proc_cmdline=%proc.cmdline
+    user_uid=%user.uid cgroups=%thread.cgroups evt_args=%evt.args
+  priority: WARNING
+  tags: [gensee, trajectory, syscall, high-risk]
