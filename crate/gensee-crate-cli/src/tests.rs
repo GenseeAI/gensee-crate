@@ -72,6 +72,35 @@ fn telemetry_test_lock() -> std::sync::MutexGuard<'static, ()> {
     cli_test_env_lock()
 }
 
+struct TestEnvVarGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl TestEnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = env::var_os(name);
+        env::set_var(name, value);
+        Self { name, previous }
+    }
+
+    fn remove(name: &'static str) -> Self {
+        let previous = env::var_os(name);
+        env::remove_var(name);
+        Self { name, previous }
+    }
+}
+
+impl Drop for TestEnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            env::set_var(self.name, previous);
+        } else {
+            env::remove_var(self.name);
+        }
+    }
+}
+
 #[test]
 fn cli_test_environment_mutations_share_one_process_wide_lock() {
     let first_guard = cli_test_env_lock();
@@ -6950,30 +6979,18 @@ fn run_config_parses_tclone_observe_only_mode() {
 #[test]
 fn legacy_observe_only_environment_does_not_change_host_run_or_hook_mode() {
     let _guard = cli_test_env_lock();
-    let previous_legacy = env::var_os("GENSEE_OBSERVE_ONLY");
-    let previous_tclone = env::var_os("GENSEE_TCLONE_OBSERVE_ONLY");
-    env::set_var("GENSEE_OBSERVE_ONLY", "1");
-    env::remove_var("GENSEE_TCLONE_OBSERVE_ONLY");
+    let _legacy = TestEnvVarGuard::set("GENSEE_OBSERVE_ONLY", "1");
+    let _tclone = TestEnvVarGuard::remove("GENSEE_TCLONE_OBSERVE_ONLY");
 
     let config = RunConfig::parse(vec![OsString::from("--"), OsString::from("codex")]).unwrap();
     assert!(!config.observe_only);
     assert!(!tclone_observe_only_container_enabled());
-
-    if let Some(previous) = previous_legacy {
-        env::set_var("GENSEE_OBSERVE_ONLY", previous);
-    } else {
-        env::remove_var("GENSEE_OBSERVE_ONLY");
-    }
-    if let Some(previous) = previous_tclone {
-        env::set_var("GENSEE_TCLONE_OBSERVE_ONLY", previous);
-    }
 }
 
 #[test]
 fn tclone_observe_only_marker_does_not_skip_command_validation() {
     let _guard = cli_test_env_lock();
-    let previous = env::var_os("GENSEE_TCLONE_OBSERVE_ONLY");
-    env::set_var("GENSEE_TCLONE_OBSERVE_ONLY", "1");
+    let _marker = TestEnvVarGuard::set("GENSEE_TCLONE_OBSERVE_ONLY", "1");
 
     assert!(tclone_observe_only_container_enabled());
     assert_eq!(
@@ -6999,12 +7016,6 @@ fn tclone_observe_only_marker_does_not_skip_command_validation() {
         OsString::from("claude-code"),
         OsString::from("--repair")
     ]));
-
-    if let Some(previous) = previous {
-        env::set_var("GENSEE_TCLONE_OBSERVE_ONLY", previous);
-    } else {
-        env::remove_var("GENSEE_TCLONE_OBSERVE_ONLY");
-    }
 }
 
 #[test]

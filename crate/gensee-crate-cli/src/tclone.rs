@@ -4120,35 +4120,15 @@ fn run_tclone_agent_inner(
         }
         path_prefixes.push(node_mount.container_bin.to_string_lossy().to_string());
     }
-    // The host Cargo bin directory commonly contains the installed `gensee`
-    // executable. Do not expose that directory at all in observe-only mode:
-    // omitting /usr/local/bin/gensee is insufficient when PATH can find the
-    // host copy through this bind mount.
-    if let Some((cargo_bin, rustup_home)) = tclone_rust_mount_for_run(observe_only) {
-        create_args.push(OsString::from("-v"));
-        create_args.push(OsString::from(format!(
-            "{}:{}:ro",
-            cargo_bin.display(),
-            cargo_bin.display()
-        )));
-        path_prefixes.push(cargo_bin.to_string_lossy().to_string());
-        if let Some(rustup_home) = rustup_home {
-            create_args.push(OsString::from("-v"));
-            create_args.push(OsString::from(format!(
-                "{}:{}:ro",
-                rustup_home.display(),
-                rustup_home.display()
-            )));
-            create_args.push(OsString::from("-e"));
-            create_args.push(OsString::from(format!(
-                "RUSTUP_HOME={}",
-                rustup_home.display()
-            )));
-        }
-        create_args.push(OsString::from("-e"));
-        create_args.push(OsString::from(format!(
-            "CARGO_HOME={container_home}/.cargo"
-        )));
+    if let Some((cargo_bin, rustup_home)) = tclone_rust_mount() {
+        append_tclone_rust_mount_args(
+            &mut create_args,
+            &mut path_prefixes,
+            &cargo_bin,
+            rustup_home.as_deref(),
+            &container_home,
+            observe_only,
+        );
     }
     if !path_prefixes.is_empty() {
         create_args.push(OsString::from("-e"));
@@ -10367,7 +10347,7 @@ fn disable_tclone_agent_hooks(
     let relative_home = container_relative_path(container_agent_home)?;
     match agent_home_name {
         "CODEX_HOME" => {
-            write_empty_hook_config(seed_root, &seed_root.join(relative_home).join("hooks.json"))
+            remove_tclone_hook_config(seed_root, &seed_root.join(relative_home).join("hooks.json"))
         }
         "CLAUDE_CONFIG_DIR" => {
             let settings_path = seed_root.join(relative_home).join("settings.json");
@@ -10386,7 +10366,7 @@ fn disable_tclone_agent_hooks(
             object.insert("disableAllHooks".to_string(), json!(true));
             write_tclone_json(&settings_path, &settings)
         }
-        "GEMINI_HOME" => write_empty_hook_config(
+        "GEMINI_HOME" => remove_tclone_hook_config(
             seed_root,
             &seed_root
                 .join(relative_home)
@@ -10397,9 +10377,17 @@ fn disable_tclone_agent_hooks(
     }
 }
 
-fn write_empty_hook_config(seed_root: &Path, path: &Path) -> io::Result<()> {
+fn remove_tclone_hook_config(seed_root: &Path, path: &Path) -> io::Result<()> {
+    let mut config = read_tclone_json_object_or_empty(path)?;
     prepare_tclone_json_path(seed_root, path)?;
-    write_tclone_json(path, &json!({}))
+    let object = config.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} must be a JSON object", path.display()),
+        )
+    })?;
+    object.remove("hooks");
+    write_tclone_json(path, &config)
 }
 
 fn prepare_tclone_json_path(seed_root: &Path, path: &Path) -> io::Result<()> {
@@ -10781,8 +10769,47 @@ fn tclone_rust_mount() -> Option<(PathBuf, Option<PathBuf>)> {
     Some((cargo_bin, rustup_home))
 }
 
-fn tclone_rust_mount_for_run(observe_only: bool) -> Option<(PathBuf, Option<PathBuf>)> {
-    (!observe_only).then(tclone_rust_mount).flatten()
+fn append_tclone_rust_mount_args(
+    create_args: &mut Vec<OsString>,
+    path_prefixes: &mut Vec<String>,
+    cargo_bin: &Path,
+    rustup_home: Option<&Path>,
+    container_home: &str,
+    observe_only: bool,
+) {
+    create_args.push(OsString::from("-v"));
+    create_args.push(OsString::from(format!(
+        "{}:{}:ro",
+        cargo_bin.display(),
+        cargo_bin.display()
+    )));
+    if observe_only {
+        // Preserve cargo/rustc parity while hiding the host-installed Gensee
+        // executable that commonly lives beside them.
+        create_args.push(OsString::from("-v"));
+        create_args.push(OsString::from(format!(
+            "/dev/null:{}/gensee:ro",
+            cargo_bin.display()
+        )));
+    }
+    path_prefixes.push(cargo_bin.to_string_lossy().to_string());
+    if let Some(rustup_home) = rustup_home {
+        create_args.push(OsString::from("-v"));
+        create_args.push(OsString::from(format!(
+            "{}:{}:ro",
+            rustup_home.display(),
+            rustup_home.display()
+        )));
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!(
+            "RUSTUP_HOME={}",
+            rustup_home.display()
+        )));
+    }
+    create_args.push(OsString::from("-e"));
+    create_args.push(OsString::from(format!(
+        "CARGO_HOME={container_home}/.cargo"
+    )));
 }
 
 fn tclone_podman() -> OsString {
@@ -13998,8 +14025,43 @@ gensee async job job_1: exited status=0
     }
 
     #[test]
-    fn tclone_observe_only_does_not_mount_the_host_rust_toolchain() {
-        assert!(tclone_rust_mount_for_run(true).is_none());
+    fn tclone_observe_only_masks_gensee_without_dropping_the_rust_toolchain() {
+        let cargo_bin = Path::new("/opt/host-rust/bin");
+        let rustup_home = Path::new("/opt/host-rust/rustup");
+        let mut create_args = Vec::new();
+        let mut path_prefixes = Vec::new();
+
+        append_tclone_rust_mount_args(
+            &mut create_args,
+            &mut path_prefixes,
+            cargo_bin,
+            Some(rustup_home),
+            "/home/gensee",
+            true,
+        );
+
+        assert!(create_args.contains(&OsString::from("/opt/host-rust/bin:/opt/host-rust/bin:ro")));
+        assert!(create_args.contains(&OsString::from("/dev/null:/opt/host-rust/bin/gensee:ro")));
+        assert!(create_args.contains(&OsString::from(
+            "/opt/host-rust/rustup:/opt/host-rust/rustup:ro"
+        )));
+        assert!(create_args.contains(&OsString::from("RUSTUP_HOME=/opt/host-rust/rustup")));
+        assert!(create_args.contains(&OsString::from("CARGO_HOME=/home/gensee/.cargo")));
+        assert_eq!(path_prefixes, vec!["/opt/host-rust/bin"]);
+
+        let mut normal_args = Vec::new();
+        let mut normal_prefixes = Vec::new();
+        append_tclone_rust_mount_args(
+            &mut normal_args,
+            &mut normal_prefixes,
+            cargo_bin,
+            Some(rustup_home),
+            "/home/gensee",
+            false,
+        );
+        assert!(!normal_args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("/dev/null:")));
     }
 
     #[test]
@@ -14502,7 +14564,7 @@ gensee async job job_1: exited status=0
         let external_hooks = root.join("external-hooks.json");
         fs::write(
             &external_hooks,
-            r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"gensee hook codex"}]}]}}"#,
+            r#"{"customSetting":"preserved","hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"gensee hook codex"}]}]}}"#,
         )
         .unwrap();
         std::os::unix::fs::symlink(&external_hooks, host_home.join("hooks.json")).unwrap();
@@ -14529,7 +14591,8 @@ gensee async job job_1: exited status=0
             &fs::read_to_string(seed.join("home/gensee/.codex/hooks.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(hooks, json!({}));
+        assert_eq!(hooks["customSetting"], "preserved");
+        assert!(hooks.get("hooks").is_none());
         assert!(fs::read_to_string(&external_hooks)
             .unwrap()
             .contains("gensee hook codex"));
@@ -14680,6 +14743,45 @@ gensee async job job_1: exited status=0
             fs::read_link(seed.join(gemini_home.strip_prefix("/").unwrap())).unwrap(),
             PathBuf::from("/home/gensee/.gemini")
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_observe_only_preserves_non_hook_gemini_configuration() {
+        let root = temp_tree("observe-only-gemini-home");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let gemini_home = root.join("host-home/yiying/.gemini");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(gemini_home.join("config")).unwrap();
+        fs::write(
+            gemini_home.join("config/hooks.json"),
+            r#"{"customSetting":"preserved","hooks":{"BeforeTool":[]}}"#,
+        )
+        .unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "GEMINI_HOME".to_string(),
+                gemini_home,
+                "/home/gensee/.gemini".to_string(),
+            )),
+            None,
+            "/workspace",
+            "/home/gensee",
+            true,
+        )
+        .unwrap();
+
+        let config: Value = serde_json::from_str(
+            &fs::read_to_string(seed.join("home/gensee/.gemini/config/hooks.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["customSetting"], "preserved");
+        assert!(config.get("hooks").is_none());
         let _ = fs::remove_dir_all(root);
     }
 
