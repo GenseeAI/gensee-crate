@@ -343,6 +343,7 @@ issues](https://github.com/GenseeAI/gensee-crate/issues) for current work.
 - [Linux controls](docs/linux.md)
 - [tclone transactional runtime](docs/tclone.md)
 - [Capability broker and leases](docs/capability-broker.md)
+- [Authenticated telemetry replay](docs/replay.md)
 - [Dashboard](docs/dashboard.md)
 - [Roadmap](docs/roadmap.md)
 

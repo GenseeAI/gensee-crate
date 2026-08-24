@@ -101,6 +101,8 @@ mod operation_supervisor;
 pub(crate) use operation_supervisor::*;
 mod falco;
 pub(crate) use falco::*;
+mod replay;
+pub(crate) use replay::*;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -344,6 +346,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             args.remove(0);
             handle_ingest(args)
         }
+        Some("replay") => {
+            args.remove(0);
+            handle_replay(args)
+        }
         Some("observe-tool-window") => {
             args.remove(0);
             observe_tool_window(args)
@@ -369,6 +375,7 @@ fn should_bootstrap_telemetry_for_command(command: &str) -> bool {
         && command != "checkpoint"
         && command != "linux"
         && command != "debug"
+        && command != "replay"
         && command != "__linux-exec"
         && command != "__cell-landlock-exec"
         && !is_linux_top_level_command(command)
@@ -5416,4 +5423,7 @@ pub(crate) fn print_usage() {
         "AUDIT:\n  gensee audit codex [--workspace <path>] [--json] [--fail-on <level>]\n  gensee audit vscode [--workspace <path>] [--vscode-profile <id>] [--json] [--fail-on <level>]\n  gensee audit <codex-cli|github-copilot-vscode|vscode-agent-host> [OPTIONS]\n"
     );
     println!("SYSTEM EVENT INGEST:\n  gensee ingest falco [--host <name>] < falco.jsonl\n");
+    println!(
+        "TELEMETRY REPLAY:\n  gensee replay build --manifest <manifest.json> --output <bundle-dir> [--signing-key <ed25519-seed.hex>]\n  gensee replay verify --bundle <bundle-dir> [--trusted-key <public-key.hex>] [--require-signature]\n  gensee replay correlate --bundle <bundle-dir> --rules <rules.json> --output <report.json> [--trusted-key <public-key.hex>] [--require-signature]\n"
+    );
 }

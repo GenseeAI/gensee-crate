@@ -1,0 +1,2 @@
+{"rule":"Container Process Observation","output_fields":{"evt.time":1712345678000000000,"proc.pid":42}}
+{"rule":"Container Network Observation","output_fields":{"evt.time":1712345678500000000,"proc.pid":42,"fd.name":"198.51.100.10:443"}}
