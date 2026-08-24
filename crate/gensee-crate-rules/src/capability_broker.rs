@@ -8,7 +8,7 @@ pub const BROKER_PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokerResourceKind {
-    RepositoryToken,
+    ExternalServiceAuthority,
     ApiToken,
     WorkloadIdentity,
     MtlsCertificate,
@@ -66,7 +66,7 @@ pub enum BrokerProviderStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokerGatewayEffectKind {
-    RepositoryRequest,
+    ExternalServiceRequest,
     ApiRequest,
     IdentityExchange,
     MtlsConnection,
@@ -219,10 +219,10 @@ mod tests {
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_1".to_string()),
-            resource_kind: BrokerResourceKind::RepositoryToken,
+            resource_kind: BrokerResourceKind::ExternalServiceAuthority,
             adapter_id: "repo-broker".to_string(),
             audience: "repo.example.test".to_string(),
-            scopes: vec!["repository:one:read".to_string()],
+            scopes: vec!["service:one:read".to_string()],
             constraints: Value::Null,
             issued_at_ms: 1,
             expires_at_ms: 2,
@@ -269,10 +269,10 @@ mod tests {
                 "protocol_version": 1,
                 "operation_id": "op_1",
                 "source_run_id": "run_1",
-                "resource_kind": "repository_token",
+                "resource_kind": "external_service_authority",
                 "adapter_id": "repo-broker",
                 "audience": "repo.example.test",
-                "scopes": ["repository:one:read"],
+                "scopes": ["service:one:read"],
                 "ttl_seconds": 60
             }
         }))

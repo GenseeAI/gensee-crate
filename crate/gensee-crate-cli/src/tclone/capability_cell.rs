@@ -1039,7 +1039,7 @@ fn validate_cell_request_for_execution(
     for broker_lease in &broker_leases {
         validate_broker_scope_against_request(&lease.request, broker_lease)?;
         match broker_lease.resource_kind {
-            BrokerResourceKind::RepositoryToken | BrokerResourceKind::ApiToken => {
+            BrokerResourceKind::ExternalServiceAuthority | BrokerResourceKind::ApiToken => {
                 active_mediators.push(MediationBoundary::SecretBroker);
                 active_mediators.push(MediationBoundary::NetworkBoundary);
                 add_gateway_kind_mediator(&mut active_mediators, broker_lease)?;
@@ -1445,7 +1445,7 @@ fn add_gateway_kind_mediator(
             )
         })?;
     let mediator = match gateway_kind {
-        "repository_api" | "external_api" | "secret" => MediationBoundary::ExternalApiGateway,
+        "external_api" | "secret" => MediationBoundary::ExternalApiGateway,
         "cloud_api" => MediationBoundary::CloudApiGateway,
         "browser_automation" => MediationBoundary::BrowserAutomationGateway,
         _ => {
@@ -2327,7 +2327,7 @@ fn build_effect_manifest(
                         purpose: effect.action.clone(),
                     });
                 }
-                BrokerGatewayEffectKind::RepositoryRequest
+                BrokerGatewayEffectKind::ExternalServiceRequest
                 | BrokerGatewayEffectKind::ApiRequest
                 | BrokerGatewayEffectKind::DatabaseRequest
                 | BrokerGatewayEffectKind::BrowserAction
@@ -3848,7 +3848,7 @@ pub(super) fn attach_broker_lease_to_cell(
         ));
     }
     let requested = match resource_kind {
-        BrokerResourceKind::RepositoryToken | BrokerResourceKind::ApiToken => {
+        BrokerResourceKind::ExternalServiceAuthority | BrokerResourceKind::ApiToken => {
             lease.request.capabilities.iter().any(|capability| {
                 matches!(capability, Capability::SecretUse | Capability::IdentityUse)
             })
@@ -3925,7 +3925,7 @@ pub(super) fn persist_test_broker_cell_binding(
     expires_at_ms: u64,
 ) -> io::Result<()> {
     let mut request = CapabilityRequest::new(
-        "read_repository_metadata",
+        "read_external_metadata",
         EffectScope::ReadOnly,
         vec![
             Capability::NetworkEgress,
@@ -3941,8 +3941,8 @@ pub(super) fn persist_test_broker_cell_binding(
         }];
     request.scope.secret_identities = vec![gensee_crate_rules::capability::SecretIdentityScope {
         handle: "repo_reader".to_string(),
-        identity: "repository-reader".to_string(),
-        purpose: "read package metadata".to_string(),
+        identity: "service-reader".to_string(),
+        purpose: "read external service metadata".to_string(),
     }];
     let lease = CapabilityCellLease {
         schema_version: CELL_LEASE_SCHEMA_VERSION,
@@ -4339,7 +4339,7 @@ mod tests {
         let socket = root.join("api.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         let mut gateway_request = CapabilityRequest::new(
-            "read_repository_metadata",
+            "read_external_metadata",
             EffectScope::ReadOnly,
             vec![
                 Capability::NetworkEgress,
@@ -4354,8 +4354,8 @@ mod tests {
         }];
         gateway_request.scope.secret_identities = vec![SecretIdentityScope {
             handle: "repo_reader".to_string(),
-            identity: "repository-reader".to_string(),
-            purpose: "read package metadata".to_string(),
+            identity: "service-reader".to_string(),
+            purpose: "read external service metadata".to_string(),
         }];
         let cell_lease = CapabilityCellLease {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
@@ -4382,7 +4382,7 @@ mod tests {
             resource_kind: BrokerResourceKind::ApiToken,
             adapter_id: "repo_adapter".to_string(),
             audience: "repo.example.test".to_string(),
-            scopes: vec!["repository:one:read".to_string()],
+            scopes: vec!["service:one:read".to_string()],
             constraints: json!({ "gateway_kind": "external_api" }),
             issued_at_ms: 100,
             expires_at_ms: 250,
@@ -4444,7 +4444,7 @@ mod tests {
             kind: BrokerGatewayEffectKind::SecretAccess,
             occurred_at_ms: 160,
             target: "repo.example.test".to_string(),
-            action: "read_package_metadata".to_string(),
+            action: "read_external_metadata".to_string(),
             request_digest: format!("sha256:{}", "b".repeat(64)),
             protocol: None,
             port: None,
@@ -4631,7 +4631,7 @@ mod tests {
             cell_id: Some("cell_network".to_string()),
             resource_kind: BrokerResourceKind::NetworkLease,
             adapter_id: super::super::capability_broker::BUILTIN_NETWORK_ADAPTER.to_string(),
-            audience: "nexus-pinned-endpoint".to_string(),
+            audience: "service-pinned-endpoint".to_string(),
             scopes: vec!["connect".to_string()],
             constraints: json!({
                 "destination": "10.20.30.40/32",

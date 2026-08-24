@@ -830,7 +830,7 @@ fn validate_broker_lease_request(request: &BrokerLeaseRequest) -> io::Result<()>
     }
     if request.cell_id.is_some() {
         let expected_gateway_kinds: &[&str] = match request.resource_kind {
-            BrokerResourceKind::RepositoryToken => &["repository_api"],
+            BrokerResourceKind::ExternalServiceAuthority => &["external_api"],
             BrokerResourceKind::ApiToken => {
                 &["external_api", "cloud_api", "browser_automation", "secret"]
             }
@@ -3115,7 +3115,7 @@ esac
         let config = BrokerAdapterConfig {
             schema_version: BROKER_ADAPTER_SCHEMA_VERSION,
             adapter_id: "idempotent_adapter".to_string(),
-            resource_kinds: vec![BrokerResourceKind::RepositoryToken],
+            resource_kinds: vec![BrokerResourceKind::ExternalServiceAuthority],
             executable: executable.to_string_lossy().to_string(),
             args: vec!["--lifecycle-v2".to_string()],
             environment_allowlist: Vec::new(),
@@ -3130,12 +3130,12 @@ esac
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             cell_id: None,
-            resource_kind: BrokerResourceKind::RepositoryToken,
+            resource_kind: BrokerResourceKind::ExternalServiceAuthority,
             adapter_id: config.adapter_id.clone(),
             audience: "repo.example.test".to_string(),
-            scopes: vec!["repository:one:read".to_string()],
+            scopes: vec!["service:one:read".to_string()],
             ttl_seconds: 60,
-            constraints: json!({ "repository": "one" }),
+            constraints: json!({ "service": "one" }),
         };
         (config, request, state)
     }
@@ -3183,7 +3183,7 @@ esac
             workspace: "/repo".to_string(),
             container_workspace: "/workspace".to_string(),
             container_home: "/home/gensee".to_string(),
-            agent_cmd: vec!["codex".to_string()],
+            agent_cmd: vec!["agent".to_string()],
             path_prefixes: Vec::new(),
             fork_base_git_head: None,
             fork_base_overlay_lowerdir: None,
@@ -3204,7 +3204,7 @@ esac
             "nested": { "value": "sk-not-public" }
         })));
         assert!(!contains_secret_shaped_json(&json!({
-            "repository": "one",
+            "service": "one",
             "expires_in": 60
         })));
     }
@@ -3552,19 +3552,19 @@ esac
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             cell_id: None,
-            resource_kind: BrokerResourceKind::RepositoryToken,
+            resource_kind: BrokerResourceKind::ExternalServiceAuthority,
             adapter_id: "repo_adapter".to_string(),
             audience: "repo.example.test".to_string(),
-            scopes: vec!["repository:one:read".to_string()],
+            scopes: vec!["service:one:read".to_string()],
             ttl_seconds: 60,
-            constraints: json!({ "repository": "one" }),
+            constraints: json!({ "service": "one" }),
         };
         let first = broker_idempotency_key("broker_lease_1", &request).unwrap();
         assert_eq!(
             first,
             broker_idempotency_key("broker_lease_1", &request).unwrap()
         );
-        request.scopes = vec!["repository:two:read".to_string()];
+        request.scopes = vec!["service:two:read".to_string()];
         assert_ne!(
             first,
             broker_idempotency_key("broker_lease_1", &request).unwrap()
@@ -3580,7 +3580,7 @@ esac
         let (config, mut request, state) = lifecycle_test_fixture(&root);
         persist_running_source(&request.source_run_id);
         request.ttl_seconds = 600;
-        request.scopes.push("repository:two:read".to_string());
+        request.scopes.push("service:two:read".to_string());
         let request_path = root.join("request.json");
         write_atomic_nofollow(
             &request_path,
@@ -3826,8 +3826,8 @@ esac
         let cell_id = "cell_publish";
         request.cell_id = Some(cell_id.to_string());
         request.constraints = json!({
-            "gateway_kind": "repository_api",
-            "repository": "one"
+            "gateway_kind": "external_api",
+            "service": "one"
         });
         let now = unix_millis().unwrap();
         super::super::capability_cell::persist_test_broker_cell_binding(
@@ -3919,8 +3919,8 @@ esac
         let cell_id = "cell_dirsync";
         request.cell_id = Some(cell_id.to_string());
         request.constraints = json!({
-            "gateway_kind": "repository_api",
-            "repository": "one"
+            "gateway_kind": "external_api",
+            "service": "one"
         });
         let now = unix_millis().unwrap();
         super::super::capability_cell::persist_test_broker_cell_binding(
@@ -4165,7 +4165,7 @@ esac
             io::ErrorKind::PermissionDenied
         );
         let mut lifecycle = load_broker_lifecycle("broker_lease_tamper").unwrap();
-        lifecycle.public_metadata = json!({ "repository": "forged" });
+        lifecycle.public_metadata = json!({ "service": "forged" });
         assert_eq!(
             validate_broker_lifecycle(&lifecycle).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
@@ -4422,14 +4422,14 @@ esac
         let executable = root.join("adapter.sh");
         fs::write(
             &executable,
-            "#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf '%s\\n' '{\"protocol_version\":1,\"provider_handle\":\"opaque_1\",\"gateway_endpoint\":\"unix:///run/gensee/repo.sock\",\"public_metadata\":{\"repository\":\"one\"},\"effects\":[],\"effect_telemetry_complete\":false}'\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf '%s\\n' '{\"protocol_version\":1,\"provider_handle\":\"opaque_1\",\"gateway_endpoint\":\"unix:///run/gensee/service.sock\",\"public_metadata\":{\"service\":\"one\"},\"effects\":[],\"effect_telemetry_complete\":false}'\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let config = BrokerAdapterConfig {
             schema_version: BROKER_ADAPTER_SCHEMA_VERSION,
             adapter_id: "repo_adapter".to_string(),
-            resource_kinds: vec![BrokerResourceKind::RepositoryToken],
+            resource_kinds: vec![BrokerResourceKind::ExternalServiceAuthority],
             executable: executable.to_string_lossy().to_string(),
             args: Vec::new(),
             environment_allowlist: Vec::new(),
@@ -4443,12 +4443,12 @@ esac
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_1".to_string()),
-            resource_kind: BrokerResourceKind::RepositoryToken,
+            resource_kind: BrokerResourceKind::ExternalServiceAuthority,
             adapter_id: "repo_adapter".to_string(),
             audience: "repo.example.test".to_string(),
-            scopes: vec!["repository:one:read".to_string()],
+            scopes: vec!["service:one:read".to_string()],
             ttl_seconds: 60,
-            constraints: json!({ "repository": "one" }),
+            constraints: json!({ "service": "one" }),
         };
 
         let response = invoke_broker_adapter(
@@ -4466,8 +4466,8 @@ esac
         .unwrap();
 
         assert_eq!(response.provider_handle, "opaque_1");
-        assert_eq!(response.gateway_endpoint, "unix:///run/gensee/repo.sock");
-        assert_eq!(response.public_metadata["repository"], "one");
+        assert_eq!(response.gateway_endpoint, "unix:///run/gensee/service.sock");
+        assert_eq!(response.public_metadata["service"], "one");
         let invocation_dir = root.join("capability-broker/adapter-invocations");
         assert_eq!(fs::read_dir(invocation_dir).unwrap().count(), 0);
 
