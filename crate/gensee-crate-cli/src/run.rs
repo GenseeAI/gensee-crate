@@ -103,7 +103,10 @@ pub(crate) struct RunConfig {
 impl RunConfig {
     pub(crate) fn parse(args: Vec<OsString>) -> io::Result<Self> {
         let mut runtime = RuntimeMode::Local;
-        let mut observe_only = run_env_flag("GENSEE_OBSERVE_ONLY");
+        // Observe-only is a host orchestration choice, not an ambient process
+        // mode. Requiring the CLI flag prevents a shell-wide environment
+        // variable from weakening unrelated local runs and hook invocations.
+        let mut observe_only = false;
         let mut sandbox = SandboxMode::None;
         let mut profile = "observe".to_string();
         let mut workspace_mode = WorkspaceMode::Direct;
@@ -345,15 +348,6 @@ impl RunConfig {
             agent_cmd,
         })
     }
-}
-
-fn run_env_flag(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
 }
 
 pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {

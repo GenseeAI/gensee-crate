@@ -987,24 +987,39 @@ fn print_bool(label: &str, value: bool) {
 }
 
 pub(crate) fn handle_hook(args: Vec<OsString>) -> io::Result<()> {
-    if observe_only_mode_enabled() {
+    let provider = match args.first().and_then(|arg| arg.to_str()) {
+        Some("claude-code") => PROVIDER_CLAUDE_CODE,
+        Some("codex") => PROVIDER_CODEX,
+        Some("antigravity") => PROVIDER_ANTIGRAVITY,
+        Some("vscode") => PROVIDER_VSCODE,
+        Some("cursor") => PROVIDER_CURSOR,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: gensee hook <claude-code|codex|antigravity|vscode|cursor>",
+            ));
+        }
+    };
+    if tclone_observe_only_container_enabled() {
+        eprintln!("gensee hook: disabled inside a Tclone observe-only container");
         return Ok(());
     }
-    match args.first().and_then(|arg| arg.to_str()) {
-        Some("claude-code") => handle_agent_hook(PROVIDER_CLAUDE_CODE),
-        Some("codex") => handle_agent_hook(PROVIDER_CODEX),
-        Some("antigravity") => handle_agent_hook(PROVIDER_ANTIGRAVITY),
-        Some("vscode") => handle_agent_hook(PROVIDER_VSCODE),
-        Some("cursor") => handle_agent_hook(PROVIDER_CURSOR),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: gensee hook <claude-code|codex|antigravity|vscode|cursor>",
-        )),
-    }
+    handle_agent_hook(provider)
 }
 
 pub(crate) fn handle_setup(args: Vec<OsString>) -> io::Result<()> {
-    if observe_only_mode_enabled() && !args.iter().any(|arg| arg.to_str() == Some("--disable")) {
+    let known_provider = matches!(
+        args.first().and_then(|arg| arg.to_str()),
+        Some("claude-code" | "codex" | "antigravity" | "vscode" | "cursor")
+    );
+    if !known_provider {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: gensee setup <claude-code|codex|antigravity|vscode|cursor> [--disable] [--gensee-home <path>] [--settings <path>|--hooks <path>] [--bin <path>]",
+        ));
+    }
+    if tclone_observe_only_setup_suppressed(&args) {
+        eprintln!("gensee setup: disabled inside a Tclone observe-only container");
         return Ok(());
     }
     match args.first().and_then(|arg| arg.to_str()) {
@@ -1020,13 +1035,20 @@ pub(crate) fn handle_setup(args: Vec<OsString>) -> io::Result<()> {
     }
 }
 
-pub(crate) fn observe_only_mode_enabled() -> bool {
-    env::var("GENSEE_OBSERVE_ONLY").is_ok_and(|value| {
+pub(crate) fn tclone_observe_only_container_enabled() -> bool {
+    env::var("GENSEE_TCLONE_OBSERVE_ONLY").is_ok_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+fn tclone_observe_only_setup_suppressed(args: &[OsString]) -> bool {
+    tclone_observe_only_container_enabled()
+        && !args
+            .iter()
+            .any(|arg| matches!(arg.to_str(), Some("--disable" | "--repair")))
 }
 
 fn setup_claude_code(args: Vec<OsString>) -> io::Result<()> {

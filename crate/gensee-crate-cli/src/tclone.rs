@@ -4060,7 +4060,7 @@ fn run_tclone_agent_inner(
     ];
     if observe_only {
         create_args.push(OsString::from("-e"));
-        create_args.push(OsString::from("GENSEE_OBSERVE_ONLY=1"));
+        create_args.push(OsString::from("GENSEE_TCLONE_OBSERVE_ONLY=1"));
     } else {
         create_args.push(OsString::from("-e"));
         create_args.push(OsString::from(format!(
@@ -4120,7 +4120,11 @@ fn run_tclone_agent_inner(
         }
         path_prefixes.push(node_mount.container_bin.to_string_lossy().to_string());
     }
-    if let Some((cargo_bin, rustup_home)) = tclone_rust_mount() {
+    // The host Cargo bin directory commonly contains the installed `gensee`
+    // executable. Do not expose that directory at all in observe-only mode:
+    // omitting /usr/local/bin/gensee is insufficient when PATH can find the
+    // host copy through this bind mount.
+    if let Some((cargo_bin, rustup_home)) = tclone_rust_mount_for_run(observe_only) {
         create_args.push(OsString::from("-v"));
         create_args.push(OsString::from(format!(
             "{}:{}:ro",
@@ -5805,7 +5809,7 @@ fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
     if record.observe_only {
         return [
             ("HOME", record.container_home.as_str()),
-            ("GENSEE_OBSERVE_ONLY", "1"),
+            ("GENSEE_TCLONE_OBSERVE_ONLY", "1"),
         ]
         .into_iter()
         .flat_map(|(key, value)| {
@@ -10367,8 +10371,11 @@ fn disable_tclone_agent_hooks(
         }
         "CLAUDE_CONFIG_DIR" => {
             let settings_path = seed_root.join(relative_home).join("settings.json");
-            prepare_tclone_json_path(seed_root, &settings_path)?;
             let mut settings = read_tclone_json_object_or_empty(&settings_path)?;
+            // Read through a copied seed symlink to preserve the user's other
+            // settings, then unlink it before writing so the host target can
+            // never be mutated.
+            prepare_tclone_json_path(seed_root, &settings_path)?;
             let object = settings.as_object_mut().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -10513,31 +10520,17 @@ fn rewrite_tclone_codex_hooks(
     let hooks_path = seed_root.join(container_relative_path(&format!(
         "{container_codex_home}/hooks.json"
     ))?);
-    let mut root = if hooks_path.exists() {
-        let contents = fs::read_to_string(&hooks_path)?;
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", hooks_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+    // Preserve the copied configuration, including a symlink target's
+    // contents, but break every seed symlink before writing. This prevents a
+    // container-specific hook rewrite from modifying host-managed dotfiles.
+    let mut root = read_tclone_json_object_or_empty(&hooks_path)?;
+    prepare_tclone_json_path(seed_root, &hooks_path)?;
 
     let gensee_home = PathBuf::from(format!("{container_home}/.gensee"));
     let command = codex_hook_command(&gensee_home, Path::new("/usr/local/bin/gensee"));
     apply_codex_hook_settings(&mut root, &command)?;
 
-    if let Some(parent) = hooks_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let serialized = serde_json::to_string_pretty(&root)?;
-    fs::write(hooks_path, format!("{serialized}\n"))
+    write_tclone_json(&hooks_path, &root)
 }
 
 fn install_tclone_host_path_compatibility(
@@ -10786,6 +10779,10 @@ fn tclone_rust_mount() -> Option<(PathBuf, Option<PathBuf>)> {
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
         .filter(|path| path.exists());
     Some((cargo_bin, rustup_home))
+}
+
+fn tclone_rust_mount_for_run(observe_only: bool) -> Option<(PathBuf, Option<PathBuf>)> {
+    (!observe_only).then(tclone_rust_mount).flatten()
 }
 
 fn tclone_podman() -> OsString {
@@ -13948,7 +13945,7 @@ gensee async job job_1: exited status=0
 
         let env_args = tclone_run_exec_env_args(&record);
 
-        assert!(env_args.contains(&OsString::from("GENSEE_OBSERVE_ONLY=1")));
+        assert!(env_args.contains(&OsString::from("GENSEE_TCLONE_OBSERVE_ONLY=1")));
         assert!(!env_args
             .iter()
             .any(|arg| arg.to_string_lossy().starts_with("GENSEE_HOME=")));
@@ -13998,6 +13995,11 @@ gensee async job job_1: exited status=0
         let error = ensure_tclone_fork_allowed(&source).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("observe-only"));
+    }
+
+    #[test]
+    fn tclone_observe_only_does_not_mount_the_host_rust_toolchain() {
+        assert!(tclone_rust_mount_for_run(true).is_none());
     }
 
     #[test]
@@ -14550,6 +14552,99 @@ gensee async job job_1: exited status=0
                     .unwrap()
             )
             .exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_codex_hook_rewrite_breaks_seed_symlink_without_touching_host_target() {
+        let root = temp_tree("codex-symlink-hooks");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let host_home = root.join("host-home/yiying/.codex");
+        let external_hooks = root.join("dotfiles/hooks.json");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(&host_home).unwrap();
+        fs::create_dir_all(external_hooks.parent().unwrap()).unwrap();
+        let original = r#"{"customSetting":"preserved","hooks":{"PreToolUse":[]}}"#;
+        fs::write(&external_hooks, original).unwrap();
+        std::os::unix::fs::symlink(&external_hooks, host_home.join("hooks.json")).unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "CODEX_HOME".to_string(),
+                host_home,
+                "/home/gensee/.codex".to_string(),
+            )),
+            None,
+            "/workspace",
+            "/home/gensee",
+            false,
+        )
+        .unwrap();
+
+        let seed_hooks = seed.join("home/gensee/.codex/hooks.json");
+        assert!(!fs::symlink_metadata(&seed_hooks)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let rewritten: Value =
+            serde_json::from_str(&fs::read_to_string(&seed_hooks).unwrap()).unwrap();
+        assert_eq!(rewritten["customSetting"], "preserved");
+        assert!(fs::read_to_string(&seed_hooks)
+            .unwrap()
+            .contains("/usr/local/bin/gensee hook codex"));
+        assert_eq!(fs::read_to_string(&external_hooks).unwrap(), original);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_observe_only_preserves_non_hook_claude_settings_from_symlink() {
+        let root = temp_tree("claude-symlink-settings");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let host_home = root.join("host-home/yiying/.claude");
+        let external_settings = root.join("dotfiles/settings.json");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(&host_home).unwrap();
+        fs::create_dir_all(external_settings.parent().unwrap()).unwrap();
+        let original =
+            r#"{"model":"claude-test","permissions":{"allow":["Read"]},"hooks":{"PreToolUse":[]}}"#;
+        fs::write(&external_settings, original).unwrap();
+        std::os::unix::fs::symlink(&external_settings, host_home.join("settings.json")).unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                host_home,
+                "/home/gensee/.claude".to_string(),
+            )),
+            None,
+            "/workspace",
+            "/home/gensee",
+            true,
+        )
+        .unwrap();
+
+        let seed_settings = seed.join("home/gensee/.claude/settings.json");
+        assert!(!fs::symlink_metadata(&seed_settings)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&seed_settings).unwrap()).unwrap();
+        assert_eq!(settings["model"], "claude-test");
+        assert_eq!(settings["permissions"]["allow"], json!(["Read"]));
+        assert_eq!(settings["disableAllHooks"], true);
+        assert!(settings.get("hooks").is_none());
+        assert_eq!(fs::read_to_string(&external_settings).unwrap(), original);
         let _ = fs::remove_dir_all(root);
     }
 

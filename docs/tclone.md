@@ -32,15 +32,19 @@ agent configuration before the container starts so Codex, Claude Code, or
 Gemini/Antigravity hooks are disabled from the first agent process. It does not
 copy `GENSEE_HOME`, inject the Gensee executable, mount the hook-observer or
 host-control channels, or issue an in-container run-control capability. This
-version of the Gensee CLI also treats `setup` and `hook` as no-ops while
-`GENSEE_OBSERVE_ONLY=1` is present. Observe-only runs cannot be forked.
+version of the Gensee CLI also treats ordinary `setup` and `hook` calls as
+diagnostic no-ops while the container-scoped
+`GENSEE_TCLONE_OBSERVE_ONLY=1` marker is present. Explicit `setup --disable`
+and `setup --repair` recovery actions remain available. Observe-only runs
+cannot be forked.
 
 The host still records the source lifecycle, operation cgroup, container PID,
 and observe-only provenance. Passive host collectors such as Falco can use that
 cgroup attribution without placing policy decisions in the agent path. This
 mode does not itself add network or filesystem confinement; those boundaries
-remain properties of the container and host experiment setup. Set
-`GENSEE_OBSERVE_ONLY=1` on the host as an alternative to passing the flag.
+remain properties of the container and host experiment setup. Select this mode
+on the host only with the explicit `--observe-only` run flag; the internal
+container marker is not a host configuration switch.
 
 The host-side Gensee process owns container orchestration. It prepares a source
 container with the workspace, detected agent config such as `CODEX_HOME`,

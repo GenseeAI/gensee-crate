@@ -6948,6 +6948,66 @@ fn run_config_parses_tclone_observe_only_mode() {
 }
 
 #[test]
+fn legacy_observe_only_environment_does_not_change_host_run_or_hook_mode() {
+    let _guard = cli_test_env_lock();
+    let previous_legacy = env::var_os("GENSEE_OBSERVE_ONLY");
+    let previous_tclone = env::var_os("GENSEE_TCLONE_OBSERVE_ONLY");
+    env::set_var("GENSEE_OBSERVE_ONLY", "1");
+    env::remove_var("GENSEE_TCLONE_OBSERVE_ONLY");
+
+    let config = RunConfig::parse(vec![OsString::from("--"), OsString::from("codex")]).unwrap();
+    assert!(!config.observe_only);
+    assert!(!tclone_observe_only_container_enabled());
+
+    if let Some(previous) = previous_legacy {
+        env::set_var("GENSEE_OBSERVE_ONLY", previous);
+    } else {
+        env::remove_var("GENSEE_OBSERVE_ONLY");
+    }
+    if let Some(previous) = previous_tclone {
+        env::set_var("GENSEE_TCLONE_OBSERVE_ONLY", previous);
+    }
+}
+
+#[test]
+fn tclone_observe_only_marker_does_not_skip_command_validation() {
+    let _guard = cli_test_env_lock();
+    let previous = env::var_os("GENSEE_TCLONE_OBSERVE_ONLY");
+    env::set_var("GENSEE_TCLONE_OBSERVE_ONLY", "1");
+
+    assert!(tclone_observe_only_container_enabled());
+    assert_eq!(
+        handle_hook(vec![OsString::from("bogus-agent")])
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        handle_setup(vec![OsString::from("bogus-agent")])
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(tclone_observe_only_setup_suppressed(&[OsString::from(
+        "claude-code"
+    )]));
+    assert!(!tclone_observe_only_setup_suppressed(&[
+        OsString::from("claude-code"),
+        OsString::from("--disable")
+    ]));
+    assert!(!tclone_observe_only_setup_suppressed(&[
+        OsString::from("claude-code"),
+        OsString::from("--repair")
+    ]));
+
+    if let Some(previous) = previous {
+        env::set_var("GENSEE_TCLONE_OBSERVE_ONLY", previous);
+    } else {
+        env::remove_var("GENSEE_TCLONE_OBSERVE_ONLY");
+    }
+}
+
+#[test]
 fn run_config_rejects_observe_only_for_local_runtime() {
     let error = RunConfig::parse(vec![
         OsString::from("--observe-only"),
