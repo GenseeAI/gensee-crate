@@ -135,9 +135,10 @@ staggering and causal order across all four lanes.
 Derived provider completion events use their client-observation offsets, and
 each lane's unified stream is sorted by its published lane offset. Unified
 events receive deterministic, globally unique IDs of the form
-`trial-NN_evt_NNNNNN`. Model `interaction_seq` values remain lane-local, while
-the already-pseudonymized nested `item_id` is enforced as globally unique across
-all 1,501 model items. The validator loads each lane's redaction ledger and run
+`trial-NN_evt_NNNNNN`. Model `interaction_seq` values remain lane-local; each
+record's explicit `trial_id` supplies lane attribution, while the
+already-pseudonymized nested `item_id` is enforced as globally unique across all
+1,501 model items. The validator loads each lane's redaction ledger and run
 provenance, binds both clock coordinates and all nested creation timestamps to
 `cohort.json`, and rejects a peer cancellation that precedes Trial 8's
 triggering escape on the cohort clock.

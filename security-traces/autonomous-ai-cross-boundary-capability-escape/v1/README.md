@@ -107,8 +107,10 @@ python3 tools/replay.py --clock cohort \
 ```
 
 The same command accepts the four `model-interactions.jsonl` paths to merge the
-model streams by `cohort_offset_ms`; equal-time items are deterministically
-ordered by their globally unique nested `item_id`.
+model streams by `cohort_offset_ms`. Every model record carries an explicit
+`trial_id`; equal-time items are ordered by lane and then `interaction_seq`, so
+each lane's retained stream order survives the merge. Pseudonymous `item_id`
+values are identities, not ordering keys.
 
 Replay is offline-only. It never executes recorded commands or opens sockets.
 

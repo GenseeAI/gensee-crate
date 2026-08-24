@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -36,7 +37,7 @@ def main() -> int:
 
     timestamp_field = "cohort_offset_ms" if args.clock == "cohort" else "ts_offset_ms"
     events = []
-    for trace in args.trace:
+    for trace_index, trace in enumerate(args.trace):
         with trace.open(encoding="utf-8") as stream:
             for line_number, line in enumerate(stream, start=1):
                 if not line.strip():
@@ -45,13 +46,22 @@ def main() -> int:
                 timestamp = event.get(timestamp_field)
                 if not isinstance(timestamp, int) or isinstance(timestamp, bool):
                     raise SystemExit(f"{trace}:{line_number}: invalid {timestamp_field}")
-                identity = event.get("event_id") or event.get("item", {}).get("item_id", "")
-                events.append((timestamp, str(identity), event))
+                trial_id = event.get("trial_id")
+                local_sequence = event.get("interaction_seq")
+                if not isinstance(trial_id, str) or not isinstance(local_sequence, int):
+                    event_id = event.get("event_id", "")
+                    if isinstance(event_id, str) and "_evt_" in event_id:
+                        trial_id, suffix = event_id.rsplit("_evt_", 1)
+                        local_sequence = int(suffix) if suffix.isdigit() else line_number
+                    else:
+                        trial_id = f"input-{trace_index:06d}"
+                        local_sequence = line_number
+                events.append((timestamp, trial_id, local_sequence, trace_index, line_number, event))
     if args.clock == "cohort":
-        events.sort(key=lambda row: (row[0], row[1]))
+        events.sort(key=lambda row: row[:5])
 
     previous_timestamp: int | None = None
-    for timestamp, _, event in events:
+    for timestamp, _, _, _, _, event in events:
         if args.source and event.get("source") not in args.source:
             continue
         if args.from_ms is not None and timestamp < args.from_ms:
@@ -71,5 +81,6 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except BrokenPipeError:
-        sys.stdout.close()
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), sys.stdout.fileno())
         raise SystemExit(0)

@@ -281,6 +281,8 @@ def interaction_clock_errors(
     if epoch is None:
         return [f"{trial_id} has an invalid declared synthetic epoch"]
     for index, row in enumerate(rows, 1):
+        if row.get("trial_id") != trial_id:
+            errors.append(f"{label} record {index} has an invalid trial ID")
         offset = row.get("ts_offset_ms")
         timestamp = parse_timestamp(row.get("ts"))
         if not isinstance(offset, int) or isinstance(offset, bool) or timestamp != epoch + timedelta(milliseconds=offset):
@@ -830,6 +832,8 @@ def validate(root: Path) -> list[str]:
         errors.append(f"model interaction stream has {len(interactions)} items, expected 372")
     if [row.get("interaction_seq") for row in interactions] != list(range(1, len(interactions) + 1)):
         errors.append("model interaction sequence is incomplete or unordered")
+    if [row.get("ts_offset_ms") for row in interactions] != sorted(row.get("ts_offset_ms") for row in interactions):
+        errors.append("model interaction timestamps are not ordered within trial-08")
     interaction_counts: dict[str, int] = {}
     developer_placeholders = 0
     for row in interactions:
@@ -1003,6 +1007,10 @@ def validate(root: Path) -> list[str]:
         cohort_interactions[trial_id] = control_interactions
         if [row.get("interaction_seq") for row in control_interactions] != list(range(1, len(control_interactions) + 1)):
             errors.append(f"{trial_id} model interaction sequence is incomplete or unordered")
+        if [row.get("ts_offset_ms") for row in control_interactions] != sorted(
+            row.get("ts_offset_ms") for row in control_interactions
+        ):
+            errors.append(f"{trial_id} model interaction timestamps are not ordered")
         control_counts: Counter[str] = Counter()
         control_developer_placeholders = 0
         for row in control_interactions:

@@ -102,7 +102,8 @@ Each line of `traces/model-interactions.jsonl` is a strict object:
 | Field | Type | Provenance | Meaning |
 | --- | --- | --- | --- |
 | `schema_version` | string, always `1.0` | synthetic | Public schema version. |
-| `interaction_seq` | positive integer | synthetic | Complete retained stream order within one trial. It restarts at 1 per lane and is not a cohort identity. |
+| `trial_id` | `trial-05` through `trial-08` | synthetic | Explicit lane attribution used with `interaction_seq` to preserve within-lane replay order. |
+| `interaction_seq` | positive integer | synthetic | Complete retained stream order within the declared trial. It restarts at 1 per lane and is not a cohort identity. |
 | `ts` | RFC 3339 timestamp | derived | Lane-local shifted pseudotime: exactly `synthetic_epoch + ts_offset_ms`. Do not merge lanes by this field. |
 | `ts_offset_ms` | non-negative integer | derived | Milliseconds from that trial's experiment origin. |
 | `cohort_offset_ms` | non-negative integer | derived | Shared merge coordinate: `actual_release_offset_ms + ts_offset_ms`. Sort this field to merge model streams. |
@@ -122,6 +123,8 @@ The counts below describe positive Trial 8. Control counts are declared in each
 
 All items contain a pseudonymous `item_id` and `metadata.turn_id`. The validator
 requires all 1,501 `item_id` values to be globally unique across the cohort.
+Model records are ordered within each explicit `trial_id` by `interaction_seq`;
+equal cohort timestamps never use pseudonymous IDs as an ordering key.
 When source creation time is available, `metadata.create_ts` and
 `metadata.create_ts_offset_ms` must appear together and must satisfy the same
 lane-epoch equation as the outer item timestamp. The nested content-block

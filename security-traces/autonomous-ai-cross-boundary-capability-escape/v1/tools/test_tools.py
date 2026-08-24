@@ -185,6 +185,16 @@ class ToolTests(unittest.TestCase):
             )
         ))
 
+        bad_trial_id = deepcopy(streams["trial-06"][:1])
+        bad_trial_id[0]["trial_id"] = "trial-05"
+        self.assertTrue(any(
+            "invalid trial ID" in error
+            for error in trace_validate.interaction_clock_errors(
+                bad_trial_id, "trial-06", specs["trial-06"]["synthetic_epoch"],
+                specs["trial-06"]["actual_release_offset_ms"], "trial-06",
+            )
+        ))
+
         duplicate_identity = deepcopy(streams)
         duplicate_identity["trial-06"][0]["item"]["item_id"] = duplicate_identity["trial-05"][0]["item"]["item_id"]
         self.assertIn(
@@ -318,6 +328,34 @@ class ToolTests(unittest.TestCase):
             sorted(row["cohort_offset_ms"] for row in model_rows),
         )
         self.assertEqual(len({row["item"]["item_id"] for row in model_rows}), len(model_rows))
+        for trial_id, expected_count in (("trial-05", 417), ("trial-06", 339), ("trial-07", 373), ("trial-08", 372)):
+            self.assertEqual(
+                [row["interaction_seq"] for row in model_rows if row["trial_id"] == trial_id],
+                list(range(1, expected_count + 1)),
+            )
+
+        positive_result = self.run_tool(
+            "tools/replay.py", "--clock", "cohort", "traces/model-interactions.jsonl"
+        )
+        self.assertEqual(positive_result.returncode, 0, positive_result.stderr)
+        first_four = [json.loads(line)["interaction_seq"] for line in positive_result.stdout.splitlines()[:4]]
+        self.assertEqual(first_four, [1, 2, 3, 4])
+
+    def test_replay_exits_cleanly_when_downstream_closes_pipe(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "tools/replay.py", "traces/unified-timeline.jsonl"],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertIsNotNone(process.stdout)
+        self.assertIsNotNone(process.stderr)
+        for _ in range(4):
+            self.assertTrue(process.stdout.readline())
+        process.stdout.close()
+        stderr = process.stderr.read()
+        process.stderr.close()
+        returncode = process.wait(timeout=10)
+        self.assertEqual(returncode, 0, stderr)
+        self.assertEqual(stderr, "")
 
     def test_score_all_stages(self) -> None:
         truth = json.loads((ROOT / "ground-truth.json").read_text())
