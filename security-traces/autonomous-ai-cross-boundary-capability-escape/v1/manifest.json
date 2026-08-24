@@ -98,9 +98,9 @@
       "sha256": "4531a67d443284d93ffed0803df5b10634aff21c3d77e381f2d48af01d875868"
     },
     {
-      "bytes": 11162,
+      "bytes": 11977,
       "path": "METHODOLOGY.md",
-      "sha256": "3fc02f7142671ec37855bcc0dc2d18c6fef74d6d8f13a4d32deae66b9b0dcf6d"
+      "sha256": "ed6dbea90285ad21fa8c243c21f20467d607b0b5ecbc3c13bea01a34ba512d3c"
     },
     {
       "bytes": 780,
@@ -108,19 +108,19 @@
       "sha256": "6a815c9c79649a0038ed0db05a09d62fc5466a1ea6540325d8e3effab9fac862"
     },
     {
-      "bytes": 13928,
+      "bytes": 14566,
       "path": "README.md",
-      "sha256": "46e7cc7ee8de8df7f8984f9cedf7ef614123a2002d7e84ec32495ea4db71011f"
+      "sha256": "e5cd589a58d8e4eee3a76b1f65d9106c99d80a40a84ede7e6b7f0703b90da46f"
     },
     {
-      "bytes": 11945,
+      "bytes": 12928,
       "path": "SCHEMA.md",
-      "sha256": "87694fb9342a0a9d74ea2bb2cd5f43f22d14aeb02b0594980877da8ba2f3e14a"
+      "sha256": "d14611aae6230206c24add54387af11afca1a6805f8aa8b579f73a56d0bca1e9"
     },
     {
-      "bytes": 1287,
+      "bytes": 1758,
       "path": "cohort.json",
-      "sha256": "8c4a0544e10fb0d8e116a8441fd1f55db25c0958e640c391f674d78ea9748e1a"
+      "sha256": "befc087afb80fd8b4337b37187d44e602839c0c560adc55f4101ea1241da1987"
     },
     {
       "bytes": 1302,
@@ -188,9 +188,9 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     {
-      "bytes": 2132462,
+      "bytes": 2344382,
       "path": "controls/trial-05/traces/unified-timeline.jsonl",
-      "sha256": "f8b14f6c6d96b799fa815ee9dcdc2140eb34d34922b1e8202220aadf128c5b63"
+      "sha256": "e4917e0bb04b5e4c6af163e91f4bf1f785e945aa7fd0cabf171bcc0294e99e54"
     },
     {
       "bytes": 1451,
@@ -258,9 +258,9 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     {
-      "bytes": 1790050,
+      "bytes": 1967284,
       "path": "controls/trial-06/traces/unified-timeline.jsonl",
-      "sha256": "f14bf20a5b8dd4fe7d914e1cfa6835fd3746baeab77641b5547081307ac2b967"
+      "sha256": "a557512572e58878c0e4f23732895f8437da43744da505c6b6169b1f2fa77b23"
     },
     {
       "bytes": 1456,
@@ -328,9 +328,9 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     {
-      "bytes": 4254572,
+      "bytes": 4685749,
       "path": "controls/trial-07/traces/unified-timeline.jsonl",
-      "sha256": "0673c4b1b85ea892ef6263b67f35918bb5afe1bbe4437b15ac832126aa440a5e"
+      "sha256": "99fa888fd8455d3275ac7cd54d29398d965dc384d3186c32dd4cffaa9dd21fa7"
     },
     {
       "bytes": 2932,
@@ -363,9 +363,9 @@
       "sha256": "0617539fed453253c207148b83b6c0e89faa6c9406078cbc64d7faf8c8c6f6d5"
     },
     {
-      "bytes": 2506,
+      "bytes": 5506,
       "path": "schemas/cohort.schema.json",
-      "sha256": "183167d4525682465876843e3dd707cf83cdbae0b81d587811fb2d60588d3542"
+      "sha256": "18b58ac9b9575eb854cdaa44b97dc0bb5d02f634dd76f8dac16ee3abb412634b"
     },
     {
       "bytes": 2430,
@@ -373,9 +373,9 @@
       "sha256": "3d9894550255e8b9eaf4bbbd388a531ce3f40c44a51e6365dc09ff4f97192902"
     },
     {
-      "bytes": 16271,
+      "bytes": 16417,
       "path": "schemas/event.schema.json",
-      "sha256": "5c927bd36e06863b101e8ec7282757e274ab48280039bdbb879ada5cadfdb55c"
+      "sha256": "6f3057855e3310779c412d166e1fc1a4d44f204c3809cbd30bb8d1a8143e9b5c"
     },
     {
       "bytes": 7904,
@@ -383,9 +383,9 @@
       "sha256": "130b8ebf006afc4b195d2bf7d513fd535cb636ff897b2ac20e88c9e8a2857a3f"
     },
     {
-      "bytes": 1964,
+      "bytes": 2645,
       "path": "tools/replay.py",
-      "sha256": "2c6958dfac3d8cb2b082640cb73f445ea9e6f8875111ceb9acca142494153329"
+      "sha256": "a0d10f3eb2c3f0daf9a73d4d459efcd56decdd19ba83fae862d7a86c370edc34"
     },
     {
       "bytes": 5148,
@@ -393,14 +393,14 @@
       "sha256": "a3cff6c0a51f9d33f8c34b13a49fcbac8e5632b4a784d41b7a19e6988f2feca9"
     },
     {
-      "bytes": 10667,
+      "bytes": 14479,
       "path": "tools/test_tools.py",
-      "sha256": "2e44b8859a1bf98999bf5586d74f02a8b0776ed7ff8be3f98d9ac0a58f01b880"
+      "sha256": "52b58d5ac19b93f1e94f1e0794e2ce662ee7c455c577f61a895ebeeea59269f2"
     },
     {
-      "bytes": 42898,
+      "bytes": 52013,
       "path": "tools/validate.py",
-      "sha256": "53b709151a5e144b45ea48b81b8618db0bf404b553c7ada84ae127c3d39bd551"
+      "sha256": "35ae7d879c63ac8b321f4995ed22cfd80bdf855673b77d1ba70e4554a1df01de"
     },
     {
       "bytes": 2774,
@@ -448,9 +448,9 @@
       "sha256": "b4643dbf0373aedc162c270ff7a7092e5f2ef917fb6ab303ccfbc3d64da25dce"
     },
     {
-      "bytes": 3249000,
+      "bytes": 3569086,
       "path": "traces/unified-timeline.jsonl",
-      "sha256": "51b07b9b33d473cb97b7c49825bda2c54a4df17f34b76a7a751cd17cf17f4728"
+      "sha256": "b63d494c189418de1638b37f7572f2d403f6562fc52c0833eae301d87c121e83"
     }
   ],
   "outcome": "one_positive_three_right_censored_controls",
@@ -459,6 +459,11 @@
   "scenario_id": "autonomous-ai-cross-boundary-capability-escape-v1",
   "schema_version": "1.0",
   "source_checksum_index_sha256": "4bc6b533380bb46151615baf2bcb90c035fb89760f583a190a83901000c86b55",
-  "synthetic_epoch": "2025-01-01T00:00:00.000Z",
+  "synthetic_epochs": {
+    "trial-05": "2025-02-01T00:00:00.000Z",
+    "trial-06": "2025-03-01T00:00:00.000Z",
+    "trial-07": "2025-04-01T00:00:00.000Z",
+    "trial-08": "2025-01-01T00:00:00.000Z"
+  },
   "title": "Autonomous AI Cross-Boundary Capability Escape Cohort"
 }

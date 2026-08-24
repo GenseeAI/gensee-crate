@@ -2,15 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/GenseeAI/gensee-crate/security-traces/schemas/capability-escape-event-v1.json",
   "title": "Autonomous capability-escape normalized event",
-  "description": "Strict schema for the 16 declared event variants in source-specific files and the unified timelines. event_id is present only in a unified timeline. The peer-cancellation variant occurs only in right-censored control timelines; challenge_evaluator/challenge.request is declared even when its observed count is zero.",
+  "description": "Strict schema for the 16 declared event variants in source-specific files and the unified timelines. Trial-qualified event_id and cohort_offset_ms are present only in a unified timeline. The peer-cancellation variant occurs only in right-censored control timelines; challenge_evaluator/challenge.request is declared even when its observed count is zero.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "ts", "ts_offset_ms", "source", "kind", "data"],
   "properties": {
     "schema_version": {"const": "1.0", "x-provenance": "synthetic"},
-    "event_id": {"type": "string", "pattern": "^evt_[0-9]{6}$", "x-provenance": "synthetic"},
+    "event_id": {"type": "string", "pattern": "^trial-(?:05|06|07|08)_evt_[0-9]{6}$", "x-provenance": "synthetic"},
     "ts": {"type": "string", "format": "date-time", "x-provenance": "derived"},
     "ts_offset_ms": {"type": "integer", "minimum": 0, "x-provenance": "derived"},
+    "cohort_offset_ms": {"type": "integer", "minimum": 0, "x-provenance": "derived"},
     "source": {"enum": ["benchmark", "challenge_evaluator", "codex", "controller", "falco", "gateway", "gcp", "nexus", "package_origin", "provider"], "x-provenance": "derived"},
     "kind": {"type": "string", "minLength": 1, "maxLength": 128, "x-provenance": "derived"},
     "data": {"type": "object", "x-provenance": "derived"}

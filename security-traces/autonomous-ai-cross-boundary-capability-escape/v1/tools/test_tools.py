@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 import shutil
 import subprocess
@@ -60,6 +61,70 @@ class ToolTests(unittest.TestCase):
             self.assertEqual((control / "traces/provider-effects.jsonl").read_text(), "")
             gateway = [json.loads(line) for line in (control / "traces/gateway-access.jsonl").read_text().splitlines()]
             self.assertFalse(any(row["data"]["correlated_direct_agent_request"] for row in gateway))
+
+    def test_cohort_clock_identity_and_causality_contract(self) -> None:
+        cohort = json.loads((ROOT / "cohort.json").read_text())
+        self.assertEqual(trace_validate.cohort_metadata_errors(cohort), [])
+        specs = {row["trial_id"]: row for row in cohort["trials"]}
+        roots = {
+            "trial-05": ROOT / "controls/trial-05",
+            "trial-06": ROOT / "controls/trial-06",
+            "trial-07": ROOT / "controls/trial-07",
+            "trial-08": ROOT,
+        }
+        timelines = {}
+        for trial_id, trial_root in roots.items():
+            rows = [
+                json.loads(line)
+                for line in (trial_root / "traces/unified-timeline.jsonl").read_text().splitlines()
+            ]
+            timelines[trial_id] = rows
+            spec = specs[trial_id]
+            self.assertEqual(
+                trace_validate.clock_coordinate_errors(
+                    rows, trial_id, spec["synthetic_epoch"], spec["actual_release_offset_ms"],
+                    unified=True, label=trial_id,
+                ),
+                [],
+            )
+        self.assertEqual(trace_validate.cohort_identity_and_causality_errors(timelines), [])
+
+        wrong_epoch = deepcopy(timelines["trial-05"][:1])
+        wrong_epoch[0]["ts"] = "2025-01-01T00:00:00.219Z"
+        self.assertTrue(any(
+            "lane epoch" in error
+            for error in trace_validate.clock_coordinate_errors(
+                wrong_epoch, "trial-05", specs["trial-05"]["synthetic_epoch"], 0,
+                unified=True, label="trial-05",
+            )
+        ))
+
+        wrong_release = deepcopy(cohort)
+        wrong_release["trials"][1]["actual_release_offset_ms"] = 0
+        cohort_schema = json.loads((ROOT / "schemas/cohort.schema.json").read_text())
+        self.assertTrue(trace_validate.schema_errors(wrong_release, cohort_schema))
+        self.assertIn(
+            "cohort trial-06 has an invalid actual_release_offset_ms",
+            trace_validate.cohort_metadata_errors(wrong_release),
+        )
+
+        duplicate_identity = deepcopy(timelines)
+        duplicate_identity["trial-06"][0]["event_id"] = duplicate_identity["trial-05"][0]["event_id"]
+        self.assertIn(
+            "cohort unified event IDs are not globally unique",
+            trace_validate.cohort_identity_and_causality_errors(duplicate_identity),
+        )
+
+        reversed_causality = deepcopy(timelines)
+        cancellation = next(
+            row for row in reversed_causality["trial-07"] if row["kind"] == "peer_escape.cancellation"
+        )
+        escape = next(row for row in reversed_causality["trial-08"] if row["kind"] == "boundary_escape.confirmed")
+        cancellation["cohort_offset_ms"] = escape["cohort_offset_ms"] - 1
+        self.assertIn(
+            "trial-07 cancellation precedes the triggering escape on the cohort clock",
+            trace_validate.cohort_identity_and_causality_errors(reversed_causality),
+        )
 
     def test_sensitive_value_guards(self) -> None:
         bearer = '"authorization": "Bearer ' + "eyJhbGciOiJIUzI1NiJ9.abc.def" + '"'
@@ -159,6 +224,23 @@ class ToolTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = sum(1 for line in (ROOT / path).read_text().splitlines() if line)
                 self.assertEqual(len(result.stdout.splitlines()), expected)
+
+    def test_cohort_replay_uses_shared_clock_and_global_identity(self) -> None:
+        paths = [
+            "controls/trial-05/traces/unified-timeline.jsonl",
+            "controls/trial-06/traces/unified-timeline.jsonl",
+            "controls/trial-07/traces/unified-timeline.jsonl",
+            "traces/unified-timeline.jsonl",
+        ]
+        result = self.run_tool("tools/replay.py", "--clock", "cohort", *paths)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(rows), 32138)
+        self.assertEqual(
+            [row["cohort_offset_ms"] for row in rows],
+            sorted(row["cohort_offset_ms"] for row in rows),
+        )
+        self.assertEqual(len({row["event_id"] for row in rows}), len(rows))
 
     def test_score_all_stages(self) -> None:
         truth = json.loads((ROOT / "ground-truth.json").read_text())

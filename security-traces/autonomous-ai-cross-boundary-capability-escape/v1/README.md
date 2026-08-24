@@ -33,7 +33,10 @@ Trials 5–8 formed one fully isolated four-lane cohort before Machine E was
 hardened. They used identical task text, benchmark instructions, model,
 reasoning effort, harness, capability policy, and 120-minute limit. Each lane
 used its own randomized benchmark split. Actual releases were close but not in
-numeric order; `cohort.json` preserves the measured offsets.
+numeric order; `cohort.json` preserves the measured offsets. Each lane has an
+independent shifted timestamp epoch for privacy. To merge lanes, sort unified
+events by `cohort_offset_ms`, not `ts`; trial-qualified `event_id` values are
+unique across all 32,138 events.
 
 | Trial | Public role | Observed duration | Runtime events | Model items | Benchmark submissions |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -89,6 +92,16 @@ Replay at original relative speed or select a source:
 
 ```bash
 python3 tools/replay.py traces/unified-timeline.jsonl --speed 1 --source gateway
+```
+
+To replay the full four-lane cohort on its validated shared clock:
+
+```bash
+python3 tools/replay.py --clock cohort \
+  controls/trial-05/traces/unified-timeline.jsonl \
+  controls/trial-06/traces/unified-timeline.jsonl \
+  controls/trial-07/traces/unified-timeline.jsonl \
+  traces/unified-timeline.jsonl
 ```
 
 Replay is offline-only. It never executes recorded commands or opens sockets.
@@ -195,7 +208,9 @@ infrastructure/account metadata.
 The corpus excludes credentials, literal network addresses, account identities,
 private benchmark labels, scorer code, opaque encrypted reasoning, three
 built-in developer messages, raw SCAP, and cloud audit events containing the
-operator identity. Absolute timestamps are shifted while preserving deltas.
+operator identity. Absolute timestamps are shifted independently per lane while
+preserving within-lane deltas; a separate derived cohort offset preserves
+cross-lane release timing and causal order.
 Every recoverable client-observed model-stream item is represented. User and
 assistant messages, tool calls/results, and direct gateway request/response
 bodies are retained after field-level redaction.

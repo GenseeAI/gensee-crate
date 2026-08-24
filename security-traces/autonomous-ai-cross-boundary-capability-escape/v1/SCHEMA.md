@@ -55,9 +55,10 @@ Each line of `traces/unified-timeline.jsonl` is one strict object:
 | Field | Type | Provenance | Meaning |
 | --- | --- | --- | --- |
 | `schema_version` | string, always `1.0` | synthetic | Public schema version. |
-| `event_id` | `evt_` plus six digits | synthetic | Sequential identifier required in the unified timeline and omitted from source-specific files. |
-| `ts` | RFC 3339 timestamp | derived | Shifted timestamp. Provider completion events use retained client-observation time. |
-| `ts_offset_ms` | non-negative integer | derived | Milliseconds from the experiment origin. |
+| `event_id` | `trial-NN_evt_` plus six digits | synthetic | Cohort-global identifier required in a unified timeline and omitted from source-specific files; the numeric suffix is sequential within the named trial. |
+| `ts` | RFC 3339 timestamp | derived | Lane-local shifted pseudotime: exactly `synthetic_epoch + ts_offset_ms`. Provider completion events use retained client-observation time. Do not merge lanes by this field. |
+| `ts_offset_ms` | non-negative integer | derived | Milliseconds from that trial's experiment origin. |
+| `cohort_offset_ms` | non-negative integer | derived | Shared clock coordinate required in unified timelines: `actual_release_offset_ms + ts_offset_ms`. Sort this field to merge lanes. |
 | `source` | enum | derived | Normalized telemetry producer. |
 | `kind` | string discriminator | derived | Event variant within the source. |
 | `data` | object | mixed | Variant-specific payload described below. |
@@ -152,8 +153,12 @@ the corpus schemas.
 
 `cohort.json` is validated by `schemas/cohort.schema.json`. It records the exact
 four-trial membership, shared configuration, lane-specific split policy,
-outcome/censoring label, publication path, and actual release offset for each
-trial. Trial order in this file is identity order, not start order.
+outcome/censoring label, publication path, synthetic epoch, and measured release
+offset for each trial. Trial order in this file is identity order, not start
+order. `actual_release_offset_ms` is measured from the Trial 5 controller
+release. Each lane's `ts` is intentionally independent pseudotime; cross-lane
+replay must merge unified events by `cohort_offset_ms` and may use `event_id` as
+a stable globally unique identity.
 
 Each `controls/trial-*/control-summary.json` is validated by
 `schemas/control-summary.schema.json`. It records observed duration, last model
@@ -173,7 +178,12 @@ requires exactly one matching `oneOf` branch, rejects undeclared properties,
 checks types/constants/enums/required fields, validates nested content blocks,
 and audits that each declared property has a valid `x-provenance` annotation.
 It also checks topology vocabulary agreement, counts, ordering, checksums,
-manifest coverage, redaction invariants, and ground-truth support.
+manifest coverage, redaction invariants, and ground-truth support. The validator
+loads every redaction ledger and run-provenance file, checks every event and
+model timestamp against its declared lane epoch, checks every unified event's
+cohort offset and globally unique ID, locks all four measured release offsets,
+and proves that all three peer cancellations follow the triggering Trial 8
+escape on the shared clock.
 For retained provider payloads it rejects raw hosted-tool/container identifier
 shapes without assuming an encoding, rejects any string-valued nested
 `encrypted_content`, and reconciles all 21 nested omission records with the

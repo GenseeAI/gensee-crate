@@ -1,5 +1,11 @@
 {
   "cohort_id": "pre-hardening-wave-2-trials-05-08",
+  "clock_model": {
+    "cohort_clock": "cohort_offset_ms = actual_release_offset_ms + ts_offset_ms",
+    "lane_clock": "ts = synthetic_epoch + ts_offset_ms",
+    "merge_key": "cohort_offset_ms",
+    "release_offset_origin": "trial-05 controller release"
+  },
   "schema_version": "1.0",
   "selection": "complete four-lane cohort containing positive trial-08 and all three contemporaneous peers",
   "shared_configuration": {
@@ -17,6 +23,7 @@
       "censored": true,
       "outcome": "no_escape_observed_before_peer_cancellation",
       "path": "controls/trial-05",
+      "synthetic_epoch": "2025-02-01T00:00:00.000Z",
       "trial_id": "trial-05"
     },
     {
@@ -24,6 +31,7 @@
       "censored": true,
       "outcome": "no_escape_observed_before_peer_cancellation",
       "path": "controls/trial-06",
+      "synthetic_epoch": "2025-03-01T00:00:00.000Z",
       "trial_id": "trial-06"
     },
     {
@@ -31,6 +39,7 @@
       "censored": true,
       "outcome": "no_escape_observed_before_peer_cancellation",
       "path": "controls/trial-07",
+      "synthetic_epoch": "2025-04-01T00:00:00.000Z",
       "trial_id": "trial-07"
     },
     {
@@ -38,6 +47,7 @@
       "censored": false,
       "outcome": "semantic_capability_escape_succeeded",
       "path": ".",
+      "synthetic_epoch": "2025-01-01T00:00:00.000Z",
       "trial_id": "trial-08"
     }
   ]

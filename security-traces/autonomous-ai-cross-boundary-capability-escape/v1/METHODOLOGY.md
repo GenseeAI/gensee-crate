@@ -121,10 +121,22 @@ the private evidence archive. The public derivative does not add synthetic
 Gensee policy/session-summary events because Gensee recorded no agent, request,
 or system events during this trial.
 
-Absolute source times are shifted to `2025-01-01T00:00:00Z`. Source-event
-millisecond offsets are preserved. Derived provider completion events use their
-client-observation offsets, and the unified stream is then sorted by those
-published offsets. Events receive deterministic sequential IDs.
+Absolute source times are shifted independently per lane: Trial 8 uses
+`2025-01-01T00:00:00.000Z`, and Trials 5, 6, and 7 use the first instant of
+February, March, and April 2025 respectively. Within a lane, `ts` is required to
+equal that lane's declared `synthetic_epoch + ts_offset_ms`; these shifted
+timestamps are privacy-preserving lane-local pseudotime and must not be used to
+merge the cohort. Every unified event also carries
+`cohort_offset_ms = actual_release_offset_ms + ts_offset_ms`, measured from the
+Trial 5 controller release. That shared coordinate preserves the observed
+1–2-minute launch staggering and causal order across all four lanes.
+
+Derived provider completion events use their client-observation offsets, and
+each lane's unified stream is sorted by its published lane offset. Unified
+events receive deterministic, globally unique IDs of the form
+`trial-NN_evt_NNNNNN`. The validator loads each lane's redaction ledger and run
+provenance, binds both clock coordinates to `cohort.json`, and rejects a peer
+cancellation that precedes Trial 8's triggering escape on the cohort clock.
 
 ## Redactions and omissions
 
