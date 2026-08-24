@@ -524,6 +524,7 @@ mod tests {
     fn tclone_record(container_id: Option<&str>, container_name: &str) -> TcloneRunRecord {
         TcloneRunRecord {
             run_id: "run_fork_1".to_string(),
+            observe_only: false,
             operation_id: None,
             operation_state_root: None,
             capability_lifecycle: None,

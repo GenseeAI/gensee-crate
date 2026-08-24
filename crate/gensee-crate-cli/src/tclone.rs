@@ -165,6 +165,8 @@ static TCLONE_HOST_FILE_TIMEOUT_CLAMP_WARNING: OnceLock<()> = OnceLock::new();
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct TcloneRunRecord {
     pub(crate) run_id: String,
+    #[serde(default)]
+    pub(crate) observe_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4176,6 +4178,7 @@ fn run_tclone_agent_inner(
     run_id: &str,
     operation_id: &str,
 ) -> io::Result<()> {
+    let observe_only = config.observe_only;
     let run_id = run_id.to_string();
     let safe_id = run_id.replace('_', "-");
     let source_container = format!("gensee-tclone-src-{safe_id}");
@@ -4191,7 +4194,6 @@ fn run_tclone_agent_inner(
     let seed_root = gensee_tmp_root()?.join(&run_id).join("tclone-seed");
     let staged_workspace = seed_root.join(container_relative_path(&container_workspace)?);
     let host_control_dir = gensee_tmp_root()?.join(&run_id).join("host-control");
-    create_restrictive_dir_all(&host_control_dir)?;
     let host_control_socket = host_control_dir.join("control.sock");
     let container_workspace_host_control_dir =
         format!("{container_workspace}/{TCLONE_HOST_CONTROL_WORKSPACE_DIR}");
@@ -4199,7 +4201,15 @@ fn run_tclone_agent_inner(
         env::set_var(TCLONE_HOST_TMUX_SOCKET_ENV, socket);
         env::set_var(TCLONE_HOST_TMUX_TARGET_ENV, target);
     }
-    let _host_control = TcloneHostControlServer::start(&host_control_socket, &host_control_dir)?;
+    let _host_control = if observe_only {
+        None
+    } else {
+        create_restrictive_dir_all(&host_control_dir)?;
+        Some(TcloneHostControlServer::start(
+            &host_control_socket,
+            &host_control_dir,
+        )?)
+    };
 
     let agent_binary = config.agent_cmd[0].to_string_lossy().to_string();
     let agent_home = detect_agent_home(&agent_binary);
@@ -4209,6 +4219,7 @@ fn run_tclone_agent_inner(
     let host_observer_socket = gensee_home
         .as_deref()
         .and_then(tclone_host_observer_socket)
+        .filter(|_| !observe_only)
         .filter(|_| env_flag_default_on("GENSEE_TCLONE_BIND_HOST_OBSERVER"));
     prepare_tclone_seed(
         &seed_root,
@@ -4217,25 +4228,28 @@ fn run_tclone_agent_inner(
         gensee_home.as_ref(),
         &container_workspace,
         &container_home,
+        observe_only,
     )?;
-    fs::create_dir_all(
-        staged_workspace
-            .join(TCLONE_HOST_CONTROL_WORKSPACE_DIR)
-            .join("requests"),
-    )?;
-    fs::create_dir_all(
-        staged_workspace
-            .join(TCLONE_HOST_CONTROL_WORKSPACE_DIR)
-            .join("responses"),
-    )?;
-    if let Ok(current_exe) = env::current_exe() {
-        if current_exe.exists() {
-            let destination =
-                seed_root.join(container_relative_path(TCLONE_CONTAINER_GENSEE_PATH)?);
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
+    if !observe_only {
+        fs::create_dir_all(
+            staged_workspace
+                .join(TCLONE_HOST_CONTROL_WORKSPACE_DIR)
+                .join("requests"),
+        )?;
+        fs::create_dir_all(
+            staged_workspace
+                .join(TCLONE_HOST_CONTROL_WORKSPACE_DIR)
+                .join("responses"),
+        )?;
+        if let Ok(current_exe) = env::current_exe() {
+            if current_exe.exists() {
+                let destination =
+                    seed_root.join(container_relative_path(TCLONE_CONTAINER_GENSEE_PATH)?);
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&current_exe, destination)?;
             }
-            fs::copy(&current_exe, destination)?;
         }
     }
 
@@ -4259,22 +4273,31 @@ fn run_tclone_agent_inner(
         OsString::from("-e"),
         OsString::from(format!("HOME={container_home}")),
         OsString::from("-e"),
-        OsString::from(format!("GENSEE_HOME={container_home}/.gensee")),
-        OsString::from("-e"),
-        OsString::from(format!("GENSEE_RUN_ID={run_id}")),
-        OsString::from("-e"),
-        OsString::from(format!("AGENT_SHIELD_SESSION_ID={run_id}")),
-        OsString::from("-e"),
-        OsString::from(format!("GENSEE_WORKSPACE={container_workspace}")),
-        OsString::from("-e"),
-        OsString::from(format!(
-            "{TCLONE_HOST_CONTROL_DIR_ENV}={container_workspace_host_control_dir}"
-        )),
-        OsString::from("-e"),
         OsString::from("TERM=xterm-256color"),
         OsString::from("-w"),
         OsString::from(&container_workspace),
     ];
+    if observe_only {
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from("GENSEE_TCLONE_OBSERVE_ONLY=1"));
+    } else {
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!(
+            "GENSEE_HOME={container_home}/.gensee"
+        )));
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!("AGENT_SHIELD_SESSION_ID={run_id}")));
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!("GENSEE_RUN_ID={run_id}")));
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!(
+            "GENSEE_WORKSPACE={container_workspace}"
+        )));
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!(
+            "{TCLONE_HOST_CONTROL_DIR_ENV}={container_workspace_host_control_dir}"
+        )));
+    }
     if let Some(host_observer_socket) = host_observer_socket {
         create_args.push(OsString::from("-v"));
         create_args.push(OsString::from(format!(
@@ -4286,7 +4309,7 @@ fn run_tclone_agent_inner(
             "{TCLONE_HOST_OBSERVER_SOCKET_ENV}={TCLONE_CONTAINER_HOST_OBSERVER_SOCKET}"
         )));
     }
-    if env_flag_default_on("GENSEE_TCLONE_BIND_HOST_CONTROL") {
+    if !observe_only && env_flag_default_on("GENSEE_TCLONE_BIND_HOST_CONTROL") {
         create_args.push(OsString::from("-v"));
         create_args.push(OsString::from(format!(
             "{}:{}:rw",
@@ -4317,30 +4340,14 @@ fn run_tclone_agent_inner(
         path_prefixes.push(node_mount.container_bin.to_string_lossy().to_string());
     }
     if let Some((cargo_bin, rustup_home)) = tclone_rust_mount() {
-        create_args.push(OsString::from("-v"));
-        create_args.push(OsString::from(format!(
-            "{}:{}:ro",
-            cargo_bin.display(),
-            cargo_bin.display()
-        )));
-        path_prefixes.push(cargo_bin.to_string_lossy().to_string());
-        if let Some(rustup_home) = rustup_home {
-            create_args.push(OsString::from("-v"));
-            create_args.push(OsString::from(format!(
-                "{}:{}:ro",
-                rustup_home.display(),
-                rustup_home.display()
-            )));
-            create_args.push(OsString::from("-e"));
-            create_args.push(OsString::from(format!(
-                "RUSTUP_HOME={}",
-                rustup_home.display()
-            )));
-        }
-        create_args.push(OsString::from("-e"));
-        create_args.push(OsString::from(format!(
-            "CARGO_HOME={container_home}/.cargo"
-        )));
+        append_tclone_rust_mount_args(
+            &mut create_args,
+            &mut path_prefixes,
+            &cargo_bin,
+            rustup_home.as_deref(),
+            &container_home,
+            observe_only,
+        );
     }
     create_args.push(OsString::from(&image));
     create_args.push(OsString::from("idle"));
@@ -4367,6 +4374,7 @@ fn run_tclone_agent_inner(
     let cleanup_guard = TcloneContainerCleanup::new(&podman, &source_container);
     let source_record = TcloneRunRecord {
         run_id: run_id.clone(),
+        observe_only,
         operation_id: Some(operation_id.to_string()),
         operation_state_root: Some(operation_state_root.to_string_lossy().to_string()),
         capability_lifecycle: None,
@@ -4408,23 +4416,26 @@ fn run_tclone_agent_inner(
     )?;
     let root_pid = inspect_container_pid(&podman, &source_container)?;
     source_operation.activate(root_pid)?;
-    write_tclone_run_context(&podman, &source_record)?;
+    if !observe_only {
+        write_tclone_run_context(&podman, &source_record)?;
+    }
     start_tclone_agent_session(
         &podman,
         &source_container,
         &container_agent_cmd,
         &path_prefixes,
     )?;
-    let _container_file_control = if env_flag(TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV) {
-        Some(TcloneContainerFileControlServer::start(
-            &podman,
-            &source_container,
-            &container_workspace_host_control_dir,
-            Duration::from_millis(200),
-        )?)
-    } else {
-        None
-    };
+    let _container_file_control =
+        if !observe_only && env_flag(TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV) {
+            Some(TcloneContainerFileControlServer::start(
+                &podman,
+                &source_container,
+                &container_workspace_host_control_dir,
+                Duration::from_millis(200),
+            )?)
+        } else {
+            None
+        };
     let no_attach = env_flag("GENSEE_TCLONE_NO_ATTACH");
     wait_tclone_agent_ready(
         &podman,
@@ -4442,11 +4453,19 @@ fn run_tclone_agent_inner(
         repo_path: repo_path
             .clone()
             .map(|path| path.to_string_lossy().to_string()),
-        mode: Some("managed-run:tclone:source".to_string()),
+        mode: Some(if observe_only {
+            "managed-run:tclone:source:observe-only".to_string()
+        } else {
+            "managed-run:tclone:source".to_string()
+        }),
         workspace_mode: Some("tclone-rootfs".to_string()),
         original_workspace: Some(original_workspace.to_string_lossy().to_string()),
         staged_workspace: Some(staged_workspace.to_string_lossy().to_string()),
-        sandbox_profile: Some("tclone-container".to_string()),
+        sandbox_profile: Some(if observe_only {
+            "tclone-container-observe-only".to_string()
+        } else {
+            "tclone-container".to_string()
+        }),
         sandbox_profile_path: None,
         started_at_ms,
         ended_at_ms: None,
@@ -4471,7 +4490,9 @@ fn run_tclone_agent_inner(
         "gensee: started tclone run {run_id} source_container={source_container} workspace={}",
         original_workspace.display()
     );
-    eprintln!("gensee: fork from another terminal with: gensee run fork {run_id}");
+    if !observe_only {
+        eprintln!("gensee: fork from another terminal with: gensee run fork {run_id}");
+    }
 
     if env_flag("GENSEE_TCLONE_NO_ATTACH") {
         eprintln!("gensee: tclone source left running without attach because GENSEE_TCLONE_NO_ATTACH is set");
@@ -4487,11 +4508,19 @@ fn run_tclone_agent_inner(
         root_pid,
         cwd: container_workspace,
         repo_path: repo_path.map(|path| path.to_string_lossy().to_string()),
-        mode: Some("managed-run:tclone:source".to_string()),
+        mode: Some(if observe_only {
+            "managed-run:tclone:source:observe-only".to_string()
+        } else {
+            "managed-run:tclone:source".to_string()
+        }),
         workspace_mode: Some("tclone-rootfs".to_string()),
         original_workspace: Some(original_workspace.to_string_lossy().to_string()),
         staged_workspace: Some(staged_workspace.to_string_lossy().to_string()),
-        sandbox_profile: Some("tclone-container".to_string()),
+        sandbox_profile: Some(if observe_only {
+            "tclone-container-observe-only".to_string()
+        } else {
+            "tclone-container".to_string()
+        }),
         sandbox_profile_path: None,
         started_at_ms,
         ended_at_ms: Some(ended_at_ms),
@@ -4576,6 +4605,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
         ));
     }
     let source = find_tclone_record(&parent)?;
+    ensure_tclone_fork_allowed(&source)?;
     if source.status == "preparing" {
         return Err(io::Error::other(format!(
             "tclone source {} is still preparing; wait for status=running before forking",
@@ -4716,6 +4746,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                 timing.mark("append_session");
                 let fork_record = TcloneRunRecord {
                     run_id: run_id.clone(),
+                    observe_only: source.observe_only,
                     operation_id: Some(child_operation_id.clone()),
                     operation_state_root: source.operation_state_root.clone(),
                     capability_lifecycle: Some(capability_lifecycle.clone()),
@@ -5978,6 +6009,20 @@ fn tclone_exec_split(args: &[OsString]) -> io::Result<(&[OsString], &[OsString])
 }
 
 fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
+    if record.observe_only {
+        return [
+            ("HOME", record.container_home.as_str()),
+            ("GENSEE_TCLONE_OBSERVE_ONLY", "1"),
+        ]
+        .into_iter()
+        .flat_map(|(key, value)| {
+            [
+                OsString::from("-e"),
+                OsString::from(format!("{key}={value}")),
+            ]
+        })
+        .collect();
+    }
     let gensee_home = format!("{}/.gensee", record.container_home);
     [
         ("HOME", record.container_home.as_str()),
@@ -6044,7 +6089,20 @@ fn write_tclone_run_context_if_possible(podman: &OsString, record: &TcloneRunRec
 }
 
 fn tclone_record_should_receive_run_context(record: &TcloneRunRecord) -> bool {
-    record.role == "fork" || record.role == "source"
+    !record.observe_only && (record.role == "fork" || record.role == "source")
+}
+
+fn ensure_tclone_fork_allowed(source: &TcloneRunRecord) -> io::Result<()> {
+    if source.observe_only {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "tclone run {} is observe-only and cannot be forked",
+                source.run_id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn write_tclone_run_context(podman: &OsString, record: &TcloneRunRecord) -> io::Result<()> {
@@ -10485,6 +10543,7 @@ fn prepare_tclone_seed(
     gensee_home: Option<&PathBuf>,
     container_workspace: &str,
     container_home: &str,
+    observe_only: bool,
 ) -> io::Result<()> {
     if seed_root.exists() {
         fs::remove_dir_all(seed_root)?;
@@ -10501,12 +10560,19 @@ fn prepare_tclone_seed(
             host_home,
             &seed_root.join(container_relative_path(container_path)?),
         )?;
-        install_tclone_host_path_compatibility(seed_root, host_home, container_path)?;
-        if name == "CODEX_HOME" {
+        install_tclone_host_path_compatibility(
+            seed_root,
+            host_home,
+            container_path,
+            !observe_only,
+        )?;
+        if observe_only {
+            disable_tclone_agent_hooks(seed_root, name, container_path)?;
+        } else if name == "CODEX_HOME" {
             rewrite_tclone_codex_hooks(seed_root, container_path, container_home)?;
         }
     }
-    if let Some(gensee_home) = gensee_home.filter(|path| path.exists()) {
+    if let Some(gensee_home) = gensee_home.filter(|path| !observe_only && path.exists()) {
         copy_path_all(
             gensee_home,
             &seed_root.join(container_relative_path(&format!(
@@ -10516,6 +10582,124 @@ fn prepare_tclone_seed(
         install_tclone_gensee_home_compatibility(seed_root, gensee_home, container_home)?;
     }
     Ok(())
+}
+
+fn disable_tclone_agent_hooks(
+    seed_root: &Path,
+    agent_home_name: &str,
+    container_agent_home: &str,
+) -> io::Result<()> {
+    let relative_home = container_relative_path(container_agent_home)?;
+    match agent_home_name {
+        "CODEX_HOME" => {
+            remove_tclone_hook_config(seed_root, &seed_root.join(relative_home).join("hooks.json"))
+        }
+        "CLAUDE_CONFIG_DIR" => {
+            let settings_path = seed_root.join(relative_home).join("settings.json");
+            let mut settings = read_tclone_json_object_or_empty(&settings_path)?;
+            // Read through a copied seed symlink to preserve the user's other
+            // settings, then unlink it before writing so the host target can
+            // never be mutated.
+            prepare_tclone_json_path(seed_root, &settings_path)?;
+            let object = settings.as_object_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} must be a JSON object", settings_path.display()),
+                )
+            })?;
+            object.remove("hooks");
+            object.insert("disableAllHooks".to_string(), json!(true));
+            write_tclone_json(&settings_path, &settings)
+        }
+        "GEMINI_HOME" => remove_tclone_hook_config(
+            seed_root,
+            &seed_root
+                .join(relative_home)
+                .join("config")
+                .join("hooks.json"),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn remove_tclone_hook_config(seed_root: &Path, path: &Path) -> io::Result<()> {
+    let mut config = read_tclone_json_object_or_empty(path)?;
+    prepare_tclone_json_path(seed_root, path)?;
+    let object = config.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} must be a JSON object", path.display()),
+        )
+    })?;
+    object.remove("hooks");
+    write_tclone_json(path, &config)
+}
+
+fn prepare_tclone_json_path(seed_root: &Path, path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("hook config has no parent: {}", path.display()),
+        )
+    })?;
+    let relative_parent = parent.strip_prefix(seed_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("hook config escapes tclone seed: {}", path.display()),
+        )
+    })?;
+    let mut current = seed_root.to_path_buf();
+    for component in relative_parent.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                fs::remove_file(&current)?;
+                fs::create_dir(&current)?;
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "hook config parent is not a directory: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn read_tclone_json_object_or_empty(path: &Path) -> io::Result<Value> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let contents = fs::read_to_string(path)?;
+    if contents.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&contents).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not valid JSON: {error}", path.display()),
+        )
+    })
+}
+
+fn write_tclone_json(path: &Path, value: &Value) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let serialized = serde_json::to_string_pretty(value)?;
+    fs::write(path, format!("{serialized}\n"))
 }
 
 fn install_tclone_init(seed_root: &Path) -> io::Result<()> {
@@ -10569,37 +10753,24 @@ fn rewrite_tclone_codex_hooks(
     let hooks_path = seed_root.join(container_relative_path(&format!(
         "{container_codex_home}/hooks.json"
     ))?);
-    let mut root = if hooks_path.exists() {
-        let contents = fs::read_to_string(&hooks_path)?;
-        if contents.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&contents).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not valid JSON: {err}", hooks_path.display()),
-                )
-            })?
-        }
-    } else {
-        json!({})
-    };
+    // Preserve the copied configuration, including a symlink target's
+    // contents, but break every seed symlink before writing. This prevents a
+    // container-specific hook rewrite from modifying host-managed dotfiles.
+    let mut root = read_tclone_json_object_or_empty(&hooks_path)?;
+    prepare_tclone_json_path(seed_root, &hooks_path)?;
 
     let gensee_home = PathBuf::from(format!("{container_home}/.gensee"));
     let command = codex_hook_command(&gensee_home, Path::new(TCLONE_CONTAINER_GENSEE_PATH));
     apply_codex_hook_settings(&mut root, &command)?;
 
-    if let Some(parent) = hooks_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let serialized = serde_json::to_string_pretty(&root)?;
-    fs::write(hooks_path, format!("{serialized}\n"))
+    write_tclone_json(&hooks_path, &root)
 }
 
 fn install_tclone_host_path_compatibility(
     seed_root: &Path,
     host_home: &Path,
     container_path: &str,
+    install_gensee_launcher: bool,
 ) -> io::Result<()> {
     let Some(host_home_parent) = host_home.parent() else {
         return Ok(());
@@ -10610,6 +10781,10 @@ fn install_tclone_host_path_compatibility(
             fs::create_dir_all(parent)?;
         }
         symlink_or_copy_marker(container_path, &host_home_link)?;
+    }
+
+    if !install_gensee_launcher {
+        return Ok(());
     }
 
     let host_cargo_bin = host_home_parent.join(".cargo/bin");
@@ -10837,6 +11012,49 @@ fn tclone_rust_mount() -> Option<(PathBuf, Option<PathBuf>)> {
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
         .filter(|path| path.exists());
     Some((cargo_bin, rustup_home))
+}
+
+fn append_tclone_rust_mount_args(
+    create_args: &mut Vec<OsString>,
+    path_prefixes: &mut Vec<String>,
+    cargo_bin: &Path,
+    rustup_home: Option<&Path>,
+    container_home: &str,
+    observe_only: bool,
+) {
+    create_args.push(OsString::from("-v"));
+    create_args.push(OsString::from(format!(
+        "{}:{}:ro",
+        cargo_bin.display(),
+        cargo_bin.display()
+    )));
+    if observe_only {
+        // Preserve cargo/rustc parity while hiding the host-installed Gensee
+        // executable that commonly lives beside them.
+        create_args.push(OsString::from("-v"));
+        create_args.push(OsString::from(format!(
+            "/dev/null:{}/gensee:ro",
+            cargo_bin.display()
+        )));
+    }
+    path_prefixes.push(cargo_bin.to_string_lossy().to_string());
+    if let Some(rustup_home) = rustup_home {
+        create_args.push(OsString::from("-v"));
+        create_args.push(OsString::from(format!(
+            "{}:{}:ro",
+            rustup_home.display(),
+            rustup_home.display()
+        )));
+        create_args.push(OsString::from("-e"));
+        create_args.push(OsString::from(format!(
+            "RUSTUP_HOME={}",
+            rustup_home.display()
+        )));
+    }
+    create_args.push(OsString::from("-e"));
+    create_args.push(OsString::from(format!(
+        "CARGO_HOME={container_home}/.cargo"
+    )));
 }
 
 fn tclone_podman() -> OsString {
@@ -11209,6 +11427,7 @@ mod tests {
     fn test_record(run_id: &str, status: &str) -> TcloneRunRecord {
         TcloneRunRecord {
             run_id: run_id.to_string(),
+            observe_only: false,
             operation_id: None,
             operation_state_root: None,
             capability_lifecycle: None,
@@ -14297,6 +14516,30 @@ gensee async job job_1: exited status=0
     }
 
     #[test]
+    fn tclone_observe_only_exec_env_omits_managed_authority() {
+        let mut record = test_record("run_observe", "running");
+        record.observe_only = true;
+        record.container_home = "/home/gensee".to_string();
+        record.container_workspace = "/workspace".to_string();
+
+        let env_args = tclone_run_exec_env_args(&record);
+
+        assert!(env_args.contains(&OsString::from("GENSEE_TCLONE_OBSERVE_ONLY=1")));
+        assert!(!env_args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("GENSEE_HOME=")));
+        assert!(!env_args.iter().any(|arg| arg
+            .to_string_lossy()
+            .starts_with("AGENT_SHIELD_SESSION_ID=")));
+        assert!(!env_args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("GENSEE_RUN_ID=")));
+        assert!(!env_args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("GENSEE_WORKSPACE=")));
+    }
+
+    #[test]
     fn tclone_run_context_payload_marks_forks() {
         let fork = test_fork_record("run_1_fork_2_0", "run_1");
 
@@ -14320,6 +14563,57 @@ gensee async job job_1: exited status=0
         assert!(tclone_record_should_receive_run_context(&source));
         assert!(tclone_record_should_receive_run_context(&fork));
         assert!(!tclone_record_should_receive_run_context(&unrelated));
+    }
+
+    #[test]
+    fn tclone_observe_only_sources_do_not_receive_run_context_or_fork() {
+        let mut source = test_record("run_observe", "running");
+        source.observe_only = true;
+
+        assert!(!tclone_record_should_receive_run_context(&source));
+        let error = ensure_tclone_fork_allowed(&source).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("observe-only"));
+    }
+
+    #[test]
+    fn tclone_observe_only_masks_gensee_without_dropping_the_rust_toolchain() {
+        let cargo_bin = Path::new("/opt/host-rust/bin");
+        let rustup_home = Path::new("/opt/host-rust/rustup");
+        let mut create_args = Vec::new();
+        let mut path_prefixes = Vec::new();
+
+        append_tclone_rust_mount_args(
+            &mut create_args,
+            &mut path_prefixes,
+            cargo_bin,
+            Some(rustup_home),
+            "/home/gensee",
+            true,
+        );
+
+        assert!(create_args.contains(&OsString::from("/opt/host-rust/bin:/opt/host-rust/bin:ro")));
+        assert!(create_args.contains(&OsString::from("/dev/null:/opt/host-rust/bin/gensee:ro")));
+        assert!(create_args.contains(&OsString::from(
+            "/opt/host-rust/rustup:/opt/host-rust/rustup:ro"
+        )));
+        assert!(create_args.contains(&OsString::from("RUSTUP_HOME=/opt/host-rust/rustup")));
+        assert!(create_args.contains(&OsString::from("CARGO_HOME=/home/gensee/.cargo")));
+        assert_eq!(path_prefixes, vec!["/opt/host-rust/bin"]);
+
+        let mut normal_args = Vec::new();
+        let mut normal_prefixes = Vec::new();
+        append_tclone_rust_mount_args(
+            &mut normal_args,
+            &mut normal_prefixes,
+            cargo_bin,
+            Some(rustup_home),
+            "/home/gensee",
+            false,
+        );
+        assert!(!normal_args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("/dev/null:")));
     }
 
     #[test]
@@ -14732,7 +15026,16 @@ gensee async job job_1: exited status=0
         fs::create_dir_all(&workspace).unwrap();
         fs::write(workspace.join("README.md"), "demo").unwrap();
 
-        prepare_tclone_seed(&seed, &workspace, None, None, "/workspace", "/home/gensee").unwrap();
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            None,
+            None,
+            "/workspace",
+            "/home/gensee",
+            false,
+        )
+        .unwrap();
 
         let init = seed.join("usr/local/bin/gensee-tclone-init");
         let contents = fs::read_to_string(&init).unwrap();
@@ -14776,6 +15079,7 @@ gensee async job job_1: exited status=0
             Some(&gensee_home),
             "/workspace",
             "/home/gensee",
+            false,
         )
         .unwrap();
 
@@ -14812,6 +15116,167 @@ gensee async job job_1: exited status=0
 
     #[cfg(unix)]
     #[test]
+    fn tclone_observe_only_seed_disables_hooks_and_omits_gensee_state() {
+        let root = temp_tree("observe-only-seed");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let host_home = root.join("host-home/yiying/.codex");
+        let gensee_home = root.join("host-home/yiying/.gensee");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(&host_home).unwrap();
+        let external_hooks = root.join("external-hooks.json");
+        fs::write(
+            &external_hooks,
+            r#"{"customSetting":"preserved","hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"gensee hook codex"}]}]}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&external_hooks, host_home.join("hooks.json")).unwrap();
+        fs::write(host_home.join("config.toml"), "model = \"gpt-test\"\n").unwrap();
+        fs::create_dir_all(&gensee_home).unwrap();
+        fs::write(gensee_home.join("policy.json"), "{}").unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "CODEX_HOME".to_string(),
+                host_home.clone(),
+                "/home/gensee/.codex".to_string(),
+            )),
+            Some(&gensee_home),
+            "/workspace",
+            "/home/gensee",
+            true,
+        )
+        .unwrap();
+
+        let hooks: Value = serde_json::from_str(
+            &fs::read_to_string(seed.join("home/gensee/.codex/hooks.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hooks["customSetting"], "preserved");
+        assert!(hooks.get("hooks").is_none());
+        assert!(fs::read_to_string(&external_hooks)
+            .unwrap()
+            .contains("gensee hook codex"));
+        assert!(
+            !fs::symlink_metadata(seed.join("home/gensee/.codex/hooks.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(seed.join("home/gensee/.codex/config.toml").exists());
+        assert!(!seed.join("home/gensee/.gensee").exists());
+        assert!(!seed.join("usr/local/bin/gensee").exists());
+        assert!(!seed
+            .join(
+                host_home
+                    .parent()
+                    .unwrap()
+                    .join(".cargo/bin/gensee")
+                    .strip_prefix("/")
+                    .unwrap()
+            )
+            .exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_codex_hook_rewrite_breaks_seed_symlink_without_touching_host_target() {
+        let root = temp_tree("codex-symlink-hooks");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let host_home = root.join("host-home/yiying/.codex");
+        let external_hooks = root.join("dotfiles/hooks.json");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(&host_home).unwrap();
+        fs::create_dir_all(external_hooks.parent().unwrap()).unwrap();
+        let original = r#"{"customSetting":"preserved","hooks":{"PreToolUse":[]}}"#;
+        fs::write(&external_hooks, original).unwrap();
+        std::os::unix::fs::symlink(&external_hooks, host_home.join("hooks.json")).unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "CODEX_HOME".to_string(),
+                host_home,
+                "/home/gensee/.codex".to_string(),
+            )),
+            None,
+            "/workspace",
+            "/home/gensee",
+            false,
+        )
+        .unwrap();
+
+        let seed_hooks = seed.join("home/gensee/.codex/hooks.json");
+        assert!(!fs::symlink_metadata(&seed_hooks)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let rewritten: Value =
+            serde_json::from_str(&fs::read_to_string(&seed_hooks).unwrap()).unwrap();
+        assert_eq!(rewritten["customSetting"], "preserved");
+        assert!(fs::read_to_string(&seed_hooks)
+            .unwrap()
+            .contains("/usr/local/bin/gensee hook codex"));
+        assert_eq!(fs::read_to_string(&external_hooks).unwrap(), original);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tclone_observe_only_preserves_non_hook_claude_settings_from_symlink() {
+        let root = temp_tree("claude-symlink-settings");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let host_home = root.join("host-home/yiying/.claude");
+        let external_settings = root.join("dotfiles/settings.json");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(&host_home).unwrap();
+        fs::create_dir_all(external_settings.parent().unwrap()).unwrap();
+        let original =
+            r#"{"model":"claude-test","permissions":{"allow":["Read"]},"hooks":{"PreToolUse":[]}}"#;
+        fs::write(&external_settings, original).unwrap();
+        std::os::unix::fs::symlink(&external_settings, host_home.join("settings.json")).unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                host_home,
+                "/home/gensee/.claude".to_string(),
+            )),
+            None,
+            "/workspace",
+            "/home/gensee",
+            true,
+        )
+        .unwrap();
+
+        let seed_settings = seed.join("home/gensee/.claude/settings.json");
+        assert!(!fs::symlink_metadata(&seed_settings)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&seed_settings).unwrap()).unwrap();
+        assert_eq!(settings["model"], "claude-test");
+        assert_eq!(settings["permissions"]["allow"], json!(["Read"]));
+        assert_eq!(settings["disableAllHooks"], true);
+        assert!(settings.get("hooks").is_none());
+        assert_eq!(fs::read_to_string(&external_settings).unwrap(), original);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tclone_seed_copies_antigravity_gemini_home() {
         let root = temp_tree("antigravity-home");
         let seed = root.join("seed");
@@ -14833,6 +15298,7 @@ gensee async job job_1: exited status=0
             None,
             "/workspace",
             "/home/gensee",
+            false,
         )
         .unwrap();
 
@@ -14841,6 +15307,45 @@ gensee async job job_1: exited status=0
             fs::read_link(seed.join(gemini_home.strip_prefix("/").unwrap())).unwrap(),
             PathBuf::from("/home/gensee/.gemini")
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tclone_observe_only_preserves_non_hook_gemini_configuration() {
+        let root = temp_tree("observe-only-gemini-home");
+        let seed = root.join("seed");
+        let workspace = root.join("workspace");
+        let gemini_home = root.join("host-home/yiying/.gemini");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("README.md"), "demo").unwrap();
+        fs::create_dir_all(gemini_home.join("config")).unwrap();
+        fs::write(
+            gemini_home.join("config/hooks.json"),
+            r#"{"customSetting":"preserved","hooks":{"BeforeTool":[]}}"#,
+        )
+        .unwrap();
+
+        prepare_tclone_seed(
+            &seed,
+            &workspace,
+            Some(&(
+                "GEMINI_HOME".to_string(),
+                gemini_home,
+                "/home/gensee/.gemini".to_string(),
+            )),
+            None,
+            "/workspace",
+            "/home/gensee",
+            true,
+        )
+        .unwrap();
+
+        let config: Value = serde_json::from_str(
+            &fs::read_to_string(seed.join("home/gensee/.gemini/config/hooks.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["customSetting"], "preserved");
+        assert!(config.get("hooks").is_none());
         let _ = fs::remove_dir_all(root);
     }
 

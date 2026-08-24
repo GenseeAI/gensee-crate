@@ -72,6 +72,35 @@ fn telemetry_test_lock() -> std::sync::MutexGuard<'static, ()> {
     cli_test_env_lock()
 }
 
+struct TestEnvVarGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl TestEnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = env::var_os(name);
+        env::set_var(name, value);
+        Self { name, previous }
+    }
+
+    fn remove(name: &'static str) -> Self {
+        let previous = env::var_os(name);
+        env::remove_var(name);
+        Self { name, previous }
+    }
+}
+
+impl Drop for TestEnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            env::set_var(self.name, previous);
+        } else {
+            env::remove_var(self.name);
+        }
+    }
+}
+
 #[test]
 fn cli_test_environment_mutations_share_one_process_wide_lock() {
     let first_guard = cli_test_env_lock();
@@ -7018,9 +7047,80 @@ fn run_config_parses_tclone_runtime() {
     .unwrap();
 
     assert_eq!(config.runtime, RuntimeMode::Tclone);
+    assert!(!config.observe_only);
     assert_eq!(config.sandbox, SandboxMode::None);
     assert_eq!(config.workspace, PathBuf::from("/repo"));
     assert_eq!(config.agent_cmd, vec![OsString::from("codex")]);
+}
+
+#[test]
+fn run_config_parses_tclone_observe_only_mode() {
+    let config = RunConfig::parse(vec![
+        OsString::from("--runtime"),
+        OsString::from("tclone"),
+        OsString::from("--observe-only"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap();
+
+    assert_eq!(config.runtime, RuntimeMode::Tclone);
+    assert!(config.observe_only);
+}
+
+#[test]
+fn legacy_observe_only_environment_does_not_change_host_run_or_hook_mode() {
+    let _guard = cli_test_env_lock();
+    let _legacy = TestEnvVarGuard::set("GENSEE_OBSERVE_ONLY", "1");
+    let _tclone = TestEnvVarGuard::remove("GENSEE_TCLONE_OBSERVE_ONLY");
+
+    let config = RunConfig::parse(vec![OsString::from("--"), OsString::from("codex")]).unwrap();
+    assert!(!config.observe_only);
+    assert!(!tclone_observe_only_container_enabled());
+}
+
+#[test]
+fn tclone_observe_only_marker_does_not_skip_command_validation() {
+    let _guard = cli_test_env_lock();
+    let _marker = TestEnvVarGuard::set("GENSEE_TCLONE_OBSERVE_ONLY", "1");
+
+    assert!(tclone_observe_only_container_enabled());
+    assert_eq!(
+        handle_hook(vec![OsString::from("bogus-agent")])
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        handle_setup(vec![OsString::from("bogus-agent")])
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(tclone_observe_only_setup_suppressed(&[OsString::from(
+        "claude-code"
+    )]));
+    assert!(!tclone_observe_only_setup_suppressed(&[
+        OsString::from("claude-code"),
+        OsString::from("--disable")
+    ]));
+    assert!(!tclone_observe_only_setup_suppressed(&[
+        OsString::from("claude-code"),
+        OsString::from("--repair")
+    ]));
+}
+
+#[test]
+fn run_config_rejects_observe_only_for_local_runtime() {
+    let error = RunConfig::parse(vec![
+        OsString::from("--observe-only"),
+        OsString::from("--"),
+        OsString::from("codex"),
+    ])
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("only with --runtime tclone"));
 }
 
 #[test]
