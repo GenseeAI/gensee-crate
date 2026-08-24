@@ -3962,6 +3962,7 @@ mod tests {
             container_workspace: "/workspace".to_string(),
             container_home: "/home/gensee".to_string(),
             agent_cmd: vec![],
+            path_prefixes: Vec::new(),
             fork_base_git_head: None,
             fork_base_overlay_lowerdir: None,
             fork_overlay_upperdir: None,

@@ -34,9 +34,12 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 pub const ENDPOINT_RETENTION_PRUNE_BATCH: u64 = 500;
+const FALCO_RETENTION_PRUNE_BATCH: u64 = 500;
+const FALCO_RETENTION_TIME_BUDGET: Duration = Duration::from_millis(50);
 pub const ARTIFACT_VISIBILITY_MIGRATION_BATCH: u64 = 1_000;
 pub const ARTIFACT_VISIBILITY_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
 const STORE_KEY_FILE: &str = "gensee.key";
@@ -79,6 +82,16 @@ pub struct EventStore {
     root: PathBuf,
     sqlite: Arc<Mutex<SqliteStore>>,
     encryption_key: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSystemEvent {
+    pub event_id: i64,
+    pub source: String,
+    pub event_type: String,
+    pub observed_at_ms: u64,
+    pub pid: Option<u32>,
+    pub raw_json: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -205,6 +218,12 @@ impl EventStore {
             sqlite: Arc::new(Mutex::new(sqlite)),
             encryption_key,
         })
+    }
+
+    /// Open a distinct SQLite connection to the same event-store root. Long-running
+    /// maintenance uses this so it never holds an ingester's in-process mutex.
+    pub fn independent_connection(&self) -> io::Result<Self> {
+        Self::new(&self.root)
     }
 
     pub fn sessions_path(&self) -> PathBuf {
@@ -346,11 +365,14 @@ impl EventStore {
 
     pub fn append_system_event(&self, event: &SystemEvent) -> io::Result<()> {
         self.append_system_event_database(event)?;
-        // Endpoint Security telemetry is already durable in SQLite and can be
-        // pruned transactionally. Duplicating this high-volume stream into an
+        // Native kernel telemetry is already durable in SQLite and can be
+        // pruned transactionally. Duplicating these high-volume streams into an
         // append-only JSONL file made retention ineffective and could consume
         // gigabytes during an event burst. Keep JSONL only for legacy sources.
-        if event.source == "macos-endpoint-security" {
+        if matches!(
+            event.source.as_str(),
+            "macos-endpoint-security" | "linux-falco"
+        ) {
             return Ok(());
         }
         append_jsonl(
@@ -429,6 +451,50 @@ impl EventStore {
 
     pub fn list_system_events(&self) -> io::Result<Vec<SystemEvent>> {
         read_jsonl(&self.system_events_path(), self.encryption_key.as_ref())
+    }
+
+    pub fn list_native_system_events(
+        &self,
+        session_id: Option<&str>,
+        path_contains: Option<&str>,
+        min_observed_at_ms: i64,
+        max_observed_at_ms: i64,
+        limit: usize,
+    ) -> io::Result<Vec<StoredSystemEvent>> {
+        let db = self.sqlite_store()?;
+        let rows = db
+            .system_events_for_sources(
+                &["macos-endpoint-security", "linux-falco"],
+                session_id,
+                path_contains,
+                min_observed_at_ms,
+                max_observed_at_ms,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            )
+            .map_err(sqlite_error)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let observed_at_ms = match u64::try_from(row.ts) {
+                    Ok(timestamp) => timestamp,
+                    Err(_) => {
+                        eprintln!(
+                            "gensee: skipping SQLite system event {} with negative timestamp {}",
+                            row.event_id, row.ts
+                        );
+                        return None;
+                    }
+                };
+                Some(StoredSystemEvent {
+                    event_id: row.event_id,
+                    source: row.source,
+                    event_type: row.event_type,
+                    observed_at_ms,
+                    pid: u32::try_from(row.pid).ok().filter(|pid| *pid != 0),
+                    raw_json: row.args.unwrap_or_else(|| "null".to_string()),
+                })
+            })
+            .collect::<Vec<_>>())
     }
 
     pub fn list_workspace_effects(&self) -> io::Result<Vec<WorkspaceEffect>> {
@@ -1538,6 +1604,67 @@ impl EventStore {
         .map(Some)
     }
 
+    /// Drain expired or over-cap Falco rows on a collector-specific cadence.
+    /// Multiple bounded transactions may run within a short time budget so a
+    /// burst can catch up without monopolizing the shared SQLite connection.
+    pub fn prune_falco_retention_if_due(
+        &self,
+        now_ms: u64,
+        interval_ms: u64,
+        raw_retention_hours: u64,
+        max_raw_events: u64,
+    ) -> io::Result<Option<u64>> {
+        let db = self.sqlite_store()?;
+        if !db
+            .claim_maintenance("falco-retention", to_i64(now_ms)?, to_i64(interval_ms)?)
+            .map_err(sqlite_error)?
+        {
+            return Ok(None);
+        }
+        drop(db);
+        self.prune_falco_retention_with_budget(
+            now_ms,
+            raw_retention_hours,
+            max_raw_events,
+            FALCO_RETENTION_PRUNE_BATCH,
+            FALCO_RETENTION_TIME_BUDGET,
+        )
+        .map(Some)
+    }
+
+    fn prune_falco_retention_with_budget(
+        &self,
+        now_ms: u64,
+        raw_retention_hours: u64,
+        max_raw_events: u64,
+        batch_limit: u64,
+        time_budget: Duration,
+    ) -> io::Result<u64> {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        if batch_limit == 0 {
+            return Ok(0);
+        }
+        let raw_cutoff = now_ms.saturating_sub(raw_retention_hours.saturating_mul(HOUR_MS));
+        let started = Instant::now();
+        let mut total = 0_u64;
+        loop {
+            let pruned = self
+                .sqlite_store()?
+                .prune_system_event_source_retention(
+                    "linux-falco",
+                    to_i64(raw_cutoff)?,
+                    i64::try_from(max_raw_events).unwrap_or(i64::MAX),
+                    i64::try_from(batch_limit).unwrap_or(i64::MAX),
+                )
+                .map_err(sqlite_error)?;
+            total = total.saturating_add(pruned);
+            if pruned < batch_limit || started.elapsed() >= time_budget {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
     /// Advance one bounded artifact-visibility rules batch at most once per
     /// interval across all processes sharing this store. Current stores avoid
     /// claiming the maintenance key, so normal dashboard polling remains
@@ -2075,14 +2202,9 @@ impl EventStore {
         self.with_sqlite_transaction(|db| {
             let ts = to_i64(event.observed_at_ms)?;
             let matched_agent_event = agent_event_for_system_event(db, event, ts)?;
-            let endpoint_session_id = endpoint_security_session_id(event);
-            let request_id = if let Some(session_id) = endpoint_session_id.as_deref() {
-                ensure_session(
-                    db,
-                    session_id,
-                    "macos-endpoint-security",
-                    event.observed_at_ms,
-                )?;
+            let attributed_session_id = system_event_session_id(event);
+            let request_id = if let Some(session_id) = attributed_session_id.as_deref() {
+                ensure_session(db, session_id, &event.source, event.observed_at_ms)?;
                 latest_or_create_request(db, session_id)?
             } else if let Some(agent_event) = &matched_agent_event {
                 agent_event.request_id
@@ -2101,7 +2223,7 @@ impl EventStore {
                     args: Some(event.raw_json.clone()),
                 })
                 .map_err(sqlite_error)?;
-            let process_tree_matched = endpoint_session_id.is_some();
+            let process_tree_matched = attributed_session_id.is_some();
             let matched = matched_agent_event.is_some() || process_tree_matched;
             if let Some(agent_event) = matched_agent_event {
                 insert_entity_relation(
@@ -2126,15 +2248,20 @@ impl EventStore {
                     "observed",
                     1.0,
                     Some(json!({
-                        "matched_by": "endpoint_security_process_tree",
-                        "session_id": endpoint_session_id,
+                        "matched_by": "system_event_session_attribution",
+                        "session_id": attributed_session_id,
                         "system_event_type": event.event_type,
                     })),
                     ts,
                 )?;
             }
             record_system_event_artifacts(db, request_id, event_id, event, ts, matched)?;
-            if !matched && event.source != "macos-endpoint-security" {
+            if !matched
+                && !matches!(
+                    event.source.as_str(),
+                    "macos-endpoint-security" | "linux-falco"
+                )
+            {
                 record_unmatched_system_event_alert(db, request_id, event_id, event, ts)?;
             }
 
@@ -3925,15 +4052,17 @@ fn text_from_raw_json(raw_json: &str, keys: &[&str]) -> Option<String> {
         .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
-fn endpoint_security_session_id(event: &SystemEvent) -> Option<String> {
-    if event.source != "macos-endpoint-security" {
-        return None;
-    }
-    serde_json::from_str::<Value>(&event.raw_json)
-        .ok()?
-        .get("attribution")?
-        .get("session_id")?
-        .as_str()
+fn system_event_session_id(event: &SystemEvent) -> Option<String> {
+    let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+    let session_id = match event.source.as_str() {
+        "linux" | "linux-falco" => value.get("session_id").and_then(Value::as_str),
+        "macos-endpoint-security" => value
+            .get("attribution")
+            .and_then(|value| value.get("session_id"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    session_id
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
 }
@@ -6859,6 +6988,199 @@ mod tests {
                 .len(),
             0
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn attributed_linux_system_events_attach_to_the_tclone_request() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-linux-attribution-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_system_event(&SystemEvent {
+                source: "linux-falco".to_string(),
+                event_type: "connect".to_string(),
+                event_kind: "NetworkConnect".to_string(),
+                observed_at_ms: 130,
+                pid: Some(42),
+                ppid: Some(1),
+                process_name: Some("curl".to_string()),
+                executable_path: Some("/usr/bin/curl".to_string()),
+                file_path: None,
+                command_line: Some("curl https://packages.example.test".to_string()),
+                raw_json: r#"{"session_id":"run_test","event":"connect"}"#.to_string(),
+            })
+            .unwrap();
+
+        let db = store.sqlite_store().unwrap();
+        let request = db.latest_request_for_session("run_test").unwrap().unwrap();
+        let system_events = db.system_events_for_request(request.request_id).unwrap();
+        assert_eq!(system_events.len(), 1);
+        assert_eq!(system_events[0].source, "linux-falco");
+        assert_eq!(system_events[0].event_type, "connect");
+        assert!(store.list_system_events().unwrap().is_empty());
+        assert_eq!(
+            db.relations_for_request(request.request_id).unwrap().len(),
+            1
+        );
+        assert!(db
+            .latest_request_for_session(SYSTEM_SESSION_ID)
+            .unwrap()
+            .is_none());
+        drop(db);
+        let native_events = store
+            .list_native_system_events(None, None, i64::MIN, i64::MAX, 100)
+            .unwrap();
+        assert_eq!(native_events.len(), 1);
+        assert_eq!(native_events[0].source, "linux-falco");
+        assert_eq!(native_events[0].event_type, "connect");
+        assert_eq!(native_events[0].observed_at_ms, 130);
+        assert_eq!(native_events[0].pid, Some(42));
+        assert_eq!(
+            native_events[0].raw_json,
+            r#"{"session_id":"run_test","event":"connect"}"#
+        );
+        assert!(store
+            .list_alerts()
+            .unwrap()
+            .iter()
+            .all(|alert| alert.rule_id != "unmatched_system_effect"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn native_system_event_listing_skips_negative_timestamps() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-native-negative-ts-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        for observed_at_ms in [130, 140] {
+            store
+                .append_system_event(&SystemEvent {
+                    source: "linux-falco".to_string(),
+                    event_type: "execve".to_string(),
+                    event_kind: "ProcessExec".to_string(),
+                    observed_at_ms,
+                    pid: Some(42),
+                    ppid: Some(1),
+                    process_name: Some("sh".to_string()),
+                    executable_path: Some("/bin/sh".to_string()),
+                    file_path: None,
+                    command_line: Some("sh -c true".to_string()),
+                    raw_json: format!(r#"{{"event_id":"event-{observed_at_ms}"}}"#),
+                })
+                .unwrap();
+        }
+        store
+            .sqlite_store()
+            .unwrap()
+            .connection()
+            .execute("UPDATE system_events SET ts = -1 WHERE ts = 130", [])
+            .unwrap();
+
+        let events = store
+            .list_native_system_events(None, None, i64::MIN, i64::MAX, 100)
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].observed_at_ms, 140);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn falco_retention_drains_multiple_batches_within_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-falco-retention-budget-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        for observed_at_ms in 1..=8 {
+            store
+                .append_system_event(&SystemEvent {
+                    source: "linux-falco".to_string(),
+                    event_type: "execve".to_string(),
+                    event_kind: "ProcessExec".to_string(),
+                    observed_at_ms,
+                    pid: Some(42),
+                    ppid: Some(1),
+                    process_name: Some("sh".to_string()),
+                    executable_path: Some("/bin/sh".to_string()),
+                    file_path: None,
+                    command_line: Some("sh -c true".to_string()),
+                    raw_json: format!(r#"{{"event_id":"event-{observed_at_ms}"}}"#),
+                })
+                .unwrap();
+        }
+
+        let pruned = store
+            .prune_falco_retention_with_budget(100, 1, 2, 3, Duration::from_secs(1))
+            .unwrap();
+        let events = store
+            .list_native_system_events(None, None, i64::MIN, i64::MAX, 100)
+            .unwrap();
+
+        assert_eq!(pruned, 6);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .into_iter()
+                .map(|event| event.observed_at_ms)
+                .collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn unattributed_falco_events_are_capture_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-falco-capture-only-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+
+        store
+            .append_system_event(&SystemEvent {
+                source: "linux-falco".to_string(),
+                event_type: "openat".to_string(),
+                event_kind: "FileWrite".to_string(),
+                observed_at_ms: 130,
+                pid: Some(42),
+                ppid: Some(1),
+                process_name: Some("sh".to_string()),
+                executable_path: Some("/bin/sh".to_string()),
+                file_path: Some("/workspace/result.txt".to_string()),
+                command_line: Some("sh -c echo".to_string()),
+                raw_json: r#"{"event":"openat"}"#.to_string(),
+            })
+            .unwrap();
+
+        assert!(store.list_system_events().unwrap().is_empty());
+        let db = store.sqlite_store().unwrap();
+        let request = db
+            .latest_request_for_session(SYSTEM_SESSION_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.system_events_for_request(request.request_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(db);
+        assert!(store
+            .list_alerts()
+            .unwrap()
+            .iter()
+            .all(|alert| alert.rule_id != "unmatched_system_effect"));
 
         fs::remove_dir_all(&dir).ok();
     }

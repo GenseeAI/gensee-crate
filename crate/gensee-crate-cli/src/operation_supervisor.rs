@@ -17,6 +17,46 @@ const LINEAGE_LAST_SEEN_PERSIST_INTERVAL_MS: u64 = 5_000;
 const MAX_RETAINED_INACTIVE_PROCESS_IDENTITIES: usize = 4_096;
 const MAX_OPERATION_VIOLATION_KINDS: usize = 256;
 
+#[cfg(target_os = "linux")]
+pub(crate) fn local_process_start_time_ticks(pid: u32) -> io::Result<u64> {
+    Ok(gensee_crate_linux::inspect_process_identity(pid)?.start_time_ticks)
+}
+
+#[cfg(target_vendor = "apple")]
+pub(crate) fn local_process_start_time_ticks(pid: u32) -> io::Result<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+    let result = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid process id"))?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(expected).expect("proc_bsdinfo size fits in i32"),
+        )
+    };
+    if result != i32::try_from(expected).expect("proc_bsdinfo size fits in i32") {
+        return Err(io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    let seconds = info.pbi_start_tvsec;
+    let microseconds = info.pbi_start_tvusec;
+    seconds
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(microseconds))
+        .filter(|value| *value != 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+pub(crate) fn local_process_start_time_ticks(_pid: u32) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stable local process identity is unsupported on this platform",
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OperationState {
@@ -131,6 +171,8 @@ pub(crate) struct ManagedOperationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Opaque, platform-local PID generation token: procfs start ticks on
+    /// Linux and process start microseconds on macOS.
     pub root_start_time_ticks: Option<u64>,
     pub cgroup: OperationCgroupRecord,
     pub envelope: OperationCapabilityEnvelope,
@@ -533,6 +575,28 @@ impl OperationSupervisor {
         .then(|| Path::new(&self.record.cgroup.path))
     }
 
+    pub(crate) fn recorded_running_root_identity(&self) -> io::Result<(u32, u64)> {
+        if self.record.state != OperationState::Running || self.record.finished_at_ms.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "managed operation is not running",
+            ));
+        }
+        self.record
+            .root_pid
+            .zip(self.record.root_start_time_ticks)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "managed operation has no stable root process identity",
+                )
+            })
+    }
+
+    pub(crate) fn record_path(&self) -> &Path {
+        &self.record_path
+    }
+
     pub(crate) fn activate(&mut self, root_pid: u32) -> io::Result<()> {
         if root_pid == 0 {
             return Err(io::Error::new(
@@ -549,6 +613,28 @@ impl OperationSupervisor {
             ));
         }
         self.record.root_pid = Some(root_pid);
+        match local_process_start_time_ticks(root_pid) {
+            Ok(root_start_time_ticks) => {
+                if self
+                    .record
+                    .root_start_time_ticks
+                    .is_some_and(|expected| expected != root_start_time_ticks)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "managed operation root PID generation changed during activation",
+                    ));
+                }
+                self.record.root_start_time_ticks = Some(root_start_time_ticks);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                self.record_violation(
+                    "stable_process_identity_unavailable",
+                    "managed attribution is unavailable on this platform",
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
         #[cfg(target_os = "linux")]
         if let Some(path) = self.cgroup_path().map(Path::to_path_buf) {
             match gensee_crate_linux::attach_process_tree_to_cgroup(root_pid, &path) {
@@ -1235,6 +1321,13 @@ fn operation_record_root_at(state_root: &Path, operation_id: &str) -> io::Result
         ));
     }
     Ok(state_root.join("operations").join(operation_id))
+}
+
+pub(crate) fn operation_record_path_at(
+    state_root: &Path,
+    operation_id: &str,
+) -> io::Result<PathBuf> {
+    Ok(operation_record_root_at(state_root, operation_id)?.join("record.json"))
 }
 
 fn safe_operation_token(value: &str) -> bool {

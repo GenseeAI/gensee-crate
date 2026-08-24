@@ -1,4 +1,5 @@
 use crate::*;
+use std::process::{Child, ExitStatus};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -97,6 +98,101 @@ pub(crate) struct RunConfig {
     pub(crate) linux_allow_net_override: Vec<String>,
     pub(crate) linux_deny_net_override: Vec<String>,
     pub(crate) agent_cmd: Vec<OsString>,
+}
+
+struct ManagedRunLifecycle {
+    operation: OperationSupervisor,
+    child: Child,
+    store: EventStore,
+    session: AgentSession,
+    outcome: Option<(Option<i32>, bool)>,
+    closed: bool,
+}
+
+impl ManagedRunLifecycle {
+    fn new(
+        operation: OperationSupervisor,
+        child: Child,
+        store: EventStore,
+        session: AgentSession,
+    ) -> Self {
+        Self {
+            operation,
+            child,
+            store,
+            session,
+            outcome: None,
+            closed: false,
+        }
+    }
+
+    fn wait_for_child(
+        &mut self,
+        max_runtime_seconds: Option<u64>,
+    ) -> io::Result<(ExitStatus, bool)> {
+        let (status, timed_out) = self
+            .operation
+            .wait_for_child(&mut self.child, max_runtime_seconds)?;
+        self.outcome = Some((status.code(), timed_out));
+        Ok((status, timed_out))
+    }
+
+    fn append_opening_session(&self) -> io::Result<()> {
+        self.store.append_session(&self.session)
+    }
+
+    fn close(&mut self, ended_at_ms: u64) -> io::Result<()> {
+        let (exit_code, timed_out) = self.outcome.unwrap_or((None, false));
+        let finish_result = self.operation.finish(exit_code, timed_out);
+        let session_result = self.append_closing_session(ended_at_ms, exit_code);
+        self.closed = finish_result.is_ok() && session_result.is_ok();
+        finish_result.and(session_result)
+    }
+
+    fn append_closing_session(&self, ended_at_ms: u64, exit_code: Option<i32>) -> io::Result<()> {
+        let mut session = self.session.clone();
+        session.ended_at_ms = Some(ended_at_ms);
+        session.exit_code = exit_code;
+        self.store.append_session(&session)
+    }
+
+    fn terminate_if_needed(&mut self) -> Option<i32> {
+        if let Some((exit_code, _)) = self.outcome {
+            return exit_code;
+        }
+        if let Ok(Some(status)) = self.child.try_wait() {
+            let exit_code = status.code();
+            self.outcome = Some((exit_code, false));
+            return exit_code;
+        }
+        let _ = self.child.kill();
+        let exit_code = self.child.wait().ok().and_then(|status| status.code());
+        self.outcome = Some((exit_code, false));
+        exit_code
+    }
+}
+
+impl Drop for ManagedRunLifecycle {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let exit_code = self.terminate_if_needed();
+        let timed_out = self.outcome.is_some_and(|(_, timed_out)| timed_out);
+        let ended_at_ms = unix_millis().unwrap_or(self.session.started_at_ms);
+        if let Err(error) = self.operation.finish(exit_code, timed_out) {
+            eprintln!(
+                "gensee: could not close failed operation {}: {error}",
+                self.operation.operation_id()
+            );
+        }
+        if let Err(error) = self.append_closing_session(ended_at_ms, exit_code) {
+            eprintln!(
+                "gensee: could not close failed session {}: {error}",
+                self.session.session_id
+            );
+        }
+    }
 }
 
 impl RunConfig {
@@ -493,7 +589,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         return Err(error);
     }
 
-    store.append_session(&AgentSession {
+    let open_session = AgentSession {
         session_id: run_id.clone(),
         agent_binary: agent_binary.clone(),
         root_pid,
@@ -513,14 +609,15 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         started_at_ms,
         ended_at_ms: None,
         exit_code: None,
-    })?;
+    };
+    let mut lifecycle =
+        ManagedRunLifecycle::new(operation_supervisor, child, store.clone(), open_session);
+    lifecycle.append_opening_session()?;
 
     let fanotify_guard = if let Some(prepared_guard) = prepared_fanotify_guard {
         match prepared_guard.start(&store, &run_id, root_pid, &agent_binary) {
             Ok(guard) => Some(guard),
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
                 return Err(error);
             }
         }
@@ -535,8 +632,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
         config.profile,
     );
 
-    let (status, timed_out) =
-        operation_supervisor.wait_for_child(&mut child, config.max_runtime_seconds)?;
+    let (status, timed_out) = lifecycle.wait_for_child(config.max_runtime_seconds)?;
     if let Some(plan) = linux_network_plan.as_ref() {
         append_linux_network_block_events(
             &store,
@@ -551,27 +647,7 @@ pub(crate) fn run_agent(config: RunConfig) -> io::Result<()> {
     drop(linux_cleanup.take());
     let ended_at_ms = unix_millis()?;
     let exit_code = status.code();
-    operation_supervisor.finish(exit_code, timed_out)?;
-
-    store.append_session(&AgentSession {
-        session_id: run_id.clone(),
-        agent_binary: config.agent_cmd[0].to_string_lossy().to_string(),
-        root_pid,
-        cwd: run_workspace.to_string_lossy().to_string(),
-        repo_path: repo_path.map(|path| path.to_string_lossy().to_string()),
-        mode: Some(format!("managed-run:{}", config.sandbox.label())),
-        workspace_mode: Some(config.workspace_mode.label().to_string()),
-        original_workspace: Some(original_workspace.to_string_lossy().to_string()),
-        staged_workspace: (config.workspace_mode == WorkspaceMode::Staged)
-            .then(|| run_workspace.to_string_lossy().to_string()),
-        sandbox_profile: (config.sandbox == SandboxMode::Mac).then(|| config.profile.clone()),
-        sandbox_profile_path: sandbox_profile
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string()),
-        started_at_ms,
-        ended_at_ms: Some(ended_at_ms),
-        exit_code,
-    })?;
+    lifecycle.close(ended_at_ms)?;
 
     eprintln!(
         "gensee: ended run {run_id} exit_code={}",
@@ -1308,4 +1384,71 @@ pub(crate) fn is_valid_discard_session_id(session_id: &str) -> bool {
         && session_id
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_run_lifecycle_drop_closes_operation_and_session() {
+        let _guard = crate::cli_test_env_lock();
+        let root = env::temp_dir().join(format!(
+            "gensee-run-lifecycle-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        env::set_var("GENSEE_HOME", &root);
+        let store = EventStore::new(&root).unwrap();
+        let mut operation = OperationSupervisor::prepare(
+            "op_lifecycle_drop",
+            "run_lifecycle_drop",
+            "managed-test",
+            OperationCapabilityEnvelope::default(),
+            None,
+        )
+        .unwrap();
+        let child = Command::new("sleep").arg("10").spawn().unwrap();
+        operation.activate(child.id()).unwrap();
+        let session = AgentSession {
+            session_id: "run_lifecycle_drop".to_string(),
+            agent_binary: "sleep".to_string(),
+            root_pid: child.id(),
+            cwd: root.to_string_lossy().to_string(),
+            repo_path: None,
+            mode: Some("managed-run:none".to_string()),
+            workspace_mode: None,
+            original_workspace: None,
+            staged_workspace: None,
+            sandbox_profile: None,
+            sandbox_profile_path: None,
+            started_at_ms: unix_millis().unwrap(),
+            ended_at_ms: None,
+            exit_code: None,
+        };
+        store.append_session(&session).unwrap();
+
+        drop(ManagedRunLifecycle::new(
+            operation,
+            child,
+            store.clone(),
+            session,
+        ));
+
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].ended_at_ms.is_some());
+        let operation: Value = serde_json::from_str(
+            &fs::read_to_string(
+                root.join("operations")
+                    .join("op_lifecycle_drop")
+                    .join("record.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(operation["state"], json!("failed"));
+
+        env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).ok();
+    }
 }

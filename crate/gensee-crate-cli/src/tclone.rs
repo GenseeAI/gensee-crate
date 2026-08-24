@@ -1,5 +1,6 @@
 use crate::*;
 use hmac::{Hmac, Mac};
+use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -37,6 +38,7 @@ const TCLONE_HOST_CONTROL_WORKSPACE_DIR: &str = ".gensee-host-control";
 const TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS: u64 = 300;
 const TCLONE_HOST_CONTROL_COMMAND_TIMEOUT_SECS: u64 = 300;
 const TCLONE_FORK_STATUS_CONTROL_TIMEOUT_SECS: u64 = 2;
+const TCLONE_CONTEXT_AUTH_CONTROL_TIMEOUT_SECS: u64 = 1;
 const TCLONE_HOST_CONTROL_AUTH_DIR: &str = "host-control-auth";
 const TCLONE_HOST_CONTROL_MAX_NONCES_PER_CAPABILITY: usize = 10_000;
 // A request must remain fresh longer than the file client's response wait, and
@@ -61,9 +63,21 @@ const TCLONE_ASYNC_PROGRESS_PANE_ENV: &str = "GENSEE_TCLONE_SHOW_PROGRESS_PANE";
 const TCLONE_WAIT_QUIET_FOR_FORK_ENV: &str = "GENSEE_TCLONE_WAIT_QUIET_FOR_FORK";
 const TCLONE_FORK_TIMING_ENV: &str = "GENSEE_TCLONE_FORK_TIMING";
 const TCLONE_CONTAINER_INIT_PATH: &str = "/usr/local/bin/gensee-tclone-init";
+const TCLONE_CONTAINER_GENSEE_PATH: &str = "/usr/local/bin/gensee";
 const TCLONE_NODE_MOUNT_PATH: &str = "/opt/gensee-host-node";
 const TCLONE_NODE_BIN_MOUNT_PATH: &str = "/opt/gensee-host-node-bin";
 pub(crate) const TCLONE_RUN_CONTEXT_PATH: &str = "/tmp/gensee-run-context.json";
+
+thread_local! {
+    // Reuse a successful host-boundary check only within the current hook
+    // request thread. This removes duplicate policy-path authentication while
+    // preserving immediate capability revocation between hook requests.
+    static AUTHENTICATED_TCLONE_CONTEXT: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+    // A host managed-run proof is process-lineage evidence, not a Tclone
+    // capability. Keep it separate so no sentinel value can masquerade as a
+    // capability secret in the Tclone cache.
+    static AUTHENTICATED_MANAGED_RUN: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 const TCLONE_FORK_RESULT_PATH: &str = "/tmp/gensee-fork-result.json";
 const TCLONE_SOURCE_FORK_HANDOFF_FILE: &str = "source-fork-handoff.json";
 const TCLONE_PARALLEL_CHOICE_OFFER_FILE: &str = "parallel-choice-offer.json";
@@ -179,6 +193,8 @@ pub(crate) struct TcloneRunRecord {
     pub(crate) container_workspace: String,
     pub(crate) container_home: String,
     pub(crate) agent_cmd: Vec<String>,
+    #[serde(default)]
+    pub(crate) path_prefixes: Vec<String>,
     #[serde(default)]
     pub(crate) fork_base_git_head: Option<String>,
     #[serde(default)]
@@ -568,7 +584,12 @@ fn read_tclone_run_context() -> io::Result<Value> {
     #[cfg(test)]
     let path = env::var_os("GENSEE_TCLONE_CONTEXT_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(TCLONE_RUN_CONTEXT_PATH));
+        .unwrap_or_else(|| {
+            env::temp_dir().join(format!(
+                "gensee-test-no-run-context-{}.json",
+                std::process::id()
+            ))
+        });
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text).map_err(|error| {
         io::Error::new(
@@ -579,8 +600,166 @@ fn read_tclone_run_context() -> io::Result<Value> {
 }
 
 pub(crate) fn current_tclone_context_run_id() -> Option<String> {
-    let context = read_tclone_run_context().ok()?;
-    tclone_context_run_id(&context)
+    let inherited_source_run_id = env::var("GENSEE_RUN_ID")
+        .ok()
+        .map(|run_id| run_id.trim().to_string())
+        .filter(|run_id| tclone_is_safe_token(run_id) && !run_id.contains("_fork_"));
+    let context = match read_tclone_run_context() {
+        Ok(context) => context,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return inherited_source_run_id,
+        Err(_) => return None,
+    };
+    let (run_id, capability) = tclone_observation_credentials_from_context(&context).ok()?;
+    if tclone_context_authentication_is_cached(&run_id, &capability) {
+        return Some(run_id);
+    }
+    match authenticate_tclone_context_identity(&run_id, &capability) {
+        Ok(()) => Some(run_id),
+        Err(error) => {
+            if env::var("GENSEE_TCLONE_HOST_OBSERVER_DEBUG")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "gensee hook: could not authenticate tclone context for {run_id}: {error}"
+                );
+            }
+            // A present but unauthenticated context is not evidence that this
+            // process belongs to the inherited source run. Leave it
+            // unattributed instead of actively mis-correlating fork effects.
+            None
+        }
+    }
+}
+
+pub(crate) fn authenticate_tclone_context_identity(
+    run_id: &str,
+    capability: &str,
+) -> io::Result<()> {
+    if tclone_context_authentication_is_cached(run_id, capability) {
+        return Ok(());
+    }
+    let observer_configured = env::var_os(TCLONE_HOST_OBSERVER_SOCKET_ENV).is_some();
+    if observer_configured
+        && crate::daemon::authenticate_tclone_context_via_host(run_id, capability).is_ok()
+    {
+        cache_authenticated_tclone_context(run_id, capability);
+        return Ok(());
+    }
+
+    let host_control_configured =
+        tclone_host_control_socket_path().is_some() || tclone_host_control_dir_path().is_some();
+    if host_control_configured {
+        authenticate_tclone_context_via_host_control(run_id, capability)?;
+        cache_authenticated_tclone_context(run_id, capability);
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        if observer_configured {
+            "host observer could not authenticate the tclone context"
+        } else {
+            "no host mediation boundary is available to authenticate the tclone context"
+        },
+    ))
+}
+
+pub(crate) fn cache_authenticated_tclone_context(run_id: &str, capability: &str) {
+    AUTHENTICATED_TCLONE_CONTEXT.with(|authenticated| {
+        authenticated.replace(Some((run_id.to_string(), capability.to_string())));
+    });
+}
+
+pub(crate) fn clear_cached_authenticated_tclone_context() {
+    AUTHENTICATED_TCLONE_CONTEXT.with(|authenticated| {
+        authenticated.replace(None);
+    });
+}
+
+pub(crate) fn cache_authenticated_managed_run(run_id: &str) {
+    AUTHENTICATED_MANAGED_RUN.with(|authenticated| {
+        authenticated.replace(Some(run_id.to_string()));
+    });
+}
+
+pub(crate) fn clear_cached_authenticated_managed_run() {
+    AUTHENTICATED_MANAGED_RUN.with(|authenticated| {
+        authenticated.replace(None);
+    });
+}
+
+pub(crate) fn cached_authenticated_managed_run_id() -> Option<String> {
+    AUTHENTICATED_MANAGED_RUN.with(|authenticated| authenticated.borrow().clone())
+}
+
+pub(crate) fn cached_authenticated_tclone_context_run_id() -> Option<String> {
+    AUTHENTICATED_TCLONE_CONTEXT.with(|authenticated| {
+        authenticated
+            .borrow()
+            .as_ref()
+            .map(|(run_id, _)| run_id.clone())
+    })
+}
+
+fn tclone_context_authentication_is_cached(run_id: &str, capability: &str) -> bool {
+    AUTHENTICATED_TCLONE_CONTEXT.with(|authenticated| {
+        authenticated
+            .borrow()
+            .as_ref()
+            .is_some_and(|(cached_run_id, cached_capability)| {
+                cached_run_id == run_id && cached_capability == capability
+            })
+    })
+}
+
+pub(crate) fn authenticate_tclone_context_via_host_control(
+    run_id: &str,
+    capability: &str,
+) -> io::Result<()> {
+    let args = vec!["run".to_string(), "identity".to_string()];
+    let nonce = Uuid::new_v4().to_string();
+    let issued_at_ms = unix_millis()?;
+    let authenticator =
+        tclone_host_control_authenticator(run_id, &nonce, issued_at_ms, &args, capability)?;
+    let request = TcloneHostControlRequest {
+        caller_run_id: Some(run_id.to_string()),
+        nonce: Some(nonce),
+        issued_at_ms: Some(issued_at_ms),
+        authenticator: Some(authenticator),
+        args,
+    };
+    let response = match tclone_host_control_socket_path() {
+        Some(socket_path) => match tclone_host_control_request(&socket_path, &request) {
+            Ok(response) => response,
+            Err(socket_error) if tclone_host_control_dir_path().is_some() => {
+                tclone_host_control_file_request(&request).map_err(|file_error| {
+                    io::Error::new(
+                        file_error.kind(),
+                        format!(
+                            "host observer unavailable; socket context authentication failed ({socket_error}); file authentication failed ({file_error})"
+                        ),
+                    )
+                })?
+            }
+            Err(error) => return Err(error),
+        },
+        None => tclone_host_control_file_request(&request)?,
+    };
+    if let Some(error) = response.error {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, error));
+    }
+    if response.exit_code == Some(0) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "host rejected tclone context identity with status {}",
+                response.exit_code.unwrap_or(1)
+            ),
+        ))
+    }
 }
 
 fn tclone_context_run_id(context: &Value) -> Option<String> {
@@ -1522,7 +1701,7 @@ fn ensure_tclone_host_control_capability(run_id: &str) -> io::Result<String> {
     rotate_tclone_host_control_capability(run_id)
 }
 
-fn rotate_tclone_host_control_capability(run_id: &str) -> io::Result<String> {
+pub(crate) fn rotate_tclone_host_control_capability(run_id: &str) -> io::Result<String> {
     let path = tclone_host_control_capability_path(run_id)?;
     if let Some(parent) = path.parent() {
         create_restrictive_dir_all(parent)?;
@@ -1668,6 +1847,7 @@ fn tclone_host_control_should_proxy(args: &[OsString]) -> bool {
                 | "discard"
                 | "lifecycle-ack"
                 | "cell"
+                | "identity"
         )
     )
 }
@@ -1686,8 +1866,15 @@ fn tclone_host_control_request(
             ),
         )
     })?;
-    if tclone_is_json_fork_status_poll(&request.args) {
-        let timeout = Some(Duration::from_secs(TCLONE_FORK_STATUS_CONTROL_TIMEOUT_SECS));
+    if tclone_is_json_fork_status_poll(&request.args)
+        || tclone_is_context_identity_request(&request.args)
+    {
+        let timeout_secs = if tclone_is_context_identity_request(&request.args) {
+            TCLONE_CONTEXT_AUTH_CONTROL_TIMEOUT_SECS
+        } else {
+            TCLONE_FORK_STATUS_CONTROL_TIMEOUT_SECS
+        };
+        let timeout = Some(Duration::from_secs(timeout_secs));
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
     }
@@ -1781,9 +1968,17 @@ fn tclone_host_control_file_timeout_secs_for_request(request: &TcloneHostControl
     let configured = tclone_host_control_file_timeout_secs();
     if tclone_is_json_fork_status_poll(&request.args) {
         configured.min(TCLONE_FORK_STATUS_CONTROL_TIMEOUT_SECS)
+    } else if tclone_is_context_identity_request(&request.args) {
+        configured.min(TCLONE_CONTEXT_AUTH_CONTROL_TIMEOUT_SECS)
     } else {
         configured
     }
+}
+
+fn tclone_is_context_identity_request(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("run")
+        && args.get(1).map(String::as_str) == Some("identity")
+        && args.len() == 2
 }
 
 fn tclone_is_json_fork_status_poll(args: &[String]) -> bool {
@@ -2016,6 +2211,14 @@ fn execute_tclone_host_control_request(
             stdout: String::new(),
             stderr: String::new(),
             error: Some(error.to_string()),
+        });
+    }
+    if tclone_is_context_identity_request(&request.args) {
+        return Ok(TcloneHostControlResponse {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
         });
     }
     if let Some(response) = tclone_child_observer_fork_status_response(&request)? {
@@ -2533,6 +2736,14 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
                 ));
             }
         }
+        "identity" => {
+            if !tclone_is_context_identity_request(&request.args) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "usage: gensee run identity",
+                ));
+            }
+        }
         // These commands manipulate the host's interactive terminal and remain
         // intentionally host-only.
         "attach" | "shell" => {
@@ -2548,10 +2759,17 @@ fn validate_tclone_host_control_request(request: &TcloneHostControlRequest) -> i
             ));
         }
     }
-    // Claim only authenticated, authorized requests. Since the signed issuance
-    // time expires before nonce records are pruned, deleting old claims cannot
-    // make a captured request replayable.
-    claim_tclone_host_control_nonce(caller_run_id, nonce)?;
+    // An exact `run identity` request is a read-only proof of the already-
+    // scoped caller context. Its signed request can be replayed only within the
+    // ten-minute freshness bound, through the same per-run control channel,
+    // and its response has no external side effect. Keep these high-frequency
+    // checks out of the O(n) nonce scan and control-operation nonce budget;
+    // every other request remains one-use.
+    if !tclone_is_context_identity_request(&request.args) {
+        // Since signed issuance expires before nonce records are pruned,
+        // deleting old claims cannot make a captured request replayable.
+        claim_tclone_host_control_nonce(caller_run_id, nonce)?;
+    }
     Ok(())
 }
 
@@ -4012,7 +4230,8 @@ fn run_tclone_agent_inner(
     )?;
     if let Ok(current_exe) = env::current_exe() {
         if current_exe.exists() {
-            let destination = seed_root.join("usr/local/bin/gensee");
+            let destination =
+                seed_root.join(container_relative_path(TCLONE_CONTAINER_GENSEE_PATH)?);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -4123,13 +4342,6 @@ fn run_tclone_agent_inner(
             "CARGO_HOME={container_home}/.cargo"
         )));
     }
-    if !path_prefixes.is_empty() {
-        create_args.push(OsString::from("-e"));
-        create_args.push(OsString::from(format!(
-            "PATH={}",
-            tclone_container_path(&path_prefixes)
-        )));
-    }
     create_args.push(OsString::from(&image));
     create_args.push(OsString::from("idle"));
     let agent_cmd_strings = container_agent_cmd
@@ -4147,7 +4359,11 @@ fn run_tclone_agent_inner(
         &run_id,
     )?;
     let output = run_command_capture(&podman, &create_args)?;
-    let container_id = output.lines().next().map(str::trim).map(str::to_string);
+    let container_id = output
+        .lines()
+        .map(str::trim)
+        .find(|line| line.len() >= 12 && line.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_string);
     let cleanup_guard = TcloneContainerCleanup::new(&podman, &source_container);
     let source_record = TcloneRunRecord {
         run_id: run_id.clone(),
@@ -4171,6 +4387,7 @@ fn run_tclone_agent_inner(
         container_workspace: container_workspace.clone(),
         container_home: container_home.clone(),
         agent_cmd: agent_cmd_strings.clone(),
+        path_prefixes: path_prefixes.clone(),
         fork_base_git_head: None,
         fork_base_overlay_lowerdir: None,
         fork_overlay_upperdir: None,
@@ -4192,7 +4409,12 @@ fn run_tclone_agent_inner(
     let root_pid = inspect_container_pid(&podman, &source_container)?;
     source_operation.activate(root_pid)?;
     write_tclone_run_context(&podman, &source_record)?;
-    start_tclone_agent_session(&podman, &source_container, &container_agent_cmd)?;
+    start_tclone_agent_session(
+        &podman,
+        &source_container,
+        &container_agent_cmd,
+        &path_prefixes,
+    )?;
     let _container_file_control = if env_flag(TCLONE_CONTAINER_HOST_CONTROL_POLL_ENV) {
         Some(TcloneContainerFileControlServer::start(
             &podman,
@@ -4516,6 +4738,7 @@ pub(crate) fn tclone_fork(args: Vec<OsString>) -> io::Result<()> {
                     container_workspace: source.container_workspace.clone(),
                     container_home: source.container_home.clone(),
                     agent_cmd: source.agent_cmd.clone(),
+                    path_prefixes: source.path_prefixes.clone(),
                     fork_base_git_head: fork_base_git_head.clone(),
                     fork_base_overlay_lowerdir: overlay_layers
                         .as_ref()
@@ -5651,7 +5874,7 @@ pub(crate) fn tclone_run_exec(args: Vec<OsString>) -> io::Result<()> {
         .arg(&record.container_workspace)
         .args(tclone_run_exec_env_args(&record))
         .arg(&record.container_name)
-        .args(command_args);
+        .args(tclone_run_exec_command_args(&record, command_args));
     if exec_json {
         let output = command.output()?;
         println!(
@@ -5771,6 +5994,23 @@ fn tclone_run_exec_env_args(record: &TcloneRunRecord) -> Vec<OsString> {
         ]
     })
     .collect()
+}
+
+fn tclone_run_exec_command_args(
+    record: &TcloneRunRecord,
+    command_args: &[OsString],
+) -> Vec<OsString> {
+    let mut wrapped = vec![
+        OsString::from("sh"),
+        OsString::from("-c"),
+        OsString::from(format!(
+            "{}; exec \"$@\"",
+            tclone_path_export(&record.path_prefixes)
+        )),
+        OsString::from("gensee-run-exec"),
+    ];
+    wrapped.extend_from_slice(command_args);
+    wrapped
 }
 
 fn tclone_run_context_payload(record: &TcloneRunRecord, capability: &str) -> Value {
@@ -10074,7 +10314,7 @@ fn find_tclone_record(target: &str) -> io::Result<TcloneRunRecord> {
         })
 }
 
-fn tclone_state_path() -> io::Result<PathBuf> {
+pub(crate) fn tclone_state_path() -> io::Result<PathBuf> {
     Ok(default_root()?.join("tclone-runs.jsonl"))
 }
 
@@ -10168,21 +10408,30 @@ fn detect_agent_home(agent_binary: &str) -> Option<(String, PathBuf, String)> {
     }
 }
 
-fn tclone_agent_start_script(agent_cmd: &[OsString]) -> String {
+fn tclone_agent_start_script(agent_cmd: &[OsString], path_prefixes: &[String]) -> String {
     let command = shell_join(agent_cmd);
+    let path_export = tclone_path_export(path_prefixes);
+    let pane_command = format!("{path_export}; exec {command}");
     format!(
-        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\nagent_pid=$!\nsleep 2\nif ! kill -0 \"$agent_pid\" 2>/dev/null; then\n  printf 'gensee agent exited during startup\\n' >> \"$log\"\n  cat \"$log\" >&2\n  exit 127\nfi\nprintf 'gensee agent started without tmux pid=%s\\n' \"$agent_pid\" >> \"$log\"\n",
+        "set -e\nexport TERM=\"${{TERM:-xterm-256color}}\"\n{path_export}\nlog=/tmp/gensee-agent-start.log\nif command -v tmux >/dev/null 2>&1; then\n  printf 'starting tmux session %s: %s\\n' {} {} > \"$log\"\n  tmux new-session -d -s {} >> \"$log\" 2>&1\n  tmux set-option -t {} remain-on-exit on >> \"$log\" 2>&1\n  tmux send-keys -t {} -- {} C-m >> \"$log\" 2>&1\n  sleep 2\n  if ! tmux has-session -t {} 2>> \"$log\"; then\n    printf 'gensee agent tmux session disappeared during startup\\n' >> \"$log\"\n    cat \"$log\" >&2\n    exit 127\n  fi\n  if tmux list-panes -t {} -F '#{{pane_dead}}' 2>> \"$log\" | grep -q '^1$'; then\n    printf 'gensee agent exited during startup; pane follows\\n' >> \"$log\"\n    tmux capture-pane -pt {} >> \"$log\" 2>&1 || true\n    cat \"$log\" >&2\n    exit 127\n  fi\n  exit 0\nfi\nprintf 'tmux not found; starting agent directly in background: %s\\n' {} > \"$log\"\nsh -lc {} >> \"$log\" 2>&1 &\nagent_pid=$!\nsleep 2\nif ! kill -0 \"$agent_pid\" 2>/dev/null; then\n  printf 'gensee agent exited during startup\\n' >> \"$log\"\n  cat \"$log\" >&2\n  exit 127\nfi\nprintf 'gensee agent started without tmux pid=%s\\n' \"$agent_pid\" >> \"$log\" 2>&1\n",
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
-        shell_quote(&format!("exec {command}")),
+        shell_quote(&pane_command),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(TCLONE_AGENT_TMUX_SESSION),
         shell_quote(&command),
-        shell_quote(&format!("exec {command}"))
+        shell_quote(&pane_command)
+    )
+}
+
+fn tclone_path_export(toolchain_paths: &[String]) -> String {
+    format!(
+        "export PATH={}:\"${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}\"",
+        shell_quote(&tclone_container_path_prefix(toolchain_paths))
     )
 }
 
@@ -10190,8 +10439,9 @@ fn start_tclone_agent_session(
     podman: &OsString,
     container_name: &str,
     agent_cmd: &[OsString],
+    path_prefixes: &[String],
 ) -> io::Result<()> {
-    let script = tclone_agent_start_script(agent_cmd);
+    let script = tclone_agent_start_script(agent_cmd, path_prefixes);
     let status = Command::new(podman)
         .arg("exec")
         .arg(container_name)
@@ -10222,14 +10472,9 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn tclone_container_path(toolchain_paths: &[String]) -> String {
-    let mut entries = vec!["/usr/local/sbin".to_string(), "/usr/local/bin".to_string()];
+fn tclone_container_path_prefix(toolchain_paths: &[String]) -> String {
+    let mut entries = vec!["/usr/libexec".to_string()];
     entries.extend(toolchain_paths.iter().cloned());
-    entries.extend(
-        ["/usr/sbin", "/usr/bin", "/sbin", "/bin"]
-            .into_iter()
-            .map(str::to_string),
-    );
     entries.join(":")
 }
 
@@ -10341,7 +10586,7 @@ fn rewrite_tclone_codex_hooks(
     };
 
     let gensee_home = PathBuf::from(format!("{container_home}/.gensee"));
-    let command = codex_hook_command(&gensee_home, Path::new("/usr/local/bin/gensee"));
+    let command = codex_hook_command(&gensee_home, Path::new(TCLONE_CONTAINER_GENSEE_PATH));
     apply_codex_hook_settings(&mut root, &command)?;
 
     if let Some(parent) = hooks_path.parent() {
@@ -10380,7 +10625,7 @@ fn install_tclone_host_path_compatibility(
                 ),
             )
         })?)?;
-        symlink_or_copy_marker("/usr/local/bin/gensee", &seed_gensee)?;
+        symlink_or_copy_marker(TCLONE_CONTAINER_GENSEE_PATH, &seed_gensee)?;
     }
     Ok(())
 }
@@ -10984,6 +11229,7 @@ mod tests {
             container_workspace: "/workspace".to_string(),
             container_home: "/home/gensee".to_string(),
             agent_cmd: vec!["codex".to_string()],
+            path_prefixes: Vec::new(),
             fork_base_git_head: None,
             fork_base_overlay_lowerdir: None,
             fork_overlay_upperdir: None,
@@ -12183,6 +12429,52 @@ mod tests {
     }
 
     #[test]
+    fn tclone_identity_checks_do_not_consume_or_scan_nonce_claims() {
+        let _guard = tclone_test_env_lock();
+        let run_id = format!(
+            "identity_nonce_test_{}_{}",
+            std::process::id(),
+            unix_millis().unwrap()
+        );
+        let root = gensee_tmp_root().unwrap().join(&run_id);
+        let capability = rotate_tclone_host_control_capability(&run_id).unwrap();
+        let request = signed_host_control_request(
+            &run_id,
+            &capability,
+            "reusable-identity-proof",
+            vec!["run".to_string(), "identity".to_string()],
+        );
+
+        validate_tclone_host_control_request(&request).unwrap();
+        validate_tclone_host_control_request(&request).unwrap();
+
+        let extra_argument = signed_host_control_request(
+            &run_id,
+            &capability,
+            "identity-with-extra-argument",
+            vec![
+                "run".to_string(),
+                "identity".to_string(),
+                "unexpected".to_string(),
+            ],
+        );
+        assert_eq!(
+            validate_tclone_host_control_request(&extra_argument)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let nonces_dir = tclone_host_control_capability_path(&run_id)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("nonces");
+        assert!(!nonces_dir.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn tclone_host_control_signed_fork_send_status_flow_enforces_authority() {
         let _guard = tclone_test_env_lock();
         let unique = format!("{}_{}", std::process::id(), unix_millis().unwrap());
@@ -12445,58 +12737,282 @@ mod tests {
     }
 
     #[test]
-    fn tclone_run_context_honors_override_path() {
+    fn inherited_run_id_cannot_be_overridden_by_agent_writable_context() {
         let _guard = tclone_test_env_lock();
         let root = temp_tree("run-context-override");
         let context_path = root.join("context.json");
-        fs::write(&context_path, r#"{"run_id":"override-run"}"#).unwrap();
+        fs::write(
+            &context_path,
+            r#"{"run_id":"override-run","role":"source"}"#,
+        )
+        .unwrap();
         let old_context = env::var_os("GENSEE_TCLONE_CONTEXT_PATH");
+        let old_run_id = env::var_os("GENSEE_RUN_ID");
+        let old_agent_session_id = env::var_os("AGENT_SHIELD_SESSION_ID");
         env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+        env::set_var("GENSEE_RUN_ID", "stale-source-run");
+        env::set_var("AGENT_SHIELD_SESSION_ID", "stale-source-run");
 
         assert_eq!(read_tclone_run_context().unwrap()["run_id"], "override-run");
+        assert_eq!(current_tclone_context_run_id(), None);
+        let hook = build_unattributed_hook_event(
+            r#"{"session_id":"agent-session","hook_event_name":"PreToolUse"}"#,
+            PROVIDER_CODEX,
+        )
+        .unwrap();
+        assert_eq!(hook.session_id.as_deref(), Some("agent-session"));
+        assert!(
+            serde_json::from_str::<Value>(&hook.raw_json).unwrap()["gensee"]["run_id"].is_null()
+        );
+        let unparseable = build_unattributed_hook_event("not-json", PROVIDER_CODEX).unwrap();
+        assert_eq!(unparseable.session_id, None);
 
         match old_context {
             Some(value) => env::set_var("GENSEE_TCLONE_CONTEXT_PATH", value),
             None => env::remove_var("GENSEE_TCLONE_CONTEXT_PATH"),
+        }
+        match old_run_id {
+            Some(value) => env::set_var("GENSEE_RUN_ID", value),
+            None => env::remove_var("GENSEE_RUN_ID"),
+        }
+        match old_agent_session_id {
+            Some(value) => env::set_var("AGENT_SHIELD_SESSION_ID", value),
+            None => env::remove_var("AGENT_SHIELD_SESSION_ID"),
         }
         fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn tclone_context_identity_requires_a_valid_role_and_safe_run_id() {
+    fn context_run_id_requires_host_mediation_even_when_local_registry_matches() {
         let _guard = tclone_test_env_lock();
-        let root = temp_tree("run-context-identity");
+        let root = temp_tree("run-context-capability");
         let context_path = root.join("context.json");
+        let old_home = env::var_os("GENSEE_HOME");
         let old_context = env::var_os("GENSEE_TCLONE_CONTEXT_PATH");
+        let old_run_id = env::var_os("GENSEE_RUN_ID");
+        env::set_var("GENSEE_HOME", &root);
         env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+        env::remove_var("GENSEE_RUN_ID");
+
+        let run_id = "authenticated-source-run";
+        let capability = rotate_tclone_host_control_capability(run_id).unwrap();
+        fs::write(
+            &context_path,
+            json!({
+                "run_id": run_id,
+                "role": "source",
+                "host_control_capability": &capability,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(current_tclone_context_run_id().is_none());
 
         fs::write(
             &context_path,
-            r#"{"run_id":"run_source_fork_1_0","role":"fork"}"#,
+            json!({
+                "run_id": "forged-source-run",
+                "role": "source",
+                "host_control_capability": &capability,
+            })
+            .to_string(),
         )
         .unwrap();
-        assert_eq!(
-            current_tclone_context_run_id().as_deref(),
-            Some("run_source_fork_1_0")
-        );
-        fs::write(&context_path, r#"{"run_id":"../../source","role":"fork"}"#).unwrap();
         assert!(current_tclone_context_run_id().is_none());
-        fs::write(&context_path, r#"{"run_id":"run_source","role":"unknown"}"#).unwrap();
-        assert!(current_tclone_context_run_id().is_none());
+
+        match old_home {
+            Some(value) => env::set_var("GENSEE_HOME", value),
+            None => env::remove_var("GENSEE_HOME"),
+        }
+        match old_context {
+            Some(value) => env::set_var("GENSEE_TCLONE_CONTEXT_PATH", value),
+            None => env::remove_var("GENSEE_TCLONE_CONTEXT_PATH"),
+        }
+        match old_run_id {
+            Some(value) => env::set_var("GENSEE_RUN_ID", value),
+            None => env::remove_var("GENSEE_RUN_ID"),
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fork_context_authenticates_through_the_host_observer_mount() {
+        let _guard = tclone_test_env_lock();
+        let root = env::temp_dir().join(format!(
+            "gto-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let context_path = root.join("context.json");
+        let observer_socket = root.join("observer.sock");
+        let missing_socket = root.join("missing-observer.sock");
+        let old_context = env::var_os("GENSEE_TCLONE_CONTEXT_PATH");
+        let old_run_id = env::var_os("GENSEE_RUN_ID");
+        let old_observer = env::var_os(TCLONE_HOST_OBSERVER_SOCKET_ENV);
+        let source_run_id = "observer-source-run";
+        let fork_run_id = "observer-source-run_fork_1_0";
+        let capability = rotate_tclone_host_control_capability(fork_run_id).unwrap();
         fs::write(
             &context_path,
-            r#"{"run_id":"run_source_fork_1_0","role":"source"}"#,
+            json!({
+                "run_id": fork_run_id,
+                "role": "fork",
+                "host_control_capability": &capability,
+            })
+            .to_string(),
         )
         .unwrap();
+        env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+        env::set_var("GENSEE_RUN_ID", source_run_id);
+
+        // When the configured host boundary is unavailable, do not fall back
+        // to a same-filesystem capability lookup that cannot exist in a live cell.
+        env::set_var(TCLONE_HOST_OBSERVER_SOCKET_ENV, &missing_socket);
         assert!(current_tclone_context_run_id().is_none());
-        fs::write(&context_path, r#"{"run_id":"run_source","role":"fork"}"#).unwrap();
-        assert!(current_tclone_context_run_id().is_none());
+
+        let listener = std::os::unix::net::UnixListener::bind(&observer_socket).unwrap();
+        let expected_capability = capability.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            let request = serde_json::from_str::<Value>(&request).unwrap();
+            assert_eq!(
+                request.get("operation").and_then(Value::as_str),
+                Some(crate::daemon::AUTHENTICATE_TCLONE_CONTEXT)
+            );
+            assert_eq!(
+                request.pointer("/input/run_id").and_then(Value::as_str),
+                Some(fork_run_id)
+            );
+            assert_eq!(
+                request.pointer("/input/capability").and_then(Value::as_str),
+                Some(expected_capability.as_str())
+            );
+            stream
+                .write_all(
+                    json!({"gensee_daemon_protocol": 1, "ok": true})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+        });
+        env::set_var(TCLONE_HOST_OBSERVER_SOCKET_ENV, &observer_socket);
+        assert_eq!(
+            current_tclone_context_run_id().as_deref(),
+            Some(fork_run_id)
+        );
+        server.join().unwrap();
+        env::set_var(TCLONE_HOST_OBSERVER_SOCKET_ENV, &missing_socket);
+        assert_eq!(
+            cached_authenticated_tclone_context_run_id().as_deref(),
+            Some(fork_run_id)
+        );
+        assert_eq!(
+            current_tclone_context_run_id().as_deref(),
+            Some(fork_run_id)
+        );
 
         match old_context {
             Some(value) => env::set_var("GENSEE_TCLONE_CONTEXT_PATH", value),
             None => env::remove_var("GENSEE_TCLONE_CONTEXT_PATH"),
         }
+        match old_run_id {
+            Some(value) => env::set_var("GENSEE_RUN_ID", value),
+            None => env::remove_var("GENSEE_RUN_ID"),
+        }
+        match old_observer {
+            Some(value) => env::set_var(TCLONE_HOST_OBSERVER_SOCKET_ENV, value),
+            None => env::remove_var(TCLONE_HOST_OBSERVER_SOCKET_ENV),
+        }
+        fs::remove_dir_all(gensee_tmp_root().unwrap().join(fork_run_id)).ok();
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fork_context_authenticates_through_host_control_without_a_daemon() {
+        let _guard = tclone_test_env_lock();
+        let root = env::temp_dir().join(format!(
+            "gtc-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap()
+        ));
+        let context_path = root.join("context.json");
+        let control_dir = root.join("control");
+        let control_socket = control_dir.join("control.sock");
+        fs::create_dir_all(&root).unwrap();
+        let old_context = env::var_os("GENSEE_TCLONE_CONTEXT_PATH");
+        let old_run_id = env::var_os("GENSEE_RUN_ID");
+        let old_observer = env::var_os(TCLONE_HOST_OBSERVER_SOCKET_ENV);
+        let old_control_socket = env::var_os(TCLONE_HOST_CONTROL_SOCKET_ENV);
+        let source_run_id = "control-source-run";
+        let fork_run_id = "control-source-run_fork_1_0";
+        let capability = rotate_tclone_host_control_capability(fork_run_id).unwrap();
+        fs::write(
+            &context_path,
+            json!({
+                "run_id": fork_run_id,
+                "role": "fork",
+                "host_control_capability": &capability,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let server = TcloneHostControlServer::start(&control_socket, &control_dir).unwrap();
+        env::set_var("GENSEE_TCLONE_CONTEXT_PATH", &context_path);
+        env::set_var("GENSEE_RUN_ID", source_run_id);
+        env::remove_var(TCLONE_HOST_OBSERVER_SOCKET_ENV);
+        env::set_var(TCLONE_HOST_CONTROL_SOCKET_ENV, &control_socket);
+
+        assert_eq!(
+            current_tclone_context_run_id().as_deref(),
+            Some(fork_run_id)
+        );
+
+        match old_context {
+            Some(value) => env::set_var("GENSEE_TCLONE_CONTEXT_PATH", value),
+            None => env::remove_var("GENSEE_TCLONE_CONTEXT_PATH"),
+        }
+        match old_run_id {
+            Some(value) => env::set_var("GENSEE_RUN_ID", value),
+            None => env::remove_var("GENSEE_RUN_ID"),
+        }
+        match old_observer {
+            Some(value) => env::set_var(TCLONE_HOST_OBSERVER_SOCKET_ENV, value),
+            None => env::remove_var(TCLONE_HOST_OBSERVER_SOCKET_ENV),
+        }
+        match old_control_socket {
+            Some(value) => env::set_var(TCLONE_HOST_CONTROL_SOCKET_ENV, value),
+            None => env::remove_var(TCLONE_HOST_CONTROL_SOCKET_ENV),
+        }
+        drop(server);
+        fs::remove_dir_all(gensee_tmp_root().unwrap().join(fork_run_id)).ok();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tclone_context_identity_requires_a_valid_role_and_safe_run_id() {
+        assert_eq!(
+            tclone_context_run_id(&json!({
+                "run_id": "run_source_fork_1_0",
+                "role": "fork",
+            }))
+            .as_deref(),
+            Some("run_source_fork_1_0")
+        );
+        assert!(
+            tclone_context_run_id(&json!({"run_id": "../../source", "role": "fork"})).is_none()
+        );
+        assert!(
+            tclone_context_run_id(&json!({"run_id": "run_source", "role": "unknown"})).is_none()
+        );
+        assert!(tclone_context_run_id(&json!({
+            "run_id": "run_source_fork_1_0",
+            "role": "source",
+        }))
+        .is_none());
+        assert!(tclone_context_run_id(&json!({"run_id": "run_source", "role": "fork"})).is_none());
     }
 
     #[test]
@@ -12601,7 +13117,7 @@ mod tests {
         let process = TcloneQuietProcess {
             pid: 11,
             stat: "Ssl+".to_string(),
-            command: "node /home/yiying/.nvm/versions/node/v24.18.0/bin/codex".to_string(),
+            command: "node /home/developer/.nvm/versions/node/v24.18.0/bin/codex".to_string(),
         };
 
         assert!(!tclone_is_transient_fork_process(&process));
@@ -12612,12 +13128,12 @@ mod tests {
         let hook = TcloneQuietProcess {
             pid: 2171,
             stat: "S".to_string(),
-            command: "/usr/local/bin/gensee hook codex".to_string(),
+            command: format!("{TCLONE_CONTAINER_GENSEE_PATH} hook codex"),
         };
         let status = TcloneQuietProcess {
             pid: 2172,
             stat: "S".to_string(),
-            command: "/usr/local/bin/gensee run fork-status job_1 --json".to_string(),
+            command: format!("{TCLONE_CONTAINER_GENSEE_PATH} run fork-status job_1 --json"),
         };
 
         assert!(!tclone_is_transient_fork_process(&hook));
@@ -13344,6 +13860,7 @@ gensee async job job_1: exited status=0
             "switch",
             "discard",
             "lifecycle-ack",
+            "identity",
         ] {
             assert!(tclone_host_control_should_proxy(&[
                 OsString::from("run"),
@@ -13480,6 +13997,13 @@ gensee async job job_1: exited status=0
         assert_eq!(
             tclone_host_control_file_timeout_secs_for_request(&list_request),
             TCLONE_HOST_CONTROL_FILE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            tclone_host_control_file_timeout_secs_for_request(&TcloneHostControlRequest {
+                args: vec!["run".to_string(), "identity".to_string()],
+                ..list_request.clone()
+            }),
+            TCLONE_CONTEXT_AUTH_CONTROL_TIMEOUT_SECS
         );
         assert_eq!(
             tclone_host_control_file_timeout_secs_for_request(&TcloneHostControlRequest {
@@ -13742,6 +14266,34 @@ gensee async job job_1: exited status=0
         assert!(env_args.contains(&OsString::from("GENSEE_RUN_ID=run_1_fork_0")));
         assert!(env_args.contains(&OsString::from("AGENT_SHIELD_SESSION_ID=run_1_fork_0")));
         assert!(env_args.contains(&OsString::from("GENSEE_WORKSPACE=/workspace")));
+        assert!(!env_args
+            .iter()
+            .any(|arg| { arg.to_str().is_some_and(|value| value.starts_with("PATH=")) }));
+    }
+
+    #[test]
+    fn tclone_run_exec_prepends_gensee_without_clobbering_image_path() {
+        let mut record = test_record("run_1", "running");
+        record.path_prefixes = vec![
+            "/opt/host-node/bin".to_string(),
+            "/opt/host-cargo/bin".to_string(),
+        ];
+        let command_args = vec![
+            OsString::from("gensee"),
+            OsString::from("run"),
+            OsString::from("summary"),
+        ];
+
+        let wrapped = tclone_run_exec_command_args(&record, &command_args);
+
+        assert_eq!(wrapped[0], "sh");
+        assert_eq!(wrapped[1], "-c");
+        let script = wrapped[2].to_string_lossy();
+        assert!(script.contains(
+            "export PATH='/usr/libexec:/opt/host-node/bin:/opt/host-cargo/bin':\"${PATH:-"
+        ));
+        assert!(script.contains("exec \"$@\""));
+        assert_eq!(&wrapped[4..], command_args.as_slice());
     }
 
     #[test]
@@ -14081,17 +14633,23 @@ gensee async job job_1: exited status=0
 
     #[test]
     fn tclone_agent_start_script_wraps_command_in_tmux_when_available() {
-        let script = tclone_agent_start_script(&[
-            OsString::from("codex"),
-            OsString::from("--prompt"),
-            OsString::from("don't panic"),
-        ]);
+        let script = tclone_agent_start_script(
+            &[
+                OsString::from("codex"),
+                OsString::from("--prompt"),
+                OsString::from("don't panic"),
+            ],
+            &["/opt/host-node/bin".to_string()],
+        );
 
         assert!(script.contains("tmux new-session -d -s 'gensee-agent'"));
         assert!(script.contains("codex"));
         assert!(script.contains("--prompt"));
         assert!(script.contains("don"));
         assert!(script.contains("panic"));
+        assert!(script
+            .contains("export PATH='/usr/libexec:/opt/host-node/bin':\"${PATH:-/usr/local/sbin"));
+        assert!(script.matches("/usr/libexec:/opt/host-node/bin").count() >= 2);
         assert!(script.contains("exit 0"));
         assert!(!script.contains("exec sleep infinity"));
         assert!(!script.contains("while :; do"));
@@ -14099,19 +14657,23 @@ gensee async job job_1: exited status=0
 
     #[test]
     fn tclone_container_path_prefers_container_local_gensee() {
-        let path = tclone_container_path(&[
-            "/home/yiying/.nvm/versions/node/v24.18.0/bin".to_string(),
-            "/home/yiying/.cargo/bin".to_string(),
+        let path = tclone_container_path_prefix(&[
+            "/home/developer/.nvm/versions/node/v24.18.0/bin".to_string(),
+            "/home/developer/.cargo/bin".to_string(),
         ]);
         let entries = path.split(':').collect::<Vec<_>>();
 
-        assert_eq!(entries[0], "/usr/local/sbin");
-        assert_eq!(entries[1], "/usr/local/bin");
+        assert_eq!(entries[0], "/usr/libexec");
+        assert_eq!(
+            entries[1],
+            "/home/developer/.nvm/versions/node/v24.18.0/bin"
+        );
+        assert_eq!(entries[2], "/home/developer/.cargo/bin");
         assert!(
-            entries.iter().position(|entry| *entry == "/usr/local/bin")
+            entries.iter().position(|entry| *entry == "/usr/libexec")
                 < entries
                     .iter()
-                    .position(|entry| *entry == "/home/yiying/.cargo/bin")
+                    .position(|entry| *entry == "/home/developer/.cargo/bin")
         );
     }
 
@@ -14190,14 +14752,14 @@ gensee async job job_1: exited status=0
         let root = temp_tree("compat-links");
         let seed = root.join("seed");
         let workspace = root.join("workspace");
-        let host_home = root.join("host-home/yiying/.codex");
-        let gensee_home = root.join("host-home/yiying/.gensee");
+        let host_home = root.join("host-home/developer/.codex");
+        let gensee_home = root.join("host-home/developer/.gensee");
         fs::create_dir_all(&workspace).unwrap();
         fs::write(workspace.join("README.md"), "demo").unwrap();
         fs::create_dir_all(&host_home).unwrap();
         fs::write(
             host_home.join("hooks.json"),
-            r#"{"hooks":{"UserPromptSubmit":[{"matcher":"*","hooks":[{"type":"command","command":"GENSEE_HOME=/home/yiying/.gensee /home/yiying/.cargo/bin/gensee hook codex"}]}]}}"#,
+            r#"{"hooks":{"UserPromptSubmit":[{"matcher":"*","hooks":[{"type":"command","command":"GENSEE_HOME=/home/developer/.gensee /home/developer/.cargo/bin/gensee hook codex"}]}]}}"#,
         )
         .unwrap();
         fs::create_dir_all(&gensee_home).unwrap();
@@ -14219,8 +14781,10 @@ gensee async job job_1: exited status=0
 
         assert!(seed.join("home/gensee/.codex/hooks.json").exists());
         let hooks = fs::read_to_string(seed.join("home/gensee/.codex/hooks.json")).unwrap();
-        assert!(hooks.contains("GENSEE_HOME=/home/gensee/.gensee /usr/local/bin/gensee hook codex"));
-        assert!(!hooks.contains("/home/yiying/.cargo/bin/gensee hook codex"));
+        assert!(hooks.contains(&format!(
+            "GENSEE_HOME=/home/gensee/.gensee {TCLONE_CONTAINER_GENSEE_PATH} hook codex"
+        )));
+        assert!(!hooks.contains("/home/developer/.cargo/bin/gensee hook codex"));
         assert_eq!(
             fs::read_link(seed.join(host_home.strip_prefix("/").unwrap())).unwrap(),
             PathBuf::from("/home/gensee/.codex")
@@ -14237,7 +14801,7 @@ gensee async job job_1: exited status=0
                 )
             )
             .unwrap(),
-            PathBuf::from("/usr/local/bin/gensee")
+            PathBuf::from(TCLONE_CONTAINER_GENSEE_PATH)
         );
         assert_eq!(
             fs::read_link(seed.join(gensee_home.strip_prefix("/").unwrap())).unwrap(),
@@ -14252,7 +14816,7 @@ gensee async job job_1: exited status=0
         let root = temp_tree("antigravity-home");
         let seed = root.join("seed");
         let workspace = root.join("workspace");
-        let gemini_home = root.join("host-home/yiying/.gemini");
+        let gemini_home = root.join("host-home/developer/.gemini");
         fs::create_dir_all(&workspace).unwrap();
         fs::write(workspace.join("README.md"), "demo").unwrap();
         fs::create_dir_all(gemini_home.join("config")).unwrap();
@@ -14698,5 +15262,24 @@ gensee async job job_1: exited status=0
         drop(lock);
         assert!(!lock_path.exists());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn managed_run_proof_does_not_populate_tclone_capability_cache() {
+        clear_cached_authenticated_tclone_context();
+        clear_cached_authenticated_managed_run();
+
+        cache_authenticated_managed_run("managed-run-1");
+
+        assert_eq!(
+            cached_authenticated_managed_run_id().as_deref(),
+            Some("managed-run-1")
+        );
+        assert!(cached_authenticated_tclone_context_run_id().is_none());
+        assert!(!tclone_context_authentication_is_cached(
+            "managed-run-1",
+            "daemon-peer-process-lineage"
+        ));
+        clear_cached_authenticated_managed_run();
     }
 }
