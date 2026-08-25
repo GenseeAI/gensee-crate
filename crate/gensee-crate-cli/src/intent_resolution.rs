@@ -32,6 +32,7 @@ pub(crate) struct ResolvedAdmission {
     pub inference_digest: String,
     pub contract: OperationContract,
     pub canonical_executable: PathBuf,
+    pub executable_sha256: String,
 }
 
 pub(crate) fn handle_intent_resolution(args: &[OsString]) -> io::Result<()> {
@@ -196,6 +197,7 @@ pub(crate) fn verify_and_resolve(
         observation_digest,
         inference_digest: digest_bytes(&inference_bytes),
         contract,
+        executable_sha256: observation.caller.executable_sha256.clone(),
         canonical_executable: normalized.canonical_executable,
     })
 }

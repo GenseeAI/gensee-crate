@@ -34,7 +34,9 @@ gensee boundary catalog verify \
 
 Signing is an administrative operation. Production admission should read only
 signed catalogs from a root-controlled location and pin the trusted public
-key. The next admission stage observes the caller and command, verifies an
+key. `gensee boundary run` pins that key at
+`/etc/gensee/catalog-root-public-key.hex` and does not expose a key-selection
+argument to the workload. The next admission stage observes the caller and command, verifies an
 approved analyzer statement, and selects a catalog mapping. The analyzer can
 nominate an operation class; it cannot provide a contract identifier or add a
 capability.

@@ -39,13 +39,17 @@ gensee boundary audit \
 
 sudo gensee boundary run \
   --catalog /etc/gensee/catalog.signed.json \
-  --trusted-key /etc/gensee/organization-public.hex \
   --observation /run/gensee/observation.json \
   --inference /run/gensee/inference.signed.json \
   --workspace /path/to/workspace \
   --manifest /tmp/gensee-effect-manifest.json \
   -- sh -c 'mkdir -p out && printf "{\\"ok\\":true}\\n" > out/result.json'
 ```
+
+The enforcing runtime does not accept a caller-selected catalog key. Operators
+provision the root-owned, owner-only trust anchor at
+`/etc/gensee/catalog-root-public-key.hex`; only administrative catalog
+inspection commands accept an explicit `--trusted-key`.
 
 Linux cgroup/nftables enforcement requires root. macOS supports only
 `network.mode: deny_all` in v1; exact endpoint envelopes fail admission rather
