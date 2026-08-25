@@ -138,6 +138,7 @@ pub struct SignedContractCatalog {
 
 pub const INTENT_OBSERVATION_SCHEMA_VERSION: u32 = 1;
 pub const INTENT_INFERENCE_SCHEMA_VERSION: u32 = 1;
+pub const INTENT_MODEL_SCHEMA_VERSION: u32 = 1;
 
 /// Facts presented to an approved probabilistic analyzer. Runtime caller and
 /// command facts are re-derived by the admission process before execution;
@@ -176,6 +177,33 @@ pub struct TrajectoryEvidence {
     pub trust_domain: String,
     pub started_at_ms: u64,
     pub finished_at_ms: u64,
+    /// Bounded, non-secret behavioral labels produced by trusted telemetry
+    /// normalization. The analyzer consumes labels, never raw transcript text.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+/// A portable scored-feature analyzer. Organizations can replace this with a
+/// learned service, but this built-in model makes intent discovery runnable
+/// without placing authorization policy in the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentAnalysisModel {
+    pub schema_version: u32,
+    pub analyzer_id: String,
+    pub model_identity: String,
+    pub classes: Vec<IntentClassModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentClassModel {
+    pub operation_class: String,
+    /// Base score in milli-units. Scores are converted to normalized
+    /// probabilities only after all bounded feature weights are applied.
+    pub intercept: i32,
+    #[serde(default)]
+    pub weights: std::collections::BTreeMap<String, i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,6 +661,11 @@ impl IntentObservation {
                 || !valid_sha256(&evidence.digest)
                 || evidence.started_at_ms > evidence.finished_at_ms
                 || evidence.finished_at_ms > self.observed_at_ms
+                || evidence.features.len() > 128
+                || evidence
+                    .features
+                    .iter()
+                    .any(|feature| !bounded_token(feature))
             {
                 return Err("trajectory evidence is malformed or duplicated".to_string());
             }
@@ -829,6 +862,7 @@ mod tests {
                 trust_domain: "host_observer".into(),
                 started_at_ms: 1,
                 finished_at_ms: 90,
+                features: vec!["prior_network_effect".into()],
             }],
             history_complete: true,
         }
