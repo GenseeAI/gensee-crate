@@ -55,11 +55,13 @@ done
 grep -q 'listening:18080' "$RUNTIME_ROOT/server.log"
 grep -q 'listening:18081' "$RUNTIME_ROOT/server.log"
 
-cargo build -p gensee-crate-cli
-GENSEE="$REPOSITORY_ROOT/target/debug/gensee"
-if [[ ! -x "$GENSEE" ]]; then
-  GENSEE="$REPOSITORY_ROOT/target/debug/gensee-crate-cli"
+if [[ -n "${GENSEE_BINARY:-}" ]]; then
+  GENSEE="$GENSEE_BINARY"
+else
+  cargo build -p gensee-crate-cli
+  GENSEE="$REPOSITORY_ROOT/target/debug/gensee"
 fi
+[[ -x "$GENSEE" ]]
 
 openssl rand -hex 32 >"$RUNTIME_ROOT/organization.seed"
 openssl rand -hex 32 >"$RUNTIME_ROOT/analyzer.seed"
