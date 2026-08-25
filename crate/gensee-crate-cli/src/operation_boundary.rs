@@ -42,6 +42,7 @@ struct ProductEntry {
 pub(crate) fn handle_operation_boundary(args: Vec<OsString>) -> io::Result<()> {
     let (subcommand, rest) = args.split_first().ok_or_else(boundary_usage_error)?;
     match subcommand.to_str() {
+        Some("catalog") => handle_contract_catalog(rest),
         Some("validate") => boundary_validate(rest),
         Some("audit") => boundary_audit(rest),
         Some("run") => boundary_run(BoundaryRunConfig::parse(rest)?),
@@ -1093,13 +1094,13 @@ fn reject_unknown_options(args: &[OsString], valued: &[&str], flags: &[&str]) ->
 fn boundary_usage_error() -> io::Error {
     io::Error::new(
         ErrorKind::InvalidInput,
-        "usage: gensee boundary <validate|audit|run> --contract <contract.json> [--workspace <dir>] [--manifest <manifest.json>] [--json] [-- <command> ...]",
+        "usage: gensee boundary <catalog|validate|audit|run> ...",
     )
 }
 
 fn print_boundary_usage() {
     println!(
-        "gensee boundary\n\nUSAGE:\n  gensee boundary validate --contract <contract.json> [--json]\n  gensee boundary audit --contract <contract.json> [--json]\n  sudo gensee boundary run --contract <contract.json> [--workspace <dir>] [--manifest <manifest.json>] -- <command> [args...]"
+        "gensee boundary\n\nUSAGE:\n  gensee boundary catalog sign --catalog <catalog.json> --key <seed.hex> --key-id <id> --output <signed.json>\n  gensee boundary catalog verify --catalog <signed.json> --trusted-key <public.hex> [--json]\n  gensee boundary validate --contract <contract.json> [--json]\n  gensee boundary audit --contract <contract.json> [--json]\n  sudo gensee boundary run --contract <contract.json> [--workspace <dir>] [--manifest <manifest.json>] -- <command> [args...]"
     );
 }
 
