@@ -241,7 +241,7 @@ cp "$RUNTIME_ROOT/verifier-request.json" "$BUNDLE/verifier-request.json"
 cp "$RUNTIME_ROOT/verifier-receipt.json" "$BUNDLE/verifier-receipt.json"
 cp "$RUNTIME_ROOT/promotion-receipt.json" "$BUNDLE/promotion-receipt.json"
 ACTIVE_TARGET="$(readlink "$RUNTIME_ROOT/promoted/current")"
-cp "$RUNTIME_ROOT/promoted/$ACTIVE_TARGET" "$BUNDLE/promoted-workspace/out/result.json"
+cp -p "$RUNTIME_ROOT/promoted/$ACTIVE_TARGET" "$BUNDLE/promoted-workspace/out/result.json"
 
 "$GENSEE" boundary proof sign --bundle "$BUNDLE" --key "$RUNTIME_ROOT/proof.seed"
 "$GENSEE" boundary proof verify \
