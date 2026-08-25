@@ -4,7 +4,7 @@
   "operation_class": "structured_data_transform",
   "execution": {
     "max_runtime_seconds": 60,
-    "require_kernel_identity": true
+    "require_os_execution_binding": true
   },
   "capabilities": {
     "network": {

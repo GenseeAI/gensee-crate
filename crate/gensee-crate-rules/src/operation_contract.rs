@@ -2,7 +2,7 @@
 //!
 //! Contracts describe authority and product shape without recognizing an
 //! application, package manager, browser, or attack signature. The runtime
-//! binds each admitted instance to kernel-observed process identity and an
+//! binds each admitted instance to an OS-observed execution subject and an
 //! effect boundary before the command starts.
 
 use serde::{Deserialize, Serialize};
@@ -32,14 +32,14 @@ pub struct ExecutionContract {
     #[serde(default = "default_max_runtime_seconds")]
     pub max_runtime_seconds: u64,
     #[serde(default = "default_true")]
-    pub require_kernel_identity: bool,
+    pub require_os_execution_binding: bool,
 }
 
 impl Default for ExecutionContract {
     fn default() -> Self {
         Self {
             max_runtime_seconds: default_max_runtime_seconds(),
-            require_kernel_identity: true,
+            require_os_execution_binding: true,
         }
     }
 }
@@ -177,8 +177,8 @@ pub struct OperationRunManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationEnforcementEvidence {
-    pub kernel_identity_bound: bool,
-    pub identity_kind: String,
+    pub os_execution_binding_established: bool,
+    pub execution_subject_kind: String,
     pub network_mode: ContractNetworkMode,
     pub network_boundary: String,
     pub network_effect_coverage: String,
@@ -257,9 +257,9 @@ impl OperationContract {
         if !(1..=86_400).contains(&self.execution.max_runtime_seconds) {
             errors.push("execution.max_runtime_seconds must be between 1 and 86400".to_string());
         }
-        if !self.execution.require_kernel_identity {
+        if !self.execution.require_os_execution_binding {
             errors.push(
-                "v1 contracts must require kernel identity; audit-only attribution is not an enforcement contract"
+                "v1 contracts must require an OS execution-subject binding; audit-only attribution is not an enforcement contract"
                     .to_string(),
             );
         }
@@ -271,7 +271,7 @@ impl OperationContract {
         let platform_supported = matches!(platform, "linux" | "macos");
         if !platform_supported {
             warnings.push(format!(
-                "kernel-bound execution is not implemented on platform {platform}"
+                "OS-bound execution enforcement is not implemented on platform {platform}"
             ));
         }
         if platform == "macos" && self.capabilities.network.mode == ContractNetworkMode::AllowExact
@@ -485,9 +485,9 @@ mod tests {
     #[test]
     fn v1_rejects_weak_identity_and_unsafe_product_switches() {
         let mut candidate = contract();
-        candidate.execution.require_kernel_identity = false;
+        candidate.execution.require_os_execution_binding = false;
         assert!(!candidate.audit_for_platform("linux").valid);
-        candidate.execution.require_kernel_identity = true;
+        candidate.execution.require_os_execution_binding = true;
         candidate.product.as_mut().unwrap().reject_symlinks = false;
         assert!(!candidate.audit_for_platform("linux").valid);
     }

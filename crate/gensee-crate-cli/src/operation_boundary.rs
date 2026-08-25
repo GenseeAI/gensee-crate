@@ -6,9 +6,8 @@ use gensee_crate_rules::network_boundary::{
 };
 use gensee_crate_rules::operation_contract::{
     ContractAudit, ContractNetworkMode, ContractNetworkProtocol, OperationContract,
-    OperationEnforcementEvidence, OperationProcessEvidence,
-    OperationPromotionEvidence, OperationRunManifest, ProductContract, StructuralProductEvidence,
-    StructuralProductType,
+    OperationEnforcementEvidence, OperationProcessEvidence, OperationPromotionEvidence,
+    OperationRunManifest, ProductContract, StructuralProductEvidence, StructuralProductType,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -169,7 +168,7 @@ fn boundary_run(config: BoundaryRunConfig) -> io::Result<()> {
         operation_envelope(&contract),
         None,
     )?;
-    if contract.execution.require_kernel_identity
+    if contract.execution.require_os_execution_binding
         && std::env::consts::OS == "linux"
         && operation.cgroup_path().is_none()
     {
@@ -220,13 +219,15 @@ fn boundary_run(config: BoundaryRunConfig) -> io::Result<()> {
     let exit_code = status.code();
     let process_group_drained = drain_operation_process_group(root_pid)?;
     let mut network_evidence = network.collect();
-    network_evidence.kernel_identity_bound = root_start_time.is_some()
+    network_evidence.os_execution_binding_established = root_start_time.is_some()
         && (std::env::consts::OS != "linux" || operation.cgroup_path().is_some());
-    if contract.execution.require_kernel_identity && !network_evidence.kernel_identity_bound {
+    if contract.execution.require_os_execution_binding
+        && !network_evidence.os_execution_binding_established
+    {
         let _ = operation.finish(exit_code, timed_out);
         return Err(io::Error::new(
             ErrorKind::PermissionDenied,
-            "required stable kernel operation identity could not be attested",
+            "required stable OS execution-subject binding could not be attested",
         ));
     }
     let allowed_packets = network_evidence
@@ -486,8 +487,8 @@ impl BoundaryNetworkGuard {
             }
         }
         OperationEnforcementEvidence {
-            kernel_identity_bound: true,
-            identity_kind: if std::env::consts::OS == "linux" {
+            os_execution_binding_established: true,
+            execution_subject_kind: if std::env::consts::OS == "linux" {
                 "pid_generation+cgroup_v2".to_string()
             } else {
                 "pid_generation+seatbelt_process_tree".to_string()

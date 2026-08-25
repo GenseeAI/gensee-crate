@@ -52,12 +52,14 @@ than silently degrading.
 ## Contract ownership
 
 Gensee defines the schema and fail-closed semantics. A platform team can
-publish reusable templates. The runtime generates the operation ID,
-PID-generation binding, cgroup identity, staged output path, deadlines, command
-digest, and effect manifest. The producer cannot choose a trusted destination.
+publish reusable templates. The runtime generates the operation ID and binds it
+to an OS execution subject: PID plus process start identity on supported hosts,
+and cgroup membership on Linux. It also generates the staged output path,
+deadlines, command digest, and effect manifest. The producer cannot choose a
+trusted destination.
 
 `allow_exact` accepts resolved IP addresses and explicit protocol/port tuples.
-Hostnames do not appear in the kernel envelope: DNS and credentialed HTTP
+Hostnames do not appear in the OS-enforced network envelope: DNS and credentialed HTTP
 belong in a trusted protocol mediator.
 
 ## Current boundary
