@@ -10,8 +10,15 @@ pub const BROKER_PROTOCOL_VERSION: u32 = 1;
 pub enum BrokerResourceKind {
     /// An opaque, mediator-bound credential for a downstream service. The
     /// credential material itself never crosses the broker boundary.
-    #[serde(alias = "repository_token", alias = "api_token")]
     ServiceCredential,
+    /// Retained wire variants keep protocol-v1 cleanup requests byte-compatible
+    /// with adapters registered before service credentials were generalized.
+    #[doc(hidden)]
+    #[serde(rename = "repository_token")]
+    LegacyServiceCredentialV1A,
+    #[doc(hidden)]
+    #[serde(rename = "api_token")]
+    LegacyServiceCredentialV1B,
     WorkloadIdentity,
     MtlsCertificate,
     FilesystemHandle,
@@ -50,8 +57,13 @@ pub enum BrokerLeaseStatus {
 #[serde(rename_all = "snake_case")]
 pub enum BrokerGatewayEffectKind {
     /// A request performed by a service mediator on behalf of the operation.
-    #[serde(alias = "repository_request", alias = "api_request")]
     ServiceRequest,
+    #[doc(hidden)]
+    #[serde(rename = "repository_request")]
+    LegacyServiceRequestV1A,
+    #[doc(hidden)]
+    #[serde(rename = "api_request")]
+    LegacyServiceRequestV1B,
     IdentityExchange,
     MtlsConnection,
     SecretAccess,
@@ -234,20 +246,46 @@ mod tests {
     }
 
     #[test]
-    fn legacy_service_credential_names_deserialize_but_never_serialize() {
-        for legacy in ["repository_token", "api_token"] {
-            let kind: BrokerResourceKind = serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
-            assert_eq!(kind, BrokerResourceKind::ServiceCredential);
+    fn legacy_service_credential_names_round_trip_for_cleanup_only() {
+        let legacy_resource_kinds = [
+            (
+                "repository_token",
+                BrokerResourceKind::LegacyServiceCredentialV1A,
+            ),
+            ("api_token", BrokerResourceKind::LegacyServiceCredentialV1B),
+        ];
+        for (wire_name, expected) in legacy_resource_kinds {
+            let kind: BrokerResourceKind =
+                serde_json::from_str(&format!("\"{wire_name}\"")).unwrap();
+            assert_eq!(kind, expected);
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{wire_name}\"")
+            );
         }
         assert_eq!(
             serde_json::to_string(&BrokerResourceKind::ServiceCredential).unwrap(),
             "\"service_credential\""
         );
 
-        for legacy in ["repository_request", "api_request"] {
+        let legacy_effect_kinds = [
+            (
+                "repository_request",
+                BrokerGatewayEffectKind::LegacyServiceRequestV1A,
+            ),
+            (
+                "api_request",
+                BrokerGatewayEffectKind::LegacyServiceRequestV1B,
+            ),
+        ];
+        for (wire_name, expected) in legacy_effect_kinds {
             let kind: BrokerGatewayEffectKind =
-                serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
-            assert_eq!(kind, BrokerGatewayEffectKind::ServiceRequest);
+                serde_json::from_str(&format!("\"{wire_name}\"")).unwrap();
+            assert_eq!(kind, expected);
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{wire_name}\"")
+            );
         }
         assert_eq!(
             serde_json::to_string(&BrokerGatewayEffectKind::ServiceRequest).unwrap(),

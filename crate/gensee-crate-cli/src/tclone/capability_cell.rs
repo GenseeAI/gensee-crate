@@ -1039,7 +1039,9 @@ fn validate_cell_request_for_execution(
     for broker_lease in &broker_leases {
         validate_broker_scope_against_request(&lease.request, broker_lease)?;
         match broker_lease.resource_kind {
-            BrokerResourceKind::ServiceCredential => {
+            BrokerResourceKind::ServiceCredential
+            | BrokerResourceKind::LegacyServiceCredentialV1A
+            | BrokerResourceKind::LegacyServiceCredentialV1B => {
                 active_mediators.push(MediationBoundary::SecretBroker);
                 active_mediators.push(MediationBoundary::NetworkBoundary);
                 add_gateway_kind_mediator(&mut active_mediators, broker_lease)?;
@@ -2331,6 +2333,8 @@ fn build_effect_manifest(
                     });
                 }
                 BrokerGatewayEffectKind::ServiceRequest
+                | BrokerGatewayEffectKind::LegacyServiceRequestV1A
+                | BrokerGatewayEffectKind::LegacyServiceRequestV1B
                 | BrokerGatewayEffectKind::DatabaseRequest
                 | BrokerGatewayEffectKind::BrowserAction
                 | BrokerGatewayEffectKind::CloudAction => {
@@ -3850,7 +3854,9 @@ pub(super) fn attach_broker_lease_to_cell(
         ));
     }
     let requested = match resource_kind {
-        BrokerResourceKind::ServiceCredential => {
+        BrokerResourceKind::ServiceCredential
+        | BrokerResourceKind::LegacyServiceCredentialV1A
+        | BrokerResourceKind::LegacyServiceCredentialV1B => {
             lease.request.capabilities.iter().any(|capability| {
                 matches!(capability, Capability::SecretUse | Capability::IdentityUse)
             })

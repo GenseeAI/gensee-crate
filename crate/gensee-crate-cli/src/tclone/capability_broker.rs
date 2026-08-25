@@ -396,6 +396,13 @@ fn validate_broker_lease_request(request: &BrokerLeaseRequest) -> io::Result<()>
             BrokerResourceKind::FilesystemHandle
             | BrokerResourceKind::NetworkLease
             | BrokerResourceKind::ExternalActionCommitToken => &[],
+            BrokerResourceKind::LegacyServiceCredentialV1A
+            | BrokerResourceKind::LegacyServiceCredentialV1B => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "legacy service-credential wire kinds are accepted only for retained-state cleanup",
+                ));
+            }
         };
         if !expected_gateway_kinds.is_empty() {
             let gateway_kind = required_json_string(&request.constraints, "gateway_kind")?;
@@ -1255,9 +1262,47 @@ mod tests {
             "nested": { "value": "sk-not-public" }
         })));
         assert!(!contains_secret_shaped_json(&json!({
-            "repository": "one",
+            "service": "records",
             "expires_in": 60
         })));
+    }
+
+    #[test]
+    fn retained_v1_lease_preserves_its_resource_kind_in_revoke_wire() {
+        let lease: BrokerLease = serde_json::from_value(json!({
+            "protocol_version": 1,
+            "lease_id": "lease_legacy",
+            "operation_id": "op_1",
+            "source_run_id": "run_1",
+            "resource_kind": "repository_token",
+            "adapter_id": "legacy_adapter",
+            "audience": "records.example.test",
+            "scopes": ["records:read"],
+            "constraints": {},
+            "issued_at_ms": 1,
+            "expires_at_ms": 2,
+            "status": "active",
+            "delivery": {
+                "kind": "gateway",
+                "gateway_endpoint": "unix:///run/gensee/legacy.sock",
+                "provider_handle": "opaque_1"
+            },
+            "public_metadata": {},
+            "gateway_effects": [],
+            "effect_telemetry_complete": false
+        }))
+        .unwrap();
+        let revoke = BrokerAdapterRequest {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            action: "revoke".to_string(),
+            lease: lease_to_request(&lease),
+            provider_handle: Some("opaque_1".to_string()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(revoke).unwrap()["lease"]["resource_kind"],
+            json!("repository_token")
+        );
     }
 
     #[test]
