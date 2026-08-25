@@ -38,6 +38,12 @@ request throughout mint, status, effect collection, and revoke. Adapters must
 return opaque provider handles, local mediator endpoints, and typed effect
 records; unknown or secret-shaped response fields fail closed.
 
+For a fresh capability cell, the exact typed scope must also appear in the
+cell's preapproved `scope.broker_capabilities` list. Gensee checks that binding
+before invoking the provider, and checks it again when the cell starts. A
+caller cannot attach a broader provider lease merely by declaring a compatible
+coarse capability or audience.
+
 Protocol-specific adapters remain small trusted components. For example, an
 HTTP mediator checks method, origin, path, and byte limits, while a database
 mediator checks database, action, and transaction mode. Those components do

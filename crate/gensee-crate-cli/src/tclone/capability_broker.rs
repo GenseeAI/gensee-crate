@@ -624,6 +624,7 @@ fn issue_broker_lease(args: &[OsString]) -> io::Result<()> {
             cell_id,
             &request.source_run_id,
             &request.operation_id,
+            &request,
             issued_at_ms,
         )?;
         let remaining_seconds = cell_expires_at_ms
