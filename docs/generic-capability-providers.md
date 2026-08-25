@@ -54,3 +54,30 @@ Defining a schema does not make an unenforced capability usable. An operation
 can receive one of these grants only when a registered adapter supports the
 exact resource kind and the normal broker lifecycle successfully reaches
 `active`. Otherwise admission fails closed.
+
+## Executable provider runtime
+
+`gensee boundary provider dispatch` is the common action host. It loads the
+active lease from host-controlled broker state, requires an invocation whose
+operation, lease, resource kind, and exact typed operation are a subset of that
+lease, then launches the configured narrow adapter without a shell or ambient
+environment. The adapter executable, working directory, arguments, resource
+kind, digest, and deadline are root-controlled configuration. Output is
+bounded and must repeat the exact invocation, target, action, effect kind, and
+request digest; Gensee binds the accepted result, lease, and executable digest
+into a host-signed dispatch receipt.
+
+The same host supports all schema-v1 capability classes. Tests exercise a
+valid invocation for every class and out-of-scope denial. This is the reusable
+provider boundary; protocol implementations remain intentionally narrow. A
+database adapter interprets the database operation, a browser adapter
+interprets the browser action, and so on. They cannot change lifecycle,
+identity, expiry, or the action envelope supplied by Gensee.
+
+```console
+gensee boundary provider dispatch \
+  --config /etc/gensee/providers/database.json \
+  --lease lease_123 \
+  --request invocation.json \
+  --output dispatch-receipt.json
+```

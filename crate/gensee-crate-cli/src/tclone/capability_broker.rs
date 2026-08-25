@@ -2995,6 +2995,23 @@ fn load_broker_lease(lease_id: &str) -> io::Result<BrokerLease> {
     Ok(lease)
 }
 
+pub(crate) fn load_active_broker_lease(lease_id: &str) -> io::Result<BrokerLease> {
+    let lease = load_broker_lease(lease_id)?;
+    if lease.status != BrokerLeaseStatus::Active || unix_millis()? >= lease.expires_at_ms {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "broker lease is not active",
+        ));
+    }
+    if lease.typed_scope.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "generic provider invocation requires a typed lease scope",
+        ));
+    }
+    Ok(lease)
+}
+
 fn persist_broker_lease(lease: &BrokerLease) -> io::Result<()> {
     write_atomic_nofollow(
         &broker_lease_path(&lease.lease_id)?,

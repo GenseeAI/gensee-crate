@@ -10,6 +10,7 @@ pub mod network_boundary;
 pub mod operation_context;
 pub mod operation_contract;
 pub mod policy;
+pub mod provider_runtime;
 pub mod semantic_verifier;
 pub mod transactional_promotion;
 
