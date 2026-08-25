@@ -396,6 +396,7 @@ mod platform {
     const BPF_ABS: u16 = 0x20;
     const BPF_JMP: u16 = 0x05;
     const BPF_JEQ: u16 = 0x10;
+    #[cfg(target_arch = "x86_64")]
     const BPF_JSET: u16 = 0x40;
     const BPF_K: u16 = 0x00;
     const BPF_RET: u16 = 0x06;
