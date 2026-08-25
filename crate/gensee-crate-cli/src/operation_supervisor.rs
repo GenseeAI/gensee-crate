@@ -361,6 +361,8 @@ impl OperationSupervisor {
         adopted_cgroup_path: Option<&Path>,
         manage_local_cgroup: bool,
     ) -> io::Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = adopted_cgroup_path;
         let operation_id = operation_id.into();
         let source_run_id = source_run_id.into();
         let action_class = action_class.into();
@@ -384,6 +386,7 @@ impl OperationSupervisor {
                 "managed operation id already exists",
             ));
         }
+        #[cfg(target_os = "linux")]
         let (path, owned_by_supervisor) = if !manage_local_cgroup {
             (PathBuf::new(), false)
         } else {
@@ -396,6 +399,8 @@ impl OperationSupervisor {
                     )
                 })
         };
+        #[cfg(not(target_os = "linux"))]
+        let (path, owned_by_supervisor) = (PathBuf::new(), false);
         let mut cgroup = OperationCgroupRecord {
             path: path.to_string_lossy().to_string(),
             state: OperationCgroupState::Unavailable,

@@ -5,6 +5,7 @@ pub mod capability_broker;
 pub mod capability_fault;
 pub mod capability_policy;
 pub mod network_boundary;
+pub mod operation_contract;
 pub mod policy;
 
 #[derive(Debug, Clone)]
