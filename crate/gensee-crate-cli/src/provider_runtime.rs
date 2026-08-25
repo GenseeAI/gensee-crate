@@ -6,8 +6,10 @@ use gensee_crate_rules::provider_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fs::File;
-use std::io::{ErrorKind, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const MAX_PROVIDER_BYTES: u64 = 1024 * 1024;
@@ -98,26 +100,7 @@ fn validate_trusted_config_path(path: &Path) -> io::Result<()> {
         &canonical,
         &hash_provider_file(&canonical, MAX_PROVIDER_BYTES)?,
     )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if unsafe { libc::geteuid() } == 0 {
-            let mut ancestor = canonical.parent();
-            while let Some(path) = ancestor {
-                let metadata = fs::symlink_metadata(path)?;
-                if !metadata.is_dir()
-                    || metadata.file_type().is_symlink()
-                    || metadata.uid() != 0
-                    || metadata.mode() & 0o022 != 0
-                {
-                    return Err(denied(
-                        "provider config has an untrusted filesystem ancestor",
-                    ));
-                }
-                ancestor = path.parent();
-            }
-        }
-    }
+    validate_trusted_ancestry(&canonical)?;
     Ok(())
 }
 
@@ -145,7 +128,31 @@ fn validate_provider_config(
         ));
     }
     validate_trusted_file(executable, &config.executable_sha256)?;
-    validate_trusted_directory(working)
+    validate_trusted_ancestry(executable)?;
+    validate_trusted_directory(working)?;
+    validate_trusted_ancestry(working)
+}
+
+fn validate_trusted_ancestry(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if unsafe { libc::geteuid() } == 0 {
+            let mut ancestor = path.parent();
+            while let Some(path) = ancestor {
+                let metadata = fs::symlink_metadata(path)?;
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != 0
+                    || metadata.mode() & 0o022 != 0
+                {
+                    return Err(denied("provider path has an untrusted filesystem ancestor"));
+                }
+                ancestor = path.parent();
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_trusted_file(path: &Path, expected: &str) -> io::Result<()> {
@@ -196,13 +203,11 @@ fn execute_provider(
         .join(&invocation.invocation_id);
     fs::create_dir_all(&runtime)?;
     #[cfg(unix)]
-    fs::set_permissions(
-        &runtime,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )?;
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
+    let executable_snapshot = snapshot_provider_executable(config, &runtime)?;
     let output_path = runtime.join("adapter-output.json");
     let output = File::create(&output_path)?;
-    let mut command = Command::new(&config.executable);
+    let mut command = Command::new(&executable_snapshot);
     command
         .args(&config.args)
         .current_dir(&config.working_directory)
@@ -247,6 +252,52 @@ fn execute_provider(
     let result = read_provider_json(&output_path)?;
     let _ = fs::remove_dir_all(runtime);
     Ok(result)
+}
+
+fn snapshot_provider_executable(
+    config: &ProviderRuntimeConfig,
+    runtime: &Path,
+) -> io::Result<PathBuf> {
+    let mut input = File::open(&config.executable)?;
+    let metadata = input.metadata()?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 * 1024 {
+        return Err(denied("provider executable is not a bounded regular file"));
+    }
+    let snapshot = runtime.join("adapter-executable");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o500);
+    let mut output = options.open(&snapshot)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| denied("provider executable size overflow"))?;
+        if total > 1024 * 1024 * 1024 {
+            return Err(denied("provider executable exceeds limit"));
+        }
+        output.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+    }
+    let digest = format!("sha256:{:x}", hasher.finalize());
+    if digest != config.executable_sha256 {
+        return Err(denied(
+            "provider executable changed before it could be pinned",
+        ));
+    }
+    output.sync_all()?;
+    drop(output);
+    #[cfg(unix)]
+    fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o500))?;
+    File::open(runtime)?.sync_all()?;
+    Ok(snapshot)
 }
 
 #[cfg(unix)]
@@ -522,6 +573,37 @@ mod tests {
         verify_provider_result(&invocation, &observed).unwrap();
         env::remove_var("SHOULD_NOT_LEAK");
         env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_snapshot_executes_admitted_bytes_after_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            env::temp_dir().join(format!("gensee-provider-snapshot-{}", uuid::Uuid::new_v4()));
+        let runtime = root.join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = root.join("adapter.sh");
+        fs::write(&executable, b"#!/bin/sh\necho admitted\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).unwrap();
+        let config = ProviderRuntimeConfig {
+            adapter_id: "adapter".into(),
+            resource_kind: BrokerResourceKind::CloudControlAction,
+            executable: executable.to_string_lossy().into_owned(),
+            executable_sha256: hash_provider_file(&executable, MAX_PROVIDER_BYTES).unwrap(),
+            args: Vec::new(),
+            working_directory: root.to_string_lossy().into_owned(),
+            max_runtime_seconds: 5,
+        };
+        let snapshot = snapshot_provider_executable(&config, &runtime).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&executable, b"#!/bin/sh\necho replaced\n").unwrap();
+        let output = Command::new(snapshot).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"admitted\n");
         fs::remove_dir_all(root).unwrap();
     }
 }

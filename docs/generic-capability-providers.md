@@ -67,6 +67,12 @@ bounded and must repeat the exact invocation, target, action, effect kind, and
 request digest; Gensee binds the accepted result, lease, and executable digest
 into a host-signed dispatch receipt.
 
+Before launch, Gensee validates every executable and working-directory
+ancestor as root-controlled, opens and copies the admitted executable into the
+private invocation directory, verifies the copied bytes against the configured
+digest, fsyncs it, and executes that snapshot. Replacing the configured path
+between admission and launch cannot substitute different adapter code.
+
 The same host supports all schema-v1 capability classes. Tests exercise a
 valid invocation for every class and out-of-scope denial. This is the reusable
 provider boundary; protocol implementations remain intentionally narrow. A
