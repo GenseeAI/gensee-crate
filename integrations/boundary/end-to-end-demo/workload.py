@@ -49,9 +49,6 @@ if acknowledgement != "ok":
 
 subprocess.Popen(
     [sys.executable, __file__, "--descendant"],
-    stdin=subprocess.DEVNULL,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
 )
 time.sleep(0.4)
 
