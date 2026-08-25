@@ -10,8 +10,10 @@ result is installed.
 `gensee boundary promotion apply` admits a product only after all of these
 conditions hold under one destination lock:
 
-1. the operation manifest is bound to the current signed catalog and exact
-   contract digest;
+1. the operation manifest has a valid host signature, is bound to the current
+   signed catalog and exact contract digest, and records exit code zero with no
+   timeout, an established execution binding, and a completely drained
+   execution subject;
 2. a fresh structural scan matches the manifest's product type, digest, entry
    count, and byte count;
 3. a catalog-approved semantic verifier signed an `accept` receipt for that

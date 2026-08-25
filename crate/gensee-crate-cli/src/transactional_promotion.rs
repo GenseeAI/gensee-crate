@@ -36,6 +36,13 @@ pub(crate) fn handle_transactional_promotion(args: &[OsString]) -> io::Result<()
 }
 
 fn apply_promotion(args: &[OsString]) -> io::Result<()> {
+    apply_promotion_with_manifest_verifier(args, verify_operation_manifest)
+}
+
+fn apply_promotion_with_manifest_verifier(
+    args: &[OsString],
+    manifest_verifier: impl Fn(&OperationRunManifest) -> io::Result<()>,
+) -> io::Result<()> {
     reject_options(
         args,
         &[
@@ -62,6 +69,8 @@ fn apply_promotion(args: &[OsString]) -> io::Result<()> {
         &required_path(args, "--manifest")?,
         "operation run manifest",
     )?;
+    manifest_verifier(&manifest)?;
+    verify_promotable_manifest_state(&manifest)?;
     let verifier_request: VerifierRequest = read_catalog_json(
         &required_path(args, "--verifier-request")?,
         "semantic verifier request",
@@ -298,6 +307,25 @@ fn apply_promotion(args: &[OsString]) -> io::Result<()> {
     persist_receipt(&destination_root, &receipt)
         .map_err(|error| at_stage("promotion receipt", error))?;
     write_json(&required_path(args, "--output")?, &receipt)
+}
+
+fn verify_promotable_manifest_state(manifest: &OperationRunManifest) -> io::Result<()> {
+    if manifest.process.exit_code != Some(0)
+        || manifest.process.timed_out
+        || !manifest.process.process_group_drained
+        || !manifest.enforcement.os_execution_binding_established
+        || !manifest.promotion.structurally_eligible
+        || manifest
+            .product
+            .as_ref()
+            .is_none_or(|product| !product.structurally_valid)
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "promotion requires an authenticated successful, drained, structurally eligible operation manifest",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_manifest_receipt_binding(
@@ -880,7 +908,8 @@ mod tests {
         let contract_digest = digest_json(&contract).unwrap();
         seal_structural_product(&staged.join("out/result.json")).unwrap();
         let product_evidence = verify_structural_product(&staged, &product_contract).unwrap();
-        let manifest = OperationRunManifest {
+        let manifest_key = SigningKey::from_bytes(&[53; 32]);
+        let mut manifest = OperationRunManifest {
             schema_version: 1,
             operation_id: "operation_promotion".into(),
             source_run_id: "source_promotion".into(),
@@ -928,7 +957,27 @@ mod tests {
             },
             started_at_ms: 1,
             finished_at_ms: 2,
+            host_signature: None,
         };
+        crate::semantic_verifier::sign_operation_manifest_with_key(&mut manifest, &manifest_key)
+            .unwrap();
+        verify_promotable_manifest_state(&manifest).unwrap();
+        let mut failed_manifest = manifest.clone();
+        failed_manifest.process.exit_code = Some(1);
+        assert_eq!(
+            verify_promotable_manifest_state(&failed_manifest)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        let mut undrained_manifest = manifest.clone();
+        undrained_manifest.process.process_group_drained = false;
+        assert_eq!(
+            verify_promotable_manifest_state(&undrained_manifest)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
         let request = VerifierRequest {
             schema_version: SEMANTIC_VERIFIER_SCHEMA_VERSION,
             request_id: "verify_promotion".into(),
@@ -1007,7 +1056,13 @@ mod tests {
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
-        apply_promotion(&args).unwrap();
+        apply_promotion_with_manifest_verifier(&args, |candidate| {
+            crate::semantic_verifier::verify_operation_manifest_with_key(
+                candidate,
+                manifest_key.verifying_key().as_bytes(),
+            )
+        })
+        .unwrap();
         let active = read_active_target(&destination, "current")
             .unwrap()
             .unwrap();
