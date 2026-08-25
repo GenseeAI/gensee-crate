@@ -107,6 +107,8 @@ mod contract_catalog;
 pub(crate) use contract_catalog::*;
 mod intent_resolution;
 pub(crate) use intent_resolution::*;
+mod operation_context;
+pub(crate) use operation_context::*;
 mod falco;
 pub(crate) use falco::*;
 mod replay;

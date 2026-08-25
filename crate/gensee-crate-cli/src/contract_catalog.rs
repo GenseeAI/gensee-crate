@@ -121,7 +121,7 @@ fn require_valid_catalog(audit: &CatalogAudit) -> io::Result<()> {
     }
 }
 
-fn read_signing_key(path: &Path) -> io::Result<SigningKey> {
+pub(crate) fn read_signing_key(path: &Path) -> io::Result<SigningKey> {
     let text = Zeroizing::new(read_bounded_text(path, 256)?);
     let decoded = Zeroizing::new(
         hex::decode(text.trim())
@@ -309,6 +309,7 @@ mod tests {
                 minimum_confidence_bps: 8000,
                 allowed_operation_classes: vec!["transform".into()],
             }],
+            operation_services: Vec::new(),
             fallback: FallbackPolicy {
                 on_ambiguous_intent: AmbiguousIntentAction::Deny,
                 safe_default_contract_id: None,

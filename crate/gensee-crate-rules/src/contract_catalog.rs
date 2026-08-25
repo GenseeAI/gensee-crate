@@ -22,6 +22,8 @@ pub struct ContractCatalog {
     pub contracts: Vec<ApprovedContract>,
     pub selectors: Vec<ContractSelector>,
     pub intent_analyzers: Vec<ApprovedIntentAnalyzer>,
+    #[serde(default)]
+    pub operation_services: Vec<ApprovedOperationService>,
     pub fallback: FallbackPolicy,
 }
 
@@ -80,6 +82,15 @@ pub struct ApprovedIntentAnalyzer {
     pub model_identity: String,
     pub minimum_confidence_bps: u16,
     pub allowed_operation_classes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedOperationService {
+    pub service_id: String,
+    pub public_key_hex: String,
+    pub can_initiate: bool,
+    pub allowed_audiences: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +366,39 @@ impl ContractCatalog {
             }
             if !analyzer_ids.insert(analyzer.analyzer_id.as_str()) {
                 errors.push(format!("duplicate analyzer_id {}", analyzer.analyzer_id));
+            }
+        }
+
+        let mut service_ids = BTreeSet::new();
+        for service in &self.operation_services {
+            if !bounded_token(&service.service_id)
+                || !valid_hex(&service.public_key_hex, 32)
+                || service.allowed_audiences.is_empty()
+                || service
+                    .allowed_audiences
+                    .iter()
+                    .any(|audience| !bounded_token(audience))
+            {
+                errors.push(format!(
+                    "operation service {} is invalid",
+                    service.service_id
+                ));
+            }
+            if !service_ids.insert(service.service_id.as_str()) {
+                errors.push(format!(
+                    "duplicate operation service {}",
+                    service.service_id
+                ));
+            }
+        }
+        for service in &self.operation_services {
+            for audience in &service.allowed_audiences {
+                if !service_ids.contains(audience.as_str()) {
+                    errors.push(format!(
+                        "operation service {} references unknown audience {}",
+                        service.service_id, audience
+                    ));
+                }
             }
         }
 
@@ -672,6 +716,7 @@ mod tests {
                 minimum_confidence_bps: 8_000,
                 allowed_operation_classes: vec!["document_transform".into()],
             }],
+            operation_services: Vec::new(),
             fallback: FallbackPolicy {
                 on_ambiguous_intent: AmbiguousIntentAction::Deny,
                 safe_default_contract_id: None,
