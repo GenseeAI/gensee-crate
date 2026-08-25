@@ -1039,7 +1039,7 @@ fn validate_cell_request_for_execution(
     for broker_lease in &broker_leases {
         validate_broker_scope_against_request(&lease.request, broker_lease)?;
         match broker_lease.resource_kind {
-            BrokerResourceKind::RepositoryToken | BrokerResourceKind::ApiToken => {
+            BrokerResourceKind::ServiceCredential => {
                 active_mediators.push(MediationBoundary::SecretBroker);
                 active_mediators.push(MediationBoundary::NetworkBoundary);
                 add_gateway_kind_mediator(&mut active_mediators, broker_lease)?;
@@ -1445,7 +1445,10 @@ fn add_gateway_kind_mediator(
             )
         })?;
     let mediator = match gateway_kind {
-        "repository_api" | "external_api" | "secret" => MediationBoundary::ExternalApiGateway,
+        "service_gateway" | "secret" => MediationBoundary::ExternalApiGateway,
+        // Read compatibility for leases created before service gateways were
+        // represented by one generic kind.
+        "repository_api" | "external_api" => MediationBoundary::ExternalApiGateway,
         "cloud_api" => MediationBoundary::CloudApiGateway,
         "browser_automation" => MediationBoundary::BrowserAutomationGateway,
         _ => {
@@ -2327,8 +2330,7 @@ fn build_effect_manifest(
                         purpose: effect.action.clone(),
                     });
                 }
-                BrokerGatewayEffectKind::RepositoryRequest
-                | BrokerGatewayEffectKind::ApiRequest
+                BrokerGatewayEffectKind::ServiceRequest
                 | BrokerGatewayEffectKind::DatabaseRequest
                 | BrokerGatewayEffectKind::BrowserAction
                 | BrokerGatewayEffectKind::CloudAction => {
@@ -3848,7 +3850,7 @@ pub(super) fn attach_broker_lease_to_cell(
         ));
     }
     let requested = match resource_kind {
-        BrokerResourceKind::RepositoryToken | BrokerResourceKind::ApiToken => {
+        BrokerResourceKind::ServiceCredential => {
             lease.request.capabilities.iter().any(|capability| {
                 matches!(capability, Capability::SecretUse | Capability::IdentityUse)
             })
@@ -4281,7 +4283,7 @@ mod tests {
         let socket = root.join("api.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         let mut gateway_request = CapabilityRequest::new(
-            "read_repository_metadata",
+            "read_service_records",
             EffectScope::ReadOnly,
             vec![
                 Capability::NetworkEgress,
@@ -4290,14 +4292,14 @@ mod tests {
             ],
         );
         gateway_request.scope.network_destinations = vec![NetworkDestinationScope {
-            destination: "repo.example.test".to_string(),
+            destination: "records.example.test".to_string(),
             protocol: "https".to_string(),
             ports: vec![443],
         }];
         gateway_request.scope.secret_identities = vec![SecretIdentityScope {
-            handle: "repo_reader".to_string(),
-            identity: "repository-reader".to_string(),
-            purpose: "read package metadata".to_string(),
+            handle: "records_reader".to_string(),
+            identity: "records-reader".to_string(),
+            purpose: "read service records".to_string(),
         }];
         let cell_lease = CapabilityCellLease {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
@@ -4321,11 +4323,11 @@ mod tests {
             operation_id: "op_gateway".to_string(),
             source_run_id: "run_gateway".to_string(),
             cell_id: Some("cell_gateway".to_string()),
-            resource_kind: BrokerResourceKind::ApiToken,
-            adapter_id: "repo_adapter".to_string(),
-            audience: "repo.example.test".to_string(),
-            scopes: vec!["repository:one:read".to_string()],
-            constraints: json!({ "gateway_kind": "external_api" }),
+            resource_kind: BrokerResourceKind::ServiceCredential,
+            adapter_id: "records_adapter".to_string(),
+            audience: "records.example.test".to_string(),
+            scopes: vec!["records:read".to_string()],
+            constraints: json!({ "gateway_kind": "service_gateway" }),
             issued_at_ms: 100,
             expires_at_ms: 250,
             status: BrokerLeaseStatus::Active,
@@ -4385,13 +4387,13 @@ mod tests {
         revoked.gateway_effects = vec![BrokerGatewayEffect {
             kind: BrokerGatewayEffectKind::SecretAccess,
             occurred_at_ms: 160,
-            target: "repo.example.test".to_string(),
-            action: "read_package_metadata".to_string(),
+            target: "records.example.test".to_string(),
+            action: "read_records".to_string(),
             request_digest: format!("sha256:{}", "b".repeat(64)),
             protocol: None,
             port: None,
             response_status: Some(200),
-            broker_handle_id: Some("repo_reader".to_string()),
+            broker_handle_id: Some("records_reader".to_string()),
         }];
         let manifest = build_effect_manifest(
             &source_record(),
@@ -4573,7 +4575,7 @@ mod tests {
             cell_id: Some("cell_network".to_string()),
             resource_kind: BrokerResourceKind::NetworkLease,
             adapter_id: super::super::capability_broker::BUILTIN_NETWORK_ADAPTER.to_string(),
-            audience: "nexus-pinned-endpoint".to_string(),
+            audience: "service-pinned-endpoint".to_string(),
             scopes: vec!["connect".to_string()],
             constraints: json!({
                 "destination": "10.20.30.40/32",

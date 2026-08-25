@@ -4189,15 +4189,15 @@ mod tests {
             handle_id: "credential_1".to_string(),
             header_name: "X-Test-Token".to_string(),
             value_file: "/unused-in-this-test".to_string(),
-            allowed_url_prefixes: vec!["https://repo.example/packages".to_string()],
+            allowed_url_prefixes: vec!["https://service.example/objects".to_string()],
         };
         assert!(credential_applies_to_url(
             &credential,
-            &Url::parse("https://repo.example/packages/a.tgz?token=1").unwrap()
+            &Url::parse("https://service.example/objects/a.bin?token=1").unwrap()
         ));
         assert!(!credential_applies_to_url(
             &credential,
-            &Url::parse("https://repo.example/packages-evil/a.tgz").unwrap()
+            &Url::parse("https://service.example/objects-evil/a.bin").unwrap()
         ));
         assert!(!credential_applies_to_url(
             &credential,

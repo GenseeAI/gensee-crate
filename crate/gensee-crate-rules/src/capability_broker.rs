@@ -8,8 +8,10 @@ pub const BROKER_PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokerResourceKind {
-    RepositoryToken,
-    ApiToken,
+    /// An opaque, mediator-bound credential for a downstream service. The
+    /// credential material itself never crosses the broker boundary.
+    #[serde(alias = "repository_token", alias = "api_token")]
+    ServiceCredential,
     WorkloadIdentity,
     MtlsCertificate,
     FilesystemHandle,
@@ -47,8 +49,9 @@ pub enum BrokerLeaseStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokerGatewayEffectKind {
-    RepositoryRequest,
-    ApiRequest,
+    /// A request performed by a service mediator on behalf of the operation.
+    #[serde(alias = "repository_request", alias = "api_request")]
+    ServiceRequest,
     IdentityExchange,
     MtlsConnection,
     SecretAccess,
@@ -188,16 +191,16 @@ mod tests {
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_1".to_string()),
-            resource_kind: BrokerResourceKind::RepositoryToken,
-            adapter_id: "repo-broker".to_string(),
-            audience: "repo.example.test".to_string(),
-            scopes: vec!["repository:one:read".to_string()],
+            resource_kind: BrokerResourceKind::ServiceCredential,
+            adapter_id: "records-broker".to_string(),
+            audience: "records.example.test".to_string(),
+            scopes: vec!["records:read".to_string()],
             constraints: Value::Null,
             issued_at_ms: 1,
             expires_at_ms: 2,
             status: BrokerLeaseStatus::Active,
             delivery: BrokerDelivery::Gateway {
-                gateway_endpoint: "unix:///run/gensee/repo.sock".to_string(),
+                gateway_endpoint: "unix:///run/gensee/records.sock".to_string(),
                 provider_handle: "opaque_1".to_string(),
             },
             public_metadata: Value::Null,
@@ -209,7 +212,8 @@ mod tests {
         let value = serde_json::to_value(lease).unwrap();
         let text = serde_json::to_string(&value).unwrap();
 
-        assert!(!text.contains("credential"));
+        assert!(!text.contains("\"credential\":"));
+        assert!(!text.contains("credential_material"));
         assert!(!text.contains("private_key"));
         assert!(!text.contains("access_token"));
     }
@@ -219,7 +223,7 @@ mod tests {
         let result = serde_json::from_value::<BrokerAdapterResponse>(serde_json::json!({
             "protocol_version": 1,
             "provider_handle": "opaque_1",
-            "gateway_endpoint": "unix:///run/gensee/repo.sock",
+            "gateway_endpoint": "unix:///run/gensee/records.sock",
             "public_metadata": {},
             "effects": [],
             "effect_telemetry_complete": false,
@@ -227,5 +231,27 @@ mod tests {
         }));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn legacy_service_credential_names_deserialize_but_never_serialize() {
+        for legacy in ["repository_token", "api_token"] {
+            let kind: BrokerResourceKind = serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
+            assert_eq!(kind, BrokerResourceKind::ServiceCredential);
+        }
+        assert_eq!(
+            serde_json::to_string(&BrokerResourceKind::ServiceCredential).unwrap(),
+            "\"service_credential\""
+        );
+
+        for legacy in ["repository_request", "api_request"] {
+            let kind: BrokerGatewayEffectKind =
+                serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
+            assert_eq!(kind, BrokerGatewayEffectKind::ServiceRequest);
+        }
+        assert_eq!(
+            serde_json::to_string(&BrokerGatewayEffectKind::ServiceRequest).unwrap(),
+            "\"service_request\""
+        );
     }
 }
