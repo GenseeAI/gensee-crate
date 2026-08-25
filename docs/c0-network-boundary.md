@@ -160,7 +160,7 @@ sudo gensee run network transaction-end \
   --transaction http_tx_1 --operation op_agent_fetch
 sudo gensee run network transaction-revoke \
   --socket /path/supervisor.sock \
-  --transaction dep_tx_1 --operation op_agent_fetch
+  --transaction http_tx_1 --operation op_agent_fetch
 ~~~
 
 Control peers are authenticated with `SO_PEERCRED` exactly like other boundary
