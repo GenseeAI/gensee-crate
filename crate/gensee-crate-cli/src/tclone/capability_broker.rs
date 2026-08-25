@@ -831,6 +831,12 @@ fn validate_broker_lease_request(request: &BrokerLeaseRequest) -> io::Result<()>
     if request.cell_id.is_some() {
         let expected_gateway_kinds: &[&str] = match request.resource_kind {
             BrokerResourceKind::ExternalServiceAuthority => &["external_api"],
+            BrokerResourceKind::LegacyExternalServiceAuthorityV1 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "legacy service-authority wire kinds are accepted only for retained-state cleanup",
+                ));
+            }
             BrokerResourceKind::ApiToken => {
                 &["external_api", "cloud_api", "browser_automation", "secret"]
             }
@@ -1232,7 +1238,11 @@ fn mint_external_provider_lease(
         }
     };
     maybe_inject_broker_fault("after_provider_mint")?;
-    apply_active_adapter_response(&mut lifecycle, &response)?;
+    apply_active_adapter_response_or_revoke(
+        &mut lifecycle,
+        &response,
+        "provider_mint_response_failed_cell_validation",
+    )?;
     append_lifecycle_transition(
         &mut lifecycle,
         BrokerLeaseStatus::Publishing,
@@ -1314,10 +1324,7 @@ fn apply_active_adapter_response(
     lifecycle: &mut BrokerLeaseLifecycle,
     response: &BrokerAdapterResponse,
 ) -> io::Result<()> {
-    if response
-        .provider_status
-        .is_some_and(|status| status != BrokerProviderStatus::Active)
-    {
+    if response.provider_status != Some(BrokerProviderStatus::Active) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "adapter mint did not report active provider authority",
@@ -1332,6 +1339,41 @@ fn apply_active_adapter_response(
     lifecycle.effects.extend(response.effects.clone());
     lifecycle.effect_telemetry_complete = response.effect_telemetry_complete;
     lifecycle.last_error = None;
+    Ok(())
+}
+
+fn apply_active_adapter_response_or_revoke(
+    lifecycle: &mut BrokerLeaseLifecycle,
+    response: &BrokerAdapterResponse,
+    reason: &str,
+) -> io::Result<()> {
+    if let Err(validation_error) = apply_active_adapter_response(lifecycle, response) {
+        // The provider has reported a successful mint. Retain only the opaque
+        // identity needed to revoke it; never publish locally invalid delivery
+        // data as an active lease.
+        if !response.provider_handle.trim().is_empty() {
+            lifecycle.provider_handle = Some(response.provider_handle.clone());
+        }
+        lifecycle.gateway_endpoint = Some(response.gateway_endpoint.clone());
+        lifecycle.public_metadata = response.public_metadata.clone();
+        lifecycle.effects.extend(response.effects.clone());
+        lifecycle.effect_telemetry_complete = response.effect_telemetry_complete;
+        lifecycle.last_error = Some(adapter_error_digest(&validation_error));
+        lifecycle.pending_action = BrokerProviderOperation::Revoke;
+        append_lifecycle_transition(
+            lifecycle,
+            BrokerLeaseStatus::Revoking,
+            unix_millis()?,
+            reason,
+        )?;
+        persist_broker_lifecycle(lifecycle)?;
+        return match invoke_revoke_for_lifecycle(lifecycle) {
+            Ok(()) => Err(validation_error),
+            Err(revoke_error) => Err(io::Error::other(format!(
+                "mint response failed local validation ({validation_error}); provider revoke also failed ({revoke_error})"
+            ))),
+        };
+    }
     Ok(())
 }
 
@@ -1820,7 +1862,11 @@ fn reconcile_provider_mint(lifecycle: &mut BrokerLeaseLifecycle) -> io::Result<(
     match status {
         Ok(response) => match response.provider_status {
             Some(BrokerProviderStatus::Active) => {
-                apply_active_adapter_response(lifecycle, &response)?;
+                apply_active_adapter_response_or_revoke(
+                    lifecycle,
+                    &response,
+                    "provider_status_response_failed_cell_validation",
+                )?;
                 append_lifecycle_transition(
                     lifecycle,
                     BrokerLeaseStatus::Publishing,
@@ -1869,7 +1915,11 @@ fn invoke_mint_for_lifecycle(lifecycle: &mut BrokerLeaseLifecycle) -> io::Result
     );
     match response {
         Ok(response) => {
-            apply_active_adapter_response(lifecycle, &response)?;
+            apply_active_adapter_response_or_revoke(
+                lifecycle,
+                &response,
+                "provider_mint_response_failed_cell_validation",
+            )?;
             append_lifecycle_transition(
                 lifecycle,
                 BrokerLeaseStatus::Publishing,
@@ -2409,13 +2459,15 @@ fn validate_broker_adapter_response(
     response: &BrokerAdapterResponse,
 ) -> io::Result<()> {
     let authority_active = match (action, response.provider_status) {
-        ("mint", None) | (_, Some(BrokerProviderStatus::Active)) => true,
+        ("mint", None) if !config.lifecycle_v2 => true,
+        (_, Some(BrokerProviderStatus::Active)) => true,
         ("revoke", None)
         | (_, Some(BrokerProviderStatus::Absent | BrokerProviderStatus::Revoked)) => false,
         ("status", None) | (_, Some(BrokerProviderStatus::Indeterminate)) => false,
         _ => false,
     };
     if response.protocol_version != BROKER_PROTOCOL_VERSION
+        || (config.lifecycle_v2 && action == "mint" && response.provider_status.is_none())
         || (action == "status" && response.provider_status.is_none())
         || (action == "revoke"
             && match response.provider_status {
@@ -3370,6 +3422,67 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn lifecycle_v2_mint_requires_explicit_active_provider_status() {
+        let _guard = crate::cli_test_env_lock();
+        let root = env::temp_dir().join(format!("gensee-broker-mint-status-{}", Uuid::new_v4()));
+        env::set_var("GENSEE_HOME", &root);
+        let (config, _, _) = lifecycle_test_fixture(&root);
+        let response = BrokerAdapterResponse {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            provider_status: None,
+            provider_handle: "opaque_1".to_string(),
+            gateway_endpoint: "unix:///run/gensee/service.sock".to_string(),
+            public_metadata: Value::Null,
+            effects: Vec::new(),
+            effect_telemetry_complete: true,
+        };
+
+        assert_eq!(
+            validate_broker_adapter_response(&config, "mint", &response)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        clear_broker_test_environment(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_cell_gateway_after_mint_is_durably_revoked() {
+        let _guard = crate::cli_test_env_lock();
+        let root = env::temp_dir().join(format!("gensee-broker-invalid-cell-{}", Uuid::new_v4()));
+        env::set_var("GENSEE_HOME", &root);
+        let (config, mut request, state) = lifecycle_test_fixture(&root);
+        request.cell_id = Some("cell_1".to_string());
+        request.constraints = json!({ "gateway_kind": "external_api" });
+        let invalid_gateway = root.join("not-a-socket");
+        fs::write(&invalid_gateway, b"ordinary file").unwrap();
+        fs::write(
+            state.with_extension("gateway"),
+            format!("unix://{}\n", invalid_gateway.display()),
+        )
+        .unwrap();
+
+        let error = mint_external_provider_lease(
+            &config,
+            "broker_lease_invalid_cell",
+            &request,
+            unix_millis().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        let lifecycle = load_broker_lifecycle("broker_lease_invalid_cell").unwrap();
+        assert_eq!(lifecycle.status, BrokerLeaseStatus::Revoked, "{error}");
+        assert!(lifecycle
+            .transitions
+            .iter()
+            .all(|transition| transition.to != BrokerLeaseStatus::Active));
+        assert_eq!(fs::read_to_string(state).unwrap().trim(), "revoked");
+        clear_broker_test_environment(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn legacy_lease_revoke_stays_legacy_after_adapter_registration_upgrade() {
         let _guard = crate::cli_test_env_lock();
         let root = env::temp_dir().join(format!("gensee-broker-legacy-upgrade-{}", Uuid::new_v4()));
@@ -3383,7 +3496,7 @@ esac
             operation_id: request.operation_id,
             source_run_id: request.source_run_id,
             cell_id: None,
-            resource_kind: request.resource_kind,
+            resource_kind: BrokerResourceKind::LegacyExternalServiceAuthorityV1,
             adapter_id: config.adapter_id,
             audience: request.audience,
             scopes: request.scopes,
@@ -3410,6 +3523,7 @@ esac
         assert!(wire.get("lease_id").is_none());
         assert!(wire.get("idempotency_key").is_none());
         assert!(wire["lease"].get("request_id").is_none());
+        assert_eq!(wire["lease"]["resource_kind"], "repository_token");
         clear_broker_test_environment(&root);
     }
 

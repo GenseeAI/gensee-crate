@@ -1039,7 +1039,9 @@ fn validate_cell_request_for_execution(
     for broker_lease in &broker_leases {
         validate_broker_scope_against_request(&lease.request, broker_lease)?;
         match broker_lease.resource_kind {
-            BrokerResourceKind::ExternalServiceAuthority | BrokerResourceKind::ApiToken => {
+            BrokerResourceKind::ExternalServiceAuthority
+            | BrokerResourceKind::LegacyExternalServiceAuthorityV1
+            | BrokerResourceKind::ApiToken => {
                 active_mediators.push(MediationBoundary::SecretBroker);
                 active_mediators.push(MediationBoundary::NetworkBoundary);
                 add_gateway_kind_mediator(&mut active_mediators, broker_lease)?;
@@ -2328,6 +2330,7 @@ fn build_effect_manifest(
                     });
                 }
                 BrokerGatewayEffectKind::ExternalServiceRequest
+                | BrokerGatewayEffectKind::LegacyExternalServiceRequestV1
                 | BrokerGatewayEffectKind::ApiRequest
                 | BrokerGatewayEffectKind::DatabaseRequest
                 | BrokerGatewayEffectKind::BrowserAction
@@ -3848,11 +3851,11 @@ pub(super) fn attach_broker_lease_to_cell(
         ));
     }
     let requested = match resource_kind {
-        BrokerResourceKind::ExternalServiceAuthority | BrokerResourceKind::ApiToken => {
-            lease.request.capabilities.iter().any(|capability| {
-                matches!(capability, Capability::SecretUse | Capability::IdentityUse)
-            })
-        }
+        BrokerResourceKind::ExternalServiceAuthority
+        | BrokerResourceKind::LegacyExternalServiceAuthorityV1
+        | BrokerResourceKind::ApiToken => lease.request.capabilities.iter().any(|capability| {
+            matches!(capability, Capability::SecretUse | Capability::IdentityUse)
+        }),
         BrokerResourceKind::WorkloadIdentity => lease
             .request
             .capabilities

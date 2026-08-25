@@ -9,6 +9,9 @@ pub const BROKER_PROTOCOL_VERSION: u32 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum BrokerResourceKind {
     ExternalServiceAuthority,
+    #[doc(hidden)]
+    #[serde(rename = "repository_token")]
+    LegacyExternalServiceAuthorityV1,
     ApiToken,
     WorkloadIdentity,
     MtlsCertificate,
@@ -67,6 +70,9 @@ pub enum BrokerProviderStatus {
 #[serde(rename_all = "snake_case")]
 pub enum BrokerGatewayEffectKind {
     ExternalServiceRequest,
+    #[doc(hidden)]
+    #[serde(rename = "repository_request")]
+    LegacyExternalServiceRequestV1,
     ApiRequest,
     IdentityExchange,
     MtlsConnection,
@@ -293,5 +299,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(response.provider_status, None);
+    }
+
+    #[test]
+    fn retained_service_authority_keeps_its_v1_cleanup_discriminator() {
+        let kind: BrokerResourceKind = serde_json::from_str("\"repository_token\"").unwrap();
+        assert_eq!(kind, BrokerResourceKind::LegacyExternalServiceAuthorityV1);
+        assert_eq!(
+            serde_json::to_string(&kind).unwrap(),
+            "\"repository_token\""
+        );
+
+        let effect: BrokerGatewayEffectKind =
+            serde_json::from_str("\"repository_request\"").unwrap();
+        assert_eq!(
+            effect,
+            BrokerGatewayEffectKind::LegacyExternalServiceRequestV1
+        );
+        assert_eq!(
+            serde_json::to_string(&effect).unwrap(),
+            "\"repository_request\""
+        );
     }
 }
