@@ -99,7 +99,7 @@ if [[ -e /etc/gensee/catalog-root-public-key.hex \
   echo "refusing to replace installed Gensee trust material; use a dedicated proof host" >&2
   exit 77
 fi
-install -m 644 "$RUNTIME_ROOT/organization-public.hex" \
+install -m 600 "$RUNTIME_ROOT/organization-public.hex" \
   /etc/gensee/catalog-root-public-key.hex
 install -m 600 "$RUNTIME_ROOT/manifest.seed" \
   /etc/gensee/operation-manifest-signing-key.hex
