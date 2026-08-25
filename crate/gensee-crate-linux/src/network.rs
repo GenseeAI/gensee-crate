@@ -622,11 +622,98 @@ pub fn remove_agent_cgroup(cgroup_path: &Path) -> io::Result<()> {
     std::fs::remove_dir(cgroup_path)
 }
 
+#[cfg(target_os = "linux")]
+pub fn kill_and_drain_agent_cgroup(
+    cgroup_path: &Path,
+    timeout: std::time::Duration,
+) -> io::Result<bool> {
+    use std::time::Instant;
+
+    if !cgroup_path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "owned operation cgroup is unavailable during teardown",
+        ));
+    }
+    let kill_path = cgroup_path.join("cgroup.kill");
+    if kill_path.exists() {
+        std::fs::write(&kill_path, b"1\n")?;
+    } else {
+        kill_cgroup_members(cgroup_path)?;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !cgroup_is_populated(cgroup_path)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        if !kill_path.exists() {
+            kill_cgroup_members(cgroup_path)?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kill_cgroup_members(cgroup_path: &Path) -> io::Result<()> {
+    let members = std::fs::read_to_string(cgroup_path.join("cgroup.procs"))?;
+    for member in members.lines().filter(|line| !line.trim().is_empty()) {
+        let pid = member.trim().parse::<i32>().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid PID in cgroup.procs")
+        })?;
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_is_populated(cgroup_path: &Path) -> io::Result<bool> {
+    let events_path = cgroup_path.join("cgroup.events");
+    if events_path.exists() {
+        let events = std::fs::read_to_string(events_path)?;
+        let populated = events.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("populated"))
+                .then(|| fields.next())
+                .flatten()
+        });
+        return match populated {
+            Some("0") => Ok(false),
+            Some("1") => Ok(true),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cgroup.events omitted a valid populated state",
+            )),
+        };
+    }
+    Ok(!std::fs::read_to_string(cgroup_path.join("cgroup.procs"))?
+        .trim()
+        .is_empty())
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn remove_agent_cgroup(_cgroup_path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "cgroup network enforcement is only available on Linux",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn kill_and_drain_agent_cgroup(
+    _cgroup_path: &Path,
+    _timeout: std::time::Duration,
+) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cgroup teardown is only available on Linux",
     ))
 }
 
@@ -1129,6 +1216,26 @@ fn escape_nft_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_teardown_uses_recursive_kill_and_requires_empty_subject() {
+        let root = std::env::temp_dir().join(format!(
+            "gensee-cgroup-drain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("cgroup.kill"), b"").unwrap();
+        std::fs::write(root.join("cgroup.events"), b"populated 0\nfrozen 0\n").unwrap();
+
+        assert!(kill_and_drain_agent_cgroup(&root, std::time::Duration::from_millis(10)).unwrap());
+        assert_eq!(std::fs::read(root.join("cgroup.kill")).unwrap(), b"1\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn builds_default_cgroup_path_with_safe_session_id() {

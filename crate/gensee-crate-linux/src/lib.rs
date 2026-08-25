@@ -28,12 +28,12 @@ pub use network::{
     apply_nftables_script, attach_current_process_to_cgroup, attach_process_tree_to_cgroup,
     bind_nftables_plan_to_source_address, collect_process_tree, create_agent_cgroup,
     default_agent_cgroup_path, delete_nftables_table, delete_nftables_table_if_exists,
-    plan_nftables_policy, read_nftables_block_events, read_nftables_endpoint_events,
-    remove_agent_cgroup, validate_nftables_plan_for_apply, LinuxCgroupAttachPlan,
-    LinuxNetworkAttemptEvent, LinuxNetworkBlockEvent, LinuxNetworkBlockReason,
-    LinuxNetworkEndpointEvent, LinuxNetworkEnforcementConfig, LinuxNetworkEnforcementPlan,
-    LinuxNftablesBlockCounter, LinuxNftablesDestination, LinuxNftablesEndpointCounter,
-    LinuxNftablesPlan,
+    kill_and_drain_agent_cgroup, plan_nftables_policy, read_nftables_block_events,
+    read_nftables_endpoint_events, remove_agent_cgroup, validate_nftables_plan_for_apply,
+    LinuxCgroupAttachPlan, LinuxNetworkAttemptEvent, LinuxNetworkBlockEvent,
+    LinuxNetworkBlockReason, LinuxNetworkEndpointEvent, LinuxNetworkEnforcementConfig,
+    LinuxNetworkEnforcementPlan, LinuxNftablesBlockCounter, LinuxNftablesDestination,
+    LinuxNftablesEndpointCounter, LinuxNftablesPlan,
 };
 #[cfg(target_os = "linux")]
 pub use network::{start_nftables_attempt_monitor, LinuxNetworkAttemptMonitor};

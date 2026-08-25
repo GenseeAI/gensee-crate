@@ -216,10 +216,12 @@ fn boundary_run(config: BoundaryRunConfig) -> io::Result<()> {
         let _ = operation.finish(None, false);
         return Err(error);
     }
+    let execution_cgroup = operation.cgroup_path().map(Path::to_path_buf);
     let (status, timed_out) =
         operation.wait_for_child(&mut child, Some(contract.execution.max_runtime_seconds))?;
     let exit_code = status.code();
-    let process_group_drained = drain_operation_process_group(root_pid)?;
+    let execution_subject_drained_before_release =
+        drain_operation_execution_subject(root_pid, execution_cgroup.as_deref())?;
     let mut network_evidence = network.collect();
     network_evidence.os_execution_binding_established = root_start_time.is_some()
         && (std::env::consts::OS != "linux" || operation.cgroup_path().is_some());
@@ -257,11 +259,20 @@ fn boundary_run(config: BoundaryRunConfig) -> io::Result<()> {
         operation.record_boundary_violation("network_effect_collection_failed", error)?;
     }
     operation.finish(exit_code, timed_out)?;
-    let product = contract
-        .product
-        .as_ref()
-        .map(|product| verify_structural_product(&staged, product))
-        .transpose()?;
+    let release_attestation = operation.attestation()?;
+    let process_group_drained = execution_subject_drained_before_release
+        && (std::env::consts::OS != "linux"
+            || release_attestation.cgroup_state
+                == crate::operation_supervisor::OperationCgroupState::Released);
+    let product = if process_group_drained {
+        contract
+            .product
+            .as_ref()
+            .map(|product| verify_structural_product(&staged, product))
+            .transpose()?
+    } else {
+        None
+    };
     let process_succeeded = status.success() && !timed_out;
     let structurally_eligible = process_succeeded
         && process_group_drained
@@ -535,6 +546,8 @@ fn boundary_command(
         OsString::from("__boundary-exec"),
         OsString::from("--gate"),
         start_gate.as_os_str().to_os_string(),
+        OsString::from("--write-root"),
+        staged.as_os_str().to_os_string(),
         OsString::from("--"),
         program.clone(),
     ];
@@ -599,7 +612,9 @@ pub(crate) fn boundary_exec_wrapper(args: Vec<OsString>) -> io::Result<()> {
         .position(|arg| arg == "--")
         .ok_or_else(boundary_usage_error)?;
     let gate = optional_path_arg(&args[..separator], "--gate")?.ok_or_else(boundary_usage_error)?;
-    reject_unknown_options(&args[..separator], &["--gate"], &[])?;
+    let write_root =
+        optional_path_arg(&args[..separator], "--write-root")?.ok_or_else(boundary_usage_error)?;
+    reject_unknown_options(&args[..separator], &["--gate", "--write-root"], &[])?;
     let command = &args[separator + 1..];
     let (program, command_args) = command.split_first().ok_or_else(boundary_usage_error)?;
     #[cfg(unix)]
@@ -628,6 +643,10 @@ pub(crate) fn boundary_exec_wrapper(args: Vec<OsString>) -> io::Result<()> {
         thread::sleep(Duration::from_millis(10));
     }
     fs::remove_file(&gate)?;
+    #[cfg(target_os = "linux")]
+    gensee_crate_linux::apply_landlock_write_sandbox(&[write_root.to_string_lossy().to_string()])?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = write_root;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -641,6 +660,7 @@ pub(crate) fn boundary_exec_wrapper(args: Vec<OsString>) -> io::Result<()> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn drain_operation_process_group(root_pid: u32) -> io::Result<bool> {
     #[cfg(unix)]
     {
@@ -668,6 +688,28 @@ fn drain_operation_process_group(root_pid: u32) -> io::Result<bool> {
     {
         let _ = root_pid;
         Ok(false)
+    }
+}
+
+fn drain_operation_execution_subject(
+    root_pid: u32,
+    cgroup_path: Option<&Path>,
+) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = root_pid;
+        let cgroup_path = cgroup_path.ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::PermissionDenied,
+                "owned operation cgroup disappeared before teardown",
+            )
+        })?;
+        gensee_crate_linux::kill_and_drain_agent_cgroup(cgroup_path, Duration::from_secs(2))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cgroup_path;
+        drain_operation_process_group(root_pid)
     }
 }
 
