@@ -6,7 +6,7 @@ do not answer “is this content correct or safe for its intended use?” Gensee
 keeps those claims separate.
 
 After a producer exits and structural verification succeeds, the host can
-create a bounded verifier request from the operation manifest:
+create a bounded verifier request from the host-authenticated operation manifest:
 
 ```console
 gensee boundary verifier request \
@@ -26,6 +26,12 @@ policy version, verdict (`accept`, `reject`, or `indeterminate`), bounded reason
 codes, and a digest of its own validation-effect manifest. The signed
 organization catalog pins verifier public keys and the profile/policy-version
 combinations each verifier may claim.
+
+`gensee boundary run` signs the complete manifest with the root-owned key at
+`/etc/gensee/operation-manifest-signing-key.hex`. Request creation verifies it
+against `/etc/gensee/operation-manifest-public-key.hex` before trusting the
+operation, contract, product, process, or enforcement fields. A producer-made
+JSON manifest cannot initiate semantic verification.
 
 ```console
 gensee boundary verifier verify \

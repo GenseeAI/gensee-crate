@@ -1,7 +1,7 @@
 use crate::*;
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use gensee_crate_rules::contract_catalog::SignedContractCatalog;
-use gensee_crate_rules::operation_contract::OperationRunManifest;
+use gensee_crate_rules::operation_contract::{OperationManifestSignature, OperationRunManifest};
 use gensee_crate_rules::semantic_verifier::{
     SignedVerifierReceipt, VerifierReceiptClaims, VerifierReceiptSignature, VerifierRequest,
     SEMANTIC_VERIFIER_SCHEMA_VERSION,
@@ -13,6 +13,9 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_VERIFIER_TTL_SECONDS: u64 = 300;
+const OPERATION_MANIFEST_SIGNATURE_DOMAIN: &[u8] = b"gensee-operation-run-manifest-v1\0";
+const OPERATION_MANIFEST_SIGNING_KEY: &str = "/etc/gensee/operation-manifest-signing-key.hex";
+const OPERATION_MANIFEST_PUBLIC_KEY: &str = "/etc/gensee/operation-manifest-public-key.hex";
 
 pub(crate) fn handle_semantic_verifier(args: &[OsString]) -> io::Result<()> {
     let (command, rest) = args.split_first().ok_or_else(verifier_usage_error)?;
@@ -34,6 +37,7 @@ fn create_request(args: &[OsString]) -> io::Result<()> {
         &required_path(args, "--manifest")?,
         "operation run manifest",
     )?;
+    verify_operation_manifest(&manifest)?;
     let product = manifest
         .product
         .as_ref()
@@ -72,6 +76,66 @@ fn create_request(args: &[OsString]) -> io::Result<()> {
     };
     request.validate(issued_at_ms).map_err(invalid_input)?;
     write_json(&required_path(args, "--output")?, &request)
+}
+
+pub(crate) fn sign_operation_manifest(manifest: &mut OperationRunManifest) -> io::Result<()> {
+    let path = Path::new(OPERATION_MANIFEST_SIGNING_KEY);
+    #[cfg(unix)]
+    validate_root_owned_path(path, false, true)?;
+    let key = read_signing_key(path)?;
+    sign_operation_manifest_with_key(manifest, &key)
+}
+
+fn sign_operation_manifest_with_key(
+    manifest: &mut OperationRunManifest,
+    key: &ed25519_dalek::SigningKey,
+) -> io::Result<()> {
+    manifest.host_signature = None;
+    let bytes = operation_manifest_signing_bytes(manifest)?;
+    manifest.host_signature = Some(OperationManifestSignature {
+        algorithm: "ed25519".to_string(),
+        signature_hex: hex::encode(key.sign(&bytes).to_bytes()),
+    });
+    Ok(())
+}
+
+pub(crate) fn verify_operation_manifest(manifest: &OperationRunManifest) -> io::Result<()> {
+    let path = Path::new(OPERATION_MANIFEST_PUBLIC_KEY);
+    #[cfg(unix)]
+    validate_root_owned_path(path, false, false)?;
+    let encoded = read_nofollow_to_string(path)?;
+    let public_key = decode_hex_array::<32>(encoded.trim(), "operation manifest public key")?;
+    verify_operation_manifest_with_key(manifest, &public_key)
+}
+
+fn verify_operation_manifest_with_key(
+    manifest: &OperationRunManifest,
+    public_key: &[u8; 32],
+) -> io::Result<()> {
+    let signature = manifest
+        .host_signature
+        .as_ref()
+        .ok_or_else(|| invalid_data("operation manifest is not host-authenticated"))?;
+    if signature.algorithm != "ed25519" {
+        return Err(invalid_data("unsupported operation manifest signature"));
+    }
+    let signature_bytes =
+        decode_hex_array::<64>(&signature.signature_hex, "operation manifest signature")?;
+    VerifyingKey::from_bytes(public_key)
+        .map_err(|error| invalid_data(format!("invalid operation manifest public key: {error}")))?
+        .verify(
+            &operation_manifest_signing_bytes(manifest)?,
+            &Signature::from_bytes(&signature_bytes),
+        )
+        .map_err(|error| invalid_data(format!("invalid operation manifest signature: {error}")))
+}
+
+fn operation_manifest_signing_bytes(manifest: &OperationRunManifest) -> io::Result<Vec<u8>> {
+    let mut unsigned = manifest.clone();
+    unsigned.host_signature = None;
+    let mut bytes = OPERATION_MANIFEST_SIGNATURE_DOMAIN.to_vec();
+    bytes.extend(serde_json::to_vec(&unsigned).map_err(json_error)?);
+    Ok(bytes)
 }
 
 fn sign_receipt(args: &[OsString]) -> io::Result<()> {
@@ -298,7 +362,11 @@ mod tests {
         AmbiguousIntentAction, ApprovedSemanticVerifier, CatalogSignature, ContractCatalog,
         FallbackPolicy, CONTRACT_CATALOG_SCHEMA_VERSION,
     };
-    use gensee_crate_rules::operation_contract::StructuralProductType;
+    use gensee_crate_rules::operation_contract::{
+        ContractNetworkMode, OperationAdmissionEvidence, OperationEnforcementEvidence,
+        OperationProcessEvidence, OperationPromotionEvidence, StructuralProductEvidence,
+        StructuralProductType,
+    };
     use gensee_crate_rules::semantic_verifier::{
         SemanticVerdict, SEMANTIC_VERIFIER_SCHEMA_VERSION,
     };
@@ -385,5 +453,76 @@ mod tests {
         let mut changed = request;
         changed.product_digest = format!("sha256:{}", "44".repeat(32));
         assert!(verify_semantic_receipt(&catalog, &changed, &receipt, 200).is_err());
+    }
+
+    #[test]
+    fn verifier_request_source_requires_exact_host_signed_manifest() {
+        let key = SigningKey::from_bytes(&[45; 32]);
+        let mut manifest = OperationRunManifest {
+            schema_version: 1,
+            operation_id: "operation_one".into(),
+            source_run_id: "run_one".into(),
+            contract_id: "contract_one".into(),
+            contract_digest: format!("sha256:{}", "11".repeat(32)),
+            command_digest: format!("sha256:{}", "12".repeat(32)),
+            admission: OperationAdmissionEvidence {
+                catalog_id: "catalog_one".into(),
+                catalog_version: 1,
+                catalog_digest: format!("sha256:{}", "13".repeat(32)),
+                observation_digest: format!("sha256:{}", "14".repeat(32)),
+                inference_digest: format!("sha256:{}", "15".repeat(32)),
+                analyzer_id: "analyzer_one".into(),
+                selected_operation_class: "transform".into(),
+                confidence_bps: 9_000,
+                resolution_source: "probabilistic_inference".into(),
+                ambiguity_reason: None,
+            },
+            operation_record: "/var/lib/gensee/operation.json".into(),
+            original_workspace: "/workspace".into(),
+            staged_workspace: "/staged".into(),
+            enforcement: OperationEnforcementEvidence {
+                os_execution_binding_established: true,
+                execution_subject_kind: "process_group".into(),
+                network_mode: ContractNetworkMode::DenyAll,
+                network_boundary: "deny_all".into(),
+                network_effect_coverage: "complete".into(),
+                allowed_network_effects: Vec::new(),
+                denied_network_effects: Vec::new(),
+                collection_errors: Vec::new(),
+            },
+            process: OperationProcessEvidence {
+                root_pid: 123,
+                root_start_time: Some(456),
+                exit_code: Some(0),
+                timed_out: false,
+                process_group_drained: true,
+            },
+            product: Some(StructuralProductEvidence {
+                kind: StructuralProductType::StructuredResult,
+                path: "out/result.json".into(),
+                digest: format!("sha256:{}", "22".repeat(32)),
+                entries: 1,
+                bytes: 2,
+                structurally_valid: true,
+                semantic_status: "receipt_required:content_policy".into(),
+                violations: Vec::new(),
+            }),
+            promotion: OperationPromotionEvidence {
+                performed: false,
+                structurally_eligible: true,
+                semantically_verified: false,
+                reason: "receipt required".into(),
+            },
+            started_at_ms: 100,
+            finished_at_ms: 110,
+            host_signature: None,
+        };
+        sign_operation_manifest_with_key(&mut manifest, &key).unwrap();
+        verify_operation_manifest_with_key(&manifest, key.verifying_key().as_bytes()).unwrap();
+
+        manifest.product.as_mut().unwrap().digest = format!("sha256:{}", "99".repeat(32));
+        assert!(
+            verify_operation_manifest_with_key(&manifest, key.verifying_key().as_bytes()).is_err()
+        );
     }
 }
