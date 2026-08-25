@@ -434,6 +434,7 @@ dependencies = [
  "gensee-crate-core",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

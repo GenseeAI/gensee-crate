@@ -740,6 +740,7 @@ fn issue_broker_lease(args: &[OsString]) -> io::Result<()> {
         source_run_id: request.source_run_id,
         cell_id: request.cell_id,
         resource_kind: request.resource_kind,
+        typed_scope: request.typed_scope,
         adapter_id: request.adapter_id,
         audience: request.audience,
         scopes: request.scopes,
@@ -828,6 +829,38 @@ fn validate_broker_lease_request(request: &BrokerLeaseRequest) -> io::Result<()>
             "broker constraints must contain selectors and handles, never credential material",
         ));
     }
+    let typed_kind = request.typed_scope.as_ref().map(|scope| {
+        scope
+            .validate()
+            .map(|()| scope.resource_kind())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+    });
+    if let Some(kind) = typed_kind.transpose()? {
+        if kind != request.resource_kind {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "typed capability scope does not match the requested resource kind",
+            ));
+        }
+    }
+    if matches!(
+        request.resource_kind,
+        BrokerResourceKind::CredentialUse
+            | BrokerResourceKind::HttpApiCall
+            | BrokerResourceKind::BrowserSession
+            | BrokerResourceKind::DatabaseTransaction
+            | BrokerResourceKind::MessageDelivery
+            | BrokerResourceKind::CiJobInvocation
+            | BrokerResourceKind::SecretRead
+            | BrokerResourceKind::FilesystemMutation
+            | BrokerResourceKind::CloudControlAction
+    ) && request.typed_scope.is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "generic provider resources require a typed capability scope",
+        ));
+    }
     if request.cell_id.is_some() {
         let expected_gateway_kinds: &[&str] = match request.resource_kind {
             BrokerResourceKind::ExternalServiceAuthority => &["external_api"],
@@ -843,6 +876,16 @@ fn validate_broker_lease_request(request: &BrokerLeaseRequest) -> io::Result<()>
             BrokerResourceKind::WorkloadIdentity => &["workload_identity"],
             BrokerResourceKind::MtlsCertificate => &["mtls"],
             BrokerResourceKind::DatabaseRole => &["database"],
+            BrokerResourceKind::CredentialUse | BrokerResourceKind::SecretRead => {
+                &["secret", "workload_identity"]
+            }
+            BrokerResourceKind::HttpApiCall => &["external_api", "cloud_api"],
+            BrokerResourceKind::BrowserSession => &["browser_automation"],
+            BrokerResourceKind::DatabaseTransaction => &["database"],
+            BrokerResourceKind::MessageDelivery => &["external_api"],
+            BrokerResourceKind::CiJobInvocation => &["external_api"],
+            BrokerResourceKind::FilesystemMutation => &["filesystem"],
+            BrokerResourceKind::CloudControlAction => &["cloud_api"],
             BrokerResourceKind::FilesystemHandle
             | BrokerResourceKind::NetworkLease
             | BrokerResourceKind::ExternalActionCommitToken => &[],
@@ -2127,6 +2170,7 @@ fn materialize_public_lease(
         source_run_id: lifecycle.request.source_run_id.clone(),
         cell_id: lifecycle.request.cell_id.clone(),
         resource_kind: lifecycle.request.resource_kind,
+        typed_scope: lifecycle.request.typed_scope.clone(),
         adapter_id: lifecycle.request.adapter_id.clone(),
         audience: lifecycle.request.audience.clone(),
         scopes: lifecycle.request.scopes.clone(),
@@ -2864,6 +2908,7 @@ fn lease_to_request(lease: &BrokerLease) -> BrokerLeaseRequest {
         source_run_id: lease.source_run_id.clone(),
         cell_id: lease.cell_id.clone(),
         resource_kind: lease.resource_kind,
+        typed_scope: lease.typed_scope.clone(),
         adapter_id: lease.adapter_id.clone(),
         audience: lease.audience.clone(),
         scopes: lease.scopes.clone(),
@@ -3183,6 +3228,7 @@ esac
             source_run_id: "run_1".to_string(),
             cell_id: None,
             resource_kind: BrokerResourceKind::ExternalServiceAuthority,
+            typed_scope: None,
             adapter_id: config.adapter_id.clone(),
             audience: "repo.example.test".to_string(),
             scopes: vec!["service:one:read".to_string()],
@@ -3270,6 +3316,7 @@ esac
             source_run_id: "run_1".to_string(),
             cell_id: None,
             resource_kind: BrokerResourceKind::NetworkLease,
+            typed_scope: None,
             adapter_id: BUILTIN_NETWORK_ADAPTER.to_string(),
             audience: "*".to_string(),
             scopes: vec!["*".to_string()],
@@ -3321,6 +3368,7 @@ esac
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_1".to_string()),
             resource_kind: BrokerResourceKind::ExternalActionCommitToken,
+            typed_scope: None,
             adapter_id: BUILTIN_EXTERNAL_ACTION_ADAPTER.to_string(),
             audience: "deploy.example.test".to_string(),
             scopes: vec!["deployment:one:commit".to_string()],
@@ -3497,6 +3545,7 @@ esac
             source_run_id: request.source_run_id,
             cell_id: None,
             resource_kind: BrokerResourceKind::LegacyExternalServiceAuthorityV1,
+            typed_scope: None,
             adapter_id: config.adapter_id,
             audience: request.audience,
             scopes: request.scopes,
@@ -3667,6 +3716,7 @@ esac
             source_run_id: "run_1".to_string(),
             cell_id: None,
             resource_kind: BrokerResourceKind::ExternalServiceAuthority,
+            typed_scope: None,
             adapter_id: "repo_adapter".to_string(),
             audience: "repo.example.test".to_string(),
             scopes: vec!["service:one:read".to_string()],
@@ -4558,6 +4608,7 @@ esac
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_1".to_string()),
             resource_kind: BrokerResourceKind::ExternalServiceAuthority,
+            typed_scope: None,
             adapter_id: "repo_adapter".to_string(),
             audience: "repo.example.test".to_string(),
             scopes: vec!["service:one:read".to_string()],
@@ -4587,5 +4638,41 @@ esac
 
         env::remove_var("GENSEE_HOME");
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generic_provider_requests_require_matching_typed_scope() {
+        use gensee_crate_rules::capability_broker::BrokerCapabilityScope;
+
+        let mut request = BrokerLeaseRequest {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            request_id: "request_typed".into(),
+            operation_id: "operation_typed".into(),
+            source_run_id: "run_typed".into(),
+            cell_id: None,
+            resource_kind: BrokerResourceKind::HttpApiCall,
+            typed_scope: None,
+            adapter_id: "http_mediator".into(),
+            audience: "api.example.test".into(),
+            scopes: vec!["request".into()],
+            ttl_seconds: 60,
+            constraints: json!({}),
+        };
+        assert!(validate_broker_lease_request(&request).is_err());
+
+        request.typed_scope = Some(BrokerCapabilityScope::SecretRead {
+            handle: "service_secret".into(),
+            purpose: "read_metadata".into(),
+        });
+        assert!(validate_broker_lease_request(&request).is_err());
+
+        request.typed_scope = Some(BrokerCapabilityScope::HttpApiCall {
+            origin: "https://api.example.test".into(),
+            methods: vec!["GET".into()],
+            path_prefixes: vec!["/v1/records".into()],
+            max_request_bytes: 4096,
+            max_response_bytes: 1024 * 1024,
+        });
+        assert!(validate_broker_lease_request(&request).is_ok());
     }
 }

@@ -1061,6 +1061,30 @@ fn validate_cell_request_for_execution(
             BrokerResourceKind::NetworkLease => {
                 active_mediators.push(MediationBoundary::NetworkBoundary);
             }
+            BrokerResourceKind::CredentialUse | BrokerResourceKind::SecretRead => {
+                active_mediators.push(MediationBoundary::SecretBroker);
+            }
+            BrokerResourceKind::HttpApiCall
+            | BrokerResourceKind::MessageDelivery
+            | BrokerResourceKind::CiJobInvocation => {
+                active_mediators.push(MediationBoundary::ExternalApiGateway);
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+            }
+            BrokerResourceKind::BrowserSession => {
+                active_mediators.push(MediationBoundary::BrowserAutomationGateway);
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+            }
+            BrokerResourceKind::DatabaseTransaction => {
+                active_mediators.push(MediationBoundary::DatabaseProxy);
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+            }
+            BrokerResourceKind::FilesystemMutation => {
+                active_mediators.push(MediationBoundary::FilesystemBoundary);
+            }
+            BrokerResourceKind::CloudControlAction => {
+                active_mediators.push(MediationBoundary::CloudApiGateway);
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+            }
             BrokerResourceKind::ExternalActionCommitToken => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -2334,7 +2358,10 @@ fn build_effect_manifest(
                 | BrokerGatewayEffectKind::ApiRequest
                 | BrokerGatewayEffectKind::DatabaseRequest
                 | BrokerGatewayEffectKind::BrowserAction
-                | BrokerGatewayEffectKind::CloudAction => {
+                | BrokerGatewayEffectKind::CloudAction
+                | BrokerGatewayEffectKind::MessageDelivery
+                | BrokerGatewayEffectKind::CiJobInvocation
+                | BrokerGatewayEffectKind::FilesystemMutation => {
                     external_requests.push(gensee_crate_rules::capability::ExternalRequestEffect {
                         gateway: broker_lease.adapter_id.clone(),
                         target: effect.target.clone(),
@@ -3892,6 +3919,41 @@ pub(super) fn attach_broker_lease_to_cell(
                 )
             })
         }
+        BrokerResourceKind::CredentialUse | BrokerResourceKind::SecretRead => {
+            lease.request.capabilities.iter().any(|capability| {
+                matches!(capability, Capability::SecretUse | Capability::IdentityUse)
+            })
+        }
+        BrokerResourceKind::HttpApiCall
+        | BrokerResourceKind::MessageDelivery
+        | BrokerResourceKind::CiJobInvocation
+        | BrokerResourceKind::BrowserSession => {
+            lease.request.capabilities.iter().any(|capability| {
+                matches!(
+                    capability,
+                    Capability::ExternalApplication
+                        | Capability::ExternalMutation
+                        | Capability::NetworkEgress
+                )
+            })
+        }
+        BrokerResourceKind::DatabaseTransaction => lease
+            .request
+            .capabilities
+            .contains(&Capability::DatabaseAccess),
+        BrokerResourceKind::FilesystemMutation => {
+            lease.request.capabilities.iter().any(|capability| {
+                matches!(
+                    capability,
+                    Capability::FilesystemWrite
+                        | Capability::FilesystemMetadata
+                        | Capability::DestructiveFilesystem
+                )
+            })
+        }
+        BrokerResourceKind::CloudControlAction => {
+            lease.request.capabilities.contains(&Capability::CloudIam)
+        }
     };
     if !requested {
         return Err(io::Error::new(
@@ -4383,6 +4445,7 @@ mod tests {
             source_run_id: "run_gateway".to_string(),
             cell_id: Some("cell_gateway".to_string()),
             resource_kind: BrokerResourceKind::ApiToken,
+            typed_scope: None,
             adapter_id: "repo_adapter".to_string(),
             audience: "repo.example.test".to_string(),
             scopes: vec!["service:one:read".to_string()],
@@ -4633,6 +4696,7 @@ mod tests {
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_network".to_string()),
             resource_kind: BrokerResourceKind::NetworkLease,
+            typed_scope: None,
             adapter_id: super::super::capability_broker::BUILTIN_NETWORK_ADAPTER.to_string(),
             audience: "service-pinned-endpoint".to_string(),
             scopes: vec!["connect".to_string()],
