@@ -25,6 +25,11 @@ shorter-lived subset of a parent grant. A service cannot introduce a new grant,
 change a scope digest, replace a lease generation, or forward to an
 unregistered audience.
 
+For generation zero, the verifier recomputes the digest of the verified signed
+catalog and requires the contract digest to identify one of that catalog's
+approved contracts. A service cannot establish a root context with invented
+but syntactically valid catalog or contract digests.
+
 ```console
 gensee boundary context issue \
   --catalog /etc/gensee/catalog.signed.json \

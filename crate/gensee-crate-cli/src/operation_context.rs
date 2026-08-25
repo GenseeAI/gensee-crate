@@ -235,6 +235,7 @@ pub(crate) fn verify_context_chain<'a>(
             &signed.signature,
         )?;
         if index == 0 {
+            verify_root_authority_binding(&signed.claims, catalog)?;
             signed
                 .claims
                 .validate_root(&catalog.catalog, now_ms)
@@ -258,6 +259,34 @@ pub(crate) fn verify_context_chain<'a>(
     Ok(tail)
 }
 
+fn verify_root_authority_binding(
+    claims: &OperationContextClaims,
+    catalog: &SignedContractCatalog,
+) -> io::Result<()> {
+    let catalog_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&catalog.catalog).map_err(json_error)?)
+    );
+    if claims.catalog_digest != catalog_digest {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "root operation context is not bound to the verified catalog",
+        ));
+    }
+    let contract_is_approved = catalog.catalog.contracts.iter().any(|approved| {
+        serde_json::to_vec(&approved.contract)
+            .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)) == claims.contract_digest)
+            .unwrap_or(false)
+    });
+    if !contract_is_approved {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "root operation context is not bound to an approved catalog contract",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_next_claims(
     claims: &OperationContextClaims,
     chain: &OperationContextChain,
@@ -275,6 +304,7 @@ fn validate_next_claims(
             .map(|_| ())
             .map_err(invalid_data)
     } else {
+        verify_root_authority_binding(claims, catalog)?;
         claims
             .validate_root(&catalog.catalog, now_ms)
             .map(|_| ())
@@ -388,10 +418,15 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use gensee_crate_rules::capability_broker::BrokerResourceKind;
     use gensee_crate_rules::contract_catalog::{
-        AmbiguousIntentAction, ApprovedOperationService, CatalogSignature, ContractCatalog,
-        FallbackPolicy, CONTRACT_CATALOG_SCHEMA_VERSION,
+        AmbiguousIntentAction, ApprovedContract, ApprovedOperationService, CatalogSignature,
+        ContractApproval, ContractCatalog, ContractOwner, FallbackPolicy,
+        CONTRACT_CATALOG_SCHEMA_VERSION,
     };
     use gensee_crate_rules::operation_context::{ContextGrant, OPERATION_CONTEXT_SCHEMA_VERSION};
+    use gensee_crate_rules::operation_contract::{
+        ContractCapabilities, ExecutionContract, OperationContract,
+        OPERATION_CONTRACT_SCHEMA_VERSION,
+    };
 
     #[test]
     fn signed_chain_verifies_attenuation_and_audience() {
@@ -405,7 +440,26 @@ mod tests {
                 version: 1,
                 issued_at_ms: 1,
                 expires_at_ms: 10_000,
-                contracts: Vec::new(),
+                contracts: vec![ApprovedContract {
+                    contract: OperationContract {
+                        schema_version: OPERATION_CONTRACT_SCHEMA_VERSION,
+                        contract_id: "contract_one".into(),
+                        operation_class: "transform".into(),
+                        execution: ExecutionContract::default(),
+                        capabilities: ContractCapabilities::default(),
+                        product: None,
+                    },
+                    owner: ContractOwner {
+                        application_id: "entry_app".into(),
+                        owning_team: "security".into(),
+                    },
+                    approval: ContractApproval {
+                        approval_id: "approval_one".into(),
+                        approved_by: "reviewer".into(),
+                        approved_at_ms: 1,
+                        expires_at_ms: 9_000,
+                    },
+                }],
                 selectors: Vec::new(),
                 intent_analyzers: Vec::new(),
                 operation_services: vec![
@@ -441,6 +495,14 @@ mod tests {
             lease_generation: 3,
             expires_at_ms: 900,
         };
+        let catalog_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&catalog.catalog).unwrap())
+        );
+        let contract_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&catalog.catalog.contracts[0].contract).unwrap())
+        );
         let root_claims = OperationContextClaims {
             schema_version: OPERATION_CONTEXT_SCHEMA_VERSION,
             token_id: "context_root".into(),
@@ -448,8 +510,8 @@ mod tests {
             generation: 0,
             issuer_service: "entry_service".into(),
             audience_service: "worker_service".into(),
-            catalog_digest: format!("sha256:{}", "22".repeat(32)),
-            contract_digest: format!("sha256:{}", "33".repeat(32)),
+            catalog_digest: catalog_digest.clone(),
+            contract_digest: contract_digest.clone(),
             issued_at_ms: 100,
             expires_at_ms: 900,
             parent_context_digest: None,
@@ -465,8 +527,8 @@ mod tests {
             generation: 1,
             issuer_service: "worker_service".into(),
             audience_service: "worker_service".into(),
-            catalog_digest: format!("sha256:{}", "22".repeat(32)),
-            contract_digest: format!("sha256:{}", "33".repeat(32)),
+            catalog_digest,
+            contract_digest,
             issued_at_ms: 101,
             expires_at_ms: 800,
             parent_context_digest: Some(digest_signed_context(&root).unwrap()),
@@ -483,6 +545,19 @@ mod tests {
         widened.contexts[1].claims.grants[0].scope_digest = format!("sha256:{}", "44".repeat(32));
         widened.contexts[1] = sign_context(widened.contexts[1].claims.clone(), &worker_key);
         assert!(verify_context_chain(&widened, &catalog, 200, None).is_err());
+
+        let mut invented_catalog = chain.clone();
+        invented_catalog.contexts[0].claims.catalog_digest = format!("sha256:{}", "22".repeat(32));
+        invented_catalog.contexts[0] =
+            sign_context(invented_catalog.contexts[0].claims.clone(), &root_key);
+        assert!(verify_context_chain(&invented_catalog, &catalog, 200, None).is_err());
+
+        let mut invented_contract = chain.clone();
+        invented_contract.contexts[0].claims.contract_digest =
+            format!("sha256:{}", "33".repeat(32));
+        invented_contract.contexts[0] =
+            sign_context(invented_contract.contexts[0].claims.clone(), &root_key);
+        assert!(verify_context_chain(&invented_contract, &catalog, 200, None).is_err());
     }
 
     fn sign_context(claims: OperationContextClaims, key: &SigningKey) -> SignedOperationContext {
