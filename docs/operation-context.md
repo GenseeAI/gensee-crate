@@ -62,3 +62,29 @@ OS identity or as proof by itself.
 Transport integrations carry the serialized chain through their authenticated
 request mechanism. The protocol is transport-neutral; an HTTP gateway, local
 socket service, task queue, or worker RPC can use the same verification rules.
+
+## Transport middleware envelope
+
+`transport-wrap` binds a bounded payload digest, content type, nonce, sender,
+recipient, context-tail digest, and shorter deadline into an Ed25519-signed
+envelope. `transport-verify` requires the service identity independently
+derived by the transport—such as an mTLS SPIFFE identity or Unix peer
+credential—to equal the signed sender before releasing the payload. Supplying
+an operation ID in a plain header is not sufficient.
+
+```console
+gensee boundary context transport-wrap \
+  --catalog catalog.signed.json --trusted-key organization.hex \
+  --chain gateway-to-worker.json --payload request.bin \
+  --content-type application_json --service-key gateway.seed \
+  --ttl-seconds 30 --output request.envelope.json
+
+gensee boundary context transport-verify \
+  --catalog catalog.signed.json --trusted-key organization.hex \
+  --chain gateway-to-worker.json --envelope request.envelope.json \
+  --peer-service gateway --output verified-request.bin
+```
+
+The CLI's `--peer-service` is an integration boundary, not caller testimony:
+production middleware must populate it from its authenticated channel. The
+same verifier is reusable in HTTP, RPC, queue, and local-socket adapters.

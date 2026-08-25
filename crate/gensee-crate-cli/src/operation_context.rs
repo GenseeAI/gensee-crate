@@ -3,7 +3,8 @@ use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use gensee_crate_rules::contract_catalog::SignedContractCatalog;
 use gensee_crate_rules::operation_context::{
     DownstreamEffectClaims, OperationContextChain, OperationContextClaims,
-    OperationContextSignature, SignedDownstreamEffect, SignedOperationContext,
+    OperationContextSignature, OperationTransportClaims, SignedDownstreamEffect,
+    SignedOperationContext, SignedOperationTransport, OPERATION_TRANSPORT_SCHEMA_VERSION,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -18,12 +19,137 @@ pub(crate) fn handle_operation_context(args: &[OsString]) -> io::Result<()> {
         Some("verify") => verify_context_command(rest),
         Some("effect-sign") => sign_effect(rest),
         Some("effect-verify") => verify_effect_command(rest),
+        Some("transport-wrap") => wrap_transport(rest),
+        Some("transport-verify") => verify_transport(rest),
         Some("--help" | "-h") => {
             print_context_usage();
             Ok(())
         }
         _ => Err(context_usage_error()),
     }
+}
+
+fn wrap_transport(args: &[OsString]) -> io::Result<()> {
+    reject_options(
+        args,
+        &[
+            "--catalog",
+            "--trusted-key",
+            "--chain",
+            "--payload",
+            "--content-type",
+            "--service-key",
+            "--ttl-seconds",
+            "--output",
+        ],
+        &[],
+    )?;
+    let catalog: SignedContractCatalog = read_catalog_json(
+        &required_path(args, "--catalog")?,
+        "signed contract catalog",
+    )?;
+    let now = unix_millis()?;
+    verify_signed_catalog(&catalog, &required_path(args, "--trusted-key")?, now)?;
+    let chain: OperationContextChain =
+        read_catalog_json(&required_path(args, "--chain")?, "operation context chain")?;
+    let tail = verify_context_chain(&chain, &catalog, now, None)?;
+    let payload = read_transport_payload(&required_path(args, "--payload")?)?;
+    let ttl = required_context_u64(args, "--ttl-seconds")?;
+    if ttl == 0 || ttl > 900 {
+        return Err(invalid_input("transport TTL must be in 1..=900 seconds"));
+    }
+    let expires = now
+        .saturating_add(ttl.saturating_mul(1000))
+        .min(tail.expires_at_ms);
+    let context_digest = digest_signed_context(chain.contexts.last().unwrap())?;
+    let claims = OperationTransportClaims {
+        schema_version: OPERATION_TRANSPORT_SCHEMA_VERSION,
+        envelope_id: format!("envelope_{}", uuid::Uuid::new_v4().simple()),
+        context_digest,
+        sender_service: tail.issuer_service.clone(),
+        recipient_service: tail.audience_service.clone(),
+        payload_digest: format!("sha256:{:x}", Sha256::digest(&payload)),
+        content_type: required_context_string(args, "--content-type")?,
+        nonce: format!("nonce_{}", uuid::Uuid::new_v4().simple()),
+        issued_at_ms: now,
+        expires_at_ms: expires,
+    };
+    claims
+        .validate_for_context(tail, &claims.context_digest, &claims.sender_service, now)
+        .map_err(invalid_data)?;
+    let key = read_signing_key(&required_path(args, "--service-key")?)?;
+    let service = catalog
+        .catalog
+        .operation_services
+        .iter()
+        .find(|s| s.service_id == claims.sender_service)
+        .ok_or_else(|| invalid_data("transport sender is not approved"))?;
+    if hex::encode(key.verifying_key().as_bytes()) != service.public_key_hex.to_lowercase() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "transport signing key does not match sender",
+        ));
+    }
+    let encoded = serde_json::to_vec(&claims).map_err(json_error)?;
+    write_json(
+        &required_path(args, "--output")?,
+        &SignedOperationTransport {
+            claims,
+            payload_hex: hex::encode(payload),
+            signature_hex: hex::encode(key.sign(&encoded).to_bytes()),
+        },
+    )
+}
+
+fn verify_transport(args: &[OsString]) -> io::Result<()> {
+    reject_options(
+        args,
+        &[
+            "--catalog",
+            "--trusted-key",
+            "--chain",
+            "--envelope",
+            "--peer-service",
+            "--output",
+        ],
+        &[],
+    )?;
+    let catalog: SignedContractCatalog = read_catalog_json(
+        &required_path(args, "--catalog")?,
+        "signed contract catalog",
+    )?;
+    let now = unix_millis()?;
+    verify_signed_catalog(&catalog, &required_path(args, "--trusted-key")?, now)?;
+    let chain: OperationContextChain =
+        read_catalog_json(&required_path(args, "--chain")?, "operation context chain")?;
+    let tail = verify_context_chain(&chain, &catalog, now, None)?;
+    let envelope: SignedOperationTransport = read_catalog_json(
+        &required_path(args, "--envelope")?,
+        "operation transport envelope",
+    )?;
+    let context_digest = digest_signed_context(chain.contexts.last().unwrap())?;
+    let peer = required_context_string(args, "--peer-service")?;
+    envelope
+        .claims
+        .validate_for_context(tail, &context_digest, &peer, now)
+        .map_err(invalid_data)?;
+    let payload = hex::decode(&envelope.payload_hex)
+        .map_err(|_| invalid_data("transport payload is not valid hex"))?;
+    if payload.len() > 4 * 1024 * 1024
+        || envelope.claims.payload_digest != format!("sha256:{:x}", Sha256::digest(&payload))
+    {
+        return Err(invalid_data("transport payload digest is invalid"));
+    }
+    verify_service_signature(
+        &catalog,
+        &envelope.claims.sender_service,
+        &serde_json::to_vec(&envelope.claims).map_err(json_error)?,
+        &OperationContextSignature {
+            algorithm: "ed25519".into(),
+            signature_hex: envelope.signature_hex,
+        },
+    )?;
+    write_atomic_nofollow(&required_path(args, "--output")?, &payload, 0o600)
 }
 
 fn issue_context(args: &[OsString]) -> io::Result<()> {
@@ -386,6 +512,27 @@ fn optional_string(args: &[OsString], name: &str) -> io::Result<Option<String>> 
     optional_path(args, name).map(|value| value.map(|path| path.to_string_lossy().to_string()))
 }
 
+fn required_context_string(args: &[OsString], name: &str) -> io::Result<String> {
+    optional_string(args, name)?.ok_or_else(context_usage_error)
+}
+
+fn required_context_u64(args: &[OsString], name: &str) -> io::Result<u64> {
+    required_context_string(args, name)?
+        .parse()
+        .map_err(|_| invalid_input(format!("{name} must be an unsigned integer")))
+}
+
+fn read_transport_payload(path: &Path) -> io::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4 * 1024 * 1024
+    {
+        return Err(invalid_input(
+            "transport payload must be a bounded regular file",
+        ));
+    }
+    fs::read(path)
+}
+
 fn has_flag(args: &[OsString], name: &str) -> bool {
     args.iter().any(|value| value == name)
 }
@@ -403,12 +550,12 @@ fn json_error(error: serde_json::Error) -> io::Error {
 }
 
 fn context_usage_error() -> io::Error {
-    invalid_input("usage: gensee boundary context <issue|verify|effect-sign|effect-verify> ...")
+    invalid_input("usage: gensee boundary context <issue|verify|effect-sign|effect-verify|transport-wrap|transport-verify> ...")
 }
 
 fn print_context_usage() {
     println!(
-        "gensee boundary context\n\nUSAGE:\n  gensee boundary context issue --catalog <signed.json> --trusted-key <org.hex> --claims <claims.json> --service-key <seed.hex> [--parent-chain <chain.json>] --output <chain.json>\n  gensee boundary context verify --catalog <signed.json> --trusted-key <org.hex> --chain <chain.json> [--audience <service>] [--json]\n  gensee boundary context effect-sign --catalog <signed.json> --trusted-key <org.hex> --chain <chain.json> --claims <effect.json> --service-key <seed.hex> --output <signed-effect.json>\n  gensee boundary context effect-verify --catalog <signed.json> --trusted-key <org.hex> --chain <chain.json> --effect <signed-effect.json>"
+        "gensee boundary context\n\nUSAGE:\n  gensee boundary context issue --catalog <signed.json> --trusted-key <org.hex> --claims <claims.json> --service-key <seed.hex> [--parent-chain <chain.json>] --output <chain.json>\n  gensee boundary context verify --catalog <signed.json> --trusted-key <org.hex> --chain <chain.json> [--audience <service>] [--json]\n  gensee boundary context effect-sign --catalog <signed.json> --trusted-key <org.hex> --chain <chain.json> --claims <effect.json> --service-key <seed.hex> --output <signed-effect.json>\n  gensee boundary context effect-verify --catalog <signed.json> --trusted-key <org.hex> --chain <chain.json> --effect <signed-effect.json>\n  gensee boundary context transport-wrap --catalog <signed.json> --trusted-key <org.hex> --chain <chain.json> --payload <file> --content-type <token> --service-key <seed.hex> --ttl-seconds <n> --output <envelope.json>\n  gensee boundary context transport-verify --catalog <signed.json> --trusted-key <org.hex> --chain <chain.json> --envelope <envelope.json> --peer-service <authenticated-id> --output <payload>"
     );
 }
 

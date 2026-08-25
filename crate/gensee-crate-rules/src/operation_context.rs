@@ -56,6 +56,67 @@ pub struct OperationContextChain {
     pub contexts: Vec<SignedOperationContext>,
 }
 
+pub const OPERATION_TRANSPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Transport-neutral authenticated request envelope. HTTP, RPC, task queue,
+/// and local-socket middleware can carry the same object after independently
+/// deriving `peer_service` from mTLS or local peer credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationTransportClaims {
+    pub schema_version: u32,
+    pub envelope_id: String,
+    pub context_digest: String,
+    pub sender_service: String,
+    pub recipient_service: String,
+    pub payload_digest: String,
+    pub content_type: String,
+    pub nonce: String,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedOperationTransport {
+    pub claims: OperationTransportClaims,
+    pub payload_hex: String,
+    pub signature_hex: String,
+}
+
+impl OperationTransportClaims {
+    pub fn validate_for_context(
+        &self,
+        tail: &OperationContextClaims,
+        context_digest: &str,
+        peer_service: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        if self.schema_version != OPERATION_TRANSPORT_SCHEMA_VERSION
+            || !token(&self.envelope_id)
+            || !token(&self.sender_service)
+            || !token(&self.recipient_service)
+            || !token(&self.content_type)
+            || !token(&self.nonce)
+            || !sha256(&self.context_digest)
+            || !sha256(&self.payload_digest)
+            || self.context_digest != context_digest
+            || self.sender_service != tail.issuer_service
+            || self.recipient_service != tail.audience_service
+            || peer_service != self.sender_service
+            || self.issued_at_ms < tail.issued_at_ms
+            || self.issued_at_ms >= self.expires_at_ms
+            || self.expires_at_ms > tail.expires_at_ms
+            || now_ms >= self.expires_at_ms
+        {
+            return Err(
+                "operation transport is not bound to context and authenticated peer".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DownstreamEffectClaims {
@@ -262,5 +323,41 @@ mod tests {
         let mut widened = grant("grant_a");
         widened.scope_digest = format!("sha256:{}", "22".repeat(32));
         assert!(validate_attenuation(&parent, &[widened]).is_err());
+    }
+
+    #[test]
+    fn transport_requires_the_authenticated_sender_and_exact_context() {
+        let tail = OperationContextClaims {
+            schema_version: OPERATION_CONTEXT_SCHEMA_VERSION,
+            token_id: "context".into(),
+            operation_id: "operation".into(),
+            generation: 1,
+            issuer_service: "gateway".into(),
+            audience_service: "worker".into(),
+            catalog_digest: format!("sha256:{}", "11".repeat(32)),
+            contract_digest: format!("sha256:{}", "22".repeat(32)),
+            parent_context_digest: Some(format!("sha256:{}", "33".repeat(32))),
+            issued_at_ms: 100,
+            expires_at_ms: 900,
+            grants: Vec::new(),
+        };
+        let claims = OperationTransportClaims {
+            schema_version: OPERATION_TRANSPORT_SCHEMA_VERSION,
+            envelope_id: "envelope".into(),
+            context_digest: format!("sha256:{}", "44".repeat(32)),
+            sender_service: "gateway".into(),
+            recipient_service: "worker".into(),
+            payload_digest: format!("sha256:{}", "55".repeat(32)),
+            content_type: "application_json".into(),
+            nonce: "nonce".into(),
+            issued_at_ms: 110,
+            expires_at_ms: 800,
+        };
+        assert!(claims
+            .validate_for_context(&tail, &claims.context_digest, "gateway", 200)
+            .is_ok());
+        assert!(claims
+            .validate_for_context(&tail, &claims.context_digest, "attacker", 200)
+            .is_err());
     }
 }
