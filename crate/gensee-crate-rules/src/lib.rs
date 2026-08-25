@@ -1,5 +1,6 @@
 use gensee_crate_core::{AgentEvent, EventKind};
 
+pub mod boundary_proof;
 pub mod capability;
 pub mod capability_broker;
 pub mod capability_fault;

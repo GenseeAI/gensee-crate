@@ -56,6 +56,7 @@ pub(crate) fn handle_operation_boundary(args: Vec<OsString>) -> io::Result<()> {
         Some("context") => handle_operation_context(rest),
         Some("verifier") => handle_semantic_verifier(rest),
         Some("promotion") => handle_transactional_promotion(rest),
+        Some("proof") => handle_boundary_proof(rest),
         Some("validate") => boundary_validate(rest),
         Some("audit") => boundary_audit(rest),
         Some("run") => boundary_run(BoundaryRunConfig::parse(rest)?),
@@ -347,7 +348,7 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
     let semantically_verified = false;
     let promotion_reason = if !process_succeeded {
         "producer did not complete successfully"
-    } else if !process_group_drained {
+    } else if !execution_subject_drained {
         "producer process group did not terminate cleanly"
     } else if !structurally_eligible {
         "structural product verification failed"
@@ -395,7 +396,7 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
             root_start_time,
             exit_code,
             timed_out,
-            process_group_drained,
+            execution_subject_drained,
         },
         product,
         promotion: OperationPromotionEvidence {

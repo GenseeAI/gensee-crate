@@ -642,7 +642,7 @@ fn sign_promotion_receipt(receipt: &TransactionalPromotionReceipt) -> io::Result
     )
 }
 
-fn verify_promotion_receipt(receipt: &TransactionalPromotionReceipt) -> io::Result<()> {
+pub(crate) fn verify_promotion_receipt(receipt: &TransactionalPromotionReceipt) -> io::Result<()> {
     let expected = sign_promotion_receipt(receipt)?;
     if expected != receipt.host_signature {
         return Err(invalid_data(
@@ -946,7 +946,7 @@ mod tests {
                 root_start_time: Some(1),
                 exit_code: Some(0),
                 timed_out: false,
-                process_group_drained: true,
+                execution_subject_drained: true,
             },
             product: Some(product_evidence.clone()),
             promotion: OperationPromotionEvidence {
