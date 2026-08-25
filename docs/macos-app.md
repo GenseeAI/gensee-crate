@@ -6,7 +6,7 @@ scope drift and verification gaps, creates recovery points before risky
 workspace changes, and audits configuration that can influence agent behavior.
 Your activity and policy stay on your Mac.
 
-**[Download the latest notarized macOS app](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)**
+**[Download the latest notarized macOS app](https://www.gensee.ai/download/crate-macos.html?placement=docs-macos-app)**
 
 The app does not implement a second Gensee backend. It embeds the `gensee` CLI
 built from this monorepo and uses the existing Rust crates, policy engine, setup
