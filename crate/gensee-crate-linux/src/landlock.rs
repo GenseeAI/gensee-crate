@@ -30,14 +30,12 @@ const BASE_WRITE_ACCESS: u64 = ACCESS_FS_WRITE_FILE
     | ACCESS_FS_MAKE_FIFO
     | ACCESS_FS_MAKE_BLOCK
     | ACCESS_FS_MAKE_SYM;
-const RUNTIME_WRITE_PATHS: &[&str] = &[
-    "/tmp",
-    "/run",
-    "/dev/null",
-    "/dev/tty",
-    "/dev/stdout",
-    "/dev/stderr",
-];
+// The operation contract supplies every writable root. Adding ambient paths
+// such as /tmp would silently make an original workspace beneath that path
+// writable, while special descriptors such as /dev/stdout are not valid
+// Landlock path-beneath parents. Already-open standard descriptors remain
+// usable without any pathname mutation grant.
+const RUNTIME_WRITE_PATHS: &[&str] = &[];
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -196,8 +194,49 @@ mod tests {
     }
 
     #[test]
-    fn runtime_write_paths_include_standard_output_symlinks() {
-        assert!(RUNTIME_WRITE_PATHS.contains(&"/dev/stdout"));
-        assert!(RUNTIME_WRITE_PATHS.contains(&"/dev/stderr"));
+    fn write_sandbox_has_no_implicit_host_mutation_roots() {
+        assert!(RUNTIME_WRITE_PATHS.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_sandbox_does_not_expand_a_declared_tmp_subtree() {
+        let root = std::env::temp_dir().join(format!(
+            "gensee-landlock-scope-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let original = root.join("original");
+        let staged = root.join("staged");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(&staged).unwrap();
+
+        // Run in a disposable child because Landlock restriction is
+        // irreversible for the calling thread and its descendants.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed: {}", io::Error::last_os_error());
+        if child == 0 {
+            let result = apply_landlock_write_sandbox(&[staged.to_string_lossy().into_owned()])
+                .and_then(|()| {
+                    std::fs::write(staged.join("allowed"), b"ok")?;
+                    match std::fs::write(original.join("denied"), b"bad") {
+                        Err(error)
+                            if matches!(error.raw_os_error(), Some(code) if code == libc::EACCES || code == libc::EPERM) => {
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                        Ok(()) => Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "undeclared sibling beneath /tmp remained writable",
+                        )),
+                    }
+                });
+            unsafe { libc::_exit(i32::from(result.is_err())) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 }
