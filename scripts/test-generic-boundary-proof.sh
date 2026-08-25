@@ -9,7 +9,7 @@ if [[ "$(id -u)" != "0" ]]; then
   echo "run this proof as root" >&2
   exit 77
 fi
-for command in cargo ip nft jq python3 openssl; do
+for command in cargo ip nft jq python3 openssl sha256sum; do
   command -v "$command" >/dev/null || {
     echo "missing prerequisite: $command" >&2
     exit 77
@@ -113,12 +113,31 @@ UID_VALUE="$(id -u)"
 ANALYZER_PUBLIC="$(tr -d '\n' <"$RUNTIME_ROOT/analyzer-public.hex")"
 VERIFIER_PUBLIC="$(tr -d '\n' <"$RUNTIME_ROOT/verifier-public.hex")"
 
+install -o root -g root -m 0500 \
+  "$REPOSITORY_ROOT/integrations/boundary/generic-proof/verifier.py" \
+  "$RUNTIME_ROOT/verifier.py"
+VERIFIER_EXECUTABLE_DIGEST="sha256:$(sha256sum "$RUNTIME_ROOT/verifier.py" | awk '{print $1}')"
+jq -n \
+  --arg executable "$RUNTIME_ROOT/verifier.py" \
+  --arg executable_digest "$VERIFIER_EXECUTABLE_DIGEST" \
+  '{
+    verifier_id: "conformance_verifier",
+    policy_version: "conformance_policy_v1",
+    executable: $executable,
+    executable_sha256: $executable_digest,
+    args: [],
+    working_directory: "/",
+    max_runtime_seconds: 20
+  }' >"$RUNTIME_ROOT/verifier-config.json"
+VERIFIER_CONFIG_DIGEST="sha256:$(jq -cj . "$RUNTIME_ROOT/verifier-config.json" | sha256sum | awk '{print $1}')"
+
 jq -n \
   --argjson now "$NOW_MS" \
   --argjson expires "$EXPIRES_MS" \
   --argjson uid "$UID_VALUE" \
   --arg analyzer_public "$ANALYZER_PUBLIC" \
   --arg verifier_public "$VERIFIER_PUBLIC" \
+  --arg verifier_config_digest "$VERIFIER_CONFIG_DIGEST" \
   --arg promotion_root "$RUNTIME_ROOT/promoted" \
   '{
     schema_version: 1,
@@ -173,7 +192,9 @@ jq -n \
       verifier_id: "conformance_verifier",
       public_key_hex: $verifier_public,
       profiles: ["structured_result_v1"],
-      policy_versions: ["conformance_policy_v1"]
+      policy_versions: ["conformance_policy_v1"],
+      require_isolation: true,
+      isolated_runtime_config_digest: $verifier_config_digest
     }],
     fallback: {on_ambiguous_intent: "deny"}
   }' >"$RUNTIME_ROOT/catalog.json"
@@ -224,13 +245,11 @@ jq -n \
   --manifest "$RUNTIME_ROOT/operation-manifest.json" \
   --ttl-seconds 300 \
   --output "$RUNTIME_ROOT/verifier-request.json"
-"$GENSEE" boundary verifier attest \
+"$GENSEE" boundary verifier run \
+  --catalog "$RUNTIME_ROOT/catalog.signed.json" \
+  --trusted-key "$RUNTIME_ROOT/organization-public.hex" \
   --request "$RUNTIME_ROOT/verifier-request.json" \
-  --verifier-id "conformance_verifier" \
-  --policy-version "conformance_policy_v1" \
-  --verdict accept \
-  --reason "fixture_semantics_valid" \
-  --effects-digest "sha256:$(printf '11%.0s' $(seq 1 32))" \
+  --config "$RUNTIME_ROOT/verifier-config.json" \
   --verifier-key "$RUNTIME_ROOT/verifier.seed" \
   --output "$RUNTIME_ROOT/verifier-receipt.json"
 "$GENSEE" boundary verifier verify \
@@ -259,6 +278,8 @@ if grep -q 'accepted:18081' "$RUNTIME_ROOT/server.log"; then
   echo "unexpected endpoint received traffic" >&2
   exit 1
 fi
+sleep 0.2
+[[ "$(grep -c 'accepted:18080' "$RUNTIME_ROOT/server.log")" -eq 2 ]]
 
 BUNDLE="$RUNTIME_ROOT/proof-bundle"
 mkdir -m 700 "$BUNDLE" "$BUNDLE/promoted-workspace" "$BUNDLE/promoted-workspace/out"
@@ -284,5 +305,13 @@ jq -e '
   .process.execution_subject_drained == true and
   .product.structurally_valid == true
 ' "$RUNTIME_ROOT/operation-manifest.json" >/dev/null
+
+jq -e '
+  .claims.isolation.profile == "linux_landlock_seccomp_no_write_no_network_no_fork_v1" and
+  .claims.isolation.network_denied == true and
+  .claims.isolation.process_creation_denied == true and
+  .claims.isolation.filesystem_mutation_denied == true and
+  .claims.reason_codes == ["fixture_semantics_valid", "isolation_verified"]
+' "$RUNTIME_ROOT/verifier-receipt.json" >/dev/null
 
 echo "generic privileged boundary proof passed"
