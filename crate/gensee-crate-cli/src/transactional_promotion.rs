@@ -216,6 +216,18 @@ fn apply_promotion(args: &[OsString]) -> io::Result<()> {
             let _ = fs::remove_dir_all(&object);
             return Err(at_stage("freeze", error));
         }
+        sync_tree(&object)?;
+        let frozen = verify_structural_product(&object, product_contract)?;
+        if frozen.digest != manifest_product.digest
+            || frozen.entries != manifest_product.entries
+            || frozen.bytes != manifest_product.bytes
+        {
+            let _ = fs::remove_dir_all(&object);
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "read-only promotion object does not match verified staged evidence",
+            ));
+        }
         sync_dir(&objects)?;
     } else {
         let copied = verify_structural_product(&object, product_contract)?;
@@ -487,6 +499,8 @@ fn copy_product(source: &Path, target: &Path, deadline: Instant) -> io::Result<(
             let entry = entry?;
             copy_product(&entry.path(), &target.join(entry.file_name()), deadline)?;
         }
+        fs::set_permissions(target, metadata.permissions())?;
+        sync_dir(target)?;
     } else if metadata.is_file() {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
@@ -511,6 +525,8 @@ fn copy_product(source: &Path, target: &Path, deadline: Instant) -> io::Result<(
             output.write_all(&buffer[..read])?;
         }
         output.sync_all()?;
+        fs::set_permissions(target, metadata.permissions())?;
+        output.sync_all()?;
     } else {
         return Err(io::Error::new(
             ErrorKind::PermissionDenied,
@@ -529,6 +545,23 @@ fn freeze_tree(path: &Path) -> io::Result<()> {
         set_mode(path, 0o555)
     } else {
         set_mode(path, 0o444)
+    }
+}
+
+fn sync_tree(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            sync_tree(&entry?.path())?;
+        }
+        sync_dir(path)
+    } else if metadata.is_file() {
+        File::open(path)?.sync_all()
+    } else {
+        Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "promotion sync rejects special filesystem objects",
+        ))
     }
 }
 
@@ -845,6 +878,7 @@ mod tests {
         };
         let catalog_digest = digest_json(&signed_catalog.catalog).unwrap();
         let contract_digest = digest_json(&contract).unwrap();
+        seal_structural_product(&staged.join("out/result.json")).unwrap();
         let product_evidence = verify_structural_product(&staged, &product_contract).unwrap();
         let manifest = OperationRunManifest {
             schema_version: 1,

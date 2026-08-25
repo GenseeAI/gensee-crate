@@ -308,16 +308,34 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
         && (std::env::consts::OS != "linux"
             || release_attestation.cgroup_state
                 == crate::operation_supervisor::OperationCgroupState::Released);
+    let process_succeeded = status.success() && !timed_out;
     let product = if process_group_drained {
         contract
             .product
             .as_ref()
-            .map(|product| verify_structural_product(&staged, product))
+            .map(|product| {
+                let initial = verify_structural_product(&staged, product)?;
+                if process_succeeded && initial.structurally_valid {
+                    seal_structural_product(&staged.join(&product.path))?;
+                    let sealed = verify_structural_product(&staged, product)?;
+                    if !sealed.structurally_valid
+                        || sealed.entries != initial.entries
+                        || sealed.bytes != initial.bytes
+                    {
+                        return Err(io::Error::new(
+                            ErrorKind::PermissionDenied,
+                            "product changed while its staged tree was being sealed",
+                        ));
+                    }
+                    Ok(sealed)
+                } else {
+                    Ok(initial)
+                }
+            })
             .transpose()?
     } else {
         None
     };
-    let process_succeeded = status.success() && !timed_out;
     let structurally_eligible = process_succeeded
         && process_group_drained
         && product
@@ -926,6 +944,43 @@ pub(crate) fn verify_structural_product(
     })
 }
 
+/// Canonicalizes an eligible staged product to read-only modes before a
+/// semantic verifier sees its digest. Promotion preserves these modes, so the
+/// verifier, manifest, immutable object, and proof bundle name the same tree.
+#[cfg(unix)]
+pub(crate) fn seal_structural_product(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "cannot seal a symlink product",
+        ));
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            seal_structural_product(&entry?.path())?;
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555))
+    } else if metadata.is_file() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o444))
+    } else {
+        Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "cannot seal a special filesystem object",
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn seal_structural_product(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "read-only product sealing requires Unix filesystem modes",
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_product(
     root: &Path,
@@ -1285,6 +1340,26 @@ mod tests {
         .unwrap();
         assert!(evidence.structurally_valid);
         assert_eq!(evidence.semantic_status, "not_claimed");
+        #[cfg(unix)]
+        {
+            seal_structural_product(&root.join("out/result.json")).unwrap();
+            let sealed = verify_structural_product(
+                &root,
+                &product(StructuralProductType::StructuredResult, "out/result.json"),
+            )
+            .unwrap();
+            assert_ne!(sealed.digest, evidence.digest);
+            seal_structural_product(&root.join("out/result.json")).unwrap();
+            assert_eq!(
+                sealed.digest,
+                verify_structural_product(
+                    &root,
+                    &product(StructuralProductType::StructuredResult, "out/result.json"),
+                )
+                .unwrap()
+                .digest
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

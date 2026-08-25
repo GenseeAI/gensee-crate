@@ -1,8 +1,11 @@
 # Generic transactional promotion
 
-The producer writes only to a staged product slot. A trusted destination and
-active-pointer name are part of the organization-signed operation contract;
-the producer cannot choose where its result is installed.
+The producer writes only to a staged product slot. After the complete
+execution subject is drained, Gensee canonicalizes the eligible product to
+read-only modes and computes the digest that a semantic verifier sees. A
+trusted destination and active-pointer name are part of the
+organization-signed operation contract; the producer cannot choose where its
+result is installed.
 
 `gensee boundary promotion apply` admits a product only after all of these
 conditions hold under one destination lock:
@@ -21,11 +24,13 @@ conditions hold under one destination lock:
 6. the caller's expected active target still matches, providing a
    compare-and-swap precondition.
 
-The host copies the product into a deterministic immutable object, re-scans it,
-freezes it read-only, and atomically renames a relative symlink to select that
-object. Promotion supports every structural product class because it operates
-on the declared product tree rather than a domain-specific installation
-format.
+The host preserves the sealed modes while copying the product into a
+deterministic immutable object, re-scans both before and after its read-only
+freeze, and atomically renames a relative symlink to select that object. The
+manifest, verifier receipt, object, and public proof therefore retain one exact
+mode-bound digest. Promotion supports every structural product class because
+it operates on the declared product tree rather than a domain-specific
+installation format.
 
 A host-signed crash journal records `prepared`, `switching`, `complete`, and
 `rolled_back` phases together with the old and new targets and all evidence
