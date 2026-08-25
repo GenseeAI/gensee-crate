@@ -72,6 +72,13 @@ derived by the transport—such as an mTLS SPIFFE identity or Unix peer
 credential—to equal the signed sender before releasing the payload. Supplying
 an operation ID in a plain header is not sufficient.
 
+After signature, peer, context, deadline, and payload verification, the
+recipient atomically records the context/recipient/nonce tuple in its private
+state before releasing the payload. A second delivery of the same envelope is
+denied even while its signature and TTL remain valid. The nonce store is part
+of the receiving service's trusted deployment state and must not be shared
+with an untrusted caller.
+
 ```console
 gensee boundary context transport-wrap \
   --catalog catalog.signed.json --trusted-key organization.hex \

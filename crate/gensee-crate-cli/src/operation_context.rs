@@ -9,7 +9,10 @@ use gensee_crate_rules::operation_context::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn handle_operation_context(args: &[OsString]) -> io::Result<()> {
@@ -149,7 +152,54 @@ fn verify_transport(args: &[OsString]) -> io::Result<()> {
             signature_hex: envelope.signature_hex,
         },
     )?;
+    consume_transport_nonce(&envelope.claims)?;
     write_atomic_nofollow(&required_path(args, "--output")?, &payload, 0o600)
+}
+
+fn consume_transport_nonce(claims: &OperationTransportClaims) -> io::Result<()> {
+    consume_transport_nonce_at(
+        &default_root()?.join("operation-context/consumed-transport-nonces"),
+        claims,
+    )
+}
+
+fn consume_transport_nonce_at(root: &Path, claims: &OperationTransportClaims) -> io::Result<()> {
+    create_restrictive_dir_all(root)?;
+    let key = format!(
+        "{:x}",
+        Sha256::digest(
+            [
+                claims.context_digest.as_bytes(),
+                b"\0",
+                claims.recipient_service.as_bytes(),
+                b"\0",
+                claims.nonce.as_bytes(),
+            ]
+            .concat()
+        )
+    );
+    let path = root.join(key);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&path).map_err(|error| {
+        if error.kind() == ErrorKind::AlreadyExists {
+            io::Error::new(
+                ErrorKind::PermissionDenied,
+                "operation transport nonce was already consumed",
+            )
+        } else {
+            error
+        }
+    })?;
+    writeln!(
+        file,
+        "{} {} {}",
+        claims.envelope_id, claims.issued_at_ms, claims.expires_at_ms
+    )?;
+    file.sync_all()?;
+    File::open(root)?.sync_all()
 }
 
 fn issue_context(args: &[OsString]) -> io::Result<()> {
@@ -706,6 +756,34 @@ mod tests {
         invented_contract.contexts[0] =
             sign_context(invented_contract.contexts[0].claims.clone(), &root_key);
         assert!(verify_context_chain(&invented_contract, &catalog, 200, None).is_err());
+    }
+
+    #[test]
+    fn transport_nonce_is_consumed_once_for_context_and_recipient() {
+        let root = env::temp_dir().join(format!(
+            "gensee-context-nonce-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let claims = OperationTransportClaims {
+            schema_version: OPERATION_TRANSPORT_SCHEMA_VERSION,
+            envelope_id: "envelope_one".into(),
+            context_digest: format!("sha256:{}", "11".repeat(32)),
+            sender_service: "gateway".into(),
+            recipient_service: "worker".into(),
+            payload_digest: format!("sha256:{}", "22".repeat(32)),
+            content_type: "application_json".into(),
+            nonce: "nonce_one".into(),
+            issued_at_ms: 100,
+            expires_at_ms: 200,
+        };
+        consume_transport_nonce_at(&root, &claims).unwrap();
+        assert_eq!(
+            consume_transport_nonce_at(&root, &claims)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn sign_context(claims: OperationContextClaims, key: &SigningKey) -> SignedOperationContext {
