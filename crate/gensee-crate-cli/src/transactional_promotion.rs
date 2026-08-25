@@ -312,7 +312,7 @@ fn apply_promotion_with_manifest_verifier(
 fn verify_promotable_manifest_state(manifest: &OperationRunManifest) -> io::Result<()> {
     if manifest.process.exit_code != Some(0)
         || manifest.process.timed_out
-        || !manifest.process.process_group_drained
+        || !manifest.process.execution_subject_drained
         || !manifest.enforcement.os_execution_binding_established
         || !manifest.promotion.structurally_eligible
         || manifest
@@ -971,7 +971,7 @@ mod tests {
             ErrorKind::PermissionDenied
         );
         let mut undrained_manifest = manifest.clone();
-        undrained_manifest.process.process_group_drained = false;
+        undrained_manifest.process.execution_subject_drained = false;
         assert_eq!(
             verify_promotable_manifest_state(&undrained_manifest)
                 .unwrap_err()

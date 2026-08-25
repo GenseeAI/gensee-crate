@@ -305,12 +305,12 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
     }
     operation.finish(exit_code, timed_out)?;
     let release_attestation = operation.attestation()?;
-    let process_group_drained = execution_subject_drained_before_release
+    let execution_subject_drained = execution_subject_drained_before_release
         && (std::env::consts::OS != "linux"
             || release_attestation.cgroup_state
                 == crate::operation_supervisor::OperationCgroupState::Released);
     let process_succeeded = status.success() && !timed_out;
-    let product = if process_group_drained {
+    let product = if execution_subject_drained {
         contract
             .product
             .as_ref()
@@ -338,7 +338,7 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
         None
     };
     let structurally_eligible = process_succeeded
-        && process_group_drained
+        && execution_subject_drained
         && product
             .as_ref()
             .is_none_or(|evidence| evidence.structurally_valid);

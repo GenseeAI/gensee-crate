@@ -202,6 +202,7 @@ pub(crate) fn verify_and_resolve(
         observation_digest,
         inference_digest: digest_bytes(&inference_bytes),
         contract,
+        executable_sha256: observation.caller.executable_sha256.clone(),
         canonical_executable: normalized.canonical_executable,
     })
 }
@@ -239,25 +240,8 @@ pub(crate) fn verify_intent_evidence(
         .map_err(|error| invalid_data(format!("invalid intent inference signature: {error}")))?;
     signed_catalog
         .catalog
-        .resolve_intent(&observation, &signed_inference.inference, now_ms)
-        .map_err(|error| io::Error::new(ErrorKind::PermissionDenied, error))?;
-    let contract = signed_catalog
-        .catalog
-        .contract(&resolution.selected_contract_id)
-        .ok_or_else(|| invalid_data("resolved contract disappeared from catalog"))?
-        .contract
-        .clone();
-    Ok(ResolvedAdmission {
-        resolution,
-        catalog_digest: digest_bytes(
-            &serde_json::to_vec(&signed_catalog.catalog).map_err(json_error)?,
-        ),
-        observation_digest,
-        inference_digest: digest_bytes(&inference_bytes),
-        contract,
-        executable_sha256: observation.caller.executable_sha256.clone(),
-        canonical_executable: normalized.canonical_executable,
-    })
+        .resolve_intent(observation, &signed_inference.inference, now_ms)
+        .map_err(|error| io::Error::new(ErrorKind::PermissionDenied, error))
 }
 
 struct NormalizedCommand {

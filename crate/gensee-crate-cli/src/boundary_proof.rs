@@ -159,6 +159,7 @@ fn validate_bundle_evidence(
         verify_intent_evidence(&catalog, &observation, &inference, validation_time_ms)?;
     let manifest: OperationRunManifest =
         read_catalog_json(&bundle.join(PROOF_FILES[4]), "operation run manifest")?;
+    verify_operation_manifest(&manifest)?;
     let request: VerifierRequest =
         read_catalog_json(&bundle.join(PROOF_FILES[5]), "semantic verifier request")?;
     let receipt: SignedVerifierReceipt =
@@ -220,6 +221,8 @@ fn validate_bundle_evidence(
         .map(|effect| effect.packets)
         .sum::<u64>();
     if !manifest.enforcement.os_execution_binding_established
+        || manifest.process.exit_code != Some(0)
+        || manifest.process.timed_out
         || allowed_packets == 0
         || denied_packets == 0
         || !manifest.process.execution_subject_drained

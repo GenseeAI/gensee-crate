@@ -558,7 +558,7 @@ mod tests {
                 root_start_time: Some(456),
                 exit_code: Some(0),
                 timed_out: false,
-                process_group_drained: true,
+                execution_subject_drained: true,
             },
             product: Some(StructuralProductEvidence {
                 kind: StructuralProductType::StructuredResult,

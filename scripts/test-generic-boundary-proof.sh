@@ -24,6 +24,8 @@ REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_ROOT="$(mktemp -d /tmp/gensee-generic-proof.XXXXXX)"
 INTERFACE="gensee-proof0"
 SERVER_PID=""
+SYSTEM_KEY_DIR_CREATED="false"
+SYSTEM_KEYS_INSTALLED="false"
 
 cleanup() {
   if [[ -n "$SERVER_PID" ]]; then
@@ -31,6 +33,14 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
   fi
   ip link delete "$INTERFACE" 2>/dev/null || true
+  if [[ "$SYSTEM_KEYS_INSTALLED" == "true" ]]; then
+    rm -f /etc/gensee/catalog-root-public-key.hex \
+      /etc/gensee/operation-manifest-signing-key.hex \
+      /etc/gensee/operation-manifest-public-key.hex
+  fi
+  if [[ "$SYSTEM_KEY_DIR_CREATED" == "true" ]]; then
+    rmdir /etc/gensee 2>/dev/null || true
+  fi
   rm -rf "$RUNTIME_ROOT"
 }
 trap cleanup EXIT
@@ -67,6 +77,7 @@ openssl rand -hex 32 >"$RUNTIME_ROOT/organization.seed"
 openssl rand -hex 32 >"$RUNTIME_ROOT/analyzer.seed"
 openssl rand -hex 32 >"$RUNTIME_ROOT/verifier.seed"
 openssl rand -hex 32 >"$RUNTIME_ROOT/proof.seed"
+openssl rand -hex 32 >"$RUNTIME_ROOT/manifest.seed"
 "$GENSEE" boundary catalog public-key \
   --key "$RUNTIME_ROOT/organization.seed" --output "$RUNTIME_ROOT/organization-public.hex"
 "$GENSEE" boundary catalog public-key \
@@ -75,6 +86,26 @@ openssl rand -hex 32 >"$RUNTIME_ROOT/proof.seed"
   --key "$RUNTIME_ROOT/verifier.seed" --output "$RUNTIME_ROOT/verifier-public.hex"
 "$GENSEE" boundary catalog public-key \
   --key "$RUNTIME_ROOT/proof.seed" --output "$RUNTIME_ROOT/proof-public.hex"
+"$GENSEE" boundary catalog public-key \
+  --key "$RUNTIME_ROOT/manifest.seed" --output "$RUNTIME_ROOT/manifest-public.hex"
+
+if [[ ! -d /etc/gensee ]]; then
+  mkdir -m 700 /etc/gensee
+  SYSTEM_KEY_DIR_CREATED="true"
+fi
+if [[ -e /etc/gensee/catalog-root-public-key.hex \
+  || -e /etc/gensee/operation-manifest-signing-key.hex \
+  || -e /etc/gensee/operation-manifest-public-key.hex ]]; then
+  echo "refusing to replace installed Gensee trust material; use a dedicated proof host" >&2
+  exit 77
+fi
+install -m 644 "$RUNTIME_ROOT/organization-public.hex" \
+  /etc/gensee/catalog-root-public-key.hex
+install -m 600 "$RUNTIME_ROOT/manifest.seed" \
+  /etc/gensee/operation-manifest-signing-key.hex
+install -m 644 "$RUNTIME_ROOT/manifest-public.hex" \
+  /etc/gensee/operation-manifest-public-key.hex
+SYSTEM_KEYS_INSTALLED="true"
 
 NOW_MS="$(( $(date +%s) * 1000 ))"
 EXPIRES_MS="$(( NOW_MS + 3600000 ))"
@@ -183,7 +214,6 @@ jq -n \
 
 "$GENSEE" boundary run \
   --catalog "$RUNTIME_ROOT/catalog.signed.json" \
-  --trusted-key "$RUNTIME_ROOT/organization-public.hex" \
   --observation "$RUNTIME_ROOT/observation.json" \
   --inference "$RUNTIME_ROOT/inference.signed.json" \
   --workspace "$RUNTIME_ROOT/workspace" \

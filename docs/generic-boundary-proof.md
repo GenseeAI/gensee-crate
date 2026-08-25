@@ -32,8 +32,9 @@ operation execution subject. It then:
    verdict, closes operation-scoped broker authority, and atomically promotes
    the unchanged result;
 7. signs a fixed evidence bundle and runs `gensee boundary proof verify` to
-   re-check its hashes, catalog, intent evidence, operation identity, network
-   effects, verifier receipt, promoted content, and promotion bindings.
+   re-check its hashes, host-authenticated operation manifest, catalog, intent
+   evidence, operation identity, network effects, verifier receipt, promoted
+   content, and promotion bindings.
 
 The Python programs are traffic/product fixtures, not trusted enforcement
 components. Replacing them with another opaque executable does not change the
@@ -57,6 +58,11 @@ verdict; it does not infer semantic safety from hashes or file layout.
   giving the producer control of the destination.
 - A verifier with only the bundle and trusted public keys can detect evidence
   or product substitution.
+
+The proof signer and verifier both authenticate the operation manifest against
+the separately provisioned host-manifest public key before using its operation,
+process, network, or product fields. Signing a bundle cannot turn a fabricated
+producer manifest into boundary evidence.
 
 It does not establish that a probabilistic analyzer is always correct or that
 one semantic verifier understands every domain. The deterministic safety
