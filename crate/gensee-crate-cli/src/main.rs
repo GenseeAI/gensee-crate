@@ -111,6 +111,8 @@ mod operation_context;
 pub(crate) use operation_context::*;
 mod semantic_verifier;
 pub(crate) use semantic_verifier::*;
+mod transactional_promotion;
+pub(crate) use transactional_promotion::*;
 mod falco;
 pub(crate) use falco::*;
 mod replay;

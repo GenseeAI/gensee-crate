@@ -55,6 +55,7 @@ pub(crate) fn handle_operation_boundary(args: Vec<OsString>) -> io::Result<()> {
         Some("intent") => handle_intent_resolution(rest),
         Some("context") => handle_operation_context(rest),
         Some("verifier") => handle_semantic_verifier(rest),
+        Some("promotion") => handle_transactional_promotion(rest),
         Some("validate") => boundary_validate(rest),
         Some("audit") => boundary_audit(rest),
         Some("run") => boundary_run(BoundaryRunConfig::parse(rest)?),
@@ -858,7 +859,7 @@ fn drain_operation_execution_subject(
     }
 }
 
-fn verify_structural_product(
+pub(crate) fn verify_structural_product(
     workspace: &Path,
     contract: &ProductContract,
 ) -> io::Result<StructuralProductEvidence> {
@@ -1265,6 +1266,7 @@ mod tests {
             reject_symlinks: true,
             reject_special_files: true,
             semantic_verifier_profile: None,
+            promotion: None,
         }
     }
 

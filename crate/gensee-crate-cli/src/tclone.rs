@@ -14,6 +14,9 @@ pub(crate) use capability_cell::{tclone_capability_cell, tclone_capability_lease
 mod capability_broker;
 pub(crate) use capability_broker::consume_external_commit_token_for_gateway;
 pub(crate) use capability_broker::tclone_capability_broker;
+pub(crate) use capability_broker::{
+    close_operation_broker_authority, sign_host_evidence, verify_host_evidence,
+};
 mod capability_lifecycle;
 
 #[cfg(unix)]
