@@ -43,6 +43,7 @@ gensee boundary verifier run \
   --catalog /etc/gensee/catalog.signed.json \
   --trusted-key /etc/gensee/organization-public.hex \
   --request verifier-request.json \
+  --manifest operation-manifest.json \
   --config /etc/gensee/verifiers/content-policy.json \
   --verifier-key /etc/gensee/verifiers/content-policy.seed.hex \
   --output verifier-receipt.json
@@ -54,6 +55,13 @@ denies network access, process forks, and filesystem writes. Unsupported
 platforms fail closed. The receipt binds the isolation profile and executable
 digest; a catalog that requires isolation rejects a receipt made by the manual
 `attest` or `sign` paths without those claims.
+
+Before launch, the host authenticates the operation manifest, rechecks its
+successful and fully drained execution state, resolves the exact product
+contract from the signed catalog, re-hashes the staged product, and copies that
+exact digest-bound product into the private verifier runtime. The verifier
+receives its read-only path in `GENSEE_VERIFIER_PRODUCT`; it does not receive a
+request containing only an unverifiable digest.
 
 `gensee boundary run` signs the complete manifest with the root-owned key at
 `/etc/gensee/operation-manifest-signing-key.hex`. Request creation verifies it

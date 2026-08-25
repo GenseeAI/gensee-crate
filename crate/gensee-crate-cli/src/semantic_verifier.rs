@@ -1,7 +1,9 @@
 use crate::*;
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use gensee_crate_rules::contract_catalog::SignedContractCatalog;
-use gensee_crate_rules::operation_contract::{OperationManifestSignature, OperationRunManifest};
+use gensee_crate_rules::operation_contract::{
+    OperationManifestSignature, OperationRunManifest, ProductContract,
+};
 use gensee_crate_rules::semantic_verifier::{
     SemanticVerdict, SignedVerifierReceipt, VerifierIsolationClaims, VerifierReceiptClaims,
     VerifierReceiptSignature, VerifierRequest, SEMANTIC_VERIFIER_SCHEMA_VERSION,
@@ -70,6 +72,7 @@ fn run_isolated_verifier(args: &[OsString]) -> io::Result<()> {
             "--catalog",
             "--trusted-key",
             "--request",
+            "--manifest",
             "--config",
             "--verifier-key",
             "--output",
@@ -85,6 +88,12 @@ fn run_isolated_verifier(args: &[OsString]) -> io::Result<()> {
     let request: VerifierRequest =
         read_catalog_json(&required_path(args, "--request")?, "verifier request")?;
     request.validate(now).map_err(invalid_input)?;
+    let manifest: OperationRunManifest = read_catalog_json(
+        &required_path(args, "--manifest")?,
+        "operation run manifest",
+    )?;
+    let (product_workspace, product_contract) =
+        verify_verifier_product_source(&catalog, &request, &manifest)?;
     let config: IsolatedVerifierConfig = read_catalog_json(
         &required_path(args, "--config")?,
         "isolated verifier config",
@@ -112,7 +121,8 @@ fn run_isolated_verifier(args: &[OsString]) -> io::Result<()> {
             "verifier key is not catalog-approved",
         ));
     }
-    let program_result = execute_isolated_verifier(&config, &request)?;
+    let program_result =
+        execute_isolated_verifier(&config, &request, &product_workspace, &product_contract)?;
     if program_result.reason_codes.is_empty()
         || program_result.reason_codes.len() > 128
         || !valid_verifier_digest(&program_result.validation_effect_manifest_digest)
@@ -166,6 +176,69 @@ fn run_isolated_verifier(args: &[OsString]) -> io::Result<()> {
     )
 }
 
+fn verify_verifier_product_source(
+    catalog: &SignedContractCatalog,
+    request: &VerifierRequest,
+    manifest: &OperationRunManifest,
+) -> io::Result<(PathBuf, ProductContract)> {
+    verify_operation_manifest(manifest)?;
+    let catalog_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&catalog.catalog).map_err(json_error)?)
+    );
+    let approved = catalog
+        .catalog
+        .contract(&manifest.contract_id)
+        .ok_or_else(|| invalid_data("verifier manifest contract is not catalog-approved"))?;
+    let contract_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&approved.contract).map_err(json_error)?)
+    );
+    let manifest_product = manifest
+        .product
+        .as_ref()
+        .ok_or_else(|| invalid_data("verifier manifest has no product"))?;
+    if manifest.admission.catalog_id != catalog.catalog.catalog_id
+        || manifest.admission.catalog_version != catalog.catalog.version
+        || manifest.admission.catalog_digest != catalog_digest
+        || manifest.contract_digest != contract_digest
+        || request.operation_id != manifest.operation_id
+        || request.contract_id != manifest.contract_id
+        || request.contract_digest != manifest.contract_digest
+        || request.product_type != manifest_product.kind
+        || request.product_digest != manifest_product.digest
+        || manifest.process.exit_code != Some(0)
+        || manifest.process.timed_out
+        || !manifest.process.execution_subject_drained
+        || !manifest.promotion.structurally_eligible
+        || !manifest_product.structurally_valid
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "isolated verifier product is not bound to an authenticated successful operation",
+        ));
+    }
+    let product_contract = approved
+        .contract
+        .product
+        .clone()
+        .ok_or_else(|| invalid_data("approved verifier contract has no product"))?;
+    let workspace = PathBuf::from(&manifest.staged_workspace);
+    let observed = verify_structural_product(&workspace, &product_contract)?;
+    if !observed.structurally_valid
+        || observed.kind != request.product_type
+        || observed.digest != request.product_digest
+        || observed.entries != manifest_product.entries
+        || observed.bytes != manifest_product.bytes
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "staged verifier product changed after its authenticated manifest",
+        ));
+    }
+    Ok((workspace, product_contract))
+}
+
 fn validate_isolated_verifier_config(config: &IsolatedVerifierConfig) -> io::Result<()> {
     if !safe_catalog_token(&config.verifier_id)
         || !safe_catalog_token(&config.policy_version)
@@ -216,14 +289,24 @@ fn validate_isolated_verifier_config(config: &IsolatedVerifierConfig) -> io::Res
 fn execute_isolated_verifier(
     config: &IsolatedVerifierConfig,
     request: &VerifierRequest,
+    product_workspace: &Path,
+    product_contract: &ProductContract,
 ) -> io::Result<VerifierProgramResult> {
-    execute_isolated_verifier_at(config, request, &default_root()?)
+    execute_isolated_verifier_at(
+        config,
+        request,
+        &default_root()?,
+        product_workspace,
+        product_contract,
+    )
 }
 
 fn execute_isolated_verifier_at(
     config: &IsolatedVerifierConfig,
     request: &VerifierRequest,
     state_root: &Path,
+    product_workspace: &Path,
+    product_contract: &ProductContract,
 ) -> io::Result<VerifierProgramResult> {
     let root = state_root
         .join("isolated-verifiers")
@@ -243,6 +326,25 @@ fn execute_isolated_verifier_at(
         return Err(io::Error::new(
             ErrorKind::PermissionDenied,
             "verifier executable changed while creating its private snapshot",
+        ));
+    }
+    let product_snapshot_workspace = root.join("product-workspace");
+    fs::create_dir(&product_snapshot_workspace)?;
+    let product_snapshot = product_snapshot_workspace.join(&product_contract.path);
+    copy_verifier_product(
+        &product_workspace.join(&product_contract.path),
+        &product_snapshot,
+        Instant::now() + Duration::from_secs(config.max_runtime_seconds),
+    )?;
+    seal_structural_product(&product_snapshot)?;
+    let copied = verify_structural_product(&product_snapshot_workspace, product_contract)?;
+    if !copied.structurally_valid
+        || copied.kind != request.product_type
+        || copied.digest != request.product_digest
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "isolated verifier product snapshot does not match its request",
         ));
     }
     #[cfg(target_os = "macos")]
@@ -266,6 +368,7 @@ fn execute_isolated_verifier_at(
         .args(&config.args)
         .current_dir(&config.working_directory)
         .env_clear()
+        .env("GENSEE_VERIFIER_PRODUCT", &product_snapshot)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -315,7 +418,7 @@ fn execute_isolated_verifier_at(
             if !status.success() {
                 return Err(io::Error::new(
                     ErrorKind::PermissionDenied,
-                    "isolated verifier failed",
+                    format!("isolated verifier failed with status {status}"),
                 ));
             }
             break;
@@ -336,6 +439,61 @@ fn execute_isolated_verifier_at(
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| invalid_data(format!("invalid isolated verifier result JSON: {error}")))
+}
+
+fn copy_verifier_product(source: &Path, target: &Path, deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            ErrorKind::TimedOut,
+            "verifier product copy timed out",
+        ));
+    }
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "verifier product copy rejects symlinks",
+        ));
+    }
+    if metadata.is_dir() {
+        fs::create_dir_all(target)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_verifier_product(&entry.path(), &target.join(entry.file_name()), deadline)?;
+        }
+        fs::set_permissions(target, metadata.permissions())?;
+    } else if metadata.is_file() {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut input = File::open(source)?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)?;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "verifier product copy timed out",
+                ));
+            }
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read])?;
+        }
+        output.sync_all()?;
+        fs::set_permissions(target, metadata.permissions())?;
+    } else {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "verifier product copy rejects special filesystem objects",
+        ));
+    }
+    Ok(())
 }
 
 struct VerifierRuntimeGuard(PathBuf);
@@ -879,7 +1037,7 @@ fn verifier_usage_error() -> io::Error {
 
 fn print_verifier_usage() {
     println!(
-        "gensee boundary verifier\n\nUSAGE:\n  gensee boundary verifier request --manifest <operation.json> --ttl-seconds <n> --output <request.json>\n  gensee boundary verifier run --catalog <signed.json> --trusted-key <org.hex> --request <request.json> --config <verifier.json> --verifier-key <seed.hex> --output <receipt.json>\n  gensee boundary verifier attest --request <request.json> --verifier-id <id> --policy-version <version> --verdict <accept|reject|indeterminate> --reason <code> --effects-digest <sha256> --verifier-key <seed.hex> --output <receipt.json>\n  gensee boundary verifier sign --catalog <signed.json> --trusted-key <org.hex> --request <request.json> --claims <claims.json> --verifier-key <seed.hex> --output <receipt.json>\n  gensee boundary verifier verify --catalog <signed.json> --trusted-key <org.hex> --request <request.json> --receipt <receipt.json> [--json]"
+        "gensee boundary verifier\n\nUSAGE:\n  gensee boundary verifier request --manifest <operation.json> --ttl-seconds <n> --output <request.json>\n  gensee boundary verifier run --catalog <signed.json> --trusted-key <org.hex> --request <request.json> --manifest <operation.json> --config <verifier.json> --verifier-key <seed.hex> --output <receipt.json>\n  gensee boundary verifier attest --request <request.json> --verifier-id <id> --policy-version <version> --verdict <accept|reject|indeterminate> --reason <code> --effects-digest <sha256> --verifier-key <seed.hex> --output <receipt.json>\n  gensee boundary verifier sign --catalog <signed.json> --trusted-key <org.hex> --request <request.json> --claims <claims.json> --verifier-key <seed.hex> --output <receipt.json>\n  gensee boundary verifier verify --catalog <signed.json> --trusted-key <org.hex> --request <request.json> --receipt <receipt.json> [--json]"
     );
 }
 
@@ -1078,12 +1236,32 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir_all(&root).unwrap();
+        let product_workspace = root.join("source-workspace");
+        fs::create_dir_all(product_workspace.join("out")).unwrap();
+        fs::write(
+            product_workspace.join("out/result.json"),
+            b"{\"ok\":true}\n",
+        )
+        .unwrap();
+        let product_contract = ProductContract {
+            kind: StructuralProductType::StructuredResult,
+            path: "out/result.json".into(),
+            max_bytes: 1024,
+            max_entries: 1,
+            reject_symlinks: true,
+            reject_special_files: true,
+            semantic_verifier_profile: Some("content_policy".into()),
+            promotion: None,
+        };
+        seal_structural_product(&product_workspace.join("out/result.json")).unwrap();
+        let product_evidence =
+            verify_structural_product(&product_workspace, &product_contract).unwrap();
         let forbidden = root.join("must-not-write");
         let executable = root.join("verifier");
         fs::write(
             &executable,
             format!(
-                "#!/usr/bin/ruby --disable-gems\nbegin; File.write('{}', 'forbidden'); exit 23; rescue Errno::EPERM; end\nputs '{{\"verdict\":\"accept\",\"reason_codes\":[\"isolated\"],\"validation_effect_manifest_digest\":\"sha256:{}\"}}'\n",
+                "#!/usr/bin/ruby --disable-gems\nexit 24 unless File.binread(ENV.fetch('GENSEE_VERIFIER_PRODUCT')) == \"{{\\\"ok\\\":true}}\\n\"\nbegin; File.write('{}', 'forbidden'); exit 23; rescue Errno::EPERM; end\nputs '{{\"verdict\":\"accept\",\"reason_codes\":[\"isolated\"],\"validation_effect_manifest_digest\":\"sha256:{}\"}}'\n",
                 forbidden.display(),
                 "55".repeat(32)
             ),
@@ -1100,8 +1278,16 @@ mod tests {
             max_runtime_seconds: 10,
         };
         let now = unix_millis().unwrap();
-        let request = verifier_request(now);
-        let result = execute_isolated_verifier_at(&config, &request, &root).unwrap();
+        let mut request = verifier_request(now);
+        request.product_digest = product_evidence.digest;
+        let result = execute_isolated_verifier_at(
+            &config,
+            &request,
+            &root,
+            &product_workspace,
+            &product_contract,
+        )
+        .unwrap();
         assert_eq!(result.verdict, SemanticVerdict::Accept);
         assert!(!forbidden.exists());
         fs::remove_dir_all(root).unwrap();
