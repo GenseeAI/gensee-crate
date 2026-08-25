@@ -33,7 +33,7 @@
   ·
   <a href="https://www.gensee.ai/discord">Join Discord</a>
   ·
-  <strong><a href="https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg">⬇️ Download the macOS app</a></strong>
+  <strong><a href="https://www.gensee.ai/download/crate-macos.html?placement=github-readme">⬇️ Download the macOS app</a></strong>
 </p>
 
 <p align="center">
@@ -90,7 +90,7 @@ Gensee store.
 
 ### Download the macOS app
 
-**[⬇️ Download Gensee Crate Personal for macOS](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)**
+**[⬇️ Download Gensee Crate Personal for macOS](https://www.gensee.ai/download/crate-macos.html?placement=github-readme)**
 
 The signed app bundles the Gensee backend and SQLite support. It does not
 require Homebrew, Rust, Xcode, `jq`, or a separate SQLite installation. See the
