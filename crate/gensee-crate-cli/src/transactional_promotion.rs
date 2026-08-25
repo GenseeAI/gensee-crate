@@ -888,6 +888,8 @@ mod tests {
                 public_key_hex: hex::encode(verifier_key.verifying_key().as_bytes()),
                 profiles: vec!["content_policy".into()],
                 policy_versions: vec!["policy_v1".into()],
+                require_isolation: false,
+                isolated_runtime_config_digest: None,
             }],
             fallback: FallbackPolicy {
                 on_ambiguous_intent: AmbiguousIntentAction::Deny,
@@ -1008,6 +1010,7 @@ mod tests {
             verdict: SemanticVerdict::Accept,
             reason_codes: vec!["accepted".into()],
             validation_effect_manifest_digest: format!("sha256:{}", "13".repeat(32)),
+            isolation: None,
             issued_at_ms: 110,
             expires_at_ms: u64::MAX - 1,
         };

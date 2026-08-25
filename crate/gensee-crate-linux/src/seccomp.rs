@@ -28,6 +28,8 @@ pub enum LinuxSeccompSyscallGroup {
     KernelModule,
     Mount,
     Namespace,
+    Network,
+    ProcessCreation,
 }
 
 impl Default for LinuxSeccompProfile {
@@ -354,6 +356,22 @@ mod platform {
             "setns" => Some(libc::SYS_setns),
             "umount2" => Some(libc::SYS_umount2),
             "unshare" => Some(libc::SYS_unshare),
+            "socket" => Some(libc::SYS_socket),
+            "socketpair" => Some(libc::SYS_socketpair),
+            "connect" => Some(libc::SYS_connect),
+            "bind" => Some(libc::SYS_bind),
+            "listen" => Some(libc::SYS_listen),
+            "accept" => Some(libc::SYS_accept),
+            "accept4" => Some(libc::SYS_accept4),
+            "sendto" => Some(libc::SYS_sendto),
+            "sendmsg" => Some(libc::SYS_sendmsg),
+            "recvfrom" => Some(libc::SYS_recvfrom),
+            "recvmsg" => Some(libc::SYS_recvmsg),
+            "clone" => Some(libc::SYS_clone),
+            "clone3" => Some(libc::SYS_clone3),
+            "fork" => Some(libc::SYS_fork),
+            "vfork" => Some(libc::SYS_vfork),
+            "io_uring_setup" => Some(libc::SYS_io_uring_setup),
             _ => None,
         }
     }

@@ -48,8 +48,21 @@ pub struct VerifierReceiptClaims {
     pub verdict: SemanticVerdict,
     pub reason_codes: Vec<String>,
     pub validation_effect_manifest_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<VerifierIsolationClaims>,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierIsolationClaims {
+    pub profile: String,
+    pub executable_digest: String,
+    pub runtime_config_digest: String,
+    pub network_denied: bool,
+    pub process_creation_denied: bool,
+    pub filesystem_mutation_denied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +119,14 @@ impl VerifierReceiptClaims {
             || !token(&self.verifier_id)
             || !token(&self.policy_version)
             || !sha256(&self.validation_effect_manifest_digest)
+            || self.isolation.as_ref().is_some_and(|isolation| {
+                !token(&isolation.profile)
+                    || !sha256(&isolation.executable_digest)
+                    || !sha256(&isolation.runtime_config_digest)
+                    || !isolation.network_denied
+                    || !isolation.process_creation_denied
+                    || !isolation.filesystem_mutation_denied
+            })
             || self.issued_at_ms < request.issued_at_ms
             || self.issued_at_ms >= self.expires_at_ms
             || self.expires_at_ms > request.expires_at_ms
@@ -182,6 +203,7 @@ mod tests {
             verdict: SemanticVerdict::Accept,
             reason_codes: vec!["validated".into()],
             validation_effect_manifest_digest: format!("sha256:{}", "44".repeat(32)),
+            isolation: None,
             issued_at_ms: 110,
             expires_at_ms: 800,
         };
