@@ -249,6 +249,7 @@ jq -n \
   --catalog "$RUNTIME_ROOT/catalog.signed.json" \
   --trusted-key "$RUNTIME_ROOT/organization-public.hex" \
   --request "$RUNTIME_ROOT/verifier-request.json" \
+  --manifest "$RUNTIME_ROOT/operation-manifest.json" \
   --config "$RUNTIME_ROOT/verifier-config.json" \
   --verifier-key "$RUNTIME_ROOT/verifier.seed" \
   --output "$RUNTIME_ROOT/verifier-receipt.json"

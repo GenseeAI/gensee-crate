@@ -10,8 +10,17 @@ import sys
 
 
 request = json.load(sys.stdin)
+with open(os.environ["GENSEE_VERIFIER_PRODUCT"], encoding="utf-8") as stream:
+    product = json.load(stream)
+
 checks = {
     "request_bound": bool(request.get("product_digest")),
+    "product_semantics_valid": product
+    == {
+        "allowed_roundtrip": True,
+        "operation_id_present": True,
+        "unexpected_endpoint_denied": True,
+    },
     "filesystem_mutation_denied": False,
     "network_denied": False,
     "process_creation_denied": False,

@@ -28,8 +28,10 @@ operation execution subject. It then:
 5. has a descendant create a new session while keeping an established allowed
    connection, then proves termination drains the entire cgroup and closes the
    connection before enforcement is removed;
-6. structurally verifies a staged result, runs the catalog-pinned semantic
-   verifier with filesystem mutation, networking, and process creation denied,
+6. structurally verifies a staged result, gives an immutable digest-bound copy
+   to the catalog-pinned semantic verifier, makes the verdict depend on the
+   expected result fields, and denies verifier filesystem mutation, networking,
+   and process creation,
    authenticates its receipt, closes operation-scoped broker authority, and
    atomically promotes the unchanged result;
 7. signs a fixed evidence bundle and runs `gensee boundary proof verify` to
@@ -56,8 +58,9 @@ verdict; it does not infer semantic safety from hashes or file layout.
   process group or session, and terminal cleanup revokes that subject before
   removing its policy. The established connection is closed and the fixture
   observes no new connection from that subject after revocation.
-- The semantic verifier runs from the catalog-pinned executable/configuration
-  under an independent no-write/no-network/no-process-creation boundary.
+- The semantic verifier runs from the catalog-pinned executable/configuration,
+  reads the exact immutable staged product, and runs under an independent
+  no-write/no-network/no-process-creation boundary.
 - A structurally and semantically verified product can be promoted without
   giving the producer control of the destination.
 - A verifier with only the bundle and trusted public keys can detect evidence
