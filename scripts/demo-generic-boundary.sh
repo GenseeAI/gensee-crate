@@ -34,6 +34,8 @@ fi
 INTERFACE="gsdemo${BASHPID}"
 INTERFACE="${INTERFACE:0:15}"
 SERVER_PID=""
+SYSTEM_KEY_DIR_CREATED="false"
+SYSTEM_KEYS_INSTALLED="false"
 
 cleanup() {
   if [[ -n "$SERVER_PID" ]]; then
@@ -41,6 +43,14 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
   fi
   ip link delete "$INTERFACE" 2>/dev/null || true
+  if [[ "$SYSTEM_KEYS_INSTALLED" == "true" ]]; then
+    rm -f /etc/gensee/catalog-root-public-key.hex \
+      /etc/gensee/operation-manifest-signing-key.hex \
+      /etc/gensee/operation-manifest-public-key.hex
+  fi
+  if [[ "$SYSTEM_KEY_DIR_CREATED" == "true" ]]; then
+    rmdir /etc/gensee 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -112,6 +122,7 @@ step 2 "Operator approves identities, intent classes, verifier, and promotion po
 openssl rand -hex 32 >"$RUNTIME_ROOT/operator/organization.seed"
 openssl rand -hex 32 >"$RUNTIME_ROOT/operator/analyzer.seed"
 openssl rand -hex 32 >"$RUNTIME_ROOT/operator/verifier.seed"
+openssl rand -hex 32 >"$RUNTIME_ROOT/operator/manifest.seed"
 "$GENSEE" boundary catalog public-key \
   --key "$RUNTIME_ROOT/operator/organization.seed" \
   --output "$RUNTIME_ROOT/operator/organization-public.hex"
@@ -121,6 +132,30 @@ openssl rand -hex 32 >"$RUNTIME_ROOT/operator/verifier.seed"
 "$GENSEE" boundary catalog public-key \
   --key "$RUNTIME_ROOT/operator/verifier.seed" \
   --output "$RUNTIME_ROOT/operator/verifier-public.hex"
+"$GENSEE" boundary catalog public-key \
+  --key "$RUNTIME_ROOT/operator/manifest.seed" \
+  --output "$RUNTIME_ROOT/operator/manifest-public.hex"
+
+if [[ ! -d /etc/gensee ]]; then
+  mkdir -m 700 /etc/gensee
+  SYSTEM_KEY_DIR_CREATED="true"
+fi
+if [[ -e /etc/gensee/catalog-root-public-key.hex \
+  || -e /etc/gensee/operation-manifest-signing-key.hex \
+  || -e /etc/gensee/operation-manifest-public-key.hex ]]; then
+  echo "refusing to replace installed Gensee trust material; use a dedicated demo host" >&2
+  exit 77
+fi
+SYSTEM_KEYS_INSTALLED="true"
+install -o root -g root -m 0600 \
+  "$RUNTIME_ROOT/operator/organization-public.hex" \
+  /etc/gensee/catalog-root-public-key.hex
+install -o root -g root -m 0600 \
+  "$RUNTIME_ROOT/operator/manifest.seed" \
+  /etc/gensee/operation-manifest-signing-key.hex
+install -o root -g root -m 0644 \
+  "$RUNTIME_ROOT/operator/manifest-public.hex" \
+  /etc/gensee/operation-manifest-public-key.hex
 
 install -o root -g root -m 0500 \
   "$REPOSITORY_ROOT/integrations/boundary/end-to-end-demo/verifier.py" \

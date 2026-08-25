@@ -22,6 +22,11 @@ the Gensee CLI:
 sudo ./scripts/demo-generic-boundary.sh
 ```
 
+Use a dedicated test host. The script refuses to overwrite pre-existing
+Gensee catalog or operation-manifest trust keys under `/etc/gensee`, installs
+ephemeral owner-only test keys for the run, and removes only those keys during
+cleanup.
+
 To use an existing binary and retain evidence at a chosen new path:
 
 ```console

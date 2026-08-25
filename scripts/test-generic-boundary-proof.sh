@@ -248,7 +248,6 @@ jq -n \
 "$GENSEE" boundary verifier run \
   --catalog "$RUNTIME_ROOT/catalog.signed.json" \
   --trusted-key "$RUNTIME_ROOT/organization-public.hex" \
-  --manifest "$RUNTIME_ROOT/operation-manifest.json" \
   --request "$RUNTIME_ROOT/verifier-request.json" \
   --manifest "$RUNTIME_ROOT/operation-manifest.json" \
   --config "$RUNTIME_ROOT/verifier-config.json" \
