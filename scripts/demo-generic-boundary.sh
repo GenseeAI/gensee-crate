@@ -342,7 +342,6 @@ NEGATIVE_COMMAND=(python3 "$WORKLOAD" negative)
 analyze_operation negative "${NEGATIVE_COMMAND[@]}"
 "$GENSEE" boundary run \
   --catalog "$CATALOG" \
-  --trusted-key "$RUNTIME_ROOT/operator/organization-public.hex" \
   --observation "$RUNTIME_ROOT/negative-observation.json" \
   --inference "$RUNTIME_ROOT/negative-inference.signed.json" \
   --workspace "$RUNTIME_ROOT/negative-workspace" \
@@ -371,7 +370,6 @@ POSITIVE_COMMAND=(python3 "$WORKLOAD" positive)
 analyze_operation positive "${POSITIVE_COMMAND[@]}"
 "$GENSEE" boundary run \
   --catalog "$CATALOG" \
-  --trusted-key "$RUNTIME_ROOT/operator/organization-public.hex" \
   --observation "$RUNTIME_ROOT/positive-observation.json" \
   --inference "$RUNTIME_ROOT/positive-inference.signed.json" \
   --workspace "$RUNTIME_ROOT/positive-workspace" \
