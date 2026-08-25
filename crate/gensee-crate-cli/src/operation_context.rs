@@ -476,6 +476,7 @@ mod tests {
                         allowed_audiences: vec!["worker_service".into()],
                     },
                 ],
+                semantic_verifiers: Vec::new(),
                 fallback: FallbackPolicy {
                     on_ambiguous_intent: AmbiguousIntentAction::Deny,
                     safe_default_contract_id: None,

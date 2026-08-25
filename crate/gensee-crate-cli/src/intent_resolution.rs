@@ -453,6 +453,7 @@ mod tests {
                 allowed_operation_classes: vec!["transform".into()],
             }],
             operation_services: Vec::new(),
+            semantic_verifiers: Vec::new(),
             fallback: FallbackPolicy {
                 on_ambiguous_intent: AmbiguousIntentAction::Deny,
                 safe_default_contract_id: None,

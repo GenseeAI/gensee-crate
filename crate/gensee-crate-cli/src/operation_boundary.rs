@@ -54,6 +54,7 @@ pub(crate) fn handle_operation_boundary(args: Vec<OsString>) -> io::Result<()> {
         Some("catalog") => handle_contract_catalog(rest),
         Some("intent") => handle_intent_resolution(rest),
         Some("context") => handle_operation_context(rest),
+        Some("verifier") => handle_semantic_verifier(rest),
         Some("validate") => boundary_validate(rest),
         Some("audit") => boundary_audit(rest),
         Some("run") => boundary_run(BoundaryRunConfig::parse(rest)?),

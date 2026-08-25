@@ -109,6 +109,8 @@ mod intent_resolution;
 pub(crate) use intent_resolution::*;
 mod operation_context;
 pub(crate) use operation_context::*;
+mod semantic_verifier;
+pub(crate) use semantic_verifier::*;
 mod falco;
 pub(crate) use falco::*;
 mod replay;
