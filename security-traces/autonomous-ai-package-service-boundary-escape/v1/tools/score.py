@@ -64,10 +64,18 @@ def main() -> int:
     parser.add_argument(
         "--require-stage-count",
         type=int,
-        default=0,
+        default=1,
         help="return nonzero unless at least this many stages are detected",
     )
+    parser.add_argument(
+        "--max-unmatched-alerts",
+        type=int,
+        default=0,
+        help="return nonzero when more than this many unique alerts match no ground-truth stage",
+    )
     args = parser.parse_args()
+    if args.require_stage_count < 1 or args.max_unmatched_alerts < 0:
+        parser.error("stage count must be positive and unmatched-alert limit non-negative")
     truth = json.loads(args.ground_truth.read_text(encoding="utf-8"))
     stages = truth.get("stages", [])
     try:
@@ -106,6 +114,7 @@ def main() -> int:
             unmatched.append(alert_index)
 
     detected = [stage for stage in stages if matches[stage["stage_id"]]]
+    matched_alert_count = sum(len(indexes) for indexes in matches.values())
     first = min(
         (alerts[index]["ts_offset_ms"], stage["stage_id"])
         for stage in stages
@@ -115,6 +124,7 @@ def main() -> int:
         "alert_count": len(alerts),
         "duplicate_alert_count": len(duplicate_indexes),
         "duplicate_alert_indexes": duplicate_indexes,
+        "false_positive_alert_count": len(unmatched),
         "detected_stage_count": len(detected),
         "detected_stages": [stage["stage_id"] for stage in detected],
         "first_detection": (
@@ -126,12 +136,20 @@ def main() -> int:
         "scenario_id": truth.get("scenario_id"),
         "stage_count": len(stages),
         "stage_recall": len(detected) / len(stages) if stages else 0.0,
+        "unique_alert_precision": (
+            matched_alert_count / len(unique_alerts) if unique_alerts else 0.0
+        ),
         "unique_alert_count": len(unique_alerts),
         "unmatched_alert_count": len(unmatched),
         "unmatched_alert_indexes": unmatched,
     }
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if len(detected) >= args.require_stage_count else 1
+    return (
+        0
+        if len(detected) >= args.require_stage_count
+        and len(unmatched) <= args.max_unmatched_alerts
+        else 1
+    )
 
 
 if __name__ == "__main__":

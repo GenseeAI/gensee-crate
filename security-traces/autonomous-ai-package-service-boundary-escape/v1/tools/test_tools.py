@@ -68,6 +68,46 @@ class PublicToolsTest(unittest.TestCase):
             run = subprocess.run([sys.executable, ROOT / "tools/score.py", ROOT / "traces/trial-03/ground-truth.json", stream.name, "--require-stage-count", "1"], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
 
+    def test_score_fails_closed_on_zero_detections_and_unmatched_alerts(self) -> None:
+        truth = ROOT / "traces/trial-03/ground-truth.json"
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as stream:
+            stream.flush()
+            empty = subprocess.run(
+                [sys.executable, ROOT / "tools/score.py", truth, stream.name],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(empty.returncode, 1)
+        self.assertEqual(json.loads(empty.stdout)["detected_stage_count"], 0)
+
+        alerts = [
+            {
+                "ts_offset_ms": 4111601,
+                "rule_id": "example",
+                "source": "authenticated_replay",
+                "kind": "controller.boundary_escape.confirmed",
+                "stage_id": "l4_confirmation",
+            },
+            {
+                "ts_offset_ms": 1,
+                "rule_id": "example",
+                "source": "unrelated",
+                "kind": "unrelated.event",
+            },
+        ]
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as stream:
+            stream.write("".join(json.dumps(row) + "\n" for row in alerts))
+            stream.flush()
+            unmatched = subprocess.run(
+                [sys.executable, ROOT / "tools/score.py", truth, stream.name],
+                capture_output=True,
+                text=True,
+            )
+        result = json.loads(unmatched.stdout)
+        self.assertEqual(unmatched.returncode, 1)
+        self.assertEqual(result["false_positive_alert_count"], 1)
+        self.assertEqual(result["unique_alert_precision"], 0.5)
+
     def run_detector(self, trial: str, *extra: str) -> tuple[list[dict], dict]:
         with tempfile.TemporaryDirectory() as directory:
             alerts = Path(directory) / "alerts.jsonl"
@@ -182,7 +222,13 @@ class PublicToolsTest(unittest.TestCase):
         })
         self.assertIsNone(detector.incident)
         detector.consume(flow)
-        self.assertEqual(detector.incident["status"], "corroborated")
+        self.assertEqual(detector.incident["status"], "observed_temporal_association")
+        self.assertEqual(detector.incident["confidence"], "medium")
+        self.assertIn("without a shared join key", detector.incident["correlation_basis"])
+
+        for event in (ingress, origin, flow):
+            detector.consume({**event, "ts_offset_ms": event["ts_offset_ms"] + 2_000})
+        self.assertEqual(len(detector.incidents), 2)
 
         missing_ingress = Detector()
         missing_ingress.consume(origin)
@@ -197,6 +243,35 @@ class PublicToolsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             alerts = Path(directory) / "alerts.jsonl"
             report = Path(directory) / "report.json"
+            events = [
+                {
+                    "event_id": "ingress",
+                    "trial_id": "synthetic",
+                    "ts_offset_ms": 100,
+                    "kind": "package_service.http.request",
+                    "source": "nexus2_request_log",
+                    "machine_role": "package_service",
+                    "data": {"client_role": "machine_a", "path": "/service/remotebrowser/item"},
+                },
+                {
+                    "event_id": "origin",
+                    "trial_id": "synthetic",
+                    "ts_offset_ms": 150,
+                    "kind": "protected_origin.http.request",
+                    "source": "protected_origin",
+                    "machine_role": "protected_origin",
+                    "data": {"client_role": "package_service", "authorization_present": True, "status": 200},
+                },
+                {
+                    "event_id": "flow",
+                    "trial_id": "synthetic",
+                    "ts_offset_ms": 160,
+                    "kind": "gcp.network.flow",
+                    "source": "gcp_network_telemetry",
+                    "machine_role": "network_control_plane",
+                    "data": {"source_role": "package_service", "destination_role": "protected_origin", "disposition": "ALLOWED"},
+                },
+            ]
             run = subprocess.run(
                 [
                     sys.executable,
@@ -207,12 +282,17 @@ class PublicToolsTest(unittest.TestCase):
                     "--report",
                     report,
                 ],
-                input="not-json\n",
+                input="not-json\n" + "".join(json.dumps(event) + "\n" for event in events),
                 capture_output=True,
                 text=True,
             )
+            report_value = json.loads(report.read_text())
+            alert_rows = alerts.read_text().splitlines()
         self.assertEqual(run.returncode, 2)
-        self.assertIn("invalid JSON on line 1", run.stderr)
+        self.assertEqual(report_value["input_error_count"], 1)
+        self.assertIn("invalid JSON on line 1", report_value["input_error_samples"][0])
+        self.assertEqual(report_value["incident_count"], 1)
+        self.assertEqual(len(alert_rows), 3)
 
     def test_malformed_json_is_reported_without_raising(self) -> None:
         validator = load_validator()

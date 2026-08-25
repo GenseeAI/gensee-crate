@@ -186,6 +186,13 @@ python3 tools/score.py traces/trial-03/ground-truth.json alerts.jsonl \
   --require-stage-count 3
 ```
 
+This detector is a trace-specific, medium-confidence temporal association. The
+published streams have no shared request/connection/artifact key, and the first
+predicate depends on the recorded source, role, and `/remotebrowser/` path
+fragment. It is suitable for replaying this evidence, not for claiming generic
+or low-false-positive prospective coverage. The scorer fails on zero detections
+and unmatched alerts by default.
+
 See [`DETECTION.md`](DETECTION.md) for the detector's bounded causal model,
 evidence chain, observability caveats, and deliberately limited claims.
 
