@@ -147,6 +147,8 @@ impl ContractCatalog {
         }
         if self.issued_at_ms >= self.expires_at_ms {
             errors.push("catalog expiry must be after issuance".to_string());
+        } else if now_ms < self.issued_at_ms {
+            errors.push("catalog is not valid yet".to_string());
         } else if now_ms >= self.expires_at_ms {
             errors.push("catalog is expired".to_string());
         }
@@ -183,8 +185,10 @@ impl ContractCatalog {
                     errors.push(format!("contract {id} {label} is invalid"));
                 }
             }
-            if approved.approval.approved_at_ms >= approved.approval.expires_at_ms
+            if approved.approval.approved_at_ms < self.issued_at_ms
+                || approved.approval.approved_at_ms >= approved.approval.expires_at_ms
                 || approved.approval.expires_at_ms > self.expires_at_ms
+                || now_ms < approved.approval.approved_at_ms
                 || now_ms >= approved.approval.expires_at_ms
             {
                 errors.push(format!(
@@ -399,5 +403,27 @@ mod tests {
         candidate.fallback.on_ambiguous_intent = AmbiguousIntentAction::UseSafeDefault;
         candidate.fallback.safe_default_contract_id = Some("caller_chosen".into());
         assert!(!candidate.audit("linux", 100).valid);
+    }
+
+    #[test]
+    fn future_catalog_or_approval_cannot_authorize_early() {
+        let mut candidate = catalog();
+        candidate.issued_at_ms = 200;
+        candidate.contracts[0].approval.approved_at_ms = 200;
+        let audit = candidate.audit("linux", 100);
+        assert!(!audit.valid);
+        assert!(audit
+            .errors
+            .iter()
+            .any(|error| error.contains("not valid yet")));
+
+        let mut candidate = catalog();
+        candidate.contracts[0].approval.approved_at_ms = 200;
+        let audit = candidate.audit("linux", 100);
+        assert!(!audit.valid);
+        assert!(audit
+            .errors
+            .iter()
+            .any(|error| error.contains("approval is expired or out of bounds")));
     }
 }
