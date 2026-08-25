@@ -4,6 +4,8 @@ use gensee_crate_rules::capability_policy::MediationBoundary;
 use gensee_crate_rules::network_boundary::{
     NetworkCapabilityEnvelope, NetworkEndpointGrant, NetworkProtocol,
 };
+#[cfg(target_os = "linux")]
+use gensee_crate_rules::operation_contract::OperationNetworkEffect;
 use gensee_crate_rules::operation_contract::{
     ContractAudit, ContractNetworkMode, ContractNetworkProtocol, OperationContract,
     OperationEnforcementEvidence, OperationProcessEvidence, OperationPromotionEvidence,
@@ -539,6 +541,7 @@ fn boundary_command(
     gated_args.extend_from_slice(args);
     #[cfg(target_os = "linux")]
     {
+        let _ = (contract, source_run_id, original, staged);
         let cgroup = cgroup_path.ok_or_else(|| {
             io::Error::new(
                 ErrorKind::PermissionDenied,
