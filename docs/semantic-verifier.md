@@ -33,17 +33,19 @@ configuration containing the verifier ID, policy version, absolute executable
 and working-directory paths, executable SHA-256, fixed arguments, and a runtime
 deadline. The catalog pins the canonical configuration digest, so the caller
 cannot substitute arguments, paths, deadlines, or executable bytes. Gensee
-copies the digest-checked executable into a private runtime
-directory before execution, clears its environment and inherited descriptors,
-passes the exact request on standard input, and accepts one bounded JSON result
-on standard output:
+copies the digest-checked executable and the exact digest-bound product into a
+private runtime directory before execution, clears inherited environment and
+descriptors, passes the request on standard input, and names the read-only
+product snapshot in `GENSEE_VERIFIER_PRODUCT`. It accepts one bounded JSON
+result on standard output, so a verdict cannot be detached from the immutable
+product snapshot:
 
 ```console
 gensee boundary verifier run \
   --catalog /etc/gensee/catalog.signed.json \
   --trusted-key /etc/gensee/organization-public.hex \
-  --request verifier-request.json \
   --manifest operation-manifest.json \
+  --request verifier-request.json \
   --config /etc/gensee/verifiers/content-policy.json \
   --verifier-key /etc/gensee/verifiers/content-policy.seed.hex \
   --output verifier-receipt.json

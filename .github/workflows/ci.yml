@@ -56,6 +56,8 @@ jobs:
           -- --exact --nocapture
       - name: Run generic privileged boundary proof
         run: sudo env PATH="$PATH" GENSEE_BINARY="$PWD/target/debug/gensee" ./scripts/test-generic-boundary-proof.sh
+      - name: Run generic operator-to-outcome demo
+        run: sudo env PATH="$PATH" GENSEE_BINARY="$PWD/target/debug/gensee" ./scripts/demo-generic-boundary.sh
 
   ui:
     runs-on: ubuntu-latest
