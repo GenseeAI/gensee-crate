@@ -44,7 +44,7 @@ pub use policy::{
 };
 pub use process_events::{LinuxProcessEvent, LinuxProcessEventSensor};
 pub use seccomp::{
-    install_seccomp_filter, LinuxSeccompDeniedSyscall, LinuxSeccompProfile,
+    install_seccomp_filter, LinuxSeccompAction, LinuxSeccompDeniedSyscall, LinuxSeccompProfile,
     LinuxSeccompSyscallGroup,
 };
 pub use session::{
