@@ -1,15 +1,17 @@
 use crate::*;
 use gensee_crate_rules::capability::Capability;
 use gensee_crate_rules::capability_policy::MediationBoundary;
+use gensee_crate_rules::contract_catalog::ContractResolutionSource;
 use gensee_crate_rules::network_boundary::{
     NetworkCapabilityEnvelope, NetworkEndpointGrant, NetworkProtocol,
 };
 #[cfg(target_os = "linux")]
 use gensee_crate_rules::operation_contract::OperationNetworkEffect;
 use gensee_crate_rules::operation_contract::{
-    ContractAudit, ContractNetworkMode, ContractNetworkProtocol, OperationContract,
-    OperationEnforcementEvidence, OperationProcessEvidence, OperationPromotionEvidence,
-    OperationRunManifest, ProductContract, StructuralProductEvidence, StructuralProductType,
+    ContractAudit, ContractNetworkMode, ContractNetworkProtocol, OperationAdmissionEvidence,
+    OperationContract, OperationEnforcementEvidence, OperationProcessEvidence,
+    OperationPromotionEvidence, OperationRunManifest, ProductContract, StructuralProductEvidence,
+    StructuralProductType,
 };
 use std::ffi::OsString;
 use std::fs::File;
@@ -24,7 +26,10 @@ const START_GATE_TIMEOUT_SECONDS: u64 = 15;
 
 #[derive(Debug)]
 struct BoundaryRunConfig {
-    contract_path: PathBuf,
+    catalog_path: PathBuf,
+    trusted_key_path: PathBuf,
+    observation_path: PathBuf,
+    inference_path: PathBuf,
     workspace: PathBuf,
     manifest_path: Option<PathBuf>,
     command: Vec<OsString>,
@@ -43,6 +48,7 @@ pub(crate) fn handle_operation_boundary(args: Vec<OsString>) -> io::Result<()> {
     let (subcommand, rest) = args.split_first().ok_or_else(boundary_usage_error)?;
     match subcommand.to_str() {
         Some("catalog") => handle_contract_catalog(rest),
+        Some("intent") => handle_intent_resolution(rest),
         Some("validate") => boundary_validate(rest),
         Some("audit") => boundary_audit(rest),
         Some("run") => boundary_run(BoundaryRunConfig::parse(rest)?),
@@ -116,9 +122,23 @@ impl BoundaryRunConfig {
         if command.is_empty() {
             return Err(boundary_usage_error());
         }
-        reject_unknown_options(options, &["--contract", "--workspace", "--manifest"], &[])?;
+        reject_unknown_options(
+            options,
+            &[
+                "--catalog",
+                "--trusted-key",
+                "--observation",
+                "--inference",
+                "--workspace",
+                "--manifest",
+            ],
+            &[],
+        )?;
         Ok(Self {
-            contract_path: required_path_arg(options, "--contract")?,
+            catalog_path: required_path_arg(options, "--catalog")?,
+            trusted_key_path: required_path_arg(options, "--trusted-key")?,
+            observation_path: required_path_arg(options, "--observation")?,
+            inference_path: required_path_arg(options, "--inference")?,
             workspace: optional_path_arg(options, "--workspace")?.unwrap_or(env::current_dir()?),
             manifest_path: optional_path_arg(options, "--manifest")?,
             command,
@@ -126,12 +146,21 @@ impl BoundaryRunConfig {
     }
 }
 
-fn boundary_run(config: BoundaryRunConfig) -> io::Result<()> {
-    let contract_bytes = read_bounded_regular_file(&config.contract_path, MAX_CONTRACT_BYTES)?;
-    let contract: OperationContract = serde_json::from_slice(&contract_bytes).map_err(|error| {
+fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
+    let admission = verify_and_resolve(
+        &config.catalog_path,
+        &config.trusted_key_path,
+        &config.observation_path,
+        &config.inference_path,
+        &config.command,
+        unix_millis()?,
+    )?;
+    config.command[0] = admission.canonical_executable.as_os_str().to_owned();
+    let contract = admission.contract.clone();
+    let contract_bytes = serde_json::to_vec(&contract).map_err(|error| {
         io::Error::new(
             ErrorKind::InvalidData,
-            format!("invalid contract JSON: {error}"),
+            format!("cannot encode selected contract: {error}"),
         )
     })?;
     let audit = contract.audit_for_platform(std::env::consts::OS);
@@ -306,6 +335,25 @@ fn boundary_run(config: BoundaryRunConfig) -> io::Result<()> {
         contract_id: contract.contract_id,
         contract_digest: sha256_prefixed(&contract_bytes),
         command_digest: digest_command(&config.command),
+        admission: OperationAdmissionEvidence {
+            catalog_id: admission.resolution.catalog_id,
+            catalog_version: admission.resolution.catalog_version,
+            catalog_digest: admission.catalog_digest,
+            observation_digest: admission.observation_digest,
+            inference_digest: admission.inference_digest,
+            analyzer_id: admission.resolution.analyzer_id,
+            selected_operation_class: admission.resolution.selected_operation_class,
+            confidence_bps: admission.resolution.confidence_bps,
+            resolution_source: match admission.resolution.source {
+                ContractResolutionSource::ProbabilisticInference => {
+                    "probabilistic_inference".to_string()
+                }
+                ContractResolutionSource::ApprovedSafeDefault => {
+                    "approved_safe_default".to_string()
+                }
+            },
+            ambiguity_reason: admission.resolution.ambiguity_reason,
+        },
         operation_record: operation.record_path().to_string_lossy().to_string(),
         original_workspace: original.to_string_lossy().to_string(),
         staged_workspace: staged.to_string_lossy().to_string(),
@@ -1100,7 +1148,7 @@ fn boundary_usage_error() -> io::Error {
 
 fn print_boundary_usage() {
     println!(
-        "gensee boundary\n\nUSAGE:\n  gensee boundary catalog sign --catalog <catalog.json> --key <seed.hex> --key-id <id> --output <signed.json>\n  gensee boundary catalog verify --catalog <signed.json> --trusted-key <public.hex> [--json]\n  gensee boundary validate --contract <contract.json> [--json]\n  gensee boundary audit --contract <contract.json> [--json]\n  sudo gensee boundary run --contract <contract.json> [--workspace <dir>] [--manifest <manifest.json>] -- <command> [args...]"
+        "gensee boundary\n\nUSAGE:\n  gensee boundary catalog sign --catalog <catalog.json> --key <seed.hex> --key-id <id> --output <signed.json>\n  gensee boundary catalog verify --catalog <signed.json> --trusted-key <public.hex> [--json]\n  gensee boundary intent observe|resolve ...\n  gensee boundary validate --contract <contract.json> [--json]\n  gensee boundary audit --contract <contract.json> [--json]\n  sudo gensee boundary run --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --inference <signed-inference.json> [--workspace <dir>] [--manifest <manifest.json>] -- <command> [args...]"
     );
 }
 
@@ -1202,13 +1250,19 @@ mod tests {
     #[test]
     fn run_parser_requires_explicit_command_boundary() {
         let args = vec![
-            OsString::from("--contract"),
-            OsString::from("contract.json"),
+            OsString::from("--catalog"),
+            OsString::from("catalog.json"),
+            OsString::from("--trusted-key"),
+            OsString::from("key.hex"),
+            OsString::from("--observation"),
+            OsString::from("observation.json"),
+            OsString::from("--inference"),
+            OsString::from("inference.json"),
             OsString::from("--"),
             OsString::from("echo"),
         ];
         assert!(BoundaryRunConfig::parse(&args).is_ok());
-        assert!(BoundaryRunConfig::parse(&args[..2]).is_err());
+        assert!(BoundaryRunConfig::parse(&args[..8]).is_err());
     }
 
     #[test]

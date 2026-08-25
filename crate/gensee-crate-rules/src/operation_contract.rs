@@ -162,6 +162,7 @@ pub struct OperationRunManifest {
     pub contract_id: String,
     pub contract_digest: String,
     pub command_digest: String,
+    pub admission: OperationAdmissionEvidence,
     pub operation_record: String,
     pub original_workspace: String,
     pub staged_workspace: String,
@@ -172,6 +173,22 @@ pub struct OperationRunManifest {
     pub promotion: OperationPromotionEvidence,
     pub started_at_ms: u64,
     pub finished_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationAdmissionEvidence {
+    pub catalog_id: String,
+    pub catalog_version: u64,
+    pub catalog_digest: String,
+    pub observation_digest: String,
+    pub inference_digest: String,
+    pub analyzer_id: String,
+    pub selected_operation_class: String,
+    pub confidence_bps: u16,
+    pub resolution_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambiguity_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
