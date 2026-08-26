@@ -1,7 +1,7 @@
 # Capability broker
 
 The capability broker is the host-owned authority boundary for short-lived
-external service access, workload identities, mTLS identities, filesystem
+service access, workload identities, mTLS identities, filesystem
 handles, network leases, database roles, and external-action commit tokens.
 Cells receive only opaque lease ids, opaque provider handles, and mediated
 gateway endpoints. They do not receive the credential used by the host broker
@@ -12,7 +12,7 @@ password.
 
 ```console
 gensee run broker adapter register --config adapter.json
-gensee run broker adapter inspect repo-broker --json
+gensee run broker adapter inspect records-broker --json
 gensee run broker lease issue --request broker-request.json --json
 gensee run broker lease inspect broker_lease_... --json
 gensee run broker lease revoke broker_lease_...
@@ -31,9 +31,9 @@ non-group/world-writable adapter executable:
 ```json
 {
   "schema_version": 1,
-  "adapter_id": "repo-broker",
-  "resource_kinds": ["external_service_authority", "api_token"],
-  "executable": "/opt/gensee/brokers/external-service-client",
+  "adapter_id": "records-broker",
+  "resource_kinds": ["service_credential"],
+  "executable": "/opt/gensee/brokers/records-client",
   "args": [],
   "environment_allowlist": [],
   "lifecycle_v2": true,
@@ -60,10 +60,10 @@ key:
     "request_id": "request_...",
     "operation_id": "op_...",
     "source_run_id": "source_...",
-    "resource_kind": "external_service_authority",
-    "adapter_id": "repo-broker",
-    "audience": "repo.example.test",
-    "scopes": ["service:one:read"],
+    "resource_kind": "service_credential",
+    "adapter_id": "records-broker",
+    "audience": "records.example.test",
+    "scopes": ["records:read"],
     "ttl_seconds": 300,
     "constraints": {"service": "one"}
   },
@@ -79,7 +79,7 @@ read-only `status` action. A successful mint or active status returns only:
   "protocol_version": 1,
   "provider_status": "active",
   "provider_handle": "opaque-provider-handle",
-  "gateway_endpoint": "unix:///run/gensee/external-service.sock",
+    "gateway_endpoint": "unix:///run/gensee/records.sock",
   "public_metadata": {"service": "one"},
   "effects": [],
   "effect_telemetry_complete": false
@@ -94,7 +94,7 @@ request shape omits `lease_id` and `idempotency_key`, including during revoke.
 The wire mode is selected from the lease's retained lifecycle format, not the
 current registration: upgrading an adapter registration to lifecycle-v2 does
 not make pre-upgrade leases unrevokeable.
-New external leases require an adapter to explicitly negotiate
+New service leases require an adapter to explicitly negotiate
 `lifecycle_v2: true`, implement `status`, and accept the lifecycle fields.
 Because inherited environment values could select a different provider tenant
 after restart, lifecycle-v2 rejects a non-empty `environment_allowlist`.
@@ -131,12 +131,22 @@ never mounted into a capability cell. Promotion receipts use a separate
 signature domain and an append-only verified ledger, so editing retained JSON
 cannot erase prior promotion history or manufacture clean evidence.
 
-The adapter contract supports `external_service_authority`, `api_token`,
-`workload_identity`, `mtls_certificate`, and `database_role`. Provider-specific
+The adapter contract supports `service_credential`, `workload_identity`,
+`mtls_certificate`, `database_role`, and the typed generic resource kinds
+`credential_use`, `http_api_call`, `browser_session`, `database_transaction`,
+`message_delivery`, `ci_job_invocation`, `secret_read`, `filesystem_mutation`,
+and `cloud_control_action`. Provider-specific
 minting remains outside the cell and outside the Gensee process; an adapter can
 use OAuth token exchange, a workload-identity service, a SPIFFE workload API,
 an internal certificate authority, or a database credential broker without
 changing the cell protocol.
+
+Protocol-v1 retained state may still contain the former `repository_token` or
+`api_token` wire names and their `repository_request` or `api_request` effect
+names. Gensee accepts those names only to inspect and revoke existing leases.
+New grants and effects use `service_credential`, `service_request`, and the
+`service_gateway` constraint so the public protocol is not tied to one service
+or experiment.
 
 ## Crash-safe provider lifecycle
 

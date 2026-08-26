@@ -17,7 +17,7 @@ hero:
       link: /team
     - theme: alt
       text: Download for macOS
-      link: https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg
+      link: https://www.gensee.ai/download/crate-macos.html?placement=docs-index
     - theme: alt
       text: GitHub
       link: https://github.com/GenseeAI/gensee-crate

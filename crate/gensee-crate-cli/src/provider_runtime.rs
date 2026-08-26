@@ -472,7 +472,7 @@ fn expected_effect(operation: &ProviderOperation) -> (BrokerGatewayEffectKind, S
             path,
             ..
         } => (
-            BrokerGatewayEffectKind::ApiRequest,
+            BrokerGatewayEffectKind::ServiceRequest,
             format!("{origin}{path}"),
             method.clone(),
         ),

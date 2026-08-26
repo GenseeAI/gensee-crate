@@ -11,7 +11,7 @@ remain in your local Gensee store.
 
 ## Start with the macOS app
 
-**[Download the latest notarized macOS app](https://github.com/GenseeAI/gensee-crate/releases/latest/download/Gensee-Crate.dmg)**
+**[Download the latest notarized macOS app](https://www.gensee.ai/download/crate-macos.html?placement=docs-personal)**
 
 The signed app bundles the Gensee backend and SQLite support. It does not
 require Homebrew, Rust, Xcode, `jq`, or a separate SQLite installation. Follow

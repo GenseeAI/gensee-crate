@@ -868,15 +868,18 @@ fn validate_broker_lease_request(request: &BrokerLeaseRequest) -> io::Result<()>
     }
     if request.cell_id.is_some() {
         let expected_gateway_kinds: &[&str] = match request.resource_kind {
-            BrokerResourceKind::ExternalServiceAuthority => &["external_api"],
-            BrokerResourceKind::LegacyExternalServiceAuthorityV1 => {
+            BrokerResourceKind::ServiceCredential => &[
+                "service_gateway",
+                "cloud_api",
+                "browser_automation",
+                "secret",
+            ],
+            BrokerResourceKind::LegacyServiceCredentialV1A
+            | BrokerResourceKind::LegacyServiceCredentialV1B => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "legacy service-authority wire kinds are accepted only for retained-state cleanup",
+                    "legacy service-credential wire kinds are accepted only for retained-state cleanup",
                 ));
-            }
-            BrokerResourceKind::ApiToken => {
-                &["external_api", "cloud_api", "browser_automation", "secret"]
             }
             BrokerResourceKind::WorkloadIdentity => &["workload_identity"],
             BrokerResourceKind::MtlsCertificate => &["mtls"],
@@ -3354,7 +3357,7 @@ mod tests {
             + r#"input=""
 while IFS= read -r line; do input="$input$line"; done
 pwd > "$state.cwd"
-gateway=unix:///run/gensee/repo.sock
+gateway=unix:///run/gensee/records.sock
 if [ -f "$gateway_file" ]; then IFS= read -r gateway < "$gateway_file"; fi
 case "$input" in
   *status*)
@@ -3395,7 +3398,7 @@ esac
         let config = BrokerAdapterConfig {
             schema_version: BROKER_ADAPTER_SCHEMA_VERSION,
             adapter_id: "idempotent_adapter".to_string(),
-            resource_kinds: vec![BrokerResourceKind::ExternalServiceAuthority],
+            resource_kinds: vec![BrokerResourceKind::ServiceCredential],
             executable: executable.to_string_lossy().to_string(),
             args: vec!["--lifecycle-v2".to_string()],
             environment_allowlist: Vec::new(),
@@ -3410,11 +3413,11 @@ esac
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             cell_id: None,
-            resource_kind: BrokerResourceKind::ExternalServiceAuthority,
+            resource_kind: BrokerResourceKind::ServiceCredential,
             typed_scope: None,
             adapter_id: config.adapter_id.clone(),
-            audience: "repo.example.test".to_string(),
-            scopes: vec!["service:one:read".to_string()],
+            audience: "records.example.test".to_string(),
+            scopes: vec!["records:read".to_string()],
             ttl_seconds: 60,
             constraints: json!({ "service": "one" }),
         };
@@ -3461,7 +3464,7 @@ esac
             fork_count: None,
             fork_approach: None,
             image: "image".to_string(),
-            workspace: "/repo".to_string(),
+            workspace: "/workspace".to_string(),
             container_workspace: "/workspace".to_string(),
             container_home: "/home/gensee".to_string(),
             agent_cmd: vec!["agent".to_string()],
@@ -3520,7 +3523,7 @@ esac
     #[test]
     fn direct_network_lease_requires_a_pinned_ip_protocol_and_ports() {
         assert!(validate_network_constraints(&json!({
-            "destination": "repo.example.test",
+            "destination": "records.example.test",
             "protocol": "tcp",
             "ports": [443]
         }))
@@ -3617,7 +3620,7 @@ esac
 
     #[test]
     fn gateway_endpoints_must_be_mediated() {
-        assert!(valid_gateway_endpoint("unix:///run/gensee/repo.sock"));
+        assert!(valid_gateway_endpoint("unix:///run/gensee/records.sock"));
         assert!(valid_gateway_endpoint("https://gateway.example.test"));
         assert!(valid_gateway_endpoint("http://127.0.0.1:8080"));
         assert!(!valid_gateway_endpoint("http://gateway.example.test"));
@@ -3635,7 +3638,7 @@ esac
             protocol_version: BROKER_PROTOCOL_VERSION,
             provider_status: None,
             provider_handle: "opaque_1".to_string(),
-            gateway_endpoint: "unix:///run/gensee/repo.sock".to_string(),
+            gateway_endpoint: "unix:///run/gensee/records.sock".to_string(),
             public_metadata: Value::Null,
             effects: Vec::new(),
             effect_telemetry_complete: true,
@@ -3685,7 +3688,7 @@ esac
         env::set_var("GENSEE_HOME", &root);
         let (config, mut request, state) = lifecycle_test_fixture(&root);
         request.cell_id = Some("cell_1".to_string());
-        request.constraints = json!({ "gateway_kind": "external_api" });
+        request.constraints = json!({ "gateway_kind": "service_gateway" });
         let invalid_gateway = root.join("not-a-socket");
         fs::write(&invalid_gateway, b"ordinary file").unwrap();
         fs::write(
@@ -3727,7 +3730,7 @@ esac
             operation_id: request.operation_id,
             source_run_id: request.source_run_id,
             cell_id: None,
-            resource_kind: BrokerResourceKind::LegacyExternalServiceAuthorityV1,
+            resource_kind: BrokerResourceKind::LegacyServiceCredentialV1A,
             typed_scope: None,
             adapter_id: config.adapter_id,
             audience: request.audience,
@@ -3737,7 +3740,7 @@ esac
             expires_at_ms: u64::MAX,
             status: BrokerLeaseStatus::Active,
             delivery: BrokerDelivery::Gateway {
-                gateway_endpoint: "unix:///run/gensee/repo.sock".to_string(),
+                gateway_endpoint: "unix:///run/gensee/records.sock".to_string(),
                 provider_handle: "opaque_1".to_string(),
             },
             public_metadata: Value::Null,
@@ -3898,11 +3901,11 @@ esac
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             cell_id: None,
-            resource_kind: BrokerResourceKind::ExternalServiceAuthority,
+            resource_kind: BrokerResourceKind::ServiceCredential,
             typed_scope: None,
-            adapter_id: "repo_adapter".to_string(),
-            audience: "repo.example.test".to_string(),
-            scopes: vec!["service:one:read".to_string()],
+            adapter_id: "records_adapter".to_string(),
+            audience: "records.example.test".to_string(),
+            scopes: vec!["records:read".to_string()],
             ttl_seconds: 60,
             constraints: json!({ "service": "one" }),
         };
@@ -4173,7 +4176,7 @@ esac
         let cell_id = "cell_publish";
         request.cell_id = Some(cell_id.to_string());
         request.constraints = json!({
-            "gateway_kind": "external_api",
+            "gateway_kind": "service_gateway",
             "service": "one"
         });
         let now = unix_millis().unwrap();
@@ -4189,7 +4192,7 @@ esac
         let socket_dir = root.join("gateway");
         fs::create_dir_all(&socket_dir).unwrap();
         fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = socket_dir.join("repo.sock");
+        let socket = socket_dir.join("records.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         fs::write(
             state.with_extension("gateway"),
@@ -4266,7 +4269,7 @@ esac
         let cell_id = "cell_dirsync";
         request.cell_id = Some(cell_id.to_string());
         request.constraints = json!({
-            "gateway_kind": "external_api",
+            "gateway_kind": "service_gateway",
             "service": "one"
         });
         let now = unix_millis().unwrap();
@@ -4282,7 +4285,7 @@ esac
         let socket_dir = root.join("gateway");
         fs::create_dir_all(&socket_dir).unwrap();
         fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = socket_dir.join("repo.sock");
+        let socket = socket_dir.join("records.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         fs::write(
             state.with_extension("gateway"),
@@ -4775,8 +4778,8 @@ esac
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let config = BrokerAdapterConfig {
             schema_version: BROKER_ADAPTER_SCHEMA_VERSION,
-            adapter_id: "repo_adapter".to_string(),
-            resource_kinds: vec![BrokerResourceKind::ExternalServiceAuthority],
+            adapter_id: "records_adapter".to_string(),
+            resource_kinds: vec![BrokerResourceKind::ServiceCredential],
             executable: executable.to_string_lossy().to_string(),
             args: Vec::new(),
             environment_allowlist: Vec::new(),
@@ -4790,11 +4793,11 @@ esac
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_1".to_string()),
-            resource_kind: BrokerResourceKind::ExternalServiceAuthority,
+            resource_kind: BrokerResourceKind::ServiceCredential,
             typed_scope: None,
-            adapter_id: "repo_adapter".to_string(),
-            audience: "repo.example.test".to_string(),
-            scopes: vec!["service:one:read".to_string()],
+            adapter_id: "records_adapter".to_string(),
+            audience: "records.example.test".to_string(),
+            scopes: vec!["records:read".to_string()],
             ttl_seconds: 60,
             constraints: json!({ "service": "one" }),
         };

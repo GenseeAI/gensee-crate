@@ -1053,9 +1053,9 @@ fn validate_cell_request_for_execution(
     for broker_lease in &broker_leases {
         validate_broker_scope_against_request(&lease.request, broker_lease)?;
         match broker_lease.resource_kind {
-            BrokerResourceKind::ExternalServiceAuthority
-            | BrokerResourceKind::LegacyExternalServiceAuthorityV1
-            | BrokerResourceKind::ApiToken => {
+            BrokerResourceKind::ServiceCredential
+            | BrokerResourceKind::LegacyServiceCredentialV1A
+            | BrokerResourceKind::LegacyServiceCredentialV1B => {
                 active_mediators.push(MediationBoundary::SecretBroker);
                 active_mediators.push(MediationBoundary::NetworkBoundary);
                 add_gateway_kind_mediator(&mut active_mediators, broker_lease)?;
@@ -1499,7 +1499,7 @@ fn add_gateway_kind_mediator(
             )
         })?;
     let mediator = match gateway_kind {
-        "external_api" | "secret" => MediationBoundary::ExternalApiGateway,
+        "service_gateway" | "external_api" | "secret" => MediationBoundary::ExternalApiGateway,
         "cloud_api" => MediationBoundary::CloudApiGateway,
         "browser_automation" => MediationBoundary::BrowserAutomationGateway,
         _ => {
@@ -2381,9 +2381,9 @@ fn build_effect_manifest(
                         purpose: effect.action.clone(),
                     });
                 }
-                BrokerGatewayEffectKind::ExternalServiceRequest
-                | BrokerGatewayEffectKind::LegacyExternalServiceRequestV1
-                | BrokerGatewayEffectKind::ApiRequest
+                BrokerGatewayEffectKind::ServiceRequest
+                | BrokerGatewayEffectKind::LegacyServiceRequestV1A
+                | BrokerGatewayEffectKind::LegacyServiceRequestV1B
                 | BrokerGatewayEffectKind::DatabaseRequest
                 | BrokerGatewayEffectKind::BrowserAction
                 | BrokerGatewayEffectKind::CloudAction
@@ -3934,11 +3934,13 @@ pub(super) fn attach_broker_lease_to_cell(
         ));
     }
     let requested = match resource_kind {
-        BrokerResourceKind::ExternalServiceAuthority
-        | BrokerResourceKind::LegacyExternalServiceAuthorityV1
-        | BrokerResourceKind::ApiToken => lease.request.capabilities.iter().any(|capability| {
-            matches!(capability, Capability::SecretUse | Capability::IdentityUse)
-        }),
+        BrokerResourceKind::ServiceCredential
+        | BrokerResourceKind::LegacyServiceCredentialV1A
+        | BrokerResourceKind::LegacyServiceCredentialV1B => {
+            lease.request.capabilities.iter().any(|capability| {
+                matches!(capability, Capability::SecretUse | Capability::IdentityUse)
+            })
+        }
         BrokerResourceKind::WorkloadIdentity => lease
             .request
             .capabilities
@@ -4056,12 +4058,12 @@ pub(super) fn persist_test_broker_cell_binding(
     );
     request.scope.network_destinations =
         vec![gensee_crate_rules::capability::NetworkDestinationScope {
-            destination: "repo.example.test".to_string(),
+            destination: "records.example.test".to_string(),
             protocol: "https".to_string(),
             ports: vec![443],
         }];
     request.scope.secret_identities = vec![gensee_crate_rules::capability::SecretIdentityScope {
-        handle: "repo_reader".to_string(),
+        handle: "records_reader".to_string(),
         identity: "service-reader".to_string(),
         purpose: "read external service metadata".to_string(),
     }];
@@ -4138,7 +4140,7 @@ mod tests {
             fork_count: None,
             fork_approach: None,
             image: "image".to_string(),
-            workspace: "/repo".to_string(),
+            workspace: "/workspace".to_string(),
             container_workspace: "/workspace".to_string(),
             container_home: "/home/gensee".to_string(),
             agent_cmd: vec![],
@@ -4524,12 +4526,12 @@ mod tests {
             ],
         );
         gateway_request.scope.network_destinations = vec![NetworkDestinationScope {
-            destination: "repo.example.test".to_string(),
+            destination: "records.example.test".to_string(),
             protocol: "https".to_string(),
             ports: vec![443],
         }];
         gateway_request.scope.secret_identities = vec![SecretIdentityScope {
-            handle: "repo_reader".to_string(),
+            handle: "records_reader".to_string(),
             identity: "service-reader".to_string(),
             purpose: "read external service metadata".to_string(),
         }];
@@ -4555,12 +4557,12 @@ mod tests {
             operation_id: "op_gateway".to_string(),
             source_run_id: "run_gateway".to_string(),
             cell_id: Some("cell_gateway".to_string()),
-            resource_kind: BrokerResourceKind::ApiToken,
+            resource_kind: BrokerResourceKind::ServiceCredential,
             typed_scope: None,
-            adapter_id: "repo_adapter".to_string(),
-            audience: "repo.example.test".to_string(),
-            scopes: vec!["service:one:read".to_string()],
-            constraints: json!({ "gateway_kind": "external_api" }),
+            adapter_id: "records_adapter".to_string(),
+            audience: "records.example.test".to_string(),
+            scopes: vec!["records:read".to_string()],
+            constraints: json!({ "gateway_kind": "service_gateway" }),
             issued_at_ms: 100,
             expires_at_ms: 250,
             status: BrokerLeaseStatus::Active,
@@ -4620,13 +4622,13 @@ mod tests {
         revoked.gateway_effects = vec![BrokerGatewayEffect {
             kind: BrokerGatewayEffectKind::SecretAccess,
             occurred_at_ms: 160,
-            target: "repo.example.test".to_string(),
+            target: "records.example.test".to_string(),
             action: "read_external_metadata".to_string(),
             request_digest: format!("sha256:{}", "b".repeat(64)),
             protocol: None,
             port: None,
             response_status: Some(200),
-            broker_handle_id: Some("repo_reader".to_string()),
+            broker_handle_id: Some("records_reader".to_string()),
         }];
         let manifest = build_effect_manifest(
             &source_record(),

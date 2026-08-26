@@ -136,8 +136,8 @@ struct HttpTransactionScope {
     scheme: String,
     /// Canonical URL authority, including a non-default port when present.
     authority: String,
-    /// Absolute path segment prefix. `/repo` matches `/repo` and `/repo/...`,
-    /// never `/v1/data`.
+    /// Absolute path segment prefix. `/objects` matches `/objects` and
+    /// `/objects/...`, never `/objects-evil`.
     path_prefix: String,
 }
 
@@ -6347,7 +6347,7 @@ mod tests {
                 handle_id: "credential_handle_1".to_string(),
                 header_name: "Authorization".to_string(),
                 value_file: credential_path.display().to_string(),
-                allowed_url_prefixes: vec![format!("http://{origin_address}/repo")],
+                allowed_url_prefixes: vec![format!("http://{origin_address}/objects")],
             }),
             gateway_id: None,
             commit_token_id: None,
@@ -6359,7 +6359,7 @@ mod tests {
             let mut stream = TcpStream::connect(gateway_address).unwrap();
             write!(
                 stream,
-                "GET http://{origin_address}/repo/artifact?presigned=do-not-log HTTP/1.1\r\nAuthorization: attacker\r\nCookie: attacker=true\r\n\r\n"
+                "GET http://{origin_address}/objects/item?presigned=do-not-log HTTP/1.1\r\nAuthorization: attacker\r\nCookie: attacker=true\r\n\r\n"
             )
             .unwrap();
             let mut response = String::new();
