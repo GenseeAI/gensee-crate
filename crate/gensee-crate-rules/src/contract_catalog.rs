@@ -102,6 +102,14 @@ pub struct ApprovedSemanticVerifier {
     pub public_key_hex: String,
     pub profiles: Vec<String>,
     pub policy_versions: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_isolation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolated_runtime_config_digest: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,6 +450,13 @@ impl ContractCatalog {
                     .policy_versions
                     .iter()
                     .any(|value| !bounded_token(value))
+                || (verifier.require_isolation
+                    && verifier
+                        .isolated_runtime_config_digest
+                        .as_deref()
+                        .is_none_or(|digest| !valid_sha256(digest)))
+                || (!verifier.require_isolation
+                    && verifier.isolated_runtime_config_digest.is_some())
             {
                 errors.push(format!(
                     "semantic verifier {} is invalid",
@@ -841,6 +856,23 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.contains("approval is expired or out of bounds")));
+    }
+
+    #[test]
+    fn isolated_verifier_requires_catalog_pinned_runtime_config() {
+        let mut candidate = catalog();
+        candidate.semantic_verifiers.push(ApprovedSemanticVerifier {
+            verifier_id: "content_verifier".into(),
+            public_key_hex: "33".repeat(32),
+            profiles: vec!["content_policy".into()],
+            policy_versions: vec!["policy_v1".into()],
+            require_isolation: true,
+            isolated_runtime_config_digest: None,
+        });
+        assert!(!candidate.audit("linux", 100).valid);
+        candidate.semantic_verifiers[0].isolated_runtime_config_digest =
+            Some(format!("sha256:{}", "44".repeat(32)));
+        assert!(candidate.audit("linux", 100).valid);
     }
 
     fn observation() -> IntentObservation {

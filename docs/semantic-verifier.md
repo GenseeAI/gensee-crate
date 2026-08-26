@@ -24,8 +24,44 @@ A trusted verifier returns a signed receipt containing the exact request
 digest and nonce, all product and contract bindings, its verifier identity,
 policy version, verdict (`accept`, `reject`, or `indeterminate`), bounded reason
 codes, and a digest of its own validation-effect manifest. The signed
-organization catalog pins verifier public keys and the profile/policy-version
-combinations each verifier may claim.
+organization catalog pins verifier public keys, the profile/policy-version
+combinations each verifier may claim, and whether the verifier must run inside
+Gensee's isolation boundary.
+
+For an isolation-required verifier, the operator installs a root-controlled
+configuration containing the verifier ID, policy version, absolute executable
+and working-directory paths, executable SHA-256, fixed arguments, and a runtime
+deadline. The catalog pins the canonical configuration digest, so the caller
+cannot substitute arguments, paths, deadlines, or executable bytes. Gensee
+copies the digest-checked executable into a private runtime
+directory before execution, clears its environment and inherited descriptors,
+passes the exact request on standard input, and accepts one bounded JSON result
+on standard output:
+
+```console
+gensee boundary verifier run \
+  --catalog /etc/gensee/catalog.signed.json \
+  --trusted-key /etc/gensee/organization-public.hex \
+  --request verifier-request.json \
+  --manifest operation-manifest.json \
+  --config /etc/gensee/verifiers/content-policy.json \
+  --verifier-key /etc/gensee/verifiers/content-policy.seed.hex \
+  --output verifier-receipt.json
+```
+
+On Linux the child is restricted by Landlock to read/execute filesystem access
+and by seccomp to no networking and no process creation. On macOS Seatbelt
+denies network access, process forks, and filesystem writes. Unsupported
+platforms fail closed. The receipt binds the isolation profile and executable
+digest; a catalog that requires isolation rejects a receipt made by the manual
+`attest` or `sign` paths without those claims.
+
+Before launch, the host authenticates the operation manifest, rechecks its
+successful and fully drained execution state, resolves the exact product
+contract from the signed catalog, re-hashes the staged product, and copies that
+exact digest-bound product into the private verifier runtime. The verifier
+receives its read-only path in `GENSEE_VERIFIER_PRODUCT`; it does not receive a
+request containing only an unverifiable digest.
 
 `gensee boundary run` signs the complete manifest with the root-owned key at
 `/etc/gensee/operation-manifest-signing-key.hex`. Request creation verifies it
@@ -49,6 +85,5 @@ promotion must also prove authority revocation and an unchanged staged product.
 
 Verifier implementations remain domain-specific. Gensee's generic role is to
 make the verifier identity and policy explicit, bind the challenge and verdict
-to immutable evidence, and prevent a producer from substituting either. A
-deployment should execute verifier code under a separate constrained identity;
-the privileged generic conformance test covers that isolation boundary.
+to immutable evidence, prevent a producer from substituting either, and enforce
+the same isolation lifecycle independent of the verifier's domain.
