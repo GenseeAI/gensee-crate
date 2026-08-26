@@ -7,6 +7,24 @@ use serde::{Deserialize, Serialize};
 
 pub const PROVIDER_INVOCATION_SCHEMA_VERSION: u32 = 1;
 
+/// Root-controlled executable registration for one operational provider.
+///
+/// The provider implementation is intentionally outside the Gensee core. The
+/// runtime pins this complete configuration and supplies only an invocation
+/// already attenuated to an active lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRuntimeConfig {
+    pub adapter_id: String,
+    pub resource_kind: BrokerResourceKind,
+    pub executable: String,
+    pub executable_sha256: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub working_directory: String,
+    pub max_runtime_seconds: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderInvocation {
@@ -90,6 +108,20 @@ pub struct ProviderAdapterResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_digest: Option<String>,
     pub occurred_at_ms: u64,
+}
+
+/// Host-authenticated evidence that a particular provider implementation
+/// handled one exact invocation under one exact lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDispatchReceipt {
+    pub schema_version: u32,
+    pub invocation: ProviderInvocation,
+    pub lease_digest: String,
+    pub adapter_id: String,
+    pub adapter_executable_digest: String,
+    pub result: ProviderAdapterResult,
+    pub host_signature: String,
 }
 
 impl ProviderInvocation {
@@ -272,6 +304,20 @@ fn sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contributor_provider_config_fixture_matches_public_protocol() {
+        let config: ProviderRuntimeConfig = serde_json::from_str(include_str!(
+            "../../../integrations/boundary/extensions/capability-provider-config.json"
+        ))
+        .unwrap();
+        assert_eq!(config.adapter_id, "analytics_database_v1");
+        assert_eq!(
+            config.resource_kind,
+            BrokerResourceKind::DatabaseTransaction
+        );
+    }
+
     #[test]
     fn every_provider_operation_is_scope_checked() {
         let cases = vec![

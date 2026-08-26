@@ -1,9 +1,10 @@
 use crate::*;
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use gensee_crate_rules::contract_catalog::{
-    ContractResolution, InferenceSignature, IntentAnalysisModel, IntentCandidate, IntentInference,
-    IntentObservation, ObservedCaller, SignedContractCatalog, SignedIntentInference,
-    TrajectoryEvidence, INTENT_INFERENCE_SCHEMA_VERSION, INTENT_MODEL_SCHEMA_VERSION,
+    ContractResolution, InferenceSignature, IntentAnalysisModel, IntentAnalyzerResult,
+    IntentCandidate, IntentInference, IntentObservation, ObservedCaller, SignedContractCatalog,
+    SignedIntentInference, TrajectoryEvidence, INTENT_ANALYZER_RESULT_SCHEMA_VERSION,
+    INTENT_INFERENCE_SCHEMA_VERSION, INTENT_MODEL_SCHEMA_VERSION,
     INTENT_OBSERVATION_SCHEMA_VERSION,
 };
 use gensee_crate_rules::operation_contract::OperationContract;
@@ -42,6 +43,7 @@ pub(crate) fn handle_intent_resolution(args: &[OsString]) -> io::Result<()> {
     match command.to_str() {
         Some("observe") => observe_command(rest),
         Some("analyze") => analyze_command(rest),
+        Some("sign-result") => sign_analyzer_result_command(rest),
         Some("attest") => attest_command(rest),
         Some("resolve") => resolve_command(rest),
         Some("--help" | "-h") => {
@@ -50,6 +52,92 @@ pub(crate) fn handle_intent_resolution(args: &[OsString]) -> io::Result<()> {
         }
         _ => Err(intent_usage_error()),
     }
+}
+
+fn sign_analyzer_result_command(args: &[OsString]) -> io::Result<()> {
+    reject_options(
+        args,
+        &[
+            "--catalog",
+            "--trusted-key",
+            "--observation",
+            "--result",
+            "--analyzer-key",
+            "--ttl-seconds",
+            "--output",
+        ],
+        &[],
+    )?;
+    let catalog: SignedContractCatalog = read_catalog_json(
+        &required_path(args, "--catalog")?,
+        "signed contract catalog",
+    )?;
+    let now_ms = unix_millis()?;
+    verify_signed_catalog(&catalog, &required_path(args, "--trusted-key")?, now_ms)?;
+    let observation: IntentObservation =
+        read_catalog_json(&required_path(args, "--observation")?, "intent observation")?;
+    observation.validate().map_err(invalid_input)?;
+    let result: IntentAnalyzerResult = read_catalog_json(
+        &required_path(args, "--result")?,
+        "external intent analyzer result",
+    )?;
+    let analyzer = catalog
+        .catalog
+        .intent_analyzers
+        .iter()
+        .find(|candidate| candidate.analyzer_id == result.analyzer_id)
+        .ok_or_else(|| invalid_data("external result uses an unapproved intent analyzer"))?;
+    if result.schema_version != INTENT_ANALYZER_RESULT_SCHEMA_VERSION
+        || result.model_identity != analyzer.model_identity
+        || result.candidates.is_empty()
+        || result.candidates.len() > 64
+        || result.candidates.iter().any(|candidate| {
+            !analyzer
+                .allowed_operation_classes
+                .contains(&candidate.operation_class)
+        })
+    {
+        return Err(invalid_data(
+            "external intent analyzer result is malformed or outside its catalog scope",
+        ));
+    }
+    let key = read_signing_key(&required_path(args, "--analyzer-key")?)?;
+    if hex::encode(key.verifying_key().as_bytes()) != analyzer.public_key_hex.to_lowercase() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "intent analyzer key is not catalog-approved",
+        ));
+    }
+    let ttl_seconds = required_u64(args, "--ttl-seconds")?;
+    if ttl_seconds == 0 || ttl_seconds > 900 {
+        return Err(invalid_input(
+            "intent inference TTL must be in 1..=900 seconds",
+        ));
+    }
+    let inference = IntentInference {
+        schema_version: INTENT_INFERENCE_SCHEMA_VERSION,
+        inference_id: format!("infer_{}", uuid::Uuid::new_v4().simple()),
+        analyzer_id: result.analyzer_id,
+        model_identity: result.model_identity,
+        observation_digest: digest_bytes(&serde_json::to_vec(&observation).map_err(json_error)?),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(ttl_seconds.saturating_mul(1000)),
+        candidates: result.candidates,
+    };
+    inference
+        .validate(&observation, now_ms)
+        .map_err(invalid_input)?;
+    let encoded = serde_json::to_vec(&inference).map_err(json_error)?;
+    write_json(
+        &required_path(args, "--output")?,
+        &SignedIntentInference {
+            inference,
+            signature: InferenceSignature {
+                algorithm: "ed25519".into(),
+                signature_hex: hex::encode(key.sign(&encoded).to_bytes()),
+            },
+        },
+    )
 }
 
 fn analyze_command(args: &[OsString]) -> io::Result<()> {
@@ -595,12 +683,12 @@ fn json_error(error: serde_json::Error) -> io::Error {
 }
 
 fn intent_usage_error() -> io::Error {
-    invalid_input("usage: gensee boundary intent <observe|analyze|attest|resolve> ...")
+    invalid_input("usage: gensee boundary intent <observe|analyze|sign-result|attest|resolve> ...")
 }
 
 fn print_intent_usage() {
     println!(
-        "gensee boundary intent\n\nUSAGE:\n  gensee boundary intent observe --output <observation.json> [--trajectory <history.json>] -- <command> [args...]\n  gensee boundary intent analyze --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --model <model.json> --analyzer-key <seed.hex> --ttl-seconds <n> --output <signed.json>\n  gensee boundary intent attest --observation <observation.json> --inference <unsigned.json> --analyzer-key <seed.hex> --output <signed.json>\n  gensee boundary intent resolve --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --inference <signed-inference.json> --output <resolution.json> -- <command> [args...]"
+        "gensee boundary intent\n\nUSAGE:\n  gensee boundary intent observe --output <observation.json> [--trajectory <history.json>] -- <command> [args...]\n  gensee boundary intent analyze --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --model <model.json> --analyzer-key <seed.hex> --ttl-seconds <n> --output <signed.json>\n  gensee boundary intent sign-result --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --result <analyzer-result.json> --analyzer-key <seed.hex> --ttl-seconds <n> --output <signed.json>\n  gensee boundary intent attest --observation <observation.json> --inference <unsigned.json> --analyzer-key <seed.hex> --output <signed.json>\n  gensee boundary intent resolve --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --inference <signed-inference.json> --output <resolution.json> -- <command> [args...]"
     );
 }
 
@@ -766,6 +854,76 @@ mod tests {
             &changed,
             200,
         )
+        .is_err());
+
+        let analyzer_result_path = temp.join("analyzer-result.json");
+        let analyzer_key_path = temp.join("analyzer.seed.hex");
+        let signed_result_path = temp.join("external-inference.json");
+        let external_result = IntentAnalyzerResult {
+            schema_version: INTENT_ANALYZER_RESULT_SCHEMA_VERSION,
+            analyzer_id: "analyzer_test".into(),
+            model_identity: "model_test".into(),
+            candidates: vec![IntentCandidate {
+                operation_class: "transform".into(),
+                confidence_bps: 9_000,
+                rationale_code: "external_model".into(),
+                evidence_ids: Vec::new(),
+            }],
+        };
+        fs::write(
+            &analyzer_result_path,
+            serde_json::to_vec(&external_result).unwrap(),
+        )
+        .unwrap();
+        fs::write(&analyzer_key_path, hex::encode(analyzer_key.to_bytes())).unwrap();
+        sign_analyzer_result_command(&[
+            "--catalog".into(),
+            catalog_path.clone().into_os_string(),
+            "--trusted-key".into(),
+            key_path.clone().into_os_string(),
+            "--observation".into(),
+            observation_path.clone().into_os_string(),
+            "--result".into(),
+            analyzer_result_path.clone().into_os_string(),
+            "--analyzer-key".into(),
+            analyzer_key_path.into_os_string(),
+            "--ttl-seconds".into(),
+            "60".into(),
+            "--output".into(),
+            signed_result_path.clone().into_os_string(),
+        ])
+        .unwrap();
+        let external_signed: SignedIntentInference =
+            serde_json::from_slice(&fs::read(&signed_result_path).unwrap()).unwrap();
+        assert_eq!(external_signed.inference.analyzer_id, "analyzer_test");
+        assert_eq!(
+            external_signed.inference.observation_digest,
+            digest_bytes(&serde_json::to_vec(&observation).unwrap())
+        );
+
+        let mut outside_scope = external_result;
+        outside_scope.candidates[0].operation_class = "admin_override".into();
+        fs::write(
+            &analyzer_result_path,
+            serde_json::to_vec(&outside_scope).unwrap(),
+        )
+        .unwrap();
+        assert!(sign_analyzer_result_command(&[
+            "--catalog".into(),
+            catalog_path.into_os_string(),
+            "--trusted-key".into(),
+            key_path.into_os_string(),
+            "--observation".into(),
+            observation_path.into_os_string(),
+            "--result".into(),
+            analyzer_result_path.into_os_string(),
+            "--analyzer-key".into(),
+            temp.join("analyzer.seed.hex").into_os_string(),
+            "--ttl-seconds".into(),
+            "60".into(),
+            "--output".into(),
+            temp.join("outside-scope.json").into_os_string(),
+        ])
         .is_err());
         fs::remove_dir_all(temp).unwrap();
     }

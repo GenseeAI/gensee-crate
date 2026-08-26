@@ -6,6 +6,32 @@ use std::collections::BTreeSet;
 
 pub const SEMANTIC_VERIFIER_SCHEMA_VERSION: u32 = 1;
 
+/// Root-controlled executable registration for a domain-specific verifier.
+/// The signed organization catalog pins the digest of this complete value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolatedVerifierConfig {
+    pub verifier_id: String,
+    pub policy_version: String,
+    pub executable: String,
+    pub executable_sha256: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub working_directory: String,
+    pub max_runtime_seconds: u64,
+}
+
+/// Bounded stdout protocol emitted by an isolated verifier implementation.
+/// Gensee adds request, product, policy, identity, and isolation bindings before
+/// signing the final receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierProgramResult {
+    pub verdict: SemanticVerdict,
+    pub reason_codes: Vec<String>,
+    pub validation_effect_manifest_digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifierRequest {
@@ -167,6 +193,20 @@ fn sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contributor_verifier_fixtures_match_public_protocols() {
+        let config: IsolatedVerifierConfig = serde_json::from_str(include_str!(
+            "../../../integrations/boundary/extensions/semantic-verifier-config.json"
+        ))
+        .unwrap();
+        let result: VerifierProgramResult = serde_json::from_str(include_str!(
+            "../../../integrations/boundary/extensions/semantic-verifier-result.json"
+        ))
+        .unwrap();
+        assert_eq!(config.verifier_id, "structured_result_policy");
+        assert_eq!(result.verdict, SemanticVerdict::Accept);
+    }
 
     fn request() -> VerifierRequest {
         VerifierRequest {

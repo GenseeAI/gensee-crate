@@ -1,0 +1,5 @@
+{
+  "verdict": "accept",
+  "reason_codes": ["schema_and_policy_valid"],
+  "validation_effect_manifest_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+}

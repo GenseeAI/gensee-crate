@@ -9,6 +9,7 @@ Gensee Crate is an open-source control layer for AI coding agents. Start with
 - [Generic operation boundary](operation-boundary.md) — admit arbitrary commands before execution, bind an OS-observed execution subject, enforce an outbound-network envelope, and structurally gate staged products without claiming semantic safety.
 - [Approved contract catalogs](contract-catalog.md) — sign organization-owned, versioned operation contracts and exact caller/class selectors so an untrusted workload cannot choose a more permissive envelope.
 - [Generic capability providers](generic-capability-providers.md) — use typed scopes and one crash-safe lease lifecycle for credential, protocol, filesystem, and control-plane mediators.
+- [Boundary extension authoring](boundary-extension-authoring.md) — add organization contracts, external intent analyzers, isolated semantic verifiers, and operational capability providers through stable, bounded protocols.
 - [Distributed operation context](operation-context.md) — authenticate service hops, deadlines, generations, attenuated grant sets, and downstream effects back to the initiating operation.
 - [Semantic-verifier receipts](semantic-verifier.md) — bind a catalog-approved verifier and policy version to the exact structural product, contract, verdict, and validation-effect digest.
 - [Transactional promotion](transactional-promotion.md) — require unchanged structural evidence, an authenticated semantic verdict, terminal authority, compare-and-swap selection, and crash-safe rollback.
