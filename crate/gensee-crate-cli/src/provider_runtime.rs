@@ -5,12 +5,15 @@ use gensee_crate_rules::provider_runtime::{
     PROVIDER_INVOCATION_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Child;
 
 const MAX_PROVIDER_BYTES: u64 = 1024 * 1024;
 
@@ -198,6 +201,7 @@ fn execute_provider(
     config: &ProviderRuntimeConfig,
     invocation: &ProviderInvocation,
 ) -> io::Result<ProviderAdapterResult> {
+    let mut execution_subject = ProviderExecutionSubject::prepare(&invocation.invocation_id)?;
     let runtime = default_root()?
         .join("provider-runtime")
         .join(&invocation.invocation_id);
@@ -218,26 +222,33 @@ fn execute_provider(
     #[cfg(unix)]
     unsafe {
         use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
+        #[cfg(target_os = "linux")]
+        let cgroup_procs = execution_subject.cgroup_procs_cstring()?;
+        command.pre_exec(move || {
             if libc::setpgid(0, 0) == 0 {
+                #[cfg(target_os = "linux")]
+                attach_provider_child_to_cgroup(&cgroup_procs)?;
                 Ok(())
             } else {
                 Err(io::Error::last_os_error())
             }
         });
     }
-    let mut child = command.spawn()?;
-    if let Some(mut input) = child.stdin.take() {
+    let child = command.spawn()?;
+    let mut child = ProviderChildGuard::new(child);
+    if let Some(mut input) = child.child_mut().stdin.take() {
         serde_json::to_writer(&mut input, invocation).map_err(json_error)?;
     }
     let deadline = Instant::now() + Duration::from_secs(config.max_runtime_seconds);
     let status = loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.child_mut().try_wait()? {
+            child.mark_reaped();
             break status;
         }
         if Instant::now() >= deadline {
-            terminate_provider_group(child.id());
-            let _ = child.wait();
+            execution_subject.drain()?;
+            let _ = child.child_mut().wait();
+            child.mark_reaped();
             return Err(io::Error::new(
                 ErrorKind::TimedOut,
                 "provider adapter exceeded its deadline",
@@ -245,13 +256,156 @@ fn execute_provider(
         }
         thread::sleep(Duration::from_millis(10));
     };
+    execution_subject.drain()?;
     if !status.success() {
-        terminate_provider_group(child.id());
         return Err(denied("provider adapter failed"));
     }
     let result = read_provider_json(&output_path)?;
     let _ = fs::remove_dir_all(runtime);
     Ok(result)
+}
+
+struct ProviderChildGuard {
+    child: Child,
+    reaped: bool,
+}
+
+impl ProviderChildGuard {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn mark_reaped(&mut self) {
+        self.reaped = true;
+    }
+}
+
+impl Drop for ProviderChildGuard {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// A provider adapter may create descendants, so the direct child's process
+/// group is not a sufficient lifetime boundary. Linux dispatch therefore
+/// creates a private cgroup before spawn, attaches the child before `exec`, and
+/// recursively kills and verifies that cgroup empty before accepting any
+/// adapter result. Other platforms fail closed until they have an equivalent
+/// non-escapable execution-subject implementation.
+struct ProviderExecutionSubject {
+    #[cfg(target_os = "linux")]
+    cgroup_path: PathBuf,
+    drained: bool,
+}
+
+impl ProviderExecutionSubject {
+    fn prepare(invocation_id: &str) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let subject_id = format!("provider-{invocation_id}-{}", uuid::Uuid::new_v4().simple());
+            let cgroup_path = gensee_crate_linux::default_agent_cgroup_path(&subject_id);
+            gensee_crate_linux::create_agent_cgroup(&cgroup_path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot create provider execution cgroup: {error}"),
+                )
+            })?;
+            Ok(Self {
+                cgroup_path,
+                drained: false,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = invocation_id;
+            Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "provider dispatch requires a Linux cgroup-v2 execution subject",
+            ))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cgroup_procs_cstring(&self) -> io::Result<CString> {
+        use std::os::unix::ffi::OsStrExt;
+
+        CString::new(self.cgroup_path.join("cgroup.procs").as_os_str().as_bytes())
+            .map_err(|_| denied("provider cgroup path contains an interior NUL"))
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        if self.drained {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if !gensee_crate_linux::kill_and_drain_agent_cgroup(
+                &self.cgroup_path,
+                Duration::from_secs(2),
+            )? {
+                return Err(denied("provider execution cgroup did not drain"));
+            }
+            gensee_crate_linux::remove_agent_cgroup(&self.cgroup_path)?;
+            self.drained = true;
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "provider dispatch requires a Linux cgroup-v2 execution subject",
+            ))
+        }
+    }
+}
+
+impl Drop for ProviderExecutionSubject {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if !self.drained {
+            let _ = gensee_crate_linux::kill_and_drain_agent_cgroup(
+                &self.cgroup_path,
+                Duration::from_secs(2),
+            );
+            let _ = gensee_crate_linux::remove_agent_cgroup(&self.cgroup_path);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn attach_provider_child_to_cgroup(cgroup_procs: &CString) -> io::Result<()> {
+    // This runs after fork and before exec, so use only async-signal-safe libc
+    // calls. Writing PID 0 to cgroup.procs attaches the writing process.
+    let fd = unsafe {
+        libc::open(
+            cgroup_procs.as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes = b"0\n";
+    let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    let write_error = (written != bytes.len() as isize).then(io::Error::last_os_error);
+    let close_result = unsafe { libc::close(fd) };
+    if let Some(error) = write_error {
+        return Err(error);
+    }
+    if close_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn snapshot_provider_executable(
@@ -299,15 +453,6 @@ fn snapshot_provider_executable(
     File::open(runtime)?.sync_all()?;
     Ok(snapshot)
 }
-
-#[cfg(unix)]
-fn terminate_provider_group(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-}
-#[cfg(not(unix))]
-fn terminate_provider_group(_pid: u32) {}
 
 fn verify_provider_result(
     invocation: &ProviderInvocation,
@@ -517,10 +662,15 @@ mod tests {
         assert!(request.validate_against(&scope).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn exact_adapter_executes_without_shell_selection_or_ambient_environment() {
         use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0
+            || !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file()
+        {
+            return;
+        }
         let _guard = cli_test_env_lock();
         let root = env::temp_dir().join(format!("gensee-provider-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -572,6 +722,92 @@ mod tests {
         let observed = execute_provider(&config, &invocation).unwrap();
         verify_provider_result(&invocation, &observed).unwrap();
         env::remove_var("SHOULD_NOT_LEAK");
+        env::remove_var("GENSEE_HOME");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_adapter_cannot_leave_detached_descendant() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } != 0
+            || !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file()
+        {
+            return;
+        }
+        let _guard = cli_test_env_lock();
+        let root = env::temp_dir().join(format!(
+            "gensee-provider-detached-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        env::set_var("GENSEE_HOME", root.join("state"));
+        let executable = root.join("adapter.sh");
+        let marker = root.join("descendant.marker");
+        let pid_file = root.join("descendant.pid");
+        let request_digest = format!("sha256:{}", "61".repeat(32));
+        let result = ProviderAdapterResult {
+            schema_version: 1,
+            invocation_id: "invoke_detached".into(),
+            decision: ProviderDecision::Completed,
+            effect_kind: BrokerGatewayEffectKind::CloudAction,
+            target: "cloud:project/a".into(),
+            action: "read".into(),
+            request_digest: request_digest.clone(),
+            output_digest: None,
+            occurred_at_ms: 1,
+        };
+        let script = format!(
+            "#!/bin/sh\nsetsid sh -c 'while :; do printf x >>\"$1\"; sleep 0.02; done' sh '{}' >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" >'{}'\ni=0\nwhile [ ! -s '{}' ] && [ \"$i\" -lt 100 ]; do sleep 0.01; i=$((i + 1)); done\nwhile IFS= read -r _; do :; done\nprintf '%s\\n' '{}'\n",
+            marker.display(),
+            pid_file.display(),
+            marker.display(),
+            serde_json::to_string(&result)
+                .unwrap()
+                .replace('\'', "'\\''")
+        );
+        fs::write(&executable, script).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).unwrap();
+        let config = ProviderRuntimeConfig {
+            adapter_id: "adapter".into(),
+            resource_kind: BrokerResourceKind::CloudControlAction,
+            executable: executable.to_string_lossy().into_owned(),
+            executable_sha256: hash_provider_file(&executable, MAX_PROVIDER_BYTES).unwrap(),
+            args: Vec::new(),
+            working_directory: root.to_string_lossy().into_owned(),
+            max_runtime_seconds: 5,
+        };
+        let invocation = ProviderInvocation {
+            schema_version: 1,
+            invocation_id: "invoke_detached".into(),
+            operation_id: "op_detached".into(),
+            lease_id: "lease_detached".into(),
+            request_digest,
+            operation: ProviderOperation::CloudControlAction {
+                provider: "cloud".into(),
+                resource: "project/a".into(),
+                action: "read".into(),
+            },
+        };
+
+        let observed = execute_provider(&config, &invocation).unwrap();
+        verify_provider_result(&invocation, &observed).unwrap();
+        let size = fs::metadata(&marker).unwrap().len();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(fs::metadata(&marker).unwrap().len(), size);
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+
         env::remove_var("GENSEE_HOME");
         fs::remove_dir_all(root).unwrap();
     }

@@ -67,6 +67,14 @@ bounded and must repeat the exact invocation, target, action, effect kind, and
 request digest; Gensee binds the accepted result, lease, and executable digest
 into a host-signed dispatch receipt.
 
+Provider dispatch currently requires Linux cgroup v2. Gensee creates a private
+cgroup before the adapter starts, attaches the adapter before `exec`, and
+recursively kills and verifies that complete execution subject empty on every
+terminal path. A successful direct-child exit is not accepted until detached
+or session-changing descendants have been killed and the owned cgroup has been
+removed. Other platforms fail closed until they provide an equivalent
+non-escapable execution-subject boundary.
+
 Before launch, Gensee validates every executable and working-directory
 ancestor as root-controlled, opens and copies the admitted executable into the
 private invocation directory, verifies the copied bytes against the configured
