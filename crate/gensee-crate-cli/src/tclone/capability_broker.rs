@@ -4,6 +4,10 @@ use gensee_crate_rules::capability_broker::{
     BrokerLeaseStatus, BrokerProviderStatus, BrokerResourceKind, ExternalActionCommitClaims,
     SignedExternalActionCommitToken, BROKER_PROTOCOL_VERSION,
 };
+use gensee_crate_rules::transactional_promotion::{
+    AuthorityClosureClaims, AuthorityLifecycleHead, SignedAuthorityClosure,
+    TRANSACTIONAL_PROMOTION_SCHEMA_VERSION,
+};
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
@@ -2742,7 +2746,7 @@ fn sign_external_commit_claims(claims: &ExternalActionCommitClaims) -> io::Resul
     sign_host_evidence("external-action-commit-v1", &serde_json::to_vec(claims)?)
 }
 
-pub(super) fn sign_host_evidence(domain: &str, payload: &[u8]) -> io::Result<String> {
+pub(crate) fn sign_host_evidence(domain: &str, payload: &[u8]) -> io::Result<String> {
     if !tclone_is_safe_token(domain) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2758,7 +2762,7 @@ pub(super) fn sign_host_evidence(domain: &str, payload: &[u8]) -> io::Result<Str
     Ok(format!("hmac-sha256:{:x}", mac.finalize().into_bytes()))
 }
 
-pub(super) fn verify_host_evidence(
+pub(crate) fn verify_host_evidence(
     domain: &str,
     payload: &[u8],
     signature: &str,
@@ -3102,6 +3106,167 @@ pub(super) fn active_attached_broker_leases(
         leases.push(lease);
     }
     Ok(leases)
+}
+
+pub(crate) fn close_operation_broker_authority(
+    operation_id: &str,
+    source_run_id: &str,
+) -> io::Result<SignedAuthorityClosure> {
+    if !tclone_is_safe_token(operation_id) || !tclone_is_safe_token(source_run_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid operation identity for authority closure",
+        ));
+    }
+    let leases_dir = broker_root()?.join("leases");
+    let mut lease_ids = Vec::new();
+    if leases_dir.exists() {
+        for entry in fs::read_dir(&leases_dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let lease: BrokerLease = serde_json::from_str(&read_nofollow_to_string(&entry.path())?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if lease.operation_id == operation_id && lease.source_run_id == source_run_id {
+                lease_ids.push(lease.lease_id);
+            }
+        }
+    }
+    lease_ids.sort();
+    lease_ids.dedup();
+    for lease_id in &lease_ids {
+        let lifecycle_path = broker_lifecycle_path(lease_id)?;
+        let _lifecycle_lock = if lifecycle_path.exists() {
+            Some(TcloneStateLock::acquire(&lifecycle_path)?)
+        } else {
+            None
+        };
+        let lease_path = broker_lease_path(lease_id)?;
+        let _lease_lock = TcloneStateLock::acquire(&lease_path)?;
+        let mut lease = load_broker_lease(lease_id)?;
+        revoke_broker_lease_record(&mut lease)?;
+        persist_broker_lease(&lease)?;
+    }
+
+    let lifecycle_dir = broker_root()?.join("lifecycles");
+    let mut lifecycle_ids = Vec::new();
+    if lifecycle_dir.exists() {
+        for entry in fs::read_dir(&lifecycle_dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(lease_id) = entry
+                .path()
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let lifecycle = load_broker_lifecycle(&lease_id)?;
+            if lifecycle.request.operation_id == operation_id
+                && lifecycle.request.source_run_id == source_run_id
+            {
+                lifecycle_ids.push(lease_id);
+            }
+        }
+    }
+    lifecycle_ids.sort();
+    lifecycle_ids.dedup();
+    for lease_id in &lifecycle_ids {
+        if lease_ids.contains(lease_id) {
+            continue;
+        }
+        let path = broker_lifecycle_path(lease_id)?;
+        let _lock = TcloneStateLock::acquire(&path)?;
+        let mut lifecycle = load_broker_lifecycle(lease_id)?;
+        if !matches!(
+            lifecycle.status,
+            BrokerLeaseStatus::Consumed
+                | BrokerLeaseStatus::Revoked
+                | BrokerLeaseStatus::Expired
+                | BrokerLeaseStatus::Failed
+        ) {
+            lifecycle.pending_action = BrokerProviderOperation::Revoke;
+            if lifecycle.status != BrokerLeaseStatus::Revoking {
+                append_lifecycle_transition(
+                    &mut lifecycle,
+                    BrokerLeaseStatus::Revoking,
+                    unix_millis()?,
+                    "promotion_authority_closure",
+                )?;
+                persist_broker_lifecycle(&lifecycle)?;
+            }
+            invoke_revoke_for_lifecycle(&mut lifecycle)?;
+        }
+    }
+
+    let mut lifecycle_heads = Vec::new();
+    let mut active_lease_ids = Vec::new();
+    let mut unresolved_lease_ids = Vec::new();
+    for lease_id in lifecycle_ids {
+        let lifecycle = load_broker_lifecycle(&lease_id)?;
+        let digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&lifecycle)?)
+        );
+        lifecycle_heads.push(AuthorityLifecycleHead {
+            lease_id: lease_id.clone(),
+            status: lifecycle.status,
+            lifecycle_digest: digest,
+        });
+        match lifecycle.status {
+            BrokerLeaseStatus::Active => active_lease_ids.push(lease_id),
+            BrokerLeaseStatus::Consumed
+            | BrokerLeaseStatus::Revoked
+            | BrokerLeaseStatus::Expired
+            | BrokerLeaseStatus::Failed => {}
+            _ => unresolved_lease_ids.push(lease_id),
+        }
+    }
+    for lease_id in lease_ids {
+        if lifecycle_heads.iter().any(|head| head.lease_id == lease_id) {
+            continue;
+        }
+        let lease = load_broker_lease(&lease_id)?;
+        let digest = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&lease)?));
+        lifecycle_heads.push(AuthorityLifecycleHead {
+            lease_id: lease_id.clone(),
+            status: lease.status,
+            lifecycle_digest: digest,
+        });
+        match lease.status {
+            BrokerLeaseStatus::Active => active_lease_ids.push(lease_id),
+            BrokerLeaseStatus::Consumed
+            | BrokerLeaseStatus::Revoked
+            | BrokerLeaseStatus::Expired
+            | BrokerLeaseStatus::Failed => {}
+            _ => unresolved_lease_ids.push(lease_id),
+        }
+    }
+    lifecycle_heads.sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
+    active_lease_ids.sort();
+    unresolved_lease_ids.sort();
+    let claims = AuthorityClosureClaims {
+        schema_version: TRANSACTIONAL_PROMOTION_SCHEMA_VERSION,
+        proof_id: format!("authority_{}", Uuid::new_v4().simple()),
+        operation_id: operation_id.to_string(),
+        source_run_id: source_run_id.to_string(),
+        checked_at_ms: unix_millis()?,
+        lifecycle_heads,
+        active_lease_ids,
+        unresolved_lease_ids,
+    };
+    let host_signature = sign_host_evidence(
+        "transactional-authority-closure-v1",
+        &serde_json::to_vec(&claims)?,
+    )?;
+    Ok(SignedAuthorityClosure {
+        claims,
+        host_signature,
+    })
 }
 
 fn validate_cell_gateway_socket(endpoint: &str) -> io::Result<PathBuf> {

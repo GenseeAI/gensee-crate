@@ -86,7 +86,7 @@ pub(crate) fn sign_operation_manifest(manifest: &mut OperationRunManifest) -> io
     sign_operation_manifest_with_key(manifest, &key)
 }
 
-fn sign_operation_manifest_with_key(
+pub(crate) fn sign_operation_manifest_with_key(
     manifest: &mut OperationRunManifest,
     key: &ed25519_dalek::SigningKey,
 ) -> io::Result<()> {
@@ -108,7 +108,7 @@ pub(crate) fn verify_operation_manifest(manifest: &OperationRunManifest) -> io::
     verify_operation_manifest_with_key(manifest, &public_key)
 }
 
-fn verify_operation_manifest_with_key(
+pub(crate) fn verify_operation_manifest_with_key(
     manifest: &OperationRunManifest,
     public_key: &[u8; 32],
 ) -> io::Result<()> {

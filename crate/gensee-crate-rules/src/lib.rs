@@ -10,6 +10,7 @@ pub mod operation_context;
 pub mod operation_contract;
 pub mod policy;
 pub mod semantic_verifier;
+pub mod transactional_promotion;
 
 #[derive(Debug, Clone)]
 pub struct RuleMatch {

@@ -119,6 +119,18 @@ pub struct ProductContract {
     pub reject_special_files: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_verifier_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<TransactionalPromotionContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionalPromotionContract {
+    /// Root-controlled absolute directory that stores immutable promoted
+    /// objects and the active relative pointer.
+    pub destination_root: String,
+    /// Single normal component used as the active relative symlink.
+    pub active_pointer: String,
 }
 
 fn default_max_product_bytes() -> u64 {
@@ -390,6 +402,23 @@ fn audit_product(product: &ProductContract, errors: &mut Vec<String>, warnings: 
                 .to_string(),
         );
     }
+    if let Some(promotion) = &product.promotion {
+        let root = Path::new(&promotion.destination_root);
+        if !root.is_absolute()
+            || promotion.destination_root.contains("//")
+            || root
+                .components()
+                .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        {
+            errors.push("promotion.destination_root must be an absolute normalized path".into());
+        }
+        if !bounded_token(&promotion.active_pointer) || promotion.active_pointer.contains('.') {
+            errors.push("promotion.active_pointer must be one safe component".into());
+        }
+        if product.semantic_verifier_profile.is_none() {
+            errors.push("transactional promotion requires a semantic verifier profile".into());
+        }
+    }
 }
 
 fn bounded_token(value: &str) -> bool {
@@ -461,6 +490,7 @@ mod tests {
                 reject_symlinks: true,
                 reject_special_files: true,
                 semantic_verifier_profile: None,
+                promotion: None,
             }),
         }
     }
@@ -515,6 +545,29 @@ mod tests {
         assert!(!candidate.audit_for_platform("linux").valid);
         candidate.execution.require_os_execution_binding = true;
         candidate.product.as_mut().unwrap().reject_symlinks = false;
+        assert!(!candidate.audit_for_platform("linux").valid);
+    }
+
+    #[test]
+    fn promotion_destination_is_signed_and_normalized() {
+        let mut candidate = contract();
+        {
+            let product = candidate.product.as_mut().unwrap();
+            product.semantic_verifier_profile = Some("content_policy".into());
+            product.promotion = Some(TransactionalPromotionContract {
+                destination_root: "/srv/gensee/promoted".into(),
+                active_pointer: "current".into(),
+            });
+        }
+        assert!(candidate.audit_for_platform("linux").valid);
+        candidate
+            .product
+            .as_mut()
+            .unwrap()
+            .promotion
+            .as_mut()
+            .unwrap()
+            .destination_root = "/srv/../escape".into();
         assert!(!candidate.audit_for_platform("linux").valid);
     }
 }
