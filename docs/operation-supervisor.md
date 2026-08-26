@@ -40,7 +40,7 @@ replaces the JSON file without following symlinks. A stale process cannot
 overwrite a newer lifecycle, envelope, lease, or effect count from another
 component.
 
-The C0 network supervisor joins this record. Its exact IP/protocol/port
+The operation network supervisor joins this record. Its exact IP/protocol/port
 envelope is copied into the generic envelope after each fail-closed nftables
 generation, expired network leases are pruned, and every allow, lease, broker,
 or deny effect increments the operation's effect count. Detailed network

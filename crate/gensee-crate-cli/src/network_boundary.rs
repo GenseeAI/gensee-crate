@@ -562,7 +562,7 @@ impl Drop for NetworkRuntimeCleanup {
     }
 }
 
-pub(crate) fn handle_c0_network(args: Vec<OsString>) -> io::Result<()> {
+pub(crate) fn handle_operation_network(args: Vec<OsString>) -> io::Result<()> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("serve") => serve_network_supervisor(&args[1..]),
         Some("event") => send_network_supervisor_event(&args[1..]),
@@ -604,7 +604,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     if !dry_run && std::env::consts::OS != "linux" {
         return Err(io::Error::new(
             ErrorKind::Unsupported,
-            "C0 network enforcement requires Linux; use --dry-run only for parser tests",
+            "operation network enforcement requires Linux; use --dry-run only for parser tests",
         ));
     }
 
@@ -873,7 +873,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         proxy_listener.set_nonblocking(true)?;
         let local_proxy = proxy_listener.local_addr()?;
         eprintln!(
-            "gensee: C0 network supervisor operation={} socket={} proxy={} dry_run={dry_run}",
+            "gensee: operation network supervisor operation={} socket={} proxy={} dry_run={dry_run}",
             config.operation_id,
             socket_path.display(),
             local_proxy

@@ -1,6 +1,6 @@
-# C0 network capability boundary
+# Operation network boundary
 
-The C0 network supervisor is the first end-to-end capability path for a
+The operation network supervisor is the first end-to-end capability path for a
 long-lived operation. It is provider-neutral: decisions use resolved IP
 addresses, protocols, ports, operation/process identity, expiry, and HTTP
 semantics. It contains no application- or product-specific rules.

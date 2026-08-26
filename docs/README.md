@@ -22,7 +22,7 @@ Gensee Crate is an open-source control layer for AI coding agents. Start with
 - [Linux host support](linux.md) — `/proc` process attribution, fanotify sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress controls, and Linux capability planning.
 - [Tclone runtime integration](tclone.md) — launch agents in cloneable Linux containers, fork live source containers, inspect diffs, keep workspaces, and discard forks.
 - [Authenticated telemetry replay](replay.md) — merge heterogeneous evidence with explicit clock semantics, verify signed replay bundles, and evaluate bounded causal rules.
-- [C0 network capability boundary](c0-network-boundary.md) — operation-scoped network envelopes, temporary in-place leases, a read-only HTTP mediator, revocation, and effect evidence.
+- [Operation network boundary](operation-network-boundary.md) — operation-scoped network envelopes, temporary in-place leases, a read-only HTTP mediator, revocation, and effect evidence.
 - [Operation supervisor](operation-supervisor.md) — durable operation identity, lifecycle, process lineage, cgroup ownership, active envelopes, leases, and boundary-effect coordination.
 - [Capability faults](capability-faults.md) — typed black-box boundary observations, subject binding, fail-closed backend routing, retry-after-lease semantics, and network counter evidence.
 - [`gensee watch` (sidecar)](watch.md) — observe filesystem effects and macOS system events without launching the agent.
