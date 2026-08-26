@@ -3,6 +3,11 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use gensee_crate_rules::contract_catalog::{
     CatalogAudit, CatalogSignature, ContractCatalog, SignedContractCatalog,
 };
+use gensee_crate_rules::operation_contract::{
+    ContractCapabilities, ExecutionContract, OperationContract, ProductContract,
+    StructuralProductType, TransactionalPromotionContract, OPERATION_CONTRACT_SCHEMA_VERSION,
+};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -17,12 +22,200 @@ pub(crate) fn handle_contract_catalog(args: &[OsString]) -> io::Result<()> {
         Some("sign") => sign_catalog(rest),
         Some("verify") => verify_catalog_command(rest),
         Some("public-key") => public_key_command(rest),
+        Some("template") => template_command(rest),
+        Some("install") => install_catalog(rest),
+        Some("status") => installed_catalog_status(rest),
         Some("--help" | "-h") => {
             print_catalog_usage();
             Ok(())
         }
         _ => Err(catalog_usage_error()),
     }
+}
+
+fn template_command(args: &[OsString]) -> io::Result<()> {
+    reject_catalog_options(
+        args,
+        &[
+            "--profile",
+            "--contract-id",
+            "--operation-class",
+            "--product-path",
+            "--verifier-profile",
+            "--destination-root",
+            "--active-pointer",
+            "--output",
+        ],
+        &[],
+    )?;
+    let profile = required_catalog_string(args, "--profile")?;
+    let contract_id = required_catalog_string(args, "--contract-id")?;
+    let operation_class = required_catalog_string(args, "--operation-class")?;
+    if !safe_catalog_token(&contract_id) || !safe_catalog_token(&operation_class) {
+        return Err(invalid_input(
+            "contract and operation class must be bounded tokens",
+        ));
+    }
+    let product =
+        match profile.as_str() {
+            "deny-all" => None,
+            "structured-result" => {
+                let path = required_catalog_string(args, "--product-path")?;
+                let verifier = required_catalog_string(args, "--verifier-profile")?;
+                if !safe_catalog_token(&verifier) {
+                    return Err(invalid_input("verifier profile must be a bounded token"));
+                }
+                let destination = optional_catalog_string(args, "--destination-root")?;
+                let pointer = optional_catalog_string(args, "--active-pointer")?;
+                if destination.is_some() != pointer.is_some() {
+                    return Err(invalid_input(
+                        "destination-root and active-pointer must be supplied together",
+                    ));
+                }
+                Some(ProductContract {
+                    kind: StructuralProductType::StructuredResult,
+                    path,
+                    max_bytes: 1024 * 1024,
+                    max_entries: 1,
+                    reject_symlinks: true,
+                    reject_special_files: true,
+                    semantic_verifier_profile: Some(verifier),
+                    promotion: destination.zip(pointer).map(
+                        |(destination_root, active_pointer)| TransactionalPromotionContract {
+                            destination_root,
+                            active_pointer,
+                        },
+                    ),
+                })
+            }
+            _ => return Err(invalid_input("unknown safe template profile")),
+        };
+    let contract = OperationContract {
+        schema_version: OPERATION_CONTRACT_SCHEMA_VERSION,
+        contract_id,
+        operation_class,
+        execution: ExecutionContract::default(),
+        capabilities: ContractCapabilities::default(),
+        product,
+    };
+    let audit = contract.audit_for_platform(std::env::consts::OS);
+    if !audit.valid {
+        return Err(invalid_input(format!(
+            "generated template is invalid: {}",
+            audit.errors.join("; ")
+        )));
+    }
+    write_json_catalog(&required_catalog_path(args, "--output")?, &contract)
+}
+
+fn install_catalog(args: &[OsString]) -> io::Result<()> {
+    reject_catalog_options(args, &["--catalog", "--trusted-key", "--root"], &[])?;
+    let input = required_catalog_path(args, "--catalog")?;
+    let trusted = required_catalog_path(args, "--trusted-key")?;
+    let root = required_catalog_path(args, "--root")?;
+    ensure_catalog_root(&root)?;
+    let signed: SignedContractCatalog = read_catalog_json(&input, "signed contract catalog")?;
+    verify_signed_catalog(&signed, &trusted, unix_millis()?)?;
+    let current_path = root.join("current.json");
+    if current_path.exists() {
+        let current: SignedContractCatalog =
+            read_catalog_json(&current_path, "installed contract catalog")?;
+        verify_signed_catalog(&current, &trusted, unix_millis()?)?;
+        if current.catalog.organization_id != signed.catalog.organization_id
+            || current.catalog.catalog_id != signed.catalog.catalog_id
+            || signed.catalog.version < current.catalog.version
+        {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "catalog installation would change ownership or roll back a version",
+            ));
+        }
+        if signed.catalog.version == current.catalog.version && signed != current {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "catalog version is already installed with different content",
+            ));
+        }
+    }
+    let encoded = serde_json::to_vec_pretty(&signed).map_err(invalid_json)?;
+    let digest = format!("{:x}", Sha256::digest(&encoded));
+    let archive = root.join("catalogs");
+    ensure_catalog_root(&archive)?;
+    let archive_path = archive.join(format!(
+        "{}-v{}-{}.json",
+        signed.catalog.catalog_id,
+        signed.catalog.version,
+        &digest[..16]
+    ));
+    if !archive_path.exists() {
+        write_atomic_nofollow(&archive_path, &encoded, 0o400)?;
+        sync_catalog_dir(&archive)?;
+    }
+    write_atomic_nofollow(&current_path, &encoded, 0o400)?;
+    sync_catalog_dir(&root)?;
+    println!(
+        "installed contract catalog: {} v{}",
+        signed.catalog.catalog_id, signed.catalog.version
+    );
+    Ok(())
+}
+
+fn installed_catalog_status(args: &[OsString]) -> io::Result<()> {
+    reject_catalog_options(args, &["--root", "--trusted-key"], &["--json"])?;
+    let root = required_catalog_path(args, "--root")?;
+    let signed: SignedContractCatalog =
+        read_catalog_json(&root.join("current.json"), "installed contract catalog")?;
+    let audit = verify_signed_catalog(
+        &signed,
+        &required_catalog_path(args, "--trusted-key")?,
+        unix_millis()?,
+    )?;
+    if has_catalog_flag(args, "--json") {
+        write_stdout_json(&signed)
+    } else {
+        println!("{} v{} valid", audit.catalog_id, audit.version);
+        Ok(())
+    }
+}
+
+fn ensure_catalog_root(path: &Path) -> io::Result<()> {
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+        #[cfg(unix)]
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid_input("catalog root must be a real directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.mode() & 0o022 != 0 || (unsafe { libc::geteuid() } == 0 && metadata.uid() != 0)
+        {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "catalog root must be owner-controlled and non-group/world-writable",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sync_catalog_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+fn write_json_catalog(path: &Path, value: &impl serde::Serialize) -> io::Result<()> {
+    let mut encoded = serde_json::to_vec_pretty(value).map_err(invalid_json)?;
+    encoded.push(b'\n');
+    write_catalog_output(path, &encoded)
+}
+
+fn write_stdout_json(value: &impl serde::Serialize) -> io::Result<()> {
+    let mut encoded = serde_json::to_vec_pretty(value).map_err(invalid_json)?;
+    encoded.push(b'\n');
+    io::stdout().write_all(&encoded)
 }
 
 fn public_key_command(args: &[OsString]) -> io::Result<()> {
@@ -224,6 +417,16 @@ fn required_catalog_string(args: &[OsString], name: &str) -> io::Result<String> 
         .ok_or_else(catalog_usage_error)
 }
 
+fn optional_catalog_string(args: &[OsString], name: &str) -> io::Result<Option<String>> {
+    let Some(index) = args.iter().position(|value| value == name) else {
+        return Ok(None);
+    };
+    args.get(index + 1)
+        .and_then(|value| value.to_str())
+        .map(|value| Some(value.to_owned()))
+        .ok_or_else(catalog_usage_error)
+}
+
 fn has_catalog_flag(args: &[OsString], name: &str) -> bool {
     args.iter().any(|value| value == name)
 }
@@ -255,12 +458,14 @@ fn invalid_json(error: serde_json::Error) -> io::Error {
 }
 
 fn catalog_usage_error() -> io::Error {
-    invalid_input("usage: gensee boundary catalog <sign|verify|public-key> ...")
+    invalid_input(
+        "usage: gensee boundary catalog <template|sign|verify|install|status|public-key> ...",
+    )
 }
 
 fn print_catalog_usage() {
     println!(
-        "gensee boundary catalog\n\nUSAGE:\n  gensee boundary catalog public-key --key <seed.hex> --output <public.hex>\n  gensee boundary catalog sign --catalog <catalog.json> --key <seed.hex> --key-id <id> --output <signed.json>\n  gensee boundary catalog verify --catalog <signed.json> --trusted-key <public.hex> [--json]"
+        "gensee boundary catalog\n\nUSAGE:\n  gensee boundary catalog template --profile <deny-all|structured-result> --contract-id <id> --operation-class <class> [--product-path <path> --verifier-profile <id> [--destination-root <dir> --active-pointer <name>]] --output <contract.json>\n  gensee boundary catalog public-key --key <seed.hex> --output <public.hex>\n  gensee boundary catalog sign --catalog <catalog.json> --key <seed.hex> --key-id <id> --output <signed.json>\n  gensee boundary catalog verify --catalog <signed.json> --trusted-key <public.hex> [--json]\n  gensee boundary catalog install --catalog <signed.json> --trusted-key <public.hex> --root <trusted-dir>\n  gensee boundary catalog status --root <trusted-dir> --trusted-key <public.hex> [--json]"
     );
 }
 
@@ -354,6 +559,30 @@ mod tests {
             .execution
             .max_runtime_seconds += 1;
         assert!(verify_signed_catalog(&signed, &trusted, 100).is_err());
+    }
+
+    #[test]
+    fn safe_template_is_deny_by_default() {
+        let temp = temp_dir("catalog-template");
+        let output = temp.join("contract.json");
+        template_command(&[
+            "--profile".into(),
+            "deny-all".into(),
+            "--contract-id".into(),
+            "safe_default".into(),
+            "--operation-class".into(),
+            "unknown_operation".into(),
+            "--output".into(),
+            output.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        let contract: OperationContract = read_catalog_json(&output, "template").unwrap();
+        assert!(matches!(
+            contract.capabilities.network.mode,
+            gensee_crate_rules::operation_contract::ContractNetworkMode::DenyAll
+        ));
+        assert!(contract.product.is_none());
+        fs::remove_dir_all(temp).unwrap();
     }
 
     fn temp_dir(label: &str) -> PathBuf {

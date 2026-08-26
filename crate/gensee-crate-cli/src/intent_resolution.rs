@@ -1,8 +1,9 @@
 use crate::*;
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use gensee_crate_rules::contract_catalog::{
-    ContractResolution, InferenceSignature, IntentInference, IntentObservation, ObservedCaller,
-    SignedContractCatalog, SignedIntentInference, TrajectoryEvidence,
+    ContractResolution, InferenceSignature, IntentAnalysisModel, IntentCandidate, IntentInference,
+    IntentObservation, ObservedCaller, SignedContractCatalog, SignedIntentInference,
+    TrajectoryEvidence, INTENT_INFERENCE_SCHEMA_VERSION, INTENT_MODEL_SCHEMA_VERSION,
     INTENT_OBSERVATION_SCHEMA_VERSION,
 };
 use gensee_crate_rules::operation_contract::OperationContract;
@@ -40,6 +41,7 @@ pub(crate) fn handle_intent_resolution(args: &[OsString]) -> io::Result<()> {
     let (command, rest) = args.split_first().ok_or_else(intent_usage_error)?;
     match command.to_str() {
         Some("observe") => observe_command(rest),
+        Some("analyze") => analyze_command(rest),
         Some("attest") => attest_command(rest),
         Some("resolve") => resolve_command(rest),
         Some("--help" | "-h") => {
@@ -48,6 +50,181 @@ pub(crate) fn handle_intent_resolution(args: &[OsString]) -> io::Result<()> {
         }
         _ => Err(intent_usage_error()),
     }
+}
+
+fn analyze_command(args: &[OsString]) -> io::Result<()> {
+    reject_options(
+        args,
+        &[
+            "--catalog",
+            "--trusted-key",
+            "--observation",
+            "--model",
+            "--analyzer-key",
+            "--ttl-seconds",
+            "--output",
+        ],
+        &[],
+    )?;
+    let catalog: SignedContractCatalog = read_catalog_json(
+        &required_path(args, "--catalog")?,
+        "signed contract catalog",
+    )?;
+    let now_ms = unix_millis()?;
+    verify_signed_catalog(&catalog, &required_path(args, "--trusted-key")?, now_ms)?;
+    let observation: IntentObservation =
+        read_catalog_json(&required_path(args, "--observation")?, "intent observation")?;
+    observation.validate().map_err(invalid_input)?;
+    let model: IntentAnalysisModel =
+        read_catalog_json(&required_path(args, "--model")?, "intent analysis model")?;
+    let analyzer = validate_analysis_model(&catalog, &model)?;
+    let key = read_signing_key(&required_path(args, "--analyzer-key")?)?;
+    if hex::encode(key.verifying_key().as_bytes()) != analyzer.public_key_hex {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "intent analyzer key is not catalog-approved",
+        ));
+    }
+    let ttl_seconds = required_u64(args, "--ttl-seconds")?;
+    if ttl_seconds == 0 || ttl_seconds > 900 {
+        return Err(invalid_input(
+            "intent inference TTL must be in 1..=900 seconds",
+        ));
+    }
+    let candidates = score_intent_model(&model, &observation)?;
+    let inference = IntentInference {
+        schema_version: INTENT_INFERENCE_SCHEMA_VERSION,
+        inference_id: format!("infer_{}", uuid::Uuid::new_v4().simple()),
+        analyzer_id: model.analyzer_id.clone(),
+        model_identity: model.model_identity.clone(),
+        observation_digest: digest_bytes(&serde_json::to_vec(&observation).map_err(json_error)?),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(ttl_seconds.saturating_mul(1000)),
+        candidates,
+    };
+    inference
+        .validate(&observation, now_ms)
+        .map_err(invalid_input)?;
+    let encoded = serde_json::to_vec(&inference).map_err(json_error)?;
+    let signed = SignedIntentInference {
+        inference,
+        signature: InferenceSignature {
+            algorithm: "ed25519".into(),
+            signature_hex: hex::encode(key.sign(&encoded).to_bytes()),
+        },
+    };
+    write_json(&required_path(args, "--output")?, &signed)
+}
+
+fn validate_analysis_model<'a>(
+    catalog: &'a SignedContractCatalog,
+    model: &IntentAnalysisModel,
+) -> io::Result<&'a gensee_crate_rules::contract_catalog::ApprovedIntentAnalyzer> {
+    if model.schema_version != INTENT_MODEL_SCHEMA_VERSION
+        || !safe_catalog_token(&model.analyzer_id)
+        || !safe_catalog_token(&model.model_identity)
+        || model.classes.is_empty()
+        || model.classes.len() > 64
+    {
+        return Err(invalid_input("intent analysis model is malformed"));
+    }
+    let analyzer = catalog
+        .catalog
+        .intent_analyzers
+        .iter()
+        .find(|candidate| candidate.analyzer_id == model.analyzer_id)
+        .ok_or_else(|| invalid_data("intent analysis model uses an unapproved analyzer"))?;
+    if analyzer.model_identity != model.model_identity {
+        return Err(invalid_data(
+            "intent analysis model identity is not approved",
+        ));
+    }
+    let mut classes = std::collections::BTreeSet::new();
+    for class in &model.classes {
+        if !safe_catalog_token(&class.operation_class)
+            || !classes.insert(class.operation_class.as_str())
+            || !analyzer
+                .allowed_operation_classes
+                .contains(&class.operation_class)
+            || class.weights.len() > 512
+            || class.weights.iter().any(|(feature, weight)| {
+                !safe_catalog_token(feature) || !(-100_000..=100_000).contains(weight)
+            })
+            || !(-100_000..=100_000).contains(&class.intercept)
+        {
+            return Err(invalid_input(
+                "intent analysis class is malformed or outside catalog scope",
+            ));
+        }
+    }
+    Ok(analyzer)
+}
+
+fn score_intent_model(
+    model: &IntentAnalysisModel,
+    observation: &IntentObservation,
+) -> io::Result<Vec<IntentCandidate>> {
+    let mut features = std::collections::BTreeSet::new();
+    features.extend(observation.command_features.iter().cloned());
+    features.insert(if observation.history_complete {
+        "history_complete".into()
+    } else {
+        "history_incomplete".into()
+    });
+    for evidence in &observation.trajectory {
+        features.insert(format!("kind_{}", evidence.kind));
+        features.insert(format!("trust_{}", evidence.trust_domain));
+        features.extend(evidence.features.iter().cloned());
+    }
+    let scores = model
+        .classes
+        .iter()
+        .map(|class| {
+            let score = features
+                .iter()
+                .fold(i64::from(class.intercept), |sum, feature| {
+                    sum.saturating_add(i64::from(*class.weights.get(feature).unwrap_or(&0)))
+                });
+            (class, score)
+        })
+        .collect::<Vec<_>>();
+    let maximum = scores.iter().map(|(_, score)| *score).max().unwrap_or(0);
+    let exponentials = scores
+        .iter()
+        .map(|(_, score)| {
+            (((*score - maximum) as f64) / 1000.0)
+                .clamp(-50.0, 0.0)
+                .exp()
+        })
+        .collect::<Vec<_>>();
+    let denominator: f64 = exponentials.iter().sum();
+    if !denominator.is_finite() || denominator <= 0.0 {
+        return Err(invalid_data("intent model produced invalid probabilities"));
+    }
+    let evidence_ids = observation
+        .trajectory
+        .iter()
+        .map(|evidence| evidence.evidence_id.clone())
+        .collect::<Vec<_>>();
+    let mut candidates = scores
+        .into_iter()
+        .zip(exponentials)
+        .map(|((class, _), probability)| IntentCandidate {
+            operation_class: class.operation_class.clone(),
+            confidence_bps: (probability * 10_000.0 / denominator)
+                .round()
+                .clamp(0.0, 10_000.0) as u16,
+            rationale_code: "bounded_feature_model".into(),
+            evidence_ids: evidence_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .confidence_bps
+            .cmp(&left.confidence_bps)
+            .then_with(|| left.operation_class.cmp(&right.operation_class))
+    });
+    Ok(candidates)
 }
 
 fn attest_command(args: &[OsString]) -> io::Result<()> {
@@ -372,6 +549,18 @@ fn required_path(args: &[OsString], name: &str) -> io::Result<PathBuf> {
     optional_path(args, name)?.ok_or_else(intent_usage_error)
 }
 
+fn required_u64(args: &[OsString], name: &str) -> io::Result<u64> {
+    let index = args
+        .iter()
+        .position(|value| value == name)
+        .ok_or_else(intent_usage_error)?;
+    args.get(index + 1)
+        .and_then(|value| value.to_str())
+        .ok_or_else(intent_usage_error)?
+        .parse()
+        .map_err(|_| invalid_input(format!("{name} must be an unsigned integer")))
+}
+
 fn optional_path(args: &[OsString], name: &str) -> io::Result<Option<PathBuf>> {
     let Some(index) = args.iter().position(|value| value == name) else {
         return Ok(None);
@@ -406,12 +595,12 @@ fn json_error(error: serde_json::Error) -> io::Error {
 }
 
 fn intent_usage_error() -> io::Error {
-    invalid_input("usage: gensee boundary intent <observe|attest|resolve> ...")
+    invalid_input("usage: gensee boundary intent <observe|analyze|attest|resolve> ...")
 }
 
 fn print_intent_usage() {
     println!(
-        "gensee boundary intent\n\nUSAGE:\n  gensee boundary intent observe --output <observation.json> [--trajectory <history.json>] -- <command> [args...]\n  gensee boundary intent attest --observation <observation.json> --inference <unsigned.json> --analyzer-key <seed.hex> --output <signed.json>\n  gensee boundary intent resolve --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --inference <signed-inference.json> --output <resolution.json> -- <command> [args...]"
+        "gensee boundary intent\n\nUSAGE:\n  gensee boundary intent observe --output <observation.json> [--trajectory <history.json>] -- <command> [args...]\n  gensee boundary intent analyze --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --model <model.json> --analyzer-key <seed.hex> --ttl-seconds <n> --output <signed.json>\n  gensee boundary intent attest --observation <observation.json> --inference <unsigned.json> --analyzer-key <seed.hex> --output <signed.json>\n  gensee boundary intent resolve --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --inference <signed-inference.json> --output <resolution.json> -- <command> [args...]"
     );
 }
 
@@ -422,8 +611,9 @@ mod tests {
     use gensee_crate_rules::contract_catalog::{
         AmbiguousIntentAction, ApprovedContract, ApprovedIntentAnalyzer, CallerSelector,
         CatalogSignature, ContractApproval, ContractCatalog, ContractOwner, ContractSelector,
-        FallbackPolicy, InferenceSignature, IntentCandidate, IntentInference,
-        SignedIntentInference, CONTRACT_CATALOG_SCHEMA_VERSION, INTENT_INFERENCE_SCHEMA_VERSION,
+        FallbackPolicy, InferenceSignature, IntentAnalysisModel, IntentCandidate, IntentClassModel,
+        IntentInference, SignedIntentInference, CONTRACT_CATALOG_SCHEMA_VERSION,
+        INTENT_INFERENCE_SCHEMA_VERSION, INTENT_MODEL_SCHEMA_VERSION,
     };
     use gensee_crate_rules::operation_contract::{
         ContractCapabilities, ExecutionContract, OPERATION_CONTRACT_SCHEMA_VERSION,
@@ -578,6 +768,58 @@ mod tests {
         )
         .is_err());
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn built_in_analyzer_uses_command_and_long_horizon_features() {
+        let observation = IntentObservation {
+            schema_version: INTENT_OBSERVATION_SCHEMA_VERSION,
+            observation_id: "obs_behavior".into(),
+            observed_at_ms: 500,
+            caller: ObservedCaller {
+                uid: 1000,
+                executable_sha256: format!("sha256:{}", "11".repeat(32)),
+                service_identity: None,
+            },
+            command_digest: format!("sha256:{}", "22".repeat(32)),
+            command_features: vec!["writes_output".into()],
+            trajectory: vec![TrajectoryEvidence {
+                evidence_id: "history_one".into(),
+                kind: "effect_manifest".into(),
+                digest: format!("sha256:{}", "33".repeat(32)),
+                trust_domain: "host_observer".into(),
+                started_at_ms: 10,
+                finished_at_ms: 400,
+                features: vec!["repeated_transform".into()],
+            }],
+            history_complete: true,
+        };
+        let model = IntentAnalysisModel {
+            schema_version: INTENT_MODEL_SCHEMA_VERSION,
+            analyzer_id: "analyzer".into(),
+            model_identity: "bounded_model_v1".into(),
+            classes: vec![
+                IntentClassModel {
+                    operation_class: "transform".into(),
+                    intercept: 0,
+                    weights: [
+                        ("writes_output".into(), 2_000),
+                        ("repeated_transform".into(), 3_000),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+                IntentClassModel {
+                    operation_class: "unknown".into(),
+                    intercept: 0,
+                    weights: Default::default(),
+                },
+            ],
+        };
+        let candidates = score_intent_model(&model, &observation).unwrap();
+        assert_eq!(candidates[0].operation_class, "transform");
+        assert!(candidates[0].confidence_bps > 9_000);
+        assert_eq!(candidates[0].evidence_ids, vec!["history_one"]);
     }
 
     fn temp_dir(label: &str) -> PathBuf {
