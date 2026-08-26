@@ -8,7 +8,7 @@ use gensee_crate_rules::operation_context::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 #[cfg(unix)]
@@ -21,6 +21,7 @@ const TRANSPORT_NONCE_RECORD_SCHEMA_VERSION: u32 = 1;
 const MAX_LIVE_TRANSPORT_NONCES_PER_RECIPIENT: usize = 1_024;
 const MAX_LIVE_TRANSPORT_NONCES_TOTAL: usize = 8_192;
 const MAX_TRANSPORT_NONCE_RECORD_BYTES: u64 = 4 * 1024;
+const TRANSPORT_NONCE_PENDING_PREFIX: &str = ".pending-";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -280,21 +281,6 @@ fn consume_transport_nonce_at_with_limits(
             .concat()
         )
     );
-    let path = root.join(key);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(&path).map_err(|error| {
-        if error.kind() == ErrorKind::AlreadyExists {
-            io::Error::new(
-                ErrorKind::PermissionDenied,
-                "operation transport nonce was already consumed",
-            )
-        } else {
-            error
-        }
-    })?;
     let record = ConsumedTransportNonceRecord {
         schema_version: TRANSPORT_NONCE_RECORD_SCHEMA_VERSION,
         envelope_id: claims.envelope_id.clone(),
@@ -304,10 +290,63 @@ fn consume_transport_nonce_at_with_limits(
         issued_at_ms: claims.issued_at_ms,
         expires_at_ms: claims.expires_at_ms,
     };
-    serde_json::to_writer(&mut file, &record).map_err(json_error)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    File::open(root)?.sync_all()
+    publish_transport_nonce_record(root, &root.join(key), &record)
+}
+
+fn publish_transport_nonce_record(
+    root: &Path,
+    final_path: &Path,
+    record: &ConsumedTransportNonceRecord,
+) -> io::Result<()> {
+    let mut encoded = serde_json::to_vec(record).map_err(json_error)?;
+    encoded.push(b'\n');
+    if encoded.len() as u64 > MAX_TRANSPORT_NONCE_RECORD_BYTES {
+        return Err(invalid_data(
+            "operation transport nonce record exceeds its size bound",
+        ));
+    }
+
+    let pending_path = root.join(format!(
+        "{TRANSPORT_NONCE_PENDING_PREFIX}{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(&pending_path)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        drop(file);
+
+        // A hard link publishes the already-fsynced inode atomically and refuses
+        // to replace an existing digest-named replay record on every supported
+        // Unix filesystem. The store lock serializes quota accounting and install.
+        fs::hard_link(&pending_path, final_path).map_err(|error| {
+            if error.kind() == ErrorKind::AlreadyExists {
+                io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "operation transport nonce was already consumed",
+                )
+            } else {
+                error
+            }
+        })?;
+        File::open(root)?.sync_all()?;
+        Ok(())
+    })();
+
+    let removed = match fs::remove_file(&pending_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) if result.is_ok() => return Err(error),
+        Err(_) => false,
+    };
+    if removed {
+        File::open(root)?.sync_all()?;
+    }
+    result
 }
 
 fn prune_and_count_transport_nonces(
@@ -322,11 +361,30 @@ fn prune_and_count_transport_nonces(
     let mut changed = false;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
-        if entry.file_name() == ".store.lock" {
+        let name = entry.file_name();
+        if name == ".store.lock" {
             continue;
         }
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
+        if is_transport_nonce_pending_name(&name) {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(invalid_data(
+                    "operation transport nonce store contains an invalid pending entry",
+                ));
+            }
+            fs::remove_file(&path)?;
+            changed = true;
+            continue;
+        }
+        if name
+            .to_string_lossy()
+            .starts_with(TRANSPORT_NONCE_PENDING_PREFIX)
+        {
+            return Err(invalid_data(
+                "operation transport nonce store contains an invalid pending entry",
+            ));
+        }
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
             || metadata.len() == 0
@@ -358,6 +416,17 @@ fn prune_and_count_transport_nonces(
         File::open(root)?.sync_all()?;
     }
     Ok((total, recipient))
+}
+
+fn is_transport_nonce_pending_name(name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|value| value.strip_prefix(TRANSPORT_NONCE_PENDING_PREFIX))
+        .is_some_and(|suffix| {
+            suffix.len() == 32
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 fn read_transport_nonce_record(path: &Path) -> io::Result<ConsumedTransportNonceRecord> {
@@ -979,6 +1048,84 @@ mod tests {
                 .kind(),
             ErrorKind::PermissionDenied
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_private_nonce_records_are_recovered_before_admission() {
+        let root = env::temp_dir().join(format!(
+            "gensee-context-nonce-pending-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        create_restrictive_dir_all(&root).unwrap();
+        let pending = root.join(format!(
+            "{TRANSPORT_NONCE_PENDING_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        File::create(&pending).unwrap().sync_all().unwrap();
+        File::open(&root).unwrap().sync_all().unwrap();
+
+        let claims = transport_claims("envelope_new", "worker", "nonce_new", 100, 400);
+        consume_transport_nonce_at(&root, &claims, 150).unwrap();
+        assert!(!pending.exists());
+        assert_eq!(transport_nonce_record_count(&root), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn published_nonce_survives_recovery_of_its_pending_hard_link() {
+        let root = env::temp_dir().join(format!(
+            "gensee-context-nonce-linked-pending-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let first = transport_claims("envelope_one", "worker", "nonce_one", 100, 400);
+        consume_transport_nonce_at(&root, &first, 150).unwrap();
+        let published = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name() != ".store.lock")
+            .unwrap()
+            .path();
+        let pending = root.join(format!(
+            "{TRANSPORT_NONCE_PENDING_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::hard_link(&published, &pending).unwrap();
+        File::open(&root).unwrap().sync_all().unwrap();
+
+        let second = transport_claims("envelope_two", "worker", "nonce_two", 100, 400);
+        consume_transport_nonce_at(&root, &second, 150).unwrap();
+        assert!(published.exists());
+        assert!(!pending.exists());
+        assert_eq!(transport_nonce_record_count(&root), 2);
+        assert_eq!(
+            consume_transport_nonce_at(&root, &first, 150)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_published_nonce_record_remains_fail_closed() {
+        let root = env::temp_dir().join(format!(
+            "gensee-context-nonce-malformed-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        create_restrictive_dir_all(&root).unwrap();
+        let published = root.join("aa".repeat(32));
+        File::create(&published).unwrap().sync_all().unwrap();
+        File::open(&root).unwrap().sync_all().unwrap();
+
+        let claims = transport_claims("envelope_new", "worker", "nonce_new", 100, 400);
+        assert_eq!(
+            consume_transport_nonce_at(&root, &claims, 150)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+        assert!(published.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

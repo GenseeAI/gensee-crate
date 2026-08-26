@@ -82,7 +82,13 @@ The store serializes consumption, retains each record through that deadline,
 and removes expired records before admitting another envelope. It fails closed
 at 1,024 live records per recipient or 8,192 live records in one store, so an
 approved sender cannot grow privileged durable state without bound. Quota
-exhaustion never evicts a still-live replay record.
+exhaustion never evicts a still-live replay record. A new record is first
+written and fsynced under a private pending name, then installed at its final
+digest name with an atomic no-replace hard link and a directory fsync. A crash
+can therefore leave only a recoverable private pending artifact or a complete
+published replay record; it cannot publish a truncated final record. Recovery
+removes reserved pending artifacts under the store lock, while malformed
+published records continue to fail closed.
 
 ```console
 gensee boundary context transport-wrap \
