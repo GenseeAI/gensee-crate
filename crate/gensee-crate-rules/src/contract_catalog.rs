@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn contributor_analyzer_result_fixture_matches_public_protocol() {
         let result: IntentAnalyzerResult = serde_json::from_str(include_str!(
-            "../../../integrations/boundary/extensions/intent-analyzer-result.json"
+            "../fixtures/boundary/extensions/intent-analyzer-result.json"
         ))
         .unwrap();
         assert_eq!(result.schema_version, INTENT_ANALYZER_RESULT_SCHEMA_VERSION);

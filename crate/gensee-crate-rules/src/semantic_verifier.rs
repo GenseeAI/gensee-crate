@@ -197,11 +197,11 @@ mod tests {
     #[test]
     fn contributor_verifier_fixtures_match_public_protocols() {
         let config: IsolatedVerifierConfig = serde_json::from_str(include_str!(
-            "../../../integrations/boundary/extensions/semantic-verifier-config.json"
+            "../fixtures/boundary/extensions/semantic-verifier-config.json"
         ))
         .unwrap();
         let result: VerifierProgramResult = serde_json::from_str(include_str!(
-            "../../../integrations/boundary/extensions/semantic-verifier-result.json"
+            "../fixtures/boundary/extensions/semantic-verifier-result.json"
         ))
         .unwrap();
         assert_eq!(config.verifier_id, "structured_result_policy");

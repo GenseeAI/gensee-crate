@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn contributor_provider_config_fixture_matches_public_protocol() {
         let config: ProviderRuntimeConfig = serde_json::from_str(include_str!(
-            "../../../integrations/boundary/extensions/capability-provider-config.json"
+            "../fixtures/boundary/extensions/capability-provider-config.json"
         ))
         .unwrap();
         assert_eq!(config.adapter_id, "analytics_database_v1");

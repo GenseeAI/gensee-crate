@@ -59,7 +59,7 @@ authenticated trajectory evidence. An external analyzer returns an
       "operation_class": "read_only_analysis",
       "confidence_bps": 9300,
       "rationale_code": "trajectory_model",
-      "evidence_ids": ["effect_history_42"]
+      "evidence_ids": []
     }
   ]
 }
@@ -78,6 +78,17 @@ gensee boundary intent sign-result \
   --analyzer-key /etc/gensee/analyzers/organization-intent.seed.hex \
   --ttl-seconds 60 --output inference.signed.json
 ```
+
+`sign-result` is a fail-fast guardrail for catalog-approved analyzer identity,
+model identity, key, class scope, result shape, observation binding, and TTL.
+Admission does not rely on those sign-time checks alone: resolution verifies
+the signature and independently rechecks analyzer/model identity, allowed
+classes, observation binding, expiry, and the catalog's minimum confidence.
+Low-confidence output may therefore be signed as an authentic analyzer result,
+but it cannot select a contract below the catalog threshold. The lower-level
+`attest` command signs an already constructed inference and deliberately does
+not perform catalog lookup; production integrations should use `sign-result`,
+and production admission always performs the independent resolution checks.
 
 To deploy it, the operator adds its ID, public key, immutable model identity,
 allowed operation classes, and minimum confidence to the signed catalog. The
@@ -124,7 +135,7 @@ bounded `VerifierProgramResult` JSON object to standard output:
   "verdict": "accept",
   "reason_codes": ["schema_and_policy_valid"],
   "validation_effect_manifest_digest":
-    "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 }
 ```
 
@@ -186,6 +197,7 @@ without embedding one customer's product names or credentials.
 - State precisely what the extension proves and what remains a domain or
   deployment assumption.
 
-The examples under `integrations/boundary/extensions/` are protocol examples,
+The compile-checked examples under
+`crate/gensee-crate-rules/fixtures/boundary/extensions/` are protocol examples,
 not pre-approved production policy. Operators must replace identities, paths,
 digests, keys, classes, profiles, and targets, then sign the resulting catalog.

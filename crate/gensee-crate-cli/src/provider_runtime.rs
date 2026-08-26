@@ -88,7 +88,6 @@ fn validate_provider_config(
     expected_adapter_id: &str,
 ) -> io::Result<()> {
     if !safe_catalog_token(&config.adapter_id)
-        || config.adapter_id != expected_adapter_id
         || config.resource_kind != kind
         || config.max_runtime_seconds == 0
         || config.max_runtime_seconds > 900
@@ -98,6 +97,9 @@ fn validate_provider_config(
             .iter()
             .any(|arg| arg.is_empty() || arg.len() > 256 || arg.bytes().any(|b| b == 0))
     {
+        return Err(denied("provider runtime config is invalid for the lease"));
+    }
+    if config.adapter_id != expected_adapter_id {
         return Err(denied(
             "provider runtime config is not the adapter selected by the lease",
         ));
@@ -631,16 +633,26 @@ mod tests {
             working_directory: "/does/not/matter".into(),
             max_runtime_seconds: 1,
         };
-        assert_eq!(
-            validate_provider_config(
-                &config,
-                BrokerResourceKind::CloudControlAction,
-                "selected_adapter"
-            )
-            .unwrap_err()
-            .kind(),
-            ErrorKind::PermissionDenied
-        );
+        let error = validate_provider_config(
+            &config,
+            BrokerResourceKind::CloudControlAction,
+            "selected_adapter",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("adapter selected by the lease"));
+
+        let mut malformed = config;
+        malformed.adapter_id = "selected_adapter".into();
+        malformed.max_runtime_seconds = 0;
+        let error = validate_provider_config(
+            &malformed,
+            BrokerResourceKind::CloudControlAction,
+            "selected_adapter",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("invalid for the lease"));
     }
 
     #[test]

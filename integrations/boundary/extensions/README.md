@@ -1,13 +1,11 @@
 # Boundary extension protocol examples
 
-These files show the language-neutral configuration and result shapes for the
-three executable extension roles:
+The canonical, compile-checked JSON protocol examples are packaged with
+`gensee-crate-rules` under
+[`crate/gensee-crate-rules/fixtures/boundary/extensions/`](../../../crate/gensee-crate-rules/fixtures/boundary/extensions/).
+Keeping the fixtures inside the crate ensures `cargo package` can include and
+validate them without reading files outside the package root.
 
-- `intent-analyzer-result.json` — output from an external intent analyzer;
-- `semantic-verifier-config.json` and `semantic-verifier-result.json` — pinned
-  verifier registration and bounded stdout result;
-- `capability-provider-config.json` — pinned provider registration.
-
-They are deliberately generic and are not production-ready registrations. The
-paths and SHA-256 values are placeholders. See
-`docs/boundary-extension-authoring.md` for deployment and trust requirements.
+They are deliberately generic and are not production-ready registrations. See
+[`docs/boundary-extension-authoring.md`](../../../docs/boundary-extension-authoring.md)
+for deployment and trust requirements.
