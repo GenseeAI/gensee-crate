@@ -990,13 +990,13 @@ mod tests {
     #[test]
     fn secret_material_cannot_be_used_as_a_broker_handle() {
         let mut request = CapabilityRequest::new(
-            "call_repository",
+            "call_records_service",
             EffectScope::ReadOnly,
             vec![Capability::SecretUse, Capability::ProcessExecution],
         );
         request.scope.secret_identities = vec![SecretIdentityScope {
             handle: "sk-secret-value".to_string(),
-            identity: "repository-reader".to_string(),
+            identity: "records-reader".to_string(),
             purpose: "read metadata".to_string(),
         }];
         let decision = CapabilityPolicyEngine::default().evaluate(

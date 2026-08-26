@@ -1,7 +1,7 @@
 # Capability broker
 
 The capability broker is the host-owned authority boundary for short-lived
-repository/API access, workload identities, mTLS identities, filesystem
+service access, workload identities, mTLS identities, filesystem
 handles, network leases, database roles, and external-action commit tokens.
 Cells receive only opaque lease ids, opaque provider handles, and mediated
 gateway endpoints. They do not receive the credential used by the host broker
@@ -12,7 +12,7 @@ password.
 
 ```console
 gensee run broker adapter register --config adapter.json
-gensee run broker adapter inspect repo-broker --json
+gensee run broker adapter inspect records-broker --json
 gensee run broker lease issue --request broker-request.json --json
 gensee run broker lease inspect broker_lease_... --json
 gensee run broker lease revoke broker_lease_...
@@ -31,9 +31,9 @@ non-group/world-writable adapter executable:
 ```json
 {
   "schema_version": 1,
-  "adapter_id": "repo-broker",
-  "resource_kinds": ["repository_token", "api_token"],
-  "executable": "/opt/gensee/brokers/repository-client",
+  "adapter_id": "records-broker",
+  "resource_kinds": ["service_credential"],
+  "executable": "/opt/gensee/brokers/records-client",
   "args": [],
   "environment_allowlist": ["BROKER_CLIENT_HANDLE"],
   "max_ttl_seconds": 300
@@ -50,8 +50,8 @@ material and returns only:
 {
   "protocol_version": 1,
   "provider_handle": "opaque-provider-handle",
-  "gateway_endpoint": "unix:///run/gensee/repository.sock",
-  "public_metadata": {"repository": "one"},
+  "gateway_endpoint": "unix:///run/gensee/records.sock",
+  "public_metadata": {"service": "records"},
   "effects": [],
   "effect_telemetry_complete": false
 }
@@ -75,12 +75,17 @@ never mounted into a capability cell. Promotion receipts use a separate
 signature domain and an append-only verified ledger, so editing retained JSON
 cannot erase prior promotion history or manufacture clean evidence.
 
-The adapter contract supports `repository_token`, `api_token`,
+The adapter contract supports `service_credential`,
 `workload_identity`, `mtls_certificate`, and `database_role`. Provider-specific
 minting remains outside the cell and outside the Gensee process; an adapter can
 use OAuth token exchange, a workload-identity service, a SPIFFE workload API,
 an internal certificate authority, or a database credential broker without
 changing the cell protocol.
+
+Earlier v1 state may contain the former service-specific credential and request
+names. Gensee can deserialize and revoke that retained state, but all newly
+serialized state uses `service_credential`, `service_request`, and
+`service_gateway`.
 
 ## Lease binding
 
@@ -113,7 +118,7 @@ broker must resolve and pin addresses before issuing the lease. Allowed-rule
 counters become network effects; blocked packets or incomplete counter
 collection prevent promotion. On non-Linux hosts this path fails closed.
 
-Brokered repository, API, identity, mTLS, browser, cloud, and database
+Brokered service, identity, mTLS, browser, cloud, and database
 capabilities instead mount only their exact Unix-domain gateway socket into a
 cell whose IP network is disabled. The broad provider credential remains
 behind that gateway.

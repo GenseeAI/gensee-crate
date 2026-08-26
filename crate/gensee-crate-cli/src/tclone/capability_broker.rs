@@ -384,16 +384,25 @@ fn validate_broker_lease_request(request: &BrokerLeaseRequest) -> io::Result<()>
     }
     if request.cell_id.is_some() {
         let expected_gateway_kinds: &[&str] = match request.resource_kind {
-            BrokerResourceKind::RepositoryToken => &["repository_api"],
-            BrokerResourceKind::ApiToken => {
-                &["external_api", "cloud_api", "browser_automation", "secret"]
-            }
+            BrokerResourceKind::ServiceCredential => &[
+                "service_gateway",
+                "cloud_api",
+                "browser_automation",
+                "secret",
+            ],
             BrokerResourceKind::WorkloadIdentity => &["workload_identity"],
             BrokerResourceKind::MtlsCertificate => &["mtls"],
             BrokerResourceKind::DatabaseRole => &["database"],
             BrokerResourceKind::FilesystemHandle
             | BrokerResourceKind::NetworkLease
             | BrokerResourceKind::ExternalActionCommitToken => &[],
+            BrokerResourceKind::LegacyServiceCredentialV1A
+            | BrokerResourceKind::LegacyServiceCredentialV1B => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "legacy service-credential wire kinds are accepted only for retained-state cleanup",
+                ));
+            }
         };
         if !expected_gateway_kinds.is_empty() {
             let gateway_kind = required_json_string(&request.constraints, "gateway_kind")?;
@@ -1253,9 +1262,47 @@ mod tests {
             "nested": { "value": "sk-not-public" }
         })));
         assert!(!contains_secret_shaped_json(&json!({
-            "repository": "one",
+            "service": "records",
             "expires_in": 60
         })));
+    }
+
+    #[test]
+    fn retained_v1_lease_preserves_its_resource_kind_in_revoke_wire() {
+        let lease: BrokerLease = serde_json::from_value(json!({
+            "protocol_version": 1,
+            "lease_id": "lease_legacy",
+            "operation_id": "op_1",
+            "source_run_id": "run_1",
+            "resource_kind": "repository_token",
+            "adapter_id": "legacy_adapter",
+            "audience": "records.example.test",
+            "scopes": ["records:read"],
+            "constraints": {},
+            "issued_at_ms": 1,
+            "expires_at_ms": 2,
+            "status": "active",
+            "delivery": {
+                "kind": "gateway",
+                "gateway_endpoint": "unix:///run/gensee/legacy.sock",
+                "provider_handle": "opaque_1"
+            },
+            "public_metadata": {},
+            "gateway_effects": [],
+            "effect_telemetry_complete": false
+        }))
+        .unwrap();
+        let revoke = BrokerAdapterRequest {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            action: "revoke".to_string(),
+            lease: lease_to_request(&lease),
+            provider_handle: Some("opaque_1".to_string()),
+        };
+
+        assert_eq!(
+            serde_json::to_value(revoke).unwrap()["lease"]["resource_kind"],
+            json!("repository_token")
+        );
     }
 
     #[test]
@@ -1284,9 +1331,32 @@ mod tests {
     }
 
     #[test]
+    fn new_service_credentials_require_the_generic_gateway_kind() {
+        let mut request = BrokerLeaseRequest {
+            protocol_version: BROKER_PROTOCOL_VERSION,
+            operation_id: "op_1".to_string(),
+            source_run_id: "run_1".to_string(),
+            cell_id: Some("cell_1".to_string()),
+            resource_kind: BrokerResourceKind::ServiceCredential,
+            adapter_id: "records_adapter".to_string(),
+            audience: "records.example.test".to_string(),
+            scopes: vec!["records:read".to_string()],
+            ttl_seconds: 60,
+            constraints: json!({ "gateway_kind": "service_gateway" }),
+        };
+
+        validate_broker_lease_request(&request).unwrap();
+        request.constraints = json!({ "gateway_kind": "repository_api" });
+        assert_eq!(
+            validate_broker_lease_request(&request).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn direct_network_lease_requires_a_pinned_ip_protocol_and_ports() {
         assert!(validate_network_constraints(&json!({
-            "destination": "repo.example.test",
+            "destination": "records.example.test",
             "protocol": "tcp",
             "ports": [443]
         }))
@@ -1423,14 +1493,14 @@ mod tests {
         let executable = root.join("adapter.sh");
         fs::write(
             &executable,
-            "#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf '%s\\n' '{\"protocol_version\":1,\"provider_handle\":\"opaque_1\",\"gateway_endpoint\":\"unix:///run/gensee/repo.sock\",\"public_metadata\":{\"repository\":\"one\"},\"effects\":[],\"effect_telemetry_complete\":false}'\n",
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf '%s\\n' '{\"protocol_version\":1,\"provider_handle\":\"opaque_1\",\"gateway_endpoint\":\"unix:///run/gensee/records.sock\",\"public_metadata\":{\"service\":\"records\"},\"effects\":[],\"effect_telemetry_complete\":false}'\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let config = BrokerAdapterConfig {
             schema_version: BROKER_ADAPTER_SCHEMA_VERSION,
-            adapter_id: "repo_adapter".to_string(),
-            resource_kinds: vec![BrokerResourceKind::RepositoryToken],
+            adapter_id: "records_adapter".to_string(),
+            resource_kinds: vec![BrokerResourceKind::ServiceCredential],
             executable: executable.to_string_lossy().to_string(),
             args: Vec::new(),
             environment_allowlist: Vec::new(),
@@ -1441,19 +1511,19 @@ mod tests {
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_1".to_string()),
-            resource_kind: BrokerResourceKind::RepositoryToken,
-            adapter_id: "repo_adapter".to_string(),
-            audience: "repo.example.test".to_string(),
-            scopes: vec!["repository:one:read".to_string()],
+            resource_kind: BrokerResourceKind::ServiceCredential,
+            adapter_id: "records_adapter".to_string(),
+            audience: "records.example.test".to_string(),
+            scopes: vec!["records:read".to_string()],
             ttl_seconds: 60,
-            constraints: json!({ "repository": "one" }),
+            constraints: json!({ "service": "records" }),
         };
 
         let response = invoke_broker_adapter(&config, "mint", &request, None).unwrap();
 
         assert_eq!(response.provider_handle, "opaque_1");
-        assert_eq!(response.gateway_endpoint, "unix:///run/gensee/repo.sock");
-        assert_eq!(response.public_metadata["repository"], "one");
+        assert_eq!(response.gateway_endpoint, "unix:///run/gensee/records.sock");
+        assert_eq!(response.public_metadata["service"], "records");
         let invocation_dir = root.join("capability-broker/adapter-invocations");
         assert_eq!(fs::read_dir(invocation_dir).unwrap().count(), 0);
 
