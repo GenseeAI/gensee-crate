@@ -54,6 +54,7 @@ pub(crate) fn handle_operation_boundary(args: Vec<OsString>) -> io::Result<()> {
         Some("catalog") => handle_contract_catalog(rest),
         Some("intent") => handle_intent_resolution(rest),
         Some("context") => handle_operation_context(rest),
+        Some("verifier") => handle_semantic_verifier(rest),
         Some("validate") => boundary_validate(rest),
         Some("audit") => boundary_audit(rest),
         Some("run") => boundary_run(BoundaryRunConfig::parse(rest)?),
@@ -340,7 +341,7 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
     } else {
         "structural gate passed without a semantic safety claim; no trusted destination was configured, so nothing was promoted"
     };
-    let manifest = OperationRunManifest {
+    let mut manifest = OperationRunManifest {
         schema_version: 1,
         operation_id,
         source_run_id,
@@ -386,7 +387,9 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
         },
         started_at_ms,
         finished_at_ms: unix_millis()?,
+        host_signature: None,
     };
+    crate::semantic_verifier::sign_operation_manifest(&mut manifest)?;
     if let Some(path) = config.manifest_path {
         write_boundary_manifest(&path, &serde_json::to_vec_pretty(&manifest)?)?;
     }

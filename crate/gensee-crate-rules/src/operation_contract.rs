@@ -173,6 +173,15 @@ pub struct OperationRunManifest {
     pub promotion: OperationPromotionEvidence,
     pub started_at_ms: u64,
     pub finished_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_signature: Option<OperationManifestSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationManifestSignature {
+    pub algorithm: String,
+    pub signature_hex: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

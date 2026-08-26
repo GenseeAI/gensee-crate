@@ -24,6 +24,8 @@ pub struct ContractCatalog {
     pub intent_analyzers: Vec<ApprovedIntentAnalyzer>,
     #[serde(default)]
     pub operation_services: Vec<ApprovedOperationService>,
+    #[serde(default)]
+    pub semantic_verifiers: Vec<ApprovedSemanticVerifier>,
     pub fallback: FallbackPolicy,
 }
 
@@ -91,6 +93,15 @@ pub struct ApprovedOperationService {
     pub public_key_hex: String,
     pub can_initiate: bool,
     pub allowed_audiences: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedSemanticVerifier {
+    pub verifier_id: String,
+    pub public_key_hex: String,
+    pub profiles: Vec<String>,
+    pub policy_versions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +399,31 @@ impl ContractCatalog {
                 errors.push(format!(
                     "duplicate operation service {}",
                     service.service_id
+                ));
+            }
+        }
+
+        let mut verifier_ids = BTreeSet::new();
+        for verifier in &self.semantic_verifiers {
+            if !bounded_token(&verifier.verifier_id)
+                || !valid_hex(&verifier.public_key_hex, 32)
+                || verifier.profiles.is_empty()
+                || verifier.policy_versions.is_empty()
+                || verifier.profiles.iter().any(|value| !bounded_token(value))
+                || verifier
+                    .policy_versions
+                    .iter()
+                    .any(|value| !bounded_token(value))
+            {
+                errors.push(format!(
+                    "semantic verifier {} is invalid",
+                    verifier.verifier_id
+                ));
+            }
+            if !verifier_ids.insert(verifier.verifier_id.as_str()) {
+                errors.push(format!(
+                    "duplicate semantic verifier {}",
+                    verifier.verifier_id
                 ));
             }
         }
@@ -717,6 +753,7 @@ mod tests {
                 allowed_operation_classes: vec!["document_transform".into()],
             }],
             operation_services: Vec::new(),
+            semantic_verifiers: Vec::new(),
             fallback: FallbackPolicy {
                 on_ambiguous_intent: AmbiguousIntentAction::Deny,
                 safe_default_contract_id: None,
