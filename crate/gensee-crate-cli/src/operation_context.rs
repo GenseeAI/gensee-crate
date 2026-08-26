@@ -6,14 +6,75 @@ use gensee_crate_rules::operation_context::{
     OperationContextSignature, OperationTransportClaims, SignedDownstreamEffect,
     SignedOperationContext, SignedOperationTransport, OPERATION_TRANSPORT_SCHEMA_VERSION,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+const TRANSPORT_NONCE_RECORD_SCHEMA_VERSION: u32 = 1;
+const MAX_LIVE_TRANSPORT_NONCES_PER_RECIPIENT: usize = 1_024;
+const MAX_LIVE_TRANSPORT_NONCES_TOTAL: usize = 8_192;
+const MAX_TRANSPORT_NONCE_RECORD_BYTES: u64 = 4 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsumedTransportNonceRecord {
+    schema_version: u32,
+    envelope_id: String,
+    context_digest: String,
+    recipient_service: String,
+    nonce_digest: String,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+}
+
+#[cfg(unix)]
+struct TransportNonceStoreLock(File);
+
+#[cfg(unix)]
+impl TransportNonceStoreLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path)?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(file))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TransportNonceStoreLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(not(unix))]
+struct TransportNonceStoreLock;
+
+#[cfg(not(unix))]
+impl TransportNonceStoreLock {
+    fn acquire(_path: &Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "durable operation transport replay protection requires file locking",
+        ))
+    }
+}
 
 pub(crate) fn handle_operation_context(args: &[OsString]) -> io::Result<()> {
     let (command, rest) = args.split_first().ok_or_else(context_usage_error)?;
@@ -152,19 +213,60 @@ fn verify_transport(args: &[OsString]) -> io::Result<()> {
             signature_hex: envelope.signature_hex,
         },
     )?;
-    consume_transport_nonce(&envelope.claims)?;
+    consume_transport_nonce(&envelope.claims, now)?;
     write_atomic_nofollow(&required_path(args, "--output")?, &payload, 0o600)
 }
 
-fn consume_transport_nonce(claims: &OperationTransportClaims) -> io::Result<()> {
+fn consume_transport_nonce(claims: &OperationTransportClaims, now_ms: u64) -> io::Result<()> {
     consume_transport_nonce_at(
         &default_root()?.join("operation-context/consumed-transport-nonces"),
         claims,
+        now_ms,
     )
 }
 
-fn consume_transport_nonce_at(root: &Path, claims: &OperationTransportClaims) -> io::Result<()> {
+fn consume_transport_nonce_at(
+    root: &Path,
+    claims: &OperationTransportClaims,
+    now_ms: u64,
+) -> io::Result<()> {
+    consume_transport_nonce_at_with_limits(
+        root,
+        claims,
+        now_ms,
+        MAX_LIVE_TRANSPORT_NONCES_PER_RECIPIENT,
+        MAX_LIVE_TRANSPORT_NONCES_TOTAL,
+    )
+}
+
+fn consume_transport_nonce_at_with_limits(
+    root: &Path,
+    claims: &OperationTransportClaims,
+    now_ms: u64,
+    max_per_recipient: usize,
+    max_total: usize,
+) -> io::Result<()> {
+    if now_ms >= claims.expires_at_ms {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "operation transport expired before nonce consumption",
+        ));
+    }
     create_restrictive_dir_all(root)?;
+    let _lock = TransportNonceStoreLock::acquire(&root.join(".store.lock"))?;
+    let (total, recipient) = prune_and_count_transport_nonces(
+        root,
+        now_ms,
+        claims.recipient_service.as_str(),
+        max_per_recipient,
+        max_total,
+    )?;
+    if total >= max_total || recipient >= max_per_recipient {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "operation transport nonce store quota is exhausted",
+        ));
+    }
     let key = format!(
         "{:x}",
         Sha256::digest(
@@ -193,13 +295,98 @@ fn consume_transport_nonce_at(root: &Path, claims: &OperationTransportClaims) ->
             error
         }
     })?;
-    writeln!(
-        file,
-        "{} {} {}",
-        claims.envelope_id, claims.issued_at_ms, claims.expires_at_ms
-    )?;
+    let record = ConsumedTransportNonceRecord {
+        schema_version: TRANSPORT_NONCE_RECORD_SCHEMA_VERSION,
+        envelope_id: claims.envelope_id.clone(),
+        context_digest: claims.context_digest.clone(),
+        recipient_service: claims.recipient_service.clone(),
+        nonce_digest: format!("sha256:{:x}", Sha256::digest(claims.nonce.as_bytes())),
+        issued_at_ms: claims.issued_at_ms,
+        expires_at_ms: claims.expires_at_ms,
+    };
+    serde_json::to_writer(&mut file, &record).map_err(json_error)?;
+    file.write_all(b"\n")?;
     file.sync_all()?;
     File::open(root)?.sync_all()
+}
+
+fn prune_and_count_transport_nonces(
+    root: &Path,
+    now_ms: u64,
+    current_recipient: &str,
+    max_per_recipient: usize,
+    max_total: usize,
+) -> io::Result<(usize, usize)> {
+    let mut total = 0usize;
+    let mut recipient = 0usize;
+    let mut changed = false;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == ".store.lock" {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() == 0
+            || metadata.len() > MAX_TRANSPORT_NONCE_RECORD_BYTES
+        {
+            return Err(invalid_data(
+                "operation transport nonce store contains an invalid entry",
+            ));
+        }
+        let record = read_transport_nonce_record(&path)?;
+        validate_transport_nonce_record(&record)?;
+        if now_ms >= record.expires_at_ms {
+            fs::remove_file(&path)?;
+            changed = true;
+            continue;
+        }
+        total = total.saturating_add(1);
+        if record.recipient_service == current_recipient {
+            recipient = recipient.saturating_add(1);
+        }
+        if total > max_total || recipient > max_per_recipient {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "operation transport nonce store exceeds its durable quota",
+            ));
+        }
+    }
+    if changed {
+        File::open(root)?.sync_all()?;
+    }
+    Ok((total, recipient))
+}
+
+fn read_transport_nonce_record(path: &Path) -> io::Result<ConsumedTransportNonceRecord> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    serde_json::from_reader(options.open(path)?).map_err(json_error)
+}
+
+fn validate_transport_nonce_record(record: &ConsumedTransportNonceRecord) -> io::Result<()> {
+    if record.schema_version != TRANSPORT_NONCE_RECORD_SCHEMA_VERSION
+        || !safe_catalog_token(&record.envelope_id)
+        || !safe_catalog_token(&record.recipient_service)
+        || !valid_context_digest(&record.context_digest)
+        || !valid_context_digest(&record.nonce_digest)
+        || record.issued_at_ms >= record.expires_at_ms
+    {
+        return Err(invalid_data(
+            "operation transport nonce record is malformed",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_context_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 fn issue_context(args: &[OsString]) -> io::Result<()> {
@@ -764,26 +951,134 @@ mod tests {
             "gensee-context-nonce-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let claims = OperationTransportClaims {
-            schema_version: OPERATION_TRANSPORT_SCHEMA_VERSION,
-            envelope_id: "envelope_one".into(),
-            context_digest: format!("sha256:{}", "11".repeat(32)),
-            sender_service: "gateway".into(),
-            recipient_service: "worker".into(),
-            payload_digest: format!("sha256:{}", "22".repeat(32)),
-            content_type: "application_json".into(),
-            nonce: "nonce_one".into(),
-            issued_at_ms: 100,
-            expires_at_ms: 200,
-        };
-        consume_transport_nonce_at(&root, &claims).unwrap();
+        let claims = transport_claims("envelope_one", "worker", "nonce_one", 100, 200);
+        consume_transport_nonce_at(&root, &claims, 150).unwrap();
         assert_eq!(
-            consume_transport_nonce_at(&root, &claims)
+            consume_transport_nonce_at(&root, &claims, 150)
                 .unwrap_err()
                 .kind(),
             ErrorKind::PermissionDenied
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expired_transport_nonces_are_pruned_before_admission() {
+        let root = env::temp_dir().join(format!(
+            "gensee-context-nonce-expiry-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let expired = transport_claims("envelope_old", "worker", "nonce_old", 100, 200);
+        consume_transport_nonce_at(&root, &expired, 150).unwrap();
+        let fresh = transport_claims("envelope_new", "worker", "nonce_new", 250, 400);
+        consume_transport_nonce_at(&root, &fresh, 250).unwrap();
+        assert_eq!(transport_nonce_record_count(&root), 1);
+        assert_eq!(
+            consume_transport_nonce_at(&root, &expired, 250)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_transport_nonce_quotas_fail_closed_without_eviction() {
+        let root = env::temp_dir().join(format!(
+            "gensee-context-nonce-quota-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let first = transport_claims("envelope_one", "worker", "nonce_one", 100, 400);
+        let same_recipient = transport_claims("envelope_two", "worker", "nonce_two", 100, 400);
+        let other_recipient =
+            transport_claims("envelope_three", "worker_two", "nonce_three", 100, 400);
+        let over_total = transport_claims("envelope_four", "worker_three", "nonce_four", 100, 400);
+        consume_transport_nonce_at_with_limits(&root, &first, 150, 1, 2).unwrap();
+        assert_eq!(
+            consume_transport_nonce_at_with_limits(&root, &same_recipient, 150, 1, 2)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        consume_transport_nonce_at_with_limits(&root, &other_recipient, 150, 1, 2).unwrap();
+        assert_eq!(
+            consume_transport_nonce_at_with_limits(&root, &over_total, 150, 1, 2)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(transport_nonce_record_count(&root), 2);
+        assert_eq!(
+            consume_transport_nonce_at_with_limits(&root, &first, 150, 1, 2)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_nonce_admission_respects_recipient_quota() {
+        use std::sync::{Arc, Barrier};
+
+        let root = env::temp_dir().join(format!(
+            "gensee-context-nonce-concurrent-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let barrier = Arc::new(Barrier::new(2));
+        let workers = ["one", "two"].map(|suffix| {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let claims = transport_claims(
+                    &format!("envelope_{suffix}"),
+                    "worker",
+                    &format!("nonce_{suffix}"),
+                    100,
+                    400,
+                );
+                barrier.wait();
+                consume_transport_nonce_at_with_limits(&root, &claims, 150, 1, 2)
+            })
+        });
+        let successes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(successes, 1);
+        assert_eq!(transport_nonce_record_count(&root), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn transport_claims(
+        envelope_id: &str,
+        recipient: &str,
+        nonce: &str,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> OperationTransportClaims {
+        OperationTransportClaims {
+            schema_version: OPERATION_TRANSPORT_SCHEMA_VERSION,
+            envelope_id: envelope_id.into(),
+            context_digest: format!("sha256:{}", "11".repeat(32)),
+            sender_service: "gateway".into(),
+            recipient_service: recipient.into(),
+            payload_digest: format!("sha256:{}", "22".repeat(32)),
+            content_type: "application_json".into(),
+            nonce: nonce.into(),
+            issued_at_ms,
+            expires_at_ms,
+        }
+    }
+
+    fn transport_nonce_record_count(root: &Path) -> usize {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != ".store.lock")
+            .count()
     }
 
     fn sign_context(claims: OperationContextClaims, key: &SigningKey) -> SignedOperationContext {

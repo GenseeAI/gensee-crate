@@ -77,7 +77,12 @@ recipient atomically records the context/recipient/nonce tuple in its private
 state before releasing the payload. A second delivery of the same envelope is
 denied even while its signature and TTL remain valid. The nonce store is part
 of the receiving service's trusted deployment state and must not be shared
-with an untrusted caller.
+with an untrusted caller. Transport envelopes have a hard fifteen-minute TTL.
+The store serializes consumption, retains each record through that deadline,
+and removes expired records before admitting another envelope. It fails closed
+at 1,024 live records per recipient or 8,192 live records in one store, so an
+approved sender cannot grow privileged durable state without bound. Quota
+exhaustion never evicts a still-live replay record.
 
 ```console
 gensee boundary context transport-wrap \

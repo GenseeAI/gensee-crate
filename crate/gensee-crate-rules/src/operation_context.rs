@@ -57,6 +57,7 @@ pub struct OperationContextChain {
 }
 
 pub const OPERATION_TRANSPORT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_OPERATION_TRANSPORT_TTL_MS: u64 = 15 * 60 * 1_000;
 
 /// Transport-neutral authenticated request envelope. HTTP, RPC, task queue,
 /// and local-socket middleware can carry the same object after independently
@@ -106,6 +107,7 @@ impl OperationTransportClaims {
             || peer_service != self.sender_service
             || self.issued_at_ms < tail.issued_at_ms
             || self.issued_at_ms >= self.expires_at_ms
+            || self.expires_at_ms - self.issued_at_ms > MAX_OPERATION_TRANSPORT_TTL_MS
             || self.expires_at_ms > tail.expires_at_ms
             || now_ms >= self.expires_at_ms
         {
@@ -358,6 +360,14 @@ mod tests {
             .is_ok());
         assert!(claims
             .validate_for_context(&tail, &claims.context_digest, "attacker", 200)
+            .is_err());
+
+        let mut long_tail = tail;
+        long_tail.expires_at_ms = MAX_OPERATION_TRANSPORT_TTL_MS + 10_000;
+        let mut long_lived = claims;
+        long_lived.expires_at_ms = long_lived.issued_at_ms + MAX_OPERATION_TRANSPORT_TTL_MS + 1;
+        assert!(long_lived
+            .validate_for_context(&long_tail, &long_lived.context_digest, "gateway", 200)
             .is_err());
     }
 }
