@@ -99,6 +99,8 @@ mod network_boundary;
 pub(crate) use network_boundary::*;
 mod operation_supervisor;
 pub(crate) use operation_supervisor::*;
+mod operation_boundary;
+pub(crate) use operation_boundary::*;
 mod falco;
 pub(crate) use falco::*;
 mod replay;
@@ -137,6 +139,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
         Some("__linux-exec") => {
             args.remove(0);
             linux_exec_wrapper(args)
+        }
+        Some("__boundary-exec") => {
+            args.remove(0);
+            boundary_exec_wrapper(args)
         }
         Some("__cell-landlock-exec") => {
             args.remove(0);
@@ -290,6 +296,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
             network_args.extend(args);
             handle_c0_network(network_args)
         }
+        Some("boundary") => {
+            args.remove(0);
+            handle_operation_boundary(args)
+        }
         Some("managed") => {
             args.remove(0);
             run_managed(args)
@@ -377,6 +387,7 @@ fn should_bootstrap_telemetry_for_command(command: &str) -> bool {
         && command != "debug"
         && command != "replay"
         && command != "__linux-exec"
+        && command != "__boundary-exec"
         && command != "__cell-landlock-exec"
         && !is_linux_top_level_command(command)
 }
@@ -5409,6 +5420,9 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 pub(crate) fn print_usage() {
     println!(
         "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--observe-only] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--approach <description>]... [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container> [--json]\n  gensee run summary <fork-id> [--json]\n  gensee run compare <parallel-fork-id> [--json]\n  gensee run choose <parallel-fork-id> <--merge|--promote|--discard-all>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee managed <create-source|delete-source|fork|merge|promote|discard|diff|status|list|reconcile>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list [--json]\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run --runtime tclone --observe-only -- codex\n  gensee run fork run_123 --copies 2 --name try-upgrade --approach 'minimal compatible upgrade' --approach 'aggressive latest-version upgrade' --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
+    );
+    println!(
+        "GENERIC OPERATION BOUNDARY:\n  gensee boundary validate --contract <contract.json> [--json]\n  gensee boundary audit --contract <contract.json> [--json]\n  sudo gensee boundary run --contract <contract.json> [--workspace <dir>] [--manifest <manifest.json>] -- <command> [args...]\n"
     );
     println!(
         "CAPABILITY FAULTS AND C0 NETWORK:\n  sudo gensee boundary-daemon --state-root <root> --config <operation.json>\n  gensee run fault --socket <path> --fault <fault.json>\n  gensee run network serve --state-root <root> --config <operation.json> [--dry-run]\n  gensee run network event --socket <path> --event <event.json>\n  gensee run network inspect --socket <path>\n"

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "contract_id": "offline-structured-result-v1",
+  "operation_class": "structured_data_transform",
+  "execution": {
+    "max_runtime_seconds": 60,
+    "require_os_execution_binding": true
+  },
+  "capabilities": {
+    "network": {
+      "mode": "deny_all",
+      "allowed_endpoints": []
+    }
+  },
+  "product": {
+    "kind": "structured_result",
+    "path": "out/result.json",
+    "max_bytes": 1048576,
+    "max_entries": 1,
+    "reject_symlinks": true,
+    "reject_special_files": true
+  }
+}
