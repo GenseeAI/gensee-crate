@@ -452,6 +452,7 @@ mod tests {
                 minimum_confidence_bps: 8_000,
                 allowed_operation_classes: vec!["transform".into()],
             }],
+            operation_services: Vec::new(),
             fallback: FallbackPolicy {
                 on_ambiguous_intent: AmbiguousIntentAction::Deny,
                 safe_default_contract_id: None,
