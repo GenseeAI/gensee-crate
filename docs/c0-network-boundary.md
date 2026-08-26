@@ -3,7 +3,7 @@
 The C0 network supervisor is the first end-to-end capability path for a
 long-lived operation. It is provider-neutral: decisions use resolved IP
 addresses, protocols, ports, operation/process identity, expiry, and HTTP
-semantics. It contains no package-manager or repository-product rules.
+semantics. It contains no application- or product-specific rules.
 
 For each boundary event it returns exactly one disposition:
 
@@ -113,10 +113,85 @@ authentication headers are not returned.
     "max_response_bytes": 134217728,
     "max_redirects": 3,
     "connect_timeout_seconds": 10,
-    "io_timeout_seconds": 30
+    "io_timeout_seconds": 30,
+    "transaction": {
+      "effect": "external_http_read",
+      "scopes": [
+        {
+          "scheme": "http",
+          "authority": "api.example.test:8080",
+          "path_prefix": "/v1/data"
+        }
+      ],
+      "max_ttl_seconds": 120,
+      "max_requests": 500,
+      "max_request_bytes": 16777216,
+      "max_response_bytes": 134217728
+    }
   }
 }
 ~~~
+
+When `proxy.transaction` is present, the HTTP mediator is inactive by default.
+Its scheme, canonical authority, segment-aware path prefix, effect, TTL ceiling,
+and cumulative request/response budgets come only from the root-owned config.
+The untrusted workload cannot supply or widen any of them. The exact
+`proxy.client_address` is the mediated client identity. Put the initiating
+workload and mediated client in separate network identities, and expose the
+proxy only to the mediated identity.
+
+The root control plane prepares and then activates one transaction:
+
+~~~console
+sudo gensee run network transaction-begin \
+  --socket /path/supervisor.sock \
+  --transaction http_tx_1 --operation op_agent_fetch \
+  --effect external_http_read --ttl-seconds 60
+sudo gensee run network transaction-activate \
+  --socket /path/supervisor.sock \
+  --transaction http_tx_1 --operation op_agent_fetch
+~~~
+
+End a successful transaction or revoke it on failure:
+
+~~~console
+sudo gensee run network transaction-end \
+  --socket /path/supervisor.sock \
+  --transaction http_tx_1 --operation op_agent_fetch
+sudo gensee run network transaction-revoke \
+  --socket /path/supervisor.sock \
+  --transaction http_tx_1 --operation op_agent_fetch
+~~~
+
+Control peers are authenticated with `SO_PEERCRED` exactly like other boundary
+administration. Transaction IDs are one-use. The requested TTL starts at
+`transaction-begin`, giving the prepared state a root-owned deadline as well as
+bounding active execution. Wrong operation, effect, client, scope, state, TTL,
+request budget, response budget, expiry, and replay all fail closed. Ambiguous
+encoded delimiter, dot-segment, and double-encoded (`%25`) paths are outside a
+transaction scope. Redirects consume another request and are checked against
+the same URL scope before DNS resolution.
+
+Only one response-budget reservation may be in flight for a transaction. The
+reservation and transaction generation are persisted before the upstream
+effect and checked again immediately before connect. Success or upstream error
+releases the reservation; a daemon crash leaves it in place, deliberately
+failing closed until the transaction expires or is terminated. A response that
+finishes after revoke or expiry is not returned to the mediated client and
+is recorded as `http_transaction_late_response_denied` with its upstream byte
+count.
+
+Lifecycle transitions and decisions are retained in
+`http-transactions.jsonl`. HTTP effects in `effects.jsonl` and request evidence
+in `http-mediator.jsonl` carry the transaction ID for correlation. If durable
+state commits but the lifecycle audit append fails, the operation is marked as
+having incomplete boundary evidence without falsely reporting that the state
+transition was denied.
+
+Transaction mode intentionally does not implement `CONNECT`. HTTPS
+absolute-form requests are supported by the mediator itself, but a client that
+requires CONNECT tunnelling cannot use this mode until a separately scoped
+tunnel design exists.
 
 `restricted_destinations` adds deployment-specific deny ranges; it cannot
 remove the built-in private, loopback, link-local, carrier NAT, metadata,
@@ -204,11 +279,13 @@ an arbitrary in-flight syscall or force an opaque program to retry. Programs
 that do not retry must be run through a mediator or in a staged child/fork whose
 supervisor can replay the operation explicitly.
 
-Explicit mediator revocation prevents new requests and redirect hops. A request
-already blocked in upstream I/O is bounded by the lesser of its configured I/O
-timeout and remaining lease lifetime, but is not yet actively interrupted by a
-revocation event. Active socket cancellation belongs in the privileged daemon
-transport.
+Explicit mediator or transaction revocation prevents new requests and redirect
+hops. Transaction mode tracks accepted client transports and shuts them down on
+revocation or expiry, so the mediated client cannot receive a late response.
+The current HTTP library does not expose its pinned upstream socket for direct
+shutdown; that socket remains bounded by the lesser of the configured I/O
+timeout and remaining transaction lifetime. Splitting transport ownership into
+a cancellable worker is the remaining step for immediate upstream-side teardown.
 
 The boundary daemon now owns policy state, nftables/cgroup mutation, broker
 signing material, credential handles, revocation, and evidence outside the
