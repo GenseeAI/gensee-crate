@@ -12,6 +12,7 @@ Gensee Crate is an open-source control layer for AI coding agents. Start with
 - [Distributed operation context](operation-context.md) — authenticate service hops, deadlines, generations, attenuated grant sets, and downstream effects back to the initiating operation.
 - [Semantic-verifier receipts](semantic-verifier.md) — bind a catalog-approved verifier and policy version to the exact structural product, contract, verdict, and validation-effect digest.
 - [Transactional promotion](transactional-promotion.md) — require unchanged structural evidence, an authenticated semantic verdict, terminal authority, compare-and-swap selection, and crash-safe rollback.
+- [Privileged generic boundary proof](generic-boundary-proof.md) — run one domain-neutral Linux conformance scenario and independently verify its signed evidence bundle.
 - [Gensee Crate Personal](personal.md) — local review, recovery points, configuration audit, and optional independent macOS verification.
 - [Gensee Crate Team](team.md) — disposable workspace forks, scoped capabilities, host-owned credentials, and evidence-gated promotion.
 - [Architecture](architecture.md) — shared policy and evidence model, workspace crates, and security boundaries.

@@ -312,7 +312,7 @@ fn apply_promotion_with_manifest_verifier(
 fn verify_promotable_manifest_state(manifest: &OperationRunManifest) -> io::Result<()> {
     if manifest.process.exit_code != Some(0)
         || manifest.process.timed_out
-        || !manifest.process.process_group_drained
+        || !manifest.process.execution_subject_drained
         || !manifest.enforcement.os_execution_binding_established
         || !manifest.promotion.structurally_eligible
         || manifest
@@ -642,7 +642,7 @@ fn sign_promotion_receipt(receipt: &TransactionalPromotionReceipt) -> io::Result
     )
 }
 
-fn verify_promotion_receipt(receipt: &TransactionalPromotionReceipt) -> io::Result<()> {
+pub(crate) fn verify_promotion_receipt(receipt: &TransactionalPromotionReceipt) -> io::Result<()> {
     let expected = sign_promotion_receipt(receipt)?;
     if expected != receipt.host_signature {
         return Err(invalid_data(
@@ -946,7 +946,7 @@ mod tests {
                 root_start_time: Some(1),
                 exit_code: Some(0),
                 timed_out: false,
-                process_group_drained: true,
+                execution_subject_drained: true,
             },
             product: Some(product_evidence.clone()),
             promotion: OperationPromotionEvidence {
@@ -971,7 +971,7 @@ mod tests {
             ErrorKind::PermissionDenied
         );
         let mut undrained_manifest = manifest.clone();
-        undrained_manifest.process.process_group_drained = false;
+        undrained_manifest.process.execution_subject_drained = false;
         assert_eq!(
             verify_promotable_manifest_state(&undrained_manifest)
                 .unwrap_err()

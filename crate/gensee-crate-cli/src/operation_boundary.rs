@@ -56,6 +56,7 @@ pub(crate) fn handle_operation_boundary(args: Vec<OsString>) -> io::Result<()> {
         Some("context") => handle_operation_context(rest),
         Some("verifier") => handle_semantic_verifier(rest),
         Some("promotion") => handle_transactional_promotion(rest),
+        Some("proof") => handle_boundary_proof(rest),
         Some("validate") => boundary_validate(rest),
         Some("audit") => boundary_audit(rest),
         Some("run") => boundary_run(BoundaryRunConfig::parse(rest)?),
@@ -304,12 +305,12 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
     }
     operation.finish(exit_code, timed_out)?;
     let release_attestation = operation.attestation()?;
-    let process_group_drained = execution_subject_drained_before_release
+    let execution_subject_drained = execution_subject_drained_before_release
         && (std::env::consts::OS != "linux"
             || release_attestation.cgroup_state
                 == crate::operation_supervisor::OperationCgroupState::Released);
     let process_succeeded = status.success() && !timed_out;
-    let product = if process_group_drained {
+    let product = if execution_subject_drained {
         contract
             .product
             .as_ref()
@@ -337,7 +338,7 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
         None
     };
     let structurally_eligible = process_succeeded
-        && process_group_drained
+        && execution_subject_drained
         && product
             .as_ref()
             .is_none_or(|evidence| evidence.structurally_valid);
@@ -347,7 +348,7 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
     let semantically_verified = false;
     let promotion_reason = if !process_succeeded {
         "producer did not complete successfully"
-    } else if !process_group_drained {
+    } else if !execution_subject_drained {
         "producer process group did not terminate cleanly"
     } else if !structurally_eligible {
         "structural product verification failed"
@@ -395,7 +396,7 @@ fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
             root_start_time,
             exit_code,
             timed_out,
-            process_group_drained,
+            execution_subject_drained,
         },
         product,
         promotion: OperationPromotionEvidence {

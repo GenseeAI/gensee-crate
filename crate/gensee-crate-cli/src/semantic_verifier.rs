@@ -3,8 +3,8 @@ use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use gensee_crate_rules::contract_catalog::SignedContractCatalog;
 use gensee_crate_rules::operation_contract::{OperationManifestSignature, OperationRunManifest};
 use gensee_crate_rules::semantic_verifier::{
-    SignedVerifierReceipt, VerifierReceiptClaims, VerifierReceiptSignature, VerifierRequest,
-    SEMANTIC_VERIFIER_SCHEMA_VERSION,
+    SemanticVerdict, SignedVerifierReceipt, VerifierReceiptClaims, VerifierReceiptSignature,
+    VerifierRequest, SEMANTIC_VERIFIER_SCHEMA_VERSION,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -21,6 +21,7 @@ pub(crate) fn handle_semantic_verifier(args: &[OsString]) -> io::Result<()> {
     let (command, rest) = args.split_first().ok_or_else(verifier_usage_error)?;
     match command.to_str() {
         Some("request") => create_request(rest),
+        Some("attest") => attest_receipt(rest),
         Some("sign") => sign_receipt(rest),
         Some("verify") => verify_receipt_command(rest),
         Some("--help" | "-h") => {
@@ -29,6 +30,68 @@ pub(crate) fn handle_semantic_verifier(args: &[OsString]) -> io::Result<()> {
         }
         _ => Err(verifier_usage_error()),
     }
+}
+
+fn attest_receipt(args: &[OsString]) -> io::Result<()> {
+    reject_options(
+        args,
+        &[
+            "--request",
+            "--verifier-id",
+            "--policy-version",
+            "--verdict",
+            "--reason",
+            "--effects-digest",
+            "--verifier-key",
+            "--output",
+        ],
+        &[],
+    )?;
+    let request: VerifierRequest =
+        read_catalog_json(&required_path(args, "--request")?, "verifier request")?;
+    let now_ms = unix_millis()?;
+    request.validate(now_ms).map_err(invalid_input)?;
+    let verdict = match required_string(args, "--verdict")?.as_str() {
+        "accept" => SemanticVerdict::Accept,
+        "reject" => SemanticVerdict::Reject,
+        "indeterminate" => SemanticVerdict::Indeterminate,
+        _ => return Err(invalid_input("invalid semantic verdict")),
+    };
+    let claims = VerifierReceiptClaims {
+        schema_version: SEMANTIC_VERIFIER_SCHEMA_VERSION,
+        receipt_id: format!("receipt_{}", uuid::Uuid::new_v4().simple()),
+        request_digest: format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&request).map_err(json_error)?)
+        ),
+        nonce: request.nonce.clone(),
+        operation_id: request.operation_id.clone(),
+        contract_id: request.contract_id.clone(),
+        contract_digest: request.contract_digest.clone(),
+        product_type: request.product_type,
+        product_digest: request.product_digest.clone(),
+        verifier_profile: request.verifier_profile.clone(),
+        verifier_id: required_string(args, "--verifier-id")?,
+        policy_version: required_string(args, "--policy-version")?,
+        verdict,
+        reason_codes: vec![required_string(args, "--reason")?],
+        validation_effect_manifest_digest: required_string(args, "--effects-digest")?,
+        issued_at_ms: now_ms,
+        expires_at_ms: request.expires_at_ms,
+    };
+    claims
+        .validate_for_request(&request, &claims.request_digest, now_ms)
+        .map_err(invalid_input)?;
+    let key = read_signing_key(&required_path(args, "--verifier-key")?)?;
+    let bytes = serde_json::to_vec(&claims).map_err(json_error)?;
+    let receipt = SignedVerifierReceipt {
+        claims,
+        signature: VerifierReceiptSignature {
+            algorithm: "ed25519".into(),
+            signature_hex: hex::encode(key.sign(&bytes).to_bytes()),
+        },
+    };
+    write_json(&required_path(args, "--output")?, &receipt)
 }
 
 fn create_request(args: &[OsString]) -> io::Result<()> {
@@ -345,12 +408,12 @@ fn json_error(error: serde_json::Error) -> io::Error {
 }
 
 fn verifier_usage_error() -> io::Error {
-    invalid_input("usage: gensee boundary verifier <request|sign|verify> ...")
+    invalid_input("usage: gensee boundary verifier <request|attest|sign|verify> ...")
 }
 
 fn print_verifier_usage() {
     println!(
-        "gensee boundary verifier\n\nUSAGE:\n  gensee boundary verifier request --manifest <operation.json> --ttl-seconds <n> --output <request.json>\n  gensee boundary verifier sign --catalog <signed.json> --trusted-key <org.hex> --request <request.json> --claims <claims.json> --verifier-key <seed.hex> --output <receipt.json>\n  gensee boundary verifier verify --catalog <signed.json> --trusted-key <org.hex> --request <request.json> --receipt <receipt.json> [--json]"
+        "gensee boundary verifier\n\nUSAGE:\n  gensee boundary verifier request --manifest <operation.json> --ttl-seconds <n> --output <request.json>\n  gensee boundary verifier attest --request <request.json> --verifier-id <id> --policy-version <version> --verdict <accept|reject|indeterminate> --reason <code> --effects-digest <sha256> --verifier-key <seed.hex> --output <receipt.json>\n  gensee boundary verifier sign --catalog <signed.json> --trusted-key <org.hex> --request <request.json> --claims <claims.json> --verifier-key <seed.hex> --output <receipt.json>\n  gensee boundary verifier verify --catalog <signed.json> --trusted-key <org.hex> --request <request.json> --receipt <receipt.json> [--json]"
     );
 }
 
@@ -495,7 +558,7 @@ mod tests {
                 root_start_time: Some(456),
                 exit_code: Some(0),
                 timed_out: false,
-                process_group_drained: true,
+                execution_subject_drained: true,
             },
             product: Some(StructuralProductEvidence {
                 kind: StructuralProductType::StructuredResult,

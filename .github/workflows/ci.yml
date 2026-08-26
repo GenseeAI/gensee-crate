@@ -38,6 +38,18 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+  generic-boundary-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install privileged boundary prerequisites
+        run: sudo apt-get update && sudo apt-get install -y iproute2 nftables jq openssl python3
+      - name: Build boundary binary
+        run: cargo build -p gensee-crate-cli
+      - name: Run generic privileged boundary proof
+        run: sudo env PATH="$PATH" GENSEE_BINARY="$PWD/target/debug/gensee" ./scripts/test-generic-boundary-proof.sh
+
   ui:
     runs-on: ubuntu-latest
     defaults:

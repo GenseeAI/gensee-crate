@@ -16,12 +16,21 @@ pub(crate) fn handle_contract_catalog(args: &[OsString]) -> io::Result<()> {
     match command.to_str() {
         Some("sign") => sign_catalog(rest),
         Some("verify") => verify_catalog_command(rest),
+        Some("public-key") => public_key_command(rest),
         Some("--help" | "-h") => {
             print_catalog_usage();
             Ok(())
         }
         _ => Err(catalog_usage_error()),
     }
+}
+
+fn public_key_command(args: &[OsString]) -> io::Result<()> {
+    reject_catalog_options(args, &["--key", "--output"], &[])?;
+    let key = read_signing_key(&required_catalog_path(args, "--key")?)?;
+    let mut encoded = hex::encode(key.verifying_key().as_bytes()).into_bytes();
+    encoded.push(b'\n');
+    write_catalog_output(&required_catalog_path(args, "--output")?, &encoded)
 }
 
 fn sign_catalog(args: &[OsString]) -> io::Result<()> {
@@ -246,12 +255,12 @@ fn invalid_json(error: serde_json::Error) -> io::Error {
 }
 
 fn catalog_usage_error() -> io::Error {
-    invalid_input("usage: gensee boundary catalog <sign|verify> ...")
+    invalid_input("usage: gensee boundary catalog <sign|verify|public-key> ...")
 }
 
 fn print_catalog_usage() {
     println!(
-        "gensee boundary catalog\n\nUSAGE:\n  gensee boundary catalog sign --catalog <catalog.json> --key <seed.hex> --key-id <id> --output <signed.json>\n  gensee boundary catalog verify --catalog <signed.json> --trusted-key <public.hex> [--json]"
+        "gensee boundary catalog\n\nUSAGE:\n  gensee boundary catalog public-key --key <seed.hex> --output <public.hex>\n  gensee boundary catalog sign --catalog <catalog.json> --key <seed.hex> --key-id <id> --output <signed.json>\n  gensee boundary catalog verify --catalog <signed.json> --trusted-key <public.hex> [--json]"
     );
 }
 

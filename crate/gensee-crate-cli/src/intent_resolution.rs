@@ -1,8 +1,9 @@
 use crate::*;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use gensee_crate_rules::contract_catalog::{
-    ContractResolution, IntentObservation, ObservedCaller, SignedContractCatalog,
-    SignedIntentInference, TrajectoryEvidence, INTENT_OBSERVATION_SCHEMA_VERSION,
+    ContractResolution, InferenceSignature, IntentInference, IntentObservation, ObservedCaller,
+    SignedContractCatalog, SignedIntentInference, TrajectoryEvidence,
+    INTENT_OBSERVATION_SCHEMA_VERSION,
 };
 use gensee_crate_rules::operation_contract::OperationContract;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,7 @@ pub(crate) fn handle_intent_resolution(args: &[OsString]) -> io::Result<()> {
     let (command, rest) = args.split_first().ok_or_else(intent_usage_error)?;
     match command.to_str() {
         Some("observe") => observe_command(rest),
+        Some("attest") => attest_command(rest),
         Some("resolve") => resolve_command(rest),
         Some("--help" | "-h") => {
             print_intent_usage();
@@ -46,6 +48,34 @@ pub(crate) fn handle_intent_resolution(args: &[OsString]) -> io::Result<()> {
         }
         _ => Err(intent_usage_error()),
     }
+}
+
+fn attest_command(args: &[OsString]) -> io::Result<()> {
+    reject_options(
+        args,
+        &["--observation", "--inference", "--analyzer-key", "--output"],
+        &[],
+    )?;
+    let observation: IntentObservation =
+        read_catalog_json(&required_path(args, "--observation")?, "intent observation")?;
+    observation.validate().map_err(invalid_input)?;
+    let mut inference: IntentInference =
+        read_catalog_json(&required_path(args, "--inference")?, "intent inference")?;
+    inference.observation_digest =
+        digest_bytes(&serde_json::to_vec(&observation).map_err(json_error)?);
+    inference
+        .validate(&observation, unix_millis()?)
+        .map_err(invalid_input)?;
+    let key = read_signing_key(&required_path(args, "--analyzer-key")?)?;
+    let bytes = serde_json::to_vec(&inference).map_err(json_error)?;
+    let signed = SignedIntentInference {
+        inference,
+        signature: InferenceSignature {
+            algorithm: "ed25519".into(),
+            signature_hex: hex::encode(key.sign(&bytes).to_bytes()),
+        },
+    };
+    write_json(&required_path(args, "--output")?, &signed)
 }
 
 fn observe_command(args: &[OsString]) -> io::Result<()> {
@@ -155,6 +185,35 @@ pub(crate) fn verify_and_resolve(
     verify_runtime_binding(&observation, &normalized)?;
     let observation_bytes = serde_json::to_vec(&observation).map_err(json_error)?;
     let observation_digest = digest_bytes(&observation_bytes);
+    let resolution =
+        verify_intent_evidence(&signed_catalog, &observation, &signed_inference, now_ms)?;
+    let inference_bytes = serde_json::to_vec(&signed_inference.inference).map_err(json_error)?;
+    let contract = signed_catalog
+        .catalog
+        .contract(&resolution.selected_contract_id)
+        .ok_or_else(|| invalid_data("resolved contract disappeared from catalog"))?
+        .contract
+        .clone();
+    Ok(ResolvedAdmission {
+        resolution,
+        catalog_digest: digest_bytes(
+            &serde_json::to_vec(&signed_catalog.catalog).map_err(json_error)?,
+        ),
+        observation_digest,
+        inference_digest: digest_bytes(&inference_bytes),
+        contract,
+        executable_sha256: observation.caller.executable_sha256.clone(),
+        canonical_executable: normalized.canonical_executable,
+    })
+}
+
+pub(crate) fn verify_intent_evidence(
+    signed_catalog: &SignedContractCatalog,
+    observation: &IntentObservation,
+    signed_inference: &SignedIntentInference,
+    now_ms: u64,
+) -> io::Result<gensee_crate_rules::contract_catalog::ContractResolution> {
+    let observation_digest = digest_bytes(&serde_json::to_vec(observation).map_err(json_error)?);
     if signed_inference.inference.observation_digest != observation_digest {
         return Err(invalid_data(
             "intent inference is not bound to the current observation",
@@ -179,27 +238,10 @@ pub(crate) fn verify_and_resolve(
         .map_err(|error| invalid_data(format!("invalid analyzer key: {error}")))?
         .verify(&inference_bytes, &Signature::from_bytes(&signature))
         .map_err(|error| invalid_data(format!("invalid intent inference signature: {error}")))?;
-    let resolution = signed_catalog
+    signed_catalog
         .catalog
-        .resolve_intent(&observation, &signed_inference.inference, now_ms)
-        .map_err(|error| io::Error::new(ErrorKind::PermissionDenied, error))?;
-    let contract = signed_catalog
-        .catalog
-        .contract(&resolution.selected_contract_id)
-        .ok_or_else(|| invalid_data("resolved contract disappeared from catalog"))?
-        .contract
-        .clone();
-    Ok(ResolvedAdmission {
-        resolution,
-        catalog_digest: digest_bytes(
-            &serde_json::to_vec(&signed_catalog.catalog).map_err(json_error)?,
-        ),
-        observation_digest,
-        inference_digest: digest_bytes(&inference_bytes),
-        contract,
-        executable_sha256: observation.caller.executable_sha256.clone(),
-        canonical_executable: normalized.canonical_executable,
-    })
+        .resolve_intent(observation, &signed_inference.inference, now_ms)
+        .map_err(|error| io::Error::new(ErrorKind::PermissionDenied, error))
 }
 
 struct NormalizedCommand {
@@ -364,12 +406,12 @@ fn json_error(error: serde_json::Error) -> io::Error {
 }
 
 fn intent_usage_error() -> io::Error {
-    invalid_input("usage: gensee boundary intent <observe|resolve> ...")
+    invalid_input("usage: gensee boundary intent <observe|attest|resolve> ...")
 }
 
 fn print_intent_usage() {
     println!(
-        "gensee boundary intent\n\nUSAGE:\n  gensee boundary intent observe --output <observation.json> [--trajectory <history.json>] -- <command> [args...]\n  gensee boundary intent resolve --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --inference <signed-inference.json> --output <resolution.json> -- <command> [args...]"
+        "gensee boundary intent\n\nUSAGE:\n  gensee boundary intent observe --output <observation.json> [--trajectory <history.json>] -- <command> [args...]\n  gensee boundary intent attest --observation <observation.json> --inference <unsigned.json> --analyzer-key <seed.hex> --output <signed.json>\n  gensee boundary intent resolve --catalog <signed.json> --trusted-key <public.hex> --observation <observation.json> --inference <signed-inference.json> --output <resolution.json> -- <command> [args...]"
     );
 }
 

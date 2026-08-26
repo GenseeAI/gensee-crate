@@ -1,9 +1,9 @@
 //! Generic admission contracts for operation-bound execution.
 //!
-//! Contracts describe authority and product shape without recognizing an
-//! application, package manager, browser, or attack signature. The runtime
-//! binds each admitted instance to an OS-observed execution subject and an
-//! effect boundary before the command starts.
+//! Contracts describe authority and product shape without recognizing a
+//! particular application, protocol, or attack signature. The runtime binds
+//! each admitted instance to an OS-observed execution subject and an effect
+//! boundary before the command starts.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -248,7 +248,10 @@ pub struct OperationProcessEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub timed_out: bool,
-    pub process_group_drained: bool,
+    /// True only after the complete OS-bound execution subject is empty. On
+    /// Linux this includes descendants that escaped the original process
+    /// group but remain in the operation cgroup.
+    pub execution_subject_drained: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
