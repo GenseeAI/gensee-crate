@@ -7,6 +7,14 @@ Gensee Crate is an open-source control layer for AI coding agents. Start with
 ## Guides
 
 - [Generic operation boundary](operation-boundary.md) — admit arbitrary commands before execution, bind an OS-observed execution subject, enforce an outbound-network envelope, and structurally gate staged products without claiming semantic safety.
+- [Approved contract catalogs](contract-catalog.md) — sign organization-owned, versioned operation contracts and exact caller/class selectors so an untrusted workload cannot choose a more permissive envelope.
+- [Generic capability providers](generic-capability-providers.md) — use typed scopes and one crash-safe lease lifecycle for credential, protocol, filesystem, and control-plane mediators.
+- [Boundary extension authoring](boundary-extension-authoring.md) — add organization contracts, external intent analyzers, isolated semantic verifiers, and operational capability providers through stable, bounded protocols.
+- [Distributed operation context](operation-context.md) — authenticate service hops, deadlines, generations, attenuated grant sets, and downstream effects back to the initiating operation.
+- [Semantic-verifier receipts](semantic-verifier.md) — bind a catalog-approved verifier and policy version to the exact structural product, contract, verdict, and validation-effect digest.
+- [Transactional promotion](transactional-promotion.md) — require unchanged structural evidence, an authenticated semantic verdict, terminal authority, compare-and-swap selection, and crash-safe rollback.
+- [Privileged generic boundary proof](generic-boundary-proof.md) — run one domain-neutral Linux conformance scenario and independently verify its signed evidence bundle.
+- [Generic end-to-end boundary demo](generic-end-to-end-demo.md) — start with operator-owned contract setup, then run one denied operation and one verified-and-promoted operation.
 - [Gensee Crate Personal](personal.md) — local review, recovery points, configuration audit, and optional independent macOS verification.
 - [Gensee Crate Team](team.md) — disposable workspace forks, scoped capabilities, host-owned credentials, and evidence-gated promotion.
 - [Architecture](architecture.md) — shared policy and evidence model, workspace crates, and security boundaries.
@@ -14,7 +22,7 @@ Gensee Crate is an open-source control layer for AI coding agents. Start with
 - [Linux host support](linux.md) — `/proc` process attribution, fanotify sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress controls, and Linux capability planning.
 - [Tclone runtime integration](tclone.md) — launch agents in cloneable Linux containers, fork live source containers, inspect diffs, keep workspaces, and discard forks.
 - [Authenticated telemetry replay](replay.md) — merge heterogeneous evidence with explicit clock semantics, verify signed replay bundles, and evaluate bounded causal rules.
-- [C0 network capability boundary](c0-network-boundary.md) — operation-scoped network envelopes, temporary in-place leases, a read-only HTTP mediator, revocation, and effect evidence.
+- [Operation network boundary](operation-network-boundary.md) — operation-scoped network envelopes, temporary in-place leases, a read-only HTTP mediator, revocation, and effect evidence.
 - [Operation supervisor](operation-supervisor.md) — durable operation identity, lifecycle, process lineage, cgroup ownership, active envelopes, leases, and boundary-effect coordination.
 - [Capability faults](capability-faults.md) — typed black-box boundary observations, subject binding, fail-closed backend routing, retry-after-lease semantics, and network counter evidence.
 - [`gensee watch` (sidecar)](watch.md) — observe filesystem effects and macOS system events without launching the agent.

@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 #[cfg(any(target_os = "linux", test))]
 use std::collections::VecDeque;
 use std::io::{BufReader, ErrorKind};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
@@ -110,6 +110,79 @@ struct HttpGatewayConfig {
     gateway_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     commit_token_id: Option<String>,
+    /// Optional inactive-by-default transaction policy for a narrowly scoped
+    /// HTTP effect. This policy is installed from the
+    /// root-owned operation config; lifecycle requests can select an operation
+    /// and TTL, but can never add destinations or raise a budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction: Option<HttpTransactionPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpTransactionPolicy {
+    effect: String,
+    scopes: Vec<HttpTransactionScope>,
+    max_ttl_seconds: u64,
+    max_requests: u64,
+    max_request_bytes: u64,
+    max_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpTransactionScope {
+    /// Canonical lowercase `http` or `https`.
+    scheme: String,
+    /// Canonical URL authority, including a non-default port when present.
+    authority: String,
+    /// Absolute path segment prefix. `/objects` matches `/objects` and
+    /// `/objects/...`, never `/objects-evil`.
+    path_prefix: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HttpTransactionStatus {
+    Prepared,
+    Active,
+    Revoked,
+    Ended,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpTransactionRecord {
+    transaction_id: String,
+    operation_id: String,
+    effect: String,
+    status: HttpTransactionStatus,
+    ttl_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activated_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<u64>,
+    requests: u64,
+    request_bytes: u64,
+    response_bytes: u64,
+    /// A durable single-hop claim on the remaining response budget. A daemon
+    /// crash intentionally leaves this populated so recovery cannot issue a
+    /// second upstream request without an explicit terminal transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_reservation: Option<HttpResponseReservation>,
+    #[serde(default)]
+    generation: u64,
+    updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpResponseReservation {
+    reservation_id: String,
+    transaction_generation: u64,
+    max_response_bytes: u64,
+    created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +230,12 @@ struct NetworkOperationRecord {
     http_mediator_lease_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     http_mediator_expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_transaction_policy: Option<HttpTransactionPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_transaction: Option<HttpTransactionRecord>,
+    #[serde(default)]
+    used_http_transaction_ids: BTreeSet<String>,
     started_at_ms: u64,
     updated_at_ms: u64,
 }
@@ -164,9 +243,39 @@ struct NetworkOperationRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum NetworkSupervisorRequest {
-    Event { event: NetworkBoundaryEvent },
-    Fault { fault: CapabilityFault },
-    RevokeHttpMediator { lease_id: String },
+    Event {
+        event: NetworkBoundaryEvent,
+    },
+    Fault {
+        fault: CapabilityFault,
+    },
+    RevokeHttpMediator {
+        lease_id: String,
+    },
+    BeginHttpTransaction {
+        transaction_id: String,
+        operation_id: String,
+        effect: String,
+        ttl_seconds: u64,
+    },
+    StartHttpTransaction {
+        transaction_id: String,
+        operation_id: String,
+        effect: String,
+        ttl_seconds: u64,
+    },
+    ActivateHttpTransaction {
+        transaction_id: String,
+        operation_id: String,
+    },
+    RevokeHttpTransaction {
+        transaction_id: String,
+        operation_id: String,
+    },
+    EndHttpTransaction {
+        transaction_id: String,
+        operation_id: String,
+    },
     Inspect,
 }
 
@@ -202,6 +311,8 @@ struct NetworkEffectRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lease_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     response_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_digest: Option<String>,
@@ -212,6 +323,8 @@ struct NetworkEffectRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     redirect_target: Option<String>,
     bytes_from_client: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes_from_upstream: Option<u64>,
     bytes_to_client: u64,
     completed_at_ms: u64,
 }
@@ -252,6 +365,21 @@ struct HttpMediatorAuditRecord {
     request_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<String>,
+    disposition: String,
+    reason_code: String,
+    observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HttpTransactionAuditRecord {
+    schema_version: u32,
+    operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<String>,
+    action: String,
     disposition: String,
     reason_code: String,
     observed_at_ms: u64,
@@ -264,6 +392,7 @@ struct NetworkSupervisor {
     counter_log_path: PathBuf,
     fault_log_path: PathBuf,
     mediator_log_path: PathBuf,
+    transaction_log_path: PathBuf,
     dry_run: bool,
     operation: Option<OperationSupervisor>,
     active_plan: Option<gensee_crate_linux::LinuxNftablesPlan>,
@@ -271,6 +400,9 @@ struct NetworkSupervisor {
     next_usage_sample_at_ms: u64,
     last_counter_error: Option<String>,
     http_mediator_lease_id: Option<String>,
+    http_transaction_policy: Option<HttpTransactionPolicy>,
+    active_http_transports: BTreeMap<u64, TcpStream>,
+    next_http_transport_id: u64,
     #[cfg(target_os = "linux")]
     attempt_monitor: Option<gensee_crate_linux::LinuxNetworkAttemptMonitor>,
     #[cfg(any(target_os = "linux", test))]
@@ -298,6 +430,19 @@ struct NetworkRuntimeCleanup {
     operation_id: String,
     source_run_id: String,
     dry_run: bool,
+}
+
+struct HttpTransportGuard {
+    supervisor: Arc<Mutex<NetworkSupervisor>>,
+    transport_id: u64,
+}
+
+impl Drop for HttpTransportGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.supervisor.lock() {
+            state.active_http_transports.remove(&self.transport_id);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -417,16 +562,21 @@ impl Drop for NetworkRuntimeCleanup {
     }
 }
 
-pub(crate) fn handle_c0_network(args: Vec<OsString>) -> io::Result<()> {
+pub(crate) fn handle_operation_network(args: Vec<OsString>) -> io::Result<()> {
     match args.first().and_then(|arg| arg.to_str()) {
         Some("serve") => serve_network_supervisor(&args[1..]),
         Some("event") => send_network_supervisor_event(&args[1..]),
         Some("fault") => send_capability_fault(&args[1..]),
         Some("revoke-http") => revoke_http_mediator(&args[1..]),
+        Some("transaction-begin") => begin_http_transaction(&args[1..]),
+        Some("transaction-activate") => activate_http_transaction(&args[1..]),
+        Some("transaction-revoke") => revoke_http_transaction(&args[1..]),
+        Some("transaction-end") => end_http_transaction(&args[1..]),
+        Some("transaction-execute") => run_effect_transaction(&args[1..]),
         Some("inspect") => inspect_network_supervisor(&args[1..]),
         _ => Err(io::Error::new(
             ErrorKind::InvalidInput,
-            "usage: gensee run network <serve --state-root ROOT --config FILE [--dry-run]|event --socket PATH --event FILE|fault --socket PATH --fault FILE|revoke-http --socket PATH --lease ID|inspect --socket PATH>",
+            "usage: gensee run network <serve --state-root ROOT --config FILE [--dry-run]|event --socket PATH --event FILE|fault --socket PATH --fault FILE|revoke-http --socket PATH --lease ID|transaction-begin --socket PATH --transaction ID --operation ID --effect EFFECT --ttl-seconds N|transaction-activate|transaction-revoke|transaction-end --socket PATH --transaction ID --operation ID|transaction-execute --config FILE --request FILE --transaction ID|inspect --socket PATH>",
         )),
     }
 }
@@ -454,7 +604,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     if !dry_run && std::env::consts::OS != "linux" {
         return Err(io::Error::new(
             ErrorKind::Unsupported,
-            "C0 network enforcement requires Linux; use --dry-run only for parser tests",
+            "operation network enforcement requires Linux; use --dry-run only for parser tests",
         ));
     }
 
@@ -476,6 +626,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
     let counter_log_path = root.join("counters.jsonl");
     let fault_log_path = root.join("faults.jsonl");
     let mediator_log_path = root.join("http-mediator.jsonl");
+    let transaction_log_path = root.join("http-transactions.jsonl");
     let previous = if record_path.exists() {
         let previous: NetworkOperationRecord =
             serde_json::from_str(&read_nofollow_to_string(&record_path)?).map_err(|error| {
@@ -491,6 +642,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
             || previous.source_address != config.source_address
             || previous.http_mediator_lease_id != config.proxy.lease_id
             || previous.http_mediator_expires_at_ms != config.proxy.expires_at_ms
+            || previous.http_transaction_policy != config.proxy.transaction
         {
             return Err(io::Error::new(
                 ErrorKind::PermissionDenied,
@@ -539,6 +691,13 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         }),
         http_mediator_lease_id: config.proxy.lease_id.clone(),
         http_mediator_expires_at_ms: config.proxy.expires_at_ms,
+        http_transaction_policy: config.proxy.transaction.clone(),
+        http_transaction: previous
+            .as_ref()
+            .and_then(|record| record.http_transaction.clone()),
+        used_http_transaction_ids: previous.as_ref().map_or_else(BTreeSet::new, |record| {
+            record.used_http_transaction_ids.clone()
+        }),
         started_at_ms,
         updated_at_ms: now_ms,
     };
@@ -632,6 +791,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         counter_log_path,
         fault_log_path,
         mediator_log_path,
+        transaction_log_path,
         dry_run,
         operation: Some(operation),
         active_plan,
@@ -639,6 +799,9 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         next_usage_sample_at_ms: now_ms.saturating_add(NETWORK_USAGE_POLL_INTERVAL_MS),
         last_counter_error: None,
         http_mediator_lease_id: config.proxy.lease_id.clone(),
+        http_transaction_policy: config.proxy.transaction.clone(),
+        active_http_transports: BTreeMap::new(),
+        next_http_transport_id: 0,
         #[cfg(target_os = "linux")]
         attempt_monitor,
         #[cfg(any(target_os = "linux", test))]
@@ -710,7 +873,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
         proxy_listener.set_nonblocking(true)?;
         let local_proxy = proxy_listener.local_addr()?;
         eprintln!(
-            "gensee: C0 network supervisor operation={} socket={} proxy={} dry_run={dry_run}",
+            "gensee: operation network supervisor operation={} socket={} proxy={} dry_run={dry_run}",
             config.operation_id,
             socket_path.display(),
             local_proxy
@@ -790,6 +953,7 @@ fn serve_network_supervisor(args: &[OsString]) -> io::Result<()> {
                 if state.has_expired_leases(now_ms) {
                     state.reconcile_expired_and_apply(&table_names)?;
                 }
+                state.expire_http_transaction_if_needed(now_ms)?;
                 #[cfg(target_os = "linux")]
                 state.sample_kernel_network_attempts(&table_names)?;
                 if now_ms >= state.next_usage_sample_at_ms {
@@ -829,7 +993,9 @@ fn validate_network_operation_config(config: &NetworkOperationConfig) -> io::Res
             .lease_id
             .as_deref()
             .is_some_and(|lease_id| !safe_network_token(lease_id))
-        || (mutating_http || config.proxy.credential.is_some()) && config.proxy.lease_id.is_none()
+        || (mutating_http || config.proxy.credential.is_some())
+            && config.proxy.lease_id.is_none()
+            && config.proxy.transaction.is_none()
         || mutating_http
             && (config.proxy.gateway_id.is_none() || config.proxy.commit_token_id.is_none())
         || config.proxy.gateway_id.is_some() != config.proxy.commit_token_id.is_some()
@@ -879,6 +1045,73 @@ fn validate_network_operation_config(config: &NetworkOperationConfig) -> io::Res
     }
     if let Some(credential) = config.proxy.credential.as_ref() {
         validate_http_credential_config(credential)?;
+    }
+    if let Some(transaction) = config.proxy.transaction.as_ref() {
+        validate_http_transaction_policy(transaction)?;
+        if config.proxy.lease_id.is_some()
+            || config.proxy.expires_at_ms.is_some()
+            || transaction.max_request_bytes > 1024 * 1024 * 1024 * 1024
+            || transaction.max_response_bytes > 1024 * 1024 * 1024 * 1024
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "transactional HTTP mediation is inactive by default and cannot use a static mediator lease",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_http_transaction_policy(policy: &HttpTransactionPolicy) -> io::Result<()> {
+    if !safe_network_token(&policy.effect)
+        || policy.scopes.is_empty()
+        || policy.max_ttl_seconds == 0
+        || policy.max_ttl_seconds > 24 * 60 * 60
+        || policy.max_requests == 0
+        || policy.max_requests > 1_000_000
+        || policy.max_request_bytes == 0
+        || policy.max_response_bytes == 0
+        || policy
+            .scopes
+            .iter()
+            .any(|scope| validate_http_transaction_scope(scope).is_err())
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "HTTP transaction requires a safe effect, canonical scopes, TTL, and bounded request/response budgets",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_http_transaction_scope(scope: &HttpTransactionScope) -> io::Result<()> {
+    if !matches!(scope.scheme.as_str(), "http" | "https")
+        || scope.authority.is_empty()
+        || !scope.path_prefix.starts_with('/')
+        || scope.path_prefix.contains(['?', '#', '\\', '%'])
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "HTTP transaction scope is not canonical",
+        ));
+    }
+    let candidate = Url::parse(&format!(
+        "{}://{}{}",
+        scope.scheme, scope.authority, scope.path_prefix
+    ))
+    .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid HTTP transaction scope"))?;
+    if candidate.scheme() != scope.scheme
+        || url_authority(&candidate)? != scope.authority
+        || candidate.path() != scope.path_prefix
+        || candidate.query().is_some()
+        || candidate.fragment().is_some()
+        || !candidate.username().is_empty()
+        || candidate.password().is_some()
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "HTTP transaction scope must use canonical scheme, authority, and path",
+        ));
     }
     Ok(())
 }
@@ -974,6 +1207,329 @@ fn valid_http_header_name(value: &str) -> bool {
 }
 
 impl NetworkSupervisor {
+    fn append_http_transaction_audit(
+        &mut self,
+        transaction_id: Option<&str>,
+        action: &str,
+        disposition: &str,
+        reason_code: &str,
+    ) -> io::Result<()> {
+        if append_bounded_json_line(
+            &self.transaction_log_path,
+            &HttpTransactionAuditRecord {
+                schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                operation_id: self.record.operation_id.clone(),
+                transaction_id: transaction_id.map(ToString::to_string),
+                action: action.to_string(),
+                disposition: disposition.to_string(),
+                reason_code: reason_code.to_string(),
+                observed_at_ms: unix_millis()?,
+            },
+            true,
+        )? {
+            self.record_evidence_rotation("http_transactions")?;
+        }
+        Ok(())
+    }
+
+    fn append_committed_http_transaction_audit(
+        &mut self,
+        transaction_id: &str,
+        action: &str,
+        disposition: &str,
+        reason_code: &str,
+    ) {
+        if self
+            .append_http_transaction_audit(Some(transaction_id), action, disposition, reason_code)
+            .is_err()
+        {
+            eprintln!(
+                "gensee: committed HTTP transaction state but its audit append failed operation={} transaction={transaction_id}",
+                self.record.operation_id
+            );
+            if let Some(operation) = self.operation.as_mut() {
+                let _ = operation.record_boundary_violation(
+                    "http_transaction_audit_incomplete",
+                    "a committed HTTP transaction transition could not be appended to its evidence log",
+                );
+            }
+        }
+    }
+
+    fn begin_http_transaction(
+        &mut self,
+        transaction_id: &str,
+        operation_id: &str,
+        effect: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        let Some(policy) = self.http_transaction_policy.as_ref() else {
+            return Err("http_transaction_policy_unavailable".to_string());
+        };
+        if !safe_network_token(transaction_id)
+            || operation_id != self.record.operation_id
+            || effect != policy.effect
+            || ttl_seconds == 0
+            || ttl_seconds > policy.max_ttl_seconds
+        {
+            return Err("http_transaction_request_outside_policy".to_string());
+        }
+        if self
+            .record
+            .used_http_transaction_ids
+            .contains(transaction_id)
+        {
+            return Err("http_transaction_id_replayed".to_string());
+        }
+        if self
+            .record
+            .http_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                matches!(
+                    transaction.status,
+                    HttpTransactionStatus::Prepared | HttpTransactionStatus::Active
+                )
+            })
+        {
+            return Err("http_transaction_already_in_progress".to_string());
+        }
+        let now_ms = unix_millis().map_err(|error| error.to_string())?;
+        let prior_record = self.record.clone();
+        self.record
+            .used_http_transaction_ids
+            .insert(transaction_id.to_string());
+        self.record.http_transaction = Some(HttpTransactionRecord {
+            transaction_id: transaction_id.to_string(),
+            operation_id: operation_id.to_string(),
+            effect: effect.to_string(),
+            status: HttpTransactionStatus::Prepared,
+            ttl_seconds,
+            activated_at_ms: None,
+            expires_at_ms: None,
+            requests: 0,
+            request_bytes: 0,
+            response_bytes: 0,
+            response_reservation: None,
+            generation: 0,
+            updated_at_ms: now_ms,
+        });
+        if let Some(transaction) = self.record.http_transaction.as_mut() {
+            transaction.expires_at_ms =
+                Some(now_ms.saturating_add(transaction.ttl_seconds.saturating_mul(1_000)));
+        }
+        self.record.updated_at_ms = now_ms;
+        if let Err(error) = self.persist() {
+            self.record = prior_record;
+            return Err(error.to_string());
+        }
+        self.append_committed_http_transaction_audit(
+            transaction_id,
+            "begin",
+            "allow",
+            "http_transaction_prepared",
+        );
+        Ok(())
+    }
+
+    fn activate_http_transaction(
+        &mut self,
+        transaction_id: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        let now_ms = unix_millis().map_err(|error| error.to_string())?;
+        self.expire_http_transaction_if_needed(now_ms)
+            .map_err(|error| error.to_string())?;
+        let prior_record = self.record.clone();
+        let Some(transaction) = self.record.http_transaction.as_mut() else {
+            return Err("http_transaction_not_prepared".to_string());
+        };
+        if transaction.transaction_id != transaction_id
+            || transaction.operation_id != operation_id
+            || operation_id != self.record.operation_id
+            || transaction.status != HttpTransactionStatus::Prepared
+        {
+            return Err("http_transaction_activation_mismatch".to_string());
+        }
+        transaction.status = HttpTransactionStatus::Active;
+        transaction.activated_at_ms = Some(now_ms);
+        transaction.generation = transaction.generation.saturating_add(1);
+        transaction.updated_at_ms = now_ms;
+        self.record.updated_at_ms = now_ms;
+        if let Err(error) = self.persist() {
+            self.record = prior_record;
+            return Err(error.to_string());
+        }
+        self.append_committed_http_transaction_audit(
+            transaction_id,
+            "activate",
+            "allow",
+            "http_transaction_active",
+        );
+        Ok(())
+    }
+
+    /// Install an active transaction with one durable state commit. Coordinators
+    /// use this transition so no command can observe an intermediate prepared
+    /// transaction and a failed activation cannot strand prepared authority.
+    fn start_http_transaction(
+        &mut self,
+        transaction_id: &str,
+        operation_id: &str,
+        effect: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        let Some(policy) = self.http_transaction_policy.as_ref() else {
+            return Err("http_transaction_policy_unavailable".to_string());
+        };
+        if !safe_network_token(transaction_id)
+            || operation_id != self.record.operation_id
+            || effect != policy.effect
+            || ttl_seconds == 0
+            || ttl_seconds > policy.max_ttl_seconds
+        {
+            return Err("http_transaction_request_outside_policy".to_string());
+        }
+        if self
+            .record
+            .used_http_transaction_ids
+            .contains(transaction_id)
+        {
+            return Err("http_transaction_id_replayed".to_string());
+        }
+        if self
+            .record
+            .http_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                matches!(
+                    transaction.status,
+                    HttpTransactionStatus::Prepared | HttpTransactionStatus::Active
+                )
+            })
+        {
+            return Err("http_transaction_already_in_progress".to_string());
+        }
+        let now_ms = unix_millis().map_err(|error| error.to_string())?;
+        let prior_record = self.record.clone();
+        self.record
+            .used_http_transaction_ids
+            .insert(transaction_id.to_string());
+        self.record.http_transaction = Some(HttpTransactionRecord {
+            transaction_id: transaction_id.to_string(),
+            operation_id: operation_id.to_string(),
+            effect: effect.to_string(),
+            status: HttpTransactionStatus::Active,
+            ttl_seconds,
+            activated_at_ms: Some(now_ms),
+            expires_at_ms: Some(now_ms.saturating_add(ttl_seconds.saturating_mul(1_000))),
+            requests: 0,
+            request_bytes: 0,
+            response_bytes: 0,
+            response_reservation: None,
+            generation: 1,
+            updated_at_ms: now_ms,
+        });
+        self.record.updated_at_ms = now_ms;
+        if let Err(error) = self.persist() {
+            self.record = prior_record;
+            return Err(error.to_string());
+        }
+        self.append_committed_http_transaction_audit(
+            transaction_id,
+            "start",
+            "allow",
+            "http_transaction_active",
+        );
+        Ok(())
+    }
+
+    fn terminal_http_transaction(
+        &mut self,
+        transaction_id: &str,
+        operation_id: &str,
+        status: HttpTransactionStatus,
+        action: &str,
+    ) -> Result<(), String> {
+        let now_ms = unix_millis().map_err(|error| error.to_string())?;
+        let Some(transaction) = self.record.http_transaction.as_mut() else {
+            return Err("http_transaction_not_found".to_string());
+        };
+        if transaction.transaction_id != transaction_id
+            || transaction.operation_id != operation_id
+            || operation_id != self.record.operation_id
+            || !matches!(
+                transaction.status,
+                HttpTransactionStatus::Prepared | HttpTransactionStatus::Active
+            )
+        {
+            return Err("http_transaction_terminal_transition_mismatch".to_string());
+        }
+        transaction.status = status;
+        transaction.updated_at_ms = now_ms;
+        self.record.updated_at_ms = now_ms;
+        self.cancel_active_http_transports();
+        self.persist().map_err(|error| error.to_string())?;
+        self.append_committed_http_transaction_audit(
+            transaction_id,
+            action,
+            "allow",
+            if status == HttpTransactionStatus::Revoked {
+                "http_transaction_revoked"
+            } else {
+                "http_transaction_ended"
+            },
+        );
+        Ok(())
+    }
+
+    fn expire_http_transaction_if_needed(&mut self, now_ms: u64) -> io::Result<bool> {
+        let expired_id = self
+            .record
+            .http_transaction
+            .as_mut()
+            .and_then(|transaction| {
+                (matches!(
+                    transaction.status,
+                    HttpTransactionStatus::Prepared | HttpTransactionStatus::Active
+                ) && transaction
+                    .expires_at_ms
+                    .is_some_and(|expires_at_ms| now_ms >= expires_at_ms))
+                .then(|| {
+                    transaction.status = HttpTransactionStatus::Expired;
+                    transaction.updated_at_ms = now_ms;
+                    transaction.transaction_id.clone()
+                })
+            });
+        let Some(transaction_id) = expired_id else {
+            return Ok(false);
+        };
+        self.record.updated_at_ms = now_ms;
+        self.cancel_active_http_transports();
+        self.persist()?;
+        self.append_committed_http_transaction_audit(
+            &transaction_id,
+            "expire",
+            "deny",
+            "http_transaction_expired",
+        );
+        Ok(true)
+    }
+
+    fn cancel_active_http_transports(&mut self) {
+        for (_, transport) in std::mem::take(&mut self.active_http_transports) {
+            let _ = transport.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn register_http_transport(&mut self, transport: &TcpStream) -> io::Result<u64> {
+        self.next_http_transport_id = self.next_http_transport_id.saturating_add(1);
+        let transport_id = self.next_http_transport_id;
+        self.active_http_transports
+            .insert(transport_id, transport.try_clone()?);
+        Ok(transport_id)
+    }
+
     fn decide(&mut self, event: &mut NetworkBoundaryEvent) -> io::Result<NetworkBoundaryDecision> {
         // Boundary clients report what happened, but the privileged supervisor
         // owns time. Lease duration must never derive from an attacker-supplied
@@ -1115,6 +1671,7 @@ impl NetworkSupervisor {
             fault_id: Some(fault.fault_id.clone()),
             event,
             lease_id: resolution.lease_id.clone(),
+            transaction_id: None,
             decision,
             response_status: None,
             request_digest: None,
@@ -1122,6 +1679,7 @@ impl NetworkSupervisor {
             credential_handle_id: None,
             redirect_target: None,
             bytes_from_client: 0,
+            bytes_from_upstream: None,
             bytes_to_client: 0,
             completed_at_ms: unix_millis()?,
         };
@@ -1566,6 +2124,11 @@ impl NetworkSupervisor {
                     &request.body,
                 ),
                 lease_id: self.http_mediator_lease_id.clone(),
+                transaction_id: self
+                    .record
+                    .http_transaction
+                    .as_ref()
+                    .map(|transaction| transaction.transaction_id.clone()),
                 disposition: disposition.to_string(),
                 reason_code: reason_code.to_string(),
                 observed_at_ms: unix_millis()?,
@@ -1676,6 +2239,7 @@ fn handle_supervisor_stream(
             let mut state = lock_supervisor(&supervisor)?;
             let response = if state.http_mediator_lease_id.as_deref() == Some(&lease_id) {
                 state.record.revoked_http_mediator_leases.insert(lease_id);
+                state.cancel_active_http_transports();
                 state.record.updated_at_ms = unix_millis()?;
                 state.persist()?;
                 NetworkSupervisorResponse {
@@ -1700,6 +2264,62 @@ fn handle_supervisor_stream(
             };
             response
         }
+        NetworkSupervisorRequest::BeginHttpTransaction {
+            transaction_id,
+            operation_id,
+            effect,
+            ttl_seconds,
+        } => {
+            let mut state = lock_supervisor(&supervisor)?;
+            let result =
+                state.begin_http_transaction(&transaction_id, &operation_id, &effect, ttl_seconds);
+            http_transaction_control_response(&mut state, &transaction_id, "begin", result)?
+        }
+        NetworkSupervisorRequest::StartHttpTransaction {
+            transaction_id,
+            operation_id,
+            effect,
+            ttl_seconds,
+        } => {
+            let mut state = lock_supervisor(&supervisor)?;
+            let result =
+                state.start_http_transaction(&transaction_id, &operation_id, &effect, ttl_seconds);
+            http_transaction_control_response(&mut state, &transaction_id, "start", result)?
+        }
+        NetworkSupervisorRequest::ActivateHttpTransaction {
+            transaction_id,
+            operation_id,
+        } => {
+            let mut state = lock_supervisor(&supervisor)?;
+            let result = state.activate_http_transaction(&transaction_id, &operation_id);
+            http_transaction_control_response(&mut state, &transaction_id, "activate", result)?
+        }
+        NetworkSupervisorRequest::RevokeHttpTransaction {
+            transaction_id,
+            operation_id,
+        } => {
+            let mut state = lock_supervisor(&supervisor)?;
+            let result = state.terminal_http_transaction(
+                &transaction_id,
+                &operation_id,
+                HttpTransactionStatus::Revoked,
+                "revoke",
+            );
+            http_transaction_control_response(&mut state, &transaction_id, "revoke", result)?
+        }
+        NetworkSupervisorRequest::EndHttpTransaction {
+            transaction_id,
+            operation_id,
+        } => {
+            let mut state = lock_supervisor(&supervisor)?;
+            let result = state.terminal_http_transaction(
+                &transaction_id,
+                &operation_id,
+                HttpTransactionStatus::Ended,
+                "end",
+            );
+            http_transaction_control_response(&mut state, &transaction_id, "end", result)?
+        }
         NetworkSupervisorRequest::Event { mut event } => {
             let mut state = lock_supervisor(&supervisor)?;
             let decision = state.decide(&mut event)?;
@@ -1713,6 +2333,7 @@ fn handle_supervisor_stream(
                             .lease
                             .as_ref()
                             .and_then(|lease| lease.lease_id.clone()),
+                        transaction_id: None,
                         decision: decision.clone(),
                         response_status: None,
                         request_digest: None,
@@ -1720,6 +2341,7 @@ fn handle_supervisor_stream(
                         credential_handle_id: None,
                         redirect_target: None,
                         bytes_from_client: 0,
+                        bytes_from_upstream: None,
                         bytes_to_client: 0,
                         completed_at_ms: unix_millis()?,
                     };
@@ -1748,6 +2370,40 @@ fn handle_supervisor_stream(
     stream.write_all(b"\n")
 }
 
+fn http_transaction_control_response(
+    state: &mut NetworkSupervisor,
+    transaction_id: &str,
+    action: &str,
+    result: Result<(), String>,
+) -> io::Result<NetworkSupervisorResponse> {
+    match result {
+        Ok(()) => Ok(NetworkSupervisorResponse {
+            ok: true,
+            decision: None,
+            resolution: None,
+            record: Some(state.record.clone()),
+            operation_recovery_health: None,
+            error: None,
+        }),
+        Err(reason_code) => {
+            state.append_http_transaction_audit(
+                Some(transaction_id),
+                action,
+                "deny",
+                &reason_code,
+            )?;
+            Ok(NetworkSupervisorResponse {
+                ok: false,
+                decision: None,
+                resolution: None,
+                record: Some(state.record.clone()),
+                operation_recovery_health: None,
+                error: Some(reason_code),
+            })
+        }
+    }
+}
+
 fn handle_http_proxy_connection(
     mut client: TcpStream,
     peer: SocketAddr,
@@ -1760,9 +2416,20 @@ fn handle_http_proxy_connection(
         .parse::<IpAddr>()
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid proxy client address"))?;
     if peer.ip() != allowed_client {
+        lock_supervisor(&supervisor)?.append_http_transaction_audit(
+            None,
+            "request",
+            "deny",
+            "http_transaction_wrong_client_identity",
+        )?;
         write_proxy_error(&mut client, 403, "client is outside the gateway audience")?;
         return Ok(());
     }
+    let transport_id = lock_supervisor(&supervisor)?.register_http_transport(&client)?;
+    let _transport_guard = HttpTransportGuard {
+        supervisor: Arc::clone(&supervisor),
+        transport_id,
+    };
     client.set_read_timeout(Some(Duration::from_secs(config.io_timeout_seconds)))?;
     client.set_write_timeout(Some(Duration::from_secs(config.io_timeout_seconds)))?;
     let request = match read_proxy_request(&mut client, config.max_request_bytes) {
@@ -1780,8 +2447,20 @@ fn handle_http_proxy_connection(
     let now_ms = unix_millis()?;
     {
         let mut state = lock_supervisor(&supervisor)?;
+        state.expire_http_transaction_if_needed(now_ms)?;
         if !http_mediator_is_active(&state, &config, now_ms) {
             state.append_http_mediator_audit(&request, "deny", "http_mediator_lease_inactive")?;
+            let transaction_id = state
+                .record
+                .http_transaction
+                .as_ref()
+                .map(|transaction| transaction.transaction_id.clone());
+            state.append_http_transaction_audit(
+                transaction_id.as_deref(),
+                "request",
+                "deny",
+                "http_transaction_inactive",
+            )?;
             write_proxy_error(
                 &mut client,
                 403,
@@ -1845,6 +2524,19 @@ fn http_mediator_is_active(
     config: &HttpGatewayConfig,
     now_ms: u64,
 ) -> bool {
+    if config.transaction.is_some() {
+        return supervisor
+            .record
+            .http_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                transaction.operation_id == supervisor.record.operation_id
+                    && transaction.status == HttpTransactionStatus::Active
+                    && transaction
+                        .expires_at_ms
+                        .is_some_and(|expires_at_ms| now_ms < expires_at_ms)
+            });
+    }
     match (config.lease_id.as_deref(), config.expires_at_ms) {
         (Some(lease_id), Some(expires_at_ms)) => {
             now_ms < expires_at_ms
@@ -1858,6 +2550,335 @@ fn http_mediator_is_active(
     }
 }
 
+fn http_transaction_scope_allows(policy: &HttpTransactionPolicy, url: &Url) -> bool {
+    let lower_path = url.path().to_ascii_lowercase();
+    if url.path().contains('\\')
+        || ["%25", "%2f", "%5c", "%2e"]
+            .iter()
+            .any(|encoded| lower_path.contains(encoded))
+    {
+        return false;
+    }
+    let Ok(authority) = url_authority(url) else {
+        return false;
+    };
+    policy.scopes.iter().any(|scope| {
+        scope.scheme == url.scheme()
+            && scope.authority == authority
+            && (scope.path_prefix == "/"
+                || url.path() == scope.path_prefix
+                || (url.path().starts_with(&scope.path_prefix)
+                    && (scope.path_prefix.ends_with('/')
+                        || url.path().as_bytes().get(scope.path_prefix.len()).copied()
+                            == Some(b'/'))))
+    })
+}
+
+#[derive(Debug, Clone)]
+struct HttpHopReservation {
+    transaction_id: String,
+    reservation_id: String,
+    transaction_generation: u64,
+    max_response_bytes: u64,
+    expires_at_ms: u64,
+}
+
+fn check_http_transaction_hop(
+    supervisor: &Arc<Mutex<NetworkSupervisor>>,
+    config: &HttpGatewayConfig,
+    url: &Url,
+) -> io::Result<()> {
+    let Some(policy) = config.transaction.as_ref() else {
+        return Ok(());
+    };
+    let mut state = lock_supervisor(supervisor)?;
+    let now_ms = unix_millis()?;
+    state.expire_http_transaction_if_needed(now_ms)?;
+    if !http_transaction_scope_allows(policy, url) {
+        let transaction_id = state
+            .record
+            .http_transaction
+            .as_ref()
+            .map(|transaction| transaction.transaction_id.clone());
+        state.append_http_transaction_audit(
+            transaction_id.as_deref(),
+            "request",
+            "deny",
+            "http_transaction_url_outside_scope",
+        )?;
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP transaction target is outside its immutable scope",
+        ));
+    }
+    if !http_mediator_is_active(&state, config, now_ms) {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP transaction is inactive",
+        ));
+    }
+    Ok(())
+}
+
+fn reserve_http_transaction_hop(
+    supervisor: &Arc<Mutex<NetworkSupervisor>>,
+    config: &HttpGatewayConfig,
+    url: &Url,
+    request_bytes: u64,
+) -> io::Result<Option<HttpHopReservation>> {
+    let Some(policy) = config.transaction.as_ref() else {
+        return Ok(None);
+    };
+    let mut state = lock_supervisor(supervisor)?;
+    let now_ms = unix_millis()?;
+    state.expire_http_transaction_if_needed(now_ms)?;
+    if !http_transaction_scope_allows(policy, url) {
+        let transaction_id = state
+            .record
+            .http_transaction
+            .as_ref()
+            .map(|transaction| transaction.transaction_id.clone());
+        state.append_http_transaction_audit(
+            transaction_id.as_deref(),
+            "request",
+            "deny",
+            "http_transaction_url_outside_scope",
+        )?;
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP transaction target is outside its immutable scope",
+        ));
+    }
+    if !http_mediator_is_active(&state, config, now_ms) {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP transaction is inactive",
+        ));
+    }
+    let transaction =
+        state.record.http_transaction.as_mut().ok_or_else(|| {
+            io::Error::new(ErrorKind::PermissionDenied, "HTTP transaction is absent")
+        })?;
+    let next_requests = transaction.requests.saturating_add(1);
+    let next_request_bytes = transaction.request_bytes.saturating_add(request_bytes);
+    let remaining_response_bytes = policy
+        .max_response_bytes
+        .saturating_sub(transaction.response_bytes);
+    if transaction.response_reservation.is_some() {
+        let transaction_id = transaction.transaction_id.clone();
+        state.append_http_transaction_audit(
+            Some(&transaction_id),
+            "request",
+            "deny",
+            "http_transaction_response_reservation_in_flight",
+        )?;
+        return Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "HTTP transaction already has an in-flight response reservation",
+        ));
+    }
+    if next_requests > policy.max_requests || next_request_bytes > policy.max_request_bytes {
+        let transaction_id = transaction.transaction_id.clone();
+        state.append_http_transaction_audit(
+            Some(&transaction_id),
+            "request",
+            "deny",
+            "http_transaction_request_budget_exhausted",
+        )?;
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP transaction request budget is exhausted",
+        ));
+    }
+    if remaining_response_bytes == 0 {
+        let transaction_id = transaction.transaction_id.clone();
+        state.append_http_transaction_audit(
+            Some(&transaction_id),
+            "request",
+            "deny",
+            "http_transaction_response_budget_exhausted",
+        )?;
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP transaction response budget is exhausted",
+        ));
+    }
+    transaction.requests = next_requests;
+    transaction.request_bytes = next_request_bytes;
+    transaction.updated_at_ms = now_ms;
+    let transaction_id = transaction.transaction_id.clone();
+    let reservation_id = format!("http_response_{}", Uuid::new_v4().simple());
+    let transaction_generation = transaction.generation;
+    let expires_at_ms = transaction.expires_at_ms.unwrap_or(now_ms);
+    transaction.response_reservation = Some(HttpResponseReservation {
+        reservation_id: reservation_id.clone(),
+        transaction_generation,
+        max_response_bytes: remaining_response_bytes,
+        created_at_ms: now_ms,
+    });
+    state.record.updated_at_ms = now_ms;
+    state.persist()?;
+    state.append_http_transaction_audit(
+        Some(&transaction_id),
+        "request",
+        "allow",
+        "http_transaction_hop_authorized",
+    )?;
+    Ok(Some(HttpHopReservation {
+        transaction_id,
+        reservation_id,
+        transaction_generation,
+        max_response_bytes: remaining_response_bytes,
+        expires_at_ms,
+    }))
+}
+
+fn commit_http_transaction_response(
+    supervisor: &Arc<Mutex<NetworkSupervisor>>,
+    config: &HttpGatewayConfig,
+    reservation: &HttpHopReservation,
+    response_bytes: u64,
+) -> io::Result<()> {
+    let Some(policy) = config.transaction.as_ref() else {
+        return Ok(());
+    };
+    let mut state = lock_supervisor(supervisor)?;
+    let now_ms = unix_millis()?;
+    state.expire_http_transaction_if_needed(now_ms)?;
+    if !http_mediator_is_active(&state, config, now_ms) {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP transaction ended before the response completed",
+        ));
+    }
+    let transaction = state
+        .record
+        .http_transaction
+        .as_mut()
+        .filter(|transaction| transaction.transaction_id == reservation.transaction_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::PermissionDenied,
+                "HTTP transaction identity changed during the request",
+            )
+        })?;
+    let reservation_matches = transaction
+        .response_reservation
+        .as_ref()
+        .is_some_and(|active| {
+            active.reservation_id == reservation.reservation_id
+                && active.transaction_generation == reservation.transaction_generation
+                && transaction.generation == reservation.transaction_generation
+        });
+    if !reservation_matches {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP response reservation is no longer active",
+        ));
+    }
+    let next_response_bytes = transaction.response_bytes.saturating_add(response_bytes);
+    if response_bytes > reservation.max_response_bytes
+        || next_response_bytes > policy.max_response_bytes
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP transaction response budget is exhausted",
+        ));
+    }
+    let prior_record = state.record.clone();
+    let transaction =
+        state.record.http_transaction.as_mut().ok_or_else(|| {
+            io::Error::new(ErrorKind::PermissionDenied, "HTTP transaction is absent")
+        })?;
+    transaction.response_bytes = next_response_bytes;
+    transaction.response_reservation = None;
+    transaction.updated_at_ms = now_ms;
+    state.record.updated_at_ms = now_ms;
+    if let Err(error) = state.persist() {
+        state.record = prior_record;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn release_http_transaction_reservation(
+    supervisor: &Arc<Mutex<NetworkSupervisor>>,
+    reservation: &HttpHopReservation,
+) -> io::Result<()> {
+    let mut state = lock_supervisor(supervisor)?;
+    let prior_record = state.record.clone();
+    let transaction = state
+        .record
+        .http_transaction
+        .as_mut()
+        .filter(|transaction| transaction.transaction_id == reservation.transaction_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::PermissionDenied,
+                "HTTP transaction identity changed during reservation release",
+            )
+        })?;
+    if !transaction
+        .response_reservation
+        .as_ref()
+        .is_some_and(|active| {
+            active.reservation_id == reservation.reservation_id
+                && active.transaction_generation == reservation.transaction_generation
+        })
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP response reservation is no longer owned by this request",
+        ));
+    }
+    transaction.response_reservation = None;
+    transaction.updated_at_ms = unix_millis()?;
+    state.record.updated_at_ms = transaction.updated_at_ms;
+    if let Err(error) = state.persist() {
+        state.record = prior_record;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn validate_http_transaction_reservation_before_upstream(
+    supervisor: &Arc<Mutex<NetworkSupervisor>>,
+    config: &HttpGatewayConfig,
+    reservation: &HttpHopReservation,
+) -> io::Result<()> {
+    let mut state = lock_supervisor(supervisor)?;
+    let now_ms = unix_millis()?;
+    state.expire_http_transaction_if_needed(now_ms)?;
+    if !http_mediator_is_active(&state, config, now_ms) {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP transaction was revoked before upstream connect",
+        ));
+    }
+    let valid = state
+        .record
+        .http_transaction
+        .as_ref()
+        .is_some_and(|transaction| {
+            transaction.transaction_id == reservation.transaction_id
+                && transaction.generation == reservation.transaction_generation
+                && transaction
+                    .response_reservation
+                    .as_ref()
+                    .is_some_and(|active| {
+                        active.reservation_id == reservation.reservation_id
+                            && active.transaction_generation == reservation.transaction_generation
+                    })
+        });
+    if !valid {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "HTTP response reservation was invalidated before upstream connect",
+        ));
+    }
+    Ok(())
+}
+
 fn execute_mediated_http(
     request: ParsedProxyRequest,
     supervisor: Arc<Mutex<NetworkSupervisor>>,
@@ -1869,7 +2890,8 @@ fn execute_mediated_http(
     loop {
         let now_ms = unix_millis()?;
         {
-            let state = lock_supervisor(&supervisor)?;
+            let mut state = lock_supervisor(&supervisor)?;
+            state.expire_http_transaction_if_needed(now_ms)?;
             if !http_mediator_is_active(&state, config, now_ms) {
                 return Err(io::Error::new(
                     ErrorKind::PermissionDenied,
@@ -1888,6 +2910,19 @@ fn execute_mediated_http(
         };
         let request_digest =
             mediated_http_request_digest(&method, &current_url, hop_headers, &request.body);
+        // Scope is checked independently before DNS. The single-in-flight
+        // response reservation is acquired later, immediately before the
+        // upstream effect, after all other preflight work succeeds.
+        check_http_transaction_hop(&supervisor, config, &current_url)?;
+        let transaction_id = if config.transaction.is_some() {
+            lock_supervisor(&supervisor)?
+                .record
+                .http_transaction
+                .as_ref()
+                .map(|transaction| transaction.transaction_id.clone())
+        } else {
+            None
+        };
         let (address, event, decision) = authorize_mediated_http_hop(
             &supervisor,
             &method,
@@ -1922,12 +2957,14 @@ fn execute_mediated_http(
                     event,
                     decision,
                     lease_id: config.lease_id.clone(),
+                    transaction_id: transaction_id.clone(),
                     response_status: Some(403),
                     request_digest: Some(request_digest),
                     response_digest: None,
                     credential_handle_id,
                     redirect_target: None,
                     bytes_from_client: request.body.len() as u64,
+                    bytes_from_upstream: None,
                     bytes_to_client: 0,
                     completed_at_ms: unix_millis()?,
                 })?;
@@ -1971,17 +3008,37 @@ fn execute_mediated_http(
                     event,
                     decision,
                     lease_id: config.lease_id.clone(),
+                    transaction_id: transaction_id.clone(),
                     response_status: Some(403),
                     request_digest: Some(request_digest),
                     response_digest: None,
                     credential_handle_id,
                     redirect_target: None,
                     bytes_from_client: request.body.len() as u64,
+                    bytes_from_upstream: None,
                     bytes_to_client: 0,
                     completed_at_ms: unix_millis()?,
                 })?;
                 return Err(io::Error::new(ErrorKind::PermissionDenied, error));
             }
+        }
+        let transaction_reservation = reserve_http_transaction_hop(
+            &supervisor,
+            config,
+            &current_url,
+            request.body.len() as u64,
+        )?;
+        let mut hop_config = config.clone();
+        if let Some(reservation) = transaction_reservation.as_ref() {
+            hop_config.max_response_bytes = hop_config
+                .max_response_bytes
+                .min(reservation.max_response_bytes);
+            hop_config.expires_at_ms = Some(reservation.expires_at_ms);
+            validate_http_transaction_reservation_before_upstream(
+                &supervisor,
+                config,
+                reservation,
+            )?;
         }
         let upstream = perform_pinned_http_request(
             &method,
@@ -1990,44 +3047,102 @@ fn execute_mediated_http(
             hop_headers,
             &request.body,
             credential.as_ref(),
-            config,
+            &hop_config,
         );
         let response = match upstream {
             Ok(response) => response,
             Err(error) => {
+                let reservation_release = transaction_reservation
+                    .as_ref()
+                    .map(|reservation| {
+                        release_http_transaction_reservation(&supervisor, reservation)
+                    })
+                    .transpose();
                 let effect = NetworkEffectRecord {
                     schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
                     fault_id: None,
                     event,
                     decision,
                     lease_id: config.lease_id.clone(),
+                    transaction_id: transaction_reservation
+                        .as_ref()
+                        .map(|reservation| reservation.transaction_id.clone()),
                     response_status: Some(502),
                     request_digest: Some(request_digest),
                     response_digest: None,
                     credential_handle_id,
                     redirect_target: None,
                     bytes_from_client: request.body.len() as u64,
+                    bytes_from_upstream: None,
                     bytes_to_client: 0,
                     completed_at_ms: unix_millis()?,
                 };
                 lock_supervisor(&supervisor)?.append_effect(&effect)?;
+                // Evidence for the attempted upstream effect must survive a
+                // reservation-release failure. A failed release deliberately
+                // leaves the durable reservation in place, so later requests
+                // remain fail closed.
+                if let Err(release_error) = reservation_release {
+                    return Err(io::Error::new(
+                        release_error.kind(),
+                        format!(
+                            "mediated upstream request failed; response reservation remained fail closed: {release_error}"
+                        ),
+                    ));
+                }
                 return Err(error);
             }
         };
-        let redirect = redirect_target(&current_url, &response)?;
         let response_digest = mediated_http_response_digest(&response);
+        if let Some(reservation) = transaction_reservation.as_ref() {
+            if let Err(error) = commit_http_transaction_response(
+                &supervisor,
+                config,
+                reservation,
+                response.body.len() as u64,
+            ) {
+                let denied_decision = NetworkBoundaryDecision {
+                    disposition: NetworkBoundaryDisposition::Deny,
+                    reason_code: "http_transaction_late_response_denied".to_string(),
+                    lease: None,
+                };
+                lock_supervisor(&supervisor)?.append_effect(&NetworkEffectRecord {
+                    schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
+                    fault_id: None,
+                    event,
+                    decision: denied_decision,
+                    lease_id: config.lease_id.clone(),
+                    transaction_id: Some(reservation.transaction_id.clone()),
+                    response_status: Some(response.status),
+                    request_digest: Some(request_digest),
+                    response_digest: Some(response_digest),
+                    credential_handle_id,
+                    redirect_target: None,
+                    bytes_from_client: request.body.len() as u64,
+                    bytes_from_upstream: Some(response.body.len() as u64),
+                    bytes_to_client: 0,
+                    completed_at_ms: unix_millis()?,
+                })?;
+                return Err(error);
+            }
+        }
+        let redirect = redirect_target(&current_url, &response)?;
         let effect = NetworkEffectRecord {
             schema_version: NETWORK_SUPERVISOR_SCHEMA_VERSION,
             fault_id: None,
             event,
             decision,
             lease_id: config.lease_id.clone(),
+            transaction_id: transaction_reservation
+                .as_ref()
+                .map(|reservation| reservation.transaction_id.clone()),
             response_status: Some(response.status),
             request_digest: Some(request_digest),
             response_digest: Some(response_digest),
             credential_handle_id,
             redirect_target: redirect.as_ref().map(redacted_url_for_evidence),
             bytes_from_client: request.body.len() as u64,
+            bytes_from_upstream: Some(response.body.len() as u64),
             bytes_to_client: response.body.len() as u64,
             completed_at_ms: unix_millis()?,
         };
@@ -2090,6 +3205,11 @@ fn authorize_mediated_http_addresses(
     let operation_id = state.record.operation_id.clone();
     let source_run_id = state.record.source_run_id.clone();
     let process_id = state.record.root_pid.unwrap_or(1);
+    let transaction_id = state
+        .record
+        .http_transaction
+        .as_ref()
+        .map(|transaction| transaction.transaction_id.clone());
     drop(state);
     let authority = url_authority(url)?;
     let mut chosen = None;
@@ -2132,12 +3252,14 @@ fn authorize_mediated_http_addresses(
                 event,
                 decision,
                 lease_id: lease_id.clone(),
+                transaction_id: transaction_id.clone(),
                 response_status: Some(403),
                 request_digest: Some(request_digest.to_string()),
                 response_digest: None,
                 credential_handle_id: None,
                 redirect_target: None,
                 bytes_from_client: 0,
+                bytes_from_upstream: None,
                 bytes_to_client: 0,
                 completed_at_ms: unix_millis()?,
             };
@@ -2704,6 +3826,77 @@ fn revoke_http_mediator(args: &[OsString]) -> io::Result<()> {
     )
 }
 
+fn begin_http_transaction(args: &[OsString]) -> io::Result<()> {
+    let transaction_id = required_safe_network_arg(args, "--transaction")?;
+    let operation_id = required_safe_network_arg(args, "--operation")?;
+    let effect = required_safe_network_arg(args, "--effect")?;
+    let ttl_seconds = network_arg_value(args, "--ttl-seconds")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidInput, "missing or invalid --ttl-seconds")
+        })?;
+    send_supervisor_request(
+        args,
+        &NetworkSupervisorRequest::BeginHttpTransaction {
+            transaction_id,
+            operation_id,
+            effect,
+            ttl_seconds,
+        },
+    )
+}
+
+fn activate_http_transaction(args: &[OsString]) -> io::Result<()> {
+    send_http_transaction_terminal_request(args, "activate")
+}
+
+fn revoke_http_transaction(args: &[OsString]) -> io::Result<()> {
+    send_http_transaction_terminal_request(args, "revoke")
+}
+
+fn end_http_transaction(args: &[OsString]) -> io::Result<()> {
+    send_http_transaction_terminal_request(args, "end")
+}
+
+fn send_http_transaction_terminal_request(args: &[OsString], action: &str) -> io::Result<()> {
+    let transaction_id = required_safe_network_arg(args, "--transaction")?;
+    let operation_id = required_safe_network_arg(args, "--operation")?;
+    let request = match action {
+        "activate" => NetworkSupervisorRequest::ActivateHttpTransaction {
+            transaction_id,
+            operation_id,
+        },
+        "revoke" => NetworkSupervisorRequest::RevokeHttpTransaction {
+            transaction_id,
+            operation_id,
+        },
+        "end" => NetworkSupervisorRequest::EndHttpTransaction {
+            transaction_id,
+            operation_id,
+        },
+        _ => {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "invalid transaction action",
+            ))
+        }
+    };
+    send_supervisor_request(args, &request)
+}
+
+fn required_safe_network_arg(args: &[OsString], name: &str) -> io::Result<String> {
+    network_arg_value(args, name)
+        .filter(|value| safe_network_token(value))
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("missing or invalid {name}"),
+            )
+        })
+}
+
 fn inspect_network_supervisor(args: &[OsString]) -> io::Result<()> {
     send_supervisor_request(args, &NetworkSupervisorRequest::Inspect)
 }
@@ -2716,15 +3909,26 @@ fn send_supervisor_request(
     let socket = network_arg_value(args, "--socket")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "missing --socket"))?;
+    let parsed = exchange_supervisor_request(&socket, request)?;
+    println!("{}", serde_json::to_string_pretty(&parsed)?);
+    supervisor_response_result(parsed)
+}
+
+#[cfg(unix)]
+fn exchange_supervisor_request(
+    socket: &Path,
+    request: &NetworkSupervisorRequest,
+) -> io::Result<NetworkSupervisorResponse> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
     let response = read_bounded_supervisor_line(BufReader::new(stream))?;
-    let parsed: NetworkSupervisorResponse = serde_json::from_str(&response)
-        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-    println!("{}", serde_json::to_string_pretty(&parsed)?);
+    serde_json::from_str(&response).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
+}
+
+fn supervisor_response_result(parsed: NetworkSupervisorResponse) -> io::Result<()> {
     if parsed.ok {
         Ok(())
     } else {
@@ -2734,6 +3938,47 @@ fn send_supervisor_request(
                 .unwrap_or_else(|| "network request failed".to_string()),
         ))
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn start_supervised_http_transaction(
+    socket: &Path,
+    transaction_id: &str,
+    operation_id: &str,
+    effect: &str,
+    ttl_seconds: u64,
+) -> io::Result<()> {
+    let response = exchange_supervisor_request(
+        socket,
+        &NetworkSupervisorRequest::StartHttpTransaction {
+            transaction_id: transaction_id.to_string(),
+            operation_id: operation_id.to_string(),
+            effect: effect.to_string(),
+            ttl_seconds,
+        },
+    )?;
+    supervisor_response_result(response)
+}
+
+#[cfg(unix)]
+pub(crate) fn finish_supervised_http_transaction(
+    socket: &Path,
+    transaction_id: &str,
+    operation_id: &str,
+    success: bool,
+) -> io::Result<()> {
+    let request = if success {
+        NetworkSupervisorRequest::EndHttpTransaction {
+            transaction_id: transaction_id.to_string(),
+            operation_id: operation_id.to_string(),
+        }
+    } else {
+        NetworkSupervisorRequest::RevokeHttpTransaction {
+            transaction_id: transaction_id.to_string(),
+            operation_id: operation_id.to_string(),
+        }
+    };
+    supervisor_response_result(exchange_supervisor_request(socket, &request)?)
 }
 
 #[cfg(not(unix))]
@@ -2787,7 +4032,11 @@ fn prepare_privileged_boundary_environment(
 }
 
 #[cfg(unix)]
-fn validate_root_owned_path(path: &Path, directory: bool, owner_only: bool) -> io::Result<()> {
+pub(crate) fn validate_root_owned_path(
+    path: &Path,
+    directory: bool,
+    owner_only: bool,
+) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -3303,7 +4552,7 @@ pub(crate) fn reap_terminal_network_boundary_for_operation(
     Ok(true)
 }
 
-fn safe_network_token(value: &str) -> bool {
+pub(crate) fn safe_network_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
@@ -3589,6 +4838,58 @@ fn denied_fault_resolution(
 mod tests {
     use super::*;
 
+    fn transaction_policy(authority: String, path_prefix: &str) -> HttpTransactionPolicy {
+        HttpTransactionPolicy {
+            effect: "external_http_read".to_string(),
+            scopes: vec![HttpTransactionScope {
+                scheme: "http".to_string(),
+                authority,
+                path_prefix: path_prefix.to_string(),
+            }],
+            max_ttl_seconds: 60,
+            max_requests: 8,
+            max_request_bytes: 1024,
+            max_response_bytes: 4096,
+        }
+    }
+
+    fn transactional_proxy(policy: HttpTransactionPolicy) -> HttpGatewayConfig {
+        HttpGatewayConfig {
+            listen: "127.0.0.1:0".to_string(),
+            client_address: "127.0.0.1".to_string(),
+            max_request_bytes: 1024,
+            max_response_bytes: 4096,
+            max_redirects: 2,
+            connect_timeout_seconds: 1,
+            io_timeout_seconds: 2,
+            lease_id: None,
+            expires_at_ms: None,
+            credential: None,
+            gateway_id: None,
+            commit_token_id: None,
+            transaction: Some(policy),
+        }
+    }
+
+    fn install_transaction_policy(
+        supervisor: &Arc<Mutex<NetworkSupervisor>>,
+        policy: &HttpTransactionPolicy,
+    ) {
+        let mut state = supervisor.lock().unwrap();
+        state.http_transaction_policy = Some(policy.clone());
+        state.record.http_transaction_policy = Some(policy.clone());
+    }
+
+    fn begin_and_activate(supervisor: &Arc<Mutex<NetworkSupervisor>>, transaction_id: &str) {
+        let mut state = supervisor.lock().unwrap();
+        state
+            .begin_http_transaction(transaction_id, "op_1", "external_http_read", 30)
+            .unwrap();
+        state
+            .activate_http_transaction(transaction_id, "op_1")
+            .unwrap();
+    }
+
     fn test_supervisor(
         root: &Path,
         policy: NetworkBoundaryPolicy,
@@ -3613,6 +4914,9 @@ mod tests {
                 revoked_http_mediator_leases: BTreeSet::new(),
                 http_mediator_lease_id: None,
                 http_mediator_expires_at_ms: None,
+                http_transaction_policy: None,
+                http_transaction: None,
+                used_http_transaction_ids: BTreeSet::new(),
                 started_at_ms: 1,
                 updated_at_ms: 1,
             },
@@ -3621,6 +4925,7 @@ mod tests {
             counter_log_path: root.join("counters.jsonl"),
             fault_log_path: root.join("faults.jsonl"),
             mediator_log_path: root.join("http-mediator.jsonl"),
+            transaction_log_path: root.join("http-transactions.jsonl"),
             dry_run: true,
             operation: None,
             active_plan: None,
@@ -3628,6 +4933,9 @@ mod tests {
             next_usage_sample_at_ms: u64::MAX,
             last_counter_error: None,
             http_mediator_lease_id: None,
+            http_transaction_policy: None,
+            active_http_transports: BTreeMap::new(),
+            next_http_transport_id: 0,
             #[cfg(target_os = "linux")]
             attempt_monitor: None,
             #[cfg(any(target_os = "linux", test))]
@@ -3652,6 +4960,342 @@ mod tests {
         assert!(try_acquire_connection(&in_flight, 1).is_none());
         drop(first);
         assert!(try_acquire_connection(&in_flight, 1).is_some());
+    }
+
+    #[test]
+    fn transaction_lifecycle_is_fail_closed_and_ids_cannot_be_replayed() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-lifecycle-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        let proxy = transactional_proxy(policy.clone());
+        install_transaction_policy(&supervisor, &policy);
+        let url = Url::parse("http://api.example.test/v1/data/a.bin").unwrap();
+
+        assert!(reserve_http_transaction_hop(&supervisor, &proxy, &url, 0).is_err());
+        {
+            let mut state = supervisor.lock().unwrap();
+            assert_eq!(
+                state
+                    .begin_http_transaction("tx_wrong", "op_wrong", "external_http_read", 10,)
+                    .unwrap_err(),
+                "http_transaction_request_outside_policy"
+            );
+            state
+                .begin_http_transaction("tx_1", "op_1", "external_http_read", 10)
+                .unwrap();
+        }
+        assert!(reserve_http_transaction_hop(&supervisor, &proxy, &url, 0).is_err());
+        supervisor
+            .lock()
+            .unwrap()
+            .activate_http_transaction("tx_1", "op_1")
+            .unwrap();
+        assert!(reserve_http_transaction_hop(&supervisor, &proxy, &url, 0)
+            .unwrap()
+            .is_some());
+        {
+            let mut state = supervisor.lock().unwrap();
+            state
+                .terminal_http_transaction("tx_1", "op_1", HttpTransactionStatus::Revoked, "revoke")
+                .unwrap();
+            assert_eq!(
+                state
+                    .begin_http_transaction("tx_1", "op_1", "external_http_read", 10,)
+                    .unwrap_err(),
+                "http_transaction_id_replayed"
+            );
+        }
+        assert!(reserve_http_transaction_hop(&supervisor, &proxy, &url, 0).is_err());
+    }
+
+    #[test]
+    fn transaction_start_persists_active_authority_in_one_transition() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-start-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        install_transaction_policy(&supervisor, &policy);
+
+        supervisor
+            .lock()
+            .unwrap()
+            .start_http_transaction("tx_coordinator", "op_1", "external_http_read", 30)
+            .unwrap();
+
+        let persisted: NetworkOperationRecord =
+            serde_json::from_str(&fs::read_to_string(root.join("record.json")).unwrap()).unwrap();
+        let transaction = persisted.http_transaction.unwrap();
+        assert_eq!(transaction.status, HttpTransactionStatus::Active);
+        assert_eq!(transaction.generation, 1);
+        assert!(transaction.activated_at_ms.is_some());
+        assert_eq!(
+            supervisor
+                .lock()
+                .unwrap()
+                .start_http_transaction("tx_coordinator", "op_1", "external_http_read", 30,)
+                .unwrap_err(),
+            "http_transaction_id_replayed"
+        );
+    }
+
+    #[test]
+    fn transaction_start_persistence_failure_exposes_no_authority() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-start-persist-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        install_transaction_policy(&supervisor, &policy);
+        let failing_record_path = root.join("record-path-is-a-directory");
+        fs::create_dir(&failing_record_path).unwrap();
+        supervisor.lock().unwrap().record_path = failing_record_path;
+
+        assert!(supervisor
+            .lock()
+            .unwrap()
+            .start_http_transaction("tx_no_authority", "op_1", "external_http_read", 30,)
+            .is_err());
+        let state = supervisor.lock().unwrap();
+        assert!(state.record.http_transaction.is_none());
+        assert!(!state
+            .record
+            .used_http_transaction_ids
+            .contains("tx_no_authority"));
+    }
+
+    #[test]
+    fn activation_persistence_failure_rolls_back_in_memory_authority() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-activation-persist-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        install_transaction_policy(&supervisor, &policy);
+        {
+            let mut state = supervisor.lock().unwrap();
+            state
+                .begin_http_transaction("tx_persist_failure", "op_1", "external_http_read", 30)
+                .unwrap();
+            let failing_record_path = root.join("record-path-is-a-directory");
+            fs::create_dir(&failing_record_path).unwrap();
+            state.record_path = failing_record_path;
+            assert!(state
+                .activate_http_transaction("tx_persist_failure", "op_1")
+                .is_err());
+            let transaction = state.record.http_transaction.as_ref().unwrap();
+            assert_eq!(transaction.status, HttpTransactionStatus::Prepared);
+            assert_eq!(transaction.generation, 0);
+            assert!(transaction.activated_at_ms.is_none());
+        }
+    }
+
+    #[test]
+    fn audit_failure_after_durable_activation_does_not_report_denial() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-activation-audit-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        install_transaction_policy(&supervisor, &policy);
+        {
+            let mut state = supervisor.lock().unwrap();
+            state
+                .begin_http_transaction("tx_audit_failure", "op_1", "external_http_read", 30)
+                .unwrap();
+            fs::remove_file(&state.transaction_log_path).unwrap();
+            fs::create_dir(&state.transaction_log_path).unwrap();
+            assert!(state
+                .activate_http_transaction("tx_audit_failure", "op_1")
+                .is_ok());
+            assert_eq!(
+                state.record.http_transaction.as_ref().unwrap().status,
+                HttpTransactionStatus::Active
+            );
+        }
+        let persisted: NetworkOperationRecord =
+            serde_json::from_str(&fs::read_to_string(root.join("record.json")).unwrap()).unwrap();
+        assert_eq!(
+            persisted.http_transaction.unwrap().status,
+            HttpTransactionStatus::Active
+        );
+    }
+
+    #[test]
+    fn response_reservation_is_single_in_flight_and_release_is_durable() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-reservation-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        let proxy = transactional_proxy(policy.clone());
+        install_transaction_policy(&supervisor, &policy);
+        begin_and_activate(&supervisor, "tx_reservation");
+        let url = Url::parse("http://api.example.test/v1/data/a").unwrap();
+
+        let first = reserve_http_transaction_hop(&supervisor, &proxy, &url, 0)
+            .unwrap()
+            .unwrap();
+        let persisted_reserved: NetworkOperationRecord =
+            serde_json::from_str(&fs::read_to_string(root.join("record.json")).unwrap()).unwrap();
+        assert_eq!(
+            persisted_reserved
+                .http_transaction
+                .unwrap()
+                .response_reservation
+                .unwrap()
+                .reservation_id,
+            first.reservation_id
+        );
+        let concurrent = reserve_http_transaction_hop(&supervisor, &proxy, &url, 0).unwrap_err();
+        assert_eq!(concurrent.kind(), ErrorKind::WouldBlock);
+        release_http_transaction_reservation(&supervisor, &first).unwrap();
+        let second = reserve_http_transaction_hop(&supervisor, &proxy, &url, 0)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.reservation_id, second.reservation_id);
+        release_http_transaction_reservation(&supervisor, &second).unwrap();
+        let persisted: NetworkOperationRecord =
+            serde_json::from_str(&fs::read_to_string(root.join("record.json")).unwrap()).unwrap();
+        assert!(persisted
+            .http_transaction
+            .unwrap()
+            .response_reservation
+            .is_none());
+    }
+
+    #[test]
+    fn revoke_invalidates_reserved_get_before_upstream_connect() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-final-check-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        let proxy = transactional_proxy(policy.clone());
+        install_transaction_policy(&supervisor, &policy);
+        begin_and_activate(&supervisor, "tx_final_check");
+        let url = Url::parse("http://api.example.test/v1/data/a").unwrap();
+        let reservation = reserve_http_transaction_hop(&supervisor, &proxy, &url, 0)
+            .unwrap()
+            .unwrap();
+        supervisor
+            .lock()
+            .unwrap()
+            .terminal_http_transaction(
+                "tx_final_check",
+                "op_1",
+                HttpTransactionStatus::Revoked,
+                "revoke",
+            )
+            .unwrap();
+        let denied = validate_http_transaction_reservation_before_upstream(
+            &supervisor,
+            &proxy,
+            &reservation,
+        )
+        .unwrap_err();
+        assert_eq!(denied.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn prepared_deadline_expires_and_double_encoded_paths_are_denied() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-prepared-expiry-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        let proxy = transactional_proxy(policy.clone());
+        install_transaction_policy(&supervisor, &policy);
+        {
+            let mut state = supervisor.lock().unwrap();
+            state
+                .begin_http_transaction("tx_prepared_expiry", "op_1", "external_http_read", 30)
+                .unwrap();
+            state
+                .record
+                .http_transaction
+                .as_mut()
+                .unwrap()
+                .expires_at_ms = Some(1);
+            state
+                .expire_http_transaction_if_needed(unix_millis().unwrap())
+                .unwrap();
+            assert_eq!(
+                state.record.http_transaction.as_ref().unwrap().status,
+                HttpTransactionStatus::Expired
+            );
+        }
+
+        begin_and_activate(&supervisor, "tx_encoded_path");
+        let double_encoded =
+            Url::parse("http://api.example.test/v1/data/%252e%252e/escape").unwrap();
+        assert!(check_http_transaction_hop(&supervisor, &proxy, &double_encoded).is_err());
+    }
+
+    #[test]
+    fn active_http_scope_denies_uci_like_destination_before_dns() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-uci-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/simple");
+        let proxy = transactional_proxy(policy.clone());
+        install_transaction_policy(&supervisor, &policy);
+        begin_and_activate(&supervisor, "tx_effect");
+
+        let legitimate = Url::parse("http://api.example.test/simple/demo").unwrap();
+        assert!(
+            reserve_http_transaction_hop(&supervisor, &proxy, &legitimate, 0)
+                .unwrap()
+                .is_some()
+        );
+        let uci = Url::parse("http://uci-benchmark.example.test/private/dataset").unwrap();
+        let denied = reserve_http_transaction_hop(&supervisor, &proxy, &uci, 0).unwrap_err();
+        assert_eq!(denied.kind(), ErrorKind::PermissionDenied);
+        assert!(denied.to_string().contains("immutable scope"));
+        let audit = fs::read_to_string(root.join("http-transactions.jsonl")).unwrap();
+        assert!(audit.contains("http_transaction_url_outside_scope"));
+    }
+
+    #[test]
+    fn transaction_expiry_and_budget_are_enforced_from_host_state() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-expiry-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let mut policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        policy.max_requests = 1;
+        let proxy = transactional_proxy(policy.clone());
+        install_transaction_policy(&supervisor, &policy);
+        begin_and_activate(&supervisor, "tx_expiry");
+        let url = Url::parse("http://api.example.test/v1/data/a").unwrap();
+        assert!(reserve_http_transaction_hop(&supervisor, &proxy, &url, 1).is_ok());
+        assert!(reserve_http_transaction_hop(&supervisor, &proxy, &url, 1).is_err());
+        {
+            let mut state = supervisor.lock().unwrap();
+            let transaction = state.record.http_transaction.as_mut().unwrap();
+            transaction.expires_at_ms = Some(1);
+            state
+                .expire_http_transaction_if_needed(unix_millis().unwrap())
+                .unwrap();
+            assert_eq!(
+                state.record.http_transaction.as_ref().unwrap().status,
+                HttpTransactionStatus::Expired
+            );
+        }
+        assert!(reserve_http_transaction_hop(&supervisor, &proxy, &url, 0).is_err());
     }
 
     #[test]
@@ -3988,11 +5632,11 @@ mod tests {
             handle_id: "credential_1".to_string(),
             header_name: "Authorization".to_string(),
             value_file: "/not/read/by-this-test".to_string(),
-            allowed_url_prefixes: vec!["https://artifacts.example:8443/repository".to_string()],
+            allowed_url_prefixes: vec!["https://api.example:8443/v1/data".to_string()],
         };
         for allowed in [
-            "https://artifacts.example:8443/repository",
-            "https://artifacts.example:8443/repository/item",
+            "https://api.example:8443/v1/data",
+            "https://api.example:8443/v1/data/item",
         ] {
             assert!(credential_applies_to_url(
                 &credential,
@@ -4000,10 +5644,10 @@ mod tests {
             ));
         }
         for outside in [
-            "https://artifacts.example/repository/item",
-            "http://artifacts.example:8443/repository/item",
-            "https://artifacts.example:8443/repository-evil/item",
-            "https://artifacts.example.evil:8443/repository/item",
+            "https://api.example/v1/data/item",
+            "http://api.example:8443/v1/data/item",
+            "https://api.example:8443/v1/data-evil/item",
+            "https://api.example.evil:8443/v1/data/item",
         ] {
             assert!(
                 !credential_applies_to_url(&credential, &Url::parse(outside).unwrap()),
@@ -4025,7 +5669,7 @@ mod tests {
         let result = authorize_mediated_http_addresses(
             &supervisor,
             "GET",
-            &Url::parse("https://artifacts.example/object").unwrap(),
+            &Url::parse("https://api.example/object").unwrap(),
             "sha256:test-request",
             None,
             vec![
@@ -4160,6 +5804,7 @@ mod tests {
             assert!(parse_proxy_request_bytes(request.as_bytes()).is_err());
         }
         for request in [
+            "CONNECT example.test:443 HTTP/1.1\r\n\r\n",
             "GET http://example.test/a HTTP/1.evil\r\n\r\n",
             "GET http://example.test/a HTTP/1.1\r\nBad Header: value\r\n\r\n",
             "GET http://example.test/a HTTP/1.1\r\nHost : example.test\r\n\r\n",
@@ -4189,19 +5834,19 @@ mod tests {
             handle_id: "credential_1".to_string(),
             header_name: "X-Test-Token".to_string(),
             value_file: "/unused-in-this-test".to_string(),
-            allowed_url_prefixes: vec!["https://service.example/objects".to_string()],
+            allowed_url_prefixes: vec!["https://api.example/v1/data".to_string()],
         };
         assert!(credential_applies_to_url(
             &credential,
-            &Url::parse("https://service.example/objects/a.bin?token=1").unwrap()
+            &Url::parse("https://api.example/v1/data/a.tgz?token=1").unwrap()
         ));
         assert!(!credential_applies_to_url(
             &credential,
-            &Url::parse("https://service.example/objects-evil/a.bin").unwrap()
+            &Url::parse("https://api.example/v1/data-evil/a.tgz").unwrap()
         ));
         assert!(!credential_applies_to_url(
             &credential,
-            &Url::parse("https://evil.example/packages/a.tgz").unwrap()
+            &Url::parse("https://evil.example/v1/data/a.tgz").unwrap()
         ));
     }
 
@@ -4228,6 +5873,7 @@ mod tests {
                 credential: None,
                 gateway_id: None,
                 commit_token_id: None,
+                transaction: None,
             },
         };
         assert!(validate_network_operation_config(&config).is_err());
@@ -4618,6 +6264,7 @@ mod tests {
             credential: None,
             gateway_id: None,
             commit_token_id: None,
+            transaction: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -4700,10 +6347,11 @@ mod tests {
                 handle_id: "credential_handle_1".to_string(),
                 header_name: "Authorization".to_string(),
                 value_file: credential_path.display().to_string(),
-                allowed_url_prefixes: vec![format!("http://{origin_address}/repo")],
+                allowed_url_prefixes: vec![format!("http://{origin_address}/objects")],
             }),
             gateway_id: None,
             commit_token_id: None,
+            transaction: None,
         };
         let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
         let gateway_address = gateway.local_addr().unwrap();
@@ -4711,7 +6359,7 @@ mod tests {
             let mut stream = TcpStream::connect(gateway_address).unwrap();
             write!(
                 stream,
-                "GET http://{origin_address}/repo/artifact?presigned=do-not-log HTTP/1.1\r\nAuthorization: attacker\r\nCookie: attacker=true\r\n\r\n"
+                "GET http://{origin_address}/objects/item?presigned=do-not-log HTTP/1.1\r\nAuthorization: attacker\r\nCookie: attacker=true\r\n\r\n"
             )
             .unwrap();
             let mut response = String::new();
@@ -4809,6 +6457,7 @@ mod tests {
                 credential: None,
                 gateway_id: None,
                 commit_token_id: None,
+                transaction: None,
             },
         )
         .unwrap();
@@ -4853,6 +6502,7 @@ mod tests {
             credential: None,
             gateway_id: None,
             commit_token_id: None,
+            transaction: None,
         };
         let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
         let gateway_address = gateway.local_addr().unwrap();
@@ -4931,6 +6581,7 @@ mod tests {
             credential: None,
             gateway_id: None,
             commit_token_id: None,
+            transaction: None,
         };
 
         let first_proxy = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4967,5 +6618,195 @@ mod tests {
         assert!(effects.contains("\"response_status\":302"));
         assert!(effects.contains("\"reason_code\":\"restricted_destination\""));
         assert!(effects.contains("\"response_status\":403"));
+    }
+
+    #[test]
+    fn transactional_redirect_cannot_escape_immutable_path_scope() {
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        origin.set_nonblocking(false).unwrap();
+        let origin_probe = origin.try_clone().unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_worker = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{origin_address}/uci/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-redirect-test-{}",
+            Uuid::new_v4()
+        ));
+        let policy = NetworkBoundaryPolicy {
+            http_gateway_available: true,
+            ..NetworkBoundaryPolicy::default()
+        };
+        let supervisor = test_supervisor(&root, policy);
+        supervisor.lock().unwrap().record.envelope.grants.push(
+            gensee_crate_rules::network_boundary::NetworkEndpointGrant {
+                destination: origin_address.ip().to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![origin_address.port()],
+                expires_at_ms: None,
+                lease_id: None,
+            },
+        );
+        let transaction_policy = transaction_policy(origin_address.to_string(), "/v1/data");
+        install_transaction_policy(&supervisor, &transaction_policy);
+        begin_and_activate(&supervisor, "tx_redirect");
+        let proxy = transactional_proxy(transaction_policy);
+        let result = execute_mediated_http(
+            ParsedProxyRequest {
+                method: "GET".to_string(),
+                url: Url::parse(&format!("http://{origin_address}/v1/data/demo.bin")).unwrap(),
+                headers: Vec::new(),
+                declared_body_bytes: 0,
+                body: Vec::new(),
+            },
+            supervisor,
+            &proxy,
+        );
+        origin_worker.join().unwrap();
+        assert!(matches!(result, Err(ref error) if error.kind() == ErrorKind::PermissionDenied));
+        origin_probe.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            origin_probe.accept(),
+            Err(error) if error.kind() == ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn transaction_proxy_rejects_wrong_client_identity_and_records_it() {
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-client-test-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = test_supervisor(&root, NetworkBoundaryPolicy::default());
+        let policy = transaction_policy("api.example.test".to_string(), "/v1/data");
+        install_transaction_policy(&supervisor, &policy);
+        begin_and_activate(&supervisor, "tx_identity");
+        let mut proxy = transactional_proxy(policy);
+        proxy.client_address = "192.0.2.20".to_string();
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_address = gateway.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(gateway_address).unwrap();
+            stream
+                .write_all(b"GET http://api.example.test/v1/data/a HTTP/1.1\r\n\r\n")
+                .unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response
+        });
+        let (stream, peer) = gateway.accept().unwrap();
+        handle_http_proxy_connection(
+            stream,
+            peer,
+            supervisor,
+            Arc::new(Mutex::new(Vec::new())),
+            proxy,
+        )
+        .unwrap();
+        let _response = client.join().unwrap();
+        let audit = fs::read_to_string(root.join("http-transactions.jsonl")).unwrap();
+        assert!(audit.contains("http_transaction_wrong_client_identity"));
+    }
+
+    #[test]
+    fn revocation_actively_shuts_down_in_flight_client_transport() {
+        use std::sync::mpsc;
+
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let origin_worker = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            accepted_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nartifact",
+                )
+                .unwrap();
+        });
+
+        let root = env::temp_dir().join(format!(
+            "gensee-network-transaction-revoke-test-{}",
+            Uuid::new_v4()
+        ));
+        let policy = NetworkBoundaryPolicy {
+            http_gateway_available: true,
+            ..NetworkBoundaryPolicy::default()
+        };
+        let supervisor = test_supervisor(&root, policy);
+        supervisor.lock().unwrap().record.envelope.grants.push(
+            gensee_crate_rules::network_boundary::NetworkEndpointGrant {
+                destination: origin_address.ip().to_string(),
+                protocol: NetworkProtocol::Tcp,
+                ports: vec![origin_address.port()],
+                expires_at_ms: None,
+                lease_id: None,
+            },
+        );
+        let transaction_policy = transaction_policy(origin_address.to_string(), "/v1/data");
+        install_transaction_policy(&supervisor, &transaction_policy);
+        begin_and_activate(&supervisor, "tx_revoke");
+        let proxy = transactional_proxy(transaction_policy);
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_address = gateway.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(gateway_address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(750)))
+                .unwrap();
+            write!(
+                stream,
+                "GET http://{origin_address}/v1/data/a HTTP/1.1\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = Vec::new();
+            let read = stream.read_to_end(&mut response);
+            (read, response)
+        });
+        let (stream, peer) = gateway.accept().unwrap();
+        let handler_supervisor = Arc::clone(&supervisor);
+        let handler = thread::spawn(move || {
+            handle_http_proxy_connection(
+                stream,
+                peer,
+                handler_supervisor,
+                Arc::new(Mutex::new(Vec::new())),
+                proxy,
+            )
+        });
+        accepted_rx.recv().unwrap();
+        supervisor
+            .lock()
+            .unwrap()
+            .terminal_http_transaction(
+                "tx_revoke",
+                "op_1",
+                HttpTransactionStatus::Revoked,
+                "revoke",
+            )
+            .unwrap();
+        let (read, response) = client.join().unwrap();
+        assert!(read.is_ok(), "revocation should close, not merely time out");
+        assert!(response.is_empty());
+        release_tx.send(()).unwrap();
+        origin_worker.join().unwrap();
+        assert!(handler.join().unwrap().is_err());
+        let effects = fs::read_to_string(root.join("effects.jsonl")).unwrap();
+        assert!(effects.contains("http_transaction_late_response_denied"));
+        assert!(effects.contains("\"transaction_id\":\"tx_revoke\""));
+        assert!(effects.contains("\"bytes_from_upstream\":8"));
+        assert!(effects.contains("\"bytes_to_client\":0"));
     }
 }

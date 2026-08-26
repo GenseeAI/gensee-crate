@@ -1,12 +1,18 @@
 use gensee_crate_core::{AgentEvent, EventKind};
 
+pub mod boundary_proof;
 pub mod capability;
 pub mod capability_broker;
 pub mod capability_fault;
 pub mod capability_policy;
+pub mod contract_catalog;
 pub mod network_boundary;
+pub mod operation_context;
 pub mod operation_contract;
 pub mod policy;
+pub mod provider_runtime;
+pub mod semantic_verifier;
+pub mod transactional_promotion;
 
 #[derive(Debug, Clone)]
 pub struct RuleMatch {

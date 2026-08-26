@@ -164,6 +164,10 @@ pub struct CapabilityScope {
     pub databases: Vec<DatabaseScope>,
     #[serde(default)]
     pub output_promotions: Vec<OutputPromotionScope>,
+    /// Exact typed broker scopes approved before a fresh cell is created.
+    /// Broker issuance may select one of these entries but may not widen it.
+    #[serde(default)]
+    pub broker_capabilities: Vec<crate::capability_broker::BrokerCapabilityScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

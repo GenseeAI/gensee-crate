@@ -1,9 +1,9 @@
 //! Generic admission contracts for operation-bound execution.
 //!
-//! Contracts describe authority and product shape without recognizing an
-//! application, package manager, browser, or attack signature. The runtime
-//! binds each admitted instance to an OS-observed execution subject and an
-//! effect boundary before the command starts.
+//! Contracts describe authority and product shape without recognizing a
+//! particular application, protocol, or attack signature. The runtime binds
+//! each admitted instance to an OS-observed execution subject and an effect
+//! boundary before the command starts.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -119,6 +119,18 @@ pub struct ProductContract {
     pub reject_special_files: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_verifier_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<TransactionalPromotionContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionalPromotionContract {
+    /// Root-controlled absolute directory that stores immutable promoted
+    /// objects and the active relative pointer.
+    pub destination_root: String,
+    /// Single normal component used as the active relative symlink.
+    pub active_pointer: String,
 }
 
 fn default_max_product_bytes() -> u64 {
@@ -162,6 +174,7 @@ pub struct OperationRunManifest {
     pub contract_id: String,
     pub contract_digest: String,
     pub command_digest: String,
+    pub admission: OperationAdmissionEvidence,
     pub operation_record: String,
     pub original_workspace: String,
     pub staged_workspace: String,
@@ -172,6 +185,31 @@ pub struct OperationRunManifest {
     pub promotion: OperationPromotionEvidence,
     pub started_at_ms: u64,
     pub finished_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_signature: Option<OperationManifestSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationManifestSignature {
+    pub algorithm: String,
+    pub signature_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationAdmissionEvidence {
+    pub catalog_id: String,
+    pub catalog_version: u64,
+    pub catalog_digest: String,
+    pub observation_digest: String,
+    pub inference_digest: String,
+    pub analyzer_id: String,
+    pub selected_operation_class: String,
+    pub confidence_bps: u16,
+    pub resolution_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambiguity_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,7 +248,10 @@ pub struct OperationProcessEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub timed_out: bool,
-    pub process_group_drained: bool,
+    /// True only after the complete OS-bound execution subject is empty. On
+    /// Linux this includes descendants that escaped the original process
+    /// group but remain in the operation cgroup.
+    pub execution_subject_drained: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +405,23 @@ fn audit_product(product: &ProductContract, errors: &mut Vec<String>, warnings: 
                 .to_string(),
         );
     }
+    if let Some(promotion) = &product.promotion {
+        let root = Path::new(&promotion.destination_root);
+        if !root.is_absolute()
+            || promotion.destination_root.contains("//")
+            || root
+                .components()
+                .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        {
+            errors.push("promotion.destination_root must be an absolute normalized path".into());
+        }
+        if !bounded_token(&promotion.active_pointer) || promotion.active_pointer.contains('.') {
+            errors.push("promotion.active_pointer must be one safe component".into());
+        }
+        if product.semantic_verifier_profile.is_none() {
+            errors.push("transactional promotion requires a semantic verifier profile".into());
+        }
+    }
 }
 
 fn bounded_token(value: &str) -> bool {
@@ -435,6 +493,7 @@ mod tests {
                 reject_symlinks: true,
                 reject_special_files: true,
                 semantic_verifier_profile: None,
+                promotion: None,
             }),
         }
     }
@@ -489,6 +548,29 @@ mod tests {
         assert!(!candidate.audit_for_platform("linux").valid);
         candidate.execution.require_os_execution_binding = true;
         candidate.product.as_mut().unwrap().reject_symlinks = false;
+        assert!(!candidate.audit_for_platform("linux").valid);
+    }
+
+    #[test]
+    fn promotion_destination_is_signed_and_normalized() {
+        let mut candidate = contract();
+        {
+            let product = candidate.product.as_mut().unwrap();
+            product.semantic_verifier_profile = Some("content_policy".into());
+            product.promotion = Some(TransactionalPromotionContract {
+                destination_root: "/srv/gensee/promoted".into(),
+                active_pointer: "current".into(),
+            });
+        }
+        assert!(candidate.audit_for_platform("linux").valid);
+        candidate
+            .product
+            .as_mut()
+            .unwrap()
+            .promotion
+            .as_mut()
+            .unwrap()
+            .destination_root = "/srv/../escape".into();
         assert!(!candidate.audit_for_platform("linux").valid);
     }
 }

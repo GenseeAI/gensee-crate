@@ -53,6 +53,19 @@ struct PathBeneathAttr {
 
 #[cfg(target_os = "linux")]
 pub fn apply_landlock_write_sandbox(write_paths: &[String]) -> io::Result<()> {
+    apply_landlock_sandbox(write_paths, true)
+}
+
+/// Gives a verifier read/execute access to the host filesystem while denying
+/// every pathname-based mutation. Output must travel over an already-open
+/// pipe or another non-filesystem channel.
+#[cfg(target_os = "linux")]
+pub fn apply_landlock_read_only_sandbox() -> io::Result<()> {
+    apply_landlock_sandbox(&[], false)
+}
+
+#[cfg(target_os = "linux")]
+fn apply_landlock_sandbox(write_paths: &[String], include_runtime_paths: bool) -> io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     const CREATE_RULESET_VERSION: u32 = 1;
@@ -102,7 +115,9 @@ pub fn apply_landlock_write_sandbox(write_paths: &[String]) -> io::Result<()> {
 
     add_path_rule(&ruleset_fd, Path::new("/"), READ_EXECUTE_ACCESS)?;
     let mut paths = write_paths.to_vec();
-    paths.extend(RUNTIME_WRITE_PATHS.iter().map(|path| (*path).to_string()));
+    if include_runtime_paths {
+        paths.extend(RUNTIME_WRITE_PATHS.iter().map(|path| (*path).to_string()));
+    }
     paths.sort();
     paths.dedup();
     for path in paths {
@@ -175,6 +190,14 @@ pub fn apply_landlock_write_sandbox(write_paths: &[String]) -> io::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn apply_landlock_write_sandbox(_write_paths: &[String]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Landlock is only available on Linux",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_landlock_read_only_sandbox() -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Landlock is only available on Linux",

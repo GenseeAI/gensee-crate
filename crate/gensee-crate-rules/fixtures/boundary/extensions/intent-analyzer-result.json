@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "analyzer_id": "organization_intent_v1",
+  "model_identity": "model_release_2026_08",
+  "candidates": [
+    {
+      "operation_class": "read_only_analysis",
+      "confidence_bps": 9300,
+      "rationale_code": "trajectory_model",
+      "evidence_ids": []
+    }
+  ]
+}

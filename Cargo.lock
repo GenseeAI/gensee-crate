@@ -337,6 +337,7 @@ name = "gensee-crate-cli"
 version = "0.3.1"
 dependencies = [
  "chrono",
+ "ed25519-dalek",
  "gensee-crate-attribution",
  "gensee-crate-config-audit",
  "gensee-crate-core",
@@ -345,6 +346,7 @@ dependencies = [
  "gensee-crate-replay",
  "gensee-crate-rules",
  "gensee-crate-store",
+ "hex",
  "hmac",
  "libc",
  "serde",
@@ -432,6 +434,7 @@ dependencies = [
  "gensee-crate-core",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

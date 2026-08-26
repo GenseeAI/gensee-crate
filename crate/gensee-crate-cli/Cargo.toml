@@ -27,6 +27,8 @@ gensee-crate-macos = { path = "../gensee-crate-macos" }
 gensee-crate-replay = { path = "../gensee-crate-replay" }
 gensee-crate-rules = { path = "../gensee-crate-rules" }
 gensee-crate-store = { path = "../gensee-crate-store" }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+hex = "0.4"
 hmac = "0.12"
 serde = { workspace = true }
 serde_json = { workspace = true }

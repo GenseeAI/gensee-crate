@@ -1,8 +1,7 @@
 # Generic operation boundary
 
 `gensee boundary` is an application-neutral admission and execution path. It
-does not recognize package managers, browsers, mail clients, or attack
-signatures.
+does not recognize a specific application, protocol, or attack signature.
 
 The v1 slice covers one effect class: outbound network authority. A contract is
 admitted before the command starts. On Linux, Gensee installs a cgroup-v2
@@ -39,11 +38,18 @@ gensee boundary audit \
   --json
 
 sudo gensee boundary run \
-  --contract integrations/boundary/offline-structured-result.json \
+  --catalog /etc/gensee/catalog.signed.json \
+  --observation /run/gensee/observation.json \
+  --inference /run/gensee/inference.signed.json \
   --workspace /path/to/workspace \
   --manifest /tmp/gensee-effect-manifest.json \
   -- sh -c 'mkdir -p out && printf "{\\"ok\\":true}\\n" > out/result.json'
 ```
+
+The enforcing runtime does not accept a caller-selected catalog key. Operators
+provision the root-owned, owner-only trust anchor at
+`/etc/gensee/catalog-root-public-key.hex`; only administrative catalog
+inspection commands accept an explicit `--trusted-key`.
 
 Linux cgroup/nftables enforcement requires root. macOS supports only
 `network.mode: deny_all` in v1; exact endpoint envelopes fail admission rather
@@ -57,6 +63,22 @@ to an OS execution subject: PID plus process start identity on supported hosts,
 and cgroup membership on Linux. It also generates the staged output path,
 deadlines, command digest, and effect manifest. The producer cannot choose a
 trusted destination.
+
+The enforcing `run` command does not accept a caller-selected contract.
+Before execution, Gensee re-derives the effective OS user, canonical executable
+hash, and command digest, then verifies that they match a preflight observation.
+An organization-approved analyzer may use this observation plus bounded
+references to earlier effect manifests to produce ranked, probabilistic
+operation-class candidates. Its signed result is accepted only if its analyzer
+and model identities, class scope, confidence threshold, observation digest,
+and expiry match the signed catalog. The winning class is then mapped through
+one exact caller selector to one approved contract.
+
+This makes intent discovery fallible but prevents it from becoming an
+authorization oracle: the analyzer cannot name a contract or add authority.
+Ties, low confidence, novel classes, runtime mismatches, and expired evidence
+deny execution unless the catalog explicitly names a safe default for that
+caller.
 
 `allow_exact` accepts resolved IP addresses and explicit protocol/port tuples.
 Hostnames do not appear in the OS-enforced network envelope: DNS and credentialed HTTP

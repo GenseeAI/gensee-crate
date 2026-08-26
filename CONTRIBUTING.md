@@ -52,6 +52,43 @@ For parser, policy, redaction, storage, dashboard rendering, or release-flow
 changes, describe the threat model in the pull request. Call out any known
 false positives, false negatives, compatibility breaks, or migration behavior.
 
+## Boundary Extensions
+
+Intent analyzers, semantic verifiers, and capability providers are independent
+extension roles. Organization catalogs and contracts are signed policy data,
+not executable plugins. Before implementing an extension, read
+[`docs/boundary-extension-authoring.md`](docs/boundary-extension-authoring.md).
+
+Contributions for an existing extension role must:
+
+- use the public, versioned protocol types in `gensee-crate-rules` and reject
+  unknown JSON fields;
+- keep domain behavior in the extension while leaving operation identity,
+  signatures, lease lifecycle, deadlines, isolation, revocation, evidence, and
+  promotion in the generic core;
+- avoid customer, vendor, experiment, credential, endpoint, and deployment
+  assumptions in core schemas or policy;
+- expose immutable identity, policy/model version, executable/configuration
+  digests, bounded input/output, and explicit failure or indeterminate states;
+- include positive utility coverage plus adversarial tests for replay,
+  substitution, scope expansion, malformed output, timeout, crash recovery,
+  descendant escape, and revocation where applicable;
+- document exactly what the extension proves and which domain or deployment
+  assumptions remain operator responsibilities.
+
+An intent analyzer may nominate only catalog-approved operation classes. A
+semantic verifier may judge only the exact digest-bound product in its request.
+A capability provider may perform only the exact operation attenuated to its
+active lease. None may select a contract, widen authority, choose a promotion
+destination, or accept a caller-selected trust key.
+
+Implementing another provider for an existing resource kind should not require
+core changes. Adding a new capability or structural product kind is a core
+protocol change and must include its typed scope, attenuation rules, evidence
+shape, threat model, and privileged conformance coverage. Example language-
+neutral protocol files live under `integrations/boundary/extensions/`; they are
+fixtures, not production policy.
+
 ## License
 
 By contributing, you agree that your contribution is licensed under the Apache

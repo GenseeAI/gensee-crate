@@ -28,6 +28,8 @@ pub enum LinuxSeccompSyscallGroup {
     KernelModule,
     Mount,
     Namespace,
+    Network,
+    ProcessCreation,
 }
 
 impl Default for LinuxSeccompProfile {
@@ -226,7 +228,7 @@ mod platform {
     }
 
     fn build_filter(audit_arch: u32, syscalls: &[i64]) -> Vec<libc::sock_filter> {
-        let mut filter = Vec::with_capacity((syscalls.len() * 2) + 5);
+        let mut filter = Vec::with_capacity((syscalls.len() * 2) + 7);
         filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET));
         filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, audit_arch, 1, 0));
         filter.push(stmt(
@@ -234,6 +236,17 @@ mod platform {
             SECCOMP_RET_ERRNO | libc::EPERM as u32,
         ));
         filter.push(stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET));
+        #[cfg(target_arch = "x86_64")]
+        {
+            // x32 uses the native audit architecture with a syscall-number
+            // marker. Deny it before exact-number matching so a verifier
+            // cannot select the alternate ABI to bypass the deny set.
+            filter.push(jump(BPF_JMP | BPF_JSET | BPF_K, X32_SYSCALL_BIT, 0, 1));
+            filter.push(stmt(
+                BPF_RET | BPF_K,
+                SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ));
+        }
         for syscall in syscalls {
             filter.push(jump(BPF_JMP | BPF_JEQ | BPF_K, *syscall as u32, 0, 1));
             filter.push(stmt(
@@ -354,6 +367,22 @@ mod platform {
             "setns" => Some(libc::SYS_setns),
             "umount2" => Some(libc::SYS_umount2),
             "unshare" => Some(libc::SYS_unshare),
+            "socket" => Some(libc::SYS_socket),
+            "socketpair" => Some(libc::SYS_socketpair),
+            "connect" => Some(libc::SYS_connect),
+            "bind" => Some(libc::SYS_bind),
+            "listen" => Some(libc::SYS_listen),
+            "accept" => Some(libc::SYS_accept),
+            "accept4" => Some(libc::SYS_accept4),
+            "sendto" => Some(libc::SYS_sendto),
+            "sendmsg" => Some(libc::SYS_sendmsg),
+            "recvfrom" => Some(libc::SYS_recvfrom),
+            "recvmsg" => Some(libc::SYS_recvmsg),
+            "clone" => Some(libc::SYS_clone),
+            "clone3" => Some(libc::SYS_clone3),
+            "fork" => Some(libc::SYS_fork),
+            "vfork" => Some(libc::SYS_vfork),
+            "io_uring_setup" => Some(libc::SYS_io_uring_setup),
             _ => None,
         }
     }
@@ -367,8 +396,12 @@ mod platform {
     const BPF_ABS: u16 = 0x20;
     const BPF_JMP: u16 = 0x05;
     const BPF_JEQ: u16 = 0x10;
+    #[cfg(target_arch = "x86_64")]
+    const BPF_JSET: u16 = 0x40;
     const BPF_K: u16 = 0x00;
     const BPF_RET: u16 = 0x06;
+    #[cfg(target_arch = "x86_64")]
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
     #[cfg(test)]
     mod tests {
