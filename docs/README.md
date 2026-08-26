@@ -8,6 +8,7 @@ Gensee Crate is an open-source control layer for AI coding agents. Start with
 
 - [Generic operation boundary](operation-boundary.md) — admit arbitrary commands before execution, bind an OS-observed execution subject, enforce an outbound-network envelope, and structurally gate staged products without claiming semantic safety.
 - [Approved contract catalogs](contract-catalog.md) — sign organization-owned, versioned operation contracts and exact caller/class selectors so an untrusted workload cannot choose a more permissive envelope.
+- [Generic capability providers](generic-capability-providers.md) — use typed scopes and one crash-safe lease lifecycle for credential, protocol, filesystem, and control-plane mediators.
 - [Gensee Crate Personal](personal.md) — local review, recovery points, configuration audit, and optional independent macOS verification.
 - [Gensee Crate Team](team.md) — disposable workspace forks, scoped capabilities, host-owned credentials, and evidence-gated promotion.
 - [Architecture](architecture.md) — shared policy and evidence model, workspace crates, and security boundaries.

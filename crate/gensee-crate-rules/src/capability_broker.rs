@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::{Component, Path};
 
 pub const BROKER_PROTOCOL_VERSION: u32 = 1;
 
@@ -19,6 +20,195 @@ pub enum BrokerResourceKind {
     NetworkLease,
     DatabaseRole,
     ExternalActionCommitToken,
+    CredentialUse,
+    HttpApiCall,
+    BrowserSession,
+    DatabaseTransaction,
+    MessageDelivery,
+    CiJobInvocation,
+    SecretRead,
+    FilesystemMutation,
+    CloudControlAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrokerCapabilityScope {
+    CredentialUse {
+        handle: String,
+        audience: String,
+        actions: Vec<String>,
+    },
+    HttpApiCall {
+        origin: String,
+        methods: Vec<String>,
+        path_prefixes: Vec<String>,
+        max_request_bytes: u64,
+        max_response_bytes: u64,
+    },
+    BrowserSession {
+        origin: String,
+        session_profile: String,
+        actions: Vec<String>,
+    },
+    DatabaseTransaction {
+        service: String,
+        database: String,
+        actions: Vec<String>,
+        read_only: bool,
+    },
+    MessageDelivery {
+        channel: String,
+        destinations: Vec<String>,
+        actions: Vec<String>,
+    },
+    CiJobInvocation {
+        runner: String,
+        workflow: String,
+        source_ref: String,
+        inputs_digest: String,
+    },
+    SecretRead {
+        handle: String,
+        purpose: String,
+    },
+    FilesystemMutation {
+        root: String,
+        operations: Vec<String>,
+        path_prefixes: Vec<String>,
+    },
+    CloudControlAction {
+        provider: String,
+        resource: String,
+        actions: Vec<String>,
+    },
+}
+
+impl BrokerCapabilityScope {
+    pub fn resource_kind(&self) -> BrokerResourceKind {
+        match self {
+            Self::CredentialUse { .. } => BrokerResourceKind::CredentialUse,
+            Self::HttpApiCall { .. } => BrokerResourceKind::HttpApiCall,
+            Self::BrowserSession { .. } => BrokerResourceKind::BrowserSession,
+            Self::DatabaseTransaction { .. } => BrokerResourceKind::DatabaseTransaction,
+            Self::MessageDelivery { .. } => BrokerResourceKind::MessageDelivery,
+            Self::CiJobInvocation { .. } => BrokerResourceKind::CiJobInvocation,
+            Self::SecretRead { .. } => BrokerResourceKind::SecretRead,
+            Self::FilesystemMutation { .. } => BrokerResourceKind::FilesystemMutation,
+            Self::CloudControlAction { .. } => BrokerResourceKind::CloudControlAction,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::CredentialUse {
+                handle,
+                audience,
+                actions,
+            } => {
+                exact_token(handle, "credential handle")?;
+                exact_target(audience, "credential audience")?;
+                exact_actions(actions, "credential actions")
+            }
+            Self::HttpApiCall {
+                origin,
+                methods,
+                path_prefixes,
+                max_request_bytes,
+                max_response_bytes,
+            } => {
+                exact_origin(origin, "HTTP origin")?;
+                if methods.is_empty()
+                    || methods.len() > 16
+                    || methods.iter().any(|method| {
+                        method.is_empty()
+                            || method.len() > 16
+                            || !method.bytes().all(|byte| byte.is_ascii_uppercase())
+                    })
+                {
+                    return Err("HTTP methods must be bounded explicit uppercase values".into());
+                }
+                exact_paths(path_prefixes, "HTTP path prefixes")?;
+                if *max_request_bytes == 0
+                    || *max_response_bytes == 0
+                    || *max_request_bytes > 1024 * 1024 * 1024
+                    || *max_response_bytes > 1024 * 1024 * 1024
+                {
+                    return Err("HTTP byte budgets are invalid".into());
+                }
+                Ok(())
+            }
+            Self::BrowserSession {
+                origin,
+                session_profile,
+                actions,
+            } => {
+                exact_origin(origin, "browser origin")?;
+                exact_token(session_profile, "browser session profile")?;
+                exact_actions(actions, "browser actions")
+            }
+            Self::DatabaseTransaction {
+                service,
+                database,
+                actions,
+                ..
+            } => {
+                exact_token(service, "database service")?;
+                exact_token(database, "database name")?;
+                exact_actions(actions, "database actions")
+            }
+            Self::MessageDelivery {
+                channel,
+                destinations,
+                actions,
+            } => {
+                exact_token(channel, "message channel")?;
+                exact_targets(destinations, "message destinations")?;
+                exact_actions(actions, "message actions")
+            }
+            Self::CiJobInvocation {
+                runner,
+                workflow,
+                source_ref,
+                inputs_digest,
+            } => {
+                exact_token(runner, "CI runner")?;
+                exact_target(workflow, "CI workflow")?;
+                exact_target(source_ref, "CI source ref")?;
+                sha256(inputs_digest, "CI inputs digest")
+            }
+            Self::SecretRead { handle, purpose } => {
+                exact_token(handle, "secret handle")?;
+                exact_token(purpose, "secret purpose")
+            }
+            Self::FilesystemMutation {
+                root,
+                operations,
+                path_prefixes,
+            } => {
+                let path = Path::new(root);
+                if !path.is_absolute()
+                    || root.contains("//")
+                    || path
+                        .components()
+                        .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+                {
+                    return Err("filesystem root must be an absolute normalized path".into());
+                }
+                exact_actions(operations, "filesystem operations")?;
+                exact_paths(path_prefixes, "filesystem path prefixes")
+            }
+            Self::CloudControlAction {
+                provider,
+                resource,
+                actions,
+            } => {
+                exact_token(provider, "cloud provider")?;
+                exact_target(resource, "cloud resource")?;
+                exact_actions(actions, "cloud actions")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +224,8 @@ pub struct BrokerLeaseRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell_id: Option<String>,
     pub resource_kind: BrokerResourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_scope: Option<BrokerCapabilityScope>,
     pub adapter_id: String,
     pub audience: String,
     pub scopes: Vec<String>,
@@ -81,6 +273,9 @@ pub enum BrokerGatewayEffectKind {
     DatabaseRequest,
     BrowserAction,
     CloudAction,
+    MessageDelivery,
+    CiJobInvocation,
+    FilesystemMutation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +324,8 @@ pub struct BrokerLease {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell_id: Option<String>,
     pub resource_kind: BrokerResourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_scope: Option<BrokerCapabilityScope>,
     pub adapter_id: String,
     pub audience: String,
     pub scopes: Vec<String>,
@@ -213,6 +410,104 @@ pub struct BrokerAdapterResponse {
     pub effect_telemetry_complete: bool,
 }
 
+fn exact_actions(values: &[String], label: &str) -> Result<(), String> {
+    if values.is_empty() || values.len() > 128 {
+        return Err(format!("{label} must be a nonempty bounded list"));
+    }
+    for value in values {
+        exact_token(value, label)?;
+    }
+    if values
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != values.len()
+    {
+        return Err(format!("{label} contains duplicates"));
+    }
+    Ok(())
+}
+
+fn exact_paths(values: &[String], label: &str) -> Result<(), String> {
+    exact_targets(values, label)?;
+    if values.iter().any(|value| !value.starts_with('/')) {
+        return Err(format!("{label} must begin with /"));
+    }
+    Ok(())
+}
+
+fn exact_targets(values: &[String], label: &str) -> Result<(), String> {
+    if values.is_empty() || values.len() > 128 {
+        return Err(format!("{label} must be a nonempty bounded list"));
+    }
+    for value in values {
+        exact_target(value, label)?;
+    }
+    if values
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != values.len()
+    {
+        return Err(format!("{label} contains duplicates"));
+    }
+    Ok(())
+}
+
+fn exact_target(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 2048
+        || value.contains('*')
+        || value.contains('\0')
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!("{label} must be exact, bounded, and non-wildcard"));
+    }
+    Ok(())
+}
+
+fn exact_origin(value: &str, label: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(value).map_err(|_| format!("{label} is not a valid URL"))?;
+    let scheme_allowed = parsed.scheme() == "https"
+        || (parsed.scheme() == "http" && matches!(parsed.host_str(), Some("127.0.0.1" | "::1")));
+    if !scheme_allowed
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return Err(format!(
+            "{label} must be an exact HTTPS or loopback HTTP origin"
+        ));
+    }
+    Ok(())
+}
+
+fn exact_token(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 256
+        || value == "."
+        || value == ".."
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(format!("{label} must be a bounded ASCII token"));
+    }
+    Ok(())
+}
+
+fn sha256(value: &str, label: &str) -> Result<(), String> {
+    if !value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(format!("{label} must be a SHA-256 digest"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +521,7 @@ mod tests {
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_1".to_string()),
             resource_kind: BrokerResourceKind::ExternalServiceAuthority,
+            typed_scope: None,
             adapter_id: "repo-broker".to_string(),
             audience: "repo.example.test".to_string(),
             scopes: vec!["service:one:read".to_string()],
@@ -320,5 +616,44 @@ mod tests {
             serde_json::to_string(&effect).unwrap(),
             "\"repository_request\""
         );
+    }
+
+    #[test]
+    fn typed_provider_scopes_are_exact_and_non_wildcard() {
+        let valid = BrokerCapabilityScope::HttpApiCall {
+            origin: "https://api.example.test".into(),
+            methods: vec!["GET".into(), "POST".into()],
+            path_prefixes: vec!["/v1/records".into()],
+            max_request_bytes: 4096,
+            max_response_bytes: 1024 * 1024,
+        };
+        assert_eq!(valid.resource_kind(), BrokerResourceKind::HttpApiCall);
+        assert!(valid.validate().is_ok());
+
+        for invalid in [
+            BrokerCapabilityScope::HttpApiCall {
+                origin: "https://api.example.test/path".into(),
+                methods: vec!["GET".into()],
+                path_prefixes: vec!["/v1".into()],
+                max_request_bytes: 1,
+                max_response_bytes: 1,
+            },
+            BrokerCapabilityScope::HttpApiCall {
+                origin: "https://api.example.test".into(),
+                methods: vec!["GET".into()],
+                path_prefixes: vec!["/*".into()],
+                max_request_bytes: 1,
+                max_response_bytes: 1,
+            },
+            BrokerCapabilityScope::HttpApiCall {
+                origin: "http://198.51.100.8".into(),
+                methods: vec!["GET".into()],
+                path_prefixes: vec!["/v1".into()],
+                max_request_bytes: 1,
+                max_response_bytes: 1,
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 }

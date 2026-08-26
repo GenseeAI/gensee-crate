@@ -5,8 +5,8 @@ use gensee_crate_rules::capability::{
     ProcessEffect, PromotionOutput, PromotionReceipt, TelemetryCoverage,
     CAPABILITY_REQUEST_SCHEMA_VERSION, EFFECT_MANIFEST_SCHEMA_VERSION,
 };
-use gensee_crate_rules::capability_broker::BrokerResourceKind;
 use gensee_crate_rules::capability_broker::{BrokerDelivery, BrokerGatewayEffectKind, BrokerLease};
+use gensee_crate_rules::capability_broker::{BrokerLeaseRequest, BrokerResourceKind};
 use gensee_crate_rules::capability_policy::{
     ApprovalRequirement, CapabilityDecision, CapabilityExecutor, CapabilityPolicyDecision,
     CapabilityPolicyEngine, MediationBoundary, PolicyEvaluationContext, PromotionRequirement,
@@ -951,6 +951,20 @@ fn validate_cell_request_for_issue(request: &CapabilityRequest) -> io::Result<Ca
     }
     validate_scope_paths(&read_paths)?;
     validate_scope_paths(&write_paths)?;
+    for (index, scope) in request.scope.broker_capabilities.iter().enumerate() {
+        scope.validate().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid approved broker capability: {error}"),
+            )
+        })?;
+        if request.scope.broker_capabilities[..index].contains(scope) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "approved broker capabilities must be unique",
+            ));
+        }
+    }
     if read_paths
         .iter()
         .any(|read| write_paths.iter().any(|write| read == write))
@@ -1059,6 +1073,30 @@ fn validate_cell_request_for_execution(
                 active_mediators.push(MediationBoundary::NetworkBoundary);
             }
             BrokerResourceKind::NetworkLease => {
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+            }
+            BrokerResourceKind::CredentialUse | BrokerResourceKind::SecretRead => {
+                active_mediators.push(MediationBoundary::SecretBroker);
+            }
+            BrokerResourceKind::HttpApiCall
+            | BrokerResourceKind::MessageDelivery
+            | BrokerResourceKind::CiJobInvocation => {
+                active_mediators.push(MediationBoundary::ExternalApiGateway);
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+            }
+            BrokerResourceKind::BrowserSession => {
+                active_mediators.push(MediationBoundary::BrowserAutomationGateway);
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+            }
+            BrokerResourceKind::DatabaseTransaction => {
+                active_mediators.push(MediationBoundary::DatabaseProxy);
+                active_mediators.push(MediationBoundary::NetworkBoundary);
+            }
+            BrokerResourceKind::FilesystemMutation => {
+                active_mediators.push(MediationBoundary::FilesystemBoundary);
+            }
+            BrokerResourceKind::CloudControlAction => {
+                active_mediators.push(MediationBoundary::CloudApiGateway);
                 active_mediators.push(MediationBoundary::NetworkBoundary);
             }
             BrokerResourceKind::ExternalActionCommitToken => {
@@ -1185,6 +1223,20 @@ fn validate_broker_scope_against_request(
                 })
         }
         BrokerResourceKind::ExternalActionCommitToken => false,
+        BrokerResourceKind::CredentialUse
+        | BrokerResourceKind::HttpApiCall
+        | BrokerResourceKind::BrowserSession
+        | BrokerResourceKind::DatabaseTransaction
+        | BrokerResourceKind::MessageDelivery
+        | BrokerResourceKind::CiJobInvocation
+        | BrokerResourceKind::SecretRead
+        | BrokerResourceKind::FilesystemMutation
+        | BrokerResourceKind::CloudControlAction => {
+            lease.typed_scope.as_ref().is_some_and(|typed| {
+                request.scope.broker_capabilities.contains(typed)
+                    && typed.resource_kind() == lease.resource_kind
+            })
+        }
         _ => allowed_audiences.contains(&lease.audience),
     };
     if !matched {
@@ -2334,7 +2386,10 @@ fn build_effect_manifest(
                 | BrokerGatewayEffectKind::ApiRequest
                 | BrokerGatewayEffectKind::DatabaseRequest
                 | BrokerGatewayEffectKind::BrowserAction
-                | BrokerGatewayEffectKind::CloudAction => {
+                | BrokerGatewayEffectKind::CloudAction
+                | BrokerGatewayEffectKind::MessageDelivery
+                | BrokerGatewayEffectKind::CiJobInvocation
+                | BrokerGatewayEffectKind::FilesystemMutation => {
                     external_requests.push(gensee_crate_rules::capability::ExternalRequestEffect {
                         gateway: broker_lease.adapter_id.clone(),
                         target: effect.target.clone(),
@@ -3793,6 +3848,7 @@ pub(super) fn validate_broker_cell_binding(
     cell_id: &str,
     source_run_id: &str,
     operation_id: &str,
+    broker_request: &BrokerLeaseRequest,
     now_ms: u64,
 ) -> io::Result<u64> {
     let lease_id = read_nofollow_to_string(&capability_cell_binding_path(cell_id)?)?
@@ -3813,6 +3869,33 @@ pub(super) fn validate_broker_cell_binding(
             io::ErrorKind::PermissionDenied,
             "broker lease does not match an unconsumed live capability cell lease",
         ));
+    }
+    if matches!(
+        broker_request.resource_kind,
+        BrokerResourceKind::CredentialUse
+            | BrokerResourceKind::HttpApiCall
+            | BrokerResourceKind::BrowserSession
+            | BrokerResourceKind::DatabaseTransaction
+            | BrokerResourceKind::MessageDelivery
+            | BrokerResourceKind::CiJobInvocation
+            | BrokerResourceKind::SecretRead
+            | BrokerResourceKind::FilesystemMutation
+            | BrokerResourceKind::CloudControlAction
+    ) {
+        let typed = broker_request.typed_scope.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "typed broker authority was not declared by the capability cell",
+            )
+        })?;
+        if typed.resource_kind() != broker_request.resource_kind
+            || !lease.request.scope.broker_capabilities.contains(typed)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "typed broker authority exceeds the exact scope approved for the capability cell",
+            ));
+        }
     }
     Ok(lease.expires_at_ms)
 }
@@ -3891,6 +3974,41 @@ pub(super) fn attach_broker_lease_to_cell(
                         | Capability::OutputPromotion
                 )
             })
+        }
+        BrokerResourceKind::CredentialUse | BrokerResourceKind::SecretRead => {
+            lease.request.capabilities.iter().any(|capability| {
+                matches!(capability, Capability::SecretUse | Capability::IdentityUse)
+            })
+        }
+        BrokerResourceKind::HttpApiCall
+        | BrokerResourceKind::MessageDelivery
+        | BrokerResourceKind::CiJobInvocation
+        | BrokerResourceKind::BrowserSession => {
+            lease.request.capabilities.iter().any(|capability| {
+                matches!(
+                    capability,
+                    Capability::ExternalApplication
+                        | Capability::ExternalMutation
+                        | Capability::NetworkEgress
+                )
+            })
+        }
+        BrokerResourceKind::DatabaseTransaction => lease
+            .request
+            .capabilities
+            .contains(&Capability::DatabaseAccess),
+        BrokerResourceKind::FilesystemMutation => {
+            lease.request.capabilities.iter().any(|capability| {
+                matches!(
+                    capability,
+                    Capability::FilesystemWrite
+                        | Capability::FilesystemMetadata
+                        | Capability::DestructiveFilesystem
+                )
+            })
+        }
+        BrokerResourceKind::CloudControlAction => {
+            lease.request.capabilities.contains(&Capability::CloudIam)
         }
     };
     if !requested {
@@ -4270,6 +4388,19 @@ mod tests {
         let _guard = crate::cli_test_env_lock();
         let root = env::temp_dir().join(format!("gensee-cell-broker-{}", Uuid::new_v4()));
         env::set_var("GENSEE_HOME", &root);
+        let approved_http =
+            gensee_crate_rules::capability_broker::BrokerCapabilityScope::HttpApiCall {
+                origin: "https://api.example.test".to_string(),
+                methods: vec!["GET".to_string()],
+                path_prefixes: vec!["/v1/records".to_string()],
+                max_request_bytes: 4096,
+                max_response_bytes: 1024 * 1024,
+            };
+        let mut cell_request = request();
+        cell_request
+            .scope
+            .broker_capabilities
+            .push(approved_http.clone());
         let lease = CapabilityCellLease {
             schema_version: CELL_LEASE_SCHEMA_VERSION,
             lease_id: "lease_one".to_string(),
@@ -4277,7 +4408,7 @@ mod tests {
             cell_id: "cell_one".to_string(),
             source_run_id: "run_one".to_string(),
             policy_decision: policy_decision_for(&request()),
-            request: request(),
+            request: cell_request,
             command: vec!["true".to_string()],
             issued_at_ms: 100,
             expires_at_ms: 200,
@@ -4296,9 +4427,51 @@ mod tests {
         )
         .unwrap();
 
+        let filesystem_request = BrokerLeaseRequest {
+            protocol_version: gensee_crate_rules::capability_broker::BROKER_PROTOCOL_VERSION,
+            request_id: "request_filesystem".to_string(),
+            operation_id: "op_one".to_string(),
+            source_run_id: "run_one".to_string(),
+            cell_id: Some("cell_one".to_string()),
+            resource_kind: BrokerResourceKind::FilesystemHandle,
+            typed_scope: None,
+            adapter_id: "gensee.filesystem".to_string(),
+            audience: "workspace".to_string(),
+            scopes: vec!["write".to_string()],
+            ttl_seconds: 30,
+            constraints: serde_json::json!({"path":"Cargo.lock","access":"write"}),
+        };
         assert_eq!(
-            validate_broker_cell_binding("cell_one", "run_one", "op_one", 150).unwrap(),
+            validate_broker_cell_binding("cell_one", "run_one", "op_one", &filesystem_request, 150)
+                .unwrap(),
             200
+        );
+        let mut typed_request = BrokerLeaseRequest {
+            resource_kind: BrokerResourceKind::HttpApiCall,
+            typed_scope: Some(approved_http.clone()),
+            adapter_id: "http_mediator".to_string(),
+            audience: "api.example.test".to_string(),
+            ..filesystem_request.clone()
+        };
+        assert_eq!(
+            validate_broker_cell_binding("cell_one", "run_one", "op_one", &typed_request, 150)
+                .unwrap(),
+            200
+        );
+        typed_request.typed_scope = Some(
+            gensee_crate_rules::capability_broker::BrokerCapabilityScope::HttpApiCall {
+                origin: "https://api.example.test".to_string(),
+                methods: vec!["GET".to_string()],
+                path_prefixes: vec!["/v1/records".to_string()],
+                max_request_bytes: 4096,
+                max_response_bytes: 2 * 1024 * 1024,
+            },
+        );
+        assert_eq!(
+            validate_broker_cell_binding("cell_one", "run_one", "op_one", &typed_request, 150)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
         );
         attach_broker_lease_to_cell(
             "cell_one",
@@ -4383,6 +4556,7 @@ mod tests {
             source_run_id: "run_gateway".to_string(),
             cell_id: Some("cell_gateway".to_string()),
             resource_kind: BrokerResourceKind::ApiToken,
+            typed_scope: None,
             adapter_id: "repo_adapter".to_string(),
             audience: "repo.example.test".to_string(),
             scopes: vec!["service:one:read".to_string()],
@@ -4633,6 +4807,7 @@ mod tests {
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_network".to_string()),
             resource_kind: BrokerResourceKind::NetworkLease,
+            typed_scope: None,
             adapter_id: super::super::capability_broker::BUILTIN_NETWORK_ADAPTER.to_string(),
             audience: "service-pinned-endpoint".to_string(),
             scopes: vec!["connect".to_string()],
