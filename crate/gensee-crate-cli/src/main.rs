@@ -115,6 +115,8 @@ mod transactional_promotion;
 pub(crate) use transactional_promotion::*;
 mod boundary_proof;
 pub(crate) use boundary_proof::*;
+mod provider_runtime;
+pub(crate) use provider_runtime::*;
 mod falco;
 pub(crate) use falco::*;
 mod replay;

@@ -47,6 +47,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y iproute2 nftables jq openssl python3
       - name: Build boundary binary
         run: cargo build -p gensee-crate-cli
+      - name: Prove provider execution-subject drain
+        run: >-
+          sudo env PATH="$PATH" HOME="$HOME"
+          RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo"
+          cargo test -p gensee-crate-cli
+          provider_runtime::tests::successful_adapter_cannot_leave_detached_descendant
+          -- --exact --nocapture
       - name: Run generic privileged boundary proof
         run: sudo env PATH="$PATH" GENSEE_BINARY="$PWD/target/debug/gensee" ./scripts/test-generic-boundary-proof.sh
 
