@@ -30,10 +30,10 @@ fn sign_catalog(args: &[OsString]) -> io::Result<()> {
     let key_path = required_catalog_path(args, "--key")?;
     let key_id = required_catalog_string(args, "--key-id")?;
     let output = required_catalog_path(args, "--output")?;
-    if !safe_token(&key_id) {
+    if !safe_catalog_token(&key_id) {
         return Err(invalid_input("key-id must be a bounded ASCII token"));
     }
-    let catalog: ContractCatalog = read_json(&input, "contract catalog")?;
+    let catalog: ContractCatalog = read_catalog_json(&input, "contract catalog")?;
     let audit = catalog.audit(std::env::consts::OS, unix_millis()?);
     require_valid_catalog(&audit)?;
     let signing_key = read_signing_key(&key_path)?;
@@ -62,7 +62,8 @@ fn verify_catalog_command(args: &[OsString]) -> io::Result<()> {
     reject_catalog_options(args, &["--catalog", "--trusted-key"], &["--json"])?;
     let catalog_path = required_catalog_path(args, "--catalog")?;
     let trusted_key_path = required_catalog_path(args, "--trusted-key")?;
-    let signed: SignedContractCatalog = read_json(&catalog_path, "signed contract catalog")?;
+    let signed: SignedContractCatalog =
+        read_catalog_json(&catalog_path, "signed contract catalog")?;
     let audit = verify_signed_catalog(&signed, &trusted_key_path, unix_millis()?)?;
     if has_catalog_flag(args, "--json") {
         let mut encoded = serde_json::to_vec_pretty(&audit).map_err(invalid_json)?;
@@ -85,7 +86,7 @@ pub(crate) fn verify_signed_catalog(
     trusted_key_path: &Path,
     now_ms: u64,
 ) -> io::Result<CatalogAudit> {
-    if signed.signature.algorithm != "ed25519" || !safe_token(&signed.signature.key_id) {
+    if signed.signature.algorithm != "ed25519" || !safe_catalog_token(&signed.signature.key_id) {
         return Err(invalid_data(
             "unsupported or invalid catalog signature metadata",
         ));
@@ -144,7 +145,10 @@ pub(crate) fn decode_hex_array<const N: usize>(value: &str, label: &str) -> io::
         .map_err(|_| invalid_data(format!("{label} must contain exactly {N} bytes")))
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path, label: &str) -> io::Result<T> {
+pub(crate) fn read_catalog_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    label: &str,
+) -> io::Result<T> {
     serde_json::from_slice(&read_bounded(path, MAX_CATALOG_BYTES)?)
         .map_err(|error| invalid_data(format!("invalid {label} JSON: {error}")))
 }
@@ -215,7 +219,7 @@ fn has_catalog_flag(args: &[OsString], name: &str) -> bool {
     args.iter().any(|value| value == name)
 }
 
-fn safe_token(value: &str) -> bool {
+pub(crate) fn safe_catalog_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
@@ -231,6 +235,10 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, message.into())
+}
+
+pub(crate) fn catalog_invalid_data(message: impl Into<String>) -> io::Error {
+    invalid_data(message)
 }
 
 fn invalid_json(error: serde_json::Error) -> io::Error {

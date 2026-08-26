@@ -1,19 +1,24 @@
 use crate::*;
 use gensee_crate_rules::capability::Capability;
 use gensee_crate_rules::capability_policy::MediationBoundary;
+use gensee_crate_rules::contract_catalog::ContractResolutionSource;
 use gensee_crate_rules::network_boundary::{
     NetworkCapabilityEnvelope, NetworkEndpointGrant, NetworkProtocol,
 };
 #[cfg(target_os = "linux")]
 use gensee_crate_rules::operation_contract::OperationNetworkEffect;
 use gensee_crate_rules::operation_contract::{
-    ContractAudit, ContractNetworkMode, ContractNetworkProtocol, OperationContract,
-    OperationEnforcementEvidence, OperationProcessEvidence, OperationPromotionEvidence,
-    OperationRunManifest, ProductContract, StructuralProductEvidence, StructuralProductType,
+    ContractAudit, ContractNetworkMode, ContractNetworkProtocol, OperationAdmissionEvidence,
+    OperationContract, OperationEnforcementEvidence, OperationProcessEvidence,
+    OperationPromotionEvidence, OperationRunManifest, ProductContract, StructuralProductEvidence,
+    StructuralProductType,
 };
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
-use std::fs::File;
-use std::io::{BufReader, ErrorKind};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const MAX_CONTRACT_BYTES: u64 = 1024 * 1024;
@@ -21,10 +26,14 @@ const SCAN_CHUNK_BYTES: usize = 64 * 1024;
 const SCAN_MAX_DEPTH: usize = 64;
 const SCAN_DEADLINE_SECONDS: u64 = 30;
 const START_GATE_TIMEOUT_SECONDS: u64 = 15;
+const BOUNDARY_CATALOG_TRUST_ANCHOR: &str = "/etc/gensee/catalog-root-public-key.hex";
+const MAX_ADMITTED_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 struct BoundaryRunConfig {
-    contract_path: PathBuf,
+    catalog_path: PathBuf,
+    observation_path: PathBuf,
+    inference_path: PathBuf,
     workspace: PathBuf,
     manifest_path: Option<PathBuf>,
     command: Vec<OsString>,
@@ -43,6 +52,7 @@ pub(crate) fn handle_operation_boundary(args: Vec<OsString>) -> io::Result<()> {
     let (subcommand, rest) = args.split_first().ok_or_else(boundary_usage_error)?;
     match subcommand.to_str() {
         Some("catalog") => handle_contract_catalog(rest),
+        Some("intent") => handle_intent_resolution(rest),
         Some("validate") => boundary_validate(rest),
         Some("audit") => boundary_audit(rest),
         Some("run") => boundary_run(BoundaryRunConfig::parse(rest)?),
@@ -116,9 +126,21 @@ impl BoundaryRunConfig {
         if command.is_empty() {
             return Err(boundary_usage_error());
         }
-        reject_unknown_options(options, &["--contract", "--workspace", "--manifest"], &[])?;
+        reject_unknown_options(
+            options,
+            &[
+                "--catalog",
+                "--observation",
+                "--inference",
+                "--workspace",
+                "--manifest",
+            ],
+            &[],
+        )?;
         Ok(Self {
-            contract_path: required_path_arg(options, "--contract")?,
+            catalog_path: required_path_arg(options, "--catalog")?,
+            observation_path: required_path_arg(options, "--observation")?,
+            inference_path: required_path_arg(options, "--inference")?,
             workspace: optional_path_arg(options, "--workspace")?.unwrap_or(env::current_dir()?),
             manifest_path: optional_path_arg(options, "--manifest")?,
             command,
@@ -126,12 +148,21 @@ impl BoundaryRunConfig {
     }
 }
 
-fn boundary_run(config: BoundaryRunConfig) -> io::Result<()> {
-    let contract_bytes = read_bounded_regular_file(&config.contract_path, MAX_CONTRACT_BYTES)?;
-    let contract: OperationContract = serde_json::from_slice(&contract_bytes).map_err(|error| {
+fn boundary_run(mut config: BoundaryRunConfig) -> io::Result<()> {
+    validate_boundary_trust_anchor(boundary_catalog_trust_anchor())?;
+    let admission = verify_and_resolve(
+        &config.catalog_path,
+        boundary_catalog_trust_anchor(),
+        &config.observation_path,
+        &config.inference_path,
+        &config.command,
+        unix_millis()?,
+    )?;
+    let contract = admission.contract.clone();
+    let contract_bytes = serde_json::to_vec(&contract).map_err(|error| {
         io::Error::new(
             ErrorKind::InvalidData,
-            format!("invalid contract JSON: {error}"),
+            format!("cannot encode selected contract: {error}"),
         )
     })?;
     let audit = contract.audit_for_platform(std::env::consts::OS);
@@ -163,6 +194,15 @@ fn boundary_run(config: BoundaryRunConfig) -> io::Result<()> {
     let source_run_id = format!("boundary_{}_{}", std::process::id(), started_at_ms);
     let staged = gensee_tmp_root()?.join(&source_run_id).join("workspace");
     copy_workspace(&original, &staged)?;
+    let executable_snapshot = snapshot_admitted_executable(
+        &admission.canonical_executable,
+        &admission.executable_sha256,
+        &staged
+            .parent()
+            .ok_or_else(|| io::Error::other("staged workspace has no operation root"))?
+            .join("admitted-executable"),
+    )?;
+    config.command[0] = executable_snapshot.into_os_string();
 
     let mut operation = OperationSupervisor::prepare(
         &operation_id,
@@ -306,6 +346,25 @@ fn boundary_run(config: BoundaryRunConfig) -> io::Result<()> {
         contract_id: contract.contract_id,
         contract_digest: sha256_prefixed(&contract_bytes),
         command_digest: digest_command(&config.command),
+        admission: OperationAdmissionEvidence {
+            catalog_id: admission.resolution.catalog_id,
+            catalog_version: admission.resolution.catalog_version,
+            catalog_digest: admission.catalog_digest,
+            observation_digest: admission.observation_digest,
+            inference_digest: admission.inference_digest,
+            analyzer_id: admission.resolution.analyzer_id,
+            selected_operation_class: admission.resolution.selected_operation_class,
+            confidence_bps: admission.resolution.confidence_bps,
+            resolution_source: match admission.resolution.source {
+                ContractResolutionSource::ProbabilisticInference => {
+                    "probabilistic_inference".to_string()
+                }
+                ContractResolutionSource::ApprovedSafeDefault => {
+                    "approved_safe_default".to_string()
+                }
+            },
+            ambiguity_reason: admission.resolution.ambiguity_reason,
+        },
         operation_record: operation.record_path().to_string_lossy().to_string(),
         original_workspace: original.to_string_lossy().to_string(),
         staged_workspace: staged.to_string_lossy().to_string(),
@@ -348,6 +407,87 @@ fn boundary_run(config: BoundaryRunConfig) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn boundary_catalog_trust_anchor() -> &'static Path {
+    Path::new(BOUNDARY_CATALOG_TRUST_ANCHOR)
+}
+
+fn validate_boundary_trust_anchor(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        validate_root_owned_path(path, false, true)
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "boundary catalog trust anchor must be a regular non-symlink file",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_admitted_executable(
+    source: &Path,
+    expected_sha256: &str,
+    destination: &Path,
+) -> io::Result<PathBuf> {
+    let mut input = File::open(source)?;
+    let metadata = input.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_ADMITTED_EXECUTABLE_BYTES {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "admitted executable must be a bounded regular file",
+        ));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("executable snapshot has no parent"))?;
+    fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o500);
+    let mut output = options.open(destination)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("executable size overflow"))?;
+        if total > MAX_ADMITTED_EXECUTABLE_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "admitted executable exceeds the snapshot limit",
+            ));
+        }
+        output.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+    }
+    let observed = format!("sha256:{:x}", hasher.finalize());
+    if observed != expected_sha256 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "admitted executable changed before it could be pinned",
+        ));
+    }
+    output.sync_all()?;
+    drop(output);
+    #[cfg(unix)]
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o500))?;
+    File::open(parent)?.sync_all()?;
+    Ok(destination.to_path_buf())
 }
 
 fn operation_envelope(contract: &OperationContract) -> OperationCapabilityEnvelope {
@@ -1100,7 +1240,7 @@ fn boundary_usage_error() -> io::Error {
 
 fn print_boundary_usage() {
     println!(
-        "gensee boundary\n\nUSAGE:\n  gensee boundary catalog sign --catalog <catalog.json> --key <seed.hex> --key-id <id> --output <signed.json>\n  gensee boundary catalog verify --catalog <signed.json> --trusted-key <public.hex> [--json]\n  gensee boundary validate --contract <contract.json> [--json]\n  gensee boundary audit --contract <contract.json> [--json]\n  sudo gensee boundary run --contract <contract.json> [--workspace <dir>] [--manifest <manifest.json>] -- <command> [args...]"
+        "gensee boundary\n\nUSAGE:\n  gensee boundary catalog sign --catalog <catalog.json> --key <seed.hex> --key-id <id> --output <signed.json>\n  gensee boundary catalog verify --catalog <signed.json> --trusted-key <public.hex> [--json]\n  gensee boundary intent observe|resolve ...\n  gensee boundary validate --contract <contract.json> [--json]\n  gensee boundary audit --contract <contract.json> [--json]\n  sudo gensee boundary run --catalog <signed.json> --observation <observation.json> --inference <signed-inference.json> [--workspace <dir>] [--manifest <manifest.json>] -- <command> [args...]\n\nThe enforcing runtime pins its catalog trust anchor at /etc/gensee/catalog-root-public-key.hex; callers cannot override it."
     );
 }
 
@@ -1202,13 +1342,44 @@ mod tests {
     #[test]
     fn run_parser_requires_explicit_command_boundary() {
         let args = vec![
-            OsString::from("--contract"),
-            OsString::from("contract.json"),
+            OsString::from("--catalog"),
+            OsString::from("catalog.json"),
+            OsString::from("--observation"),
+            OsString::from("observation.json"),
+            OsString::from("--inference"),
+            OsString::from("inference.json"),
             OsString::from("--"),
             OsString::from("echo"),
         ];
         assert!(BoundaryRunConfig::parse(&args).is_ok());
-        assert!(BoundaryRunConfig::parse(&args[..2]).is_err());
+        assert!(BoundaryRunConfig::parse(&args[..6]).is_err());
+        let mut caller_selected_anchor = args.clone();
+        caller_selected_anchor.splice(
+            2..2,
+            [
+                OsString::from("--trusted-key"),
+                OsString::from("attacker.hex"),
+            ],
+        );
+        assert!(BoundaryRunConfig::parse(&caller_selected_anchor).is_err());
+    }
+
+    #[test]
+    fn admitted_executable_snapshot_is_content_bound() {
+        let root = std::env::temp_dir().join(format!(
+            "gensee-boundary-executable-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let snapshot = root.join("private/snapshot");
+        fs::write(&source, b"#!/bin/sh\nprintf original\\n\n").unwrap();
+        let expected = sha256_prefixed(&fs::read(&source).unwrap());
+        snapshot_admitted_executable(&source, &expected, &snapshot).unwrap();
+        fs::write(&source, b"#!/bin/sh\nprintf replaced\\n\n").unwrap();
+        assert_eq!(sha256_prefixed(&fs::read(&snapshot).unwrap()), expected);
+        assert_ne!(fs::read(&snapshot).unwrap(), fs::read(&source).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

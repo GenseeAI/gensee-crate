@@ -114,6 +114,107 @@ pub struct SignedContractCatalog {
     pub signature: CatalogSignature,
 }
 
+pub const INTENT_OBSERVATION_SCHEMA_VERSION: u32 = 1;
+pub const INTENT_INFERENCE_SCHEMA_VERSION: u32 = 1;
+
+/// Facts presented to an approved probabilistic analyzer. Runtime caller and
+/// command facts are re-derived by the admission process before execution;
+/// evidence references allow a long-horizon analyzer to use authenticated
+/// earlier effects without making the authorization core model-specific.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentObservation {
+    pub schema_version: u32,
+    pub observation_id: String,
+    pub observed_at_ms: u64,
+    pub caller: ObservedCaller,
+    pub command_digest: String,
+    #[serde(default)]
+    pub command_features: Vec<String>,
+    #[serde(default)]
+    pub trajectory: Vec<TrajectoryEvidence>,
+    pub history_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedCaller {
+    pub uid: u32,
+    pub executable_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrajectoryEvidence {
+    pub evidence_id: String,
+    pub kind: String,
+    pub digest: String,
+    pub trust_domain: String,
+    pub started_at_ms: u64,
+    pub finished_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentInference {
+    pub schema_version: u32,
+    pub inference_id: String,
+    pub analyzer_id: String,
+    pub model_identity: String,
+    pub observation_digest: String,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub candidates: Vec<IntentCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentCandidate {
+    pub operation_class: String,
+    pub confidence_bps: u16,
+    pub rationale_code: String,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedIntentInference {
+    pub inference: IntentInference,
+    pub signature: InferenceSignature,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceSignature {
+    pub algorithm: String,
+    pub signature_hex: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractResolutionSource {
+    ProbabilisticInference,
+    ApprovedSafeDefault,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractResolution {
+    pub catalog_id: String,
+    pub catalog_version: u64,
+    pub observation_id: String,
+    pub inference_id: String,
+    pub analyzer_id: String,
+    pub selected_operation_class: String,
+    pub selected_contract_id: String,
+    pub confidence_bps: u16,
+    pub source: ContractResolutionSource,
+    pub ambiguity_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogAudit {
@@ -288,6 +389,119 @@ impl ContractCatalog {
             .iter()
             .find(|item| item.contract.contract_id == id)
     }
+
+    /// Resolve one verified inference. The inference contains no contract ID
+    /// and therefore cannot widen authority; selection always passes through
+    /// an exact caller/class selector in this signed catalog.
+    pub fn resolve_intent(
+        &self,
+        observation: &IntentObservation,
+        inference: &IntentInference,
+        now_ms: u64,
+    ) -> Result<ContractResolution, String> {
+        observation.validate()?;
+        inference.validate(observation, now_ms)?;
+        let analyzer = self
+            .intent_analyzers
+            .iter()
+            .find(|item| item.analyzer_id == inference.analyzer_id)
+            .ok_or_else(|| "intent inference uses an unapproved analyzer".to_string())?;
+        if analyzer.model_identity != inference.model_identity {
+            return Err("intent inference model identity is not catalog-approved".to_string());
+        }
+
+        let mut ranked = inference.candidates.iter().collect::<Vec<_>>();
+        ranked.sort_by_key(|candidate| std::cmp::Reverse(candidate.confidence_bps));
+        let best = ranked
+            .first()
+            .ok_or_else(|| "intent inference has no candidates".to_string())?;
+        let tied = ranked
+            .get(1)
+            .is_some_and(|candidate| candidate.confidence_bps == best.confidence_bps);
+        let permitted_class = analyzer
+            .allowed_operation_classes
+            .iter()
+            .any(|class| class == &best.operation_class);
+        let confident = best.confidence_bps >= analyzer.minimum_confidence_bps;
+
+        if !tied && permitted_class && confident {
+            let selected = self.select_for_caller(&observation.caller, &best.operation_class)?;
+            return Ok(ContractResolution {
+                catalog_id: self.catalog_id.clone(),
+                catalog_version: self.version,
+                observation_id: observation.observation_id.clone(),
+                inference_id: inference.inference_id.clone(),
+                analyzer_id: inference.analyzer_id.clone(),
+                selected_operation_class: best.operation_class.clone(),
+                selected_contract_id: selected.contract_id.clone(),
+                confidence_bps: best.confidence_bps,
+                source: ContractResolutionSource::ProbabilisticInference,
+                ambiguity_reason: None,
+            });
+        }
+
+        let reason = if tied {
+            "highest-confidence operation classes are tied"
+        } else if !permitted_class {
+            "highest-confidence operation class is outside analyzer scope"
+        } else {
+            "highest-confidence operation class is below the catalog threshold"
+        };
+        match self.fallback.on_ambiguous_intent {
+            AmbiguousIntentAction::Deny => Err(format!("ambiguous intent denied: {reason}")),
+            AmbiguousIntentAction::RequireApproval => Err(format!(
+                "ambiguous intent requires explicit operator approval: {reason}"
+            )),
+            AmbiguousIntentAction::UseSafeDefault => {
+                let contract_id = self
+                    .fallback
+                    .safe_default_contract_id
+                    .as_deref()
+                    .ok_or_else(|| "safe-default contract is missing".to_string())?;
+                let approved = self
+                    .contract(contract_id)
+                    .ok_or_else(|| "safe-default contract is not approved".to_string())?;
+                let selected = self
+                    .select_for_caller(&observation.caller, &approved.contract.operation_class)?;
+                if selected.contract_id != contract_id {
+                    return Err(
+                        "safe-default contract is not selected for the observed caller".to_string(),
+                    );
+                }
+                Ok(ContractResolution {
+                    catalog_id: self.catalog_id.clone(),
+                    catalog_version: self.version,
+                    observation_id: observation.observation_id.clone(),
+                    inference_id: inference.inference_id.clone(),
+                    analyzer_id: inference.analyzer_id.clone(),
+                    selected_operation_class: approved.contract.operation_class.clone(),
+                    selected_contract_id: contract_id.to_string(),
+                    confidence_bps: best.confidence_bps,
+                    source: ContractResolutionSource::ApprovedSafeDefault,
+                    ambiguity_reason: Some(reason.to_string()),
+                })
+            }
+        }
+    }
+
+    fn select_for_caller(
+        &self,
+        caller: &ObservedCaller,
+        operation_class: &str,
+    ) -> Result<&ContractSelector, String> {
+        let mut matches = self.selectors.iter().filter(|selector| {
+            selector.operation_class == operation_class && selector.caller.matches(caller)
+        });
+        let selected = matches.next().ok_or_else(|| {
+            "no approved contract matches the observed caller and class".to_string()
+        })?;
+        if matches.next().is_some() {
+            return Err(
+                "multiple approved contracts match the observed caller and class".to_string(),
+            );
+        }
+        Ok(selected)
+    }
 }
 
 impl CallerSelector {
@@ -295,6 +509,93 @@ impl CallerSelector {
         (self.uid.is_some() || self.executable_sha256.is_some() || self.service_identity.is_some())
             && self.executable_sha256.as_deref().is_none_or(valid_sha256)
             && self.service_identity.as_deref().is_none_or(bounded_token)
+    }
+
+    fn matches(&self, caller: &ObservedCaller) -> bool {
+        self.uid.is_none_or(|uid| uid == caller.uid)
+            && self
+                .executable_sha256
+                .as_deref()
+                .is_none_or(|digest| digest == caller.executable_sha256)
+            && self
+                .service_identity
+                .as_deref()
+                .is_none_or(|identity| caller.service_identity.as_deref() == Some(identity))
+    }
+}
+
+impl IntentObservation {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != INTENT_OBSERVATION_SCHEMA_VERSION
+            || !bounded_token(&self.observation_id)
+            || !valid_sha256(&self.command_digest)
+            || !valid_sha256(&self.caller.executable_sha256)
+            || self
+                .caller
+                .service_identity
+                .as_deref()
+                .is_some_and(|value| !bounded_token(value))
+            || self.command_features.len() > 128
+            || self
+                .command_features
+                .iter()
+                .any(|value| !bounded_token(value))
+            || self.trajectory.len() > 1024
+        {
+            return Err("intent observation is malformed or exceeds schema limits".to_string());
+        }
+        let mut ids = BTreeSet::new();
+        for evidence in &self.trajectory {
+            if !ids.insert(evidence.evidence_id.as_str())
+                || !bounded_token(&evidence.evidence_id)
+                || !bounded_token(&evidence.kind)
+                || !bounded_token(&evidence.trust_domain)
+                || !valid_sha256(&evidence.digest)
+                || evidence.started_at_ms > evidence.finished_at_ms
+                || evidence.finished_at_ms > self.observed_at_ms
+            {
+                return Err("trajectory evidence is malformed or duplicated".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl IntentInference {
+    pub fn validate(&self, observation: &IntentObservation, now_ms: u64) -> Result<(), String> {
+        if self.schema_version != INTENT_INFERENCE_SCHEMA_VERSION
+            || !bounded_token(&self.inference_id)
+            || !bounded_token(&self.analyzer_id)
+            || !bounded_token(&self.model_identity)
+            || !valid_sha256(&self.observation_digest)
+            || self.issued_at_ms >= self.expires_at_ms
+            || now_ms >= self.expires_at_ms
+            || self.candidates.is_empty()
+            || self.candidates.len() > 64
+        {
+            return Err("intent inference is malformed, expired, or empty".to_string());
+        }
+        let evidence_ids = observation
+            .trajectory
+            .iter()
+            .map(|item| item.evidence_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut classes = BTreeSet::new();
+        for candidate in &self.candidates {
+            if !classes.insert(candidate.operation_class.as_str())
+                || !bounded_token(&candidate.operation_class)
+                || !bounded_token(&candidate.rationale_code)
+                || candidate.confidence_bps > 10_000
+                || candidate.evidence_ids.len() > 128
+                || candidate
+                    .evidence_ids
+                    .iter()
+                    .any(|id| !evidence_ids.contains(id.as_str()))
+            {
+                return Err("intent candidate is malformed or duplicated".to_string());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -425,5 +726,67 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.contains("approval is expired or out of bounds")));
+    }
+
+    fn observation() -> IntentObservation {
+        IntentObservation {
+            schema_version: INTENT_OBSERVATION_SCHEMA_VERSION,
+            observation_id: "obs_1".into(),
+            observed_at_ms: 100,
+            caller: ObservedCaller {
+                uid: 1000,
+                executable_sha256: format!("sha256:{}", "22".repeat(32)),
+                service_identity: Some("editor_service".into()),
+            },
+            command_digest: format!("sha256:{}", "33".repeat(32)),
+            command_features: vec!["writes_structured_output".into()],
+            trajectory: vec![TrajectoryEvidence {
+                evidence_id: "prior_effects".into(),
+                kind: "effect_manifest".into(),
+                digest: format!("sha256:{}", "44".repeat(32)),
+                trust_domain: "host_observer".into(),
+                started_at_ms: 1,
+                finished_at_ms: 90,
+            }],
+            history_complete: true,
+        }
+    }
+
+    fn inference(confidence_bps: u16) -> IntentInference {
+        IntentInference {
+            schema_version: INTENT_INFERENCE_SCHEMA_VERSION,
+            inference_id: "infer_1".into(),
+            analyzer_id: "trajectory_analyzer".into(),
+            model_identity: "intent_model_v3".into(),
+            observation_digest: format!("sha256:{}", "55".repeat(32)),
+            issued_at_ms: 100,
+            expires_at_ms: 500,
+            candidates: vec![IntentCandidate {
+                operation_class: "document_transform".into(),
+                confidence_bps,
+                rationale_code: "trajectory_match".into(),
+                evidence_ids: vec!["prior_effects".into()],
+            }],
+        }
+    }
+
+    #[test]
+    fn inference_selects_class_not_contract() {
+        let resolution = catalog()
+            .resolve_intent(&observation(), &inference(9_000), 200)
+            .unwrap();
+        assert_eq!(resolution.selected_contract_id, "offline_transform_v1");
+        assert_eq!(
+            resolution.source,
+            ContractResolutionSource::ProbabilisticInference
+        );
+    }
+
+    #[test]
+    fn low_confidence_cannot_widen_authority() {
+        let error = catalog()
+            .resolve_intent(&observation(), &inference(7_999), 200)
+            .unwrap_err();
+        assert!(error.contains("ambiguous intent denied"));
     }
 }
