@@ -89,3 +89,7 @@ Verifier implementations remain domain-specific. Gensee's generic role is to
 make the verifier identity and policy explicit, bind the challenge and verdict
 to immutable evidence, prevent a producer from substituting either, and enforce
 the same isolation lifecycle independent of the verifier's domain.
+
+The public `IsolatedVerifierConfig`, `VerifierRequest`, and
+`VerifierProgramResult` protocols and a contributor checklist are documented in
+[Boundary extension authoring](boundary-extension-authoring.md).

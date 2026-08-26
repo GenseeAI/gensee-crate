@@ -95,3 +95,9 @@ gensee boundary provider dispatch \
   --request invocation.json \
   --output dispatch-receipt.json
 ```
+
+The lease selects the adapter ID as well as the resource kind. Dispatch rejects
+a different provider configuration even if it advertises the same coarse kind.
+The public `ProviderRuntimeConfig`, `ProviderInvocation`,
+`ProviderAdapterResult`, and contributor requirements are documented in
+[Boundary extension authoring](boundary-extension-authoring.md).

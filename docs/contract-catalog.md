@@ -80,3 +80,11 @@ normalizes class scores into ranked probabilities and signs the inference with
 the catalog-approved analyzer key. The catalog still supplies the confidence
 floor and maps the winning operation class to authority. A model cannot name a
 contract or add a capability.
+
+Organizations are not required to use that scorer. An external analyzer can
+consume the same `IntentObservation` protocol and emit an
+`IntentAnalyzerResult` containing only ranked operation classes, confidence,
+rationale codes, and referenced evidence IDs. `intent sign-result` validates
+that result against the catalog-approved analyzer/model/class scope, supplies
+the observation binding and short lifetime, and signs the inference with the
+approved analyzer key. See [Boundary extension authoring](boundary-extension-authoring.md).

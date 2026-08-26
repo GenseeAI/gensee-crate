@@ -1,10 +1,10 @@
 use crate::*;
 use gensee_crate_rules::capability_broker::{BrokerGatewayEffectKind, BrokerResourceKind};
 use gensee_crate_rules::provider_runtime::{
-    ProviderAdapterResult, ProviderDecision, ProviderInvocation, ProviderOperation,
-    PROVIDER_INVOCATION_SCHEMA_VERSION,
+    ProviderAdapterResult, ProviderDecision, ProviderDispatchReceipt, ProviderInvocation,
+    ProviderOperation, ProviderRuntimeConfig, PROVIDER_INVOCATION_SCHEMA_VERSION,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::ffi::OsString;
@@ -16,31 +16,6 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 
 const MAX_PROVIDER_BYTES: u64 = 1024 * 1024;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderRuntimeConfig {
-    adapter_id: String,
-    resource_kind: BrokerResourceKind,
-    executable: String,
-    executable_sha256: String,
-    #[serde(default)]
-    args: Vec<String>,
-    working_directory: String,
-    max_runtime_seconds: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderDispatchReceipt {
-    schema_version: u32,
-    invocation: ProviderInvocation,
-    lease_digest: String,
-    adapter_id: String,
-    adapter_executable_digest: String,
-    result: ProviderAdapterResult,
-    host_signature: String,
-}
 
 pub(crate) fn handle_generic_provider(args: &[OsString]) -> io::Result<()> {
     let (command, rest) = args.split_first().ok_or_else(provider_usage_error)?;
@@ -78,7 +53,7 @@ fn dispatch(args: &[OsString]) -> io::Result<()> {
         .as_ref()
         .ok_or_else(|| denied("active lease has no typed scope"))?;
     invocation.validate_against(scope).map_err(denied)?;
-    validate_provider_config(&config, lease.resource_kind)?;
+    validate_provider_config(&config, lease.resource_kind, &lease.adapter_id)?;
     let result = execute_provider(&config, &invocation)?;
     verify_provider_result(&invocation, &result)?;
     let mut receipt = ProviderDispatchReceipt {
@@ -110,6 +85,7 @@ fn validate_trusted_config_path(path: &Path) -> io::Result<()> {
 fn validate_provider_config(
     config: &ProviderRuntimeConfig,
     kind: BrokerResourceKind,
+    expected_adapter_id: &str,
 ) -> io::Result<()> {
     if !safe_catalog_token(&config.adapter_id)
         || config.resource_kind != kind
@@ -122,6 +98,11 @@ fn validate_provider_config(
             .any(|arg| arg.is_empty() || arg.len() > 256 || arg.bytes().any(|b| b == 0))
     {
         return Err(denied("provider runtime config is invalid for the lease"));
+    }
+    if config.adapter_id != expected_adapter_id {
+        return Err(denied(
+            "provider runtime config is not the adapter selected by the lease",
+        ));
     }
     let executable = Path::new(&config.executable);
     let working = Path::new(&config.working_directory);
@@ -640,6 +621,40 @@ fn print_provider_usage() {
 mod tests {
     use super::*;
     use gensee_crate_rules::capability_broker::BrokerCapabilityScope;
+
+    #[test]
+    fn provider_config_must_match_the_adapter_selected_by_the_lease() {
+        let config = ProviderRuntimeConfig {
+            adapter_id: "different_adapter".into(),
+            resource_kind: BrokerResourceKind::CloudControlAction,
+            executable: "/does/not/matter".into(),
+            executable_sha256: format!("sha256:{}", "11".repeat(32)),
+            args: Vec::new(),
+            working_directory: "/does/not/matter".into(),
+            max_runtime_seconds: 1,
+        };
+        let error = validate_provider_config(
+            &config,
+            BrokerResourceKind::CloudControlAction,
+            "selected_adapter",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("adapter selected by the lease"));
+
+        let mut malformed = config;
+        malformed.adapter_id = "selected_adapter".into();
+        malformed.max_runtime_seconds = 0;
+        let error = validate_provider_config(
+            &malformed,
+            BrokerResourceKind::CloudControlAction,
+            "selected_adapter",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("invalid for the lease"));
+    }
+
     #[test]
     fn invocation_cannot_expand_any_typed_scope() {
         let scope = BrokerCapabilityScope::CloudControlAction {

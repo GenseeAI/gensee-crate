@@ -5,37 +5,17 @@ use gensee_crate_rules::operation_contract::{
     OperationManifestSignature, OperationRunManifest, ProductContract,
 };
 use gensee_crate_rules::semantic_verifier::{
-    SemanticVerdict, SignedVerifierReceipt, VerifierIsolationClaims, VerifierReceiptClaims,
-    VerifierReceiptSignature, VerifierRequest, SEMANTIC_VERIFIER_SCHEMA_VERSION,
+    IsolatedVerifierConfig, SemanticVerdict, SignedVerifierReceipt, VerifierIsolationClaims,
+    VerifierProgramResult, VerifierReceiptClaims, VerifierReceiptSignature, VerifierRequest,
+    SEMANTIC_VERIFIER_SCHEMA_VERSION,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IsolatedVerifierConfig {
-    verifier_id: String,
-    policy_version: String,
-    executable: String,
-    executable_sha256: String,
-    #[serde(default)]
-    args: Vec<String>,
-    working_directory: String,
-    max_runtime_seconds: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VerifierProgramResult {
-    verdict: SemanticVerdict,
-    reason_codes: Vec<String>,
-    validation_effect_manifest_digest: String,
-}
 
 const MAX_VERIFIER_TTL_SECONDS: u64 = 300;
 const OPERATION_MANIFEST_SIGNATURE_DOMAIN: &[u8] = b"gensee-operation-run-manifest-v1\0";

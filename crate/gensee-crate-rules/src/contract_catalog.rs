@@ -147,6 +147,7 @@ pub struct SignedContractCatalog {
 pub const INTENT_OBSERVATION_SCHEMA_VERSION: u32 = 1;
 pub const INTENT_INFERENCE_SCHEMA_VERSION: u32 = 1;
 pub const INTENT_MODEL_SCHEMA_VERSION: u32 = 1;
+pub const INTENT_ANALYZER_RESULT_SCHEMA_VERSION: u32 = 1;
 
 /// Facts presented to an approved probabilistic analyzer. Runtime caller and
 /// command facts are re-derived by the admission process before execution;
@@ -235,6 +236,20 @@ pub struct IntentCandidate {
     pub rationale_code: String,
     #[serde(default)]
     pub evidence_ids: Vec<String>,
+}
+
+/// Language-neutral output protocol for an external intent analyzer.
+///
+/// The analyzer nominates ranked operation classes only. The trusted Gensee
+/// signer supplies the observation digest, inference identity, and deadline;
+/// the signed catalog later maps a class to a contract and capability envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentAnalyzerResult {
+    pub schema_version: u32,
+    pub analyzer_id: String,
+    pub model_identity: String,
+    pub candidates: Vec<IntentCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -813,6 +828,16 @@ mod tests {
     fn approved_catalog_is_valid() {
         let audit = catalog().audit("linux", 100);
         assert!(audit.valid, "{:?}", audit.errors);
+    }
+
+    #[test]
+    fn contributor_analyzer_result_fixture_matches_public_protocol() {
+        let result: IntentAnalyzerResult = serde_json::from_str(include_str!(
+            "../fixtures/boundary/extensions/intent-analyzer-result.json"
+        ))
+        .unwrap();
+        assert_eq!(result.schema_version, INTENT_ANALYZER_RESULT_SCHEMA_VERSION);
+        assert_eq!(result.candidates[0].operation_class, "read_only_analysis");
     }
 
     #[test]
