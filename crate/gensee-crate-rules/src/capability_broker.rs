@@ -8,7 +8,10 @@ pub const BROKER_PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokerResourceKind {
-    RepositoryToken,
+    ExternalServiceAuthority,
+    #[doc(hidden)]
+    #[serde(rename = "repository_token")]
+    LegacyExternalServiceAuthorityV1,
     ApiToken,
     WorkloadIdentity,
     MtlsCertificate,
@@ -22,6 +25,10 @@ pub enum BrokerResourceKind {
 #[serde(deny_unknown_fields)]
 pub struct BrokerLeaseRequest {
     pub protocol_version: u32,
+    /// Caller-generated stable id for one issuance intent. Reusing it with
+    /// different canonical request content is rejected.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_id: String,
     pub operation_id: String,
     pub source_run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -38,16 +45,34 @@ pub struct BrokerLeaseRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokerLeaseStatus {
+    Preparing,
+    Activating,
+    Publishing,
     Active,
+    Revoking,
     Consumed,
     Revoked,
     Expired,
+    Failed,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerProviderStatus {
+    Absent,
+    Active,
+    Revoked,
+    Indeterminate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrokerGatewayEffectKind {
-    RepositoryRequest,
+    ExternalServiceRequest,
+    #[doc(hidden)]
+    #[serde(rename = "repository_request")]
+    LegacyExternalServiceRequestV1,
     ApiRequest,
     IdentityExchange,
     MtlsConnection,
@@ -159,6 +184,12 @@ pub struct BrokerAdapterRequest {
     pub protocol_version: u32,
     pub action: String,
     pub lease: BrokerLeaseRequest,
+    /// Stable across retries and crash recovery. Adapters must use this key to
+    /// make `mint` and `revoke` idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_handle: Option<String>,
 }
@@ -167,7 +198,13 @@ pub struct BrokerAdapterRequest {
 #[serde(deny_unknown_fields)]
 pub struct BrokerAdapterResponse {
     pub protocol_version: u32,
+    /// Required for `status`. Legacy mint/revoke adapters may omit this; the
+    /// broker interprets successful legacy responses according to the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_status: Option<BrokerProviderStatus>,
+    #[serde(default)]
     pub provider_handle: String,
+    #[serde(default)]
     pub gateway_endpoint: String,
     #[serde(default)]
     pub public_metadata: Value,
@@ -188,10 +225,10 @@ mod tests {
             operation_id: "op_1".to_string(),
             source_run_id: "run_1".to_string(),
             cell_id: Some("cell_1".to_string()),
-            resource_kind: BrokerResourceKind::RepositoryToken,
+            resource_kind: BrokerResourceKind::ExternalServiceAuthority,
             adapter_id: "repo-broker".to_string(),
             audience: "repo.example.test".to_string(),
-            scopes: vec!["repository:one:read".to_string()],
+            scopes: vec!["service:one:read".to_string()],
             constraints: Value::Null,
             issued_at_ms: 1,
             expires_at_ms: 2,
@@ -227,5 +264,61 @@ mod tests {
         }));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn lifecycle_protocol_additions_deserialize_legacy_adapter_messages() {
+        let request: BrokerAdapterRequest = serde_json::from_value(serde_json::json!({
+            "protocol_version": 1,
+            "action": "mint",
+            "lease": {
+                "protocol_version": 1,
+                "operation_id": "op_1",
+                "source_run_id": "run_1",
+                "resource_kind": "external_service_authority",
+                "adapter_id": "repo-broker",
+                "audience": "repo.example.test",
+                "scopes": ["service:one:read"],
+                "ttl_seconds": 60
+            }
+        }))
+        .unwrap();
+        assert_eq!(request.idempotency_key, None);
+        assert_eq!(request.lease_id, None);
+        assert!(request.lease.request_id.is_empty());
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert!(serialized.get("idempotency_key").is_none());
+        assert!(serialized.get("lease_id").is_none());
+        assert!(serialized["lease"].get("request_id").is_none());
+
+        let response: BrokerAdapterResponse = serde_json::from_value(serde_json::json!({
+            "protocol_version": 1,
+            "provider_handle": "opaque_1",
+            "gateway_endpoint": "unix:///run/gensee/repo.sock",
+            "effect_telemetry_complete": false
+        }))
+        .unwrap();
+        assert_eq!(response.provider_status, None);
+    }
+
+    #[test]
+    fn retained_service_authority_keeps_its_v1_cleanup_discriminator() {
+        let kind: BrokerResourceKind = serde_json::from_str("\"repository_token\"").unwrap();
+        assert_eq!(kind, BrokerResourceKind::LegacyExternalServiceAuthorityV1);
+        assert_eq!(
+            serde_json::to_string(&kind).unwrap(),
+            "\"repository_token\""
+        );
+
+        let effect: BrokerGatewayEffectKind =
+            serde_json::from_str("\"repository_request\"").unwrap();
+        assert_eq!(
+            effect,
+            BrokerGatewayEffectKind::LegacyExternalServiceRequestV1
+        );
+        assert_eq!(
+            serde_json::to_string(&effect).unwrap(),
+            "\"repository_request\""
+        );
     }
 }
