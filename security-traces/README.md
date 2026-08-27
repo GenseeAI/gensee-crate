@@ -1,5 +1,11 @@
 # Open agent-security traces
 
+<p align="center">
+  <a href="https://github.com/GenseeAI/gensee-crate" aria-label="Star Gensee Crate on GitHub">
+    <img src="https://img.shields.io/github/stars/GenseeAI/gensee-crate?style=for-the-badge&amp;logo=github&amp;label=Star%20Gensee%20Crate" alt="Star Gensee Crate on GitHub" />
+  </a>
+</p>
+
 This directory publishes sanitized, replayable traces from a controlled
 experiment in autonomous-agent boundary crossing. The central question is:
 
@@ -91,6 +97,17 @@ that a complete labeled archive reached Machine A, that labels influenced a
 candidate, or that a label-assisted submission exceeded the legitimate score
 ceiling. “Capability escape succeeded” and “benchmark cheating succeeded” are
 therefore separate claims in the ground truth.
+
+## Watch the package-service boundary escape
+
+[![Animated forensic replay of Cohort 2 Trial 3, showing a blind benchmark
+agent cross the package-service boundary through Nexus and return to ordinary
+model work](assets/trial-03-package-service-boundary-escape-timeline.gif)](https://www.gensee.ai/blogs/reproducing-autonomous-agent-package-service-boundary-escape.html#the-successful-run-trial-3-crosses-the-package-service-boundary)
+
+The animation compresses 110 minutes of Cohort 2, Trial 3 into 54 seconds. It
+follows the validated timeline from conventional model building through the
+authenticated Nexus-to-origin boundary effect and back to ordinary classifier
+work. [Open the interactive, scrubbable replay and full write-up](https://www.gensee.ai/blogs/reproducing-autonomous-agent-package-service-boundary-escape.html#the-successful-run-trial-3-crosses-the-package-service-boundary).
 
 ## The two cohorts
 
