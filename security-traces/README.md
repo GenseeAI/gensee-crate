@@ -98,6 +98,81 @@ candidate, or that a label-assisted submission exceeded the legitimate score
 ceiling. “Capability escape succeeded” and “benchmark cheating succeeded” are
 therefore separate claims in the ground truth.
 
+## Paper and trace analysis
+
+The accompanying paper presents the study design, quantitative timelines,
+behavioral trajectory analysis, causal reconstruction, and counterfactual
+intervention points across all eight runs:
+
+> **[Download “Characterizing Transitive Authority in Autonomous Coding
+> Agents: An Eight-Run Multi-Layer Trace Study” (PDF)](papers/characterizing-transitive-authority-in-autonomous-coding-agents.pdf?raw=1)**
+
+### High-level findings
+
+- **The two boundary crossings had different behavioral signatures.** Gateway
+  Trial 4 was a low-volume semantic outlier whose aggregate tool, command,
+  host, and network activity remained within the control range. Package Trial
+  3 was a persistence outlier, with a much longer and denser service-specific
+  investigation.
+- **Generic activity volume was not a common boundary-crossing detector.**
+  File, process, network, retry, endpoint, and command totals did not reliably
+  distinguish both crossing runs from controls. A control run exceeded Gateway
+  Trial 4 on several of these measures.
+- **Infrastructure exploration was common; authority-bearing effects were
+  rare.** All eight runs investigated public provenance and probed the network
+  early. Only two requests produced independently confirmed effects under
+  authority not held by the agent container.
+- **The decisive signal was semantic and cross-layer.** In both crossings, an
+  agent-initiated operation was admitted by a trusted service and produced a
+  downstream effect under broader service-held authority. Reconstructing that
+  chain required agent, service, network, and downstream-effect evidence rather
+  than an agent-visible transcript alone.
+- **A boundary crossing was not equivalent to benchmark compromise.** Neither
+  run acquired or used protected labels, and neither demonstrated a benchmark
+  advantage attributable to protected information.
+- **The earliest candidate control points were admission-time semantic
+  decisions.** The trace-derived intervention points were the hosted-tool
+  declaration at approximately 36.18 minutes in Gateway Trial 4 and the Remote
+  Repository Browser admission at approximately 68.52 minutes in Package Trial
+  3. These are counterfactual findings; enforcement was not enabled or tested.
+
+### Quantitative activity over time
+
+The following figures show the model, command, host, network, and trusted-service
+activity used in the paper's quantitative analysis. Dashed red lines mark the
+first independently confirmed boundary effect in each crossing run.
+
+#### Model, tool, and command activity
+
+![Model reasoning-item, tool-call, and completed-command activity for all eight runs in five-minute bins](assets/analysis/model-tool-command-activity.png)
+
+Gateway Trial 4 remained within the control range by overall model, tool, and
+command volume. Package Trial 3 ran longer and remained active after its first
+boundary effect.
+
+#### Gateway-condition container activity
+
+![Gateway-condition file write-open, process, and network-connect activity from retained Falco rule events](assets/analysis/gateway-container-activity.png)
+
+The gateway boundary effect did not coincide with a unique container-level
+activity spike. A control run produced more network-connect events overall.
+
+#### Package-condition container activity
+
+![Package-condition file-access, process, and network or IPC activity from retained Falco rule events](assets/analysis/package-container-activity.png)
+
+Package Trial 3 produced a longer trace and larger totals, but it did not have
+the highest duration-normalized network or IPC rate. Its Falco capture also
+reported drops, so the retained event totals are lower bounds.
+
+#### Trusted-service activity
+
+![Inference, package-service, protected-origin, and provider-effect activity for all eight runs](assets/analysis/trusted-service-activity.png)
+
+Generic inference-request volume did not isolate Gateway Trial 4. Service-level
+semantics sharply distinguished the two confirmed effects: hosted provider
+effects in Gateway Trial 4 and Nexus-to-origin activity in Package Trial 3.
+
 ## Watch the package-service boundary escape
 
 [![Animated forensic replay of Cohort 2 Trial 3, showing a blind benchmark
