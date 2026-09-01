@@ -15,7 +15,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use serde::Deserialize;
 
@@ -655,6 +656,36 @@ pub struct Policy {
     override_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicySourceStamp {
+    path: Option<PathBuf>,
+    modified: Option<SystemTime>,
+    len: Option<u64>,
+    is_file: bool,
+}
+
+impl PolicySourceStamp {
+    fn current() -> Self {
+        let path = env::var_os("GENSEE_POLICY_FILE")
+            .map(PathBuf::from)
+            .or_else(user_policy_path);
+        let metadata = path.as_deref().and_then(|path| fs::metadata(path).ok());
+        Self {
+            path,
+            modified: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok()),
+            len: metadata.as_ref().map(std::fs::Metadata::len),
+            is_file: metadata.is_some_and(|metadata| metadata.is_file()),
+        }
+    }
+}
+
+struct CachedPolicy {
+    source: PolicySourceStamp,
+    policy: Arc<Policy>,
+}
+
 /// The bundled default policy document as JSON text — the template emitted by
 /// `gensee policy print-default` / `gensee policy init`.
 pub fn default_policy_json() -> &'static str {
@@ -788,6 +819,30 @@ impl Policy {
     pub fn global() -> &'static Policy {
         static GLOBAL: OnceLock<Policy> = OnceLock::new();
         GLOBAL.get_or_init(Policy::load)
+    }
+
+    /// A shared current-policy snapshot that reloads when the configured
+    /// policy source changes. This keeps high-volume passive enrichment off
+    /// the JSON read/parse path while still observing policy edits without a
+    /// daemon restart.
+    pub fn cached_current() -> Arc<Policy> {
+        static CURRENT: OnceLock<Mutex<CachedPolicy>> = OnceLock::new();
+
+        let source = PolicySourceStamp::current();
+        let cache = CURRENT.get_or_init(|| {
+            Mutex::new(CachedPolicy {
+                source: source.clone(),
+                policy: Arc::new(Policy::load()),
+            })
+        });
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.source != source {
+            cache.policy = Arc::new(Policy::load());
+            cache.source = source;
+        }
+        Arc::clone(&cache.policy)
     }
 
     /// Load the active policy source now, without using the process-wide cache.
@@ -1942,6 +1997,13 @@ mod tests {
                 .max_file_subjects_per_tool,
             50
         );
+        assert_eq!(
+            Policy::cached_current()
+                .document()
+                .resource_governance
+                .max_file_subjects_per_tool,
+            50
+        );
 
         doc["resource_governance"]["max_file_subjects_per_tool"] = serde_json::json!(100);
         fs::write(
@@ -1951,6 +2013,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             Policy::load_current()
+                .document()
+                .resource_governance
+                .max_file_subjects_per_tool,
+            100
+        );
+        assert_eq!(
+            Policy::cached_current()
                 .document()
                 .resource_governance
                 .max_file_subjects_per_tool,

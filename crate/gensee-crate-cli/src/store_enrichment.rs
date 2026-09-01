@@ -9,8 +9,9 @@ pub(crate) fn append_hook_event_with_policy(
     }
 
     let operations = gensee_crate_store::hook_file_operations(event);
+    let policy = Policy::cached_current();
     let mut enrichment = observation_enrichment(
-        Policy::global(),
+        &policy,
         event.session_id.as_deref(),
         event.tool_use_id.as_deref(),
         event.observed_at_ms,
@@ -27,9 +28,9 @@ pub(crate) fn append_file_intent_with_policy(
     store: &EventStore,
     intent: &FileIntent,
 ) -> io::Result<()> {
-    let policy = Policy::global();
+    let policy = Policy::cached_current();
     let enrichment = observation_enrichment(
-        policy,
+        &policy,
         intent.session_id.as_deref(),
         intent.tool_use_id.as_deref(),
         intent.observed_at_ms,
@@ -43,9 +44,9 @@ pub(crate) fn append_workspace_effect_with_policy(
     store: &EventStore,
     effect: &WorkspaceEffect,
 ) -> io::Result<()> {
-    let policy = Policy::global();
+    let policy = Policy::cached_current();
     let enrichment = observation_enrichment(
-        policy,
+        &policy,
         effect.session_id.as_deref(),
         None,
         effect.observed_at_ms,
@@ -59,18 +60,20 @@ pub(crate) fn append_system_event_with_policy(
     store: &EventStore,
     event: &SystemEvent,
 ) -> io::Result<()> {
-    let policy = Policy::global();
+    let policy = Policy::cached_current();
     let artifact_classifications = gensee_crate_store::system_event_paths(event)
         .into_iter()
-        .map(|path| artifact_classification(policy, path))
+        .map(|path| artifact_classification(&policy, path))
         .collect();
     let unmatched_system_alert = if matches!(
         event.source.as_str(),
         "macos-endpoint-security" | "linux-falco"
-    ) {
+    )
+        || !gensee_crate_store::system_event_can_record_unmatched_alert(&event.event_type)
+    {
         None
     } else {
-        prepare_policy_alert(policy, unmatched_system_event_alert(event))
+        prepare_policy_alert(&policy, unmatched_system_event_alert(event))
     };
     store.append_system_event_with_enrichment(
         event,

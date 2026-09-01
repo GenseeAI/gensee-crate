@@ -24,6 +24,7 @@ use rusqlite::{functions::FunctionFlags, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fmt;
@@ -156,6 +157,10 @@ pub struct FileOperation {
 }
 
 impl ObservationEnrichment {
+    fn has_path_enrichment(&self) -> bool {
+        !self.alerts.is_empty() || !self.artifact_classifications.is_empty()
+    }
+
     fn alerts_for_path<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a PolicyAlert> {
         self.alerts
             .iter()
@@ -169,6 +174,9 @@ impl ObservationEnrichment {
     }
 
     fn validate_paths<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> io::Result<()> {
+        if !self.has_path_enrichment() {
+            return Ok(());
+        }
         let paths = paths.into_iter().collect::<HashSet<_>>();
         let unmatched_alert = self.alerts.iter().find(|alert| {
             alert
@@ -192,6 +200,24 @@ impl ObservationEnrichment {
             io::ErrorKind::InvalidInput,
             format!("observation enrichment does not match an extracted path: {detail}"),
         ))
+    }
+
+    fn evidence_safe_for_paths<'a>(
+        &'a self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Cow<'a, Self> {
+        match self.validate_paths(paths) {
+            Ok(()) => Cow::Borrowed(self),
+            Err(error) => {
+                eprintln!("gensee store: ignoring invalid policy enrichment: {error}");
+                Cow::Owned(Self {
+                    // The operations are store-derived input to base evidence
+                    // materialization, not policy output.
+                    file_operations: self.file_operations.clone(),
+                    ..Default::default()
+                })
+            }
+        }
     }
 }
 
@@ -414,8 +440,9 @@ impl EventStore {
                 &extracted
             }
         };
-        enrichment.validate_paths(operations.iter().map(|operation| operation.path.as_str()))?;
-        self.append_hook_event_database(event, enrichment)?;
+        let enrichment = enrichment
+            .evidence_safe_for_paths(operations.iter().map(|operation| operation.path.as_str()));
+        self.append_hook_event_database(event, &enrichment, operations)?;
         append_jsonl(&self.hooks_path(), event, self.encryption_key.as_ref())
     }
 
@@ -453,8 +480,8 @@ impl EventStore {
         intent: &FileIntent,
         enrichment: &ObservationEnrichment,
     ) -> io::Result<()> {
-        enrichment.validate_paths([intent.path.as_str()])?;
-        self.append_file_intent_database(intent, enrichment)?;
+        let enrichment = enrichment.evidence_safe_for_paths([intent.path.as_str()]);
+        self.append_file_intent_database(intent, &enrichment)?;
         append_jsonl(
             &self.file_intents_path(),
             intent,
@@ -472,9 +499,17 @@ impl EventStore {
         event: &SystemEvent,
         enrichment: &ObservationEnrichment,
     ) -> io::Result<()> {
-        let paths = system_event_paths(event);
-        enrichment.validate_paths(paths.iter().map(String::as_str))?;
-        self.append_system_event_database(event, enrichment)?;
+        let paths = enrichment
+            .has_path_enrichment()
+            .then(|| system_event_paths(event));
+        let enrichment = enrichment.evidence_safe_for_paths(
+            paths
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str),
+        );
+        self.append_system_event_database(event, &enrichment)?;
         // Native kernel telemetry is already durable in SQLite and can be
         // pruned transactionally. Duplicating these high-volume streams into an
         // append-only JSONL file made retention ineffective and could consume
@@ -505,8 +540,8 @@ impl EventStore {
         effect: &WorkspaceEffect,
         enrichment: &ObservationEnrichment,
     ) -> io::Result<()> {
-        enrichment.validate_paths([effect.path.as_str()])?;
-        self.append_workspace_effect_database(effect, enrichment)?;
+        let enrichment = enrichment.evidence_safe_for_paths([effect.path.as_str()]);
+        self.append_workspace_effect_database(effect, &enrichment)?;
         append_jsonl(
             &self.workspace_effects_path(),
             effect,
@@ -2087,6 +2122,7 @@ impl EventStore {
         &self,
         event: &AgentHookEvent,
         enrichment: &ObservationEnrichment,
+        file_operations: &[FileOperation],
     ) -> io::Result<()> {
         let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
         // Transcript reads can be tens of megabytes. Prepare their incremental
@@ -2180,12 +2216,19 @@ impl EventStore {
                         cwd: event.cwd.clone().unwrap_or_default(),
                         permission_mode: event.permission_mode.clone(),
                         tool_name: event.tool_name.clone(),
-                        tool_input: tool_input_json(event, enrichment.file_operations.as_deref()),
+                        tool_input: tool_input_json(event, file_operations),
                         tool_response: tool_response_json(event),
                         tool_use_id: event.tool_use_id.clone(),
                     };
                     let event_id = db.insert_agent_event(&agent_event).map_err(sqlite_error)?;
-                    record_native_tool_artifact(db, request_id, event_id, event, enrichment)?;
+                    record_native_tool_artifact(
+                        db,
+                        request_id,
+                        event_id,
+                        event,
+                        enrichment,
+                        file_operations,
+                    )?;
                     refresh_request_resource_rates(db, request_id)?;
                 }
                 _ => {}
@@ -3196,18 +3239,11 @@ fn record_native_tool_artifact(
     agent_event_id: i64,
     event: &AgentHookEvent,
     enrichment: &ObservationEnrichment,
+    tools: &[FileOperation],
 ) -> io::Result<()> {
     if event.hook_event_name.as_deref() != Some("PreToolUse") {
         return Ok(());
     }
-    let extracted;
-    let tools = match enrichment.file_operations.as_deref() {
-        Some(operations) => operations,
-        None => {
-            extracted = hook_file_operations(event);
-            &extracted
-        }
-    };
     if tools.is_empty() {
         return Ok(());
     }
@@ -4157,8 +4193,7 @@ fn record_prepared_unmatched_system_event_alert(
     alert: Option<&PolicyAlert>,
     created_at: i64,
 ) -> io::Result<()> {
-    let request_relation = request_artifact_relation_type(&event.event_type);
-    if !matches!(request_relation, "produced" | "modified" | "deleted") {
+    if !system_event_can_record_unmatched_alert(&event.event_type) {
         return Ok(());
     }
     let Some(alert) = alert else {
@@ -4826,6 +4861,16 @@ fn request_artifact_relation_type(event_type: &str) -> &'static str {
     }
 }
 
+/// Whether an unattributed system event can represent a filesystem effect
+/// worth alerting on. Policy-aware callers use this gate to avoid preparing an
+/// alert that the store will necessarily discard.
+pub fn system_event_can_record_unmatched_alert(event_type: &str) -> bool {
+    matches!(
+        request_artifact_relation_type(event_type),
+        "produced" | "modified" | "deleted"
+    )
+}
+
 fn file_uri(path: &str) -> String {
     let normalized = path
         .strip_prefix("/tmp/")
@@ -4904,18 +4949,7 @@ fn resolve_tool_path(path: &str, cwd: Option<&str>) -> String {
     normalize_agent_path(path, cwd.unwrap_or("."))
 }
 
-fn tool_input_json(
-    event: &AgentHookEvent,
-    extracted_operations: Option<&[FileOperation]>,
-) -> Option<String> {
-    let extracted;
-    let tools = match extracted_operations {
-        Some(operations) => operations,
-        None => {
-            extracted = hook_file_operations(event);
-            &extracted
-        }
-    };
+fn tool_input_json(event: &AgentHookEvent, tools: &[FileOperation]) -> Option<String> {
     match tools {
         [] => {
             if event.tool_input_command.is_some() || event.tool_input_description.is_some() {
@@ -6820,7 +6854,7 @@ mod tests {
     }
 
     #[test]
-    fn enrichment_with_an_unmatched_path_is_rejected_before_write() {
+    fn invalid_enrichment_is_dropped_without_losing_observation() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-store-test-enrichment-path-{}",
             std::process::id()
@@ -6837,7 +6871,7 @@ mod tests {
             sensitive: false,
             confidence: "high".to_string(),
         };
-        let error = store
+        store
             .append_file_intent_with_enrichment(
                 &intent,
                 &ObservationEnrichment {
@@ -6855,11 +6889,54 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(store.list_file_intents().unwrap().is_empty());
+        assert_eq!(store.list_file_intents().unwrap().len(), 1);
+        assert!(store.list_alerts().unwrap().is_empty());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_hook_enrichment_does_not_abort_or_drop_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-hook-enrichment-path-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let event = native_tool_event("Read", "tool_1", r#"{"file_path":"/repo/actual.txt"}"#, 110);
+
+        store
+            .append_hook_event_with_enrichment(
+                &event,
+                &ObservationEnrichment {
+                    alerts: vec![PolicyAlert {
+                        session_id: Some("s1".to_string()),
+                        tool_use_id: Some("tool_1".to_string()),
+                        severity: "high".to_string(),
+                        action: "warn".to_string(),
+                        rule_id: "mismatched_path".to_string(),
+                        message: "wrong subject".to_string(),
+                        path: Some("/repo/other.txt".to_string()),
+                        evidence: None,
+                        observed_at_ms: 110,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.list_hook_events().unwrap().len(), 1);
+        assert!(store.list_alerts().unwrap().is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unmatched_alert_gate_excludes_read_shaped_system_events() {
+        assert!(!system_event_can_record_unmatched_alert("open"));
+        assert!(!system_event_can_record_unmatched_alert("stat"));
+        assert!(system_event_can_record_unmatched_alert("write"));
+        assert!(system_event_can_record_unmatched_alert("rename"));
+        assert!(system_event_can_record_unmatched_alert("unlink"));
     }
 
     #[test]

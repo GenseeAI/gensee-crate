@@ -11,6 +11,11 @@ changes.
 Use this section for user-visible changes after the initial open-source
 release.
 
+### Changed
+
+- NotebookRead and NotebookEdit hooks now receive the same active path-policy
+  enforcement as other file-reading and file-editing tools.
+
 ## 0.3.1 - 2026-08-21
 
 ### Changed
