@@ -20,7 +20,6 @@ pub use gensee_crate_db::sqlite::{
     AlertRecord, ArtifactFactRecord, ArtifactObservationRecord, ArtifactRiskTagRecord,
     ChainVerification, HumanFeedbackRecord,
 };
-use gensee_crate_rules::policy::Policy;
 use rusqlite::{functions::FunctionFlags, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -122,6 +121,40 @@ pub struct PolicyAlert {
     pub path: Option<String>,
     pub evidence: Option<Value>,
     pub observed_at_ms: u64,
+}
+
+/// Policy-derived data supplied by an ingestion caller.
+///
+/// The event store deliberately does not load policy or evaluate observations.
+/// Callers may provide no enrichment for evidence-only collection, or attach
+/// pre-evaluated alerts and artifact classifications for detection-enabled
+/// deployments.
+#[derive(Debug, Clone, Default)]
+pub struct ObservationEnrichment {
+    pub alerts: Vec<PolicyAlert>,
+    pub artifact_classifications: Vec<ArtifactClassification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactClassification {
+    pub path: String,
+    pub is_memory_artifact: bool,
+    pub is_persistent_target: bool,
+    pub is_control_plane: bool,
+}
+
+impl ObservationEnrichment {
+    fn alerts_for_path<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a PolicyAlert> {
+        self.alerts
+            .iter()
+            .filter(move |alert| alert.path.as_deref() == Some(path))
+    }
+
+    fn classification_for_path(&self, path: &str) -> Option<&ArtifactClassification> {
+        self.artifact_classifications
+            .iter()
+            .find(|classification| classification.path == path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,7 +359,15 @@ impl EventStore {
     }
 
     pub fn append_hook_event(&self, event: &AgentHookEvent) -> io::Result<()> {
-        self.append_hook_event_database(event)?;
+        self.append_hook_event_with_enrichment(event, &ObservationEnrichment::default())
+    }
+
+    pub fn append_hook_event_with_enrichment(
+        &self,
+        event: &AgentHookEvent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
+        self.append_hook_event_database(event, enrichment)?;
         append_jsonl(&self.hooks_path(), event, self.encryption_key.as_ref())
     }
 
@@ -355,7 +396,15 @@ impl EventStore {
     }
 
     pub fn append_file_intent(&self, intent: &FileIntent) -> io::Result<()> {
-        self.append_file_intent_database(intent)?;
+        self.append_file_intent_with_enrichment(intent, &ObservationEnrichment::default())
+    }
+
+    pub fn append_file_intent_with_enrichment(
+        &self,
+        intent: &FileIntent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
+        self.append_file_intent_database(intent, enrichment)?;
         append_jsonl(
             &self.file_intents_path(),
             intent,
@@ -364,7 +413,15 @@ impl EventStore {
     }
 
     pub fn append_system_event(&self, event: &SystemEvent) -> io::Result<()> {
-        self.append_system_event_database(event)?;
+        self.append_system_event_with_enrichment(event, &ObservationEnrichment::default())
+    }
+
+    pub fn append_system_event_with_enrichment(
+        &self,
+        event: &SystemEvent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
+        self.append_system_event_database(event, enrichment)?;
         // Native kernel telemetry is already durable in SQLite and can be
         // pruned transactionally. Duplicating these high-volume streams into an
         // append-only JSONL file made retention ineffective and could consume
@@ -383,7 +440,15 @@ impl EventStore {
     }
 
     pub fn append_workspace_effect(&self, effect: &WorkspaceEffect) -> io::Result<()> {
-        self.append_workspace_effect_database(effect)?;
+        self.append_workspace_effect_with_enrichment(effect, &ObservationEnrichment::default())
+    }
+
+    pub fn append_workspace_effect_with_enrichment(
+        &self,
+        effect: &WorkspaceEffect,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
+        self.append_workspace_effect_database(effect, enrichment)?;
         append_jsonl(
             &self.workspace_effects_path(),
             effect,
@@ -1491,16 +1556,6 @@ impl EventStore {
         dedupe_key: &str,
         window_ms: u64,
     ) -> io::Result<bool> {
-        let policy = Policy::load_current();
-        let tuned = policy.tuned_alert_values(&alert.rule_id, &alert.severity, &alert.action);
-        if !policy
-            .document()
-            .endpoint_security
-            .minimum_recorded_severity
-            .includes(&tuned.severity)
-        {
-            return Ok(false);
-        }
         self.with_sqlite_transaction(|db| {
             let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
@@ -1789,6 +1844,15 @@ impl EventStore {
         observation: &ArtifactObservationInput,
         tags: &[ArtifactRiskTagInput],
     ) -> io::Result<()> {
+        self.record_artifact_observation_and_tags_with_classification(observation, tags, None)
+    }
+
+    pub fn record_artifact_observation_and_tags_with_classification(
+        &self,
+        observation: &ArtifactObservationInput,
+        tags: &[ArtifactRiskTagInput],
+        classification: Option<&ArtifactClassification>,
+    ) -> io::Result<()> {
         if !artifact_path_is_concrete(&observation.path) {
             return Ok(());
         }
@@ -1870,6 +1934,7 @@ impl EventStore {
                     agent_authored: observation.mutation && session_id != UNKNOWN_SESSION_ID,
                     unmatched_effect: false,
                     risk,
+                    classification,
                     metadata: Some(json!({
                         "source": "artifact_content_inspection",
                         "content_truncated": observation.content_truncated,
@@ -1960,7 +2025,11 @@ impl EventStore {
         }
     }
 
-    fn append_hook_event_database(&self, event: &AgentHookEvent) -> io::Result<()> {
+    fn append_hook_event_database(
+        &self,
+        event: &AgentHookEvent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
         let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
         // Transcript reads can be tens of megabytes. Prepare their incremental
         // state before BEGIN IMMEDIATE so dashboard readers and other hook
@@ -2058,7 +2127,7 @@ impl EventStore {
                         tool_use_id: event.tool_use_id.clone(),
                     };
                     let event_id = db.insert_agent_event(&agent_event).map_err(sqlite_error)?;
-                    record_native_tool_artifact(db, request_id, event_id, event)?;
+                    record_native_tool_artifact(db, request_id, event_id, event, enrichment)?;
                     refresh_request_resource_rates(db, request_id)?;
                 }
                 _ => {}
@@ -2156,7 +2225,11 @@ impl EventStore {
         })
     }
 
-    fn append_file_intent_database(&self, intent: &FileIntent) -> io::Result<()> {
+    fn append_file_intent_database(
+        &self,
+        intent: &FileIntent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
         self.with_sqlite_transaction(|db| {
             let session_id = intent.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, &intent.provider, intent.observed_at_ms)?;
@@ -2176,20 +2249,23 @@ impl EventStore {
                     tool_use_id: intent.tool_use_id.clone(),
                 })
                 .map_err(sqlite_error)?;
-            record_file_intent_artifact(db, request_id, event_id, intent)?;
+            record_file_intent_artifact(db, request_id, event_id, intent, enrichment)?;
             if intent.provider != "bash-command-parser" {
-                record_file_operation_alerts(
+                record_prepared_file_operation_alerts(
                     db,
                     request_id,
                     Some(EntityRef::agent_event(event_id)),
-                    &intent.operation,
                     &intent.path,
-                    Some(json!({
-                        "source": intent.provider,
-                        "tool_use_id": intent.tool_use_id,
-                        "confidence": intent.confidence,
-                        "sensitive": intent.sensitive,
-                    })),
+                    enrichment,
+                    merge_rule_evidence(
+                        Some(json!({
+                            "source": intent.provider,
+                            "tool_use_id": intent.tool_use_id,
+                            "confidence": intent.confidence,
+                            "sensitive": intent.sensitive,
+                        })),
+                        &intent.operation,
+                    ),
                     to_i64(intent.observed_at_ms)?,
                 )?;
             }
@@ -2198,7 +2274,11 @@ impl EventStore {
         })
     }
 
-    fn append_system_event_database(&self, event: &SystemEvent) -> io::Result<()> {
+    fn append_system_event_database(
+        &self,
+        event: &SystemEvent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
         self.with_sqlite_transaction(|db| {
             let ts = to_i64(event.observed_at_ms)?;
             let matched_agent_event = agent_event_for_system_event(db, event, ts)?;
@@ -2255,7 +2335,9 @@ impl EventStore {
                     ts,
                 )?;
             }
-            record_system_event_artifacts(db, request_id, event_id, event, ts, matched)?;
+            record_system_event_artifacts(
+                db, request_id, event_id, event, ts, matched, enrichment,
+            )?;
             if !matched
                 && !matches!(
                     event.source.as_str(),
@@ -2269,7 +2351,11 @@ impl EventStore {
         })
     }
 
-    fn append_workspace_effect_database(&self, effect: &WorkspaceEffect) -> io::Result<()> {
+    fn append_workspace_effect_database(
+        &self,
+        effect: &WorkspaceEffect,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
         self.with_sqlite_transaction(|db| {
             let session_id = effect.session_id.as_deref().unwrap_or(SYSTEM_SESSION_ID);
             ensure_session(db, session_id, &effect.source, effect.observed_at_ms)?;
@@ -2352,6 +2438,7 @@ impl EventStore {
                     agent_authored: false,
                     unmatched_effect,
                     risk: None,
+                    classification: enrichment.classification_for_path(&effect.path),
                     metadata: Some(json!({
                         "source": effect.source,
                         "confidence": effect.confidence,
@@ -2361,17 +2448,20 @@ impl EventStore {
                     })),
                 },
             )?;
-            record_file_operation_alerts(
+            record_prepared_file_operation_alerts(
                 db,
                 request_id,
                 Some(EntityRef::system_event(event_id)),
-                &effect.effect_type,
                 &effect.path,
-                Some(json!({
-                    "source": effect.source,
-                    "confidence": effect.confidence,
-                    "attribution": effect.attribution,
-                })),
+                enrichment,
+                merge_rule_evidence(
+                    Some(json!({
+                        "source": effect.source,
+                        "confidence": effect.confidence,
+                        "attribution": effect.attribution,
+                    })),
+                    &effect.effect_type,
+                ),
                 to_i64(effect.observed_at_ms)?,
             )
         })
@@ -2702,34 +2792,16 @@ fn insert_entity_relation(
 }
 
 fn insert_alert(db: &SqliteStore, input: AlertInput<'_>) -> io::Result<()> {
-    let policy = Policy::load_current();
-    let tuned = policy.tuned_alert_values(input.rule_id, input.severity, input.action);
-    if !policy
-        .document()
-        .endpoint_security
-        .minimum_recorded_severity
-        .includes(&tuned.severity)
-    {
-        return Ok(());
-    }
-    let mut evidence = input.evidence;
-    if let Some(severity) = tuned.pre_review_severity {
-        evidence =
-            add_alert_evidence_field(evidence, "pre_review_severity", Value::String(severity));
-    }
-    if let Some(action) = tuned.pre_review_action {
-        evidence = add_alert_evidence_field(evidence, "pre_review_action", Value::String(action));
-    }
     db.insert_alert(&NewAlert {
         request_id: input.request_id,
         entity_kind: input.entity.map(|entity| entity.kind.to_string()),
         entity_id: input.entity.map(|entity| entity.id),
-        severity: tuned.severity,
-        action: tuned.action,
+        severity: input.severity.to_string(),
+        action: input.action.to_string(),
         rule_id: input.rule_id.to_string(),
         message: input.message.to_string(),
         path: input.path.map(str::to_string),
-        evidence: evidence.map(|value| value.to_string()),
+        evidence: input.evidence.map(|value| value.to_string()),
         created_at: input.created_at,
     })
     .map(|_| ())
@@ -2788,6 +2860,7 @@ struct ArtifactFactUpdate<'a> {
     agent_authored: bool,
     unmatched_effect: bool,
     risk: Option<ArtifactFactRisk<'a>>,
+    classification: Option<&'a ArtifactClassification>,
     metadata: Option<Value>,
 }
 
@@ -2823,7 +2896,6 @@ fn action_rank(action: &str) -> u8 {
 }
 
 fn update_artifact_fact(db: &SqliteStore, update: ArtifactFactUpdate<'_>) -> io::Result<()> {
-    let policy = Policy::global();
     let uri = file_uri(update.path);
     let existing = db.artifact_fact("file", &uri).map_err(sqlite_error)?;
     let fresh_existing = existing.as_ref().filter(|fact| {
@@ -2921,9 +2993,18 @@ fn update_artifact_fact(db: &SqliteStore, update: ArtifactFactUpdate<'_>) -> io:
             || update.agent_authored,
         is_unmatched_modified: previous_recent.is_some_and(|fact| fact.is_unmatched_modified)
             || (update.mutating && update.unmatched_effect),
-        is_memory_artifact: policy.is_memory_artifact_path(update.path),
-        is_persistent_target: policy.is_persistent_target_path(update.path),
-        is_control_plane: policy.is_control_plane_path(update.path),
+        is_memory_artifact: update
+            .classification
+            .map(|classification| classification.is_memory_artifact)
+            .unwrap_or_else(|| previous.is_some_and(|fact| fact.is_memory_artifact)),
+        is_persistent_target: update
+            .classification
+            .map(|classification| classification.is_persistent_target)
+            .unwrap_or_else(|| previous.is_some_and(|fact| fact.is_persistent_target)),
+        is_control_plane: update
+            .classification
+            .map(|classification| classification.is_control_plane)
+            .unwrap_or_else(|| previous.is_some_and(|fact| fact.is_control_plane)),
         dashboard_visible: dashboard_artifact_path_is_visible(
             update.path,
             update
@@ -2948,6 +3029,7 @@ fn record_file_intent_artifact(
     request_id: i64,
     agent_event_id: i64,
     intent: &FileIntent,
+    enrichment: &ObservationEnrichment,
 ) -> io::Result<()> {
     let ts = to_i64(intent.observed_at_ms)?;
     let Some(artifact_id) = upsert_file_artifact(
@@ -3031,6 +3113,7 @@ fn record_file_intent_artifact(
             agent_authored: true,
             unmatched_effect: false,
             risk: None,
+            classification: enrichment.classification_for_path(&intent.path),
             metadata: Some(json!({
                 "source": intent.provider,
                 "operation": intent.operation,
@@ -3047,6 +3130,7 @@ fn record_native_tool_artifact(
     request_id: i64,
     agent_event_id: i64,
     event: &AgentHookEvent,
+    enrichment: &ObservationEnrichment,
 ) -> io::Result<()> {
     if event.hook_event_name.as_deref() != Some("PreToolUse") {
         return Ok(());
@@ -3124,17 +3208,20 @@ fn record_native_tool_artifact(
         }
 
         if should_record_native_tool_file_alert(&event.provider) {
-            record_file_operation_alerts(
+            record_prepared_file_operation_alerts(
                 db,
                 request_id,
                 Some(EntityRef::agent_event(agent_event_id)),
-                &tool.operation,
                 &tool.path,
-                Some(json!({
-                    "source": event.provider,
-                    "tool_name": event.tool_name,
-                    "tool_use_id": event.tool_use_id,
-                })),
+                enrichment,
+                merge_rule_evidence(
+                    Some(json!({
+                        "source": event.provider,
+                        "tool_name": event.tool_name,
+                        "tool_use_id": event.tool_use_id,
+                    })),
+                    &tool.operation,
+                ),
                 ts,
             )?;
         }
@@ -3154,6 +3241,7 @@ fn record_native_tool_artifact(
                 agent_authored: true,
                 unmatched_effect: false,
                 risk: None,
+                classification: enrichment.classification_for_path(&tool.path),
                 metadata: Some(json!({
                     "source": event.provider,
                     "operation": tool.operation,
@@ -3310,6 +3398,7 @@ fn record_system_event_artifacts(
     event: &SystemEvent,
     ts: i64,
     matched_agent_intent: bool,
+    enrichment: &ObservationEnrichment,
 ) -> io::Result<()> {
     let raw_event = serde_json::from_str::<Value>(&event.raw_json).ok();
     let modified = raw_event
@@ -3382,6 +3471,7 @@ fn record_system_event_artifacts(
                 unmatched_effect: !matched_agent_intent
                     && matches!(request_relation_type, "produced" | "modified" | "deleted"),
                 risk: None,
+                classification: enrichment.classification_for_path(&path),
                 metadata: Some(json!({
                     "source": event.source,
                     "system_event_type": event.event_type,
@@ -3396,35 +3486,49 @@ fn record_system_event_artifacts(
     Ok(())
 }
 
-fn record_file_operation_alerts(
+fn record_prepared_file_operation_alerts(
     db: &SqliteStore,
     request_id: i64,
     entity: Option<EntityRef>,
-    operation: &str,
     path: &str,
+    enrichment: &ObservationEnrichment,
     evidence: Option<Value>,
     created_at: i64,
 ) -> io::Result<()> {
-    // Passive risk findings over an observed artifact, evaluated by the shared
-    // data-driven policy engine (same rules as the active PreToolUse path).
-    for finding in Policy::global().evaluate_observation(operation, path) {
+    for alert in enrichment.alerts_for_path(path) {
         insert_alert(
             db,
             AlertInput {
                 request_id: Some(request_id),
                 entity,
-                severity: &finding.severity,
-                action: finding.action.as_str(),
-                rule_id: &finding.rule_id,
-                message: &finding.message,
-                path: finding.path.as_deref().or(Some(path)),
-                evidence: merge_rule_evidence(evidence.clone(), operation),
+                severity: &alert.severity,
+                action: &alert.action,
+                rule_id: &alert.rule_id,
+                message: &alert.message,
+                path: alert.path.as_deref().or(Some(path)),
+                evidence: merge_evidence(evidence.clone(), alert.evidence.clone()),
                 created_at,
             },
         )?;
     }
 
     Ok(())
+}
+
+fn merge_evidence(base: Option<Value>, enrichment: Option<Value>) -> Option<Value> {
+    match (base, enrichment) {
+        (Some(Value::Object(mut base)), Some(Value::Object(enrichment))) => {
+            base.extend(enrichment);
+            Some(Value::Object(base))
+        }
+        (Some(base), Some(enrichment)) => Some(json!({
+            "observation": base,
+            "derived": enrichment,
+        })),
+        (Some(base), None) => Some(base),
+        (None, Some(enrichment)) => Some(enrichment),
+        (None, None) => None,
+    }
 }
 
 fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::Result<Vec<Value>> {
@@ -4067,7 +4171,7 @@ fn system_event_session_id(event: &SystemEvent) -> Option<String> {
         .map(str::to_string)
 }
 
-fn system_event_paths(event: &SystemEvent) -> Vec<String> {
+pub fn system_event_paths(event: &SystemEvent) -> Vec<String> {
     let mut paths = BTreeSet::new();
     if let Some(path) = &event.file_path {
         add_path_variants(path, &mut paths);
@@ -6529,7 +6633,7 @@ mod tests {
     }
 
     #[test]
-    fn risky_file_intents_create_alert_rows() {
+    fn prepared_file_intent_alerts_are_persisted_without_store_evaluation() {
         let dir =
             std::env::temp_dir().join(format!("gensee-store-test-alerts-{}", std::process::id()));
         let store = EventStore::new(&dir).unwrap();
@@ -6558,18 +6662,40 @@ mod tests {
         let alerts = store.list_alerts().unwrap();
         assert_eq!(alerts.len(), 0);
 
+        let intent = FileIntent {
+            provider: "external-file-intent-source".to_string(),
+            session_id: Some("s1".to_string()),
+            tool_use_id: Some("tool_2".to_string()),
+            observed_at_ms: 120,
+            operation: "read".to_string(),
+            path: "/Users/test/.ssh/config".to_string(),
+            source_command: "cat ~/.ssh/config".to_string(),
+            sensitive: true,
+            confidence: "low".to_string(),
+        };
         store
-            .append_file_intent(&FileIntent {
-                provider: "external-file-intent-source".to_string(),
-                session_id: Some("s1".to_string()),
-                tool_use_id: Some("tool_2".to_string()),
-                observed_at_ms: 120,
-                operation: "read".to_string(),
-                path: "/Users/test/.ssh/config".to_string(),
-                source_command: "cat ~/.ssh/config".to_string(),
-                sensitive: true,
-                confidence: "low".to_string(),
-            })
+            .append_file_intent_with_enrichment(
+                &intent,
+                &ObservationEnrichment {
+                    alerts: vec![PolicyAlert {
+                        session_id: Some("s1".to_string()),
+                        tool_use_id: Some("tool_2".to_string()),
+                        severity: "critical".to_string(),
+                        action: "block".to_string(),
+                        rule_id: "policy_sensitive_file_access".to_string(),
+                        message: "Sensitive file access".to_string(),
+                        path: Some("/Users/test/.ssh/config".to_string()),
+                        evidence: None,
+                        observed_at_ms: 120,
+                    }],
+                    artifact_classifications: vec![ArtifactClassification {
+                        path: "/Users/test/.ssh/config".to_string(),
+                        is_memory_artifact: true,
+                        is_persistent_target: false,
+                        is_control_plane: true,
+                    }],
+                },
+            )
             .unwrap();
 
         let alerts = store.list_alerts().unwrap();
@@ -6579,6 +6705,13 @@ mod tests {
         assert_eq!(alerts[0].rule_id, "policy_sensitive_file_access");
         assert_eq!(alerts[0].session_id.as_deref(), Some("s1"));
         assert_eq!(alerts[0].path.as_deref(), Some("/Users/test/.ssh/config"));
+        let fact = store
+            .artifact_fact_for_file("/Users/test/.ssh/config")
+            .unwrap()
+            .unwrap();
+        assert!(fact.is_memory_artifact);
+        assert!(!fact.is_persistent_target);
+        assert!(fact.is_control_plane);
 
         fs::remove_dir_all(&dir).ok();
     }

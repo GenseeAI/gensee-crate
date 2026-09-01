@@ -766,7 +766,7 @@ fn process_tclone_observer_request(store: &EventStore, request: Value) -> io::Re
             )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
             scope_tclone_observation_event(&mut event, run_id)?;
-            store.append_hook_event(&event)?;
+            append_hook_event_with_policy(store, &event)?;
             if !matches!(
                 event.hook_event_name.as_deref(),
                 Some("PreToolUse" | "PermissionRequest" | "PreInvocation")
