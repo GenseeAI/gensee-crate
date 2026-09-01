@@ -2698,19 +2698,24 @@ pub(crate) fn native_policy_subjects(event: &AgentHookEvent) -> Vec<PolicySubjec
         return subjects;
     }
 
-    let operation = match tool_name {
-        "Read" => "read",
-        "Write" => "write",
-        "Edit" | "MultiEdit" => "edit",
-        "Delete" => "delete",
+    let (operation, notebook) = match tool_name {
+        "Read" => ("read", false),
+        "Write" => ("write", false),
+        "Edit" | "MultiEdit" => ("edit", false),
+        "Delete" => ("delete", false),
+        "NotebookRead" => ("read", true),
+        "NotebookEdit" => ("edit", true),
         _ => return Vec::new(),
     };
-    let Some(path) = input
-        .get("file_path")
-        .or_else(|| input.get("filePath"))
-        .or_else(|| input.get("path"))
-        .and_then(Value::as_str)
-    else {
+    let path = if notebook {
+        input.get("notebook_path")
+    } else {
+        input
+            .get("file_path")
+            .or_else(|| input.get("filePath"))
+            .or_else(|| input.get("path"))
+    };
+    let Some(path) = path.and_then(Value::as_str) else {
         return Vec::new();
     };
 
@@ -2724,7 +2729,7 @@ pub(crate) fn native_policy_subjects(event: &AgentHookEvent) -> Vec<PolicySubjec
 fn is_cursor_file_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "Read" | "Write" | "Edit" | "MultiEdit" | "Delete"
+        "Read" | "Write" | "Edit" | "MultiEdit" | "Delete" | "NotebookRead" | "NotebookEdit"
     )
 }
 

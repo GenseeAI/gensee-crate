@@ -1622,7 +1622,7 @@ mod tclone_observation_tests {
         let (store, root) = test_store("falco-retention-backstop");
         for observed_at_ms in 1..=3 {
             store
-                .append_system_event(&SystemEvent {
+                .append_system_event_evidence_only(&SystemEvent {
                     source: "linux-falco".to_string(),
                     event_type: "execve".to_string(),
                     event_kind: "ProcessExec".to_string(),
@@ -1638,7 +1638,7 @@ mod tclone_observation_tests {
                 .unwrap();
         }
         store
-            .append_system_event(&SystemEvent {
+            .append_system_event_evidence_only(&SystemEvent {
                 source: "macos-endpoint-security".to_string(),
                 event_type: "exec".to_string(),
                 event_kind: "ProcessExec".to_string(),

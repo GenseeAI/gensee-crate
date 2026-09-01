@@ -40,7 +40,7 @@ pub(crate) fn record_write_time_artifact_observations(
         };
         record_artifact_snapshot_and_tags(event, store, &path, &snapshot, &findings)?;
         for finding in findings {
-            record_policy_alert(store, &finding.to_policy_alert(event))?;
+            record_policy_alert(store, finding.to_policy_alert(event))?;
         }
     }
 
