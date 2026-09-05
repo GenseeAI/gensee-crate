@@ -193,7 +193,10 @@ the oldest retained record reports the missing range once in health; the first
 returned event carries the gap so durable ingestion can record it. A zero cursor
 means a fresh or reset consumer and starts at retained history without counting
 pre-attachment history as loss. Revocation erases buffered session payloads while
-retaining cursor positions, so disabling a session cannot scramble a wrapped ring. Fetch retries
+retaining cursor positions, so disabling a session cannot scramble a wrapped ring.
+Revoked entries retain loss counts without retaining session or path data. Loss
+is folded into the next returned event; when a batch ends without such an event,
+a metadata-only `sensor_gap` record makes that loss immediately durable. Fetch retries
 do not inflate the cumulative ring-loss counter. Kernel-reported loss remains
 independent of ring retention. Gap alerts are limited to one per boot
 per minute, while exact cumulative loss counters remain visible in sensor health.
@@ -209,8 +212,10 @@ policy or claiming that a finite buffer can absorb unlimited load.
 
 ## Configuration compatibility
 
-Malformed or incompatible Cowork roots exclude the entire affected Cowork
-session and emit a diagnostic, while valid unrelated roots and sensor policy
-updates continue applying. Invalid Cowork roots never fall back to unchecked
-ordinary roots. The shared `signing-identity-fixture.json` is asserted by both
-the Rust classifier tests and the native extension tests to catch trust-rule drift.
+Malformed or incompatible Cowork updates retain the affected session's last
+valid roots, verified process generations, and buffered evidence. New invalid
+sessions are excluded. Unrelated sensor policy and root updates still apply.
+The reply and sensor health report a configuration warning until corrected;
+explicitly removing the session still revokes its scope and buffered payloads.
+The shared `signing-identity-fixture.json` is asserted by both the Rust classifier
+tests and the native extension tests to catch trust-rule drift.

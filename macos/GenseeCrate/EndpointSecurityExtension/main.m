@@ -133,6 +133,13 @@ static BOOL GenseeIsOwnProcess(const es_process_t *process)
          [signingID isEqualToString:@"ai.gensee.crate.cli"]);
 }
 
+static BOOL GenseeIsValidProcessIdentifier(id value)
+{
+    return [value isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID() &&
+        [value longLongValue] > 0 && [value longLongValue] <= INT_MAX &&
+        [value doubleValue] == [value longLongValue];
+}
+
 static BOOL GenseeIsCoworkVirtualMachineProcess(const es_process_t *process)
 {
     if (process == NULL || !process->is_platform_binary) return NO;
@@ -372,6 +379,8 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 @property(nonatomic) uint64_t kernelDrops;
 @property(nonatomic) uint64_t reportedDrops;
 @property(nonatomic) NSString *mode;
+@property(nonatomic) NSString *configurationWarning;
+@property(nonatomic) NSString *instanceID;
 @property(nonatomic) NSArray<NSString *> *protectedPaths;
 @property(nonatomic) NSSet<NSString *> *blockedExecutables;
 @property(nonatomic) NSDictionary<NSNumber *, NSString *> *managedRoots;
@@ -396,6 +405,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         _queue = dispatch_queue_create("ai.gensee.crate.endpoint-security.event-ring", DISPATCH_QUEUE_SERIAL);
         _events = [NSMutableArray arrayWithCapacity:GenseeRingCapacity];
         _nextCursor = 1;
+        _instanceID = NSUUID.UUID.UUIDString;
         _mode = @"observe";
         _protectedPaths = @[];
         _blockedExecutables = [NSSet set];
@@ -689,12 +699,15 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     NSNumber *oldest = self.events.count ? [self eventAtOffsetLocked:0][@"sensor_cursor"] : @(self.nextCursor);
     __block NSUInteger managedProcessCount = 0;
     __block NSString *mode = @"observe";
+    __block NSString *configurationWarning = @"";
     @synchronized (self) {
         managedProcessCount = self.managedProcesses.count;
         mode = self.mode;
+        configurationWarning = self.configurationWarning ?: @"";
     }
     return @{
         @"schema_version": @1,
+        @"configuration_warning": configurationWarning,
         @"mode": mode,
         @"boot_id": GenseeBootID(),
         @"running": @YES,
@@ -732,22 +745,44 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
             if (oldest - 1 > accountedThrough) self.ringDrops += oldest - 1 - accountedThrough;
             self.reportedRingLossThrough = MAX(self.reportedRingLossThrough, oldest - 1);
         }
+        uint64_t pendingLoss = lost;
         NSUInteger offset = cursor >= oldest ? MIN(cursor - oldest + 1, self.events.count) : 0;
         for (; offset < self.events.count; offset++) {
             NSDictionary *event = [self eventAtOffsetLocked:offset];
             uint64_t eventCursor = [event[@"sensor_cursor"] unsignedLongLongValue];
-            // Revoked payloads are erased, but their cursor positions remain so
-            // sparse revocation cannot break cursor arithmetic or skip events.
-            next = eventCursor;
-            if ([event[@"sensor_revoked"] boolValue]) continue;
-            if (batch.count == 0 && lost > 0) {
+            if ([event[@"sensor_revoked"] boolValue]) {
+                pendingLoss += [event[@"dropped_events"] unsignedLongLongValue];
+                // Fold loss into the next live event, or a metadata-only gap
+                // record below if the batch ends with revoked payloads.
+                next = eventCursor;
+                continue;
+            }
+            if (pendingLoss > 0) {
                 NSMutableDictionary *withLoss = [event mutableCopy];
-                withLoss[@"dropped_events"] = @([event[@"dropped_events"] unsignedLongLongValue] + lost);
+                withLoss[@"dropped_events"] = @([event[@"dropped_events"] unsignedLongLongValue] + pendingLoss);
                 event = withLoss;
+                pendingLoss = 0;
             }
             [batch addObject:event];
             next = eventCursor;
             if (batch.count >= safeLimit) break;
+        }
+        if (pendingLoss > 0 && self.events.count > 0) {
+            NSDictionary *last = [self eventAtOffsetLocked:self.events.count - 1];
+            next = [last[@"sensor_cursor"] unsignedLongLongValue];
+            // Never resurrect revoked actor/path/session data just to report
+            // transport loss. The sensor itself is the actor of this diagnostic.
+            [batch addObject:@{
+                @"schema_version": @1,
+                @"event_id": [NSString stringWithFormat:@"%@:%llu:gap", self.instanceID, (unsigned long long)next],
+                @"boot_id": GenseeBootID(),
+                @"sensor_cursor": @(next),
+                @"observed_at_ms": last[@"observed_at_ms"] ?: @((uint64_t)(NSDate.date.timeIntervalSince1970 * 1000)),
+                @"event_type": @"sensor_gap",
+                @"action": @"notify",
+                @"actor": @{@"pid": @(getpid())},
+                @"dropped_events": @(pendingLoss),
+            }];
         }
         reply(batch, next, [self healthLocked]);
     });
@@ -795,14 +830,23 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     NSMutableDictionary<NSString *, NSString *> *coworkSessionModes = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSString *, NSNumber *> *coworkCanonicalRootPIDs = [NSMutableDictionary dictionary];
     NSMutableSet<NSString *> *invalidCoworkSessions = [NSMutableSet set];
+    BOOL unidentifiedCoworkSession = NO;
     for (NSDictionary *root in managedRoots ?: @[]) {
         if (![root isKindOfClass:NSDictionary.class]) continue;
         NSNumber *pid = root[@"pid"];
         NSString *sessionID = root[@"session_id"];
-        if ([pid isKindOfClass:NSNumber.class] && [sessionID isKindOfClass:NSString.class] && pid.unsignedIntValue > 0) {
+        BOOL readableSession = [sessionID isKindOfClass:NSString.class] && sessionID.length > 0;
+        BOOL cowork = [root[@"kind"] isKindOfClass:NSString.class] && [root[@"kind"] isEqualToString:@"claude-cowork"];
+        if (!GenseeIsValidProcessIdentifier(pid) || !readableSession) {
+            if (cowork) {
+                if (readableSession) [invalidCoworkSessions addObject:sessionID];
+                else unidentifiedCoworkSession = YES;
+            }
+            continue;
+        }
+        {
             roots[pid] = sessionID;
-            NSString *kind = root[@"kind"];
-            if ([kind isKindOfClass:NSString.class] && [kind isEqualToString:@"claude-cowork"]) {
+            if (cowork) {
                 NSString *sessionMode = root[@"cowork_session_mode"];
                 if (![sessionMode isKindOfClass:NSString.class] ||
                     ![@[@"local", @"cloud", @"unknown"] containsObject:sessionMode]) {
@@ -810,9 +854,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
                     continue;
                 }
                 NSNumber *canonicalRoot = root[@"root_pid"];
-                if (![canonicalRoot isKindOfClass:NSNumber.class] ||
-                    canonicalRoot.longLongValue <= 0 || canonicalRoot.longLongValue > INT_MAX ||
-                    canonicalRoot.doubleValue != canonicalRoot.longLongValue ||
+                if (!GenseeIsValidProcessIdentifier(canonicalRoot) ||
                     (coworkCanonicalRootPIDs[sessionID] != nil &&
                      ![coworkCanonicalRootPIDs[sessionID] isEqual:canonicalRoot]) ||
                     (coworkSessionModes[sessionID] != nil &&
@@ -832,24 +874,35 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
             [invalidCoworkSessions addObject:sessionID];
         }
     }
-    // Version skew or conflicting Cowork metadata must not block unrelated
-    // policy updates. Exclude the entire affected session, including candidates
-    // seen before the invalid entry; never downgrade it to an unchecked root.
-    for (NSNumber *pid in [roots.allKeys copy]) {
-        if ([invalidCoworkSessions containsObject:roots[pid]]) {
-            [roots removeObjectForKey:pid];
-            [coworkRootPIDs removeObject:pid];
-        }
-    }
-    for (NSString *sessionID in invalidCoworkSessions) {
-        [coworkSessionModes removeObjectForKey:sessionID];
-        [coworkCanonicalRootPIDs removeObjectForKey:sessionID];
-    }
-    if (invalidCoworkSessions.count > 0) {
-        os_log_error(GenseeLog(), "Skipped %lu invalid Cowork session configurations; unrelated policy remains active.",
-                     (unsigned long)invalidCoworkSessions.count);
-    }
     @synchronized (self) {
+        // If a malformed entry cannot identify its session, preserve all known
+        // Cowork sessions; an explicit opt-out (no Cowork entries) still revokes.
+        if (unidentifiedCoworkSession) {
+            [invalidCoworkSessions addObjectsFromArray:self.coworkSessionModes.allKeys];
+            [invalidCoworkSessions addObjectsFromArray:coworkSessionModes.allKeys];
+        }
+        for (NSNumber *pid in [roots.allKeys copy]) {
+            if ([invalidCoworkSessions containsObject:roots[pid]]) {
+                [roots removeObjectForKey:pid];
+                [coworkRootPIDs removeObject:pid];
+            }
+        }
+        for (NSString *sessionID in invalidCoworkSessions) {
+            [coworkSessionModes removeObjectForKey:sessionID];
+            [coworkCanonicalRootPIDs removeObjectForKey:sessionID];
+            if (self.coworkSessionModes[sessionID] == nil) continue;
+            coworkSessionModes[sessionID] = self.coworkSessionModes[sessionID];
+            coworkCanonicalRootPIDs[sessionID] = self.coworkCanonicalRootPIDs[sessionID];
+            for (NSNumber *pid in self.managedRoots) {
+                if ([self.managedRoots[pid] isEqualToString:sessionID]) {
+                    roots[pid] = sessionID;
+                    if ([self.coworkRootPIDs containsObject:pid]) [coworkRootPIDs addObject:pid];
+                }
+            }
+        }
+        self.configurationWarning = invalidCoworkSessions.count > 0 || unidentifiedCoworkSession
+            ? @"Invalid Cowork configuration; retaining prior scope and evidence. New sessions are excluded until corrected."
+            : nil;
         NSSet<NSString *> *activeSessions = [NSSet setWithArray:roots.allValues];
         NSMutableDictionary<NSString *, NSString *> *activeProcesses = [NSMutableDictionary dictionary];
         [self.managedProcesses enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *sessionID, BOOL *stop) {
@@ -870,14 +923,16 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         for (NSUInteger offset = 0; offset < self.events.count; offset++) {
             NSDictionary *event = [self eventAtOffsetLocked:offset];
             NSString *sessionID = event[@"attribution"][@"session_id"];
-            if (sessionID.length > 0 && ![activeSessions containsObject:sessionID]) {
+            if (sessionID.length > 0 && ![activeSessions containsObject:sessionID] && ![invalidCoworkSessions containsObject:sessionID]) {
                 NSUInteger index = (self.ringStart + offset) % self.events.count;
-                self.events[index] = @{@"sensor_cursor": event[@"sensor_cursor"], @"sensor_revoked": @YES};
+                self.events[index] = @{@"sensor_cursor": event[@"sensor_cursor"], @"sensor_revoked": @YES,
+                                       @"dropped_events": event[@"dropped_events"] ?: @0,
+                                       @"observed_at_ms": event[@"observed_at_ms"] ?: @0};
             }
         }
     });
     if (self.client != NULL) es_clear_cache(self.client);
-    reply(YES, nil);
+    reply(YES, self.configurationWarning);
 }
 
 @end

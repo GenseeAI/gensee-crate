@@ -433,17 +433,18 @@ impl EventStore {
         event: &AgentHookEvent,
         enrichment: &ObservationEnrichment,
     ) -> io::Result<()> {
+        let parsed = ParsedHookEvent::new(event);
         let extracted;
         let operations = match enrichment.file_operations.as_deref() {
             Some(operations) => operations,
             None => {
-                extracted = hook_file_operations(event);
+                extracted = hook_file_operations_from(event, parsed.raw.as_ref());
                 &extracted
             }
         };
         let enrichment = enrichment
             .evidence_safe_for_paths(operations.iter().map(|operation| operation.path.as_str()));
-        self.append_hook_event_database(event, &enrichment, operations)?;
+        self.append_hook_event_database(&parsed, &enrichment, operations)?;
         append_jsonl(&self.hooks_path(), event, self.encryption_key.as_ref())
     }
 
@@ -2143,10 +2144,11 @@ impl EventStore {
 
     fn append_hook_event_database(
         &self,
-        event: &AgentHookEvent,
+        parsed: &ParsedHookEvent<'_>,
         enrichment: &ObservationEnrichment,
         file_operations: &[FileOperation],
     ) -> io::Result<()> {
+        let event = parsed.event;
         let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
         // Transcript reads can be tens of megabytes. Prepare their incremental
         // state before BEGIN IMMEDIATE so dashboard readers and other hook
@@ -2176,8 +2178,8 @@ impl EventStore {
                     let request_id = db
                         .insert_request(&NewRequest {
                             session_id: session_id.to_string(),
-                            original_user_prompt: text_from_raw_json(
-                                &event.raw_json,
+                            original_user_prompt: text_from_raw_value(
+                                parsed.raw.as_ref(),
                                 &["prompt", "user_prompt", "message"],
                             ),
                             final_response: None,
@@ -2195,7 +2197,8 @@ impl EventStore {
                             .ok()
                             .and(update.total)
                     });
-                    let response = text_from_raw_json(&event.raw_json, &["last_assistant_message"]);
+                    let response =
+                        text_from_raw_value(parsed.raw.as_ref(), &["last_assistant_message"]);
                     let request_id = if let Some(request) = db
                         .latest_request_for_session(session_id)
                         .map_err(sqlite_error)?
@@ -2239,7 +2242,7 @@ impl EventStore {
                         cwd: event.cwd.clone().unwrap_or_default(),
                         permission_mode: event.permission_mode.clone(),
                         tool_name: event.tool_name.clone(),
-                        tool_input: tool_input_json(event, file_operations),
+                        tool_input: tool_input_json(event, file_operations, parsed.raw.as_ref()),
                         tool_response: tool_response_json(event),
                         tool_use_id: event.tool_use_id.clone(),
                     };
@@ -4171,7 +4174,7 @@ fn dashboard_ignored_file_touch_paths_with_limits(
             command_line: None,
             raw_json: raw_json.to_string(),
         };
-        for path in system_event_paths(&event) {
+        for path in system_event_paths_from(&event, Some(&raw_event)) {
             if artifact_path_is_concrete(&path)
                 && (dashboard_file_touch_is_background(&path)
                     || !should_materialize_system_artifact(&event, &path, Some(&raw_event)))
@@ -4282,8 +4285,8 @@ fn is_agent_event(event: &AgentHookEvent) -> bool {
         || event.tool_use_id.is_some()
 }
 
-fn text_from_raw_json(raw_json: &str, keys: &[&str]) -> Option<String> {
-    let value = serde_json::from_str::<Value>(raw_json).ok()?;
+fn text_from_raw_value(raw: Option<&Value>, keys: &[&str]) -> Option<String> {
+    let value = raw?;
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
 }
@@ -4974,11 +4977,30 @@ fn file_uri(path: &str) -> String {
 /// Extract the file operations the store will materialize for a hook event.
 /// Policy-aware callers use this exact result to prepare enrichment, avoiding a
 /// second parser with subtly different tool or path handling.
+struct ParsedHookEvent<'a> {
+    event: &'a AgentHookEvent,
+    raw: Option<Value>,
+}
+
+impl<'a> ParsedHookEvent<'a> {
+    fn new(event: &'a AgentHookEvent) -> Self {
+        Self {
+            event,
+            raw: serde_json::from_str(&event.raw_json).ok(),
+        }
+    }
+}
+
 pub fn hook_file_operations(event: &AgentHookEvent) -> Vec<FileOperation> {
+    let parsed = ParsedHookEvent::new(event);
+    hook_file_operations_from(event, parsed.raw.as_ref())
+}
+
+fn hook_file_operations_from(event: &AgentHookEvent, raw: Option<&Value>) -> Vec<FileOperation> {
     let Some(tool_name) = event.tool_name.as_deref() else {
         return Vec::new();
     };
-    let Ok(value) = serde_json::from_str::<Value>(&event.raw_json) else {
+    let Some(value) = raw else {
         return Vec::new();
     };
     let Some(input) = value.get("tool_input") else {
@@ -5037,7 +5059,11 @@ fn resolve_tool_path(path: &str, cwd: Option<&str>) -> String {
     normalize_agent_path(path, cwd.unwrap_or("."))
 }
 
-fn tool_input_json(event: &AgentHookEvent, tools: &[FileOperation]) -> Option<String> {
+fn tool_input_json(
+    event: &AgentHookEvent,
+    tools: &[FileOperation],
+    raw: Option<&Value>,
+) -> Option<String> {
     match tools {
         [] => {
             if event.tool_input_command.is_some() || event.tool_input_description.is_some() {
@@ -5052,7 +5078,7 @@ fn tool_input_json(event: &AgentHookEvent, tools: &[FileOperation]) -> Option<St
             // they can include prompts, command arguments, or secret material.
             let tool_name = event.tool_name.as_deref()?;
             if event.provider == "vscode" && matches!(tool_name, "file_search" | "grep_search") {
-                let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+                let value = raw?;
                 let query = value
                     .get("tool_input")?
                     .get("query")?
@@ -5066,7 +5092,7 @@ fn tool_input_json(event: &AgentHookEvent, tools: &[FileOperation]) -> Option<St
             if !matches!(tool_name, "WebSearch" | "WebFetch" | "ToolSearch") {
                 return None;
             }
-            let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+            let value = raw?;
             let input = value.get("tool_input")?;
             if input.is_null() {
                 return None;

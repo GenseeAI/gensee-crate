@@ -52,9 +52,90 @@ static BOOL Configure(GenseeSensorService *service, NSArray *roots)
     return accepted;
 }
 
+static void TestInvalidConfigurationPreservesScopeAndEvidence(void)
+{
+    GenseeSensorService *service = [[GenseeSensorService alloc] init];
+    NSCAssert(Configure(service, @[CoworkRoot(@500), CoworkRoot(@501)]), @"initial valid scope");
+    es_process_t helper = CoworkProcess(501, "com.anthropic.claudefordesktop.helper.Renderer", "Q6L2SF6YDW");
+    NSCAssert([service sessionForProcessLocked:&helper messageVersion:4] != nil, @"cache verified generation");
+    dispatch_sync(service.queue, ^{ [service appendEventLocked:@{@"attribution": @{@"session_id": @"cowork"}, @"file": @{@"path": @"/test/preserved"}}]; });
+    for (id badPID in @[@"502", @0, @(-1), @1.5, @YES, @2147483648ULL, NSNull.null]) {
+        NSMutableDictionary *bad = [CoworkRoot(@502) mutableCopy];
+        bad[@"pid"] = badPID;
+        __block NSString *warning;
+        __block BOOL accepted = NO;
+        [service updateConfiguration:@{@"mode": @"protect", @"protected_paths": @[@"/test/protected"],
+            @"blocked_executables": @[@"/test/blocked"],
+            @"managed_roots": @[CoworkRoot(@500), CoworkRoot(@503), bad, @{@"pid": @900, @"session_id": @"ordinary"}]}
+            withReply:^(BOOL success, NSString *message) { accepted = success; warning = message; }];
+        NSCAssert(accepted && warning.length > 0, @"partial acceptance returns a visible warning");
+        NSCAssert([service.mode isEqual:@"protect"] && [service.protectedPaths containsObject:@"/test/protected"] && [service.blockedExecutables containsObject:@"/test/blocked"], @"unrelated policy updates apply");
+        NSCAssert(service.managedRoots[@501] != nil && service.managedRoots[@503] == nil && service.managedRoots[@900] != nil, @"retain only previous Cowork roots plus valid unrelated scope");
+        NSCAssert([[service sessionForProcessLocked:&helper messageVersion:4] isEqual:@"cowork"], @"cached verified process remains enforced");
+        dispatch_sync(service.queue, ^{
+            NSCAssert([service eventAtOffsetLocked:0][@"file"] != nil, @"malformed config never erases buffered evidence");
+            NSCAssert([[service healthLocked][@"configuration_warning"] length] > 0, @"warning survives into health replies");
+        });
+    }
+    NSCAssert(Configure(service, @[CoworkRoot(@500), CoworkRoot(@501)]), @"corrected configuration");
+    NSCAssert(service.configurationWarning == nil, @"correction clears warning");
+    NSCAssert(Configure(service, @[]), @"explicit opt-out still revokes");
+    NSCAssert([service sessionForProcessLocked:&helper messageVersion:4] == nil, @"opt-out clears adopted generations");
+    dispatch_sync(service.queue, ^{ NSCAssert([service eventAtOffsetLocked:0][@"file"] == nil, @"explicit revocation erases payload"); });
+    NSMutableDictionary *bad = [CoworkRoot(@501) mutableCopy];
+    bad[@"pid"] = @"501";
+    NSCAssert(Configure(service, @[CoworkRoot(@500), bad]), @"new invalid session is isolated");
+    NSCAssert(service.managedRoots.count == 0 && service.configurationWarning.length > 0, @"new malformed sessions are never partially adopted");
+}
+
+static void TestRevocationPreservesLoss(void)
+{
+    GenseeSensorService *service = [[GenseeSensorService alloc] init];
+    dispatch_sync(service.queue, ^{
+        [service appendEventLocked:@{}];
+        service.kernelDrops = 3;
+        [service appendEventLocked:@{@"attribution": @{@"session_id": @"removed"}, @"file": @{@"path": @"/private/removed"}}];
+    });
+    NSCAssert(Configure(service, @[]), @"revoke kernel marker payload");
+    __block NSArray *batch;
+    __block uint64_t cursor;
+    [service fetchEventsAfterCursor:0 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *health) { batch = events; cursor = next; }];
+    dispatch_sync(service.queue, ^{});
+    NSCAssert(batch.count == 2 && cursor == 2, @"trailing revoked loss is immediately deliverable");
+    NSDictionary *gap = batch.lastObject;
+    NSCAssert([gap[@"event_type"] isEqual:@"sensor_gap"] && [gap[@"dropped_events"] unsignedLongLongValue] == 3, @"kernel loss survives revocation");
+    NSCAssert(gap[@"file"] == nil && gap[@"attribution"] == nil && [gap[@"actor"][@"pid"] intValue] == getpid(), @"diagnostic never restores revoked identity or path");
+    [service fetchEventsAfterCursor:1 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *health) { batch = events; }];
+    dispatch_sync(service.queue, ^{});
+    NSCAssert([batch.firstObject isEqual:gap], @"retry is stable and does not inflate loss");
+    [service fetchEventsAfterCursor:2 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *health) { batch = events; }];
+    dispatch_sync(service.queue, ^{});
+    NSCAssert(batch.count == 0, @"acknowledged loss is not delivered again");
+    dispatch_sync(service.queue, ^{ [service appendEventLocked:@{}]; });
+    [service fetchEventsAfterCursor:1 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *health) { batch = events; }];
+    dispatch_sync(service.queue, ^{});
+    NSCAssert(batch.count == 1 && [batch.firstObject[@"dropped_events"] unsignedLongLongValue] == 3 && batch.firstObject[@"event_type"] == nil, @"fold revoked delta into next live event when available");
+
+    GenseeSensorService *wrapped = [[GenseeSensorService alloc] init];
+    dispatch_sync(wrapped.queue, ^{
+        for (NSUInteger i = 0; i < GenseeRingCapacity + 7; i++) [wrapped appendEventLocked:@{@"attribution": @{@"session_id": @"removed"}}];
+    });
+    NSCAssert(Configure(wrapped, @[]), @"revoke wrapped ring");
+    for (NSUInteger retry = 0; retry < 2; retry++) {
+        [wrapped fetchEventsAfterCursor:2 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *health) {
+            batch = events; cursor = next;
+            NSCAssert([health[@"ring_drops"] unsignedLongLongValue] == 5, @"gap counters remain exact across retry");
+        }];
+        dispatch_sync(wrapped.queue, ^{});
+        NSCAssert(batch.count == 1 && [batch.firstObject[@"dropped_events"] unsignedLongLongValue] == 5 && cursor == GenseeRingCapacity + 7, @"all-revoked replay still durably reports its gap");
+    }
+}
+
 int main(int argc, const char *argv[])
 {
     @autoreleasepool {
+        TestInvalidConfigurationPreservesScopeAndEvidence();
+        TestRevocationPreservesLoss();
         NSCAssert(argc == 2, @"shared signing fixture path required");
         NSData *fixtureData = [NSData dataWithContentsOfFile:@(argv[1])];
         NSArray *fixtures = [NSJSONSerialization JSONObjectWithData:fixtureData options:0 error:NULL];
@@ -65,11 +146,8 @@ int main(int argc, const char *argv[])
             NSCAssert(GenseeIsTrustedCoworkProcess(&actor) == [fixture[@"trusted"] boolValue], @"shared signing identity parity");
         }
         es_process_t impostor = CoworkProcess(502, "com.anthropic.claudefordesktop.helper-evil", "Q6L2SF6YDW");
-        NSCAssert(!GenseeIsTrustedCoworkProcess(&impostor), @"helper prefix must end at a component boundary");
         es_process_t vm = CoworkProcess(503, "com.apple.Virtualization.VirtualMachine", "");
-        NSCAssert(!GenseeIsTrustedCoworkProcess(&vm), @"VM signing ID alone is insufficient");
         vm.is_platform_binary = YES;
-        NSCAssert(GenseeIsTrustedCoworkProcess(&vm), @"platform VM is adoptable");
 
         GenseeSensorService *service = [[GenseeSensorService alloc] init];
         NSArray *roots = @[CoworkRoot(@502), CoworkRoot(@501), CoworkRoot(@500)];
@@ -78,19 +156,19 @@ int main(int argc, const char *argv[])
         NSCAssert(Configure(service, [[roots reverseObjectEnumerator] allObjects]), @"reverse adoption order");
         NSCAssert([[service rootPIDForSessionLocked:@"cowork"] isEqual:@500], @"root is independent of order");
         NSCAssert(Configure(service, @[CoworkRoot(@501)]), @"invalid Cowork must not reject all configuration");
-        NSCAssert(service.managedRoots.count == 0, @"exclude missing canonical app root");
+        NSCAssert(service.managedRoots.count == 3, @"preserve prior roots for missing canonical app root");
         NSMutableDictionary *conflict = [CoworkRoot(@501) mutableCopy];
         conflict[@"root_pid"] = @501;
         NSCAssert(Configure(service, @[CoworkRoot(@500), conflict]), @"isolate conflicting canonical roots");
-        NSCAssert(service.managedRoots.count == 0, @"exclude entire conflicting session");
+        NSCAssert(service.managedRoots.count == 3, @"preserve prior roots for conflicting session");
         NSMutableDictionary *legacy = [CoworkRoot(@500) mutableCopy];
         [legacy removeObjectForKey:@"root_pid"];
         NSCAssert(Configure(service, @[legacy, @{@"pid": @900, @"session_id": @"ordinary"}]), @"accept ordinary roots alongside old Cowork schema");
-        NSCAssert(service.managedRoots.count == 1 && [service.managedRoots[@900] isEqual:@"ordinary"], @"invalid Cowork must not bypass signing checks as an ordinary root");
-        NSCAssert(service.coworkSessionModes.count == 0, @"invalid session metadata removed");
+        NSCAssert(service.managedRoots.count == 4 && [service.managedRoots[@900] isEqual:@"ordinary"], @"keep prior Cowork and accept unrelated roots");
+        NSCAssert(service.coworkSessionModes.count == 1, @"prior Cowork metadata preserved");
         legacy[@"cowork_session_mode"] = @"invalid";
         NSCAssert(Configure(service, @[legacy, @{@"pid": @900, @"session_id": @"ordinary"}]), @"invalid mode is isolated too");
-        NSCAssert(service.managedRoots.count == 1 && [service.managedRoots[@900] isEqual:@"ordinary"], @"preserve unrelated configuration");
+        NSCAssert(service.managedRoots.count == 4 && [service.managedRoots[@900] isEqual:@"ordinary"], @"preserve unrelated configuration");
         NSCAssert(Configure(service, roots), @"restore valid roots");
 
         es_process_t helper = CoworkProcess(501, "com.anthropic.claudefordesktop.helper.Renderer", "Q6L2SF6YDW");

@@ -26,7 +26,21 @@ with tempfile.TemporaryDirectory(prefix='gensee-ingest-gaps-') as directory:
     ingest([300])  # Restart and change PID/path: same sensor incident.
     ingest([61000])  # Later incident must remain visible.
     ingest([62000], 'new-boot')  # Another sensor generation is independent.
+    # The sensor uses a metadata-only diagnostic when revoked payloads carry
+    # loss and no live event remains to carry the delta.
+    diagnostic = {
+        'schema_version': 1, 'event_id': 'diagnostic-boot:900:gap',
+        'boot_id': 'diagnostic-boot', 'sensor_cursor': 900,
+        'observed_at_ms': 1788640123000, 'event_type': 'sensor_gap',
+        'action': 'notify', 'actor': {'pid': 9999}, 'dropped_events': 7,
+    }
+    subprocess.run([binary, 'ingest', 'endpoint-security'], env=env,
+                   input=json.dumps(diagnostic) + '\n', text=True,
+                   capture_output=True, check=True)
     with sqlite3.connect(Path(directory) / 'gensee.db') as database:
         rows = database.execute('SELECT rule_id, count(*) FROM alerts GROUP BY rule_id').fetchall()
-        assert rows == [('endpoint_security_event_gap', 3)], rows
+        assert rows == [('endpoint_security_event_gap', 4)], rows
+        payload = json.loads(database.execute("SELECT args FROM system_events WHERE type='sensor_gap'").fetchone()[0])
+        assert payload['dropped_events'] == 7
+        assert not payload.get('file') and not payload.get('attribution', {}).get('session_id')
     print('Endpoint ingest gap regression passed')

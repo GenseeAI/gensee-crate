@@ -24,6 +24,7 @@ struct EndpointSensorHealth: Equatable {
     var managedProcesses: UInt64 = 0
     var lastEventAt: Date?
     var error: String?
+    var configurationWarning: String?
     var launchContinuityIssue: EndpointEvidenceContinuityIssue?
 
     var hasDataLoss: Bool {
@@ -305,7 +306,7 @@ final class EndpointSecuritySensor: ObservableObject {
                 )
             }
             health.connected = true
-            health.error = ingestionWarning
+            health.error = health.configurationWarning ?? ingestionWarning
         } catch {
             health.connected = false
             health.error = error.localizedDescription
@@ -314,13 +315,13 @@ final class EndpointSecuritySensor: ObservableObject {
 
     private func pushConfiguration(using connection: GenseeEndpointSecurityBridge) async throws {
         let configuration = pendingConfiguration
-        let accepted = try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Bool, Error>) in
+        let warning = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<String?, Error>) in
             connection.updateConfiguration(
                 configuration,
                 reply: { accepted, message in
                     if accepted {
-                        continuation.resume(returning: true)
+                        continuation.resume(returning: message)
                     } else {
                         continuation.resume(throwing: NSError(
                             domain: "ai.gensee.crate.endpoint-security",
@@ -332,7 +333,8 @@ final class EndpointSecuritySensor: ObservableObject {
                 failure: { error in continuation.resume(throwing: error) }
             )
         }
-        if accepted { configurationNeedsPush = false }
+        health.configurationWarning = warning
+        configurationNeedsPush = false
     }
 
     @discardableResult
@@ -340,6 +342,9 @@ final class EndpointSecuritySensor: ObservableObject {
         _ dictionary: [String: Any],
         fetchedThroughCursor: UInt64
     ) -> Bool {
+        if let warning = dictionary["configuration_warning"] as? String {
+            health.configurationWarning = warning.isEmpty ? nil : warning
+        }
         let nextBootID = dictionary["boot_id"] as? String ?? ""
         let nextCursor = number(dictionary["next_cursor"])
         let oldestCursor = number(dictionary["oldest_cursor"])
