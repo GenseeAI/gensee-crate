@@ -388,6 +388,7 @@ private struct CoworkHarnessRow: View {
     @ObservedObject var sensor: EndpointSecuritySensor
     let integration: IntegrationDescriptor
     @State private var expanded = false
+    @State private var pendingProtectionLevel: ProtectionLevel?
 
     private var sensorReady: Bool {
         sensor.health.connected && sensor.health.running && sensor.health.error == nil
@@ -404,14 +405,8 @@ private struct CoworkHarnessRow: View {
                         DashboardTag(text: integration.statusLabel, color: integration.configured ? .dashboardBlue : .secondary)
                     }
                     Text(integration.detail).font(.system(size: 11)).foregroundStyle(.secondary)
-                    Text(integration.configured
-                         ? "Mac sensor: \(sensorReady ? "running" : "needs attention") · Audit collection: manual setup"
-                         : integration.installationDetail)
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if integration.installed || integration.configured {
-                        Text("Uses this Mac’s \(model.policy.endpointSecurityMode) sensor mode · Session mode: \(model.coworkSessionMode)")
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    if !integration.installed {
+                        Text(integration.installationDetail).font(.system(size: 10)).foregroundStyle(.secondary)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -431,66 +426,127 @@ private struct CoworkHarnessRow: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
 
-            DisclosureGroup("Setup and coverage", isExpanded: $expanded) {
-                VStack(alignment: .leading, spacing: 9) {
-                    Text("Endpoint policy: \(model.policy.endpointSecurityMode). Enabling visibility applies this Mac’s existing sensor rules to Claude Desktop and its tracked descendants, which may include other Claude activity. Start in Observe mode in Settings when trying the pilot.")
-                    HStack(spacing: 10) {
-                        Text("Session mode")
-                        Picker("Cowork session mode", selection: Binding(
-                            get: { model.coworkSessionMode },
-                            set: { mode in Task { await model.setCoworkSessionMode(mode) } }
-                        )) {
-                            Text("Unknown / mixed").tag("unknown")
-                            Text("Local").tag("local")
-                            Text("Cloud").tag("cloud")
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    Text("Protection (Mac-wide)").fontWeight(.medium)
+                    Picker("Mac-wide protection", selection: Binding<ProtectionLevel?>(
+                        get: { model.protectionLevel },
+                        set: { level in
+                            guard let level else { return }
+                            if model.wouldLowerProtection(level) {
+                                pendingProtectionLevel = level
+                            } else {
+                                Task { _ = await model.applyProtectionLevel(level) }
+                            }
                         }
-                        .labelsHidden()
-                        .frame(width: 155)
-                        .disabled(model.isDemoMode || !model.backendAvailable || model.runningCommand != nil)
-                        .accessibilityIdentifier("harness.claude-cowork.sessionMode")
+                    )) {
+                        if model.protectionLevel == nil { Text("Custom").tag(Optional<ProtectionLevel>.none) }
+                        ForEach(ProtectionLevel.allCases) { level in
+                            Text(level.endpointMode.capitalized).tag(Optional(level))
+                        }
                     }
-                    Text("Use Local only when the tracked sessions run locally. Leave mixed or unverified sessions Unknown. Restart manual audit ingestion after changing this setting.")
-                    Text("Sensor: \(sensorReady ? "connected and running" : "unavailable — check the extension and Full Disk Access in Settings").")
-                    if let error = sensor.health.error {
-                        Text(error).foregroundStyle(Color.dashboardGold)
-                    }
-                    if sensor.health.hasDataLoss || sensor.health.hasBackpressure {
-                        Text("The sensor reports evidence loss or a collection backlog. Review sensor health in Settings.")
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(width: 270)
+                    .disabled(model.isDemoMode || !model.backendAvailable || model.policyDocument.isEmpty || model.runningCommand != nil)
+                    .accessibilityIdentifier("harness.claude-cowork.protectionLevel")
+                    .help("Uses the same presets as Settings: Observe = Fast, Protect = Review, Strict = Sensitive. Changes sensor mode and hook interactivity for all enabled harnesses.")
+                }
+                Text(protectionDetail + " Shared by all enabled harnesses.")
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 16) {
+                    Label(sensorReady ? "Sensor connected" : "Sensor unavailable", systemImage: sensorReady ? "checkmark.circle" : "exclamationmark.circle")
+                    Link("Set up audit collection ↗", destination: URL(string: "https://github.com/GenseeAI/gensee-crate/blob/main/integrations/claude-cowork/README.md#local-audit-ingestion")!)
+                        .help("Audit collection runs separately in your terminal. Stop it there when finished.")
+                    if !sensorReady || sensor.health.hasDataLoss || sensor.health.hasBackpressure {
+                        Button("Review sensor health") { model.requestedDashboardDestination = .settings }
+                            .buttonStyle(.link)
                             .foregroundStyle(Color.dashboardGold)
                     }
-                    Text("Audit collection requires a separate terminal stream for each session. Enable and Disable control endpoint visibility; stop manual audit streams in their terminals. Gensee cannot confirm that a manual collector is still running.")
-                    Link("Open Cowork audit setup guide", destination: URL(string: "https://github.com/GenseeAI/gensee-crate/blob/main/integrations/claude-cowork/README.md#local-audit-ingestion")!)
-
-                    if let issue = model.coworkCheckIssue {
-                        Text(issue).foregroundStyle(Color.dashboardGold)
-                    } else if let evidence = model.coworkEvidence, let checkedAt = model.coworkCheckedAt {
-                        Text("Evidence checked \(checkedAt.formatted(date: .abbreviated, time: .standard)). Sample: latest \(evidence.sampleLimit) stored system events.")
-                            .fontWeight(.medium)
-                        evidenceLine("Native tool audit", date: evidence.lastEvent(source: "claude-cowork-local-audit", origin: "host-native"))
-                        evidenceLine("VM tool audit", date: evidence.lastEvent(source: "claude-cowork-local-audit", origin: "vm-mediated"))
-                        evidenceLine("Other / unknown audit", date: evidence.lastEvent(source: "claude-cowork-local-audit", origin: "unattributed"))
-                        evidenceLine("Cloud tool audit", date: evidence.lastEvent(source: "claude-cowork-local-audit", origin: "cloud-mediated"))
-                        evidenceLine("Cowork endpoint evidence", date: evidence.lastEvent(source: "macos-endpoint-security"))
-                        Text("These are historical event times, not a live health guarantee. Older evidence may fall outside the sample. Run a native file task and a VM shell task in a test folder, then Verify again and check that the times advance.")
-                    } else {
-                        Text("Evidence has not been checked. Enable visibility, configure audit ingestion, then use Verify.")
-                    }
-                    Text("VM coverage includes tool boundaries and host-visible effects. Guest commands, guest process lineage, cloud execution, and automatic causal joining of audit and sensor events are outside this pilot’s visibility.")
                 }
-                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-                .padding(.top, 8)
+                Text("Covers host activity and VM boundaries; guest commands and cloud execution are outside coverage.")
+                    .foregroundStyle(.secondary)
+
+                DisclosureGroup("Session & evidence", isExpanded: $expanded) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 10) {
+                            Text("Session mode")
+                            Picker("Cowork session mode", selection: Binding(
+                                get: { model.coworkSessionMode },
+                                set: { mode in Task { await model.setCoworkSessionMode(mode) } }
+                            )) {
+                                Text("Unknown / mixed").tag("unknown")
+                                Text("Local").tag("local")
+                                Text("Cloud").tag("cloud")
+                            }
+                            .labelsHidden()
+                            .frame(width: 155)
+                            .disabled(model.isDemoMode || !model.backendAvailable || model.runningCommand != nil)
+                            .accessibilityIdentifier("harness.claude-cowork.sessionMode")
+                            .help("Choose Local only for confirmed local sessions. Restart manual audit ingestion after changing mode.")
+                        }
+                        if let issue = model.coworkCheckIssue {
+                            Text(issue).foregroundStyle(Color.dashboardGold)
+                        } else if let evidence = model.coworkEvidence, let checkedAt = model.coworkCheckedAt {
+                            if evidence.evidence.isEmpty {
+                                Text("No Cowork evidence in the latest \(evidence.sampleLimit) events.")
+                            } else {
+                                ForEach(Array(evidence.evidence.enumerated()), id: \.offset) { _, item in
+                                    HStack {
+                                        Text(evidenceLabel(item))
+                                        Text(Date(timeIntervalSince1970: Double(item.lastEventAt) / 1_000).formatted(date: .abbreviated, time: .standard))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                            Text("Checked \(checkedAt.formatted(date: .omitted, time: .shortened)) · Recent history, not live verification")
+                                .foregroundStyle(.secondary)
+                                .help("Samples the latest \(evidence.sampleLimit) system events. Older evidence may be outside the sample. Run native and VM test tasks, then Verify again to check for new event times.")
+                        } else {
+                            Text("Run a Cowork task, then Verify to check recent evidence.")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.top, 8)
+                }
             }
-            .font(.system(size: 10))
+            .font(.system(size: 11))
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.leading, 54)
         }
         .padding(.vertical, 13)
         .accessibilityElement(children: .contain)
+        .alert("Lower protection for all harnesses?", isPresented: Binding(
+            get: { pendingProtectionLevel != nil },
+            set: { if !$0 { pendingProtectionLevel = nil } }
+        ), presenting: pendingProtectionLevel) { level in
+            Button("Cancel", role: .cancel) { pendingProtectionLevel = nil }
+            Button("Use \(level.endpointMode.capitalized)", role: .destructive) {
+                pendingProtectionLevel = nil
+                Task { _ = await model.applyProtectionLevel(level) }
+            }
+        } message: { _ in
+            Text("This changes this Mac’s sensor mode and hook interactivity for all enabled harnesses.")
+        }
     }
 
-    private func evidenceLine(_ label: String, date: Date?) -> some View {
-        Text("\(label): \(date.map { $0.formatted(date: .abbreviated, time: .standard) } ?? "not seen in sample")")
+    private var protectionDetail: String {
+        switch model.protectionLevel {
+        case .observe: "Records host activity; existing hook rules still apply."
+        case .guarded: "Blocks protected host paths and executables."
+        case .unattended: "Same host blocks as Protect; risky hook approvals become denials."
+        case nil: "Custom policy. Select a preset to change protection."
+        }
+    }
+
+    private func evidenceLabel(_ item: CoworkEvidenceStatus.Evidence) -> String {
+        guard item.source == "claude-cowork-local-audit" else { return "Host events (\(item.origin))" }
+        switch item.origin {
+        case "host-native": return "Native audit"
+        case "vm-mediated": return "VM audit"
+        case "cloud-mediated": return "Cloud audit"
+        default: return "Unknown audit"
+        }
     }
 }

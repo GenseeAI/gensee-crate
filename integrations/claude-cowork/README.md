@@ -41,9 +41,15 @@ Cowork endpoint opt-in; it preserves Claude Code hooks and the Mac's current
 Endpoint Security mode. Start in Observe mode in Settings for the pilot.
 The Setup Assistant's bulk action enables hooks only; opt into Cowork separately.
 
-Expand **Setup and coverage** to select the independently established session
-mode (unknown by default), inspect live sensor health, and open these audit
-instructions. **Verify** reads historical audit and Cowork sensor evidence from
+The **Protection (Mac-wide)** selector uses the same presets as Settings:
+Observe (Fast), Protect (Review), and Strict (Sensitive). It changes sensor mode
+and hook interactivity for all enabled harnesses. Protect and Strict enforce the
+same Cowork host rules; Strict also converts risky hook approvals to denials.
+Neither adds guest-command or cloud enforcement.
+
+Expand **Session & evidence** to select the independently established session
+mode (unknown by default) and inspect recent evidence. Sensor status and the
+manual audit setup link stay visible in the row. **Verify** reads historical audit and Cowork sensor evidence from
 the latest 2,000 stored system events. It shows event times separately for native,
 VM, cloud, and unknown audit boundaries; no evidence in this bounded sample does
 not mean no evidence exists in older history. The same metadata-only diagnostics
