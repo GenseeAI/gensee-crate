@@ -121,6 +121,8 @@ mod falco;
 pub(crate) use falco::*;
 mod replay;
 pub(crate) use replay::*;
+mod cowork;
+pub(crate) use cowork::*;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -3410,6 +3412,20 @@ const ENDPOINT_SECURITY_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[
         help: "Absolute executable paths denied to managed agent trees",
         allow_null: false,
     },
+    PolicySetupItem {
+        key: "cowork_endpoint_visibility.enabled",
+        value_type: PolicySetupValueType::Bool,
+        label: "Claude Cowork endpoint visibility",
+        help: "Register the signed Claude Desktop process tree as a managed macOS root",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "cowork_endpoint_visibility.session_mode",
+        value_type: PolicySetupValueType::String,
+        label: "Claude Cowork session mode",
+        help: "local, cloud, or unknown; use unknown unless independently established",
+        allow_null: false,
+    },
 ];
 
 const WATCH_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[PolicySetupItem {
@@ -3559,6 +3575,8 @@ const SETTABLE_POLICY_KEYS: &[&str] = &[
     "endpoint_security.raw_event_retention_hours",
     "endpoint_security.max_raw_events",
     "endpoint_security.low_severity_retention_hours",
+    "cowork_endpoint_visibility.enabled",
+    "cowork_endpoint_visibility.session_mode",
     "recovery.default_mode",
     "recovery.harnesses.codex",
     "recovery.harnesses.claude-code",
@@ -3626,6 +3644,8 @@ pub(crate) fn telemetry_policy_key_bucket(key: &str) -> &'static str {
         "endpoint_security.low_severity_retention_hours" => {
             "endpoint_security.low_severity_retention_hours"
         }
+        "cowork_endpoint_visibility.enabled" => "cowork_endpoint_visibility.enabled",
+        "cowork_endpoint_visibility.session_mode" => "cowork_endpoint_visibility.session_mode",
         "recovery.default_mode" => "recovery.default_mode",
         "recovery.harnesses.codex" => "recovery.harnesses.codex",
         "recovery.harnesses.claude-code" => "recovery.harnesses.claude-code",
@@ -3706,9 +3726,10 @@ pub(crate) fn handle_ingest(args: Vec<OsString>) -> io::Result<()> {
         Some("eslogger") => ingest_eslogger(),
         Some("endpoint-security") => ingest_endpoint_security(),
         Some("falco") => ingest_falco(args[1..].to_vec()),
+        Some("cowork-audit") => ingest_cowork_audit(args[1..].to_vec()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee ingest eslogger|endpoint-security|falco [--host <name>]",
+            "usage: gensee ingest eslogger|endpoint-security|falco [--host <name>]|cowork-audit [--session-mode local|cloud|unknown]",
         )),
     }
 }

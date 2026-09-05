@@ -52,6 +52,8 @@ export interface SystemEvent {
   path: string | null;
   /** Computed by the API — the process that triggered the event. */
   process: string | null;
+  /** Evidence-based execution boundary; never inferred when evidence is absent. */
+  execution_origin: 'host-native' | 'vm-mediated' | 'cloud-mediated' | 'unattributed';
 }
 
 export type TransactionOperation =

@@ -1,3 +1,4 @@
+use crate::cowork::{classify_cowork_event, CoworkEventContext};
 use gensee_crate_core::{endpoint_security_path_is_known_build_output, AgentSession, SystemEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -135,6 +136,8 @@ pub struct EndpointSecurityEvent {
     pub attribution: EndpointSecurityAttribution,
     #[serde(default)]
     pub decision: EndpointSecurityDecision,
+    #[serde(default)]
+    pub cowork: Option<CoworkEventContext>,
 }
 
 fn default_action() -> String {
@@ -197,7 +200,11 @@ impl EndpointSecurityEvent {
     }
 
     pub fn into_system_event(self) -> io::Result<SystemEvent> {
-        let raw_json = serde_json::to_string(&self).map_err(io::Error::other)?;
+        let cowork_visibility = classify_cowork_event(&self);
+        let mut raw_value = serde_json::to_value(&self).map_err(io::Error::other)?;
+        raw_value["cowork_visibility"] =
+            serde_json::to_value(&cowork_visibility).map_err(io::Error::other)?;
+        let raw_json = serde_json::to_string(&raw_value).map_err(io::Error::other)?;
         let event_kind = if self.action == "auth" {
             "authorization"
         } else {
@@ -236,7 +243,8 @@ impl EndpointSecurityEvent {
             file_path: self.primary_path().map(str::to_string),
             command_line,
             raw_json,
-        })
+        }
+        .with_execution_origin(cowork_visibility.execution_origin))
     }
 }
 
@@ -713,6 +721,7 @@ mod tests {
             modified: None,
             attribution: EndpointSecurityAttribution::default(),
             decision: EndpointSecurityDecision::default(),
+            cowork: None,
         }
     }
 

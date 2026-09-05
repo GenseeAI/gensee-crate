@@ -7317,6 +7317,8 @@ fn policy_setup_flow_updates_dashboard_settings() {
         "protect",                         // endpoint_security.mode
         "/Users/me/.ssh,/Users/me/.aws",   // endpoint_security.protected_paths
         "/usr/bin/osascript",              // endpoint_security.blocked_executables
+        "yes",                             // cowork_endpoint_visibility.enabled
+        "local",                           // cowork_endpoint_visibility.session_mode
         "none",                            // watch.system_events
         "/Users/me/templates,/opt/shared", // allow_path_prefixes
     ]
@@ -7346,6 +7348,14 @@ fn policy_setup_flow_updates_dashboard_settings() {
     assert_eq!(
         policy_value_get(&root, "runtime.max_runtime_seconds"),
         Some(&json!(600))
+    );
+    assert_eq!(
+        policy_value_get(&root, "cowork_endpoint_visibility.enabled"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        policy_value_get(&root, "cowork_endpoint_visibility.session_mode"),
+        Some(&json!("local"))
     );
     assert_eq!(
         policy_value_get(&root, "linux.seccomp.enabled"),

@@ -410,8 +410,9 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
                 println!("    system events:");
                 for event in &call.system_events {
                     println!(
-                        "      source={} kind={} type={} pid={} ppid={} process={} path={} network={} command={}",
+                        "      source={} origin={} kind={} type={} pid={} ppid={} process={} path={} network={} command={}",
                         event.source,
+                        event.execution_origin().as_str(),
                         event.event_kind,
                         event.event_type,
                         option_u32_display(event.pid),
@@ -439,9 +440,10 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
         println!("Layer 1 system events");
         for event in system_events.iter().rev().take(20).rev() {
             println!(
-                "  {} | source={} | kind={} | type={} | pid={} | process={} | path={} | network={} | command={}",
+                "  {} | source={} | origin={} | kind={} | type={} | pid={} | process={} | path={} | network={} | command={}",
                 event.observed_at_ms,
                 event.source,
+                event.execution_origin().as_str(),
                 event.event_kind,
                 event.event_type,
                 option_u32_display(event.pid),

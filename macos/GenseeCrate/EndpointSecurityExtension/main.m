@@ -133,6 +133,15 @@ static BOOL GenseeIsOwnProcess(const es_process_t *process)
          [signingID isEqualToString:@"ai.gensee.crate.cli"]);
 }
 
+static BOOL GenseeIsClaudeDesktopProcess(const es_process_t *process)
+{
+    if (process == NULL) return NO;
+    NSString *signingID = GenseeStringFromToken(process->signing_id);
+    NSString *teamID = GenseeStringFromToken(process->team_id);
+    return [teamID isEqualToString:@"Q6L2SF6YDW"] &&
+        [signingID isEqualToString:@"com.anthropic.claudefordesktop"];
+}
+
 static NSString *GenseeDestinationPath(const es_file_t *directory, es_string_token_t filename)
 {
     NSString *name = GenseeStringFromToken(filename);
@@ -354,6 +363,8 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 @property(nonatomic) NSSet<NSString *> *blockedExecutables;
 @property(nonatomic) NSDictionary<NSNumber *, NSString *> *managedRoots;
 @property(nonatomic) NSMutableDictionary<NSString *, NSString *> *managedProcesses;
+@property(nonatomic) NSSet<NSNumber *> *coworkRootPIDs;
+@property(nonatomic) NSDictionary<NSString *, NSString *> *coworkSessionModes;
 @property(nonatomic) uint64_t maxAuthorizationLatencyUS;
 @property(nonatomic) uint64_t authorizationCount;
 @property(nonatomic) uint64_t deniedCount;
@@ -376,6 +387,8 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         _blockedExecutables = [NSSet set];
         _managedRoots = @{};
         _managedProcesses = [NSMutableDictionary dictionary];
+        _coworkRootPIDs = [NSSet set];
+        _coworkSessionModes = @{};
         _maxAuthorizationLatencyUS = 10000;
     }
     return self;
@@ -419,6 +432,9 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     NSNumber *pid = @(audit_token_to_pid(process->audit_token));
     session = self.managedRoots[pid];
     if (session != nil) {
+        if ([self.coworkRootPIDs containsObject:pid] && !GenseeIsClaudeDesktopProcess(process)) {
+            return nil;
+        }
         self.managedProcesses[key] = session;
         return session;
     }
@@ -536,11 +552,15 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 {
     __block NSString *actorSession = nil;
     __block NSNumber *actorRootPID = nil;
+    __block NSString *actorCoworkMode = nil;
     __block BOOL actorIsOwn = NO;
     @synchronized (self) {
         actorIsOwn = [self isOwnProcessLocked:message->process];
         actorSession = [self sessionForProcessLocked:message->process messageVersion:message->version];
-        if (actorSession != nil) actorRootPID = [self rootPIDForSessionLocked:actorSession];
+        if (actorSession != nil) {
+            actorRootPID = [self rootPIDForSessionLocked:actorSession];
+            actorCoworkMode = self.coworkSessionModes[actorSession];
+        }
         if (message->event_type == ES_EVENT_TYPE_NOTIFY_FORK) {
             if (actorSession != nil) self.managedProcesses[[self keyForProcess:message->event.fork.child]] = actorSession;
         } else if (message->event_type == ES_EVENT_TYPE_NOTIFY_EXEC) {
@@ -560,6 +580,11 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
                 NSMutableDictionary<NSNumber *, NSString *> *remainingRoots = [self.managedRoots mutableCopy];
                 [remainingRoots removeObjectForKey:pid];
                 self.managedRoots = remainingRoots;
+                if ([self.coworkRootPIDs containsObject:pid]) {
+                    NSMutableSet<NSNumber *> *remainingCoworkRoots = [self.coworkRootPIDs mutableCopy];
+                    [remainingCoworkRoots removeObject:pid];
+                    self.coworkRootPIDs = remainingCoworkRoots;
+                }
             }
         }
     }
@@ -575,6 +600,16 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         @"confidence": @1.0,
         @"matched_by": @"endpoint_security_process_tree",
     };
+    if (actorCoworkMode != nil) {
+        serialized[@"cowork"] = @{
+            @"session_id": actorSession,
+            @"session_mode": actorCoworkMode,
+            // Process-tree membership proves that Cowork caused the syscall,
+            // but does not by itself prove whether a local host tool, the VM,
+            // or a bridge caused it. Audit correlation supplies that evidence.
+            @"tool_surface": @"unknown",
+        };
+    }
     dispatch_async(self.queue, ^{
         NSMutableDictionary *withCursor = [serialized mutableCopy];
         withCursor[@"sensor_cursor"] = @(self.nextCursor++);
@@ -690,11 +725,24 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         return;
     }
     NSMutableDictionary<NSNumber *, NSString *> *roots = [NSMutableDictionary dictionary];
+    NSMutableSet<NSNumber *> *coworkRootPIDs = [NSMutableSet set];
+    NSMutableDictionary<NSString *, NSString *> *coworkSessionModes = [NSMutableDictionary dictionary];
     for (NSDictionary *root in managedRoots ?: @[]) {
         NSNumber *pid = root[@"pid"];
         NSString *sessionID = root[@"session_id"];
         if ([pid isKindOfClass:NSNumber.class] && [sessionID isKindOfClass:NSString.class] && pid.unsignedIntValue > 0) {
             roots[pid] = sessionID;
+            NSString *kind = root[@"kind"];
+            if ([kind isKindOfClass:NSString.class] && [kind isEqualToString:@"claude-cowork"]) {
+                NSString *sessionMode = root[@"cowork_session_mode"];
+                if (![sessionMode isKindOfClass:NSString.class] ||
+                    ![@[@"local", @"cloud", @"unknown"] containsObject:sessionMode]) {
+                    reply(NO, @"Cowork managed roots require a local, cloud, or unknown session mode.");
+                    return;
+                }
+                [coworkRootPIDs addObject:pid];
+                coworkSessionModes[sessionID] = sessionMode;
+            }
         }
     }
     @synchronized (self) {
@@ -708,6 +756,8 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         self.blockedExecutables = [NSSet setWithArray:[(blockedExecutables ?: @[]) valueForKey:@"stringByStandardizingPath"]];
         self.managedRoots = roots;
         self.managedProcesses = activeProcesses;
+        self.coworkRootPIDs = coworkRootPIDs;
+        self.coworkSessionModes = coworkSessionModes;
         self.maxAuthorizationLatencyUS = (maxAuthorizationLatencyMS ?: @10).unsignedLongLongValue * 1000ULL;
     }
     NSSet<NSString *> *activeSessions = [NSSet setWithArray:roots.allValues];

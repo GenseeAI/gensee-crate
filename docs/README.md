@@ -30,6 +30,7 @@ Gensee Crate is an open-source control layer for AI coding agents. Start with
 - [`gensee policy`](gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.
 - [`gensee audit`](config-audit.md) — statically review Codex and VS Code agent permissions, privacy, MCP, skills, hooks, extensions, rules, and instructions.
 - [Claude Code hooks](claude-code-hooks.md) — wire Claude Code prompts and tool intent into Gensee, and read the combined timeline.
+- [Claude Cowork endpoint visibility](../integrations/claude-cowork/README.md) — macOS pilot contract, local audit adapter, execution-origin labels, and explicit VM/cloud limitations.
 - [Codex hooks](codex-support.md) — wire Codex prompts and tool intent into Gensee, and read the combined timeline.
 - [Codex integration](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/codex) — setup commands, hook samples, and smoke-test payloads.
 - [Antigravity support](antigravity-support.md) — global hook setup, `.agents` policy coverage, and sidecar audit.
