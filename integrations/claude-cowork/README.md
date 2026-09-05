@@ -99,6 +99,12 @@ are learned from Endpoint Security fork/exec events. All candidates retain the
 app's canonical root PID; enumeration order cannot change the recorded root.
 Snapshot collection reserves growth capacity, retries boundedly, and logs failure.
 
+Launchd-owned VM processes are also associated when Endpoint Security's
+responsible audit token points to an already verified Cowork process generation.
+This requires Apple's platform VM identity and an exact `(pid, pidversion)` match;
+an unrelated VM or a reused responsible PID is not adopted. Association can only
+start after evidence for the responsible process has been observed.
+
 Apple's signed `com.apple.Virtualization.VirtualMachine` process is recognized
 as a VM boundary. Seeing that boundary does not reveal the Linux process that
 performed a command. A VM audit boundary is `vm-mediated`. Observing a resulting file on the Mac does
@@ -144,4 +150,27 @@ adoption, PID-generation, canonical-root, conservative tool-surface, and process
 snapshot retry paths. It uses synthetic records without starting an ES client.
 Rust Cowork tests cover timestamp/mode handling, origin classification, and
 policy-enriched artifact ingestion without spurious unmatched-effect alerts.
-A signed, entitled live test is still needed to validate real Claude/macOS builds.
+Repeat signed, entitled live tests for each supported Claude/macOS build.
+
+The signed macOS 15.1 / Claude Desktop 1.46388.4 regression run exercised native
+Read/Write/Edit and `mcp__workspace__bash` in the local Linux VM. Independent
+file evidence was captured for both, including the existing launchd-owned VM.
+This is a compatibility result for that build, not a guarantee for other versions.
+See [the validation notes](VALIDATION.md) for results and limitations.
+
+## Sensor buffering and health
+
+The endpoint retains a bounded 20,000-event circular replay buffer. Normal
+eviction of consumed history does not count as loss. A consumer cursor behind
+the oldest retained record reports the missing range once in health; the first
+returned event carries the gap so durable ingestion can record it. Fetch retries
+do not inflate the cumulative ring-loss counter. Kernel-reported loss remains
+independent of ring retention. Gap alerts are limited to one per boot
+per minute, while exact cumulative loss counters remain visible in sensor health.
+
+The app drains acknowledged batches of up to 500 records with a short yield
+while a backlog exists, and polls every 500 ms when idle or disconnected.
+Backpressure does not reduce the batch size or add an idle polling delay to
+each queued batch. Ingestion timing excludes time spent waiting for input.
+This improves burst recovery without changing the synchronous authorization
+policy or claiming that a finite buffer can absorb unlimited load.

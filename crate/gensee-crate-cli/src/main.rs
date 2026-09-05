@@ -4131,7 +4131,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
     let mut rejected_in_batch = 0_u64;
     let mut persisted_in_batch = 0_u64;
     let mut suppressed_in_batch = 0_u64;
-    let mut batch_started = Instant::now();
+    let mut batch_started = None;
     let mut recording = Policy::load_current().document().endpoint_security.clone();
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -4144,6 +4144,9 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             continue;
         }
         if let Some(commit) = endpoint_ingest_commit(line)? {
+            // Time ingestion/maintenance, not the idle wait for the host's
+            // next poll. Idle time otherwise looks like storage backpressure.
+            let batch_started = batch_started.take().unwrap_or_else(Instant::now);
             let mut acknowledgement =
                 endpoint_ingest_ack(&commit, received_in_batch, rejected_in_batch)?;
             let mut pruned_system_events = 0_u64;
@@ -4204,13 +4207,13 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             rejected_in_batch = 0;
             persisted_in_batch = 0;
             suppressed_in_batch = 0;
-            batch_started = Instant::now();
             continue;
         }
         // The host's barrier counts every event line it sent. Rejected lines
         // still belong to that batch; report them in the durable ack so the
         // host can advance past malformed/version-skewed evidence and surface
         // the loss instead of replaying the same poisoned batch forever.
+        batch_started.get_or_insert_with(Instant::now);
         received_in_batch += 1;
         let parsed = match EndpointSecurityEvent::parse(line) {
             Ok(event) => event,
@@ -4294,7 +4297,13 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 evidence: Some(evidence.clone()),
                 observed_at_ms,
             };
-            if let Some(session_id) = active_session_id.as_deref() {
+            if alert.rule_id == "endpoint_security_event_gap" {
+                // Loss is a sensor-health incident, not a finding per affected
+                // file/process. Keep the first alert per minute and retain exact
+                // cumulative counters in sensor health.
+                let key = format!("endpoint-evidence-gap:{}", event.boot_id);
+                record_endpoint_policy_alert(&store, alert, &key, 60_000)?;
+            } else if let Some(session_id) = active_session_id.as_deref() {
                 let path = alert.path.as_deref().unwrap_or("");
                 let key =
                     endpoint_alert_dedupe_key(session_id, &event, path, event.event_type.as_str());

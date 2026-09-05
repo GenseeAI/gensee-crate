@@ -92,6 +92,19 @@ int main(void)
         reused.parent_audit_token = (audit_token_t){0};
         NSCAssert([service sessionForProcessLocked:&reused messageVersion:4] == nil, @"PID reuse must not inherit prior generation");
 
+        vm.ppid = 1;
+        vm.responsible_audit_token = helper.audit_token;
+        NSCAssert([[service sessionForProcessLocked:&vm messageVersion:4] isEqual:@"cowork"], @"adopt launchd VM through verified responsible generation");
+        es_process_t unrelatedVM = vm;
+        unrelatedVM.audit_token.val[5] = 504;
+        unrelatedVM.responsible_audit_token.val[7]++;
+        NSCAssert([service sessionForProcessLocked:&unrelatedVM messageVersion:4] == nil, @"responsible PID reuse is not association");
+        unrelatedVM.responsible_audit_token = helper.audit_token;
+        unrelatedVM.is_platform_binary = NO;
+        NSCAssert([service sessionForProcessLocked:&unrelatedVM messageVersion:4] == nil, @"untrusted VM cannot use responsible-process adoption");
+        unrelatedVM.is_platform_binary = YES;
+        NSCAssert([service sessionForProcessLocked:&unrelatedVM messageVersion:3] == nil, @"old ES messages lack responsible tokens");
+
         es_message_t message = {0};
         message.version = 4;
         message.process = &helper;
@@ -102,6 +115,38 @@ int main(void)
         NSDictionary *event = service.events.lastObject;
         NSCAssert([event[@"cowork"][@"tool_surface"] isEqual:@"unknown"], @"local tree must not invent host-tool evidence");
         NSCAssert([event[@"attribution"][@"root_pid"] isEqual:@500], @"recorded root remains canonical");
+
+        message.process = &vm;
+        [service recordMessage:&message mode:@"observe" result:@"allow" ruleID:nil reason:nil latencyUS:0];
+        dispatch_sync(service.queue, ^{});
+        NSCAssert([service.events.lastObject[@"cowork"][@"tool_surface"] isEqual:@"shell"], @"associated platform VM records shell boundary");
+        NSCAssert(Configure(service, @[]), @"disable Cowork roots");
+        NSCAssert([service sessionForProcessLocked:&vm messageVersion:4] == nil, @"disabling Cowork revokes cached VM association");
+
+        GenseeSensorService *ring = [[GenseeSensorService alloc] init];
+        dispatch_sync(ring.queue, ^{
+            for (NSUInteger i = 0; i < GenseeRingCapacity + 7; i++) [ring appendEventLocked:@{}];
+        });
+        NSCAssert(ring.events.count == GenseeRingCapacity, @"ring memory stays bounded");
+        __block NSArray *batch;
+        __block NSDictionary *health;
+        [ring fetchEventsAfterCursor:GenseeRingCapacity limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *state) { batch = events; health = state; }];
+        dispatch_sync(ring.queue, ^{});
+        NSCAssert(batch.count == 7, @"fetch resumes at the durable cursor after wraparound");
+        NSCAssert([health[@"ring_drops"] unsignedLongLongValue] == 0, @"consumed history eviction is not loss");
+        for (NSDictionary *row in batch) NSCAssert([row[@"dropped_events"] unsignedLongLongValue] == 0, @"ordinary eviction emits no alert");
+        [ring fetchEventsAfterCursor:2 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *state) { batch = events; health = state; }];
+        dispatch_sync(ring.queue, ^{});
+        NSCAssert([batch.firstObject[@"sensor_cursor"] unsignedLongLongValue] == 8, @"oldest cursor survives wraparound");
+        NSCAssert([batch.firstObject[@"dropped_events"] unsignedLongLongValue] == 5, @"report only unread missing cursors");
+        NSCAssert([health[@"ring_drops"] unsignedLongLongValue] == 5, @"health counts the actual missing range");
+        [ring fetchEventsAfterCursor:2 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *state) { health = state; }];
+        dispatch_sync(ring.queue, ^{});
+        NSCAssert([health[@"ring_drops"] unsignedLongLongValue] == 5, @"retried fetch does not inflate loss counters");
+        dispatch_sync(ring.queue, ^{ ring.kernelDrops = 3; [ring appendEventLocked:@{}]; });
+        [ring fetchEventsAfterCursor:GenseeRingCapacity + 7 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *state) { batch = events; }];
+        dispatch_sync(ring.queue, ^{});
+        NSCAssert([batch.firstObject[@"dropped_events"] unsignedLongLongValue] == 3, @"real kernel loss remains visible");
 
         snapshotFetches = 0;
         NSArray *descendants = GenseeDescendantProcessIdentifiers(500);

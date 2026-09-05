@@ -99,7 +99,11 @@ final class EndpointSecuritySensor: ObservableObject {
             pollingTask = Task { [weak self] in
                 while !Task.isCancelled {
                     await self?.pollOnce()
-                    try? await Task.sleep(for: .milliseconds(500))
+                    // A durable acknowledgement bounds each batch. Drain a
+                    // backlog promptly instead of throttling the slow consumer
+                    // further; errors and idle streams retain the normal delay.
+                    let draining = self?.health.connected == true && (self?.health.backlogEvents ?? 0) > 0
+                    try? await Task.sleep(for: .milliseconds(draining ? 10 : 500))
                 }
             }
         } catch {
@@ -257,7 +261,7 @@ final class EndpointSecuritySensor: ObservableObject {
                 (continuation: CheckedContinuation<([[String: Any]], UInt64, [String: Any]), Error>) in
                 connection.fetchEvents(
                     afterCursor: cursor,
-                    limit: health.hasBackpressure ? 100 : 500,
+                    limit: 500,
                     reply: { events, nextCursor, health in
                         guard let events = events as? [[String: Any]],
                               let health = health as? [String: Any]

@@ -366,6 +366,8 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 @property(nonatomic) uint64_t nextCursor;
 @property(nonatomic) uint64_t totalEvents;
 @property(nonatomic) uint64_t ringDrops;
+@property(nonatomic) NSUInteger ringStart;
+@property(nonatomic) uint64_t reportedRingLossThrough;
 @property(nonatomic) uint64_t lastGlobalSequence;
 @property(nonatomic) uint64_t kernelDrops;
 @property(nonatomic) uint64_t reportedDrops;
@@ -459,6 +461,19 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
                                audit_token_to_pidversion(process->parent_audit_token)];
         session = self.managedProcesses[parentKey];
         if (session != nil) self.managedProcesses[key] = session;
+        // XPC virtual machines are parented by launchd, not Claude. Only the
+        // kernel-supplied responsible *generation* of an already verified
+        // Cowork process can associate Apple's platform VM with this tree.
+        if (session == nil && GenseeIsCoworkVirtualMachineProcess(process)) {
+            NSString *responsibleKey = [NSString stringWithFormat:@"%d:%d",
+                audit_token_to_pid(process->responsible_audit_token),
+                audit_token_to_pidversion(process->responsible_audit_token)];
+            NSString *responsibleSession = self.managedProcesses[responsibleKey];
+            if (self.coworkSessionModes[responsibleSession ?: @""] != nil) {
+                session = responsibleSession;
+                self.managedProcesses[key] = session;
+            }
+        }
     }
     return session;
 }
@@ -631,20 +646,30 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         };
     }
     dispatch_async(self.queue, ^{
-        NSMutableDictionary *withCursor = [serialized mutableCopy];
-        withCursor[@"sensor_cursor"] = @(self.nextCursor++);
-        uint64_t cumulativeDrops = self.kernelDrops + self.ringDrops;
-        withCursor[@"dropped_events"] = @(cumulativeDrops >= self.reportedDrops
-            ? cumulativeDrops - self.reportedDrops
-            : cumulativeDrops);
-        self.reportedDrops = cumulativeDrops;
-        [self.events addObject:withCursor];
-        self.totalEvents += 1;
-        if (self.events.count > GenseeRingCapacity) {
-            [self.events removeObjectAtIndex:0];
-            self.ringDrops += 1;
-        }
+        [self appendEventLocked:serialized];
     });
+}
+
+- (void)appendEventLocked:(NSDictionary *)event
+{
+    NSMutableDictionary *withCursor = [event mutableCopy];
+    withCursor[@"sensor_cursor"] = @(self.nextCursor++);
+    withCursor[@"dropped_events"] = @(self.kernelDrops - self.reportedDrops);
+    self.reportedDrops = self.kernelDrops;
+    if (self.events.count < GenseeRingCapacity) {
+        [self.events addObject:withCursor];
+    } else {
+        // Evict replay history in O(1). Eviction is not evidence loss unless a
+        // consumer's durable cursor falls behind the oldest retained record.
+        self.events[self.ringStart] = withCursor;
+        self.ringStart = (self.ringStart + 1) % GenseeRingCapacity;
+    }
+    self.totalEvents += 1;
+}
+
+- (NSDictionary *)eventAtOffsetLocked:(NSUInteger)offset
+{
+    return self.events[(self.ringStart + offset) % self.events.count];
 }
 
 - (void)observeGlobalSequence:(const es_message_t *)message
@@ -661,7 +686,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 
 - (NSDictionary *)healthLocked
 {
-    NSNumber *oldest = self.events.firstObject[@"sensor_cursor"] ?: @(self.nextCursor);
+    NSNumber *oldest = self.events.count ? [self eventAtOffsetLocked:0][@"sensor_cursor"] : @(self.nextCursor);
     __block NSUInteger managedProcessCount = 0;
     __block NSString *mode = @"observe";
     @synchronized (self) {
@@ -696,9 +721,24 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         NSUInteger safeLimit = MIN(MAX(limit, 1), 1000);
         NSMutableArray *batch = [NSMutableArray arrayWithCapacity:safeLimit];
         uint64_t next = cursor;
-        for (NSDictionary *event in self.events) {
+        uint64_t oldest = self.events.count
+            ? [[self eventAtOffsetLocked:0][@"sensor_cursor"] unsignedLongLongValue] : self.nextCursor;
+        uint64_t lost = oldest > cursor && oldest - cursor > 1 ? oldest - cursor - 1 : 0;
+        if (lost > 0) {
+            // Count a missing cursor range once, including across fetch retries.
+            uint64_t accountedThrough = MAX(cursor, self.reportedRingLossThrough);
+            if (oldest - 1 > accountedThrough) self.ringDrops += oldest - 1 - accountedThrough;
+            self.reportedRingLossThrough = MAX(self.reportedRingLossThrough, oldest - 1);
+        }
+        NSUInteger offset = cursor >= oldest ? MIN(cursor - oldest + 1, self.events.count) : 0;
+        for (; offset < self.events.count; offset++) {
+            NSDictionary *event = [self eventAtOffsetLocked:offset];
             uint64_t eventCursor = [event[@"sensor_cursor"] unsignedLongLongValue];
-            if (eventCursor <= cursor) continue;
+            if (batch.count == 0 && lost > 0) {
+                NSMutableDictionary *withLoss = [event mutableCopy];
+                withLoss[@"dropped_events"] = @([event[@"dropped_events"] unsignedLongLongValue] + lost);
+                event = withLoss;
+            }
             [batch addObject:event];
             next = eventCursor;
             if (batch.count >= safeLimit) break;
