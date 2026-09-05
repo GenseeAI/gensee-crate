@@ -49,7 +49,11 @@ struct DashboardHarnessesPage: View {
                     DashboardCard("Harness protection") {
                         VStack(spacing: 0) {
                             ForEach(Array(model.integrations.enumerated()), id: \.element.id) { index, integration in
-                                harnessRow(integration)
+                                if integration.isCowork {
+                                    CoworkHarnessRow(model: model, sensor: model.endpointSensor, integration: integration)
+                                } else {
+                                    harnessRow(integration)
+                                }
                                 if index < model.integrations.count - 1 {
                                     Divider().padding(.leading, 54)
                                 }
@@ -373,5 +377,120 @@ struct DashboardHarnessesPage: View {
         if integration.isHealthy { return .dashboardGreen }
         if integration.awaitingVerification { return .dashboardGold }
         return .secondary
+    }
+}
+
+/// Cowork has endpoint evidence, not Claude Code's synchronous policy hooks.
+/// Observe the sensor directly so connectivity cannot get stuck at a stale
+/// value while the expensive dashboard projection is idle.
+private struct CoworkHarnessRow: View {
+    @ObservedObject var model: ConsoleModel
+    @ObservedObject var sensor: EndpointSecuritySensor
+    let integration: IntegrationDescriptor
+    @State private var expanded = false
+
+    private var sensorReady: Bool {
+        sensor.health.connected && sensor.health.running && sensor.health.error == nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 14) {
+                DashboardSymbol("desktopcomputer", color: .secondary, size: 15, weight: .regular)
+                    .frame(width: 40, height: 40)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text("Claude Cowork").font(.system(size: 13, weight: .semibold))
+                        DashboardTag(text: integration.statusLabel, color: integration.configured ? .dashboardBlue : .secondary)
+                    }
+                    Text(integration.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text(integration.configured
+                         ? "Mac sensor: \(sensorReady ? "running" : "needs attention") · Audit collection: manual setup"
+                         : integration.installationDetail)
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if integration.installed || integration.configured {
+                        Text("Uses this Mac’s \(model.policy.endpointSecurityMode) sensor mode · Session mode: \(model.coworkSessionMode)")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Button("Verify") {
+                    expanded = true
+                    Task { await model.verifyCowork() }
+                }
+                .disabled(!integration.configured || !model.backendAvailable || model.isDemoMode || model.runningCommand != nil)
+                .accessibilityIdentifier("harness.claude-cowork.verify")
+                Button(integration.configured ? "Disable visibility" : "Enable visibility") {
+                    expanded = true
+                    Task { await model.setIntegrationEnabled(integration.id, enabled: !integration.configured) }
+                }
+                .disabled(!integration.canToggle || !model.backendAvailable || model.isDemoMode || model.runningCommand != nil)
+                .accessibilityIdentifier("harness.claude-cowork.toggle")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            DisclosureGroup("Setup and coverage", isExpanded: $expanded) {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("Endpoint policy: \(model.policy.endpointSecurityMode). Enabling visibility applies this Mac’s existing sensor rules to Claude Desktop and its tracked descendants, which may include other Claude activity. Start in Observe mode in Settings when trying the pilot.")
+                    HStack(spacing: 10) {
+                        Text("Session mode")
+                        Picker("Cowork session mode", selection: Binding(
+                            get: { model.coworkSessionMode },
+                            set: { mode in Task { await model.setCoworkSessionMode(mode) } }
+                        )) {
+                            Text("Unknown / mixed").tag("unknown")
+                            Text("Local").tag("local")
+                            Text("Cloud").tag("cloud")
+                        }
+                        .labelsHidden()
+                        .frame(width: 155)
+                        .disabled(model.isDemoMode || !model.backendAvailable || model.runningCommand != nil)
+                        .accessibilityIdentifier("harness.claude-cowork.sessionMode")
+                    }
+                    Text("Use Local only when the tracked sessions run locally. Leave mixed or unverified sessions Unknown. Restart manual audit ingestion after changing this setting.")
+                    Text("Sensor: \(sensorReady ? "connected and running" : "unavailable — check the extension and Full Disk Access in Settings").")
+                    if let error = sensor.health.error {
+                        Text(error).foregroundStyle(Color.dashboardGold)
+                    }
+                    if sensor.health.hasDataLoss || sensor.health.hasBackpressure {
+                        Text("The sensor reports evidence loss or a collection backlog. Review sensor health in Settings.")
+                            .foregroundStyle(Color.dashboardGold)
+                    }
+                    Text("Audit collection requires a separate terminal stream for each session. Enable and Disable control endpoint visibility; stop manual audit streams in their terminals. Gensee cannot confirm that a manual collector is still running.")
+                    Link("Open Cowork audit setup guide", destination: URL(string: "https://github.com/GenseeAI/gensee-crate/blob/main/integrations/claude-cowork/README.md#local-audit-ingestion")!)
+
+                    if let issue = model.coworkCheckIssue {
+                        Text(issue).foregroundStyle(Color.dashboardGold)
+                    } else if let evidence = model.coworkEvidence, let checkedAt = model.coworkCheckedAt {
+                        Text("Evidence checked \(checkedAt.formatted(date: .abbreviated, time: .standard)). Sample: latest \(evidence.sampleLimit) stored system events.")
+                            .fontWeight(.medium)
+                        evidenceLine("Native tool audit", date: evidence.lastEvent(source: "claude-cowork-local-audit", origin: "host-native"))
+                        evidenceLine("VM tool audit", date: evidence.lastEvent(source: "claude-cowork-local-audit", origin: "vm-mediated"))
+                        evidenceLine("Other / unknown audit", date: evidence.lastEvent(source: "claude-cowork-local-audit", origin: "unattributed"))
+                        evidenceLine("Cloud tool audit", date: evidence.lastEvent(source: "claude-cowork-local-audit", origin: "cloud-mediated"))
+                        evidenceLine("Cowork endpoint evidence", date: evidence.lastEvent(source: "macos-endpoint-security"))
+                        Text("These are historical event times, not a live health guarantee. Older evidence may fall outside the sample. Run a native file task and a VM shell task in a test folder, then Verify again and check that the times advance.")
+                    } else {
+                        Text("Evidence has not been checked. Enable visibility, configure audit ingestion, then use Verify.")
+                    }
+                    Text("VM coverage includes tool boundaries and host-visible effects. Guest commands, guest process lineage, cloud execution, and automatic causal joining of audit and sensor events are outside this pilot’s visibility.")
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .padding(.top, 8)
+            }
+            .font(.system(size: 10))
+            .padding(.leading, 54)
+        }
+        .padding(.vertical, 13)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func evidenceLine(_ label: String, date: Date?) -> some View {
+        Text("\(label): \(date.map { $0.formatted(date: .abbreviated, time: .standard) } ?? "not seen in sample")")
     }
 }

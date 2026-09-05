@@ -406,7 +406,7 @@ struct SetupAssistantView: View {
         VStack(alignment: .leading, spacing: 18) {
             setupHeading(
                 "Connect your AI harnesses",
-                detail: "Gensee found \(model.integrations.filter(\.installed).count) of six supported harnesses. Unavailable harnesses remain visible so coverage is explicit."
+                detail: "Gensee found \(model.integrations.filter(\.installed).count) of \(model.integrations.count) supported harnesses. Unavailable harnesses remain visible so coverage is explicit."
             )
 
             HStack {
@@ -421,7 +421,7 @@ struct SetupAssistantView: View {
                         isEnablingAll = false
                     }
                 } label: {
-                    Label("Enable All Installed", systemImage: "checkmark.shield")
+                    Label("Enable Installed Hooks", systemImage: "checkmark.shield")
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.dashboardRed)
@@ -489,7 +489,7 @@ struct SetupAssistantView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
             if step < stepTitles.count - 1 {
-                Button(step == 3 && !enableableHarnesses.isEmpty ? "Enable Installed & Continue" : "Continue") {
+                Button(step == 3 && !enableableHarnesses.isEmpty ? "Enable Hooks & Continue" : "Continue") {
                     if step == 3 && !enableableHarnesses.isEmpty {
                         Task {
                             isEnablingAll = true
@@ -668,6 +668,10 @@ struct SetupAssistantView: View {
                     (integration.configured && !integration.requiresRepair && activation.actionTitle == nil)
                         || model.runningCommand != nil
                 )
+            } else if integration.isCowork {
+                Text("Set up in Harnesses")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
             } else if !integration.supportsDirectHooks {
                 Text("Managed launch")
                     .font(.system(size: 10, weight: .medium))
@@ -691,7 +695,7 @@ struct SetupAssistantView: View {
                     Text(integration.name).font(.system(size: 12, weight: .semibold))
                     DashboardTag(text: integration.statusLabel, color: integration.isHealthy ? .dashboardGreen : .dashboardGold)
                 }
-                Text(integration.configured ? instruction.title : "Enable protection before testing")
+                Text(integration.isCowork ? instruction.title : integration.configured ? instruction.title : "Enable protection before testing")
                     .font(.system(size: 10, weight: .medium))
                 Text(integration.configured ? instruction.detail : integration.installationDetail)
                     .font(.system(size: 10))

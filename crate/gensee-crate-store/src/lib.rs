@@ -943,6 +943,34 @@ impl EventStore {
         )
     }
 
+    /// On-demand pilot diagnostics, bounded by primary-key order rather than a
+    /// full history scan. Evidence is historical, not a collector heartbeat or
+    /// proof of guest visibility. Never return paths, commands, or audit content.
+    pub fn cowork_status(&self) -> io::Result<Value> {
+        let db = self.sqlite_store()?;
+        let rows = query_json_rows(
+            db.connection(),
+            "WITH recent AS MATERIALIZED (
+                SELECT event_id, ts, source, execution_origin, args
+                FROM system_events ORDER BY event_id DESC LIMIT 2000
+             )
+             SELECT source, execution_origin, MAX(ts)
+             FROM recent
+             WHERE source = 'claude-cowork-local-audit'
+                OR (source = 'macos-endpoint-security'
+                    AND json_type(args, '$.cowork_visibility') = 'object')
+             GROUP BY source, execution_origin",
+            |row| {
+                Ok(json!({
+                    "source": row.get::<_, String>(0)?,
+                    "origin": row.get::<_, String>(1)?,
+                    "last_event_at": row.get::<_, i64>(2)?,
+                }))
+            },
+        )?;
+        Ok(json!({ "sample_limit": 2000, "evidence": rows }))
+    }
+
     pub fn dashboard_state(&self) -> io::Result<Value> {
         // Dashboard refresh is outside the agent authorization path and is a
         // natural opportunity to advance one bounded visibility-rules batch.
@@ -7337,6 +7365,75 @@ mod tests {
         assert!(store.list_system_events().unwrap().is_empty());
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cowork_status_is_bounded_and_separates_audit_from_sensor_evidence() {
+        let dir = std::env::temp_dir().join(format!("gensee-cowork-status-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        assert_eq!(store.cowork_status().unwrap()["evidence"], json!([]));
+        for (source, origin, raw_json, ts) in [
+            (
+                "claude-cowork-local-audit",
+                ExecutionOrigin::HostNative,
+                "{}",
+                1000,
+            ),
+            (
+                "claude-cowork-local-audit",
+                ExecutionOrigin::VmMediated,
+                "{}",
+                2000,
+            ),
+            (
+                "macos-endpoint-security",
+                ExecutionOrigin::Unattributed,
+                r#"{"cowork_visibility":{},"file_path":"private-path"}"#,
+                3000,
+            ),
+            // An unrelated sensor event must not verify Cowork coverage.
+            (
+                "macos-endpoint-security",
+                ExecutionOrigin::VmMediated,
+                "{}",
+                4000,
+            ),
+        ] {
+            store
+                .append_system_event_evidence_only(&SystemEvent {
+                    source: source.into(),
+                    event_type: "test".into(),
+                    event_kind: "agent_boundary".into(),
+                    execution_origin: origin,
+                    observed_at_ms: ts,
+                    pid: None,
+                    ppid: None,
+                    process_name: None,
+                    executable_path: None,
+                    file_path: None,
+                    command_line: None,
+                    raw_json: raw_json.into(),
+                })
+                .unwrap();
+        }
+        let status = store.cowork_status().unwrap();
+        assert_eq!(status["sample_limit"], 2000);
+        let evidence = status["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 3);
+        assert!(evidence.contains(&json!({"source":"macos-endpoint-security", "origin":"unattributed", "last_event_at":3000})));
+        assert!(!status.to_string().contains("private-path"));
+        {
+            let db = store.sqlite_store().unwrap();
+            db.connection().execute_batch(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2000)
+                 INSERT INTO system_events(pid, request_id, ts, source, type, cwd)
+                 SELECT 0, (SELECT request_id FROM system_events LIMIT 1), 5000, 'noise', 'test', '' FROM n;"
+            ).unwrap();
+        }
+        assert_eq!(store.cowork_status().unwrap()["evidence"], json!([]));
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
