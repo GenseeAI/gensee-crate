@@ -802,13 +802,16 @@ fn append_linux_network_block_events(
             event.packets,
             event.bytes
         );
-        store.append_system_event(&linux_network_block_system_event(
-            &event,
-            session_id,
-            root_pid,
-            process_name,
-            observed_at_ms,
-        ))?;
+        append_system_event_with_policy(
+            store,
+            &linux_network_block_system_event(
+                &event,
+                session_id,
+                root_pid,
+                process_name,
+                observed_at_ms,
+            ),
+        )?;
     }
     Ok(())
 }
@@ -983,12 +986,15 @@ pub(crate) fn drain_linux_fanotify_events(
             event.decision.verdict,
             event.request.path.as_deref().unwrap_or("-")
         );
-        if let Err(error) = store.append_system_event(&linux_fanotify_system_event(
-            &event,
-            session_id,
-            agent_binary,
-            unix_millis().unwrap_or(0),
-        )) {
+        if let Err(error) = append_system_event_with_policy(
+            store,
+            &linux_fanotify_system_event(
+                &event,
+                session_id,
+                agent_binary,
+                unix_millis().unwrap_or(0),
+            ),
+        ) {
             eprintln!("gensee: linux fanotify warning: could not append timeline event: {error}");
         }
     }

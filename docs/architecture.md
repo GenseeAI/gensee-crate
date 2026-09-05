@@ -49,7 +49,7 @@ and cgroup/nftables network controls. See
 | `crate/gensee-crate-core` | Platform-agnostic event, session, and cross-session primitives |
 | `crate/gensee-crate-attribution` | Agent/session/request/tool attribution graph and correlation evidence |
 | `crate/gensee-crate-rules` | Deterministic detection rules and the data-driven [policy engine](policy.md) |
-| `crate/gensee-crate-store` | Local storage and migrations |
+| `crate/gensee-crate-store` | Policy-neutral local evidence, derived-finding storage, and migrations; callers optionally attach pre-evaluated enrichment |
 | `crate/gensee-crate-macos` | macOS EndpointSecurity integration |
 | `macos/GenseeCrate` | Native Swift security console and signed Endpoint Security system extension |
 | `crate/gensee-crate-linux` | Experimental Linux capability detection, `/proc` monitoring, policy decisions, fanotify planning/debug probes, seccomp launcher profiles, and cgroup/nftables egress controls |

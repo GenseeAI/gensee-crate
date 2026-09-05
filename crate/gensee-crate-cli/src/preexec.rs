@@ -40,7 +40,7 @@ pub(crate) fn record_write_time_artifact_observations(
         };
         record_artifact_snapshot_and_tags(event, store, &path, &snapshot, &findings)?;
         for finding in findings {
-            store.append_policy_alert(&finding.to_policy_alert(event))?;
+            record_policy_alert(store, finding.to_policy_alert(event))?;
         }
     }
 
@@ -379,7 +379,9 @@ pub(crate) fn record_artifact_snapshot_and_tags(
             })),
         })
         .collect::<Vec<_>>();
-    store.record_artifact_observation_and_tags(
+    let policy = Policy::load_current();
+    let classification = artifact_classification(&policy, path.to_string());
+    store.record_artifact_observation_and_tags_with_classification(
         &ArtifactObservationInput {
             session_id: event.session_id.clone(),
             path: path.to_string(),
@@ -396,6 +398,7 @@ pub(crate) fn record_artifact_snapshot_and_tags(
             observed_at_ms: event.observed_at_ms,
         },
         &tags,
+        Some(&classification),
     )
 }
 

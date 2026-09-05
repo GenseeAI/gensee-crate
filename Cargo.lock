@@ -444,7 +444,6 @@ dependencies = [
  "chacha20poly1305",
  "gensee-crate-core",
  "gensee-crate-db",
- "gensee-crate-rules",
  "rusqlite",
  "serde",
  "serde_json",

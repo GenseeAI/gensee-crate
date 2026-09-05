@@ -20,12 +20,12 @@ pub use gensee_crate_db::sqlite::{
     AlertRecord, ArtifactFactRecord, ArtifactObservationRecord, ArtifactRiskTagRecord,
     ChainVerification, HumanFeedbackRecord,
 };
-use gensee_crate_rules::policy::Policy;
 use rusqlite::{functions::FunctionFlags, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -123,6 +123,103 @@ pub struct PolicyAlert {
     pub path: Option<String>,
     pub evidence: Option<Value>,
     pub observed_at_ms: u64,
+}
+
+/// Policy-derived data supplied by an ingestion caller.
+///
+/// The event store deliberately does not load policy or evaluate observations.
+/// Callers may provide no enrichment for evidence-only collection, or attach
+/// pre-evaluated alerts and artifact classifications for detection-enabled
+/// deployments.
+#[derive(Debug, Clone, Default)]
+pub struct ObservationEnrichment {
+    pub alerts: Vec<PolicyAlert>,
+    pub artifact_classifications: Vec<ArtifactClassification>,
+    /// Store-extracted operations used to prepare this enrichment. Supplying
+    /// these avoids reparsing the hook payload inside the write transaction.
+    pub file_operations: Option<Vec<FileOperation>>,
+    /// Prepared only by policy-aware callers; the store still decides whether
+    /// the system event is actually unmatched and mutation-shaped.
+    pub unmatched_system_alert: Option<PolicyAlert>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactClassification {
+    pub path: String,
+    pub is_memory_artifact: bool,
+    pub is_persistent_target: bool,
+    pub is_control_plane: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FileOperation {
+    pub operation: String,
+    pub path: String,
+}
+
+impl ObservationEnrichment {
+    fn has_path_enrichment(&self) -> bool {
+        !self.alerts.is_empty() || !self.artifact_classifications.is_empty()
+    }
+
+    fn alerts_for_path<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a PolicyAlert> {
+        self.alerts
+            .iter()
+            .filter(move |alert| alert.path.as_deref() == Some(path))
+    }
+
+    fn classification_for_path(&self, path: &str) -> Option<&ArtifactClassification> {
+        self.artifact_classifications
+            .iter()
+            .find(|classification| classification.path == path)
+    }
+
+    fn validate_paths<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> io::Result<()> {
+        if !self.has_path_enrichment() {
+            return Ok(());
+        }
+        let paths = paths.into_iter().collect::<HashSet<_>>();
+        let unmatched_alert = self.alerts.iter().find(|alert| {
+            alert
+                .path
+                .as_deref()
+                .is_none_or(|path| !paths.contains(path))
+        });
+        let unmatched_classification = self
+            .artifact_classifications
+            .iter()
+            .find(|classification| !paths.contains(classification.path.as_str()));
+        if unmatched_alert.is_none() && unmatched_classification.is_none() {
+            return Ok(());
+        }
+
+        let detail = unmatched_alert
+            .and_then(|alert| alert.path.as_deref())
+            .or_else(|| unmatched_classification.map(|classification| classification.path.as_str()))
+            .unwrap_or("<missing alert path>");
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("observation enrichment does not match an extracted path: {detail}"),
+        ))
+    }
+
+    fn evidence_safe_for_paths<'a>(
+        &'a self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Cow<'a, Self> {
+        match self.validate_paths(paths) {
+            Ok(()) => Cow::Borrowed(self),
+            Err(error) => {
+                eprintln!("gensee store: ignoring invalid policy enrichment: {error}");
+                Cow::Owned(Self {
+                    // The operations are store-derived input to base evidence
+                    // materialization, not policy output.
+                    file_operations: self.file_operations.clone(),
+                    ..Default::default()
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,8 +423,27 @@ impl EventStore {
         Ok(true)
     }
 
-    pub fn append_hook_event(&self, event: &AgentHookEvent) -> io::Result<()> {
-        self.append_hook_event_database(event)?;
+    /// Persist evidence without policy-derived alerts or classifications.
+    pub fn append_hook_event_evidence_only(&self, event: &AgentHookEvent) -> io::Result<()> {
+        self.append_hook_event_with_enrichment(event, &ObservationEnrichment::default())
+    }
+
+    pub fn append_hook_event_with_enrichment(
+        &self,
+        event: &AgentHookEvent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
+        let extracted;
+        let operations = match enrichment.file_operations.as_deref() {
+            Some(operations) => operations,
+            None => {
+                extracted = hook_file_operations(event);
+                &extracted
+            }
+        };
+        let enrichment = enrichment
+            .evidence_safe_for_paths(operations.iter().map(|operation| operation.path.as_str()));
+        self.append_hook_event_database(event, &enrichment, operations)?;
         append_jsonl(&self.hooks_path(), event, self.encryption_key.as_ref())
     }
 
@@ -355,8 +471,18 @@ impl EventStore {
         )
     }
 
-    pub fn append_file_intent(&self, intent: &FileIntent) -> io::Result<()> {
-        self.append_file_intent_database(intent)?;
+    /// Persist evidence without policy-derived alerts or classifications.
+    pub fn append_file_intent_evidence_only(&self, intent: &FileIntent) -> io::Result<()> {
+        self.append_file_intent_with_enrichment(intent, &ObservationEnrichment::default())
+    }
+
+    pub fn append_file_intent_with_enrichment(
+        &self,
+        intent: &FileIntent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
+        let enrichment = enrichment.evidence_safe_for_paths([intent.path.as_str()]);
+        self.append_file_intent_database(intent, &enrichment)?;
         append_jsonl(
             &self.file_intents_path(),
             intent,
@@ -364,8 +490,27 @@ impl EventStore {
         )
     }
 
-    pub fn append_system_event(&self, event: &SystemEvent) -> io::Result<()> {
-        self.append_system_event_database(event)?;
+    /// Persist evidence without policy-derived alerts or classifications.
+    pub fn append_system_event_evidence_only(&self, event: &SystemEvent) -> io::Result<()> {
+        self.append_system_event_with_enrichment(event, &ObservationEnrichment::default())
+    }
+
+    pub fn append_system_event_with_enrichment(
+        &self,
+        event: &SystemEvent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
+        let paths = enrichment
+            .has_path_enrichment()
+            .then(|| system_event_paths(event));
+        let enrichment = enrichment.evidence_safe_for_paths(
+            paths
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str),
+        );
+        self.append_system_event_database(event, &enrichment)?;
         // Native kernel telemetry is already durable in SQLite and can be
         // pruned transactionally. Duplicating these high-volume streams into an
         // append-only JSONL file made retention ineffective and could consume
@@ -383,8 +528,21 @@ impl EventStore {
         )
     }
 
-    pub fn append_workspace_effect(&self, effect: &WorkspaceEffect) -> io::Result<()> {
-        self.append_workspace_effect_database(effect)?;
+    /// Persist evidence without policy-derived alerts or classifications.
+    pub fn append_workspace_effect_evidence_only(
+        &self,
+        effect: &WorkspaceEffect,
+    ) -> io::Result<()> {
+        self.append_workspace_effect_with_enrichment(effect, &ObservationEnrichment::default())
+    }
+
+    pub fn append_workspace_effect_with_enrichment(
+        &self,
+        effect: &WorkspaceEffect,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
+        let enrichment = enrichment.evidence_safe_for_paths([effect.path.as_str()]);
+        self.append_workspace_effect_database(effect, &enrichment)?;
         append_jsonl(
             &self.workspace_effects_path(),
             effect,
@@ -1493,16 +1651,6 @@ impl EventStore {
         dedupe_key: &str,
         window_ms: u64,
     ) -> io::Result<bool> {
-        let policy = Policy::load_current();
-        let tuned = policy.tuned_alert_values(&alert.rule_id, &alert.severity, &alert.action);
-        if !policy
-            .document()
-            .endpoint_security
-            .minimum_recorded_severity
-            .includes(&tuned.severity)
-        {
-            return Ok(false);
-        }
         self.with_sqlite_transaction(|db| {
             let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
@@ -1791,6 +1939,15 @@ impl EventStore {
         observation: &ArtifactObservationInput,
         tags: &[ArtifactRiskTagInput],
     ) -> io::Result<()> {
+        self.record_artifact_observation_and_tags_with_classification(observation, tags, None)
+    }
+
+    pub fn record_artifact_observation_and_tags_with_classification(
+        &self,
+        observation: &ArtifactObservationInput,
+        tags: &[ArtifactRiskTagInput],
+        classification: Option<&ArtifactClassification>,
+    ) -> io::Result<()> {
         if !artifact_path_is_concrete(&observation.path) {
             return Ok(());
         }
@@ -1872,6 +2029,7 @@ impl EventStore {
                     agent_authored: observation.mutation && session_id != UNKNOWN_SESSION_ID,
                     unmatched_effect: false,
                     risk,
+                    classification,
                     metadata: Some(json!({
                         "source": "artifact_content_inspection",
                         "content_truncated": observation.content_truncated,
@@ -1962,7 +2120,12 @@ impl EventStore {
         }
     }
 
-    fn append_hook_event_database(&self, event: &AgentHookEvent) -> io::Result<()> {
+    fn append_hook_event_database(
+        &self,
+        event: &AgentHookEvent,
+        enrichment: &ObservationEnrichment,
+        file_operations: &[FileOperation],
+    ) -> io::Result<()> {
         let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
         // Transcript reads can be tens of megabytes. Prepare their incremental
         // state before BEGIN IMMEDIATE so dashboard readers and other hook
@@ -2055,12 +2218,19 @@ impl EventStore {
                         cwd: event.cwd.clone().unwrap_or_default(),
                         permission_mode: event.permission_mode.clone(),
                         tool_name: event.tool_name.clone(),
-                        tool_input: tool_input_json(event),
+                        tool_input: tool_input_json(event, file_operations),
                         tool_response: tool_response_json(event),
                         tool_use_id: event.tool_use_id.clone(),
                     };
                     let event_id = db.insert_agent_event(&agent_event).map_err(sqlite_error)?;
-                    record_native_tool_artifact(db, request_id, event_id, event)?;
+                    record_native_tool_artifact(
+                        db,
+                        request_id,
+                        event_id,
+                        event,
+                        enrichment,
+                        file_operations,
+                    )?;
                     refresh_request_resource_rates(db, request_id)?;
                 }
                 _ => {}
@@ -2159,7 +2329,11 @@ impl EventStore {
         })
     }
 
-    fn append_file_intent_database(&self, intent: &FileIntent) -> io::Result<()> {
+    fn append_file_intent_database(
+        &self,
+        intent: &FileIntent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
         self.with_sqlite_transaction(|db| {
             let session_id = intent.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
             ensure_session(db, session_id, &intent.provider, intent.observed_at_ms)?;
@@ -2179,20 +2353,23 @@ impl EventStore {
                     tool_use_id: intent.tool_use_id.clone(),
                 })
                 .map_err(sqlite_error)?;
-            record_file_intent_artifact(db, request_id, event_id, intent)?;
+            record_file_intent_artifact(db, request_id, event_id, intent, enrichment)?;
             if intent.provider != "bash-command-parser" {
-                record_file_operation_alerts(
+                record_prepared_file_operation_alerts(
                     db,
                     request_id,
                     Some(EntityRef::agent_event(event_id)),
-                    &intent.operation,
                     &intent.path,
-                    Some(json!({
-                        "source": intent.provider,
-                        "tool_use_id": intent.tool_use_id,
-                        "confidence": intent.confidence,
-                        "sensitive": intent.sensitive,
-                    })),
+                    enrichment,
+                    merge_rule_evidence(
+                        Some(json!({
+                            "source": intent.provider,
+                            "tool_use_id": intent.tool_use_id,
+                            "confidence": intent.confidence,
+                            "sensitive": intent.sensitive,
+                        })),
+                        &intent.operation,
+                    ),
                     to_i64(intent.observed_at_ms)?,
                 )?;
             }
@@ -2201,7 +2378,11 @@ impl EventStore {
         })
     }
 
-    fn append_system_event_database(&self, event: &SystemEvent) -> io::Result<()> {
+    fn append_system_event_database(
+        &self,
+        event: &SystemEvent,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
         self.with_sqlite_transaction(|db| {
             let ts = to_i64(event.observed_at_ms)?;
             let matched_agent_event = agent_event_for_system_event(db, event, ts)?;
@@ -2259,21 +2440,34 @@ impl EventStore {
                     ts,
                 )?;
             }
-            record_system_event_artifacts(db, request_id, event_id, event, ts, matched)?;
+            record_system_event_artifacts(
+                db, request_id, event_id, event, ts, matched, enrichment,
+            )?;
             if !matched
                 && !matches!(
                     event.source.as_str(),
                     "macos-endpoint-security" | "linux-falco" | "claude-cowork-local-audit"
                 )
             {
-                record_unmatched_system_event_alert(db, request_id, event_id, event, ts)?;
+                record_prepared_unmatched_system_event_alert(
+                    db,
+                    request_id,
+                    event_id,
+                    event,
+                    enrichment.unmatched_system_alert.as_ref(),
+                    ts,
+                )?;
             }
 
             Ok(())
         })
     }
 
-    fn append_workspace_effect_database(&self, effect: &WorkspaceEffect) -> io::Result<()> {
+    fn append_workspace_effect_database(
+        &self,
+        effect: &WorkspaceEffect,
+        enrichment: &ObservationEnrichment,
+    ) -> io::Result<()> {
         self.with_sqlite_transaction(|db| {
             let session_id = effect.session_id.as_deref().unwrap_or(SYSTEM_SESSION_ID);
             ensure_session(db, session_id, &effect.source, effect.observed_at_ms)?;
@@ -2357,6 +2551,7 @@ impl EventStore {
                     agent_authored: false,
                     unmatched_effect,
                     risk: None,
+                    classification: enrichment.classification_for_path(&effect.path),
                     metadata: Some(json!({
                         "source": effect.source,
                         "confidence": effect.confidence,
@@ -2366,17 +2561,20 @@ impl EventStore {
                     })),
                 },
             )?;
-            record_file_operation_alerts(
+            record_prepared_file_operation_alerts(
                 db,
                 request_id,
                 Some(EntityRef::system_event(event_id)),
-                &effect.effect_type,
                 &effect.path,
-                Some(json!({
-                    "source": effect.source,
-                    "confidence": effect.confidence,
-                    "attribution": effect.attribution,
-                })),
+                enrichment,
+                merge_rule_evidence(
+                    Some(json!({
+                        "source": effect.source,
+                        "confidence": effect.confidence,
+                        "attribution": effect.attribution,
+                    })),
+                    &effect.effect_type,
+                ),
                 to_i64(effect.observed_at_ms)?,
             )
         })
@@ -2707,34 +2905,16 @@ fn insert_entity_relation(
 }
 
 fn insert_alert(db: &SqliteStore, input: AlertInput<'_>) -> io::Result<()> {
-    let policy = Policy::load_current();
-    let tuned = policy.tuned_alert_values(input.rule_id, input.severity, input.action);
-    if !policy
-        .document()
-        .endpoint_security
-        .minimum_recorded_severity
-        .includes(&tuned.severity)
-    {
-        return Ok(());
-    }
-    let mut evidence = input.evidence;
-    if let Some(severity) = tuned.pre_review_severity {
-        evidence =
-            add_alert_evidence_field(evidence, "pre_review_severity", Value::String(severity));
-    }
-    if let Some(action) = tuned.pre_review_action {
-        evidence = add_alert_evidence_field(evidence, "pre_review_action", Value::String(action));
-    }
     db.insert_alert(&NewAlert {
         request_id: input.request_id,
         entity_kind: input.entity.map(|entity| entity.kind.to_string()),
         entity_id: input.entity.map(|entity| entity.id),
-        severity: tuned.severity,
-        action: tuned.action,
+        severity: input.severity.to_string(),
+        action: input.action.to_string(),
         rule_id: input.rule_id.to_string(),
         message: input.message.to_string(),
         path: input.path.map(str::to_string),
-        evidence: evidence.map(|value| value.to_string()),
+        evidence: input.evidence.map(|value| value.to_string()),
         created_at: input.created_at,
     })
     .map(|_| ())
@@ -2759,7 +2939,7 @@ fn merge_alert_evidence(evidence: Option<Value>, tool_use_id: Option<&str>) -> O
     }
 }
 
-fn add_alert_evidence_field(evidence: Option<Value>, key: &str, value: Value) -> Option<Value> {
+pub fn add_alert_evidence_field(evidence: Option<Value>, key: &str, value: Value) -> Option<Value> {
     match evidence {
         Some(Value::Object(mut map)) => {
             map.insert(key.to_string(), value);
@@ -2793,6 +2973,7 @@ struct ArtifactFactUpdate<'a> {
     agent_authored: bool,
     unmatched_effect: bool,
     risk: Option<ArtifactFactRisk<'a>>,
+    classification: Option<&'a ArtifactClassification>,
     metadata: Option<Value>,
 }
 
@@ -2828,7 +3009,6 @@ fn action_rank(action: &str) -> u8 {
 }
 
 fn update_artifact_fact(db: &SqliteStore, update: ArtifactFactUpdate<'_>) -> io::Result<()> {
-    let policy = Policy::global();
     let uri = file_uri(update.path);
     let existing = db.artifact_fact("file", &uri).map_err(sqlite_error)?;
     let fresh_existing = existing.as_ref().filter(|fact| {
@@ -2926,9 +3106,18 @@ fn update_artifact_fact(db: &SqliteStore, update: ArtifactFactUpdate<'_>) -> io:
             || update.agent_authored,
         is_unmatched_modified: previous_recent.is_some_and(|fact| fact.is_unmatched_modified)
             || (update.mutating && update.unmatched_effect),
-        is_memory_artifact: policy.is_memory_artifact_path(update.path),
-        is_persistent_target: policy.is_persistent_target_path(update.path),
-        is_control_plane: policy.is_control_plane_path(update.path),
+        is_memory_artifact: update
+            .classification
+            .map(|classification| classification.is_memory_artifact)
+            .unwrap_or_else(|| previous.is_some_and(|fact| fact.is_memory_artifact)),
+        is_persistent_target: update
+            .classification
+            .map(|classification| classification.is_persistent_target)
+            .unwrap_or_else(|| previous.is_some_and(|fact| fact.is_persistent_target)),
+        is_control_plane: update
+            .classification
+            .map(|classification| classification.is_control_plane)
+            .unwrap_or_else(|| previous.is_some_and(|fact| fact.is_control_plane)),
         dashboard_visible: dashboard_artifact_path_is_visible(
             update.path,
             update
@@ -2953,6 +3142,7 @@ fn record_file_intent_artifact(
     request_id: i64,
     agent_event_id: i64,
     intent: &FileIntent,
+    enrichment: &ObservationEnrichment,
 ) -> io::Result<()> {
     let ts = to_i64(intent.observed_at_ms)?;
     let Some(artifact_id) = upsert_file_artifact(
@@ -3036,6 +3226,7 @@ fn record_file_intent_artifact(
             agent_authored: true,
             unmatched_effect: false,
             risk: None,
+            classification: enrichment.classification_for_path(&intent.path),
             metadata: Some(json!({
                 "source": intent.provider,
                 "operation": intent.operation,
@@ -3052,16 +3243,18 @@ fn record_native_tool_artifact(
     request_id: i64,
     agent_event_id: i64,
     event: &AgentHookEvent,
+    enrichment: &ObservationEnrichment,
+    tools: &[FileOperation],
 ) -> io::Result<()> {
     if event.hook_event_name.as_deref() != Some("PreToolUse") {
         return Ok(());
     }
-    let tools = native_file_tools(event);
     if tools.is_empty() {
         return Ok(());
     }
 
     let ts = to_i64(event.observed_at_ms)?;
+    let mut alerted_paths = HashSet::new();
     for tool in tools {
         let Some(artifact_id) = upsert_file_artifact(
             db,
@@ -3128,18 +3321,23 @@ fn record_native_tool_artifact(
             }
         }
 
-        if should_record_native_tool_file_alert(&event.provider) {
-            record_file_operation_alerts(
+        if should_record_native_tool_file_alert(&event.provider)
+            && alerted_paths.insert(tool.path.as_str())
+        {
+            record_prepared_file_operation_alerts(
                 db,
                 request_id,
                 Some(EntityRef::agent_event(agent_event_id)),
-                &tool.operation,
                 &tool.path,
-                Some(json!({
-                    "source": event.provider,
-                    "tool_name": event.tool_name,
-                    "tool_use_id": event.tool_use_id,
-                })),
+                enrichment,
+                merge_rule_evidence(
+                    Some(json!({
+                        "source": event.provider,
+                        "tool_name": event.tool_name,
+                        "tool_use_id": event.tool_use_id,
+                    })),
+                    &tool.operation,
+                ),
                 ts,
             )?;
         }
@@ -3159,6 +3357,7 @@ fn record_native_tool_artifact(
                 agent_authored: true,
                 unmatched_effect: false,
                 risk: None,
+                classification: enrichment.classification_for_path(&tool.path),
                 metadata: Some(json!({
                     "source": event.provider,
                     "operation": tool.operation,
@@ -3315,6 +3514,7 @@ fn record_system_event_artifacts(
     event: &SystemEvent,
     ts: i64,
     matched_agent_intent: bool,
+    enrichment: &ObservationEnrichment,
 ) -> io::Result<()> {
     let raw_event = serde_json::from_str::<Value>(&event.raw_json).ok();
     let modified = raw_event
@@ -3387,6 +3587,7 @@ fn record_system_event_artifacts(
                 unmatched_effect: !matched_agent_intent
                     && matches!(request_relation_type, "produced" | "modified" | "deleted"),
                 risk: None,
+                classification: enrichment.classification_for_path(&path),
                 metadata: Some(json!({
                     "source": event.source,
                     "system_event_type": event.event_type,
@@ -3401,35 +3602,49 @@ fn record_system_event_artifacts(
     Ok(())
 }
 
-fn record_file_operation_alerts(
+fn record_prepared_file_operation_alerts(
     db: &SqliteStore,
     request_id: i64,
     entity: Option<EntityRef>,
-    operation: &str,
     path: &str,
+    enrichment: &ObservationEnrichment,
     evidence: Option<Value>,
     created_at: i64,
 ) -> io::Result<()> {
-    // Passive risk findings over an observed artifact, evaluated by the shared
-    // data-driven policy engine (same rules as the active PreToolUse path).
-    for finding in Policy::global().evaluate_observation(operation, path) {
+    for alert in enrichment.alerts_for_path(path) {
         insert_alert(
             db,
             AlertInput {
                 request_id: Some(request_id),
                 entity,
-                severity: &finding.severity,
-                action: finding.action.as_str(),
-                rule_id: &finding.rule_id,
-                message: &finding.message,
-                path: finding.path.as_deref().or(Some(path)),
-                evidence: merge_rule_evidence(evidence.clone(), operation),
+                severity: &alert.severity,
+                action: &alert.action,
+                rule_id: &alert.rule_id,
+                message: &alert.message,
+                path: alert.path.as_deref().or(Some(path)),
+                evidence: merge_evidence(evidence.clone(), alert.evidence.clone()),
                 created_at,
             },
         )?;
     }
 
     Ok(())
+}
+
+fn merge_evidence(base: Option<Value>, enrichment: Option<Value>) -> Option<Value> {
+    match (base, enrichment) {
+        (Some(Value::Object(mut base)), Some(Value::Object(enrichment))) => {
+            base.extend(enrichment);
+            Some(Value::Object(base))
+        }
+        (Some(base), Some(enrichment)) => Some(json!({
+            "observation": base,
+            "derived": enrichment,
+        })),
+        (Some(base), None) => Some(base),
+        (None, Some(enrichment)) => Some(enrichment),
+        (None, None) => None,
+    }
 }
 
 fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::Result<Vec<Value>> {
@@ -3976,34 +4191,32 @@ fn dashboard_endpoint_event_is_file_mutation(event_type: &str, raw_event: &Value
     }
 }
 
-fn record_unmatched_system_event_alert(
+fn record_prepared_unmatched_system_event_alert(
     db: &SqliteStore,
     request_id: i64,
     system_event_id: i64,
     event: &SystemEvent,
+    alert: Option<&PolicyAlert>,
     created_at: i64,
 ) -> io::Result<()> {
-    let request_relation = request_artifact_relation_type(&event.event_type);
-    if !matches!(request_relation, "produced" | "modified" | "deleted") {
+    if !system_event_can_record_unmatched_alert(&event.event_type) {
         return Ok(());
     }
+    let Some(alert) = alert else {
+        return Ok(());
+    };
 
     insert_alert(
         db,
         AlertInput {
             request_id: Some(request_id),
             entity: Some(EntityRef::system_event(system_event_id)),
-            severity: "medium",
-            action: "warn",
-            rule_id: "unmatched_system_effect",
-            message: "Filesystem effect was observed without a matching agent file intent",
-            path: event.file_path.as_deref(),
-            evidence: Some(json!({
-                "source": event.source,
-                "event_type": event.event_type,
-                "event_kind": event.event_kind,
-                "process_name": event.process_name,
-            })),
+            severity: &alert.severity,
+            action: &alert.action,
+            rule_id: &alert.rule_id,
+            message: &alert.message,
+            path: alert.path.as_deref().or(event.file_path.as_deref()),
+            evidence: alert.evidence.clone(),
             created_at,
         },
     )
@@ -4077,7 +4290,7 @@ fn system_event_session_id(event: &SystemEvent) -> Option<String> {
         .map(str::to_string)
 }
 
-fn system_event_paths(event: &SystemEvent) -> Vec<String> {
+pub fn system_event_paths(event: &SystemEvent) -> Vec<String> {
     let mut paths = BTreeSet::new();
     if let Some(path) = &event.file_path {
         add_path_variants(path, &mut paths);
@@ -4695,6 +4908,16 @@ fn request_artifact_relation_type(event_type: &str) -> &'static str {
     }
 }
 
+/// Whether an unattributed system event can represent a filesystem effect
+/// worth alerting on. Policy-aware callers use this gate to avoid preparing an
+/// alert that the store will necessarily discard.
+pub fn system_event_can_record_unmatched_alert(event_type: &str) -> bool {
+    matches!(
+        request_artifact_relation_type(event_type),
+        "produced" | "modified" | "deleted"
+    )
+}
+
 fn file_uri(path: &str) -> String {
     let normalized = path
         .strip_prefix("/tmp/")
@@ -4707,12 +4930,10 @@ fn file_uri(path: &str) -> String {
     }
 }
 
-struct NativeFileTool {
-    operation: String,
-    path: String,
-}
-
-fn native_file_tools(event: &AgentHookEvent) -> Vec<NativeFileTool> {
+/// Extract the file operations the store will materialize for a hook event.
+/// Policy-aware callers use this exact result to prepare enrichment, avoiding a
+/// second parser with subtly different tool or path handling.
+pub fn hook_file_operations(event: &AgentHookEvent) -> Vec<FileOperation> {
     let Some(tool_name) = event.tool_name.as_deref() else {
         return Vec::new();
     };
@@ -4728,7 +4949,7 @@ fn native_file_tools(event: &AgentHookEvent) -> Vec<NativeFileTool> {
         };
         return parse_apply_patch_changes(patch)
             .into_iter()
-            .map(|change| NativeFileTool {
+            .map(|change| FileOperation {
                 operation: change.operation,
                 path: resolve_tool_path(&change.path, event.cwd.as_deref()),
             })
@@ -4737,7 +4958,7 @@ fn native_file_tools(event: &AgentHookEvent) -> Vec<NativeFileTool> {
     if tool_name.starts_with("mcp__") {
         return parse_mcp_file_intents(tool_name, input)
             .into_iter()
-            .map(|intent| NativeFileTool {
+            .map(|intent| FileOperation {
                 operation: intent.operation,
                 path: resolve_tool_path(&intent.path, event.cwd.as_deref()),
             })
@@ -4746,7 +4967,7 @@ fn native_file_tools(event: &AgentHookEvent) -> Vec<NativeFileTool> {
     if event.provider == "vscode" {
         return parse_vscode_file_intents(tool_name, input)
             .into_iter()
-            .map(|intent| NativeFileTool {
+            .map(|intent| FileOperation {
                 operation: intent.operation,
                 path: resolve_tool_path(&intent.path, event.cwd.as_deref()),
             })
@@ -4765,7 +4986,7 @@ fn native_file_tools(event: &AgentHookEvent) -> Vec<NativeFileTool> {
     let Some(path) = input.get(path_key).and_then(Value::as_str) else {
         return Vec::new();
     };
-    vec![NativeFileTool {
+    vec![FileOperation {
         operation: operation.to_string(),
         path: resolve_tool_path(path, event.cwd.as_deref()),
     }]
@@ -4775,9 +4996,8 @@ fn resolve_tool_path(path: &str, cwd: Option<&str>) -> String {
     normalize_agent_path(path, cwd.unwrap_or("."))
 }
 
-fn tool_input_json(event: &AgentHookEvent) -> Option<String> {
-    let tools = native_file_tools(event);
-    match tools.as_slice() {
+fn tool_input_json(event: &AgentHookEvent, tools: &[FileOperation]) -> Option<String> {
+    match tools {
         [] => {
             if event.tool_input_command.is_some() || event.tool_input_description.is_some() {
                 return store_tool_input(json!({
@@ -5309,7 +5529,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         let store = EventStore::new(&dir).unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"test completion"}"#,
                 100,
@@ -5319,7 +5539,7 @@ mod tests {
         assert!(store.completed_request_ids_after(0, 50).unwrap().is_empty());
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "Stop",
                 r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
                 200,
@@ -5543,7 +5763,7 @@ mod tests {
         ));
         let store = EventStore::new(&dir).unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"test"}"#,
                 now,
@@ -5555,7 +5775,7 @@ mod tests {
             now + 1,
         );
         read.tool_name = Some("Read".to_string());
-        store.append_hook_event(&read).unwrap();
+        store.append_hook_event_evidence_only(&read).unwrap();
 
         let transcript = dir.join("transcript.jsonl");
         fs::write(
@@ -5569,7 +5789,7 @@ mod tests {
             now + 2,
         );
         stop.transcript_path = Some(transcript.display().to_string());
-        store.append_hook_event(&stop).unwrap();
+        store.append_hook_event_evidence_only(&stop).unwrap();
         store
             .append_policy_alert(&PolicyAlert {
                 session_id: Some("s1".to_string()),
@@ -5633,7 +5853,7 @@ mod tests {
         ));
         let store = EventStore::new(&dir).unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"Review this request"}"#,
                 now,
@@ -5646,7 +5866,7 @@ mod tests {
         );
         tool.tool_name = Some("Read".to_string());
         tool.tool_use_id = Some("read-1".to_string());
-        store.append_hook_event(&tool).unwrap();
+        store.append_hook_event_evidence_only(&tool).unwrap();
         store
             .append_policy_alert(&PolicyAlert {
                 session_id: Some("s1".to_string()),
@@ -5676,7 +5896,7 @@ mod tests {
                 .unwrap();
         }
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "Stop",
                 r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
                 now + 5,
@@ -5723,7 +5943,7 @@ mod tests {
         ));
         let store = EventStore::new(&dir).unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"Do the task"}"#,
                 now,
@@ -5736,7 +5956,7 @@ mod tests {
         );
         permission.tool_name = Some("Bash".to_string());
         permission.tool_use_id = Some("denied-1".to_string());
-        store.append_hook_event(&permission).unwrap();
+        store.append_hook_event_evidence_only(&permission).unwrap();
         let mut post_only = hook_event(
             "PostToolUseFailure",
             r#"{"session_id":"s1","hook_event_name":"PostToolUseFailure","tool_name":"Read","tool_use_id":"post-only"}"#,
@@ -5744,7 +5964,7 @@ mod tests {
         );
         post_only.tool_name = Some("Read".to_string());
         post_only.tool_use_id = Some("post-only".to_string());
-        store.append_hook_event(&post_only).unwrap();
+        store.append_hook_event_evidence_only(&post_only).unwrap();
         store
             .append_policy_alert(&PolicyAlert {
                 session_id: Some("s1".to_string()),
@@ -5774,7 +5994,7 @@ mod tests {
                 .unwrap();
         }
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "Stop",
                 r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
                 now + 4,
@@ -5800,14 +6020,14 @@ mod tests {
         ));
         let store = EventStore::new(&dir).unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"Edit the app"}"#,
                 now,
             ))
             .unwrap();
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "codex".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("edit-1".to_string()),
@@ -5847,25 +6067,28 @@ mod tests {
             .to_string(),
         };
         store
-            .append_system_event(&endpoint_event("/repo/App.swift", now + 2))
+            .append_system_event_evidence_only(&endpoint_event("/repo/App.swift", now + 2))
             .unwrap();
         store
-            .append_system_event(&endpoint_event("/repo/Outside.swift", now + 3))
+            .append_system_event_evidence_only(&endpoint_event("/repo/Outside.swift", now + 3))
             .unwrap();
         store
-            .append_system_event(&endpoint_event("/dev/null", now + 4))
+            .append_system_event_evidence_only(&endpoint_event("/dev/null", now + 4))
             .unwrap();
         store
-            .append_system_event(&endpoint_event(
+            .append_system_event_evidence_only(&endpoint_event(
                 "/Users/test/.codex/state_5.sqlite",
                 now + 5,
             ))
             .unwrap();
         store
-            .append_system_event(&endpoint_event("/Users/test/.gensee/gensee.db", now + 6))
+            .append_system_event_evidence_only(&endpoint_event(
+                "/Users/test/.gensee/gensee.db",
+                now + 6,
+            ))
             .unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "Stop",
                 r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
                 now + 7,
@@ -5953,7 +6176,7 @@ mod tests {
         ));
         let store = EventStore::new(&dir).unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"Edit the source"}"#,
                 now,
@@ -5966,9 +6189,9 @@ mod tests {
             r#"{"patch":"*** Begin Patch\n*** Update File: Sources/App.swift\n@@\n-old\n+new\n*** End Patch"}"#,
             now + 1,
         );
-        store.append_hook_event(&started).unwrap();
+        store.append_hook_event_evidence_only(&started).unwrap();
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("patch-1".to_string()),
@@ -5989,9 +6212,9 @@ mod tests {
         );
         completed.hook_event_name = Some("PostToolUse".to_string());
         completed.raw_json = r#"{"session_id":"s1","hook_event_name":"PostToolUse","cwd":"/repo","tool_name":"apply_patch","tool_use_id":"patch-1","tool_input":{"patch":"*** Begin Patch\n*** Update File: Sources/App.swift\n@@\n-old\n+new\n*** End Patch"}}"#.to_string();
-        store.append_hook_event(&completed).unwrap();
+        store.append_hook_event_evidence_only(&completed).unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "Stop",
                 r#"{"session_id":"s1","hook_event_name":"Stop","cwd":"/repo","last_assistant_message":"done"}"#,
                 now + 3,
@@ -6117,7 +6340,7 @@ mod tests {
         ));
         let store = EventStore::new(&dir).unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"Edit the source"}"#,
                 now,
@@ -6149,7 +6372,7 @@ mod tests {
         };
         for index in 0..(MAX_DASHBOARD_FILE_TOUCH_CANDIDATES + 20) {
             store
-                .append_system_event(&endpoint_event(
+                .append_system_event_evidence_only(&endpoint_event(
                     format!("/Users/test/.codex/state_{index:04}.sqlite"),
                     now + 1 + u64::try_from(index).unwrap(),
                 ))
@@ -6157,13 +6380,13 @@ mod tests {
         }
         let source_path = "/repo/Sources/App.swift";
         store
-            .append_system_event(&endpoint_event(
+            .append_system_event_evidence_only(&endpoint_event(
                 source_path.to_string(),
                 now + 1 + u64::try_from(MAX_DASHBOARD_FILE_TOUCH_CANDIDATES + 20).unwrap(),
             ))
             .unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "Stop",
                 r#"{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}"#,
                 now + 200,
@@ -6371,7 +6594,7 @@ mod tests {
             ),
         };
 
-        store.append_hook_event(&event).unwrap();
+        store.append_hook_event_evidence_only(&event).unwrap();
         let loaded = store.list_hook_events().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(
@@ -6482,7 +6705,7 @@ mod tests {
             command_line: Some(command_line.to_string()),
             raw_json: raw_json.to_string(),
         };
-        store.append_system_event(&event).unwrap();
+        store.append_system_event_evidence_only(&event).unwrap();
 
         let loaded = store.list_system_events().unwrap();
         assert_eq!(loaded.len(), 1);
@@ -6515,14 +6738,14 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"please inspect"}"#,
                 100,
             ))
             .unwrap();
         store
-            .append_hook_event(&AgentHookEvent {
+            .append_hook_event_evidence_only(&AgentHookEvent {
                 provider: "claude-code".to_string(),
                 session_id: Some("s1".to_string()),
                 hook_event_name: Some("PreToolUse".to_string()),
@@ -6543,7 +6766,7 @@ mod tests {
             })
             .unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "Stop",
                 r#"{"session_id":"s1","hook_event_name":"Stop","cwd":"/repo","last_assistant_message":"done"}"#,
                 120,
@@ -6579,47 +6802,87 @@ mod tests {
     }
 
     #[test]
-    fn risky_file_intents_create_alert_rows() {
+    fn prepared_file_intent_alerts_are_persisted_without_store_evaluation() {
         let dir =
             std::env::temp_dir().join(format!("gensee-store-test-alerts-{}", std::process::id()));
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"read creds"}"#,
                 100,
             ))
             .unwrap();
+        let bash_intent = FileIntent {
+            provider: "bash-command-parser".to_string(),
+            session_id: Some("s1".to_string()),
+            tool_use_id: Some("tool_1".to_string()),
+            observed_at_ms: 110,
+            operation: "read".to_string(),
+            path: "/Users/test/.ssh/config".to_string(),
+            source_command: "cat ~/.ssh/config".to_string(),
+            sensitive: true,
+            confidence: "low".to_string(),
+        };
         store
-            .append_file_intent(&FileIntent {
-                provider: "bash-command-parser".to_string(),
-                session_id: Some("s1".to_string()),
-                tool_use_id: Some("tool_1".to_string()),
-                observed_at_ms: 110,
-                operation: "read".to_string(),
-                path: "/Users/test/.ssh/config".to_string(),
-                source_command: "cat ~/.ssh/config".to_string(),
-                sensitive: true,
-                confidence: "low".to_string(),
-            })
+            .append_file_intent_with_enrichment(
+                &bash_intent,
+                &ObservationEnrichment {
+                    alerts: vec![PolicyAlert {
+                        session_id: Some("s1".to_string()),
+                        tool_use_id: Some("tool_1".to_string()),
+                        severity: "critical".to_string(),
+                        action: "block".to_string(),
+                        rule_id: "must_be_suppressed".to_string(),
+                        message: "Bash parser alert".to_string(),
+                        path: Some("/Users/test/.ssh/config".to_string()),
+                        evidence: None,
+                        observed_at_ms: 110,
+                    }],
+                    ..Default::default()
+                },
+            )
             .unwrap();
 
         let alerts = store.list_alerts().unwrap();
         assert_eq!(alerts.len(), 0);
 
+        let intent = FileIntent {
+            provider: "external-file-intent-source".to_string(),
+            session_id: Some("s1".to_string()),
+            tool_use_id: Some("tool_2".to_string()),
+            observed_at_ms: 120,
+            operation: "read".to_string(),
+            path: "/Users/test/.ssh/config".to_string(),
+            source_command: "cat ~/.ssh/config".to_string(),
+            sensitive: true,
+            confidence: "low".to_string(),
+        };
         store
-            .append_file_intent(&FileIntent {
-                provider: "external-file-intent-source".to_string(),
-                session_id: Some("s1".to_string()),
-                tool_use_id: Some("tool_2".to_string()),
-                observed_at_ms: 120,
-                operation: "read".to_string(),
-                path: "/Users/test/.ssh/config".to_string(),
-                source_command: "cat ~/.ssh/config".to_string(),
-                sensitive: true,
-                confidence: "low".to_string(),
-            })
+            .append_file_intent_with_enrichment(
+                &intent,
+                &ObservationEnrichment {
+                    alerts: vec![PolicyAlert {
+                        session_id: Some("s1".to_string()),
+                        tool_use_id: Some("tool_2".to_string()),
+                        severity: "critical".to_string(),
+                        action: "block".to_string(),
+                        rule_id: "policy_sensitive_file_access".to_string(),
+                        message: "Sensitive file access".to_string(),
+                        path: Some("/Users/test/.ssh/config".to_string()),
+                        evidence: None,
+                        observed_at_ms: 120,
+                    }],
+                    artifact_classifications: vec![ArtifactClassification {
+                        path: "/Users/test/.ssh/config".to_string(),
+                        is_memory_artifact: true,
+                        is_persistent_target: false,
+                        is_control_plane: true,
+                    }],
+                    ..Default::default()
+                },
+            )
             .unwrap();
 
         let alerts = store.list_alerts().unwrap();
@@ -6629,8 +6892,101 @@ mod tests {
         assert_eq!(alerts[0].rule_id, "policy_sensitive_file_access");
         assert_eq!(alerts[0].session_id.as_deref(), Some("s1"));
         assert_eq!(alerts[0].path.as_deref(), Some("/Users/test/.ssh/config"));
+        let fact = store
+            .artifact_fact_for_file("/Users/test/.ssh/config")
+            .unwrap()
+            .unwrap();
+        assert!(fact.is_memory_artifact);
+        assert!(!fact.is_persistent_target);
+        assert!(fact.is_control_plane);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_enrichment_is_dropped_without_losing_observation() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-enrichment-path-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let intent = FileIntent {
+            provider: "external-file-intent-source".to_string(),
+            session_id: Some("s1".to_string()),
+            tool_use_id: Some("tool_1".to_string()),
+            observed_at_ms: 110,
+            operation: "read".to_string(),
+            path: "/repo/actual.txt".to_string(),
+            source_command: "read file".to_string(),
+            sensitive: false,
+            confidence: "high".to_string(),
+        };
+        store
+            .append_file_intent_with_enrichment(
+                &intent,
+                &ObservationEnrichment {
+                    alerts: vec![PolicyAlert {
+                        session_id: Some("s1".to_string()),
+                        tool_use_id: Some("tool_1".to_string()),
+                        severity: "high".to_string(),
+                        action: "warn".to_string(),
+                        rule_id: "mismatched_path".to_string(),
+                        message: "wrong subject".to_string(),
+                        path: Some("/repo/other.txt".to_string()),
+                        evidence: None,
+                        observed_at_ms: 110,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.list_file_intents().unwrap().len(), 1);
+        assert!(store.list_alerts().unwrap().is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_hook_enrichment_does_not_abort_or_drop_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-hook-enrichment-path-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let event = native_tool_event("Read", "tool_1", r#"{"file_path":"/repo/actual.txt"}"#, 110);
+
+        store
+            .append_hook_event_with_enrichment(
+                &event,
+                &ObservationEnrichment {
+                    alerts: vec![PolicyAlert {
+                        session_id: Some("s1".to_string()),
+                        tool_use_id: Some("tool_1".to_string()),
+                        severity: "high".to_string(),
+                        action: "warn".to_string(),
+                        rule_id: "mismatched_path".to_string(),
+                        message: "wrong subject".to_string(),
+                        path: Some("/repo/other.txt".to_string()),
+                        evidence: None,
+                        observed_at_ms: 110,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.list_hook_events().unwrap().len(), 1);
+        assert!(store.list_alerts().unwrap().is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unmatched_alert_gate_excludes_read_shaped_system_events() {
+        assert!(!system_event_can_record_unmatched_alert("open"));
+        assert!(!system_event_can_record_unmatched_alert("stat"));
+        assert!(system_event_can_record_unmatched_alert("write"));
+        assert!(system_event_can_record_unmatched_alert("rename"));
+        assert!(system_event_can_record_unmatched_alert("unlink"));
     }
 
     #[test]
@@ -6642,7 +6998,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"write outside"}"#,
                 100,
@@ -6680,14 +7036,14 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"inspect the deployment settings"}"#,
                 100,
             ))
             .unwrap();
         store
-            .append_hook_event(&AgentHookEvent {
+            .append_hook_event_evidence_only(&AgentHookEvent {
                 provider: "claude-code".to_string(),
                 session_id: Some("s1".to_string()),
                 hook_event_name: Some("PreToolUse".to_string()),
@@ -6708,7 +7064,7 @@ mod tests {
             })
             .unwrap();
         store
-            .append_hook_event(&AgentHookEvent {
+            .append_hook_event_evidence_only(&AgentHookEvent {
                 provider: "claude-code".to_string(),
                 session_id: Some("s1".to_string()),
                 hook_event_name: Some("PostToolUse".to_string()),
@@ -6807,7 +7163,7 @@ mod tests {
         let response = format!("{response_marker}{}", "r".repeat(32 * 1_024));
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 &json!({
                     "session_id": "s1",
@@ -6820,7 +7176,7 @@ mod tests {
             ))
             .unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "Stop",
                 &json!({
                     "session_id": "s1",
@@ -6888,7 +7244,7 @@ mod tests {
         ));
         let store = EventStore::new(&dir).unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"build"}"#,
                 100,
@@ -6956,7 +7312,7 @@ mod tests {
             std::env::temp_dir().join(format!("gensee-store-test-rollback-{}", std::process::id()));
         let store = EventStore::new(&dir).unwrap();
 
-        let result = store.append_system_event(&SystemEvent {
+        let result = store.append_system_event_evidence_only(&SystemEvent {
             source: "test".to_string(),
             event_type: "exec".to_string(),
             event_kind: "process".to_string(),
@@ -6990,14 +7346,14 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"watch this"}"#,
                 100,
             ))
             .unwrap();
         store
-            .append_system_event(&SystemEvent {
+            .append_system_event_evidence_only(&SystemEvent {
                 source: "eslogger".to_string(),
                 event_type: "exec".to_string(),
                 event_kind: "process".to_string(),
@@ -7053,7 +7409,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_system_event(&SystemEvent {
+            .append_system_event_evidence_only(&SystemEvent {
                 source: "linux-falco".to_string(),
                 event_type: "connect".to_string(),
                 event_kind: "NetworkConnect".to_string(),
@@ -7119,7 +7475,7 @@ mod tests {
             ("Write", "write", "file_mutation", "/repo/output.txt"),
         ] {
             store
-                .append_system_event(&SystemEvent {
+                .append_system_event_evidence_only(&SystemEvent {
                     source: "claude-cowork-local-audit".to_string(),
                     event_type: "cowork_tool_boundary".to_string(),
                     event_kind: event_kind.to_string(),
@@ -7179,7 +7535,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
         for observed_at_ms in [130, 140] {
             store
-                .append_system_event(&SystemEvent {
+                .append_system_event_evidence_only(&SystemEvent {
                     source: "linux-falco".to_string(),
                     event_type: "execve".to_string(),
                     event_kind: "ProcessExec".to_string(),
@@ -7221,7 +7577,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
         for observed_at_ms in 1..=8 {
             store
-                .append_system_event(&SystemEvent {
+                .append_system_event_evidence_only(&SystemEvent {
                     source: "linux-falco".to_string(),
                     event_type: "execve".to_string(),
                     event_kind: "ProcessExec".to_string(),
@@ -7266,7 +7622,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         let store = EventStore::new(&dir).unwrap();
         store
-            .append_system_event(&SystemEvent {
+            .append_system_event_evidence_only(&SystemEvent {
                 source: "linux-falco".to_string(),
                 event_type: "execve".to_string(),
                 event_kind: "ProcessExec".to_string(),
@@ -7306,7 +7662,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_system_event(&SystemEvent {
+            .append_system_event_evidence_only(&SystemEvent {
                 source: "linux-falco".to_string(),
                 event_type: "openat".to_string(),
                 event_kind: "FileWrite".to_string(),
@@ -7353,7 +7709,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_system_event(&SystemEvent {
+            .append_system_event_evidence_only(&SystemEvent {
                 source: "macos-endpoint-security".to_string(),
                 event_type: "write".to_string(),
                 event_kind: "file_mutation".to_string(),
@@ -7427,14 +7783,14 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"write this"}"#,
                 100,
             ))
             .unwrap();
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool_1".to_string()),
@@ -7447,7 +7803,7 @@ mod tests {
             })
             .unwrap();
         store
-            .append_system_event(&SystemEvent {
+            .append_system_event_evidence_only(&SystemEvent {
                 source: "macos-eslogger".to_string(),
                 event_type: "write".to_string(),
                 event_kind: "file_mutation".to_string(),
@@ -7582,7 +7938,7 @@ mod tests {
             ),
         ];
         for event in &ignored {
-            store.append_system_event(event).unwrap();
+            store.append_system_event_evidence_only(event).unwrap();
             assert!(store
                 .artifact_fact_for_file(event.file_path.as_deref().unwrap())
                 .unwrap()
@@ -7590,7 +7946,7 @@ mod tests {
         }
 
         store
-            .append_system_event(&endpoint_event(
+            .append_system_event_evidence_only(&endpoint_event(
                 "write",
                 "file_mutation",
                 "/repo/src/lib.rs",
@@ -7605,7 +7961,7 @@ mod tests {
             .is_some());
 
         store
-            .append_system_event(&endpoint_event(
+            .append_system_event_evidence_only(&endpoint_event(
                 "write",
                 "file_mutation",
                 "/repo/target/exfil.env",
@@ -7630,7 +7986,9 @@ mod tests {
         build_output.process_name = Some("rustc".to_string());
         build_output.executable_path =
             Some("/Users/test/.rustup/toolchains/stable/bin/rustc".to_string());
-        store.append_system_event(&build_output).unwrap();
+        store
+            .append_system_event_evidence_only(&build_output)
+            .unwrap();
         assert!(store
             .artifact_fact_for_file("/repo/target/debug/output.o")
             .unwrap()
@@ -7850,7 +8208,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"watch derived"}"#,
                 100,
@@ -7869,7 +8227,7 @@ mod tests {
             })
             .unwrap();
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool_1".to_string()),
@@ -7882,7 +8240,7 @@ mod tests {
             })
             .unwrap();
         store
-            .append_workspace_effect(&WorkspaceEffect {
+            .append_workspace_effect_evidence_only(&WorkspaceEffect {
                 source: "fsevents".to_string(),
                 session_id: Some("s1".to_string()),
                 workspace: "/repo".to_string(),
@@ -7944,14 +8302,14 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"create input"}"#,
                 100,
             ))
             .unwrap();
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool_1".to_string()),
@@ -7969,14 +8327,14 @@ mod tests {
         };
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"summarize input"}"#,
                 200,
             ))
             .unwrap();
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool_2".to_string()),
@@ -8019,14 +8377,14 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"create and verify input"}"#,
                 100,
             ))
             .unwrap();
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool_1".to_string()),
@@ -8039,7 +8397,7 @@ mod tests {
             })
             .unwrap();
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool_1".to_string()),
@@ -8079,7 +8437,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"inspect scripts"}"#,
                 100,
@@ -8090,7 +8448,7 @@ mod tests {
             .enumerate()
         {
             store
-                .append_file_intent(&FileIntent {
+                .append_file_intent_evidence_only(&FileIntent {
                     provider: "bash-command-parser".to_string(),
                     session_id: Some("s1".to_string()),
                     tool_use_id: Some(format!("tool_{index}")),
@@ -8110,7 +8468,7 @@ mod tests {
         assert!(dashboard["artifacts"].as_array().unwrap().is_empty());
 
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool_route".to_string()),
@@ -8128,7 +8486,7 @@ mod tests {
             .is_some());
 
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool_concrete".to_string()),
@@ -8163,14 +8521,14 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"write input"}"#,
                 100,
             ))
             .unwrap();
         store
-            .append_hook_event(&native_tool_event(
+            .append_hook_event_evidence_only(&native_tool_event(
                 "Write",
                 "tool_write",
                 r#"{"file_path":"/repo/doc.txt","content":"hello"}"#,
@@ -8183,14 +8541,14 @@ mod tests {
         };
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"read input"}"#,
                 200,
             ))
             .unwrap();
         store
-            .append_hook_event(&native_tool_event(
+            .append_hook_event_evidence_only(&native_tool_event(
                 "Read",
                 "tool_read",
                 r#"{"file_path":"/repo/doc.txt"}"#,
@@ -8198,7 +8556,7 @@ mod tests {
             ))
             .unwrap();
         store
-            .append_hook_event(&native_tool_event(
+            .append_hook_event_evidence_only(&native_tool_event(
                 "Write",
                 "tool_summary",
                 r#"{"file_path":"/repo/summary.txt","content":"summary"}"#,
@@ -8273,7 +8631,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"read input"}"#,
                 100,
@@ -8286,7 +8644,7 @@ mod tests {
             110,
         );
         read_event.provider = "vscode".to_string();
-        store.append_hook_event(&read_event).unwrap();
+        store.append_hook_event_evidence_only(&read_event).unwrap();
 
         let db = store.sqlite_store().unwrap();
         let request = db.latest_request_for_session("s1").unwrap().unwrap();
@@ -8316,7 +8674,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"find code"}"#,
                 100,
@@ -8330,7 +8688,7 @@ mod tests {
                 110 + index as u64,
             );
             event.provider = "vscode".to_string();
-            store.append_hook_event(&event).unwrap();
+            store.append_hook_event_evidence_only(&event).unwrap();
         }
 
         let db = store.sqlite_store().unwrap();
@@ -8358,14 +8716,14 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"write input"}"#,
                 100,
             ))
             .unwrap();
         store
-            .append_hook_event(&native_tool_event(
+            .append_hook_event_evidence_only(&native_tool_event(
                 "mcp__filesystem__write_file",
                 "mcp_write",
                 r#"{"path":"data/input.txt","content":"hello"}"#,
@@ -8378,14 +8736,14 @@ mod tests {
         };
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"read input"}"#,
                 200,
             ))
             .unwrap();
         store
-            .append_hook_event(&native_tool_event(
+            .append_hook_event_evidence_only(&native_tool_event(
                 "mcp__filesystem__read_file",
                 "mcp_read",
                 r#"{"file_path":"data/input.txt"}"#,
@@ -8443,7 +8801,7 @@ mod tests {
 *** End Patch"#;
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"apply patch"}"#,
                 100,
@@ -8459,7 +8817,7 @@ mod tests {
         // Native file-tool normalization must win so the changed paths remain
         // available for intent/Endpoint Security correlation.
         patch_event.tool_input_command = Some(patch.to_string());
-        store.append_hook_event(&patch_event).unwrap();
+        store.append_hook_event_evidence_only(&patch_event).unwrap();
 
         let db = store.sqlite_store().unwrap();
         let request = db.latest_request_for_session("s1").unwrap().unwrap();
@@ -8504,7 +8862,7 @@ mod tests {
         let store = EventStore::new(&dir).unwrap();
 
         store
-            .append_workspace_effect(&WorkspaceEffect {
+            .append_workspace_effect_evidence_only(&WorkspaceEffect {
                 source: "gensee-watch-fsevents".to_string(),
                 session_id: Some("watch_1".to_string()),
                 workspace: "/repo".to_string(),
@@ -8516,14 +8874,14 @@ mod tests {
             })
             .unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"read watched file"}"#,
                 200,
             ))
             .unwrap();
         store
-            .append_hook_event(&native_tool_event(
+            .append_hook_event_evidence_only(&native_tool_event(
                 "Read",
                 "tool_read",
                 r#"{"file_path":"/repo/watched.txt"}"#,
@@ -8556,14 +8914,14 @@ mod tests {
         ));
         let store = EventStore::new(&dir).unwrap();
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"write it"}"#,
                 100,
             ))
             .unwrap();
         store
-            .append_hook_event(&native_tool_event(
+            .append_hook_event_evidence_only(&native_tool_event(
                 "Bash",
                 "tool-active",
                 r#"{"command":"printf hi > out.txt"}"#,
@@ -8584,7 +8942,7 @@ mod tests {
         let mut completed = native_tool_event("Bash", "tool-active", "{}", 300);
         completed.hook_event_name = Some("PostToolUse".to_string());
         completed.raw_json = r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"tool-active"}"#.to_string();
-        store.append_hook_event(&completed).unwrap();
+        store.append_hook_event_evidence_only(&completed).unwrap();
         assert!(store.active_tool_call("s1", 350, 1_000).unwrap().is_none());
 
         fs::remove_dir_all(&dir).ok();
@@ -8619,7 +8977,7 @@ mod tests {
         }
 
         store
-            .append_hook_event(&hook_event(
+            .append_hook_event_evidence_only(&hook_event(
                 "UserPromptSubmit",
                 r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"one"}"#,
                 120,
@@ -8631,10 +8989,10 @@ mod tests {
             130,
         );
         prompt_s2.session_id = Some("s2".to_string());
-        store.append_hook_event(&prompt_s2).unwrap();
+        store.append_hook_event_evidence_only(&prompt_s2).unwrap();
 
         store
-            .append_hook_event(&native_tool_event(
+            .append_hook_event_evidence_only(&native_tool_event(
                 "Bash",
                 "tool-s1",
                 r#"{"command":"one"}"#,
@@ -8645,9 +9003,9 @@ mod tests {
         tool_s2.session_id = Some("s2".to_string());
         tool_s2.cwd = Some("/repo/other".to_string());
         tool_s2.raw_json = r#"{"session_id":"s2","hook_event_name":"PreToolUse","cwd":"/repo/other","tool_name":"Bash","tool_use_id":"tool-s2","tool_input":{"command":"two"}}"#.to_string();
-        store.append_hook_event(&tool_s2).unwrap();
+        store.append_hook_event_evidence_only(&tool_s2).unwrap();
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "native-file-tool".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some("tool-s1".to_string()),
@@ -8694,7 +9052,9 @@ mod tests {
         completed_s2.hook_event_name = Some("PostToolUse".to_string());
         completed_s2.observed_at_ms = 360;
         completed_s2.raw_json = r#"{"session_id":"s2","hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"tool-s2"}"#.to_string();
-        store.append_hook_event(&completed_s2).unwrap();
+        store
+            .append_hook_event_evidence_only(&completed_s2)
+            .unwrap();
         let completion_grace = store
             .active_tool_call_for_root_pid_at_path(
                 1234,

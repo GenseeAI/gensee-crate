@@ -47,7 +47,7 @@ pub(crate) fn ingest_cowork_audit(args: Vec<OsString>) -> io::Result<()> {
         match system_events_from_cowork_audit_line(&line, mode) {
             Ok(events) => {
                 for event in events {
-                    store.append_system_event(&event)?;
+                    append_system_event_with_policy(&store, &event)?;
                     ingested += 1;
                 }
             }
