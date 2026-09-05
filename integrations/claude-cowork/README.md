@@ -41,8 +41,8 @@ Cowork endpoint opt-in; it preserves Claude Code hooks and the Mac's current
 Endpoint Security mode. Start in Observe mode in Settings for the pilot.
 The Setup Assistant's bulk action enables hooks only; opt into Cowork separately.
 
-The **Protection (Mac-wide)** selector uses the same presets as Settings:
-Observe (Fast), Protect (Review), and Strict (Sensitive). It changes sensor mode
+Mac-wide protection is configured in **Settings → Protection Level**:
+Fast (Observe), Review (Protect), and Sensitive (Strict). It changes sensor mode
 and hook interactivity for all enabled harnesses. Protect and Strict enforce the
 same Cowork host rules; Strict also converts risky hook approvals to denials.
 Neither adds guest-command or cloud enforcement.

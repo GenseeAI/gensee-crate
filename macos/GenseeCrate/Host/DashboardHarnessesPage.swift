@@ -388,7 +388,6 @@ private struct CoworkHarnessRow: View {
     @ObservedObject var sensor: EndpointSecuritySensor
     let integration: IntegrationDescriptor
     @State private var expanded = false
-    @State private var pendingProtectionLevel: ProtectionLevel?
 
     private var sensorReady: Bool {
         sensor.health.connected && sensor.health.running && sensor.health.error == nil
@@ -427,33 +426,6 @@ private struct CoworkHarnessRow: View {
             .controlSize(.small)
 
             VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 12) {
-                    Text("Protection (Mac-wide)").fontWeight(.medium)
-                    Picker("Mac-wide protection", selection: Binding<ProtectionLevel?>(
-                        get: { model.protectionLevel },
-                        set: { level in
-                            guard let level else { return }
-                            if model.wouldLowerProtection(level) {
-                                pendingProtectionLevel = level
-                            } else {
-                                Task { _ = await model.applyProtectionLevel(level) }
-                            }
-                        }
-                    )) {
-                        if model.protectionLevel == nil { Text("Custom").tag(Optional<ProtectionLevel>.none) }
-                        ForEach(ProtectionLevel.allCases) { level in
-                            Text(level.endpointMode.capitalized).tag(Optional(level))
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(width: 270)
-                    .disabled(model.isDemoMode || !model.backendAvailable || model.policyDocument.isEmpty || model.runningCommand != nil)
-                    .accessibilityIdentifier("harness.claude-cowork.protectionLevel")
-                    .help("Uses the same presets as Settings: Observe = Fast, Protect = Review, Strict = Sensitive. Changes sensor mode and hook interactivity for all enabled harnesses.")
-                }
-                Text(protectionDetail + " Shared by all enabled harnesses.")
-                    .foregroundStyle(.secondary)
                 HStack(spacing: 16) {
                     Label(sensorReady ? "Sensor connected" : "Sensor unavailable", systemImage: sensorReady ? "checkmark.circle" : "exclamationmark.circle")
                     Link("Set up audit collection ↗", destination: URL(string: "https://github.com/GenseeAI/gensee-crate/blob/main/integrations/claude-cowork/README.md#local-audit-ingestion")!)
@@ -517,27 +489,6 @@ private struct CoworkHarnessRow: View {
         }
         .padding(.vertical, 13)
         .accessibilityElement(children: .contain)
-        .alert("Lower protection for all harnesses?", isPresented: Binding(
-            get: { pendingProtectionLevel != nil },
-            set: { if !$0 { pendingProtectionLevel = nil } }
-        ), presenting: pendingProtectionLevel) { level in
-            Button("Cancel", role: .cancel) { pendingProtectionLevel = nil }
-            Button("Use \(level.endpointMode.capitalized)", role: .destructive) {
-                pendingProtectionLevel = nil
-                Task { _ = await model.applyProtectionLevel(level) }
-            }
-        } message: { _ in
-            Text("This changes this Mac’s sensor mode and hook interactivity for all enabled harnesses.")
-        }
-    }
-
-    private var protectionDetail: String {
-        switch model.protectionLevel {
-        case .observe: "Records host activity; existing hook rules still apply."
-        case .guarded: "Blocks protected host paths and executables."
-        case .unattended: "Same host blocks as Protect; risky hook approvals become denials."
-        case nil: "Custom policy. Select a preset to change protection."
-        }
     }
 
     private func evidenceLabel(_ item: CoworkEvidenceStatus.Evidence) -> String {
