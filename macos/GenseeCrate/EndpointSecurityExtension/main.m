@@ -133,13 +133,22 @@ static BOOL GenseeIsOwnProcess(const es_process_t *process)
          [signingID isEqualToString:@"ai.gensee.crate.cli"]);
 }
 
-static BOOL GenseeIsClaudeDesktopProcess(const es_process_t *process)
+static BOOL GenseeIsCoworkVirtualMachineProcess(const es_process_t *process)
+{
+    if (process == NULL || !process->is_platform_binary) return NO;
+    NSString *signingID = GenseeStringFromToken(process->signing_id);
+    return [signingID isEqualToString:@"com.apple.Virtualization.VirtualMachine"];
+}
+
+static BOOL GenseeIsTrustedCoworkProcess(const es_process_t *process)
 {
     if (process == NULL) return NO;
     NSString *signingID = GenseeStringFromToken(process->signing_id);
     NSString *teamID = GenseeStringFromToken(process->team_id);
-    return [teamID isEqualToString:@"Q6L2SF6YDW"] &&
-        [signingID isEqualToString:@"com.anthropic.claudefordesktop"];
+    BOOL signedByAnthropic = [teamID isEqualToString:@"Q6L2SF6YDW"] &&
+        ([signingID isEqualToString:@"com.anthropic.claudefordesktop"] ||
+         [signingID isEqualToString:@"com.anthropic.claudefordesktop.helper"]);
+    return signedByAnthropic || GenseeIsCoworkVirtualMachineProcess(process);
 }
 
 static NSString *GenseeDestinationPath(const es_file_t *directory, es_string_token_t filename)
@@ -432,7 +441,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     NSNumber *pid = @(audit_token_to_pid(process->audit_token));
     session = self.managedRoots[pid];
     if (session != nil) {
-        if ([self.coworkRootPIDs containsObject:pid] && !GenseeIsClaudeDesktopProcess(process)) {
+        if ([self.coworkRootPIDs containsObject:pid] && !GenseeIsTrustedCoworkProcess(process)) {
             return nil;
         }
         self.managedProcesses[key] = session;
@@ -553,6 +562,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     __block NSString *actorSession = nil;
     __block NSNumber *actorRootPID = nil;
     __block NSString *actorCoworkMode = nil;
+    __block NSString *actorCoworkToolSurface = nil;
     __block BOOL actorIsOwn = NO;
     @synchronized (self) {
         actorIsOwn = [self isOwnProcessLocked:message->process];
@@ -560,6 +570,13 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         if (actorSession != nil) {
             actorRootPID = [self rootPIDForSessionLocked:actorSession];
             actorCoworkMode = self.coworkSessionModes[actorSession];
+            if ([actorCoworkMode isEqualToString:@"local"]) {
+                actorCoworkToolSurface = GenseeIsCoworkVirtualMachineProcess(message->process)
+                    ? @"shell"
+                    : @"host";
+            } else {
+                actorCoworkToolSurface = @"unknown";
+            }
         }
         if (message->event_type == ES_EVENT_TYPE_NOTIFY_FORK) {
             if (actorSession != nil) self.managedProcesses[[self keyForProcess:message->event.fork.child]] = actorSession;
@@ -604,10 +621,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         serialized[@"cowork"] = @{
             @"session_id": actorSession,
             @"session_mode": actorCoworkMode,
-            // Process-tree membership proves that Cowork caused the syscall,
-            // but does not by itself prove whether a local host tool, the VM,
-            // or a bridge caused it. Audit correlation supplies that evidence.
-            @"tool_surface": @"unknown",
+            @"tool_surface": actorCoworkToolSurface,
         };
     }
     dispatch_async(self.queue, ^{

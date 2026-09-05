@@ -189,6 +189,7 @@ impl LinuxKernelEvent {
             source: "linux".to_string(),
             event_type: "kernel".to_string(),
             event_kind: format!("{:?}", self.kind),
+            execution_origin: Default::default(),
             observed_at_ms: self.observed_at_ms,
             pid: self.pid,
             ppid: self.ppid,

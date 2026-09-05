@@ -1,4 +1,50 @@
 #import "GenseeEndpointSecurityBridge.h"
+#import <sys/sysctl.h>
+
+NSArray<NSNumber *> *GenseeDescendantProcessIdentifiers(pid_t rootPID)
+{
+    if (rootPID <= 0) return @[];
+    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t byteCount = 0;
+    if (sysctl(mib, 4, NULL, &byteCount, NULL, 0) != 0 || byteCount == 0) return @[];
+
+    struct kinfo_proc *processes = malloc(byteCount);
+    if (processes == NULL) return @[];
+    if (sysctl(mib, 4, processes, &byteCount, NULL, 0) != 0) {
+        free(processes);
+        return @[];
+    }
+
+    NSUInteger processCount = byteCount / sizeof(struct kinfo_proc);
+    NSMutableDictionary<NSNumber *, NSMutableArray<NSNumber *> *> *childrenByParent =
+        [NSMutableDictionary dictionary];
+    for (NSUInteger index = 0; index < processCount; index++) {
+        pid_t pid = processes[index].kp_proc.p_pid;
+        pid_t parentPID = processes[index].kp_eproc.e_ppid;
+        if (pid <= 0 || parentPID <= 0) continue;
+        NSNumber *parent = @(parentPID);
+        NSMutableArray<NSNumber *> *children = childrenByParent[parent];
+        if (children == nil) {
+            children = [NSMutableArray array];
+            childrenByParent[parent] = children;
+        }
+        [children addObject:@(pid)];
+    }
+    free(processes);
+
+    NSMutableArray<NSNumber *> *queue = [NSMutableArray arrayWithObject:@(rootPID)];
+    NSMutableArray<NSNumber *> *descendants = [NSMutableArray array];
+    NSMutableSet<NSNumber *> *seen = [NSMutableSet setWithObject:@(rootPID)];
+    for (NSUInteger index = 0; index < queue.count; index++) {
+        for (NSNumber *child in childrenByParent[queue[index]] ?: @[]) {
+            if ([seen containsObject:child]) continue;
+            [seen addObject:child];
+            [queue addObject:child];
+            [descendants addObject:child];
+        }
+    }
+    return descendants;
+}
 
 @protocol GenseeEndpointSecurityRemote
 - (void)fetchEventsAfterCursor:(uint64_t)cursor

@@ -21,10 +21,24 @@ impl CoworkAuditMode {
             )),
         }
     }
+
+    fn from_configured(value: policy::CoworkConfiguredSessionMode) -> Self {
+        match value {
+            policy::CoworkConfiguredSessionMode::Local => Self::Local,
+            policy::CoworkConfiguredSessionMode::Cloud => Self::Cloud,
+            policy::CoworkConfiguredSessionMode::Unknown => Self::Unknown,
+        }
+    }
 }
 
 pub(crate) fn ingest_cowork_audit(args: Vec<OsString>) -> io::Result<()> {
-    let mode = cowork_audit_mode(&args)?;
+    let policy = Policy::load_current();
+    if let Some(error) = policy.override_error() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+    }
+    let configured_mode =
+        CoworkAuditMode::from_configured(policy.document().cowork_endpoint_visibility.session_mode);
+    let mode = cowork_audit_mode(&args, configured_mode)?;
     let store = EventStore::default_local()?;
     let mut ingested = 0_u64;
     let mut rejected = 0_u64;
@@ -47,8 +61,11 @@ pub(crate) fn ingest_cowork_audit(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
-fn cowork_audit_mode(args: &[OsString]) -> io::Result<CoworkAuditMode> {
-    let mut mode = CoworkAuditMode::Unknown;
+fn cowork_audit_mode(
+    args: &[OsString],
+    configured_mode: CoworkAuditMode,
+) -> io::Result<CoworkAuditMode> {
+    let mut explicit_mode = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].to_str() {
@@ -62,7 +79,7 @@ fn cowork_audit_mode(args: &[OsString]) -> io::Result<CoworkAuditMode> {
                             "--session-mode requires local, cloud, or unknown",
                         )
                     })?;
-                mode = CoworkAuditMode::parse(value)?;
+                explicit_mode = Some(CoworkAuditMode::parse(value)?);
                 index += 2;
             }
             Some(other) => {
@@ -79,7 +96,15 @@ fn cowork_audit_mode(args: &[OsString]) -> io::Result<CoworkAuditMode> {
             }
         }
     }
-    Ok(mode)
+    if configured_mode != CoworkAuditMode::Unknown
+        && explicit_mode.is_some_and(|mode| mode != configured_mode)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--session-mode conflicts with cowork_endpoint_visibility.session_mode",
+        ));
+    }
+    Ok(explicit_mode.unwrap_or(configured_mode))
 }
 
 pub(crate) fn system_events_from_cowork_audit_line(
@@ -99,14 +124,14 @@ pub(crate) fn system_events_from_cowork_audit_line(
         .get("session_id")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_string);
-    let observed_at_ms = value
-        .get("_audit_timestamp")
-        .or_else(|| value.get("timestamp"))
-        .and_then(Value::as_str)
-        .and_then(parse_rfc3339_millis)
-        .or_else(|| unix_millis().ok())
-        .unwrap_or_default();
+        .map(str::to_string)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Cowork audit tool event is missing session_id",
+            )
+        })?;
+    let observed_at_ms = cowork_audit_timestamp_millis(&value)?;
 
     content
         .iter()
@@ -127,6 +152,7 @@ pub(crate) fn system_events_from_cowork_audit_line(
                 })
                 .map(str::to_string);
             let (origin, visibility_limit) = cowork_tool_origin(mode, tool_name);
+            let tool_operation = cowork_tool_operation(tool_name);
             let raw_json = json!({
                 "schema_version": 1,
                 "collector": "claude-cowork-local-audit",
@@ -136,14 +162,20 @@ pub(crate) fn system_events_from_cowork_audit_line(
                 "process_name": "Claude Cowork",
                 "file_path": file_path,
                 "session_mode": cowork_mode_name(mode),
-                "execution_origin": origin.as_str(),
+                "tool_operation": tool_operation,
                 "visibility_limit": visibility_limit,
                 "content_and_command_omitted": true,
             });
             Ok(SystemEvent {
                 source: "claude-cowork-local-audit".to_string(),
                 event_type: "cowork_tool_boundary".to_string(),
-                event_kind: "agent_boundary".to_string(),
+                event_kind: match tool_operation {
+                    "read" => "file_read",
+                    "write" | "edit" => "file_mutation",
+                    _ => "agent_boundary",
+                }
+                .to_string(),
+                execution_origin: origin,
                 observed_at_ms,
                 pid: None,
                 ppid: None,
@@ -189,6 +221,16 @@ fn is_cowork_host_tool(tool_name: &str) -> bool {
     )
 }
 
+fn cowork_tool_operation(tool_name: &str) -> &'static str {
+    match tool_name {
+        "Read" | "Glob" | "Grep" | "LS" => "read",
+        "Write" => "write",
+        "Edit" | "MultiEdit" => "edit",
+        "mcp__workspace__bash" => "shell",
+        _ => "unknown",
+    }
+}
+
 fn cowork_mode_name(mode: CoworkAuditMode) -> &'static str {
     match mode {
         CoworkAuditMode::Local => "local",
@@ -201,6 +243,31 @@ fn parse_rfc3339_millis(value: &str) -> Option<u64> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .and_then(|timestamp| u64::try_from(timestamp.timestamp_millis()).ok())
+}
+
+fn parse_cowork_timestamp(value: &Value) -> Option<u64> {
+    value
+        .as_str()
+        .and_then(parse_rfc3339_millis)
+        .or_else(|| value.as_u64())
+        .or_else(|| {
+            value
+                .as_i64()
+                .and_then(|timestamp| u64::try_from(timestamp).ok())
+        })
+}
+
+fn cowork_audit_timestamp_millis(value: &Value) -> io::Result<u64> {
+    ["_audit_timestamp", "timestamp"]
+        .into_iter()
+        .filter_map(|key| value.get(key))
+        .find_map(parse_cowork_timestamp)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Cowork audit tool event has no valid RFC3339 or epoch-millisecond timestamp",
+            )
+        })
 }
 
 #[cfg(test)]
@@ -261,5 +328,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(events[0].execution_origin(), ExecutionOrigin::Unattributed);
+    }
+
+    #[test]
+    fn configured_mode_is_default_and_conflicts_are_rejected() {
+        assert_eq!(
+            cowork_audit_mode(&[], CoworkAuditMode::Local).unwrap(),
+            CoworkAuditMode::Local
+        );
+        assert!(cowork_audit_mode(
+            &[OsString::from("--session-mode"), OsString::from("cloud"),],
+            CoworkAuditMode::Local,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn timestamp_tries_fallback_key_after_malformed_audit_timestamp() {
+        let mut value: Value = serde_json::from_str(&line("Read")).unwrap();
+        value["_audit_timestamp"] = Value::String("invalid".to_string());
+        value["timestamp"] = Value::String("2026-09-05T06:56:14.198Z".to_string());
+        let events =
+            system_events_from_cowork_audit_line(&value.to_string(), CoworkAuditMode::Local)
+                .unwrap();
+        assert_eq!(events[0].observed_at_ms, 1_788_591_374_198);
+    }
+
+    #[test]
+    fn malformed_timestamps_are_rejected_instead_of_retimed() {
+        let mut value: Value = serde_json::from_str(&line("Read")).unwrap();
+        value["_audit_timestamp"] = Value::String("invalid".to_string());
+        assert!(
+            system_events_from_cowork_audit_line(&value.to_string(), CoworkAuditMode::Local,)
+                .is_err()
+        );
     }
 }

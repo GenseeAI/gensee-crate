@@ -5,7 +5,7 @@ use chacha20poly1305::{
 use gensee_crate_core::{
     endpoint_security_path_is_known_build_output, extract_apply_patch_input, normalize_agent_path,
     parse_apply_patch_changes, parse_mcp_file_intents, parse_vscode_file_intents, AgentHookEvent,
-    AgentSession, FileIntent, ProcessObservation, SystemEvent, WorkspaceEffect,
+    AgentSession, ExecutionOrigin, FileIntent, ProcessObservation, SystemEvent, WorkspaceEffect,
 };
 use gensee_crate_db::sqlite::{
     artifact_path_is_concrete, dashboard_artifact_is_visible as dashboard_artifact_path_is_visible,
@@ -91,6 +91,7 @@ pub struct StoredSystemEvent {
     pub event_type: String,
     pub observed_at_ms: u64,
     pub pid: Option<u32>,
+    pub execution_origin: ExecutionOrigin,
     pub raw_json: String,
 }
 
@@ -491,6 +492,7 @@ impl EventStore {
                     event_type: row.event_type,
                     observed_at_ms,
                     pid: u32::try_from(row.pid).ok().filter(|pid| *pid != 0),
+                    execution_origin: ExecutionOrigin::from_label(&row.execution_origin),
                     raw_json: row.args.unwrap_or_else(|| "null".to_string()),
                 })
             })
@@ -2150,6 +2152,7 @@ impl EventStore {
                 event_type: "process_observation".to_string(),
                 cwd: String::new(),
                 args: Some(json_record(observation)?),
+                execution_origin: "unattributed".to_string(),
             })
             .map(|_| ())
             .map_err(sqlite_error)
@@ -2221,6 +2224,7 @@ impl EventStore {
                     event_type: event.event_type.clone(),
                     cwd: String::new(),
                     args: Some(event.raw_json.clone()),
+                    execution_origin: event.execution_origin.as_str().to_string(),
                 })
                 .map_err(sqlite_error)?;
             let process_tree_matched = attributed_session_id.is_some();
@@ -2259,7 +2263,7 @@ impl EventStore {
             if !matched
                 && !matches!(
                     event.source.as_str(),
-                    "macos-endpoint-security" | "linux-falco"
+                    "macos-endpoint-security" | "linux-falco" | "claude-cowork-local-audit"
                 )
             {
                 record_unmatched_system_event_alert(db, request_id, event_id, event, ts)?;
@@ -2285,6 +2289,7 @@ impl EventStore {
                     event_type: effect.effect_type.clone(),
                     cwd: effect.workspace.clone(),
                     args: Some(json_record(effect)?),
+                    execution_origin: "unattributed".to_string(),
                 })
                 .map_err(sqlite_error)?;
             let Some(artifact_id) = upsert_file_artifact(
@@ -3921,6 +3926,7 @@ fn dashboard_ignored_file_touch_paths_with_limits(
             source,
             event_type,
             event_kind: "file_mutation".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms: u64::try_from(ts).unwrap_or_default(),
             pid: u32::try_from(pid).ok(),
             ppid: raw_event
@@ -4060,6 +4066,10 @@ fn system_event_session_id(event: &SystemEvent) -> Option<String> {
             .get("attribution")
             .and_then(|value| value.get("session_id"))
             .and_then(Value::as_str),
+        "claude-cowork-local-audit" => value
+            .get("attribution")
+            .and_then(|value| value.get("session_id"))
+            .and_then(Value::as_str),
         _ => None,
     };
     session_id
@@ -4132,6 +4142,12 @@ fn should_materialize_system_artifact(
     path: &str,
     raw_event: Option<&Value>,
 ) -> bool {
+    if event.source == "claude-cowork-local-audit" {
+        return matches!(
+            cowork_tool_operation(event),
+            Some("read" | "write" | "edit")
+        );
+    }
     if event.source != "macos-endpoint-security" {
         return true;
     }
@@ -4605,6 +4621,13 @@ fn artifact_access(operation: &str) -> ArtifactAccess {
 }
 
 fn system_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str {
+    if event.source == "claude-cowork-local-audit" {
+        return match cowork_tool_operation(event) {
+            Some("read") => "read_by",
+            Some("edit") => "modified",
+            _ => "wrote",
+        };
+    }
     if event.event_kind == "file_read" {
         return "read_by";
     }
@@ -4627,6 +4650,13 @@ fn system_artifact_relation_type(event_type: &str) -> &'static str {
 }
 
 fn request_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str {
+    if event.source == "claude-cowork-local-audit" {
+        return match cowork_tool_operation(event) {
+            Some("read") => "consumed_by",
+            Some("edit") => "modified",
+            _ => "produced",
+        };
+    }
     if event.event_kind == "file_read" {
         return "consumed_by";
     }
@@ -4634,6 +4664,23 @@ fn request_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str
         return "modified";
     }
     request_artifact_relation_type(&event.event_type)
+}
+
+fn cowork_tool_operation(event: &SystemEvent) -> Option<&str> {
+    if event.source != "claude-cowork-local-audit" {
+        return None;
+    }
+    serde_json::from_str::<Value>(&event.raw_json)
+        .ok()?
+        .get("tool_operation")?
+        .as_str()
+        .map(|operation| match operation {
+            "read" => "read",
+            "write" => "write",
+            "edit" => "edit",
+            "shell" => "shell",
+            _ => "unknown",
+        })
 }
 
 fn request_artifact_relation_type(event_type: &str) -> &'static str {
@@ -5777,6 +5824,7 @@ mod tests {
             source: "macos-endpoint-security".to_string(),
             event_type: "write".to_string(),
             event_kind: "file_mutation".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms,
             pid: Some(42),
             ppid: Some(1),
@@ -6080,6 +6128,7 @@ mod tests {
             source: "macos-endpoint-security".to_string(),
             event_type: "write".to_string(),
             event_kind: "file_mutation".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms,
             pid: Some(42),
             ppid: Some(1),
@@ -6423,6 +6472,7 @@ mod tests {
             source: "test".to_string(),
             event_type: "exec".to_string(),
             event_kind: "process".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms: 1,
             pid: Some(1),
             ppid: Some(0),
@@ -6910,6 +6960,7 @@ mod tests {
             source: "test".to_string(),
             event_type: "exec".to_string(),
             event_kind: "process".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms: 1,
             pid: Some(1),
             ppid: Some(0),
@@ -6950,6 +7001,7 @@ mod tests {
                 source: "eslogger".to_string(),
                 event_type: "exec".to_string(),
                 event_kind: "process".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 130,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7005,6 +7057,7 @@ mod tests {
                 source: "linux-falco".to_string(),
                 event_type: "connect".to_string(),
                 event_kind: "NetworkConnect".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 130,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7054,6 +7107,69 @@ mod tests {
     }
 
     #[test]
+    fn cowork_audit_events_attach_to_session_with_typed_artifact_relations() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-cowork-attribution-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        for (tool_name, tool_operation, event_kind, path) in [
+            ("Read", "read", "file_read", "/repo/input.txt"),
+            ("Write", "write", "file_mutation", "/repo/output.txt"),
+        ] {
+            store
+                .append_system_event(&SystemEvent {
+                    source: "claude-cowork-local-audit".to_string(),
+                    event_type: "cowork_tool_boundary".to_string(),
+                    event_kind: event_kind.to_string(),
+                    execution_origin: ExecutionOrigin::HostNative,
+                    observed_at_ms: 130,
+                    pid: None,
+                    ppid: None,
+                    process_name: Some("Claude Cowork".to_string()),
+                    executable_path: None,
+                    file_path: Some(path.to_string()),
+                    command_line: None,
+                    raw_json: json!({
+                        "attribution": { "session_id": "cowork-session" },
+                        "tool_name": tool_name,
+                        "tool_operation": tool_operation,
+                        "file_path": path,
+                    })
+                    .to_string(),
+                })
+                .unwrap();
+        }
+
+        let db = store.sqlite_store().unwrap();
+        let request = db
+            .latest_request_for_session("cowork-session")
+            .unwrap()
+            .unwrap();
+        let events = db.system_events_for_request(request.request_id).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.execution_origin == "host-native"));
+        let relations = db.relations_for_request(request.request_id).unwrap();
+        assert!(relations
+            .iter()
+            .any(|relation| relation.relation_type == "consumed_by"));
+        assert!(relations
+            .iter()
+            .any(|relation| relation.relation_type == "produced"));
+        drop(db);
+        assert!(store
+            .list_alerts()
+            .unwrap()
+            .iter()
+            .all(|alert| alert.rule_id != "unmatched_system_effect"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn native_system_event_listing_skips_negative_timestamps() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-store-test-native-negative-ts-{}",
@@ -7067,6 +7183,7 @@ mod tests {
                     source: "linux-falco".to_string(),
                     event_type: "execve".to_string(),
                     event_kind: "ProcessExec".to_string(),
+                    execution_origin: Default::default(),
                     observed_at_ms,
                     pid: Some(42),
                     ppid: Some(1),
@@ -7108,6 +7225,7 @@ mod tests {
                     source: "linux-falco".to_string(),
                     event_type: "execve".to_string(),
                     event_kind: "ProcessExec".to_string(),
+                    execution_origin: Default::default(),
                     observed_at_ms,
                     pid: Some(42),
                     ppid: Some(1),
@@ -7152,6 +7270,7 @@ mod tests {
                 source: "linux-falco".to_string(),
                 event_type: "execve".to_string(),
                 event_kind: "ProcessExec".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 1,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7191,6 +7310,7 @@ mod tests {
                 source: "linux-falco".to_string(),
                 event_type: "openat".to_string(),
                 event_kind: "FileWrite".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 130,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7237,6 +7357,7 @@ mod tests {
                 source: "macos-endpoint-security".to_string(),
                 event_type: "write".to_string(),
                 event_kind: "file_mutation".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 130,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7330,6 +7451,7 @@ mod tests {
                 source: "macos-eslogger".to_string(),
                 event_type: "write".to_string(),
                 event_kind: "file_mutation".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 120,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7405,6 +7527,7 @@ mod tests {
                 source: "macos-endpoint-security".to_string(),
                 event_type: event_type.to_string(),
                 event_kind: event_kind.to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms,
                 pid: Some(5311),
                 ppid: Some(5310),

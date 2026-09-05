@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const ANTHROPIC_TEAM_ID: &str = "Q6L2SF6YDW";
 pub const CLAUDE_DESKTOP_SIGNING_ID: &str = "com.anthropic.claudefordesktop";
+pub const CLAUDE_DESKTOP_HELPER_SIGNING_ID: &str = "com.anthropic.claudefordesktop.helper";
 pub const CLAUDE_CODE_SIGNING_ID: &str = "com.anthropic.claude-code";
 pub const APPLE_VIRTUAL_MACHINE_SIGNING_ID: &str = "com.apple.Virtualization.VirtualMachine";
 
@@ -50,9 +51,16 @@ pub struct CoworkVisibility {
 }
 
 pub fn classify_cowork_event(event: &EndpointSecurityEvent) -> CoworkVisibility {
-    let context = event.cowork.as_ref();
+    let Some(context) = event.cowork.as_ref() else {
+        return CoworkVisibility {
+            execution_origin: ExecutionOrigin::Unattributed,
+            confidence: 0.0,
+            matched_by: "not_a_cowork_managed_event",
+            visibility_limit: None,
+        };
+    };
 
-    if context.is_some_and(|context| context.session_mode == CoworkSessionMode::Cloud) {
+    if context.session_mode == CoworkSessionMode::Cloud {
         return CoworkVisibility {
             execution_origin: ExecutionOrigin::CloudMediated,
             confidence: 1.0,
@@ -62,7 +70,7 @@ pub fn classify_cowork_event(event: &EndpointSecurityEvent) -> CoworkVisibility 
     }
 
     if is_cowork_virtual_machine_process(&event.actor)
-        || context.is_some_and(|context| context.tool_surface == CoworkToolSurface::Shell)
+        || context.tool_surface == CoworkToolSurface::Shell
     {
         return CoworkVisibility {
             execution_origin: ExecutionOrigin::VmMediated,
@@ -80,10 +88,9 @@ pub fn classify_cowork_event(event: &EndpointSecurityEvent) -> CoworkVisibility 
         };
     }
 
-    if context.is_some_and(|context| {
-        context.session_mode == CoworkSessionMode::Local
-            && context.tool_surface == CoworkToolSurface::Host
-    }) && is_anthropic_host_process(&event.actor)
+    if context.session_mode == CoworkSessionMode::Local
+        && context.tool_surface == CoworkToolSurface::Host
+        && is_anthropic_host_process(&event.actor)
     {
         return CoworkVisibility {
             execution_origin: ExecutionOrigin::HostNative,
@@ -107,15 +114,21 @@ pub fn is_anthropic_host_process(process: &EndpointSecurityProcess) -> bool {
     process.team_id.as_deref() == Some(ANTHROPIC_TEAM_ID)
         && matches!(
             process.signing_id.as_deref(),
-            Some(CLAUDE_DESKTOP_SIGNING_ID | CLAUDE_CODE_SIGNING_ID)
+            Some(
+                CLAUDE_DESKTOP_SIGNING_ID
+                    | CLAUDE_DESKTOP_HELPER_SIGNING_ID
+                    | CLAUDE_CODE_SIGNING_ID
+            )
         )
 }
 
 pub fn is_cowork_virtual_machine_process(process: &EndpointSecurityProcess) -> bool {
-    process.signing_id.as_deref() == Some(APPLE_VIRTUAL_MACHINE_SIGNING_ID)
-        || process.executable_path.as_deref().is_some_and(|path| {
-            path.ends_with("/com.apple.Virtualization.VirtualMachine") && process.platform_binary
-        })
+    process.platform_binary
+        && (process.signing_id.as_deref() == Some(APPLE_VIRTUAL_MACHINE_SIGNING_ID)
+            || process
+                .executable_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("/com.apple.Virtualization.VirtualMachine")))
 }
 
 #[cfg(test)]
@@ -179,6 +192,25 @@ mod tests {
     }
 
     #[test]
+    fn desktop_helper_is_a_signed_host_native_actor() {
+        let mut event = event(EndpointSecurityProcess {
+            pid: 43,
+            signing_id: Some(CLAUDE_DESKTOP_HELPER_SIGNING_ID.to_string()),
+            team_id: Some(ANTHROPIC_TEAM_ID.to_string()),
+            ..EndpointSecurityProcess::default()
+        });
+        event.cowork = Some(CoworkEventContext {
+            session_mode: CoworkSessionMode::Local,
+            tool_surface: CoworkToolSurface::Host,
+            ..CoworkEventContext::default()
+        });
+        assert_eq!(
+            classify_cowork_event(&event).execution_origin,
+            ExecutionOrigin::HostNative
+        );
+    }
+
+    #[test]
     fn shell_is_vm_mediated_and_preserves_the_visibility_limit() {
         let mut event = event(anthropic_actor());
         event.cowork = Some(CoworkEventContext {
@@ -211,15 +243,38 @@ mod tests {
 
     #[test]
     fn apple_virtualization_process_is_vm_mediated() {
-        let event = event(EndpointSecurityProcess {
+        let mut event = event(EndpointSecurityProcess {
             pid: 9,
             signing_id: Some(APPLE_VIRTUAL_MACHINE_SIGNING_ID.to_string()),
             platform_binary: true,
             ..EndpointSecurityProcess::default()
         });
+        event.cowork = Some(CoworkEventContext {
+            session_mode: CoworkSessionMode::Local,
+            tool_surface: CoworkToolSurface::Shell,
+            ..CoworkEventContext::default()
+        });
         assert_eq!(
             classify_cowork_event(&event).execution_origin,
             ExecutionOrigin::VmMediated
+        );
+    }
+
+    #[test]
+    fn signing_id_without_platform_identity_is_not_a_vm_boundary() {
+        let mut event = event(EndpointSecurityProcess {
+            pid: 9,
+            signing_id: Some(APPLE_VIRTUAL_MACHINE_SIGNING_ID.to_string()),
+            platform_binary: false,
+            ..EndpointSecurityProcess::default()
+        });
+        event.cowork = Some(CoworkEventContext {
+            session_mode: CoworkSessionMode::Local,
+            ..CoworkEventContext::default()
+        });
+        assert_eq!(
+            classify_cowork_event(&event).execution_origin,
+            ExecutionOrigin::Unattributed
         );
     }
 }

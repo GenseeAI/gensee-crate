@@ -393,10 +393,12 @@ fn get_session_events(state: tauri::State<AppState>, id: String) -> Result<Vec<V
                 json_extract(se.args, '$.process.executable.path'),
                 json_extract(se.args, '$.process_name')
             ) AS process,
-            COALESCE(
-                json_extract(se.args, '$.execution_origin'),
-                'unattributed'
-            ) AS execution_origin
+            CASE
+                WHEN se.source = 'claude-cowork-local-audit'
+                  OR json_type(se.args, '$.cowork') = 'object'
+                THEN se.execution_origin
+                ELSE NULL
+            END AS execution_origin
           FROM system_events se
           JOIN requests r ON se.request_id = r.request_id
          WHERE r.session_id = ?1

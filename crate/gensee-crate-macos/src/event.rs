@@ -200,10 +200,12 @@ impl EndpointSecurityEvent {
     }
 
     pub fn into_system_event(self) -> io::Result<SystemEvent> {
-        let cowork_visibility = classify_cowork_event(&self);
         let mut raw_value = serde_json::to_value(&self).map_err(io::Error::other)?;
-        raw_value["cowork_visibility"] =
-            serde_json::to_value(&cowork_visibility).map_err(io::Error::other)?;
+        let cowork_visibility = self.cowork.as_ref().map(|_| classify_cowork_event(&self));
+        if let Some(visibility) = &cowork_visibility {
+            raw_value["cowork_visibility"] =
+                serde_json::to_value(visibility).map_err(io::Error::other)?;
+        }
         let raw_json = serde_json::to_string(&raw_value).map_err(io::Error::other)?;
         let event_kind = if self.action == "auth" {
             "authorization"
@@ -235,6 +237,9 @@ impl EndpointSecurityEvent {
             source: "macos-endpoint-security".to_string(),
             event_type: normalized_type,
             event_kind: event_kind.to_string(),
+            execution_origin: cowork_visibility
+                .map(|visibility| visibility.execution_origin)
+                .unwrap_or_default(),
             observed_at_ms: self.observed_at_ms,
             pid: Some(self.actor.pid),
             ppid: self.actor.ppid,
@@ -243,8 +248,7 @@ impl EndpointSecurityEvent {
             file_path: self.primary_path().map(str::to_string),
             command_line,
             raw_json,
-        }
-        .with_execution_origin(cowork_visibility.execution_origin))
+        })
     }
 }
 
@@ -742,6 +746,19 @@ mod tests {
             ended_at_ms: None,
             exit_code: None,
         }
+    }
+
+    #[test]
+    fn unrelated_endpoint_event_has_no_cowork_decoration() {
+        let system_event = event("open", process(10, 1, Some(1), Some(1)))
+            .into_system_event()
+            .unwrap();
+        let raw: Value = serde_json::from_str(&system_event.raw_json).unwrap();
+        assert!(raw.get("cowork_visibility").is_none());
+        assert_eq!(
+            system_event.execution_origin,
+            gensee_crate_core::ExecutionOrigin::Unattributed
+        );
     }
 
     #[test]

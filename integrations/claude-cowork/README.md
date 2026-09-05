@@ -48,17 +48,19 @@ Anthropic API integration:
 
 ```sh
 tail -F "$HOME/Library/Application Support/Claude/local-agent-mode-sessions/<account>/<org>/<session>/audit.jsonl" \
-  | gensee ingest cowork-audit --session-mode local
+  | gensee ingest cowork-audit
 ```
 
 For per-user installations the base is usually under the user's
 `~/Library/Application Support/Claude` directory. Deployments should discover
 the path rather than hard-code account, organization, or session identifiers.
 
-`--session-mode` accepts `local`, `cloud`, or `unknown`. The operator or managed
-configuration must provide this value: the endpoint cannot reliably infer it
-from the Claude process name. Use `unknown` whenever the tenant/session setting
-has not been independently established.
+The ingester defaults to `cowork_endpoint_visibility.session_mode`, keeping the
+audit and Endpoint Security paths on one mode. `--session-mode` accepts `local`,
+`cloud`, or `unknown` as an explicit override when policy is `unknown`; a flag
+that conflicts with a concrete policy mode is rejected. The endpoint cannot
+reliably infer the mode from the Claude process name, so use `unknown` whenever
+the tenant/session setting has not been independently established.
 
 The ingester recognizes native file tools such as `Read`, `Write`, `Edit`,
 `Glob`, and `Grep`, and the local VM shell tool `mcp__workspace__bash`. It stores
@@ -76,6 +78,12 @@ The first-party macOS sensor records host-side process identity, parent PID,
 signing identity, file reads/opens, writes, creates, closes, renames, truncates,
 and deletes. The Cowork audit boundary timestamp, file path, session ID, and
 tool-use ID provide the semantic side of correlation.
+
+When visibility is enabled for an already-running Claude Desktop instance, the
+host registers its current recursive descendant set as well as the app PID.
+The extension still validates each adopted PID as an Anthropic-signed Claude
+Desktop/helper process or Apple's platform-signed VM process before trusting it;
+later descendants continue to be learned from Endpoint Security fork/exec events.
 
 Apple's signed `com.apple.Virtualization.VirtualMachine` process is recognized
 as a VM boundary. Seeing that boundary does not reveal the Linux process that

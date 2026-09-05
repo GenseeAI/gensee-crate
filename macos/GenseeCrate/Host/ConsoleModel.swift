@@ -1851,16 +1851,22 @@ final class ConsoleModel: ObservableObject {
             }
             .map { ["pid": $0.rootPID, "session_id": $0.sessionID] as [String: Any] }
         if coworkEndpointVisibilityEnabled {
-            roots += NSWorkspace.shared.runningApplications.compactMap { application in
+            roots += NSWorkspace.shared.runningApplications.flatMap { application -> [[String: Any]] in
                 guard application.bundleIdentifier == "com.anthropic.claudefordesktop",
                       application.processIdentifier > 0
-                else { return nil }
-                return [
-                    "pid": UInt32(application.processIdentifier),
-                    "session_id": "cowork-desktop-\(application.processIdentifier)",
-                    "kind": "claude-cowork",
-                    "cowork_session_mode": coworkSessionMode,
-                ] as [String: Any]
+                else { return [] }
+                let rootPID = application.processIdentifier
+                let sessionID = "cowork-desktop-\(rootPID)"
+                let processIdentifiers = [NSNumber(value: rootPID)]
+                    + GenseeDescendantProcessIdentifiers(rootPID)
+                return processIdentifiers.map { processIdentifier in
+                    [
+                        "pid": processIdentifier.uint32Value,
+                        "session_id": sessionID,
+                        "kind": "claude-cowork",
+                        "cowork_session_mode": coworkSessionMode,
+                    ] as [String: Any]
+                }
             }
         }
         endpointSensor.updateConfiguration(
