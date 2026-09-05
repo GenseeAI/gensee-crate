@@ -98,11 +98,17 @@ final class EndpointSecuritySensor: ObservableObject {
             try connect()
             pollingTask = Task { [weak self] in
                 while !Task.isCancelled {
+                    let previousCursor = self?.cursor
                     await self?.pollOnce()
                     // A durable acknowledgement bounds each batch. Drain a
                     // backlog promptly instead of throttling the slow consumer
                     // further; errors and idle streams retain the normal delay.
-                    let draining = self?.health.connected == true && (self?.health.backlogEvents ?? 0) > 0
+                    let draining = EndpointIngestBatchPolicy.shouldDrainImmediately(
+                        connected: self?.health.connected == true,
+                        backlog: self?.health.backlogEvents ?? 0,
+                        previousCursor: previousCursor ?? 0,
+                        currentCursor: self?.cursor ?? 0
+                    )
                     try? await Task.sleep(for: .milliseconds(draining ? 10 : 500))
                 }
             }

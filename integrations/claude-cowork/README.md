@@ -184,14 +184,27 @@ See [the validation notes](VALIDATION.md) for results and limitations.
 The endpoint retains a bounded 20,000-event circular replay buffer. Normal
 eviction of consumed history does not count as loss. A consumer cursor behind
 the oldest retained record reports the missing range once in health; the first
-returned event carries the gap so durable ingestion can record it. Fetch retries
+returned event carries the gap so durable ingestion can record it. A zero cursor
+means a fresh or reset consumer and starts at retained history without counting
+pre-attachment history as loss. Revocation erases buffered session payloads while
+retaining cursor positions, so disabling a session cannot scramble a wrapped ring. Fetch retries
 do not inflate the cumulative ring-loss counter. Kernel-reported loss remains
 independent of ring retention. Gap alerts are limited to one per boot
 per minute, while exact cumulative loss counters remain visible in sensor health.
 
 The app drains acknowledged batches of up to 500 records with a short yield
 while a backlog exists, and polls every 500 ms when idle or disconnected.
-Backpressure does not reduce the batch size or add an idle polling delay to
-each queued batch. Ingestion timing excludes time spent waiting for input.
+Fast draining requires the acknowledged cursor to advance; disconnected or
+non-advancing iterations fall back to the idle delay. Backpressure does not
+reduce the batch size. Ingestion timing excludes time spent waiting for input.
 This improves burst recovery without changing the synchronous authorization
 policy or claiming that a finite buffer can absorb unlimited load.
+
+
+## Configuration compatibility
+
+Malformed or incompatible Cowork roots exclude the entire affected Cowork
+session and emit a diagnostic, while valid unrelated roots and sensor policy
+updates continue applying. Invalid Cowork roots never fall back to unchecked
+ordinary roots. The shared `signing-identity-fixture.json` is asserted by both
+the Rust classifier tests and the native extension tests to catch trust-rule drift.

@@ -7,4 +7,4 @@ xcrun clang -fobjc-arc -fblocks -Wno-nullability-completeness -mmacosx-version-m
   -framework Foundation -lEndpointSecurity -lbsm \
   "$repository_root/macos/GenseeCrate/Tests/CoworkEndpointScopeTests.m" \
   -o "$test_directory/cowork-scope-tests"
-"$test_directory/cowork-scope-tests"
+"$test_directory/cowork-scope-tests" "$repository_root/integrations/claude-cowork/signing-identity-fixture.json"

@@ -1,6 +1,14 @@
 import XCTest
 
 final class EndpointIngestAcknowledgementIOTests: XCTestCase {
+    func testFastDrainRequiresAcknowledgedForwardProgress() {
+        XCTAssertTrue(EndpointIngestBatchPolicy.shouldDrainImmediately(connected: true, backlog: 500, previousCursor: 1, currentCursor: 501))
+        XCTAssertFalse(EndpointIngestBatchPolicy.shouldDrainImmediately(connected: true, backlog: 500, previousCursor: 1, currentCursor: 1))
+        XCTAssertFalse(EndpointIngestBatchPolicy.shouldDrainImmediately(connected: true, backlog: 500, previousCursor: 501, currentCursor: 0))
+        XCTAssertFalse(EndpointIngestBatchPolicy.shouldDrainImmediately(connected: false, backlog: 500, previousCursor: 1, currentCursor: 501))
+        XCTAssertFalse(EndpointIngestBatchPolicy.shouldDrainImmediately(connected: true, backlog: 0, previousCursor: 1, currentCursor: 501))
+    }
+
     func testAcknowledgementTimeoutScalesForBacklogBatches() {
         XCTAssertEqual(
             EndpointIngestBatchPolicy.acknowledgementTimeout(forEventCount: 0),

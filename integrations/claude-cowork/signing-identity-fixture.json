@@ -1,0 +1,158 @@
+[
+  {
+    "signing_id": "com.anthropic.claudefordesktop",
+    "team_id": "Q6L2SF6YDW",
+    "platform": false,
+    "trusted": true
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop",
+    "team_id": "OTHER",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop",
+    "team_id": "",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claude-code",
+    "team_id": "Q6L2SF6YDW",
+    "platform": false,
+    "trusted": true
+  },
+  {
+    "signing_id": "com.anthropic.claude-code",
+    "team_id": "OTHER",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claude-code",
+    "team_id": "",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper",
+    "team_id": "Q6L2SF6YDW",
+    "platform": false,
+    "trusted": true
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper",
+    "team_id": "OTHER",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper",
+    "team_id": "",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper.GPU",
+    "team_id": "Q6L2SF6YDW",
+    "platform": false,
+    "trusted": true
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper.GPU",
+    "team_id": "OTHER",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper.GPU",
+    "team_id": "",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper.Renderer",
+    "team_id": "Q6L2SF6YDW",
+    "platform": false,
+    "trusted": true
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper.Renderer",
+    "team_id": "OTHER",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper.Renderer",
+    "team_id": "",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper.Plugin",
+    "team_id": "Q6L2SF6YDW",
+    "platform": false,
+    "trusted": true
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper.Plugin",
+    "team_id": "OTHER",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper.Plugin",
+    "team_id": "",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.helper-evil",
+    "team_id": "Q6L2SF6YDW",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claudefordesktop.evil",
+    "team_id": "Q6L2SF6YDW",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.anthropic.claude-code.evil",
+    "team_id": "Q6L2SF6YDW",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "",
+    "team_id": "Q6L2SF6YDW",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.apple.Virtualization.VirtualMachine",
+    "team_id": "",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.apple.Virtualization.VirtualMachine",
+    "team_id": "",
+    "platform": true,
+    "trusted": true
+  },
+  {
+    "signing_id": "com.apple.Virtualization.VirtualMachine.evil",
+    "team_id": "",
+    "platform": false,
+    "trusted": false
+  },
+  {
+    "signing_id": "com.apple.Virtualization.VirtualMachine.evil",
+    "team_id": "",
+    "platform": true,
+    "trusted": false
+  }
+]

@@ -52,17 +52,17 @@ static BOOL Configure(GenseeSensorService *service, NSArray *roots)
     return accepted;
 }
 
-int main(void)
+int main(int argc, const char *argv[])
 {
     @autoreleasepool {
-        const char *helpers[] = {"com.anthropic.claudefordesktop", "com.anthropic.claude-code",
-            "com.anthropic.claudefordesktop.helper", "com.anthropic.claudefordesktop.helper.GPU",
-            "com.anthropic.claudefordesktop.helper.Renderer", "com.anthropic.claudefordesktop.helper.Plugin"};
-        for (size_t i = 0; i < sizeof(helpers) / sizeof(helpers[0]); i++) {
-            es_process_t actor = CoworkProcess(501, helpers[i], "Q6L2SF6YDW");
-            NSCAssert(GenseeIsTrustedCoworkProcess(&actor), @"signed helper must be adoptable");
-            actor.team_id = (es_string_token_t){5, "OTHER"};
-            NSCAssert(!GenseeIsTrustedCoworkProcess(&actor), @"wrong team must not be adopted");
+        NSCAssert(argc == 2, @"shared signing fixture path required");
+        NSData *fixtureData = [NSData dataWithContentsOfFile:@(argv[1])];
+        NSArray *fixtures = [NSJSONSerialization JSONObjectWithData:fixtureData options:0 error:NULL];
+        NSCAssert(fixtures.count > 0, @"shared signing fixtures must load");
+        for (NSDictionary *fixture in fixtures) {
+            es_process_t actor = CoworkProcess(501, [fixture[@"signing_id"] UTF8String], [fixture[@"team_id"] UTF8String]);
+            actor.is_platform_binary = [fixture[@"platform"] boolValue];
+            NSCAssert(GenseeIsTrustedCoworkProcess(&actor) == [fixture[@"trusted"] boolValue], @"shared signing identity parity");
         }
         es_process_t impostor = CoworkProcess(502, "com.anthropic.claudefordesktop.helper-evil", "Q6L2SF6YDW");
         NSCAssert(!GenseeIsTrustedCoworkProcess(&impostor), @"helper prefix must end at a component boundary");
@@ -77,10 +77,21 @@ int main(void)
         NSCAssert([[service rootPIDForSessionLocked:@"cowork"] isEqual:@500], @"canonical root is the app");
         NSCAssert(Configure(service, [[roots reverseObjectEnumerator] allObjects]), @"reverse adoption order");
         NSCAssert([[service rootPIDForSessionLocked:@"cowork"] isEqual:@500], @"root is independent of order");
-        NSCAssert(!Configure(service, @[CoworkRoot(@501)]), @"reject missing canonical app root");
+        NSCAssert(Configure(service, @[CoworkRoot(@501)]), @"invalid Cowork must not reject all configuration");
+        NSCAssert(service.managedRoots.count == 0, @"exclude missing canonical app root");
         NSMutableDictionary *conflict = [CoworkRoot(@501) mutableCopy];
         conflict[@"root_pid"] = @501;
-        NSCAssert(!Configure(service, @[CoworkRoot(@500), conflict]), @"reject conflicting canonical roots");
+        NSCAssert(Configure(service, @[CoworkRoot(@500), conflict]), @"isolate conflicting canonical roots");
+        NSCAssert(service.managedRoots.count == 0, @"exclude entire conflicting session");
+        NSMutableDictionary *legacy = [CoworkRoot(@500) mutableCopy];
+        [legacy removeObjectForKey:@"root_pid"];
+        NSCAssert(Configure(service, @[legacy, @{@"pid": @900, @"session_id": @"ordinary"}]), @"accept ordinary roots alongside old Cowork schema");
+        NSCAssert(service.managedRoots.count == 1 && [service.managedRoots[@900] isEqual:@"ordinary"], @"invalid Cowork must not bypass signing checks as an ordinary root");
+        NSCAssert(service.coworkSessionModes.count == 0, @"invalid session metadata removed");
+        legacy[@"cowork_session_mode"] = @"invalid";
+        NSCAssert(Configure(service, @[legacy, @{@"pid": @900, @"session_id": @"ordinary"}]), @"invalid mode is isolated too");
+        NSCAssert(service.managedRoots.count == 1 && [service.managedRoots[@900] isEqual:@"ordinary"], @"preserve unrelated configuration");
+        NSCAssert(Configure(service, roots), @"restore valid roots");
 
         es_process_t helper = CoworkProcess(501, "com.anthropic.claudefordesktop.helper.Renderer", "Q6L2SF6YDW");
         NSCAssert([[service sessionForProcessLocked:&helper messageVersion:4] isEqual:@"cowork"], @"adopt running renderer");
@@ -135,6 +146,11 @@ int main(void)
         NSCAssert(batch.count == 7, @"fetch resumes at the durable cursor after wraparound");
         NSCAssert([health[@"ring_drops"] unsignedLongLongValue] == 0, @"consumed history eviction is not loss");
         for (NSDictionary *row in batch) NSCAssert([row[@"dropped_events"] unsignedLongLongValue] == 0, @"ordinary eviction emits no alert");
+        [ring fetchEventsAfterCursor:0 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *state) { batch = events; health = state; }];
+        dispatch_sync(ring.queue, ^{});
+        NSCAssert([batch.firstObject[@"sensor_cursor"] unsignedLongLongValue] == 8, @"fresh cursor begins at retained history");
+        NSCAssert([batch.firstObject[@"dropped_events"] unsignedLongLongValue] == 0 && [health[@"ring_drops"] unsignedLongLongValue] == 0, @"fresh attachment must not invent loss");
+
         [ring fetchEventsAfterCursor:2 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *state) { batch = events; health = state; }];
         dispatch_sync(ring.queue, ^{});
         NSCAssert([batch.firstObject[@"sensor_cursor"] unsignedLongLongValue] == 8, @"oldest cursor survives wraparound");
@@ -147,6 +163,28 @@ int main(void)
         [ring fetchEventsAfterCursor:GenseeRingCapacity + 7 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *state) { batch = events; }];
         dispatch_sync(ring.queue, ^{});
         NSCAssert([batch.firstObject[@"dropped_events"] unsignedLongLongValue] == 3, @"real kernel loss remains visible");
+        GenseeSensorService *pruned = [[GenseeSensorService alloc] init];
+        dispatch_sync(pruned.queue, ^{
+            for (NSUInteger i = 0; i < GenseeRingCapacity + 7; i++) {
+                [pruned appendEventLocked:@{@"attribution": @{@"session_id": i % 2 ? @"keep" : @"remove"}}];
+            }
+        });
+        NSCAssert(Configure(pruned, @[@{@"pid": @900, @"session_id": @"keep"}]), @"revoke a session after ring wrap");
+        [pruned fetchEventsAfterCursor:8 limit:10 withReply:^(NSArray *events, uint64_t next, NSDictionary *state) { batch = events; }];
+        dispatch_sync(pruned.queue, ^{});
+        NSCAssert([batch.firstObject[@"sensor_cursor"] unsignedLongLongValue] == 10, @"revocation must not skip the next retained event");
+        for (NSDictionary *event in batch) NSCAssert([event[@"attribution"][@"session_id"] isEqual:@"keep"], @"revoked payload must not be delivered");
+        dispatch_sync(pruned.queue, ^{
+            uint64_t previous = 0;
+            for (NSUInteger i = 0; i < pruned.events.count; i++) {
+                NSDictionary *event = [pruned eventAtOffsetLocked:i];
+                uint64_t current = [event[@"sensor_cursor"] unsignedLongLongValue];
+                NSCAssert(current > previous && ([event[@"sensor_revoked"] boolValue] || [event[@"attribution"][@"session_id"] isEqual:@"keep"]), @"pruning preserves logical cursor order");
+                previous = current;
+            }
+            [pruned appendEventLocked:@{}];
+            NSCAssert([[pruned eventAtOffsetLocked:pruned.events.count - 1][@"sensor_cursor"] unsignedLongLongValue] > previous, @"append remains ordered after pruning");
+        });
 
         snapshotFetches = 0;
         NSArray *descendants = GenseeDescendantProcessIdentifiers(500);

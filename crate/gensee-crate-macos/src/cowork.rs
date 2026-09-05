@@ -132,6 +132,28 @@ mod tests {
     use super::*;
     use crate::{EndpointSecurityAttribution, EndpointSecurityDecision};
 
+    #[test]
+    fn shared_signing_identity_fixture_matches_sensor_contract() {
+        let fixtures: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../integrations/claude-cowork/signing-identity-fixture.json"
+        ))
+        .unwrap();
+        assert!(!fixtures.is_empty());
+        for fixture in fixtures {
+            let actor = EndpointSecurityProcess {
+                signing_id: fixture["signing_id"].as_str().map(str::to_owned),
+                team_id: fixture["team_id"].as_str().map(str::to_owned),
+                platform_binary: fixture["platform"].as_bool().unwrap(),
+                ..Default::default()
+            };
+            assert_eq!(
+                is_anthropic_host_process(&actor) || is_cowork_virtual_machine_process(&actor),
+                fixture["trusted"].as_bool().unwrap(),
+                "{fixture}"
+            );
+        }
+    }
+
     fn event(actor: EndpointSecurityProcess) -> EndpointSecurityEvent {
         EndpointSecurityEvent {
             schema_version: 1,

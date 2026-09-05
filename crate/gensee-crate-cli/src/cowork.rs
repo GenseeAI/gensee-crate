@@ -35,8 +35,9 @@ pub(crate) fn ingest_cowork_audit(args: Vec<OsString>) -> io::Result<()> {
     let policy = Policy::load_current();
     let configured_mode =
         CoworkAuditMode::from_configured(policy.document().cowork_endpoint_visibility.session_mode);
-    let mode = cowork_ingest_mode(&args, configured_mode, policy.override_error().is_some())?;
-    if policy.override_error().is_some() {
+    let policy_invalid = policy.override_error().is_some();
+    let mode = cowork_ingest_mode(&args, configured_mode, policy_invalid)?;
+    if policy_invalid {
         // Evidence collection must survive an invalid local policy. Do not use
         // either a default or a CLI assertion to upgrade origin in this state.
         eprintln!(
@@ -70,19 +71,12 @@ fn cowork_ingest_mode(
     configured_mode: CoworkAuditMode,
     invalid_policy: bool,
 ) -> io::Result<CoworkAuditMode> {
-    let mode = cowork_audit_mode(
-        args,
-        if invalid_policy {
-            CoworkAuditMode::Unknown
-        } else {
-            configured_mode
-        },
-    )?;
-    Ok(if invalid_policy {
-        CoworkAuditMode::Unknown
-    } else {
-        mode
-    })
+    if invalid_policy {
+        // Validate syntax even though no caller assertion can establish mode.
+        cowork_audit_mode(args, CoworkAuditMode::Unknown)?;
+        return Ok(CoworkAuditMode::Unknown);
+    }
+    cowork_audit_mode(args, configured_mode)
 }
 
 fn cowork_audit_mode(

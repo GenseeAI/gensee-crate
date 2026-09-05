@@ -500,17 +500,10 @@ impl EventStore {
         event: &SystemEvent,
         enrichment: &ObservationEnrichment,
     ) -> io::Result<()> {
-        let paths = enrichment
-            .has_path_enrichment()
-            .then(|| system_event_paths(event));
-        let enrichment = enrichment.evidence_safe_for_paths(
-            paths
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .map(String::as_str),
-        );
-        self.append_system_event_database(event, &enrichment)?;
+        let parsed = ParsedSystemEvent::new(event);
+        let enrichment =
+            enrichment.evidence_safe_for_paths(parsed.paths.iter().map(String::as_str));
+        self.append_system_event_database(&parsed, &enrichment)?;
         // Native kernel telemetry is already durable in SQLite and can be
         // pruned transactionally. Duplicating these high-volume streams into an
         // append-only JSONL file made retention ineffective and could consume
@@ -2408,13 +2401,14 @@ impl EventStore {
 
     fn append_system_event_database(
         &self,
-        event: &SystemEvent,
+        parsed: &ParsedSystemEvent<'_>,
         enrichment: &ObservationEnrichment,
     ) -> io::Result<()> {
+        let event = parsed.event;
         self.with_sqlite_transaction(|db| {
             let ts = to_i64(event.observed_at_ms)?;
-            let matched_agent_event = agent_event_for_system_event(db, event, ts)?;
-            let attributed_session_id = system_event_session_id(event);
+            let matched_agent_event = agent_event_for_system_event(db, parsed, ts)?;
+            let attributed_session_id = system_event_session_id(event, parsed.raw.as_ref());
             let request_id = if let Some(session_id) = attributed_session_id.as_deref() {
                 ensure_session(db, session_id, &event.source, event.observed_at_ms)?;
                 latest_or_create_request(db, session_id)?
@@ -2469,7 +2463,7 @@ impl EventStore {
                 )?;
             }
             record_system_event_artifacts(
-                db, request_id, event_id, event, ts, matched, enrichment,
+                db, request_id, event_id, parsed, ts, matched, enrichment,
             )?;
             if !matched && system_event_source_can_record_unmatched_alert(&event.source) {
                 record_prepared_unmatched_system_event_alert(
@@ -2838,11 +2832,11 @@ fn system_request_id(db: &SqliteStore, observed_at_ms: u64) -> io::Result<i64> {
 
 fn agent_event_for_system_event(
     db: &SqliteStore,
-    event: &SystemEvent,
+    parsed: &ParsedSystemEvent<'_>,
     ts: i64,
 ) -> io::Result<Option<AgentEventRecord>> {
-    for path in system_event_paths(event) {
-        if let Some(agent_event) = agent_event_for_path(db, &path, ts)? {
+    for path in &parsed.paths {
+        if let Some(agent_event) = agent_event_for_path(db, path, ts)? {
             return Ok(Some(agent_event));
         }
     }
@@ -3534,25 +3528,25 @@ fn record_system_event_artifacts(
     db: &SqliteStore,
     request_id: i64,
     system_event_id: i64,
-    event: &SystemEvent,
+    parsed: &ParsedSystemEvent<'_>,
     ts: i64,
     matched_agent_intent: bool,
     enrichment: &ObservationEnrichment,
 ) -> io::Result<()> {
-    let raw_event = serde_json::from_str::<Value>(&event.raw_json).ok();
+    let event = parsed.event;
+    let raw_event = parsed.raw.as_ref();
     let modified = raw_event
-        .as_ref()
         .and_then(|value| value.get("modified"))
         .and_then(Value::as_bool);
-    let relation_type = system_artifact_relation_type_for_event(event, raw_event.as_ref());
-    let request_relation_type = request_artifact_relation_type_for_event(event, raw_event.as_ref());
-    for path in system_event_paths(event) {
-        if !should_materialize_system_artifact(event, &path, raw_event.as_ref()) {
+    let relation_type = system_artifact_relation_type_for_event(event, raw_event);
+    let request_relation_type = request_artifact_relation_type_for_event(event, raw_event);
+    for path in &parsed.paths {
+        if !should_materialize_system_artifact(event, path, raw_event) {
             continue;
         }
         let Some(artifact_id) = upsert_file_artifact(
             db,
-            &path,
+            path,
             ts,
             Some(json!({
                 "source": event.source,
@@ -3596,7 +3590,7 @@ fn record_system_event_artifacts(
         update_artifact_fact(
             db,
             ArtifactFactUpdate {
-                path: &path,
+                path,
                 artifact_id,
                 digest: None,
                 observed_at: ts,
@@ -3610,7 +3604,7 @@ fn record_system_event_artifacts(
                 unmatched_effect: !matched_agent_intent
                     && matches!(request_relation_type, "produced" | "modified" | "deleted"),
                 risk: None,
-                classification: enrichment.classification_for_path(&path),
+                classification: enrichment.classification_for_path(path),
                 metadata: Some(json!({
                     "source": event.source,
                     "system_event_type": event.event_type,
@@ -4294,8 +4288,8 @@ fn text_from_raw_json(raw_json: &str, keys: &[&str]) -> Option<String> {
         .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
-fn system_event_session_id(event: &SystemEvent) -> Option<String> {
-    let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+fn system_event_session_id(event: &SystemEvent, raw: Option<&Value>) -> Option<String> {
+    let value = raw?;
     let session_id = match event.source.as_str() {
         "linux" | "linux-falco" => value.get("session_id").and_then(Value::as_str),
         "macos-endpoint-security" => value
@@ -4313,14 +4307,33 @@ fn system_event_session_id(event: &SystemEvent) -> Option<String> {
         .map(str::to_string)
 }
 
+struct ParsedSystemEvent<'a> {
+    event: &'a SystemEvent,
+    raw: Option<Value>,
+    paths: Vec<String>,
+}
+
+impl<'a> ParsedSystemEvent<'a> {
+    fn new(event: &'a SystemEvent) -> Self {
+        let raw = serde_json::from_str::<Value>(&event.raw_json).ok();
+        let paths = system_event_paths_from(event, raw.as_ref());
+        Self { event, raw, paths }
+    }
+}
+
 pub fn system_event_paths(event: &SystemEvent) -> Vec<String> {
+    let raw = serde_json::from_str::<Value>(&event.raw_json).ok();
+    system_event_paths_from(event, raw.as_ref())
+}
+
+fn system_event_paths_from(event: &SystemEvent, raw: Option<&Value>) -> Vec<String> {
     let mut paths = BTreeSet::new();
     if let Some(path) = &event.file_path {
         add_path_variants(path, &mut paths);
     }
 
-    if let Ok(value) = serde_json::from_str::<Value>(&event.raw_json) {
-        collect_path_values(&value, &mut paths);
+    if let Some(value) = raw {
+        collect_path_values(value, &mut paths);
     }
 
     paths.into_iter().collect()

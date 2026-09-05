@@ -377,29 +377,7 @@ fn get_session_requests(
 
 const SESSION_EVENTS_QUERY: &str = "
         SELECT se.event_id, se.pid, se.request_id, se.ts, se.source, se.type, se.cwd, se.args,
-            COALESCE(
-                -- Workspace-effect/fsevents records store the changed file at
-                -- the top level. cwd is the workspace root, not the event path.
-                json_extract(se.args, '$.path'),
-                json_extract(se.args, '$.file_path'),
-                json_extract(se.args, '$.event.write.target.path'),
-                json_extract(se.args, '$.event.create.destination.path'),
-                json_extract(se.args, '$.event.rename.destination.path'),
-                json_extract(se.args, '$.event.unlink.target.path'),
-                json_extract(se.args, '$.event.exec.target.path'),
-                json_extract(se.args, '$.event.open.file.path'),
-                CASE WHEN se.cwd != '' THEN se.cwd END
-            ) AS path,
-            COALESCE(
-                json_extract(se.args, '$.process.executable.path'),
-                json_extract(se.args, '$.process_name')
-            ) AS process,
-            CASE
-                WHEN se.source = 'claude-cowork-local-audit'
-                  OR json_type(se.args, '$.cowork') = 'object'
-                THEN se.execution_origin
-                ELSE NULL
-            END AS execution_origin
+            se.execution_origin
           FROM system_events se
           JOIN requests r ON se.request_id = r.request_id
          WHERE r.session_id = ?1
@@ -410,7 +388,49 @@ const SESSION_EVENTS_QUERY: &str = "
 #[tauri::command]
 fn get_session_events(state: tauri::State<AppState>, id: String) -> Result<Vec<Value>, String> {
     let conn = state.ro.lock().map_err(|e| e.to_string())?;
-    qjson(&conn, SESSION_EVENTS_QUERY, &[&id])
+    session_event_rows(&conn, &id)
+}
+
+fn session_event_rows(conn: &Connection, id: &str) -> Result<Vec<Value>, String> {
+    let mut rows = qjson(conn, SESSION_EVENTS_QUERY, &[&id])?;
+    for row in &mut rows {
+        let args = row["args"]
+            .as_str()
+            .and_then(|args| serde_json::from_str::<Value>(args).ok());
+        let parsed = args.as_ref().unwrap_or(&Value::Null);
+        row["path"] = [
+            "/path",
+            "/file_path",
+            "/event/write/target/path",
+            "/event/create/destination/path",
+            "/event/rename/destination/path",
+            "/event/unlink/target/path",
+            "/event/exec/target/path",
+            "/event/open/file/path",
+        ]
+        .iter()
+        .find_map(|pointer| parsed.pointer(pointer).filter(|value| !value.is_null()))
+        .cloned()
+        .unwrap_or_else(|| {
+            row["cwd"]
+                .as_str()
+                .filter(|cwd| !cwd.is_empty())
+                .map(|cwd| Value::String(cwd.into()))
+                .unwrap_or(Value::Null)
+        });
+        row["process"] = parsed
+            .pointer("/process/executable/path")
+            .filter(|value| !value.is_null())
+            .or_else(|| parsed.get("process_name"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if row["source"] != "claude-cowork-local-audit"
+            && !parsed.get("cowork").is_some_and(Value::is_object)
+        {
+            row["execution_origin"] = Value::Null;
+        }
+    }
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -1263,10 +1283,38 @@ mod tests {
             unique.len(),
             "query must not rely on last-wins column mapping"
         );
-        let events = qjson(&conn, SESSION_EVENTS_QUERY, &[&"s"]).unwrap();
+        let events = session_event_rows(&conn, "s").unwrap();
         assert_eq!(events[0]["execution_origin"], "unattributed");
         assert_eq!(events[1]["execution_origin"], "host-native");
         assert!(events[2]["execution_origin"].is_null());
+        assert_eq!(events[0]["path"], "/repo");
+        let payload = serde_json::json!({
+            "path": null,
+            "file_path": "/preferred",
+            "event": {"write": {"target": {"path": "/nested"}}},
+            "process": {"executable": {"path": null}},
+            "process_name": "Claude",
+            "cowork": "not-an-object"
+        })
+        .to_string();
+        conn.execute(
+            "UPDATE system_events SET args=?1 WHERE event_id=3",
+            [&payload],
+        )
+        .unwrap();
+        let events = session_event_rows(&conn, "s").unwrap();
+        assert_eq!(events[0]["path"], "/preferred");
+        assert_eq!(events[0]["process"], "Claude");
+        assert_eq!(events[0]["args"], payload);
+        assert!(events[0]["execution_origin"].is_null());
+        conn.execute(
+            "UPDATE system_events SET args='invalid-json', cwd='' WHERE event_id=3",
+            [],
+        )
+        .unwrap();
+        let events = session_event_rows(&conn, "s").unwrap();
+        assert!(events[0]["path"].is_null());
+        assert!(events[0]["process"].is_null());
     }
 
     #[test]
