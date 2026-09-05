@@ -8,6 +8,13 @@ on:
       - open-source-prep
 
 jobs:
+  cowork-endpoint-scope:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Cowork native adoption and attribution
+        run: scripts/test-cowork-endpoint-scope.sh
+
   security-traces:
     runs-on: ubuntu-latest
     steps:

@@ -112,23 +112,19 @@ pub fn classify_cowork_event(event: &EndpointSecurityEvent) -> CoworkVisibility 
 
 pub fn is_anthropic_host_process(process: &EndpointSecurityProcess) -> bool {
     process.team_id.as_deref() == Some(ANTHROPIC_TEAM_ID)
-        && matches!(
-            process.signing_id.as_deref(),
-            Some(
+        && process.signing_id.as_deref().is_some_and(|signing_id| {
+            matches!(
+                signing_id,
                 CLAUDE_DESKTOP_SIGNING_ID
                     | CLAUDE_DESKTOP_HELPER_SIGNING_ID
                     | CLAUDE_CODE_SIGNING_ID
-            )
-        )
+            ) || signing_id.starts_with("com.anthropic.claudefordesktop.helper.")
+        })
 }
 
 pub fn is_cowork_virtual_machine_process(process: &EndpointSecurityProcess) -> bool {
     process.platform_binary
-        && (process.signing_id.as_deref() == Some(APPLE_VIRTUAL_MACHINE_SIGNING_ID)
-            || process
-                .executable_path
-                .as_deref()
-                .is_some_and(|path| path.ends_with("/com.apple.Virtualization.VirtualMachine")))
+        && process.signing_id.as_deref() == Some(APPLE_VIRTUAL_MACHINE_SIGNING_ID)
 }
 
 #[cfg(test)]
@@ -189,6 +185,45 @@ mod tests {
             classify_cowork_event(&event).execution_origin,
             ExecutionOrigin::HostNative
         );
+    }
+
+    #[test]
+    fn local_tree_membership_does_not_establish_host_tool_origin() {
+        let mut event = event(anthropic_actor());
+        event.cowork = Some(CoworkEventContext {
+            session_mode: CoworkSessionMode::Local,
+            ..CoworkEventContext::default()
+        });
+        assert_eq!(
+            classify_cowork_event(&event).execution_origin,
+            ExecutionOrigin::Unattributed
+        );
+    }
+
+    #[test]
+    fn host_identity_requires_anthropic_team_and_bounded_helper_prefix() {
+        for signing_id in [
+            CLAUDE_DESKTOP_SIGNING_ID,
+            CLAUDE_CODE_SIGNING_ID,
+            CLAUDE_DESKTOP_HELPER_SIGNING_ID,
+            "com.anthropic.claudefordesktop.helper.GPU",
+            "com.anthropic.claudefordesktop.helper.Renderer",
+            "com.anthropic.claudefordesktop.helper.Plugin",
+        ] {
+            let mut actor = anthropic_actor();
+            actor.signing_id = Some(signing_id.into());
+            assert!(is_anthropic_host_process(&actor));
+            actor.team_id = Some("OTHER".into());
+            assert!(!is_anthropic_host_process(&actor));
+        }
+        for signing_id in [
+            "com.anthropic.claudefordesktop.helper-evil",
+            "com.anthropic.other",
+        ] {
+            let mut actor = anthropic_actor();
+            actor.signing_id = Some(signing_id.into());
+            assert!(!is_anthropic_host_process(&actor));
+        }
     }
 
     #[test]

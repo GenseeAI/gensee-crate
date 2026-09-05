@@ -1,17 +1,38 @@
 #import "GenseeEndpointSecurityBridge.h"
 #import <sys/sysctl.h>
+#import <errno.h>
+#import <os/log.h>
 
 NSArray<NSNumber *> *GenseeDescendantProcessIdentifiers(pid_t rootPID)
 {
     if (rootPID <= 0) return @[];
     int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
     size_t byteCount = 0;
-    if (sysctl(mib, 4, NULL, &byteCount, NULL, 0) != 0 || byteCount == 0) return @[];
-
-    struct kinfo_proc *processes = malloc(byteCount);
-    if (processes == NULL) return @[];
-    if (sysctl(mib, 4, processes, &byteCount, NULL, 0) != 0) {
+    struct kinfo_proc *processes = NULL;
+    // The process table may grow between probe and fetch. Bound both memory
+    // and retries, reserve slack, and report failure instead of hiding a gap.
+    const size_t maximumBytes = 64 * 1024 * 1024;
+    for (NSUInteger attempt = 0; attempt < 3; attempt++) {
+        if (sysctl(mib, 4, NULL, &byteCount, NULL, 0) != 0) {
+            os_log_error(OS_LOG_DEFAULT, "Gensee Cowork process snapshot probe failed: errno=%d", errno);
+            return @[];
+        }
+        if (byteCount > maximumBytes / 2) break;
+        size_t capacity = byteCount + byteCount / 4 + 32 * sizeof(struct kinfo_proc);
+        processes = malloc(capacity);
+        if (processes == NULL) break;
+        byteCount = capacity;
+        if (sysctl(mib, 4, processes, &byteCount, NULL, 0) == 0) break;
+        int snapshotError = errno;
         free(processes);
+        processes = NULL;
+        if (snapshotError != ENOMEM) {
+            os_log_error(OS_LOG_DEFAULT, "Gensee Cowork process snapshot failed: errno=%d", snapshotError);
+            return @[];
+        }
+    }
+    if (processes == NULL) {
+        os_log_error(OS_LOG_DEFAULT, "Gensee Cowork descendant adoption incomplete: process snapshot exceeded retry/resource limit");
         return @[];
     }
 

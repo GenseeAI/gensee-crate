@@ -1,21 +1,26 @@
 # Claude Cowork endpoint visibility (macOS pilot)
 
-This adapter records what Claude Cowork causes on a managed Mac without
+This local adapter records Claude Cowork audit boundaries and host effects on a Mac without
 claiming visibility that the endpoint does not have. It combines the macOS
 Endpoint Security stream with Cowork's local audit stream and assigns every
-Cowork boundary event exactly one execution-origin label:
+Cowork boundary event exactly one execution-origin label. Configuration, evidence,
+and the dashboard stay on the endpoint. This integration adds no enrollment,
+central policy service, fleet management, or remote-control API.
+
+Execution-origin labels describe the available evidence:
 
 | Label | Meaning |
 | --- | --- |
-| `host-native` | A known Cowork host tool ran locally and its endpoint effects can be observed and enforced with Endpoint Security. |
+| `host-native` | A local audit record identifies a known host tool, or an OS event has explicit host-tool context and verified signing identity. Audit intent alone does not prove an effect occurred. |
 | `vm-mediated` | A local shell/code tool crossed the Linux VM boundary. Crate records the boundary and host-visible result, not guest commands or process lineage. |
 | `cloud-mediated` | The session was explicitly identified as cloud mode. Crate records only effects bridged back through the endpoint; cloud execution is outside endpoint visibility. |
 | `unattributed` | Available evidence cannot establish the execution surface. Crate does not guess. |
 
 ## Pilot contract
 
-1. Crate provides high-fidelity monitoring and enforcement for host-native
-   Cowork activity captured by macOS Endpoint Security.
+1. Crate records Cowork's local audit stream and independently observed process
+   and file events. Local protected-path and blocked-executable policy applies
+   at the supported Endpoint Security boundaries.
 2. For local shell execution, Crate records the VM boundary and resulting
    endpoint changes but does not claim guest command-level visibility.
 3. For cloud sessions, Crate records only local bridged effects and marks cloud
@@ -57,16 +62,21 @@ the path rather than hard-code account, organization, or session identifiers.
 
 The ingester defaults to `cowork_endpoint_visibility.session_mode`, keeping the
 audit and Endpoint Security paths on one mode. `--session-mode` accepts `local`,
-`cloud`, or `unknown` as an explicit override when policy is `unknown`; a flag
-that conflicts with a concrete policy mode is rejected. The endpoint cannot
-reliably infer the mode from the Claude process name, so use `unknown` whenever
-the tenant/session setting has not been independently established.
+`cloud`, or `unknown`. A concrete flag conflicting with a concrete local policy
+mode is rejected. Explicit `unknown` always collects conservatively without
+claiming a mode, even when policy specifies one. An invalid local policy emits a
+warning and ingestion continues as `unknown`, regardless of the requested mode.
+The endpoint cannot reliably infer mode from the Claude process name; use
+`unknown` for mixed or unverified sessions.
 
 The ingester recognizes native file tools such as `Read`, `Write`, `Edit`,
 `Glob`, and `Grep`, and the local VM shell tool `mcp__workspace__bash`. It stores
 tool name, tool-use ID, session ID, timestamp, file path when present, origin,
 and the applicable visibility limitation. File contents and shell commands are
-omitted.
+omitted. Tool events require a session ID and a valid timestamp: RFC3339, or
+integral epoch milliseconds from 1,000,000,000,000 through 4,102,444,800,000.
+Numeric epoch seconds and fractional milliseconds are rejected rather than
+silently dated to 1970 or retimed to the current moment.
 
 The local audit format is not a public Anthropic compatibility contract. Treat
 this parser as a versioned pilot adapter and fail to `unattributed` if the
@@ -81,27 +91,35 @@ tool-use ID provide the semantic side of correlation.
 
 When visibility is enabled for an already-running Claude Desktop instance, the
 host registers its current recursive descendant set as well as the app PID.
-The extension still validates each adopted PID as an Anthropic-signed Claude
-Desktop/helper process or Apple's platform-signed VM process before trusting it;
-later descendants continue to be learned from Endpoint Security fork/exec events.
+The extension validates each adoption candidate as an Anthropic-signed Claude
+Desktop, Claude Code, or Desktop helper (including dotted helper variants), or
+Apple's platform-signed VM process. Untrusted snapshot candidates can still
+inherit independently verified parent-generation attribution. Later descendants
+are learned from Endpoint Security fork/exec events. All candidates retain the
+app's canonical root PID; enumeration order cannot change the recorded root.
+Snapshot collection reserves growth capacity, retries boundedly, and logs failure.
 
 Apple's signed `com.apple.Virtualization.VirtualMachine` process is recognized
 as a VM boundary. Seeing that boundary does not reveal the Linux process that
-performed a command. A filesystem result should therefore remain
-`vm-mediated`, even when Crate can hash or diff the final file on the Mac.
+performed a command. A VM audit boundary is `vm-mediated`. Observing a resulting file on the Mac does
+not by itself prove which guest command caused it.
 
 Endpoint Security records include `cowork_visibility` evidence with the match
 method, confidence, and visibility limitation. A Claude host process stays
-`unattributed` until local audit/session evidence establishes whether it came
-from a local host tool or a cloud bridge.
+`unattributed` without explicit tool evidence; a local-mode process tree alone
+never produces a `host-native` label for caches, settings, or bridge activity.
+The sensor currently emits unknown tool surface for non-VM processes. The local
+audit stream separately records tool boundaries; automatic causal joining of its
+session/tool IDs to the sensor's process-tree session is not implemented here.
 
 ## Enforcement boundary
 
-Crate can enforce policy on endpoint-visible file, process, and network actions.
-It cannot enforce an individual syscall inside Cowork's Linux VM or a command
-running in Anthropic's cloud. If a customer requires complete guest or cloud
-command telemetry, endpoint-only deployment is insufficient and must be paired
-with a supported upstream audit source.
+This adapter uses the existing local Endpoint Security file/process controls.
+It adds no network mediation and cannot enforce an individual syscall inside
+Cowork's Linux VM or a command running in Anthropic's cloud. Claude Desktop can
+share processes across activities, so the opt-in process-tree policy is broader
+than one Cowork task. Start in `observe` mode and validate scope before enabling
+`protect` or `strict` on the local machine.
 
 ## Pilot validation
 
@@ -110,10 +128,20 @@ test folder:
 
 1. Ask Cowork's shell tool to create a file.
 2. Ask Cowork's native file tool to create another file without shell.
-3. Confirm the native event is `host-native` and has Endpoint Security process,
-   parent, signing, and file-event evidence.
-4. Confirm the shell boundary is `vm-mediated`, the resulting file is captured,
-   and no guest command/process claim is emitted.
+3. Confirm the local audit boundary is `host-native` for the known file tool.
+   Inspect independent Endpoint Security process, signing, and file evidence;
+   non-VM sensor events remain `unattributed` without explicit tool context.
+4. Confirm the shell audit boundary is `vm-mediated` and inspect any host-visible
+   file effects without claiming guest commands or automatic causal correlation.
 5. Repeat with an explicitly cloud-mode session and confirm bridged effects are
    `cloud-mediated` with the cloud visibility limitation.
 6. Feed an unknown tool/mode and confirm it is `unattributed`.
+
+## Regression checks
+
+Run `scripts/test-cowork-endpoint-scope.sh` on macOS for the actual extension's
+adoption, PID-generation, canonical-root, conservative tool-surface, and process
+snapshot retry paths. It uses synthetic records without starting an ES client.
+Rust Cowork tests cover timestamp/mode handling, origin classification, and
+policy-enriched artifact ingestion without spurious unmatched-effect alerts.
+A signed, entitled live test is still needed to validate real Claude/macOS builds.

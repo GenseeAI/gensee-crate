@@ -1862,6 +1862,7 @@ final class ConsoleModel: ObservableObject {
                 return processIdentifiers.map { processIdentifier in
                     [
                         "pid": processIdentifier.uint32Value,
+                        "root_pid": UInt32(rootPID),
                         "session_id": sessionID,
                         "kind": "claude-cowork",
                         "cowork_session_mode": coworkSessionMode,

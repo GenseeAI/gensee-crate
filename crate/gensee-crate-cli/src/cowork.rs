@@ -33,12 +33,16 @@ impl CoworkAuditMode {
 
 pub(crate) fn ingest_cowork_audit(args: Vec<OsString>) -> io::Result<()> {
     let policy = Policy::load_current();
-    if let Some(error) = policy.override_error() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, error));
-    }
     let configured_mode =
         CoworkAuditMode::from_configured(policy.document().cowork_endpoint_visibility.session_mode);
-    let mode = cowork_audit_mode(&args, configured_mode)?;
+    let mode = cowork_ingest_mode(&args, configured_mode, policy.override_error().is_some())?;
+    if policy.override_error().is_some() {
+        // Evidence collection must survive an invalid local policy. Do not use
+        // either a default or a CLI assertion to upgrade origin in this state.
+        eprintln!(
+            "gensee cowork audit: local policy is invalid; collecting with unknown session mode"
+        );
+    }
     let store = EventStore::default_local()?;
     let mut ingested = 0_u64;
     let mut rejected = 0_u64;
@@ -59,6 +63,26 @@ pub(crate) fn ingest_cowork_audit(args: Vec<OsString>) -> io::Result<()> {
     }
     eprintln!("gensee: ingested {ingested} Cowork boundary event(s), rejected {rejected}");
     Ok(())
+}
+
+fn cowork_ingest_mode(
+    args: &[OsString],
+    configured_mode: CoworkAuditMode,
+    invalid_policy: bool,
+) -> io::Result<CoworkAuditMode> {
+    let mode = cowork_audit_mode(
+        args,
+        if invalid_policy {
+            CoworkAuditMode::Unknown
+        } else {
+            configured_mode
+        },
+    )?;
+    Ok(if invalid_policy {
+        CoworkAuditMode::Unknown
+    } else {
+        mode
+    })
 }
 
 fn cowork_audit_mode(
@@ -97,7 +121,8 @@ fn cowork_audit_mode(
         }
     }
     if configured_mode != CoworkAuditMode::Unknown
-        && explicit_mode.is_some_and(|mode| mode != configured_mode)
+        && explicit_mode
+            .is_some_and(|mode| mode != CoworkAuditMode::Unknown && mode != configured_mode)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -205,19 +230,14 @@ fn cowork_tool_origin(
             Some("guest command and process lineage are not endpoint-visible"),
         );
     }
-    if mode == CoworkAuditMode::Local && is_cowork_host_tool(tool_name) {
+    if mode == CoworkAuditMode::Local
+        && matches!(cowork_tool_operation(tool_name), "read" | "write" | "edit")
+    {
         return (ExecutionOrigin::HostNative, None);
     }
     (
         ExecutionOrigin::Unattributed,
         Some("tool execution surface cannot be established from endpoint evidence"),
-    )
-}
-
-fn is_cowork_host_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "Read" | "Write" | "Edit" | "MultiEdit" | "Glob" | "Grep" | "LS"
     )
 }
 
@@ -246,15 +266,15 @@ fn parse_rfc3339_millis(value: &str) -> Option<u64> {
 }
 
 fn parse_cowork_timestamp(value: &Value) -> Option<u64> {
-    value
-        .as_str()
-        .and_then(parse_rfc3339_millis)
-        .or_else(|| value.as_u64())
-        .or_else(|| {
-            value
-                .as_i64()
-                .and_then(|timestamp| u64::try_from(timestamp).ok())
-        })
+    if let Some(value) = value.as_str() {
+        return parse_rfc3339_millis(value);
+    }
+    // Cowork numeric timestamps are milliseconds, not ambiguous epoch seconds.
+    // Accept integer-valued JSON floats too, but reject seconds, fractional
+    // milliseconds, and dates outside this adapter's documented 2001–2100 range.
+    let timestamp = value.as_f64()?;
+    (timestamp.fract() == 0.0 && (1_000_000_000_000.0..=4_102_444_800_000.0).contains(&timestamp))
+        .then_some(timestamp as u64)
 }
 
 fn cowork_audit_timestamp_millis(value: &Value) -> io::Result<u64> {
@@ -341,6 +361,56 @@ mod tests {
             CoworkAuditMode::Local,
         )
         .is_err());
+    }
+
+    #[test]
+    fn explicit_unknown_preserves_collection_without_claiming_a_mode() {
+        let args = [OsString::from("--session-mode"), OsString::from("unknown")];
+        for configured in [CoworkAuditMode::Local, CoworkAuditMode::Cloud] {
+            assert_eq!(
+                cowork_audit_mode(&args, configured).unwrap(),
+                CoworkAuditMode::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_policy_collects_unattributed_even_with_an_explicit_mode() {
+        for args in [
+            vec![],
+            vec![OsString::from("--session-mode"), OsString::from("local")],
+        ] {
+            let mode = cowork_ingest_mode(&args, CoworkAuditMode::Cloud, true).unwrap();
+            let events = system_events_from_cowork_audit_line(&line("Write"), mode).unwrap();
+            assert_eq!(events[0].execution_origin, ExecutionOrigin::Unattributed);
+        }
+        assert!(cowork_ingest_mode(
+            &[OsString::from("--bad-option")],
+            CoworkAuditMode::Local,
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn numeric_timestamps_require_unambiguous_integral_milliseconds() {
+        for timestamp in [json!(1_788_591_374_198_u64), json!(1_788_591_374_198.0)] {
+            let mut value: Value = serde_json::from_str(&line("Read")).unwrap();
+            value["_audit_timestamp"] = timestamp;
+            let events =
+                system_events_from_cowork_audit_line(&value.to_string(), CoworkAuditMode::Local)
+                    .unwrap();
+            assert_eq!(events[0].observed_at_ms, 1_788_591_374_198);
+        }
+        for timestamp in [
+            json!(1_788_591_374),
+            json!(-1),
+            json!(0),
+            json!(1_788_591_374_198.5),
+            json!(u64::MAX),
+        ] {
+            assert_eq!(parse_cowork_timestamp(&timestamp), None);
+        }
     }
 
     #[test]

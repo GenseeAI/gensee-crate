@@ -2443,12 +2443,7 @@ impl EventStore {
             record_system_event_artifacts(
                 db, request_id, event_id, event, ts, matched, enrichment,
             )?;
-            if !matched
-                && !matches!(
-                    event.source.as_str(),
-                    "macos-endpoint-security" | "linux-falco" | "claude-cowork-local-audit"
-                )
-            {
+            if !matched && system_event_source_can_record_unmatched_alert(&event.source) {
                 record_prepared_unmatched_system_event_alert(
                     db,
                     request_id,
@@ -3521,8 +3516,8 @@ fn record_system_event_artifacts(
         .as_ref()
         .and_then(|value| value.get("modified"))
         .and_then(Value::as_bool);
-    let relation_type = system_artifact_relation_type_for_event(event);
-    let request_relation_type = request_artifact_relation_type_for_event(event);
+    let relation_type = system_artifact_relation_type_for_event(event, raw_event.as_ref());
+    let request_relation_type = request_artifact_relation_type_for_event(event, raw_event.as_ref());
     for path in system_event_paths(event) {
         if !should_materialize_system_artifact(event, &path, raw_event.as_ref()) {
             continue;
@@ -4357,7 +4352,7 @@ fn should_materialize_system_artifact(
 ) -> bool {
     if event.source == "claude-cowork-local-audit" {
         return matches!(
-            cowork_tool_operation(event),
+            cowork_tool_operation(raw_event),
             Some("read" | "write" | "edit")
         );
     }
@@ -4833,9 +4828,12 @@ fn artifact_access(operation: &str) -> ArtifactAccess {
     }
 }
 
-fn system_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str {
+fn system_artifact_relation_type_for_event(
+    event: &SystemEvent,
+    raw_event: Option<&Value>,
+) -> &'static str {
     if event.source == "claude-cowork-local-audit" {
-        return match cowork_tool_operation(event) {
+        return match cowork_tool_operation(raw_event) {
             Some("read") => "read_by",
             Some("edit") => "modified",
             _ => "wrote",
@@ -4862,9 +4860,12 @@ fn system_artifact_relation_type(event_type: &str) -> &'static str {
     }
 }
 
-fn request_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str {
+fn request_artifact_relation_type_for_event(
+    event: &SystemEvent,
+    raw_event: Option<&Value>,
+) -> &'static str {
     if event.source == "claude-cowork-local-audit" {
-        return match cowork_tool_operation(event) {
+        return match cowork_tool_operation(raw_event) {
             Some("read") => "consumed_by",
             Some("edit") => "modified",
             _ => "produced",
@@ -4879,21 +4880,10 @@ fn request_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str
     request_artifact_relation_type(&event.event_type)
 }
 
-fn cowork_tool_operation(event: &SystemEvent) -> Option<&str> {
-    if event.source != "claude-cowork-local-audit" {
-        return None;
-    }
-    serde_json::from_str::<Value>(&event.raw_json)
-        .ok()?
-        .get("tool_operation")?
-        .as_str()
-        .map(|operation| match operation {
-            "read" => "read",
-            "write" => "write",
-            "edit" => "edit",
-            "shell" => "shell",
-            _ => "unknown",
-        })
+fn cowork_tool_operation(raw_event: Option<&Value>) -> Option<&str> {
+    // The producer owns tool taxonomy. Reuse the event already parsed by the
+    // caller; do not parse the same payload again for each lineage relation.
+    raw_event?.get("tool_operation")?.as_str()
 }
 
 fn request_artifact_relation_type(event_type: &str) -> &'static str {
@@ -4906,6 +4896,16 @@ fn request_artifact_relation_type(event_type: &str) -> &'static str {
         | "setextattr" | "deleteextattr" => "modified",
         _ => "produced",
     }
+}
+
+/// Sources with their own attribution do not use the legacy unmatched-effect
+/// heuristic. Shared by ingestion and persistence so policy enrichment cannot
+/// prepare alerts that the store would necessarily discard.
+pub fn system_event_source_can_record_unmatched_alert(source: &str) -> bool {
+    !matches!(
+        source,
+        "macos-endpoint-security" | "linux-falco" | "claude-cowork-local-audit"
+    )
 }
 
 /// Whether an unattributed system event can represent a filesystem effect
@@ -7473,28 +7473,45 @@ mod tests {
         for (tool_name, tool_operation, event_kind, path) in [
             ("Read", "read", "file_read", "/repo/input.txt"),
             ("Write", "write", "file_mutation", "/repo/output.txt"),
+            ("Edit", "edit", "file_mutation", "/repo/edited.txt"),
         ] {
             store
-                .append_system_event_evidence_only(&SystemEvent {
-                    source: "claude-cowork-local-audit".to_string(),
-                    event_type: "cowork_tool_boundary".to_string(),
-                    event_kind: event_kind.to_string(),
-                    execution_origin: ExecutionOrigin::HostNative,
-                    observed_at_ms: 130,
-                    pid: None,
-                    ppid: None,
-                    process_name: Some("Claude Cowork".to_string()),
-                    executable_path: None,
-                    file_path: Some(path.to_string()),
-                    command_line: None,
-                    raw_json: json!({
-                        "attribution": { "session_id": "cowork-session" },
-                        "tool_name": tool_name,
-                        "tool_operation": tool_operation,
-                        "file_path": path,
-                    })
-                    .to_string(),
-                })
+                .append_system_event_with_enrichment(
+                    &SystemEvent {
+                        source: "claude-cowork-local-audit".to_string(),
+                        event_type: "cowork_tool_boundary".to_string(),
+                        event_kind: event_kind.to_string(),
+                        execution_origin: ExecutionOrigin::HostNative,
+                        observed_at_ms: 130,
+                        pid: None,
+                        ppid: None,
+                        process_name: Some("Claude Cowork".to_string()),
+                        executable_path: None,
+                        file_path: Some(path.to_string()),
+                        command_line: None,
+                        raw_json: json!({
+                            "attribution": { "session_id": "cowork-session" },
+                            "tool_name": tool_name,
+                            "tool_operation": tool_operation,
+                            "file_path": path,
+                        })
+                        .to_string(),
+                    },
+                    &ObservationEnrichment {
+                        unmatched_system_alert: Some(PolicyAlert {
+                            session_id: None,
+                            tool_use_id: None,
+                            severity: "medium".into(),
+                            action: "warn".into(),
+                            rule_id: "unmatched_system_effect".into(),
+                            message: "prepared unmatched effect".into(),
+                            path: Some(path.into()),
+                            evidence: None,
+                            observed_at_ms: 130,
+                        }),
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
         }
 
@@ -7504,7 +7521,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let events = db.system_events_for_request(request.request_id).unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert!(events
             .iter()
             .all(|event| event.execution_origin == "host-native"));
@@ -7515,6 +7532,9 @@ mod tests {
         assert!(relations
             .iter()
             .any(|relation| relation.relation_type == "produced"));
+        assert!(relations
+            .iter()
+            .any(|relation| relation.relation_type == "modified"));
         drop(db);
         assert!(store
             .list_alerts()
@@ -7522,6 +7542,49 @@ mod tests {
             .iter()
             .all(|alert| alert.rule_id != "unmatched_system_effect"));
 
+        // Positive control: the same prepared alert must persist for a legacy
+        // source. This fails if the test stops exercising enriched ingestion.
+        store
+            .append_system_event_with_enrichment(
+                &SystemEvent {
+                    source: "eslogger".into(),
+                    event_type: "write".into(),
+                    event_kind: "file_mutation".into(),
+                    execution_origin: Default::default(),
+                    observed_at_ms: 140,
+                    pid: None,
+                    ppid: None,
+                    process_name: None,
+                    executable_path: None,
+                    file_path: Some("/repo/legacy.txt".into()),
+                    command_line: None,
+                    raw_json: "{}".into(),
+                },
+                &ObservationEnrichment {
+                    unmatched_system_alert: Some(PolicyAlert {
+                        session_id: None,
+                        tool_use_id: None,
+                        severity: "medium".into(),
+                        action: "warn".into(),
+                        rule_id: "unmatched_system_effect".into(),
+                        message: "prepared unmatched effect".into(),
+                        path: Some("/repo/legacy.txt".into()),
+                        evidence: None,
+                        observed_at_ms: 140,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .list_alerts()
+                .unwrap()
+                .iter()
+                .filter(|alert| alert.rule_id == "unmatched_system_effect")
+                .count(),
+            1
+        );
         fs::remove_dir_all(dir).ok();
     }
 

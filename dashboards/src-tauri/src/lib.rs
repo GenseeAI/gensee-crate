@@ -145,13 +145,16 @@ fn get_config_audit(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    audit_target(target, &AuditOptions {
-        workspace,
-        codex_home,
-        codex_profile,
-        vscode_user_data,
-        vscode_profile,
-    })
+    audit_target(
+        target,
+        &AuditOptions {
+            workspace,
+            codex_home,
+            codex_profile,
+            vscode_user_data,
+            vscode_profile,
+        },
+    )
     .map_err(|error| error.to_string())
 }
 
@@ -167,7 +170,10 @@ fn resolve_audit_workspace(workspace: Option<String>) -> Result<PathBuf, String>
             .map_err(|error| format!("Unable to resolve the audit workspace: {error}"))?,
     };
     if !path.is_dir() {
-        return Err(format!("Audit workspace is not a directory: {}", path.display()));
+        return Err(format!(
+            "Audit workspace is not a directory: {}",
+            path.display()
+        ));
     }
     Ok(path)
 }
@@ -369,13 +375,8 @@ fn get_session_requests(
     )
 }
 
-#[tauri::command]
-fn get_session_events(state: tauri::State<AppState>, id: String) -> Result<Vec<Value>, String> {
-    let conn = state.ro.lock().map_err(|e| e.to_string())?;
-    qjson(
-        &conn,
-        "
-        SELECT se.*,
+const SESSION_EVENTS_QUERY: &str = "
+        SELECT se.event_id, se.pid, se.request_id, se.ts, se.source, se.type, se.cwd, se.args,
             COALESCE(
                 -- Workspace-effect/fsevents records store the changed file at
                 -- the top level. cwd is the workspace root, not the event path.
@@ -404,9 +405,12 @@ fn get_session_events(state: tauri::State<AppState>, id: String) -> Result<Vec<V
          WHERE r.session_id = ?1
          ORDER BY se.ts DESC
          LIMIT 200
-    ",
-        &[&id],
-    )
+    ";
+
+#[tauri::command]
+fn get_session_events(state: tauri::State<AppState>, id: String) -> Result<Vec<Value>, String> {
+    let conn = state.ro.lock().map_err(|e| e.to_string())?;
+    qjson(&conn, SESSION_EVENTS_QUERY, &[&id])
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,6 +1246,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_event_query_has_unique_columns_and_only_labels_cowork() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE requests(request_id INTEGER, session_id TEXT);
+            CREATE TABLE system_events(event_id INTEGER, pid INTEGER, request_id INTEGER,
+            ts INTEGER, source TEXT, type TEXT, cwd TEXT, args TEXT, execution_origin TEXT);
+            INSERT INTO requests VALUES(1, 's');
+            INSERT INTO system_events VALUES(1, 42, 1, 1, 'eslogger', 'write', '/repo', '{}', 'unattributed');
+            INSERT INTO system_events VALUES(2, 42, 1, 2, 'claude-cowork-local-audit', 'cowork_tool_boundary', '/repo', '{}', 'host-native');
+            INSERT INTO system_events VALUES(3, 42, 1, 3, 'macos-endpoint-security', 'write', '/repo', '{\"cowork\":{}}', 'unattributed');").unwrap();
+        let stmt = conn.prepare(SESSION_EVENTS_QUERY).unwrap();
+        let names = stmt.column_names();
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "query must not rely on last-wins column mapping"
+        );
+        let events = qjson(&conn, SESSION_EVENTS_QUERY, &[&"s"]).unwrap();
+        assert_eq!(events[0]["execution_origin"], "unattributed");
+        assert_eq!(events[1]["execution_origin"], "host-native");
+        assert!(events[2]["execution_origin"].is_null());
+    }
+
+    #[test]
     fn config_audit_command_uses_the_shared_ruleset() {
         let root = std::env::temp_dir().join(format!(
             "gensee-dashboard-config-audit-{}",
@@ -1285,8 +1313,15 @@ mod tests {
         ));
         fs::write(&path, "not a directory").unwrap();
 
-        let error = get_config_audit(None, Some(path.to_string_lossy().into_owned()), None, None, None, None)
-            .expect_err("file workspace should be rejected");
+        let error = get_config_audit(
+            None,
+            Some(path.to_string_lossy().into_owned()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("file workspace should be rejected");
 
         assert!(error.contains("not a directory"));
         let _ = fs::remove_file(path);

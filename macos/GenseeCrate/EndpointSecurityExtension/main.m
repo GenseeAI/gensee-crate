@@ -147,7 +147,9 @@ static BOOL GenseeIsTrustedCoworkProcess(const es_process_t *process)
     NSString *teamID = GenseeStringFromToken(process->team_id);
     BOOL signedByAnthropic = [teamID isEqualToString:@"Q6L2SF6YDW"] &&
         ([signingID isEqualToString:@"com.anthropic.claudefordesktop"] ||
-         [signingID isEqualToString:@"com.anthropic.claudefordesktop.helper"]);
+         [signingID isEqualToString:@"com.anthropic.claudefordesktop.helper"] ||
+         [signingID hasPrefix:@"com.anthropic.claudefordesktop.helper."] ||
+         [signingID isEqualToString:@"com.anthropic.claude-code"]);
     return signedByAnthropic || GenseeIsCoworkVirtualMachineProcess(process);
 }
 
@@ -374,6 +376,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 @property(nonatomic) NSMutableDictionary<NSString *, NSString *> *managedProcesses;
 @property(nonatomic) NSSet<NSNumber *> *coworkRootPIDs;
 @property(nonatomic) NSDictionary<NSString *, NSString *> *coworkSessionModes;
+@property(nonatomic) NSDictionary<NSString *, NSNumber *> *coworkCanonicalRootPIDs;
 @property(nonatomic) uint64_t maxAuthorizationLatencyUS;
 @property(nonatomic) uint64_t authorizationCount;
 @property(nonatomic) uint64_t deniedCount;
@@ -398,6 +401,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         _managedProcesses = [NSMutableDictionary dictionary];
         _coworkRootPIDs = [NSSet set];
         _coworkSessionModes = @{};
+        _coworkCanonicalRootPIDs = @{};
         _maxAuthorizationLatencyUS = 10000;
     }
     return self;
@@ -441,11 +445,13 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     NSNumber *pid = @(audit_token_to_pid(process->audit_token));
     session = self.managedRoots[pid];
     if (session != nil) {
-        if ([self.coworkRootPIDs containsObject:pid] && !GenseeIsTrustedCoworkProcess(process)) {
-            return nil;
+        if (![self.coworkRootPIDs containsObject:pid] || GenseeIsTrustedCoworkProcess(process)) {
+            self.managedProcesses[key] = session;
+            return session;
         }
-        self.managedProcesses[key] = session;
-        return session;
+        // A snapshot candidate is not authority. A rejected candidate can still
+        // inherit an independently verified parent generation below.
+        session = nil;
     }
     if (messageVersion >= 4) {
         NSString *parentKey = [NSString stringWithFormat:@"%d:%d",
@@ -469,6 +475,8 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 
 - (NSNumber *_Nullable)rootPIDForSessionLocked:(NSString *)session
 {
+    NSNumber *canonicalRoot = self.coworkCanonicalRootPIDs[session];
+    if (canonicalRoot != nil) return canonicalRoot;
     for (NSNumber *pid in self.managedRoots) {
         if ([self.managedRoots[pid] isEqualToString:session]) return pid;
     }
@@ -570,13 +578,11 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         if (actorSession != nil) {
             actorRootPID = [self rootPIDForSessionLocked:actorSession];
             actorCoworkMode = self.coworkSessionModes[actorSession];
-            if ([actorCoworkMode isEqualToString:@"local"]) {
-                actorCoworkToolSurface = GenseeIsCoworkVirtualMachineProcess(message->process)
-                    ? @"shell"
-                    : @"host";
-            } else {
-                actorCoworkToolSurface = @"unknown";
-            }
+            // Tree membership establishes the observer process, not which
+            // Cowork tool caused an effect. Never manufacture host-tool evidence
+            // for app bookkeeping, VM bridges, or unknown tool surfaces.
+            actorCoworkToolSurface = GenseeIsCoworkVirtualMachineProcess(message->process)
+                ? @"shell" : @"unknown";
         }
         if (message->event_type == ES_EVENT_TYPE_NOTIFY_FORK) {
             if (actorSession != nil) self.managedProcesses[[self keyForProcess:message->event.fork.child]] = actorSession;
@@ -741,6 +747,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     NSMutableDictionary<NSNumber *, NSString *> *roots = [NSMutableDictionary dictionary];
     NSMutableSet<NSNumber *> *coworkRootPIDs = [NSMutableSet set];
     NSMutableDictionary<NSString *, NSString *> *coworkSessionModes = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSNumber *> *coworkCanonicalRootPIDs = [NSMutableDictionary dictionary];
     for (NSDictionary *root in managedRoots ?: @[]) {
         NSNumber *pid = root[@"pid"];
         NSString *sessionID = root[@"session_id"];
@@ -754,9 +761,28 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
                     reply(NO, @"Cowork managed roots require a local, cloud, or unknown session mode.");
                     return;
                 }
+                NSNumber *canonicalRoot = root[@"root_pid"];
+                if (![canonicalRoot isKindOfClass:NSNumber.class] ||
+                    canonicalRoot.longLongValue <= 0 || canonicalRoot.longLongValue > INT_MAX ||
+                    canonicalRoot.doubleValue != canonicalRoot.longLongValue ||
+                    (coworkCanonicalRootPIDs[sessionID] != nil &&
+                     ![coworkCanonicalRootPIDs[sessionID] isEqual:canonicalRoot]) ||
+                    (coworkSessionModes[sessionID] != nil &&
+                     ![coworkSessionModes[sessionID] isEqualToString:sessionMode])) {
+                    reply(NO, @"Cowork adoption requires one canonical root PID and mode per session.");
+                    return;
+                }
                 [coworkRootPIDs addObject:pid];
                 coworkSessionModes[sessionID] = sessionMode;
+                coworkCanonicalRootPIDs[sessionID] = canonicalRoot;
             }
+        }
+    }
+    for (NSString *sessionID in coworkCanonicalRootPIDs) {
+        NSNumber *canonicalRoot = coworkCanonicalRootPIDs[sessionID];
+        if (![roots[canonicalRoot] isEqualToString:sessionID] || ![coworkRootPIDs containsObject:canonicalRoot]) {
+            reply(NO, @"Cowork canonical root must be registered in the same session.");
+            return;
         }
     }
     @synchronized (self) {
@@ -772,6 +798,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         self.managedProcesses = activeProcesses;
         self.coworkRootPIDs = coworkRootPIDs;
         self.coworkSessionModes = coworkSessionModes;
+        self.coworkCanonicalRootPIDs = coworkCanonicalRootPIDs;
         self.maxAuthorizationLatencyUS = (maxAuthorizationLatencyMS ?: @10).unsignedLongLongValue * 1000ULL;
     }
     NSSet<NSString *> *activeSessions = [NSSet setWithArray:roots.allValues];

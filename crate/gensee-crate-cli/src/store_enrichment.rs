@@ -65,16 +65,14 @@ pub(crate) fn append_system_event_with_policy(
         .into_iter()
         .map(|path| artifact_classification(&policy, path))
         .collect();
-    let unmatched_system_alert = if matches!(
-        event.source.as_str(),
-        "macos-endpoint-security" | "linux-falco"
-    )
-        || !gensee_crate_store::system_event_can_record_unmatched_alert(&event.event_type)
-    {
-        None
-    } else {
-        prepare_policy_alert(&policy, unmatched_system_event_alert(event))
-    };
+    let unmatched_system_alert =
+        if !gensee_crate_store::system_event_source_can_record_unmatched_alert(&event.source)
+            || !gensee_crate_store::system_event_can_record_unmatched_alert(&event.event_type)
+        {
+            None
+        } else {
+            prepare_policy_alert(&policy, unmatched_system_event_alert(event))
+        };
     store.append_system_event_with_enrichment(
         event,
         &ObservationEnrichment {
