@@ -3572,6 +3572,28 @@ fn native_policy_subjects_parse_mcp_file_paths_and_commands() {
 }
 
 #[test]
+fn native_policy_subjects_parse_notebook_paths() {
+    for (tool_name, operation) in [("NotebookRead", "read"), ("NotebookEdit", "edit")] {
+        let payload = json!({
+            "session_id": "s1",
+            "hook_event_name": "PreToolUse",
+            "cwd": "/repo",
+            "tool_name": tool_name,
+            "tool_use_id": "notebook_1",
+            "tool_input": { "notebook_path": "analysis.ipynb" },
+        })
+        .to_string();
+        let event = build_agent_hook_event(&payload).unwrap();
+
+        let subjects = native_policy_subjects(&event);
+
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].operation, operation);
+        assert_eq!(subjects[0].path, "/repo/analysis.ipynb");
+    }
+}
+
+#[test]
 fn mcp_tool_url_fields_count_as_network_egress() {
     let payload = json!({
         "session_id": "s1",
@@ -4771,7 +4793,7 @@ fn current_session_agent_write_with_watch_effect_still_allows() {
     fs::write(&script, "echo watched\n").unwrap();
     let observed_at_ms = unix_millis().unwrap();
     store
-        .append_file_intent(&FileIntent {
+        .append_file_intent_evidence_only(&FileIntent {
             provider: "bash-command-parser".to_string(),
             session_id: Some("s1".to_string()),
             tool_use_id: Some("tool-write".to_string()),
@@ -4784,7 +4806,7 @@ fn current_session_agent_write_with_watch_effect_still_allows() {
         })
         .unwrap();
     store
-        .append_workspace_effect(&WorkspaceEffect {
+        .append_workspace_effect_evidence_only(&WorkspaceEffect {
             source: "gensee-watch-fsevents".to_string(),
             session_id: Some("watch-session".to_string()),
             workspace: workspace.to_string_lossy().to_string(),
@@ -4822,7 +4844,7 @@ fn externally_modified_executable_asks_before_exec() {
     let script = workspace.join("external.sh");
     fs::write(&script, "echo external\n").unwrap();
     store
-        .append_workspace_effect(&WorkspaceEffect {
+        .append_workspace_effect_evidence_only(&WorkspaceEffect {
             source: "gensee-watch-fsevents".to_string(),
             session_id: Some("watch-session".to_string()),
             workspace: workspace.to_string_lossy().to_string(),
@@ -6729,7 +6751,7 @@ fn resource_governance_blocks_tool_call_quota_exhaustion() {
         let payload =
             pretool_bash_payload("s1", workspace.to_str().unwrap(), &format!("echo {idx}"));
         let event = build_agent_hook_event(&payload).unwrap();
-        store.append_hook_event(&event).unwrap();
+        store.append_hook_event_evidence_only(&event).unwrap();
     }
     let payload = pretool_bash_payload("s1", workspace.to_str().unwrap(), "echo final");
     let event = build_agent_hook_event(&payload).unwrap();
@@ -6748,7 +6770,7 @@ fn resource_governance_uses_request_file_rate() {
     let (store, workspace) = temp_store_and_workspace("resource-file-rate");
     let now = unix_millis().unwrap();
     store
-        .append_hook_event(
+        .append_hook_event_evidence_only(
             &build_agent_hook_event(
                 &json!({
                     "session_id": "s1",
@@ -6763,7 +6785,7 @@ fn resource_governance_uses_request_file_rate() {
         .unwrap();
     for idx in 0..2 {
         store
-            .append_file_intent(&FileIntent {
+            .append_file_intent_evidence_only(&FileIntent {
                 provider: "bash-command-parser".to_string(),
                 session_id: Some("s1".to_string()),
                 tool_use_id: Some(format!("t{idx}")),
@@ -6808,7 +6830,7 @@ fn resource_governance_uses_request_network_rate() {
     let (store, workspace) = temp_store_and_workspace("resource-network-rate");
     let now = unix_millis().unwrap();
     store
-        .append_hook_event(
+        .append_hook_event_evidence_only(
             &build_agent_hook_event(
                 &json!({
                     "session_id": "s1",

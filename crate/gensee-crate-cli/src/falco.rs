@@ -117,7 +117,7 @@ pub(crate) fn ingest_falco(args: Vec<OsString>) -> io::Result<()> {
                         );
                     }
                 }
-                match store.append_system_event(&event) {
+                match append_system_event_with_policy(&store, &event) {
                     Ok(()) => {
                         store_error_active = false;
                         count += 1;

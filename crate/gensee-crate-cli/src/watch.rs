@@ -441,7 +441,7 @@ fn watch_pid(config: WatchConfig) -> io::Result<()> {
             Ok(events) => {
                 for event in events {
                     let system_event = event.to_system_event();
-                    store.append_system_event(&system_event)?;
+                    append_system_event_with_policy(&store, &system_event)?;
                     eprintln!(
                         "gensee: linux event kind={:?} pid={} process={} command={}",
                         event.kind,
@@ -639,7 +639,7 @@ fn ingest_eslogger_reader<R: Read>(reader: R, store: EventStore) -> io::Result<u
             continue;
         }
         let event = system_event_from_eslogger_line(line, unix_millis()?);
-        store.append_system_event(&event)?;
+        append_system_event_with_policy(&store, &event)?;
         count += 1;
     }
     Ok(count)
@@ -687,7 +687,7 @@ pub(crate) fn print_and_store_workspace_effect(
         effect.effect_type,
         path_relative_display(Path::new(&effect.workspace), Path::new(&effect.path))
     );
-    store.append_workspace_effect(effect)
+    append_workspace_effect_with_policy(store, effect)
 }
 
 #[cfg(not(target_os = "macos"))]

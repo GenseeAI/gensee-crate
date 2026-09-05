@@ -756,7 +756,7 @@ mod native_system_event_tests {
             None,
         )
         .unwrap();
-        store.append_system_event(&event).unwrap();
+        store.append_system_event_evidence_only(&event).unwrap();
 
         assert!(store.list_system_events().unwrap().is_empty());
         let events = timeline_system_events(&store, None, None, i64::MIN, i64::MAX, 100).unwrap();
@@ -784,8 +784,8 @@ mod native_system_event_tests {
         let mut newer = attributed_event("run_2");
         newer.observed_at_ms = 200;
         newer.raw_json = json!({"session_id": "run_2", "event_id": "falco-2"}).to_string();
-        store.append_system_event(&first).unwrap();
-        store.append_system_event(&newer).unwrap();
+        store.append_system_event_evidence_only(&first).unwrap();
+        store.append_system_event_evidence_only(&newer).unwrap();
 
         let events =
             timeline_system_events(&store, Some("run_1"), None, i64::MIN, i64::MAX, 1).unwrap();
@@ -823,8 +823,8 @@ mod native_system_event_tests {
             "output_fields": {"fd.name": "/workspace/noise.txt"}
         })
         .to_string();
-        store.append_system_event(&matching).unwrap();
-        store.append_system_event(&newer).unwrap();
+        store.append_system_event_evidence_only(&matching).unwrap();
+        store.append_system_event_evidence_only(&newer).unwrap();
 
         let events =
             timeline_system_events(&store, None, Some("target.txt"), i64::MIN, i64::MAX, 1)
@@ -911,8 +911,8 @@ mod native_system_event_tests {
             format!("{}\n", serde_json::to_string(&event).unwrap()),
         )
         .unwrap();
-        store.append_system_event(&event).unwrap();
-        store.append_system_event(&event).unwrap();
+        store.append_system_event_evidence_only(&event).unwrap();
+        store.append_system_event_evidence_only(&event).unwrap();
 
         let events = timeline_system_events(&store, None, None, i64::MIN, i64::MAX, 100).unwrap();
 

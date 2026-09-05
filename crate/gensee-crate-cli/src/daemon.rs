@@ -766,7 +766,7 @@ fn process_tclone_observer_request(store: &EventStore, request: Value) -> io::Re
             )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
             scope_tclone_observation_event(&mut event, run_id)?;
-            store.append_hook_event(&event)?;
+            append_hook_event_with_policy(store, &event)?;
             if !matches!(
                 event.hook_event_name.as_deref(),
                 Some("PreToolUse" | "PermissionRequest" | "PreInvocation")
@@ -1622,7 +1622,7 @@ mod tclone_observation_tests {
         let (store, root) = test_store("falco-retention-backstop");
         for observed_at_ms in 1..=3 {
             store
-                .append_system_event(&SystemEvent {
+                .append_system_event_evidence_only(&SystemEvent {
                     source: "linux-falco".to_string(),
                     event_type: "execve".to_string(),
                     event_kind: "ProcessExec".to_string(),
@@ -1638,7 +1638,7 @@ mod tclone_observation_tests {
                 .unwrap();
         }
         store
-            .append_system_event(&SystemEvent {
+            .append_system_event_evidence_only(&SystemEvent {
                 source: "macos-endpoint-security".to_string(),
                 event_type: "exec".to_string(),
                 event_kind: "ProcessExec".to_string(),
