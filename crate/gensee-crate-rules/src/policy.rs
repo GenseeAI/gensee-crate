@@ -122,6 +122,8 @@ pub struct PolicyDocument {
     #[serde(default)]
     pub endpoint_security: EndpointSecurityConfig,
     #[serde(default)]
+    pub cowork_endpoint_visibility: CoworkEndpointVisibilityConfig,
+    #[serde(default)]
     pub recovery: RecoveryConfig,
     /// Trusted path prefixes exempt from the FP-prone secret/persistence
     /// findings (the JSON form of `GENSEE_POLICY_ALLOW_PATH_PREFIXES`).
@@ -298,6 +300,25 @@ impl Default for EndpointSecurityConfig {
             low_severity_retention_hours: Some(48),
         }
     }
+}
+
+/// Opt-in management of the Claude Desktop process tree. The mode is supplied
+/// by managed configuration because a signed host helper alone cannot prove
+/// whether a Cowork action originated locally or in Anthropic's cloud.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CoworkEndpointVisibilityConfig {
+    pub enabled: bool,
+    pub session_mode: CoworkConfiguredSessionMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoworkConfiguredSessionMode {
+    Local,
+    Cloud,
+    #[default]
+    Unknown,
 }
 
 /// Git-backed recovery points created by harness hooks before agent changes.
@@ -1793,6 +1814,9 @@ mod tests {
         assert_eq!(endpoint.raw_event_retention_hours, 24);
         assert_eq!(endpoint.max_raw_events, 100_000);
         assert_eq!(endpoint.low_severity_retention_hours, Some(48));
+        let cowork = &policy.document().cowork_endpoint_visibility;
+        assert!(!cowork.enabled);
+        assert_eq!(cowork.session_mode, CoworkConfiguredSessionMode::Unknown);
         let recovery = &policy.document().recovery;
         assert_eq!(recovery.mode_for("codex"), RecoveryMode::Auto);
         assert_eq!(recovery.retention_hours, 168);
@@ -1901,6 +1925,7 @@ mod tests {
             "enforcement",
             "watch",
             "endpoint_security",
+            "cowork_endpoint_visibility",
             "recovery",
             "allow_path_prefixes",
         ] {
@@ -1918,6 +1943,11 @@ mod tests {
         assert!(d.runtime.max_runtime_seconds.is_none());
         assert_eq!(d.watch.system_events, SystemEventMode::EndpointSecurity);
         assert_eq!(d.endpoint_security.mode, EndpointSecurityMode::Observe);
+        assert!(!d.cowork_endpoint_visibility.enabled);
+        assert_eq!(
+            d.cowork_endpoint_visibility.session_mode,
+            CoworkConfiguredSessionMode::Unknown
+        );
         assert!(d.allow_path_prefixes.is_empty());
     }
 

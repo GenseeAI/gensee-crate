@@ -1821,25 +1821,54 @@ final class ConsoleModel: ObservableObject {
         ]
         var blockedExecutables: [String] = []
         var maxAuthorizationLatencyMS: UInt64 = 10
+        var coworkEndpointVisibilityEnabled = false
+        var coworkSessionMode = "unknown"
         if let data = policyDocument.data(using: .utf8),
-           let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let endpoint = document["endpoint_security"] as? [String: Any]
+           let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         {
-            protectedPaths += endpoint["protected_paths"] as? [String] ?? []
-            blockedExecutables = endpoint["blocked_executables"] as? [String] ?? []
-            maxAuthorizationLatencyMS = (endpoint["max_auth_latency_ms"] as? NSNumber)?.uint64Value ?? 10
+            if let endpoint = document["endpoint_security"] as? [String: Any] {
+                protectedPaths += endpoint["protected_paths"] as? [String] ?? []
+                blockedExecutables = endpoint["blocked_executables"] as? [String] ?? []
+                maxAuthorizationLatencyMS = (endpoint["max_auth_latency_ms"] as? NSNumber)?.uint64Value ?? 10
+            }
+            if let cowork = document["cowork_endpoint_visibility"] as? [String: Any] {
+                coworkEndpointVisibilityEnabled = (cowork["enabled"] as? NSNumber)?.boolValue ?? false
+                let configuredMode = cowork["session_mode"] as? String ?? "unknown"
+                if ["local", "cloud", "unknown"].contains(configuredMode) {
+                    coworkSessionMode = configuredMode
+                }
+            }
         }
         let enabledHarnesses = Set(integrations.lazy.filter(\.configured).map(\.id))
         let sessions = hasLoadedEndpointSessionRecords
             ? endpointSessionRecords
             : snapshot.jsonSessions
-        let roots = sessions
+        var roots = sessions
             .filter {
                 $0.isActive
                     && $0.rootPID != 0
                     && EndpointSessionScope.isEnabled($0, enabledHarnesses: enabledHarnesses)
             }
             .map { ["pid": $0.rootPID, "session_id": $0.sessionID] as [String: Any] }
+        if coworkEndpointVisibilityEnabled {
+            roots += NSWorkspace.shared.runningApplications.flatMap { application -> [[String: Any]] in
+                guard application.bundleIdentifier == "com.anthropic.claudefordesktop",
+                      application.processIdentifier > 0
+                else { return [] }
+                let rootPID = application.processIdentifier
+                let sessionID = "cowork-desktop-\(rootPID)"
+                let processIdentifiers = [NSNumber(value: rootPID)]
+                    + GenseeDescendantProcessIdentifiers(rootPID)
+                return processIdentifiers.map { processIdentifier in
+                    [
+                        "pid": processIdentifier.uint32Value,
+                        "session_id": sessionID,
+                        "kind": "claude-cowork",
+                        "cowork_session_mode": coworkSessionMode,
+                    ] as [String: Any]
+                }
+            }
+        }
         endpointSensor.updateConfiguration(
             mode: policy.endpointSecurityMode,
             protectedPaths: Array(Set(protectedPaths)).sorted(),
