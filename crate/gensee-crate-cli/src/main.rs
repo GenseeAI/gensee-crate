@@ -4032,7 +4032,7 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
         "hook_bypass_file_mutation".into(),
     ];
     let version = format!(
-        "historical-routine-v4:{:x}",
+        "historical-routine-v5:{:x}",
         Sha256::digest(
             format!(
                 "{}:{}",
@@ -4064,14 +4064,22 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
                 == policy.document().categories.write_outside_workspace.rule_id
                 || rule == "hook_bypass_file_mutation")
                 && matches!(operation, "" | "write" | "create" | "mutation");
-            let regular_scratch_delete = (rule == policy.document().categories.destructive.rule_id
+            let scratch_delete = (rule == policy.document().categories.destructive.rule_id
                 || rule == "hook_bypass_file_mutation")
                 && operation == "delete"
                 && gensee_crate_core::recorded_scratch_path(path).is_some()
                 && e.pointer("/file/mode")
                     .and_then(Value::as_u64)
-                    .is_some_and(|m| m & 0o170000 == 0o100000);
-            ((ordinary_write || regular_scratch_delete)
+                    .is_some_and(|m| {
+                        m & 0o170000 == 0o100000
+                            // Recorded unlink of an ordinary scratch directory is
+                            // cleanup too. Child-file findings remain independently
+                            // classified; this never grants recursive-delete access.
+                            || (m & 0o170000 == 0o040000
+                                && e["event_type"] == "unlink"
+                                && matches!(e["action"].as_str(), Some("notify" | "auth")))
+                    });
+            ((ordinary_write || scratch_delete)
                 && policy.is_routine_recorded_write(rule, path, workspace))
                 || housekeeping::is_routine(&policy, rule, path, &e)
         },

@@ -352,6 +352,51 @@ mod tests {
     }
 
     #[test]
+    fn scratch_directory_unlinks_are_quiet_without_hiding_protected_or_unknown_effects() {
+        let dir =
+            env::temp_dir().join(format!("gensee-directory-cleanup-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        for (index, path, operation, mode, action, result) in [
+            (
+                0,
+                "/private/tmp/claude-502/scratchpad/wt/target/debug/build/serde/out",
+                "delete",
+                0o040755,
+                "auth",
+                "allow",
+            ),
+            (1, "/tmp/task/build", "delete", 0o040755, "notify", "allow"),
+            (2, "/tmp/task/.ssh", "delete", 0o040700, "notify", "allow"),
+            (3, "/repo/src", "delete", 0o040755, "notify", "allow"),
+            (4, "/tmp/task/link", "delete", 0o120755, "notify", "allow"),
+            (5, "/tmp/task/blocked", "delete", 0o040755, "auth", "deny"),
+            (6, "/tmp/task/unknown", "delete", 0, "notify", "allow"),
+            (7, "/tmp/task/moved", "rename", 0o040755, "notify", "allow"),
+            (8, "/tmp/task/unspecified", "delete", 0o040755, "", "allow"),
+        ] {
+            let mut a = alert("high", if result == "deny" { "block" } else { "warn" });
+            a.rule_id = "policy_destructive_file_operation".into();
+            a.path = Some(path.into());
+            a.evidence = Some(
+                json!({"logical_operation":operation,"event_type":if operation == "delete" {"unlink"} else {"rename"},
+                "action":action,"decision":{"result":result},"file":{"path":path,"mode":mode}}),
+            );
+            record_endpoint_policy_alert(&store, a, &format!("directory-{index}"), 10_000).unwrap();
+        }
+        let before = store.verify_alert_chain().unwrap();
+        configure_dashboard_noise_filter(&store).unwrap();
+        assert_eq!(
+            store.dashboard_state().unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 9);
+        assert_eq!(store.verify_alert_chain().unwrap(), before);
+    }
+
+    #[test]
     fn historical_housekeeping_filter_preserves_actor_source_and_block_boundaries() {
         let dir = env::temp_dir().join(format!(
             "gensee-housekeeping-dashboard-{}",

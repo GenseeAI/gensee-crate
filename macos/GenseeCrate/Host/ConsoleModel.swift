@@ -937,21 +937,16 @@ final class ConsoleModel: ObservableObject {
         } catch { approvalMemoryIssue = error.localizedDescription }
     }
 
-    func previewApproval(_ alert: SecurityAlert) async -> RememberedApproval? {
-        guard !isDemoMode, backendAvailable else { return nil }
-        do {
-            return try await cli.decode(RememberedApproval.self, arguments: ["approval", "preview", "--alert-id", String(alert.alertID)])
-        } catch { errorMessage = error.localizedDescription; return nil }
+    func previewApproval(_ alert: SecurityAlert) async throws -> RememberedApproval {
+        guard !isDemoMode, backendAvailable else { throw CocoaError(.featureUnsupported) }
+        return try await cli.decode(RememberedApproval.self, arguments: ["approval", "preview", "--alert-id", String(alert.alertID)])
     }
 
-    func rememberApproval(_ alert: SecurityAlert, preview: RememberedApproval, scope: String) async -> Bool {
-        guard !isDemoMode, backendAvailable else { return false }
-        do {
-            _ = try await cli.run(["approval", "grant", "--alert-id", String(alert.alertID), "--scope", scope, "--expected-key", preview.key])
-            noticeMessage = "Approval saved for future matching actions. Retry the action in your harness."
-            await refreshRememberedApprovals()
-            return true
-        } catch { errorMessage = error.localizedDescription; return false }
+    func rememberApproval(_ alert: SecurityAlert, preview: RememberedApproval, scope: String) async throws {
+        guard !isDemoMode, backendAvailable else { throw CocoaError(.featureUnsupported) }
+        _ = try await cli.run(["approval", "grant", "--alert-id", String(alert.alertID), "--scope", scope, "--expected-key", preview.key])
+        noticeMessage = "Approval saved for future matching actions. Retry the action in your harness."
+        await refreshRememberedApprovals()
     }
 
     func revokeApproval(_ id: String) async {
@@ -1921,7 +1916,7 @@ final class ConsoleModel: ObservableObject {
             }
             .map { ["pid": $0.rootPID, "session_id": $0.sessionID] as [String: Any] }
         if coworkEndpointVisibilityEnabled {
-            roots += NSWorkspace.shared.runningApplications.flatMap { application -> [[String: Any]] in
+            let coworkRoots = NSWorkspace.shared.runningApplications.flatMap { application -> [[String: Any]] in
                 guard application.bundleIdentifier == "com.anthropic.claudefordesktop",
                       application.processIdentifier > 0
                 else { return [] }
@@ -1939,6 +1934,7 @@ final class ConsoleModel: ObservableObject {
                     ] as [String: Any]
                 }
             }
+            roots = EndpointSessionScope.mergingRoots(roots, cowork: coworkRoots)
         }
         endpointSensor.updateConfiguration(
             mode: policy.endpointSecurityMode,

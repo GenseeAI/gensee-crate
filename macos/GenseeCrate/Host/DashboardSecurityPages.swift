@@ -251,6 +251,7 @@ private struct FindingReviewControl: View {
     let alert: SecurityAlert
     @ObservedObject var model: ConsoleModel
     @State private var approvalPreview: RememberedApproval?
+    @State private var showExactApproval = false
     @State private var savingApproval = false
     @State private var approvalIssue: String?
     @State private var showReadException = false
@@ -270,7 +271,9 @@ private struct FindingReviewControl: View {
             if alert.action.lowercased() == "ask" {
                 Divider()
                 Button("Approve this exact action…") {
-                    Task { approvalIssue = nil; approvalPreview = await model.previewApproval(alert) }
+                    approvalIssue = nil
+                    approvalPreview = nil
+                    showExactApproval = true
                 }
             }
         } label: {
@@ -285,26 +288,41 @@ private struct FindingReviewControl: View {
         .controlSize(.small)
         .fixedSize()
         .disabled(model.feedbackAlertID != nil)
-        .sheet(item: $approvalPreview) { preview in
+        .sheet(isPresented: $showExactApproval) {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Approve matching actions").font(.headline)
-                Text("\(preview.provider) · \(preview.rule)").font(.caption).foregroundStyle(.secondary)
-                Text(preview.path).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
-                Text("Project: \(preview.project)").font(.caption)
-                if let input = preview.tool_input_preview {
-                    ScrollView { Text(input).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 120)
+                Text("Approve this exact action").font(.headline)
+                if let preview = approvalPreview {
+                    Text("\(preview.provider) · \(preview.rule)").font(.caption).foregroundStyle(.secondary)
+                    Text(preview.path).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                    Text("Project: \(preview.project)").font(.caption)
+                    if let input = preview.tool_input_preview {
+                        ScrollView { Text(input).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 120)
+                    }
+                    if let issue = approvalIssue { Text(issue).font(.caption).foregroundStyle(.red) }
+                    Text("Applies to this target and tool input. Executable and credential-read approvals require the content inspected for this alert to remain unchanged. This does not execute a historical action; retry it in your harness.").font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("Cancel") { showExactApproval = false }
+                        Spacer()
+                        Button("Allow once") { saveApproval(preview, scope: "once") }
+                        Button("This session") { saveApproval(preview, scope: "session") }
+                        Button("This project") { saveApproval(preview, scope: "project") }
+                    }
+                    Text("One-use and session approvals expire within 24 hours. Project approvals expire in 30 days. Revoke them in Settings.").font(.caption2).foregroundStyle(.secondary)
+                } else if let issue = approvalIssue {
+                    Text("This action cannot be remembered").font(.subheadline)
+                    Text(issue).font(.callout).textSelection(.enabled)
+                    Text("Retry the action in Claude to get a fresh approval. For a credential-read finding, you can instead use Always allow matching reads from the finding menu to explicitly choose a file or folder.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Close") { showExactApproval = false }
+                } else {
+                    ProgressView("Checking recorded action…")
+                    Button("Cancel") { showExactApproval = false }
                 }
-                if let issue = approvalIssue { Text(issue).font(.caption).foregroundStyle(.red) }
-                Text("Applies to this target and tool input. Executable and credential-read approvals require the content inspected for this alert to remain unchanged. This does not execute a historical action; retry it in your harness.").font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Button("Cancel") { approvalPreview = nil }
-                    Spacer()
-                    Button("Allow once") { saveApproval(preview, scope: "once") }
-                    Button("This session") { saveApproval(preview, scope: "session") }
-                    Button("This project") { saveApproval(preview, scope: "project") }
-                }
-                Text("One-use and session approvals expire within 24 hours. Project approvals expire in 30 days. Revoke them in Settings.").font(.caption2).foregroundStyle(.secondary)
             }.padding(24).frame(width: 600).disabled(savingApproval)
+                .task {
+                    do { approvalPreview = try await model.previewApproval(alert) }
+                    catch { approvalIssue = GenseeCLIError.userFacingApprovalMessage(error) }
+                }
         }
         .sheet(isPresented: $showReadException) {
             ScopedReadExceptionSheet(alert: alert, model: model)
@@ -316,8 +334,10 @@ private struct FindingReviewControl: View {
         guard !savingApproval else { return }
         savingApproval = true
         Task {
-            if await model.rememberApproval(alert, preview: preview, scope: scope) { approvalPreview = nil }
-            else { approvalIssue = model.errorMessage }
+            do {
+                try await model.rememberApproval(alert, preview: preview, scope: scope)
+                showExactApproval = false
+            } catch { approvalIssue = GenseeCLIError.userFacingApprovalMessage(error) }
             savingApproval = false
         }
     }
@@ -364,7 +384,7 @@ private struct ScopedReadExceptionSheet: View {
                         busy = true
                         Task {
                             do { try await model.saveReadException(alert, preview: preview); dismiss() }
-                            catch { issue = error.localizedDescription }
+                            catch { issue = GenseeCLIError.userFacingApprovalMessage(error) }
                             busy = false
                         }
                     }
@@ -373,7 +393,7 @@ private struct ScopedReadExceptionSheet: View {
                         busy = true
                         Task {
                             do { preview = try await model.previewReadException(alert, path: path, readScope: readScope); issue = nil }
-                            catch { issue = error.localizedDescription }
+                            catch { issue = GenseeCLIError.userFacingApprovalMessage(error) }
                             busy = false
                         }
                     }
@@ -416,6 +436,10 @@ private struct AlertMetadata: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if alert.ruleID == "policy_credential_content_read" {
+                Text("A credential-like pattern matched file content. This does not verify that a credential is real or active. Source code and test data can match; report those as false positives.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Label("Alert evidence", systemImage: "list.bullet.rectangle")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)

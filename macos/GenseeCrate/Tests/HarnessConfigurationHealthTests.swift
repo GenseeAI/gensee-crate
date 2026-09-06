@@ -32,6 +32,21 @@ final class HarnessConfigurationHealthTests: XCTestCase {
         XCTAssertEqual(status.lastEvent(source: "macos-endpoint-security"), Date(timeIntervalSince1970: 2))
     }
 
+    func testCurrentCoworkRootsReplaceConflictingHistoricalHookPIDs() {
+        let sessions: [[String: Any]] = [
+            ["pid": UInt32(42), "session_id": "old-hook"],
+            ["pid": UInt32(43), "session_id": "other-old-hook"],
+            ["pid": UInt32(99), "session_id": "standalone-code"]
+        ]
+        let cowork: [[String: Any]] = [42, 43].map {
+            ["pid": UInt32($0), "session_id": "cowork-desktop-42", "root_pid": UInt32(42)]
+        }
+        let merged = EndpointSessionScope.mergingRoots(sessions, cowork: cowork)
+        XCTAssertEqual(merged.count, 3)
+        XCTAssertEqual(merged.compactMap { $0["session_id"] as? String }, ["standalone-code", "cowork-desktop-42", "cowork-desktop-42"])
+        XCTAssertEqual(EndpointSessionScope.mergingRoots(sessions, cowork: []).count, 3)
+    }
+
     func testEndpointRootsHonorHarnessToggleForHookSessions() {
         let codex = AgentSessionRecord(
             sessionID: "codex-session",

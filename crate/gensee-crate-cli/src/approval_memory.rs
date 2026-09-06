@@ -51,6 +51,44 @@ fn eligible(rule: &str) -> bool {
     )
 }
 
+// Inspect shell syntax before tokenization removes quote information. Quoted
+// search patterns such as "reconnect()" are literals, not command substitution.
+fn static_shell_command(command: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    for c in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote == Some('\'') {
+            if c == '\'' {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(c, '$' | '`') {
+            return false;
+        }
+        if quote == Some('"') {
+            if c == '"' {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '\n' | '(' | ')' => return false,
+            _ => {}
+        }
+    }
+    quote.is_none() && !escaped
+}
+
 fn context(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<Approval> {
     if !eligible(rule) || !is_supported_provider(&event.provider) {
         return Err(io::Error::other(
@@ -67,7 +105,7 @@ fn context(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<Approva
         .as_deref()
         .ok_or_else(|| io::Error::other("No captured working directory."))?;
     let command = event.tool_input_command.as_deref().unwrap_or("");
-    if command.contains(['$', '`', '\n', '(', ')']) {
+    if !static_shell_command(command) {
         return Err(io::Error::other(
             "Dynamic shell commands require a fresh approval.",
         ));
@@ -160,7 +198,7 @@ fn read_target(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<Rea
         ));
     }
     let command = event.tool_input_command.as_deref().unwrap_or("");
-    if command.contains(['$', '`', '\n', '(', ')']) {
+    if !static_shell_command(command) {
         return Err(io::Error::other(
             "Dynamic commands require a fresh approval.",
         ));
@@ -169,19 +207,29 @@ fn read_target(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<Rea
         .cwd
         .as_deref()
         .ok_or_else(|| io::Error::other("Missing project."))?;
-    let project = fs::canonicalize(leading_bash_effective_cwd(command, cwd))?;
-    let path = fs::canonicalize(path)?;
-    if project.parent().is_none() || !path.is_file() {
+    // Explicit read exceptions apply to future content. A temporary file (or
+    // worktree) may already be gone; resolve existing ancestors without treating
+    // dangling symlinks or inaccessible paths as ordinary missing leaves.
+    let project =
+        gensee_crate_core::resolve_concrete_path(&leading_bash_effective_cwd(command, cwd))
+            .ok_or_else(|| io::Error::other("The recorded project cannot be resolved safely."))?;
+    let path = gensee_crate_core::resolve_concrete_path(path)
+        .ok_or_else(|| io::Error::other("The recorded file cannot be resolved safely."))?;
+    let ordinary_file = match fs::metadata(&path) {
+        Ok(metadata) => metadata.is_file(),
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
+    };
+    if project.parent().is_none() || !ordinary_file {
         return Err(io::Error::other(
             "Read exceptions require a concrete file and project.",
         ));
     }
     let intents = file_intents_from_hook(event, event.tool_input_command.as_deref());
     let subjects = policy_subjects(event, &intents);
-    if !subjects
-        .iter()
-        .any(|s| s.operation == "read" && fs::canonicalize(&s.path).ok().as_ref() == Some(&path))
-    {
+    if !subjects.iter().any(|s| {
+        s.operation == "read"
+            && gensee_crate_core::resolve_concrete_path(&s.path).as_ref() == Some(&path)
+    }) {
         return Err(io::Error::other(
             "The original call does not establish a read of this file.",
         ));
@@ -205,7 +253,8 @@ fn read_exception(
         captured["rule"].as_str().unwrap_or(""),
         captured["path"].as_str().unwrap_or(""),
     )?;
-    let path = fs::canonicalize(requested_path)?;
+    let path = gensee_crate_core::resolve_concrete_path(requested_path)
+        .ok_or_else(|| io::Error::other("The exception path cannot be resolved safely."))?;
     let home = env::var("HOME").ok().and_then(|p| fs::canonicalize(p).ok());
     let valid = match scope {
         "file" => path == target.path,
@@ -644,6 +693,32 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
+    #[test]
+    fn static_commands_distinguish_literal_search_patterns_from_expansion() {
+        for command in [
+            r#"grep -rn "health.error\|reconnect()" Host/*.swift | head"#,
+            r#"grep '$HOME `literal` ()' file"#,
+            r#"grep "escaped \$HOME" file"#,
+            r#"sed -n 1140,1175p file; echo ---; grep updateConfiguration Host/*.swift"#,
+        ] {
+            assert!(static_shell_command(command), "{command}");
+        }
+        for command in [
+            "cat $(get-path)",
+            "cat `get-path`",
+            "(cat file)",
+            "cat $FILE",
+            r#"cat "$(get-path)""#,
+            r#"cat "$FILE""#,
+            "cat file\ncat other",
+            "cat 'unclosed",
+            "cat trailing\\",
+            r#"cat "\\$FILE""#,
+        ] {
+            assert!(!static_shell_command(command), "{command}");
+        }
+    }
+
     fn fixture() -> (EventStore, PathBuf, AgentHookEvent, PolicyFinding) {
         let root = env::temp_dir().join(format!("approval-regression-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("project");
@@ -717,6 +792,52 @@ mod tests {
         })
         .unwrap();
         (store, workspace, event, finding, approval)
+    }
+
+    #[test]
+    fn scoped_read_accepts_quoted_search_parentheses_but_rejects_substitution() {
+        let (_store, workspace, _, finding, _) = read_fixture();
+        for (command, accepted) in [
+            (
+                r#"sed -n 1,3p run.py; echo ---; grep -rn "health.error\|reconnect()" run.py | head"#,
+                true,
+            ),
+            (r#"cat "$(echo run.py)""#, false),
+        ] {
+            let event = build_unattributed_hook_event(
+                &json!({"session_id":"session-a","cwd":workspace,
+                "hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":command}})
+                .to_string(),
+                "claude-code",
+            )
+            .unwrap();
+            assert_eq!(
+                read_target(&event, SCOPED_READ_RULE, finding.path.as_deref().unwrap()).is_ok(),
+                accepted
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_read_exception_can_target_cleaned_up_scratch_file_but_not_dangling_link() {
+        let (_store, workspace, event, finding, _) = read_fixture();
+        let path = finding.path.as_deref().unwrap();
+        fs::remove_file(path).unwrap();
+        let captured = json!({"rule":SCOPED_READ_RULE,"path":path});
+        assert!(read_exception(&event, &captured, "file", path, 10).is_ok());
+        assert!(read_exception(
+            &event,
+            &captured,
+            "directory",
+            workspace.to_str().unwrap(),
+            10
+        )
+        .is_ok());
+        symlink(workspace.join("absent-secret"), path).unwrap();
+        assert!(read_exception(&event, &captured, "file", path, 10).is_err());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(&workspace).unwrap();
+        assert!(read_exception(&event, &captured, "file", path, 10).is_ok());
     }
 
     #[test]

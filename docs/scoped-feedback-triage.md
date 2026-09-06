@@ -83,3 +83,24 @@ expiry/revocation, concurrent updates, old override migration, immutable evidenc
 and replay against labeled benign and malicious cases. Evaluate the credential
 content detector separately: a Swift declaration or template is not proof that a
 file contains a live credential; report “possible credentials” unless validated.
+
+## Historical findings and approval previews
+
+A quoted search pattern such as `"reconnect()"` is static shell input. Approval
+previews distinguish it from substitution, backticks and unquoted subshells; those
+continue to require a fresh approval. Preview failures remain in the approval
+sheet with recovery guidance instead of opening a generic application error.
+
+An explicit read exception can refer to a cleaned-up temporary file or project.
+Existing ancestors must resolve safely; dangling links, inaccessible paths, root
+grants and unrelated targets remain invalid. Folder exceptions require an existing
+containing folder. The preview still binds provider, project, read operation and
+credential-content rule. This does not relax the original-content requirement for
+exact approvals or grant permission for other operations.
+
+Historical credential findings retain their recorded evidence but display “possible
+credentials,” because a pattern match does not establish that a credential is live.
+Routine Endpoint Security unlink records for ordinary scratch directories, as well
+as files, are excluded from warning projections. Protected paths, denied actions,
+symlinks, unknown types and directory renames remain visible; raw records and child
+findings remain intact. This presentation filter never authorizes deletion.

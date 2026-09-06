@@ -176,6 +176,16 @@ struct AgentSessionRecord: Decodable, Identifiable {
 }
 
 enum EndpointSessionScope {
+    // A current desktop process tree takes precedence over historical hook PID
+    // claims. Never send conflicting claims: the sensor rejects that Cowork scope.
+    static func mergingRoots(_ sessions: [[String: Any]], cowork: [[String: Any]]) -> [[String: Any]] {
+        let coworkPIDs = Set(cowork.compactMap { ($0["pid"] as? NSNumber)?.uint32Value })
+        return sessions.filter { root in
+            guard let pid = (root["pid"] as? NSNumber)?.uint32Value else { return false }
+            return !coworkPIDs.contains(pid)
+        } + cowork
+    }
+
     static func isEnabled(
         _ session: AgentSessionRecord,
         enabledHarnesses: Set<String>
@@ -301,6 +311,9 @@ struct SecurityAlert: Decodable, Identifiable {
     }
 
     var findingSummary: String {
+        if ruleID == "policy_credential_content_read" {
+            return path.map { "Possible credentials in read file: \($0)" } ?? "Possible credentials in read file"
+        }
         guard ruleID == "policy_destructive_file_operation", let evidence,
               let data = evidence.data(using: .utf8),
               let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
