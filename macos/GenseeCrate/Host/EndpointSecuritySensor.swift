@@ -343,6 +343,11 @@ final class EndpointSecuritySensor: ObservableObject {
         }
         health.running = (dictionary["running"] as? Bool) ?? false
         health.mode = (dictionary["mode"] as? String) ?? "observe"
+        health.receivedMessages = number(dictionary["received_messages"])
+        health.maxCallbackLatencyUS = number(dictionary["max_callback_latency_us"])
+        health.pendingEvidence = number(dictionary["pending_evidence"])
+        health.maxPendingEvidence = number(dictionary["max_pending_evidence"])
+        health.maxQueueDelayUS = number(dictionary["max_queue_delay_us"])
         health.totalEvents = number(dictionary["total_events"])
         health.bufferedEvents = number(dictionary["buffered_events"])
         let effectiveCursor = didRewind ? cursor : fetchedThroughCursor

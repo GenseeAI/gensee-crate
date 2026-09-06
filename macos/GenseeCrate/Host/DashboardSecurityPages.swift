@@ -270,7 +270,7 @@ private struct FindingReviewControl: View {
                 }
                 Divider()
             }
-            Menu("Set future severity") {
+            Menu("Set rule-wide severity") {
                 ForEach(severities, id: \.self) { severity in
                     Button {
                         requestTune(severity: severity)
@@ -283,7 +283,7 @@ private struct FindingReviewControl: View {
                     }
                 }
             }
-            Menu("Set future action") {
+            Menu("Set rule-wide action") {
                 ForEach(actions, id: \.self) { action in
                     Button {
                         requestTune(action: action)
@@ -300,7 +300,7 @@ private struct FindingReviewControl: View {
             if model.feedbackAlertID == alert.alertID {
                 ProgressView().controlSize(.small)
             } else {
-                Label(currentOverride == nil ? "Review" : "Tuned", systemImage: "slider.horizontal.3")
+                Label(currentOverride == nil ? "Review" : "Rule override", systemImage: "slider.horizontal.3")
                     .font(.system(size: 12, weight: .medium))
             }
         }

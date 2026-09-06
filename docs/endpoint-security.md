@@ -45,7 +45,7 @@ gensee policy set endpoint_security.mode observe
 ```
 
 - `off` — respond allow to authorization messages and omit telemetry.
-- `observe` — record auth/notify evidence; never deny (default).
+- `observe` — record notification evidence for completed operations; answer authorization callbacks promptly without ancestry/path evaluation or duplicate authorization telemetry; never deny (default).
 - `protect` — deny configured protected-path and blocked-executable operations
   inside explicitly managed agent process trees.
 - `strict` — the managed-tree fail-closed posture. Unrelated host processes
@@ -106,3 +106,20 @@ Gensee database or other host files.
 
 `endpoint-spike` and `gensee ingest eslogger` remain available only as manual
 diagnostic compatibility tools.
+
+## Throughput diagnostics
+
+Sequence accounting runs synchronously in the serial ES callback before filtering.
+It never dispatches a ring-queue task for unrelated system-wide traffic. Observe/off
+skip authorization ancestry and path evaluation; protect/strict retain authorization
+decisions and notification evidence. Each callback has a bounded-lifetime autorelease
+pool. No system-wide file-event muting is used, so newly adopted process generations
+remain discoverable.
+
+Settings exposes messages received, maximum callback time, current/peak pending
+evidence, and maximum evidence-queue delay alongside kernel/ring loss and host-ingest
+latency. These maxima cover this sensor lifetime, not only the latest sampling interval.
+They distinguish callback pressure, ring-queue pressure, and host ingestion backlog;
+they cannot reconstruct the cause of an older gap. Full Disk Access fixes client
+startup permission, not throughput. Error 4 from `es_new_client` means TCC still
+rejects the extension even when it is listed as activated.

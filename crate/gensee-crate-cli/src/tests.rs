@@ -4628,6 +4628,11 @@ fn credential_content_scanner_flags_secrets_not_templates() {
     assert!(content_has_credentials("api_key=changeme\n").is_none()); // < 8 + placeholder
     assert!(content_has_credentials("# set your password in the dashboard\n").is_none());
     assert!(content_has_credentials("let password = read_input();\n").is_none());
+    assert!(content_has_credentials(
+        r#"if let secret = document["secret_paths"] as? [String: Any] {"#
+    )
+    .is_none());
+    assert!(content_has_credentials(r#"token = credentials["token"]"#).is_none());
     // source ref
 }
 

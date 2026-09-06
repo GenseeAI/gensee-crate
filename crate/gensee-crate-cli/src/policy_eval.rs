@@ -1970,7 +1970,7 @@ fn looks_like_secret_value(raw: &str) -> bool {
     }
     // Code / markup syntax -> a source reference, not a literal secret
     // (e.g. `password = read_input();`).
-    if v.contains(['(', ')', ';', '{', '}', '<', '>']) {
+    if v.contains(['(', ')', ';', '{', '}', '<', '>', '[', ']']) {
         return false;
     }
     let lower = v.to_ascii_lowercase();
@@ -2039,7 +2039,7 @@ pub(crate) fn credential_content_findings(subjects: &[PolicySubject]) -> Vec<Pol
                 action: PolicyAction::Ask,
                 severity: "medium".to_string(),
                 rule_id: "policy_credential_content_read".to_string(),
-                message: format!("Read of file containing live credentials: {}", subject.path),
+                message: format!("Read of file containing possible credentials: {}", subject.path),
                 path: Some(subject.path.clone()),
                 evidence: json!({
                     "source": "credential_content",

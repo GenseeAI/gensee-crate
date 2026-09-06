@@ -4,6 +4,11 @@ struct EndpointSensorHealth: Equatable {
     var connected = false
     var running = false
     var mode = "observe"
+    var receivedMessages: UInt64 = 0
+    var maxCallbackLatencyUS: UInt64 = 0
+    var pendingEvidence: UInt64 = 0
+    var maxPendingEvidence: UInt64 = 0
+    var maxQueueDelayUS: UInt64 = 0
     var totalEvents: UInt64 = 0
     var bufferedEvents: UInt64 = 0
     var backlogEvents: UInt64 = 0
@@ -39,7 +44,7 @@ struct EndpointSensorHealth: Equatable {
     var hasDataLoss: Bool {
         kernelDrops > 0 || ringDrops > 0 || rejectedEvents > 0 || launchContinuityIssue != nil
     }
-    var hasBackpressure: Bool { backlogEvents >= 1_000 || lastBatchDurationMS >= 1_000 }
+    var hasBackpressure: Bool { backlogEvents >= 1_000 || pendingEvidence >= 1_000 || lastBatchDurationMS >= 1_000 }
     var exceedsAuthorizationLatencyBudget: Bool {
         maxAuthorizationLatencyUS > configuredMaxAuthorizationLatencyUS
     }

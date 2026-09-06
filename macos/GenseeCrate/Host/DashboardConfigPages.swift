@@ -157,7 +157,7 @@ private struct PolicySettingsView: View {
             if !reviewOverrides.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        Text("Tuned rules")
+                        Text("Rule-wide overrides")
                             .font(.system(size: 13, weight: .semibold))
                         Text("\(reviewOverrides.count)")
                             .font(.system(size: 10, weight: .semibold))
@@ -1146,6 +1146,12 @@ struct DashboardSettingsPage: View {
                 Label("Authorization latency exceeded the configured budget", systemImage: "exclamationmark.triangle")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Color.dashboardGold)
+            }
+            DisclosureGroup("Sensor throughput diagnostics") {
+                settingsLine("Messages received", sensor.health.receivedMessages.formatted())
+                settingsLine("Max callback time", "\(sensor.health.maxCallbackLatencyUS) µs")
+                settingsLine("Evidence waiting / peak", "\(sensor.health.pendingEvidence) / \(sensor.health.maxPendingEvidence)")
+                settingsLine("Max evidence queue delay", "\(sensor.health.maxQueueDelayUS) µs")
             }
             settingsLine("Managed processes", sensor.health.managedProcesses.formatted())
             if let sensorMessage = endpointSensorMessage {

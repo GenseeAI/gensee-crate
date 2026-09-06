@@ -222,9 +222,36 @@ static void TestRevocationPreservesLoss(void)
     }
 }
 
+// Sequence accounting must stay independent of a stalled evidence consumer.
+static void TestSequenceAccountingDoesNotQueueSystemWideWork(void)
+{
+    GenseeSensorService *service = [[GenseeSensorService alloc] init];
+    dispatch_semaphore_t release = dispatch_semaphore_create(0);
+    dispatch_async(service.queue, ^{ dispatch_semaphore_wait(release, DISPATCH_TIME_FOREVER); });
+    es_message_t message = {0};
+    message.version = 4;
+    for (uint64_t sequence = 1; sequence <= 100000; sequence++) {
+        message.global_seq_num = sequence;
+        [service observeGlobalSequence:&message];
+    }
+    message.global_seq_num = 100006;
+    [service observeGlobalSequence:&message];
+    NSCAssert(service.receivedMessages == 100001, @"all messages counted synchronously");
+    NSCAssert(service.lastGlobalSequence == 100006 && service.kernelDrops == 5, @"exact kernel loss while evidence queue is blocked");
+    NSCAssert(service.pendingEvidence == 0, @"sequence accounting enqueues no evidence");
+    dispatch_semaphore_signal(release);
+    dispatch_sync(service.queue, ^{
+        [service appendEventLocked:@{}];
+        NSCAssert([service.events.lastObject[@"dropped_events"] unsignedLongLongValue] == 5, @"loss survives into evidence");
+        [service appendEventLocked:@{}];
+        NSCAssert([service.events.lastObject[@"dropped_events"] unsignedLongLongValue] == 0, @"no duplicate loss");
+    });
+}
+
 int main(int argc, const char *argv[])
 {
     @autoreleasepool {
+        TestSequenceAccountingDoesNotQueueSystemWideWork();
         TestInvalidConfigurationPreservesScopeAndEvidence();
         TestUnidentifiedEntriesDoNotFreezeOtherSessions();
         TestReassignedPIDsTakePrecedenceOverRestoration();
