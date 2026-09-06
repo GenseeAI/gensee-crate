@@ -284,7 +284,7 @@ struct SecurityAlert: Decodable, Identifiable {
         switch action.lowercased() {
         case "block", "deny": return "Blocked"
         case "ask": return "Approval requested"
-        case "warn": return "Review"
+        case "warn": return "Warning"
         default: return "Allowed"
         }
     }

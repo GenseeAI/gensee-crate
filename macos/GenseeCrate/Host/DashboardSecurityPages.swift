@@ -23,7 +23,7 @@ struct DashboardAlertsPage: View {
             VStack(alignment: .leading, spacing: 16) {
                 DashboardPageHeader("Alerts", description: "Policy decisions and risk findings across all sessions.") {
                     HStack(spacing: 8) {
-                        Picker("Status", selection: $action) { ForEach(["All", "Allowed", "Review", "Approval requested", "Blocked"], id: \.self, content: Text.init) }.frame(width: 180)
+                        Picker("Status", selection: $action) { ForEach(["All", "Allowed", "Warning", "Approval requested", "Blocked"], id: \.self, content: Text.init) }.frame(width: 180)
                         Button { model.markAllAlertsRead() } label: {
                             Label("Mark All as Read", systemImage: "checkmark.circle")
                                 .frame(minWidth: 116)
