@@ -8,6 +8,13 @@ on:
       - open-source-prep
 
 jobs:
+  cowork-endpoint-scope:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Cowork native adoption and attribution
+        run: scripts/test-cowork-endpoint-scope.sh
+
   security-traces:
     runs-on: ubuntu-latest
     steps:
@@ -37,6 +44,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test workspace
         run: cargo test --workspace
+      - name: Test sensor-gap ingestion across restarts
+        run: |
+          cargo build -p gensee-crate-cli
+          python3 scripts/test-endpoint-ingest-gaps.py
 
   generic-boundary-proof:
     runs-on: ubuntu-latest

@@ -222,6 +222,18 @@ function SystemEventsPanel({ sessionId }: { sessionId: string }) {
               {new Date(e.ts).toLocaleTimeString()}
             </Typography.Text>
             <Tag style={{ flexShrink: 0 }}>{e.type}</Tag>
+            {e.execution_origin && (
+              <Tag
+                color={
+                  e.execution_origin === 'host-native' ? 'green' :
+                  e.execution_origin === 'vm-mediated' ? 'gold' :
+                  e.execution_origin === 'cloud-mediated' ? 'blue' : undefined
+                }
+                style={{ flexShrink: 0 }}
+              >
+                {e.execution_origin}
+              </Tag>
+            )}
             {processName && (
               <Typography.Text
                 type="secondary"

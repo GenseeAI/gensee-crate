@@ -163,6 +163,15 @@
         "low_severity_retention_hours": { "type": ["integer", "null"], "minimum": 1, "maximum": 8760, "default": 48, "description": "Permanently delete info, low, and medium alerts after this many hours; null keeps them indefinitely." }
       }
     },
+    "cowork_endpoint_visibility": {
+      "type": "object",
+      "description": "Opt-in macOS management and origin labeling for the Claude Desktop Cowork process tree.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false, "description": "Register running Claude Desktop processes as managed Endpoint Security roots." },
+        "session_mode": { "type": "string", "enum": ["local", "cloud", "unknown"], "default": "unknown", "description": "Externally established Cowork mode. Unknown prevents Crate from guessing from the host helper identity." }
+      }
+    },
     "watch": {
       "type": "object",
       "description": "Sidecar watch defaults.",

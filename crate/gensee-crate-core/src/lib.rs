@@ -9,7 +9,9 @@ pub mod sessions;
 pub mod vscode;
 
 pub use apply_patch::{extract_apply_patch_input, parse_apply_patch_changes, ApplyPatchChange};
-pub use events::{AgentAttribution, AgentEvent, EventKind, SystemEvent, WorkspaceEffect};
+pub use events::{
+    AgentAttribution, AgentEvent, EventKind, ExecutionOrigin, SystemEvent, WorkspaceEffect,
+};
 pub use hooks::{AgentHookEvent, FileIntent, ProcessObservation};
 pub use mcp::{parse_mcp_file_intents, McpFileIntent};
 pub use path::{endpoint_security_path_is_known_build_output, normalize_agent_path};

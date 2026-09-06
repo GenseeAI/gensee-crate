@@ -7,6 +7,9 @@ final class ConsoleModel: ObservableObject {
     @Published private(set) var runs = RunListResponse()
     @Published private(set) var policy = PolicySummary()
     @Published private(set) var policyDocument = ""
+    @Published private(set) var coworkEvidence: CoworkEvidenceStatus?
+    @Published private(set) var coworkCheckedAt: Date?
+    @Published private(set) var coworkCheckIssue: String?
     @Published private(set) var integrations: [IntegrationDescriptor] = []
     @Published private(set) var dailyDetail: DailyDetail?
     @Published private(set) var dailyDetailLoadState = DailyDetailLoadState.idle
@@ -256,6 +259,7 @@ final class ConsoleModel: ObservableObject {
             }
             policy = next
             policyDocument = try await loadPolicyDocument()
+            refreshIntegrations()
             configureEndpointSensor()
         } catch {
             errorMessage = error.localizedDescription
@@ -997,6 +1001,25 @@ final class ConsoleModel: ObservableObject {
             return
         }
 
+        if provider == "claude-cowork" {
+            guard runningCommand == nil else { return }
+            runningCommand = "Updating Claude Cowork visibility"
+            defer { runningCommand = nil }
+            do {
+                _ = try await cli.run(["policy", "set", "cowork_endpoint_visibility.enabled", enabled ? "true" : "false"])
+                coworkEvidence = nil
+                coworkCheckedAt = nil
+                coworkCheckIssue = nil
+                await refreshPolicy()
+                noticeMessage = enabled
+                    ? "Cowork endpoint visibility enabled in \(policy.endpointSecurityMode) mode. Audit ingestion requires separate setup; use Verify for details."
+                    : "Cowork endpoint visibility disabled. Stop any manually started audit ingestion in its terminal separately."
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            return
+        }
+
         let previousValue = integration.configured
         let previousVerified = verifiedIntegrationIDs.contains(provider)
         let previousBaseline = harnessVerificationBaselines[provider]
@@ -1187,7 +1210,47 @@ final class ConsoleModel: ObservableObject {
 
     func refreshHarnesses() async {
         guard !isDemoMode else { return }
+        await refreshPolicy()
         await refreshIntegrationsWithCurrentBackend()
+    }
+
+    var coworkSessionMode: String {
+        coworkPolicy["session_mode"] as? String ?? "unknown"
+    }
+
+    private var coworkPolicy: [String: Any] {
+        guard let data = policyDocument.data(using: .utf8),
+              let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return [:] }
+        return document["cowork_endpoint_visibility"] as? [String: Any] ?? [:]
+    }
+
+    func verifyCowork() async {
+        guard !isDemoMode, backendAvailable, runningCommand == nil else { return }
+        let generation = dataSourceGeneration
+        runningCommand = "Checking Claude Cowork evidence"
+        defer { runningCommand = nil }
+        coworkEvidence = nil
+        coworkCheckedAt = nil
+        coworkCheckIssue = nil
+        await refreshPolicy()
+        do {
+            let evidence = try await cli.decode(CoworkEvidenceStatus.self, arguments: ["cowork-status"], timeout: 10)
+            guard acceptsLiveData(generation: generation) else { return }
+            coworkEvidence = evidence
+            coworkCheckedAt = Date()
+        } catch {
+            guard acceptsLiveData(generation: generation) else { return }
+            coworkCheckIssue = "Could not read Cowork evidence: \(error.localizedDescription)"
+        }
+    }
+
+    func setCoworkSessionMode(_ mode: String) async {
+        guard !isDemoMode, runningCommand == nil, ["local", "cloud", "unknown"].contains(mode) else { return }
+        coworkEvidence = nil
+        coworkCheckedAt = nil
+        coworkCheckIssue = nil
+        await setPolicy(key: "cowork_endpoint_visibility.session_mode", value: mode)
     }
 
     func enterDemoMode() {
@@ -1606,6 +1669,9 @@ final class ConsoleModel: ObservableObject {
             bundleIdentifiers: ["com.openai.codex"]
         ) || Self.executableInstalled(names: ["codex"])
         let claudeInstalled = Self.claudeCodeInstalled(home: home)
+        let coworkInstalled = Self.applicationInstalled(
+            names: ["Claude"], bundleIdentifiers: ["com.anthropic.claudefordesktop"]
+        )
         let cursorInstalled = Self.applicationInstalled(
             names: ["Cursor"],
             bundleIdentifiers: ["com.todesktop.230313mzl4w4u92"]
@@ -1627,6 +1693,11 @@ final class ConsoleModel: ObservableObject {
                 "claude-code", "Claude Code", "Prompt, tool, permission, and lifecycle policy hooks",
                 ".claude/settings.json", "terminal", claudeInstalled, true,
                 claudeInstalled ? "Claude Code is available on this Mac." : "The claude command was not found."
+            ),
+            (
+                "claude-cowork", "Claude Cowork", "Endpoint visibility for native tools and VM boundaries",
+                "", "desktopcomputer", coworkInstalled, false,
+                coworkInstalled ? "Claude Desktop is installed. Cowork availability depends on your Claude account." : "Install Claude Desktop to use Cowork on this Mac."
             ),
             (
                 "antigravity", "Antigravity", "Global pre-invocation and tool policy hooks",
@@ -1671,7 +1742,7 @@ final class ConsoleModel: ObservableObject {
                 id: provider,
                 name: name,
                 detail: detail,
-                configPath: path.path,
+                configPath: provider == "claude-cowork" ? policyURL.path : path.path,
                 symbolName: symbol,
                 installed: installed,
                 supportsDirectHooks: supportsDirectHooks,
@@ -1680,8 +1751,8 @@ final class ConsoleModel: ObservableObject {
                 configurationNote: inspection.note,
                 canRepair: inspection.canRepair,
                 configuredBackendPath: inspection.backendPath,
-                configured: inspection.configured,
-                verified: verifiedIntegrationIDs.contains(provider)
+                configured: provider == "claude-cowork" ? (coworkPolicy["enabled"] as? Bool ?? false) : inspection.configured,
+                verified: provider != "claude-cowork" && verifiedIntegrationIDs.contains(provider)
             )
         }
     }
@@ -1821,25 +1892,55 @@ final class ConsoleModel: ObservableObject {
         ]
         var blockedExecutables: [String] = []
         var maxAuthorizationLatencyMS: UInt64 = 10
+        var coworkEndpointVisibilityEnabled = false
+        var coworkSessionMode = "unknown"
         if let data = policyDocument.data(using: .utf8),
-           let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let endpoint = document["endpoint_security"] as? [String: Any]
+           let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         {
-            protectedPaths += endpoint["protected_paths"] as? [String] ?? []
-            blockedExecutables = endpoint["blocked_executables"] as? [String] ?? []
-            maxAuthorizationLatencyMS = (endpoint["max_auth_latency_ms"] as? NSNumber)?.uint64Value ?? 10
+            if let endpoint = document["endpoint_security"] as? [String: Any] {
+                protectedPaths += endpoint["protected_paths"] as? [String] ?? []
+                blockedExecutables = endpoint["blocked_executables"] as? [String] ?? []
+                maxAuthorizationLatencyMS = (endpoint["max_auth_latency_ms"] as? NSNumber)?.uint64Value ?? 10
+            }
+            if let cowork = document["cowork_endpoint_visibility"] as? [String: Any] {
+                coworkEndpointVisibilityEnabled = (cowork["enabled"] as? NSNumber)?.boolValue ?? false
+                let configuredMode = cowork["session_mode"] as? String ?? "unknown"
+                if ["local", "cloud", "unknown"].contains(configuredMode) {
+                    coworkSessionMode = configuredMode
+                }
+            }
         }
         let enabledHarnesses = Set(integrations.lazy.filter(\.configured).map(\.id))
         let sessions = hasLoadedEndpointSessionRecords
             ? endpointSessionRecords
             : snapshot.jsonSessions
-        let roots = sessions
+        var roots = sessions
             .filter {
                 $0.isActive
                     && $0.rootPID != 0
                     && EndpointSessionScope.isEnabled($0, enabledHarnesses: enabledHarnesses)
             }
             .map { ["pid": $0.rootPID, "session_id": $0.sessionID] as [String: Any] }
+        if coworkEndpointVisibilityEnabled {
+            roots += NSWorkspace.shared.runningApplications.flatMap { application -> [[String: Any]] in
+                guard application.bundleIdentifier == "com.anthropic.claudefordesktop",
+                      application.processIdentifier > 0
+                else { return [] }
+                let rootPID = application.processIdentifier
+                let sessionID = "cowork-desktop-\(rootPID)"
+                let processIdentifiers = [NSNumber(value: rootPID)]
+                    + GenseeDescendantProcessIdentifiers(rootPID)
+                return processIdentifiers.map { processIdentifier in
+                    [
+                        "pid": processIdentifier.uint32Value,
+                        "root_pid": UInt32(rootPID),
+                        "session_id": sessionID,
+                        "kind": "claude-cowork",
+                        "cowork_session_mode": coworkSessionMode,
+                    ] as [String: Any]
+                }
+            }
+        }
         endpointSensor.updateConfiguration(
             mode: policy.endpointSecurityMode,
             protectedPaths: Array(Set(protectedPaths)).sorted(),

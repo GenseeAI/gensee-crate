@@ -1,6 +1,11 @@
 #import <Foundation/Foundation.h>
+#import <sys/types.h>
 
 NS_ASSUME_NONNULL_BEGIN
+
+/// Returns the current recursive descendant PIDs for a live process. This is
+/// used when a managed application is adopted after its helpers have started.
+FOUNDATION_EXPORT NSArray<NSNumber *> *GenseeDescendantProcessIdentifiers(pid_t rootPID);
 
 typedef void (^GenseeEndpointSecurityEventsReply)(NSArray<NSDictionary *> *events,
                                                    uint64_t nextCursor,

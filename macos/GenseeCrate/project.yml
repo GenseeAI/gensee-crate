@@ -35,6 +35,7 @@ targets:
       - Host/EndpointSecurityExtensionManager.swift
       - Host/EndpointSecuritySensor.swift
       - Host/EndpointIngestAcknowledgementIO.swift
+      - Host/EndpointSensorHealth.swift
       - Host/GenseeEndpointSecurityBridge.h
       - Host/GenseeEndpointSecurityBridge.m
       - Host/GenseeCLI.swift
@@ -141,6 +142,7 @@ targets:
     sources:
       - Host/HarnessConfigurationHealth.swift
       - Host/EndpointIngestAcknowledgementIO.swift
+      - Host/EndpointSensorHealth.swift
       - Host/HarnessActivationGuidance.swift
       - Host/AlertSeverityBreakdown.swift
       - Host/TimelineModels.swift
@@ -152,6 +154,7 @@ targets:
       - Host/CheckpointModels.swift
       - Tests/HarnessConfigurationHealthTests.swift
       - Tests/EndpointIngestAcknowledgementIOTests.swift
+      - Tests/EndpointSensorHealthTests.swift
       - Tests/HarnessActivationGuidanceTests.swift
       - Tests/AlertSeverityBreakdownTests.swift
       - Tests/TimelineModelsTests.swift

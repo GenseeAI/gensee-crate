@@ -11,6 +11,13 @@ changes.
 Use this section for user-visible changes after the initial open-source
 release.
 
+### Added
+
+- Added a macOS-first Claude Cowork endpoint-visibility adapter with explicit
+  `host-native`, `vm-mediated`, `cloud-mediated`, and `unattributed` execution
+  origins, opt-in signed process-tree management, local audit ingestion,
+  VM/cloud limitation evidence, and timeline labels.
+
 ### Changed
 
 - NotebookRead and NotebookEdit hooks now receive the same active path-policy

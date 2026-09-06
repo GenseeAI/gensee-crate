@@ -25,6 +25,12 @@ enum HarnessActivationGuidance {
                 detail: "Codex requires you to trust non-managed hooks before they run. Open the Codex CLI, enter /hooks, and trust the Gensee commands. The ChatGPT app does not expose /hooks, so Gensee opens its bundled Codex CLI for this one-time review and closes the review window after approval.",
                 actionTitle: "Open Codex Hook Review"
             )
+        case "claude-cowork":
+            HarnessActivationInstruction(
+                title: "Verify endpoint and audit evidence in Harnesses",
+                detail: "Cowork uses endpoint visibility and a separately configured local audit stream. Open Harnesses → Claude Cowork for setup and evidence checks. VM coverage includes boundaries and host-visible effects, not guest commands.",
+                actionTitle: nil
+            )
         case "claude-code":
             HarnessActivationInstruction(
                 title: "Restart Claude Code, then send a prompt",

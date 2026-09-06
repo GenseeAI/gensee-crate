@@ -5,6 +5,33 @@ final class HarnessConfigurationHealthTests: XCTestCase {
     private let homeURL = URL(fileURLWithPath: "/Users/test/.gensee")
     private let backendURL = URL(fileURLWithPath: "/Applications/Gensee Crate.app/Contents/Resources/bin/gensee")
 
+    func testCoworkToggleIsIndependentOfHooksAndNeverClaimsProtected() {
+        var cowork = IntegrationDescriptor(
+            id: "claude-cowork", name: "Claude Cowork", detail: "", configPath: "", symbolName: "desktopcomputer",
+            installed: false, supportsDirectHooks: false, installationDetail: "", configurationIssue: nil,
+            configurationNote: nil, canRepair: false, configuredBackendPath: nil, configured: false, verified: false
+        )
+        XCTAssertFalse(cowork.canToggle)
+        XCTAssertEqual(cowork.statusLabel, "Not installed")
+        cowork.configured = true
+        // Removal of Claude must not prevent the user from revoking opt-in.
+        XCTAssertTrue(cowork.canToggle)
+        XCTAssertFalse(cowork.requiresRepair)
+        XCTAssertEqual(cowork.statusLabel, "Visibility enabled")
+        cowork.verified = true
+        XCTAssertNotEqual(cowork.statusLabel, "Protected")
+        XCTAssertFalse(cowork.isHealthy)
+        XCTAssertFalse(cowork.awaitingVerification)
+        XCTAssertFalse(HarnessActivationGuidance.eventMatches(provider: "claude-code", source: "claude-cowork-local-audit"))
+    }
+
+    func testCoworkEvidenceKeepsSourcesAndSurfacesSeparate() throws {
+        let status = try JSONDecoder().decode(CoworkEvidenceStatus.self, from: Data(#"{"sample_limit":2000,"evidence":[{"source":"claude-cowork-local-audit","origin":"host-native","last_event_at":1000},{"source":"macos-endpoint-security","origin":"vm-mediated","last_event_at":2000}]}"#.utf8))
+        XCTAssertEqual(status.lastEvent(source: "claude-cowork-local-audit", origin: "host-native"), Date(timeIntervalSince1970: 1))
+        XCTAssertNil(status.lastEvent(source: "claude-cowork-local-audit", origin: "vm-mediated"))
+        XCTAssertEqual(status.lastEvent(source: "macos-endpoint-security"), Date(timeIntervalSince1970: 2))
+    }
+
     func testEndpointRootsHonorHarnessToggleForHookSessions() {
         let codex = AgentSessionRecord(
             sessionID: "codex-session",

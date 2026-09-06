@@ -338,6 +338,7 @@ issues](https://github.com/GenseeAI/gensee-crate/issues) for current work.
 - [Architecture](docs/architecture.md)
 - [Policy](docs/policy.md)
 - [Claude Code hooks](docs/claude-code-hooks.md)
+- [Claude Cowork macOS endpoint visibility](integrations/claude-cowork/README.md)
 - [Configuration audit](docs/config-audit.md)
 - [Run and sandbox modes](docs/run-and-sandbox.md)
 - [Linux controls](docs/linux.md)

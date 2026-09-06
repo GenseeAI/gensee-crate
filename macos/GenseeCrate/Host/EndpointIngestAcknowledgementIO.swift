@@ -2,6 +2,10 @@ import Darwin
 import Foundation
 
 enum EndpointIngestBatchPolicy {
+    static func shouldDrainImmediately(connected: Bool, backlog: UInt64, previousCursor: UInt64, currentCursor: UInt64) -> Bool {
+        connected && backlog > 0 && currentCursor > previousCursor
+    }
+
     private static let minimumAcknowledgementTimeout: TimeInterval = 5
     private static let acknowledgementTimeoutPerEvent: TimeInterval = 0.1
     private static let maximumAcknowledgementTimeout: TimeInterval = 60

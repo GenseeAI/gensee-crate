@@ -410,8 +410,9 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
                 println!("    system events:");
                 for event in &call.system_events {
                     println!(
-                        "      source={} kind={} type={} pid={} ppid={} process={} path={} network={} command={}",
+                        "      source={}{} kind={} type={} pid={} ppid={} process={} path={} network={} command={}",
                         event.source,
+                        system_event_origin_display(event),
                         event.event_kind,
                         event.event_type,
                         option_u32_display(event.pid),
@@ -439,9 +440,10 @@ pub(crate) fn show_timeline(args: Vec<OsString>) -> io::Result<()> {
         println!("Layer 1 system events");
         for event in system_events.iter().rev().take(20).rev() {
             println!(
-                "  {} | source={} | kind={} | type={} | pid={} | process={} | path={} | network={} | command={}",
+                "  {} | source={}{} | kind={} | type={} | pid={} | process={} | path={} | network={} | command={}",
                 event.observed_at_ms,
                 event.source,
+                system_event_origin_display(event),
                 event.event_kind,
                 event.event_type,
                 option_u32_display(event.pid),
@@ -546,6 +548,7 @@ pub(crate) fn stored_system_event_for_timeline(
     }
     event.observed_at_ms = stored.observed_at_ms;
     event.pid = stored.pid.or(event.pid);
+    event.execution_origin = stored.execution_origin;
     event.raw_json = stored.raw_json;
     Ok(event)
 }
@@ -651,6 +654,7 @@ mod native_system_event_tests {
             source: "linux-falco".to_string(),
             event_type: "execve".to_string(),
             event_kind: "ProcessExec".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms: 150,
             pid: Some(42),
             ppid: Some(1),
@@ -682,6 +686,7 @@ mod native_system_event_tests {
             event_type: "connect".to_string(),
             observed_at_ms: 123,
             pid: Some(42),
+            execution_origin: Default::default(),
             raw_json: raw_json.clone(),
         };
 
@@ -706,6 +711,7 @@ mod native_system_event_tests {
             event_type: "unknown".to_string(),
             observed_at_ms: 123,
             pid: Some(42),
+            execution_origin: Default::default(),
             raw_json: json!({
                 "rule": "Container Process Lifecycle",
                 "tags": ["process"],
@@ -728,6 +734,7 @@ mod native_system_event_tests {
             event_type: "network_activity".to_string(),
             observed_at_ms: 123,
             pid: Some(42),
+            execution_origin: Default::default(),
             raw_json: json!({
                 "rule": "Container Network And IPC",
                 "tags": ["network", "ipc"],
@@ -862,6 +869,7 @@ mod native_system_event_tests {
             event_type: "write".to_string(),
             observed_at_ms: 123,
             pid: Some(42),
+            execution_origin: Default::default(),
             raw_json,
         };
         let event = stored_system_event_for_timeline(stored).unwrap();
@@ -1329,6 +1337,18 @@ pub(crate) fn system_event_session_id(event: &SystemEvent) -> Option<String> {
         .or_else(|| value.pointer("/attribution/session_id"))?
         .as_str()
         .map(str::to_string)
+}
+
+fn system_event_origin_display(event: &SystemEvent) -> String {
+    let is_cowork = event.source == "claude-cowork-local-audit"
+        || serde_json::from_str::<Value>(&event.raw_json)
+            .ok()
+            .is_some_and(|value| value.get("cowork").is_some());
+    if is_cowork {
+        format!(" origin={}", event.execution_origin().as_str())
+    } else {
+        String::new()
+    }
 }
 
 pub(crate) fn system_event_network_dest(event: &SystemEvent) -> Option<String> {
@@ -1940,6 +1960,7 @@ pub(crate) fn system_event_from_eslogger_line(line: &str, observed_at_ms: u64) -
             source: "macos-eslogger".to_string(),
             event_type: "unknown".to_string(),
             event_kind: "unknown".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms,
             pid: None,
             ppid: None,
@@ -1965,6 +1986,7 @@ pub(crate) fn system_event_from_eslogger_line(line: &str, observed_at_ms: u64) -
         source: "macos-eslogger".to_string(),
         event_type,
         event_kind,
+        execution_origin: Default::default(),
         observed_at_ms,
         pid: find_first_u32(&value, &["pid", "process_id", "audit_token_pid"]),
         ppid: find_first_u32(&value, &["ppid", "parent_pid"]),

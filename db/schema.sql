@@ -81,6 +81,8 @@ CREATE TABLE IF NOT EXISTS system_events (
   type        TEXT NOT NULL,
   cwd         TEXT NOT NULL,
   args        TEXT,
+  execution_origin TEXT NOT NULL DEFAULT 'unattributed'
+    CHECK (execution_origin IN ('host-native', 'vm-mediated', 'cloud-mediated', 'unattributed')),
   FOREIGN KEY (request_id) REFERENCES requests(request_id),
   CHECK (args IS NULL OR json_valid(args))
 );

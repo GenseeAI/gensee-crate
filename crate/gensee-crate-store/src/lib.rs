@@ -5,7 +5,7 @@ use chacha20poly1305::{
 use gensee_crate_core::{
     endpoint_security_path_is_known_build_output, extract_apply_patch_input, normalize_agent_path,
     parse_apply_patch_changes, parse_mcp_file_intents, parse_vscode_file_intents, AgentHookEvent,
-    AgentSession, FileIntent, ProcessObservation, SystemEvent, WorkspaceEffect,
+    AgentSession, ExecutionOrigin, FileIntent, ProcessObservation, SystemEvent, WorkspaceEffect,
 };
 use gensee_crate_db::sqlite::{
     artifact_path_is_concrete, dashboard_artifact_is_visible as dashboard_artifact_path_is_visible,
@@ -25,6 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fmt;
@@ -91,6 +92,7 @@ pub struct StoredSystemEvent {
     pub event_type: String,
     pub observed_at_ms: u64,
     pub pid: Option<u32>,
+    pub execution_origin: ExecutionOrigin,
     pub raw_json: String,
 }
 
@@ -432,17 +434,18 @@ impl EventStore {
         event: &AgentHookEvent,
         enrichment: &ObservationEnrichment,
     ) -> io::Result<()> {
+        let parsed = ParsedHookEvent::new(event);
         let extracted;
         let operations = match enrichment.file_operations.as_deref() {
             Some(operations) => operations,
             None => {
-                extracted = hook_file_operations(event);
+                extracted = hook_file_operations_from(event, parsed.raw());
                 &extracted
             }
         };
         let enrichment = enrichment
             .evidence_safe_for_paths(operations.iter().map(|operation| operation.path.as_str()));
-        self.append_hook_event_database(event, &enrichment, operations)?;
+        self.append_hook_event_database(&parsed, &enrichment, operations)?;
         append_jsonl(&self.hooks_path(), event, self.encryption_key.as_ref())
     }
 
@@ -499,17 +502,10 @@ impl EventStore {
         event: &SystemEvent,
         enrichment: &ObservationEnrichment,
     ) -> io::Result<()> {
-        let paths = enrichment
-            .has_path_enrichment()
-            .then(|| system_event_paths(event));
-        let enrichment = enrichment.evidence_safe_for_paths(
-            paths
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .map(String::as_str),
-        );
-        self.append_system_event_database(event, &enrichment)?;
+        let parsed = ParsedSystemEvent::new(event);
+        let enrichment =
+            enrichment.evidence_safe_for_paths(parsed.paths.iter().map(String::as_str));
+        self.append_system_event_database(&parsed, &enrichment)?;
         // Native kernel telemetry is already durable in SQLite and can be
         // pruned transactionally. Duplicating these high-volume streams into an
         // append-only JSONL file made retention ineffective and could consume
@@ -649,6 +645,7 @@ impl EventStore {
                     event_type: row.event_type,
                     observed_at_ms,
                     pid: u32::try_from(row.pid).ok().filter(|pid| *pid != 0),
+                    execution_origin: ExecutionOrigin::from_label(&row.execution_origin),
                     raw_json: row.args.unwrap_or_else(|| "null".to_string()),
                 })
             })
@@ -939,6 +936,34 @@ impl EventStore {
             window_ms,
             completion_grace_ms,
         )
+    }
+
+    /// On-demand pilot diagnostics, bounded by primary-key order rather than a
+    /// full history scan. Evidence is historical, not a collector heartbeat or
+    /// proof of guest visibility. Never return paths, commands, or audit content.
+    pub fn cowork_status(&self) -> io::Result<Value> {
+        let db = self.sqlite_store()?;
+        let rows = query_json_rows(
+            db.connection(),
+            "WITH recent AS MATERIALIZED (
+                SELECT event_id, ts, source, execution_origin, args
+                FROM system_events ORDER BY event_id DESC LIMIT 2000
+             )
+             SELECT source, execution_origin, MAX(ts)
+             FROM recent
+             WHERE source = 'claude-cowork-local-audit'
+                OR (source = 'macos-endpoint-security'
+                    AND json_type(args, '$.cowork_visibility') = 'object')
+             GROUP BY source, execution_origin",
+            |row| {
+                Ok(json!({
+                    "source": row.get::<_, String>(0)?,
+                    "origin": row.get::<_, String>(1)?,
+                    "last_event_at": row.get::<_, i64>(2)?,
+                }))
+            },
+        )?;
+        Ok(json!({ "sample_limit": 2000, "evidence": rows }))
     }
 
     pub fn dashboard_state(&self) -> io::Result<Value> {
@@ -2120,10 +2145,11 @@ impl EventStore {
 
     fn append_hook_event_database(
         &self,
-        event: &AgentHookEvent,
+        parsed: &ParsedHookEvent<'_>,
         enrichment: &ObservationEnrichment,
         file_operations: &[FileOperation],
     ) -> io::Result<()> {
+        let event = parsed.event;
         let session_id = event.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
         // Transcript reads can be tens of megabytes. Prepare their incremental
         // state before BEGIN IMMEDIATE so dashboard readers and other hook
@@ -2145,6 +2171,22 @@ impl EventStore {
             } else {
                 None
             };
+        // Resolve only the fields this event consumes before taking the SQLite
+        // writer lock. Enriched file operations still never parse raw JSON.
+        let (prompt, response, tool_input) = match event.hook_event_name.as_deref() {
+            Some("UserPromptSubmit") => (
+                text_from_raw_value(parsed.raw(), &["prompt", "user_prompt", "message"]),
+                None,
+                None,
+            ),
+            Some("Stop") => (
+                None,
+                text_from_raw_value(parsed.raw(), &["last_assistant_message"]),
+                None,
+            ),
+            _ if is_agent_event(event) => (None, None, tool_input_json(parsed, file_operations)),
+            _ => (None, None, None),
+        };
         self.with_sqlite_transaction(|db| {
             ensure_session(db, session_id, &event.provider, event.observed_at_ms)?;
 
@@ -2153,10 +2195,7 @@ impl EventStore {
                     let request_id = db
                         .insert_request(&NewRequest {
                             session_id: session_id.to_string(),
-                            original_user_prompt: text_from_raw_json(
-                                &event.raw_json,
-                                &["prompt", "user_prompt", "message"],
-                            ),
+                            original_user_prompt: prompt,
                             final_response: None,
                             events: Some(event.raw_json.clone()),
                             file_accessed_rate: 0.0,
@@ -2172,7 +2211,6 @@ impl EventStore {
                             .ok()
                             .and(update.total)
                     });
-                    let response = text_from_raw_json(&event.raw_json, &["last_assistant_message"]);
                     let request_id = if let Some(request) = db
                         .latest_request_for_session(session_id)
                         .map_err(sqlite_error)?
@@ -2216,7 +2254,7 @@ impl EventStore {
                         cwd: event.cwd.clone().unwrap_or_default(),
                         permission_mode: event.permission_mode.clone(),
                         tool_name: event.tool_name.clone(),
-                        tool_input: tool_input_json(event, file_operations),
+                        tool_input,
                         tool_response: tool_response_json(event),
                         tool_use_id: event.tool_use_id.clone(),
                     };
@@ -2320,6 +2358,7 @@ impl EventStore {
                 event_type: "process_observation".to_string(),
                 cwd: String::new(),
                 args: Some(json_record(observation)?),
+                execution_origin: "unattributed".to_string(),
             })
             .map(|_| ())
             .map_err(sqlite_error)
@@ -2377,13 +2416,14 @@ impl EventStore {
 
     fn append_system_event_database(
         &self,
-        event: &SystemEvent,
+        parsed: &ParsedSystemEvent<'_>,
         enrichment: &ObservationEnrichment,
     ) -> io::Result<()> {
+        let event = parsed.event;
         self.with_sqlite_transaction(|db| {
             let ts = to_i64(event.observed_at_ms)?;
-            let matched_agent_event = agent_event_for_system_event(db, event, ts)?;
-            let attributed_session_id = system_event_session_id(event);
+            let matched_agent_event = agent_event_for_system_event(db, parsed, ts)?;
+            let attributed_session_id = system_event_session_id(event, parsed.raw.as_ref());
             let request_id = if let Some(session_id) = attributed_session_id.as_deref() {
                 ensure_session(db, session_id, &event.source, event.observed_at_ms)?;
                 latest_or_create_request(db, session_id)?
@@ -2402,6 +2442,7 @@ impl EventStore {
                     event_type: event.event_type.clone(),
                     cwd: String::new(),
                     args: Some(event.raw_json.clone()),
+                    execution_origin: event.execution_origin.as_str().to_string(),
                 })
                 .map_err(sqlite_error)?;
             let process_tree_matched = attributed_session_id.is_some();
@@ -2437,14 +2478,9 @@ impl EventStore {
                 )?;
             }
             record_system_event_artifacts(
-                db, request_id, event_id, event, ts, matched, enrichment,
+                db, request_id, event_id, parsed, ts, matched, enrichment,
             )?;
-            if !matched
-                && !matches!(
-                    event.source.as_str(),
-                    "macos-endpoint-security" | "linux-falco"
-                )
-            {
+            if !matched && system_event_source_can_record_unmatched_alert(&event.source) {
                 record_prepared_unmatched_system_event_alert(
                     db,
                     request_id,
@@ -2479,6 +2515,7 @@ impl EventStore {
                     event_type: effect.effect_type.clone(),
                     cwd: effect.workspace.clone(),
                     args: Some(json_record(effect)?),
+                    execution_origin: "unattributed".to_string(),
                 })
                 .map_err(sqlite_error)?;
             let Some(artifact_id) = upsert_file_artifact(
@@ -2810,11 +2847,11 @@ fn system_request_id(db: &SqliteStore, observed_at_ms: u64) -> io::Result<i64> {
 
 fn agent_event_for_system_event(
     db: &SqliteStore,
-    event: &SystemEvent,
+    parsed: &ParsedSystemEvent<'_>,
     ts: i64,
 ) -> io::Result<Option<AgentEventRecord>> {
-    for path in system_event_paths(event) {
-        if let Some(agent_event) = agent_event_for_path(db, &path, ts)? {
+    for path in &parsed.paths {
+        if let Some(agent_event) = agent_event_for_path(db, path, ts)? {
             return Ok(Some(agent_event));
         }
     }
@@ -3506,25 +3543,25 @@ fn record_system_event_artifacts(
     db: &SqliteStore,
     request_id: i64,
     system_event_id: i64,
-    event: &SystemEvent,
+    parsed: &ParsedSystemEvent<'_>,
     ts: i64,
     matched_agent_intent: bool,
     enrichment: &ObservationEnrichment,
 ) -> io::Result<()> {
-    let raw_event = serde_json::from_str::<Value>(&event.raw_json).ok();
+    let event = parsed.event;
+    let raw_event = parsed.raw.as_ref();
     let modified = raw_event
-        .as_ref()
         .and_then(|value| value.get("modified"))
         .and_then(Value::as_bool);
-    let relation_type = system_artifact_relation_type_for_event(event);
-    let request_relation_type = request_artifact_relation_type_for_event(event);
-    for path in system_event_paths(event) {
-        if !should_materialize_system_artifact(event, &path, raw_event.as_ref()) {
+    let relation_type = system_artifact_relation_type_for_event(event, raw_event);
+    let request_relation_type = request_artifact_relation_type_for_event(event, raw_event);
+    for path in &parsed.paths {
+        if !should_materialize_system_artifact(event, path, raw_event) {
             continue;
         }
         let Some(artifact_id) = upsert_file_artifact(
             db,
-            &path,
+            path,
             ts,
             Some(json!({
                 "source": event.source,
@@ -3568,7 +3605,7 @@ fn record_system_event_artifacts(
         update_artifact_fact(
             db,
             ArtifactFactUpdate {
-                path: &path,
+                path,
                 artifact_id,
                 digest: None,
                 observed_at: ts,
@@ -3582,7 +3619,7 @@ fn record_system_event_artifacts(
                 unmatched_effect: !matched_agent_intent
                     && matches!(request_relation_type, "produced" | "modified" | "deleted"),
                 risk: None,
-                classification: enrichment.classification_for_path(&path),
+                classification: enrichment.classification_for_path(path),
                 metadata: Some(json!({
                     "source": event.source,
                     "system_event_type": event.event_type,
@@ -4136,6 +4173,7 @@ fn dashboard_ignored_file_touch_paths_with_limits(
             source,
             event_type,
             event_kind: "file_mutation".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms: u64::try_from(ts).unwrap_or_default(),
             pid: u32::try_from(pid).ok(),
             ppid: raw_event
@@ -4148,7 +4186,7 @@ fn dashboard_ignored_file_touch_paths_with_limits(
             command_line: None,
             raw_json: raw_json.to_string(),
         };
-        for path in system_event_paths(&event) {
+        for path in system_event_paths_from(&event, Some(&raw_event)) {
             if artifact_path_is_concrete(&path)
                 && (dashboard_file_touch_is_background(&path)
                     || !should_materialize_system_artifact(&event, &path, Some(&raw_event)))
@@ -4259,17 +4297,21 @@ fn is_agent_event(event: &AgentHookEvent) -> bool {
         || event.tool_use_id.is_some()
 }
 
-fn text_from_raw_json(raw_json: &str, keys: &[&str]) -> Option<String> {
-    let value = serde_json::from_str::<Value>(raw_json).ok()?;
+fn text_from_raw_value(raw: Option<&Value>, keys: &[&str]) -> Option<String> {
+    let value = raw?;
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
 }
 
-fn system_event_session_id(event: &SystemEvent) -> Option<String> {
-    let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+fn system_event_session_id(event: &SystemEvent, raw: Option<&Value>) -> Option<String> {
+    let value = raw?;
     let session_id = match event.source.as_str() {
         "linux" | "linux-falco" => value.get("session_id").and_then(Value::as_str),
         "macos-endpoint-security" => value
+            .get("attribution")
+            .and_then(|value| value.get("session_id"))
+            .and_then(Value::as_str),
+        "claude-cowork-local-audit" => value
             .get("attribution")
             .and_then(|value| value.get("session_id"))
             .and_then(Value::as_str),
@@ -4280,14 +4322,33 @@ fn system_event_session_id(event: &SystemEvent) -> Option<String> {
         .map(str::to_string)
 }
 
+struct ParsedSystemEvent<'a> {
+    event: &'a SystemEvent,
+    raw: Option<Value>,
+    paths: Vec<String>,
+}
+
+impl<'a> ParsedSystemEvent<'a> {
+    fn new(event: &'a SystemEvent) -> Self {
+        let raw = serde_json::from_str::<Value>(&event.raw_json).ok();
+        let paths = system_event_paths_from(event, raw.as_ref());
+        Self { event, raw, paths }
+    }
+}
+
 pub fn system_event_paths(event: &SystemEvent) -> Vec<String> {
+    let raw = serde_json::from_str::<Value>(&event.raw_json).ok();
+    system_event_paths_from(event, raw.as_ref())
+}
+
+fn system_event_paths_from(event: &SystemEvent, raw: Option<&Value>) -> Vec<String> {
     let mut paths = BTreeSet::new();
     if let Some(path) = &event.file_path {
         add_path_variants(path, &mut paths);
     }
 
-    if let Ok(value) = serde_json::from_str::<Value>(&event.raw_json) {
-        collect_path_values(&value, &mut paths);
+    if let Some(value) = raw {
+        collect_path_values(value, &mut paths);
     }
 
     paths.into_iter().collect()
@@ -4345,6 +4406,12 @@ fn should_materialize_system_artifact(
     path: &str,
     raw_event: Option<&Value>,
 ) -> bool {
+    if event.source == "claude-cowork-local-audit" {
+        return matches!(
+            cowork_tool_operation(raw_event),
+            Some("read" | "write" | "edit")
+        );
+    }
     if event.source != "macos-endpoint-security" {
         return true;
     }
@@ -4817,7 +4884,17 @@ fn artifact_access(operation: &str) -> ArtifactAccess {
     }
 }
 
-fn system_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str {
+fn system_artifact_relation_type_for_event(
+    event: &SystemEvent,
+    raw_event: Option<&Value>,
+) -> &'static str {
+    if event.source == "claude-cowork-local-audit" {
+        return match cowork_tool_operation(raw_event) {
+            Some("read") => "read_by",
+            Some("edit") => "modified",
+            _ => "wrote",
+        };
+    }
     if event.event_kind == "file_read" {
         return "read_by";
     }
@@ -4839,7 +4916,17 @@ fn system_artifact_relation_type(event_type: &str) -> &'static str {
     }
 }
 
-fn request_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str {
+fn request_artifact_relation_type_for_event(
+    event: &SystemEvent,
+    raw_event: Option<&Value>,
+) -> &'static str {
+    if event.source == "claude-cowork-local-audit" {
+        return match cowork_tool_operation(raw_event) {
+            Some("read") => "consumed_by",
+            Some("edit") => "modified",
+            _ => "produced",
+        };
+    }
     if event.event_kind == "file_read" {
         return "consumed_by";
     }
@@ -4847,6 +4934,12 @@ fn request_artifact_relation_type_for_event(event: &SystemEvent) -> &'static str
         return "modified";
     }
     request_artifact_relation_type(&event.event_type)
+}
+
+fn cowork_tool_operation(raw_event: Option<&Value>) -> Option<&str> {
+    // The producer owns tool taxonomy. Reuse the event already parsed by the
+    // caller; do not parse the same payload again for each lineage relation.
+    raw_event?.get("tool_operation")?.as_str()
 }
 
 fn request_artifact_relation_type(event_type: &str) -> &'static str {
@@ -4859,6 +4952,16 @@ fn request_artifact_relation_type(event_type: &str) -> &'static str {
         | "setextattr" | "deleteextattr" => "modified",
         _ => "produced",
     }
+}
+
+/// Sources with their own attribution do not use the legacy unmatched-effect
+/// heuristic. Shared by ingestion and persistence so policy enrichment cannot
+/// prepare alerts that the store would necessarily discard.
+pub fn system_event_source_can_record_unmatched_alert(source: &str) -> bool {
+    !matches!(
+        source,
+        "macos-endpoint-security" | "linux-falco" | "claude-cowork-local-audit"
+    )
 }
 
 /// Whether an unattributed system event can represent a filesystem effect
@@ -4886,11 +4989,48 @@ fn file_uri(path: &str) -> String {
 /// Extract the file operations the store will materialize for a hook event.
 /// Policy-aware callers use this exact result to prepare enrichment, avoiding a
 /// second parser with subtly different tool or path handling.
+struct ParsedHookEvent<'a> {
+    event: &'a AgentHookEvent,
+    raw: OnceCell<Option<Value>>,
+    #[cfg(test)]
+    before_parse: Option<&'a dyn Fn()>,
+}
+
+impl<'a> ParsedHookEvent<'a> {
+    fn new(event: &'a AgentHookEvent) -> Self {
+        Self {
+            event,
+            raw: OnceCell::new(),
+            #[cfg(test)]
+            before_parse: None,
+        }
+    }
+
+    // Enriched hooks often need no raw fields. Parse only on demand, and cache
+    // malformed input too so multiple consumers never retry a failed parse.
+    fn raw(&self) -> Option<&Value> {
+        self.raw
+            .get_or_init(|| {
+                #[cfg(test)]
+                if let Some(before_parse) = self.before_parse {
+                    before_parse();
+                }
+                serde_json::from_str(&self.event.raw_json).ok()
+            })
+            .as_ref()
+    }
+}
+
 pub fn hook_file_operations(event: &AgentHookEvent) -> Vec<FileOperation> {
+    let parsed = ParsedHookEvent::new(event);
+    hook_file_operations_from(event, parsed.raw())
+}
+
+fn hook_file_operations_from(event: &AgentHookEvent, raw: Option<&Value>) -> Vec<FileOperation> {
     let Some(tool_name) = event.tool_name.as_deref() else {
         return Vec::new();
     };
-    let Ok(value) = serde_json::from_str::<Value>(&event.raw_json) else {
+    let Some(value) = raw else {
         return Vec::new();
     };
     let Some(input) = value.get("tool_input") else {
@@ -4949,7 +5089,8 @@ fn resolve_tool_path(path: &str, cwd: Option<&str>) -> String {
     normalize_agent_path(path, cwd.unwrap_or("."))
 }
 
-fn tool_input_json(event: &AgentHookEvent, tools: &[FileOperation]) -> Option<String> {
+fn tool_input_json(parsed: &ParsedHookEvent<'_>, tools: &[FileOperation]) -> Option<String> {
+    let event = parsed.event;
     match tools {
         [] => {
             if event.tool_input_command.is_some() || event.tool_input_description.is_some() {
@@ -4964,7 +5105,7 @@ fn tool_input_json(event: &AgentHookEvent, tools: &[FileOperation]) -> Option<St
             // they can include prompts, command arguments, or secret material.
             let tool_name = event.tool_name.as_deref()?;
             if event.provider == "vscode" && matches!(tool_name, "file_search" | "grep_search") {
-                let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+                let value = parsed.raw()?;
                 let query = value
                     .get("tool_input")?
                     .get("query")?
@@ -4978,7 +5119,7 @@ fn tool_input_json(event: &AgentHookEvent, tools: &[FileOperation]) -> Option<St
             if !matches!(tool_name, "WebSearch" | "WebFetch" | "ToolSearch") {
                 return None;
             }
-            let value = serde_json::from_str::<Value>(&event.raw_json).ok()?;
+            let value = parsed.raw()?;
             let input = value.get("tool_input")?;
             if input.is_null() {
                 return None;
@@ -5997,6 +6138,7 @@ mod tests {
             source: "macos-endpoint-security".to_string(),
             event_type: "write".to_string(),
             event_kind: "file_mutation".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms,
             pid: Some(42),
             ppid: Some(1),
@@ -6303,6 +6445,7 @@ mod tests {
             source: "macos-endpoint-security".to_string(),
             event_type: "write".to_string(),
             event_kind: "file_mutation".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms,
             pid: Some(42),
             ppid: Some(1),
@@ -6646,6 +6789,7 @@ mod tests {
             source: "test".to_string(),
             event_type: "exec".to_string(),
             event_kind: "process".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms: 1,
             pid: Some(1),
             ppid: Some(0),
@@ -6679,6 +6823,92 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enriched_hook_database_skips_unused_raw_parse() {
+        let dir =
+            std::env::temp_dir().join(format!("gensee-store-lazy-hook-{}", std::process::id()));
+        let store = EventStore::new(&dir).unwrap();
+        // A large Read response must not be parsed again after the policy
+        // caller has supplied its file operations.
+        let mut event =
+            native_tool_event("Read", "read-1", r#"{"file_path":"/repo/large.txt"}"#, 100);
+        event.raw_json = json!({"tool_response": "x".repeat(2 * 1024 * 1024)}).to_string();
+        let parsed = ParsedHookEvent::new(&event);
+        let operations = vec![FileOperation {
+            operation: "read".into(),
+            path: "/repo/large.txt".into(),
+        }];
+        store
+            .append_hook_event_database(&parsed, &ObservationEnrichment::default(), &operations)
+            .unwrap();
+        assert!(
+            parsed.raw.get().is_none(),
+            "enriched Read must not parse raw JSON"
+        );
+        let events = store
+            .sqlite_store()
+            .unwrap()
+            .agent_events_for_request(1)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0]
+            .tool_input
+            .as_deref()
+            .unwrap()
+            .contains("/repo/large.txt"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hook_raw_fields_are_parsed_before_database_lock() {
+        let dir =
+            std::env::temp_dir().join(format!("gensee-hook-parse-lock-{}", std::process::id()));
+        let store = EventStore::new(&dir).unwrap();
+        let mut vscode =
+            native_tool_event("file_search", "search-vscode", r#"{"query":"*.rs"}"#, 101);
+        vscode.provider = "vscode".into();
+        for event in [
+            native_tool_event("WebSearch", "search-1", r#"{"query":"test"}"#, 100),
+            vscode,
+            hook_event("UserPromptSubmit", r#"{"prompt":"hello"}"#, 102),
+            hook_event("Stop", r#"{"last_assistant_message":"done"}"#, 103),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let before_parse = || {
+                assert!(
+                    store.sqlite.try_lock().is_ok(),
+                    "JSON parsing must precede the store mutex and write transaction"
+                );
+                calls.set(calls.get() + 1);
+            };
+            let mut parsed = ParsedHookEvent::new(&event);
+            parsed.before_parse = Some(&before_parse);
+            store
+                .append_hook_event_database(&parsed, &ObservationEnrichment::default(), &[])
+                .unwrap();
+            assert_eq!(calls.get(), 1, "raw fields must still be parsed once");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hook_raw_consumers_share_a_lazy_parse() {
+        let event = native_tool_event("WebSearch", "search-1", r#"{"query":"test"}"#, 100);
+        let parsed = ParsedHookEvent::new(&event);
+        assert!(parsed.raw.get().is_none());
+        let input = tool_input_json(&parsed, &[]).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&input).unwrap()["query"],
+            "test"
+        );
+        let first = parsed.raw().unwrap();
+        assert!(std::ptr::eq(first, parsed.raw().unwrap()));
+        let invalid = hook_event("Stop", "invalid JSON", 101);
+        let parsed = ParsedHookEvent::new(&invalid);
+        assert!(parsed.raw().is_none());
+        assert_eq!(parsed.raw.get(), Some(&None));
     }
 
     #[test]
@@ -7266,6 +7496,7 @@ mod tests {
             source: "test".to_string(),
             event_type: "exec".to_string(),
             event_kind: "process".to_string(),
+            execution_origin: Default::default(),
             observed_at_ms: 1,
             pid: Some(1),
             ppid: Some(0),
@@ -7289,6 +7520,75 @@ mod tests {
     }
 
     #[test]
+    fn cowork_status_is_bounded_and_separates_audit_from_sensor_evidence() {
+        let dir = std::env::temp_dir().join(format!("gensee-cowork-status-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        assert_eq!(store.cowork_status().unwrap()["evidence"], json!([]));
+        for (source, origin, raw_json, ts) in [
+            (
+                "claude-cowork-local-audit",
+                ExecutionOrigin::HostNative,
+                "{}",
+                1000,
+            ),
+            (
+                "claude-cowork-local-audit",
+                ExecutionOrigin::VmMediated,
+                "{}",
+                2000,
+            ),
+            (
+                "macos-endpoint-security",
+                ExecutionOrigin::Unattributed,
+                r#"{"cowork_visibility":{},"file_path":"private-path"}"#,
+                3000,
+            ),
+            // An unrelated sensor event must not verify Cowork coverage.
+            (
+                "macos-endpoint-security",
+                ExecutionOrigin::VmMediated,
+                "{}",
+                4000,
+            ),
+        ] {
+            store
+                .append_system_event_evidence_only(&SystemEvent {
+                    source: source.into(),
+                    event_type: "test".into(),
+                    event_kind: "agent_boundary".into(),
+                    execution_origin: origin,
+                    observed_at_ms: ts,
+                    pid: None,
+                    ppid: None,
+                    process_name: None,
+                    executable_path: None,
+                    file_path: None,
+                    command_line: None,
+                    raw_json: raw_json.into(),
+                })
+                .unwrap();
+        }
+        let status = store.cowork_status().unwrap();
+        assert_eq!(status["sample_limit"], 2000);
+        let evidence = status["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 3);
+        assert!(evidence.contains(&json!({"source":"macos-endpoint-security", "origin":"unattributed", "last_event_at":3000})));
+        assert!(!status.to_string().contains("private-path"));
+        {
+            let db = store.sqlite_store().unwrap();
+            db.connection().execute_batch(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2000)
+                 INSERT INTO system_events(pid, request_id, ts, source, type, cwd)
+                 SELECT 0, (SELECT request_id FROM system_events LIMIT 1), 5000, 'noise', 'test', '' FROM n;"
+            ).unwrap();
+        }
+        assert_eq!(store.cowork_status().unwrap()["evidence"], json!([]));
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn unmatched_system_events_stay_on_system_request() {
         let dir =
             std::env::temp_dir().join(format!("gensee-store-test-system-{}", std::process::id()));
@@ -7306,6 +7606,7 @@ mod tests {
                 source: "eslogger".to_string(),
                 event_type: "exec".to_string(),
                 event_kind: "process".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 130,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7361,6 +7662,7 @@ mod tests {
                 source: "linux-falco".to_string(),
                 event_type: "connect".to_string(),
                 event_kind: "NetworkConnect".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 130,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7410,6 +7712,132 @@ mod tests {
     }
 
     #[test]
+    fn cowork_audit_events_attach_to_session_with_typed_artifact_relations() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-test-cowork-attribution-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        for (tool_name, tool_operation, event_kind, path) in [
+            ("Read", "read", "file_read", "/repo/input.txt"),
+            ("Write", "write", "file_mutation", "/repo/output.txt"),
+            ("Edit", "edit", "file_mutation", "/repo/edited.txt"),
+        ] {
+            store
+                .append_system_event_with_enrichment(
+                    &SystemEvent {
+                        source: "claude-cowork-local-audit".to_string(),
+                        event_type: "cowork_tool_boundary".to_string(),
+                        event_kind: event_kind.to_string(),
+                        execution_origin: ExecutionOrigin::HostNative,
+                        observed_at_ms: 130,
+                        pid: None,
+                        ppid: None,
+                        process_name: Some("Claude Cowork".to_string()),
+                        executable_path: None,
+                        file_path: Some(path.to_string()),
+                        command_line: None,
+                        raw_json: json!({
+                            "attribution": { "session_id": "cowork-session" },
+                            "tool_name": tool_name,
+                            "tool_operation": tool_operation,
+                            "file_path": path,
+                        })
+                        .to_string(),
+                    },
+                    &ObservationEnrichment {
+                        unmatched_system_alert: Some(PolicyAlert {
+                            session_id: None,
+                            tool_use_id: None,
+                            severity: "medium".into(),
+                            action: "warn".into(),
+                            rule_id: "unmatched_system_effect".into(),
+                            message: "prepared unmatched effect".into(),
+                            path: Some(path.into()),
+                            evidence: None,
+                            observed_at_ms: 130,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let db = store.sqlite_store().unwrap();
+        let request = db
+            .latest_request_for_session("cowork-session")
+            .unwrap()
+            .unwrap();
+        let events = db.system_events_for_request(request.request_id).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events
+            .iter()
+            .all(|event| event.execution_origin == "host-native"));
+        let relations = db.relations_for_request(request.request_id).unwrap();
+        assert!(relations
+            .iter()
+            .any(|relation| relation.relation_type == "consumed_by"));
+        assert!(relations
+            .iter()
+            .any(|relation| relation.relation_type == "produced"));
+        assert!(relations
+            .iter()
+            .any(|relation| relation.relation_type == "modified"));
+        drop(db);
+        assert!(store
+            .list_alerts()
+            .unwrap()
+            .iter()
+            .all(|alert| alert.rule_id != "unmatched_system_effect"));
+
+        // Positive control: the same prepared alert must persist for a legacy
+        // source. This fails if the test stops exercising enriched ingestion.
+        store
+            .append_system_event_with_enrichment(
+                &SystemEvent {
+                    source: "eslogger".into(),
+                    event_type: "write".into(),
+                    event_kind: "file_mutation".into(),
+                    execution_origin: Default::default(),
+                    observed_at_ms: 140,
+                    pid: None,
+                    ppid: None,
+                    process_name: None,
+                    executable_path: None,
+                    file_path: Some("/repo/legacy.txt".into()),
+                    command_line: None,
+                    raw_json: "{}".into(),
+                },
+                &ObservationEnrichment {
+                    unmatched_system_alert: Some(PolicyAlert {
+                        session_id: None,
+                        tool_use_id: None,
+                        severity: "medium".into(),
+                        action: "warn".into(),
+                        rule_id: "unmatched_system_effect".into(),
+                        message: "prepared unmatched effect".into(),
+                        path: Some("/repo/legacy.txt".into()),
+                        evidence: None,
+                        observed_at_ms: 140,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .list_alerts()
+                .unwrap()
+                .iter()
+                .filter(|alert| alert.rule_id == "unmatched_system_effect")
+                .count(),
+            1
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn native_system_event_listing_skips_negative_timestamps() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-store-test-native-negative-ts-{}",
@@ -7423,6 +7851,7 @@ mod tests {
                     source: "linux-falco".to_string(),
                     event_type: "execve".to_string(),
                     event_kind: "ProcessExec".to_string(),
+                    execution_origin: Default::default(),
                     observed_at_ms,
                     pid: Some(42),
                     ppid: Some(1),
@@ -7464,6 +7893,7 @@ mod tests {
                     source: "linux-falco".to_string(),
                     event_type: "execve".to_string(),
                     event_kind: "ProcessExec".to_string(),
+                    execution_origin: Default::default(),
                     observed_at_ms,
                     pid: Some(42),
                     ppid: Some(1),
@@ -7508,6 +7938,7 @@ mod tests {
                 source: "linux-falco".to_string(),
                 event_type: "execve".to_string(),
                 event_kind: "ProcessExec".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 1,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7547,6 +7978,7 @@ mod tests {
                 source: "linux-falco".to_string(),
                 event_type: "openat".to_string(),
                 event_kind: "FileWrite".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 130,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7593,6 +8025,7 @@ mod tests {
                 source: "macos-endpoint-security".to_string(),
                 event_type: "write".to_string(),
                 event_kind: "file_mutation".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 130,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7686,6 +8119,7 @@ mod tests {
                 source: "macos-eslogger".to_string(),
                 event_type: "write".to_string(),
                 event_kind: "file_mutation".to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms: 120,
                 pid: Some(42),
                 ppid: Some(1),
@@ -7761,6 +8195,7 @@ mod tests {
                 source: "macos-endpoint-security".to_string(),
                 event_type: event_type.to_string(),
                 event_kind: event_kind.to_string(),
+                execution_origin: Default::default(),
                 observed_at_ms,
                 pid: Some(5311),
                 ppid: Some(5310),

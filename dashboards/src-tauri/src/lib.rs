@@ -145,13 +145,16 @@ fn get_config_audit(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    audit_target(target, &AuditOptions {
-        workspace,
-        codex_home,
-        codex_profile,
-        vscode_user_data,
-        vscode_profile,
-    })
+    audit_target(
+        target,
+        &AuditOptions {
+            workspace,
+            codex_home,
+            codex_profile,
+            vscode_user_data,
+            vscode_profile,
+        },
+    )
     .map_err(|error| error.to_string())
 }
 
@@ -167,7 +170,10 @@ fn resolve_audit_workspace(workspace: Option<String>) -> Result<PathBuf, String>
             .map_err(|error| format!("Unable to resolve the audit workspace: {error}"))?,
     };
     if !path.is_dir() {
-        return Err(format!("Audit workspace is not a directory: {}", path.display()));
+        return Err(format!(
+            "Audit workspace is not a directory: {}",
+            path.display()
+        ));
     }
     Ok(path)
 }
@@ -369,34 +375,62 @@ fn get_session_requests(
     )
 }
 
-#[tauri::command]
-fn get_session_events(state: tauri::State<AppState>, id: String) -> Result<Vec<Value>, String> {
-    let conn = state.ro.lock().map_err(|e| e.to_string())?;
-    qjson(
-        &conn,
-        "
-        SELECT se.*,
-            COALESCE(
-                -- Workspace-effect/fsevents records store the changed file at
-                -- the top level. cwd is the workspace root, not the event path.
-                json_extract(se.args, '$.path'),
-                json_extract(se.args, '$.event.write.target.path'),
-                json_extract(se.args, '$.event.create.destination.path'),
-                json_extract(se.args, '$.event.rename.destination.path'),
-                json_extract(se.args, '$.event.unlink.target.path'),
-                json_extract(se.args, '$.event.exec.target.path'),
-                json_extract(se.args, '$.event.open.file.path'),
-                CASE WHEN se.cwd != '' THEN se.cwd END
-            ) AS path,
-            json_extract(se.args, '$.process.executable.path') AS process
+const SESSION_EVENTS_QUERY: &str = "
+        SELECT se.event_id, se.pid, se.request_id, se.ts, se.source, se.type, se.cwd, se.args,
+            se.execution_origin
           FROM system_events se
           JOIN requests r ON se.request_id = r.request_id
          WHERE r.session_id = ?1
          ORDER BY se.ts DESC
          LIMIT 200
-    ",
-        &[&id],
-    )
+    ";
+
+#[tauri::command]
+fn get_session_events(state: tauri::State<AppState>, id: String) -> Result<Vec<Value>, String> {
+    let conn = state.ro.lock().map_err(|e| e.to_string())?;
+    session_event_rows(&conn, &id)
+}
+
+fn session_event_rows(conn: &Connection, id: &str) -> Result<Vec<Value>, String> {
+    let mut rows = qjson(conn, SESSION_EVENTS_QUERY, &[&id])?;
+    for row in &mut rows {
+        let args = row["args"]
+            .as_str()
+            .and_then(|args| serde_json::from_str::<Value>(args).ok());
+        let parsed = args.as_ref().unwrap_or(&Value::Null);
+        row["path"] = [
+            "/path",
+            "/file_path",
+            "/event/write/target/path",
+            "/event/create/destination/path",
+            "/event/rename/destination/path",
+            "/event/unlink/target/path",
+            "/event/exec/target/path",
+            "/event/open/file/path",
+        ]
+        .iter()
+        .find_map(|pointer| parsed.pointer(pointer).filter(|value| !value.is_null()))
+        .cloned()
+        .unwrap_or_else(|| {
+            row["cwd"]
+                .as_str()
+                .filter(|cwd| !cwd.is_empty())
+                .map(|cwd| Value::String(cwd.into()))
+                .unwrap_or(Value::Null)
+        });
+        row["process"] = parsed
+            .pointer("/process/executable/path")
+            .filter(|value| !value.is_null())
+            .or_else(|| parsed.get("process_name"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if row["source"] != "claude-cowork-local-audit"
+            && !parsed.get("cowork").is_some_and(Value::is_object)
+        {
+            row["execution_origin"] = Value::Null;
+        }
+    }
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,6 +1266,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_event_query_has_unique_columns_and_only_labels_cowork() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE requests(request_id INTEGER, session_id TEXT);
+            CREATE TABLE system_events(event_id INTEGER, pid INTEGER, request_id INTEGER,
+            ts INTEGER, source TEXT, type TEXT, cwd TEXT, args TEXT, execution_origin TEXT);
+            INSERT INTO requests VALUES(1, 's');
+            INSERT INTO system_events VALUES(1, 42, 1, 1, 'eslogger', 'write', '/repo', '{}', 'unattributed');
+            INSERT INTO system_events VALUES(2, 42, 1, 2, 'claude-cowork-local-audit', 'cowork_tool_boundary', '/repo', '{}', 'host-native');
+            INSERT INTO system_events VALUES(3, 42, 1, 3, 'macos-endpoint-security', 'write', '/repo', '{\"cowork\":{}}', 'unattributed');").unwrap();
+        let stmt = conn.prepare(SESSION_EVENTS_QUERY).unwrap();
+        let names = stmt.column_names();
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "query must not rely on last-wins column mapping"
+        );
+        let events = session_event_rows(&conn, "s").unwrap();
+        assert_eq!(events[0]["execution_origin"], "unattributed");
+        assert_eq!(events[1]["execution_origin"], "host-native");
+        assert!(events[2]["execution_origin"].is_null());
+        assert_eq!(events[0]["path"], "/repo");
+        let payload = serde_json::json!({
+            "path": null,
+            "file_path": "/preferred",
+            "event": {"write": {"target": {"path": "/nested"}}},
+            "process": {"executable": {"path": null}},
+            "process_name": "Claude",
+            "cowork": "not-an-object"
+        })
+        .to_string();
+        conn.execute(
+            "UPDATE system_events SET args=?1 WHERE event_id=3",
+            [&payload],
+        )
+        .unwrap();
+        let events = session_event_rows(&conn, "s").unwrap();
+        assert_eq!(events[0]["path"], "/preferred");
+        assert_eq!(events[0]["process"], "Claude");
+        assert_eq!(events[0]["args"], payload);
+        assert!(events[0]["execution_origin"].is_null());
+        conn.execute(
+            "UPDATE system_events SET args='invalid-json', cwd='' WHERE event_id=3",
+            [],
+        )
+        .unwrap();
+        let events = session_event_rows(&conn, "s").unwrap();
+        assert!(events[0]["path"].is_null());
+        assert!(events[0]["process"].is_null());
+    }
+
+    #[test]
     fn config_audit_command_uses_the_shared_ruleset() {
         let root = std::env::temp_dir().join(format!(
             "gensee-dashboard-config-audit-{}",
@@ -1275,8 +1361,15 @@ mod tests {
         ));
         fs::write(&path, "not a directory").unwrap();
 
-        let error = get_config_audit(None, Some(path.to_string_lossy().into_owned()), None, None, None, None)
-            .expect_err("file workspace should be rejected");
+        let error = get_config_audit(
+            None,
+            Some(path.to_string_lossy().into_owned()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("file workspace should be rejected");
 
         assert!(error.contains("not a directory"));
         let _ = fs::remove_file(path);

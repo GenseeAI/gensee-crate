@@ -779,13 +779,15 @@ struct IntegrationDescriptor: Identifiable, Equatable {
     var configured: Bool
     var verified: Bool
 
-    var canToggle: Bool { installed && supportsDirectHooks }
+    var isCowork: Bool { id == "claude-cowork" }
+    var canToggle: Bool { isCowork ? (installed || configured) : installed && supportsDirectHooks }
     var configurationHealthy: Bool { configured && configurationIssue == nil }
-    var isHealthy: Bool { configurationHealthy && verified }
+    var isHealthy: Bool { !isCowork && configurationHealthy && verified }
     var requiresRepair: Bool { canToggle && configured && configurationIssue != nil && canRepair }
-    var awaitingVerification: Bool { configurationHealthy && !verified }
+    var awaitingVerification: Bool { !isCowork && configurationHealthy && !verified }
 
     var statusLabel: String {
+        if isCowork { return configured ? "Visibility enabled" : installed ? "Ready to enable" : "Not installed" }
         if !installed { return "Not installed" }
         if !supportsDirectHooks { return "Managed launch only" }
         if configurationIssue != nil { return canRepair ? "Needs repair" : "Manual fix needed" }
@@ -796,5 +798,30 @@ struct IntegrationDescriptor: Identifiable, Equatable {
         case "claude-code", "antigravity", "cursor", "vscode": return "Restart & test"
         default: return "Test required"
         }
+    }
+}
+
+struct CoworkEvidenceStatus: Decodable {
+    struct Evidence: Decodable {
+        let source: String
+        let origin: String
+        let lastEventAt: Int64
+
+        enum CodingKeys: String, CodingKey {
+            case source, origin
+            case lastEventAt = "last_event_at"
+        }
+    }
+    let sampleLimit: Int
+    let evidence: [Evidence]
+
+    enum CodingKeys: String, CodingKey {
+        case sampleLimit = "sample_limit"
+        case evidence
+    }
+
+    func lastEvent(source: String, origin: String? = nil) -> Date? {
+        evidence.filter { $0.source == source && (origin == nil || $0.origin == origin) }
+            .map { Date(timeIntervalSince1970: Double($0.lastEventAt) / 1_000) }.max()
     }
 }

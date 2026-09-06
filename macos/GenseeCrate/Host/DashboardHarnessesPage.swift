@@ -49,7 +49,11 @@ struct DashboardHarnessesPage: View {
                     DashboardCard("Harness protection") {
                         VStack(spacing: 0) {
                             ForEach(Array(model.integrations.enumerated()), id: \.element.id) { index, integration in
-                                harnessRow(integration)
+                                if integration.isCowork {
+                                    CoworkHarnessRow(model: model, sensor: model.endpointSensor, integration: integration)
+                                } else {
+                                    harnessRow(integration)
+                                }
                                 if index < model.integrations.count - 1 {
                                     Divider().padding(.leading, 54)
                                 }
@@ -373,5 +377,127 @@ struct DashboardHarnessesPage: View {
         if integration.isHealthy { return .dashboardGreen }
         if integration.awaitingVerification { return .dashboardGold }
         return .secondary
+    }
+}
+
+/// Cowork has endpoint evidence, not Claude Code's synchronous policy hooks.
+/// Observe the sensor directly so connectivity cannot get stuck at a stale
+/// value while the expensive dashboard projection is idle.
+private struct CoworkHarnessRow: View {
+    @ObservedObject var model: ConsoleModel
+    @ObservedObject var sensor: EndpointSecuritySensor
+    let integration: IntegrationDescriptor
+    @State private var expanded = false
+
+    private var sensorReady: Bool {
+        sensor.health.isAvailable
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 14) {
+                DashboardSymbol("desktopcomputer", color: .secondary, size: 15, weight: .regular)
+                    .frame(width: 40, height: 40)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text("Claude Cowork").font(.system(size: 13, weight: .semibold))
+                        DashboardTag(text: integration.statusLabel, color: integration.configured ? .dashboardBlue : .secondary)
+                    }
+                    Text(integration.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                    if !integration.installed {
+                        Text(integration.installationDetail).font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Button("Verify") {
+                    expanded = true
+                    Task { await model.verifyCowork() }
+                }
+                .disabled(!integration.configured || !model.backendAvailable || model.isDemoMode || model.runningCommand != nil)
+                .accessibilityIdentifier("harness.claude-cowork.verify")
+                Button(integration.configured ? "Disable visibility" : "Enable visibility") {
+                    expanded = true
+                    Task { await model.setIntegrationEnabled(integration.id, enabled: !integration.configured) }
+                }
+                .disabled(!integration.canToggle || !model.backendAvailable || model.isDemoMode || model.runningCommand != nil)
+                .accessibilityIdentifier("harness.claude-cowork.toggle")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 16) {
+                    Label(sensorReady ? "Sensor connected" : "Sensor unavailable", systemImage: sensorReady ? "checkmark.circle" : "exclamationmark.circle")
+                    Link("Set up audit collection ↗", destination: URL(string: "https://github.com/GenseeAI/gensee-crate/blob/main/integrations/claude-cowork/README.md#local-audit-ingestion")!)
+                        .help("Audit collection runs separately in your terminal. Stop it there when finished.")
+                    if sensor.health.needsAttention {
+                        Button("Review sensor health") { model.requestedDashboardDestination = .settings }
+                            .buttonStyle(.link)
+                            .foregroundStyle(Color.dashboardGold)
+                    }
+                }
+                .foregroundStyle(.secondary)
+                Text("Covers host activity and VM boundaries; guest commands and cloud execution are outside coverage.")
+                    .foregroundStyle(.secondary)
+
+                DisclosureGroup("Session & evidence", isExpanded: $expanded) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 10) {
+                            Text("Session mode")
+                            Picker("Cowork session mode", selection: Binding(
+                                get: { model.coworkSessionMode },
+                                set: { mode in Task { await model.setCoworkSessionMode(mode) } }
+                            )) {
+                                Text("Unknown / mixed").tag("unknown")
+                                Text("Local").tag("local")
+                                Text("Cloud").tag("cloud")
+                            }
+                            .labelsHidden()
+                            .frame(width: 155)
+                            .disabled(model.isDemoMode || !model.backendAvailable || model.runningCommand != nil)
+                            .accessibilityIdentifier("harness.claude-cowork.sessionMode")
+                            .help("Choose Local only for confirmed local sessions. Restart manual audit ingestion after changing mode.")
+                        }
+                        if let issue = model.coworkCheckIssue {
+                            Text(issue).foregroundStyle(Color.dashboardGold)
+                        } else if let evidence = model.coworkEvidence, let checkedAt = model.coworkCheckedAt {
+                            if evidence.evidence.isEmpty {
+                                Text("No Cowork evidence in the latest \(evidence.sampleLimit) events.")
+                            } else {
+                                ForEach(Array(evidence.evidence.enumerated()), id: \.offset) { _, item in
+                                    HStack {
+                                        Text(evidenceLabel(item))
+                                        Text(Date(timeIntervalSince1970: Double(item.lastEventAt) / 1_000).formatted(date: .abbreviated, time: .standard))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                            Text("Checked \(checkedAt.formatted(date: .omitted, time: .shortened)) · Recent history, not live verification")
+                                .foregroundStyle(.secondary)
+                                .help("Samples the latest \(evidence.sampleLimit) system events. Older evidence may be outside the sample. Run native and VM test tasks, then Verify again to check for new event times.")
+                        } else {
+                            Text("Run a Cowork task, then Verify to check recent evidence.")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.top, 8)
+                }
+            }
+            .font(.system(size: 11))
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.leading, 54)
+        }
+        .padding(.vertical, 13)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func evidenceLabel(_ item: CoworkEvidenceStatus.Evidence) -> String {
+        guard item.source == "claude-cowork-local-audit" else { return "Host events (\(item.origin))" }
+        switch item.origin {
+        case "host-native": return "Native audit"
+        case "vm-mediated": return "VM audit"
+        case "cloud-mediated": return "Cloud audit"
+        default: return "Unknown audit"
+        }
     }
 }

@@ -356,6 +356,7 @@ fn falco_system_event_from_value(
         source: FALCO_SOURCE.to_string(),
         event_type,
         event_kind,
+        execution_origin: Default::default(),
         observed_at_ms: falco_event_time_ms(&fields, observed_at_ms).unwrap_or(observed_at_ms),
         pid: falco_u32(&fields, &["proc.pid", "thread.tid"]),
         ppid: falco_u32(&fields, &["proc.ppid"]),

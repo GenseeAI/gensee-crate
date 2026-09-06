@@ -1,40 +1,5 @@
 import Foundation
 
-struct EndpointSensorHealth: Equatable {
-    var connected = false
-    var running = false
-    var mode = "observe"
-    var totalEvents: UInt64 = 0
-    var bufferedEvents: UInt64 = 0
-    var backlogEvents: UInt64 = 0
-    var kernelDrops: UInt64 = 0
-    var ringDrops: UInt64 = 0
-    var lastGlobalSequence: UInt64 = 0
-    var ingestedEvents: UInt64 = 0
-    var persistedEvents: UInt64 = 0
-    var suppressedEvents: UInt64 = 0
-    var prunedSystemEvents: UInt64 = 0
-    var prunedLowSeverityAlerts: UInt64 = 0
-    var lastBatchDurationMS: UInt64 = 0
-    var rejectedEvents: UInt64 = 0
-    var authorizationCount: UInt64 = 0
-    var deniedCount: UInt64 = 0
-    var maxAuthorizationLatencyUS: UInt64 = 0
-    var configuredMaxAuthorizationLatencyUS: UInt64 = 10_000
-    var managedProcesses: UInt64 = 0
-    var lastEventAt: Date?
-    var error: String?
-    var launchContinuityIssue: EndpointEvidenceContinuityIssue?
-
-    var hasDataLoss: Bool {
-        kernelDrops > 0 || ringDrops > 0 || rejectedEvents > 0 || launchContinuityIssue != nil
-    }
-    var hasBackpressure: Bool { backlogEvents >= 1_000 || lastBatchDurationMS >= 1_000 }
-    var exceedsAuthorizationLatencyBudget: Bool {
-        maxAuthorizationLatencyUS > configuredMaxAuthorizationLatencyUS
-    }
-}
-
 /// Pulls bounded event batches from the root system extension and streams them
 /// to one long-lived `gensee ingest endpoint-security` process. The Rust side
 /// owns durable storage, process graph attribution, findings, and correlation.
@@ -66,7 +31,6 @@ final class EndpointSecuritySensor: ObservableObject {
     private var configurationNeedsPush = false
     private var ingestErrorBuffer = Data()
     private var ingestAcknowledgementBuffer = Data()
-    private var ingestionWarning: String?
 
     init(homeURL: URL, executableURL: URL?) {
         self.homeURL = homeURL
@@ -98,8 +62,18 @@ final class EndpointSecuritySensor: ObservableObject {
             try connect()
             pollingTask = Task { [weak self] in
                 while !Task.isCancelled {
+                    let previousCursor = self?.cursor
                     await self?.pollOnce()
-                    try? await Task.sleep(for: .milliseconds(500))
+                    // A durable acknowledgement bounds each batch. Drain a
+                    // backlog promptly instead of throttling the slow consumer
+                    // further; errors and idle streams retain the normal delay.
+                    let draining = EndpointIngestBatchPolicy.shouldDrainImmediately(
+                        connected: self?.health.connected == true,
+                        backlog: self?.health.backlogEvents ?? 0,
+                        previousCursor: previousCursor ?? 0,
+                        currentCursor: self?.cursor ?? 0
+                    )
+                    try? await Task.sleep(for: .milliseconds(draining ? 10 : 500))
                 }
             }
         } catch {
@@ -257,7 +231,7 @@ final class EndpointSecuritySensor: ObservableObject {
                 (continuation: CheckedContinuation<([[String: Any]], UInt64, [String: Any]), Error>) in
                 connection.fetchEvents(
                     afterCursor: cursor,
-                    limit: health.hasBackpressure ? 100 : 500,
+                    limit: 500,
                     reply: { events, nextCursor, health in
                         guard let events = events as? [[String: Any]],
                               let health = health as? [String: Any]
@@ -290,12 +264,12 @@ final class EndpointSecuritySensor: ObservableObject {
                 )
                 cursor = pendingCursor
                 persistCursor()
-                ingestionWarning = EndpointIngestBatchPolicy.warning(
+                health.ingestionWarning = EndpointIngestBatchPolicy.warning(
                     forRejectedEvents: rejectedEvents
                 )
             }
             health.connected = true
-            health.error = ingestionWarning
+            health.error = nil
         } catch {
             health.connected = false
             health.error = error.localizedDescription
@@ -304,13 +278,13 @@ final class EndpointSecuritySensor: ObservableObject {
 
     private func pushConfiguration(using connection: GenseeEndpointSecurityBridge) async throws {
         let configuration = pendingConfiguration
-        let accepted = try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Bool, Error>) in
+        let warning = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<String?, Error>) in
             connection.updateConfiguration(
                 configuration,
                 reply: { accepted, message in
                     if accepted {
-                        continuation.resume(returning: true)
+                        continuation.resume(returning: message)
                     } else {
                         continuation.resume(throwing: NSError(
                             domain: "ai.gensee.crate.endpoint-security",
@@ -322,7 +296,8 @@ final class EndpointSecuritySensor: ObservableObject {
                 failure: { error in continuation.resume(throwing: error) }
             )
         }
-        if accepted { configurationNeedsPush = false }
+        health.configurationWarning = warning
+        configurationNeedsPush = false
     }
 
     @discardableResult
@@ -330,6 +305,9 @@ final class EndpointSecuritySensor: ObservableObject {
         _ dictionary: [String: Any],
         fetchedThroughCursor: UInt64
     ) -> Bool {
+        if let warning = dictionary["configuration_warning"] as? String {
+            health.configurationWarning = warning.isEmpty ? nil : warning
+        }
         let nextBootID = dictionary["boot_id"] as? String ?? ""
         let nextCursor = number(dictionary["next_cursor"])
         let oldestCursor = number(dictionary["oldest_cursor"])
@@ -440,7 +418,7 @@ final class EndpointSecuritySensor: ObservableObject {
                 eventCount: UInt64(events.count)
             )
         } catch {
-            ingestionWarning = error.localizedDescription
+            health.ingestionWarning = error.localizedDescription
             stopIngester()
             throw error
         }

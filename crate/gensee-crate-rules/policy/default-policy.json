@@ -517,6 +517,10 @@
     "max_raw_events": 100000,
     "low_severity_retention_hours": 48
   },
+  "cowork_endpoint_visibility": {
+    "enabled": false,
+    "session_mode": "unknown"
+  },
   "recovery": {
     "default_mode": "auto",
     "harnesses": {

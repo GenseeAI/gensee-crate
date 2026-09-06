@@ -11,12 +11,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // already-initialized store must not rerun CREATE/ALTER statements on every
 // short-lived hook or dashboard process: schema DDL needs a writer lock and can
 // otherwise starve behind the long-lived Endpoint Security ingester.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 // This checksum intentionally names the schema version. If schema.sql changes,
 // bump SCHEMA_VERSION and replace this with the checksum for the new version.
 #[cfg(test)]
-const SCHEMA_V2_SQL_SHA256: &str =
-    "708e9f5ce79743ba025dfc76373c7bedb38cfafebde933e7e8e842f0a7eb26fb";
+const SCHEMA_V3_SQL_SHA256: &str =
+    "7deebdddb91badc4a083a3b2edd0d06586353ab2203dbbfe7a14e249b035d90b";
 // Increment whenever dashboard artifact visibility rules change. Existing
 // stores are reclassified by bounded background maintenance before this
 // version is stamped on their cached count.
@@ -375,6 +375,7 @@ pub struct SystemEventRecord {
     pub event_type: String,
     pub cwd: String,
     pub args: Option<String>,
+    pub execution_origin: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -386,6 +387,7 @@ pub struct NewSystemEvent {
     pub event_type: String,
     pub cwd: String,
     pub args: Option<String>,
+    pub execution_origin: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -708,6 +710,7 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
         migrate_session_root_pid(&conn).map_err(SqliteError::Schema)?;
         migrate_session_token_usage(&conn).map_err(SqliteError::Schema)?;
         migrate_transcript_token_state(&conn).map_err(SqliteError::Schema)?;
+        migrate_system_event_execution_origin(&conn).map_err(SqliteError::Schema)?;
         ensure_artifact_dashboard_visibility_column(&conn).map_err(SqliteError::Schema)?;
         ensure_dashboard_artifact_count_rules_version_column(&conn).map_err(SqliteError::Schema)?;
 
@@ -1214,8 +1217,8 @@ impl SqliteStore {
         self.conn
             .execute(
                 "INSERT INTO system_events (
-                    pid, request_id, ts, source, type, cwd, args
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    pid, request_id, ts, source, type, cwd, args, execution_origin
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     event.pid,
                     event.request_id,
@@ -1224,6 +1227,7 @@ impl SqliteStore {
                     event.event_type,
                     event.cwd,
                     event.args,
+                    event.execution_origin,
                 ],
             )
             .map_err(SqliteError::Database)?;
@@ -1618,7 +1622,7 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT event_id, pid, request_id, ts, source, type, cwd, args
+                "SELECT event_id, pid, request_id, ts, source, type, cwd, args, execution_origin
                  FROM system_events
                  WHERE request_id = ?1
                  ORDER BY ts",
@@ -1673,9 +1677,9 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT event_id, pid, request_id, ts, source, type, cwd, args
+                "SELECT event_id, pid, request_id, ts, source, type, cwd, args, execution_origin
                  FROM (
-                     SELECT event_id, pid, request_id, ts, source, type, cwd, args
+                     SELECT event_id, pid, request_id, ts, source, type, cwd, args, execution_origin
                      FROM system_events
                      WHERE source IN ({placeholders})
                        {session_predicate}
@@ -2833,6 +2837,19 @@ fn migrate_transcript_token_state(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+fn migrate_system_event_execution_origin(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = table_columns(conn, "system_events")?;
+    if !columns.is_empty() && !columns.iter().any(|column| column == "execution_origin") {
+        conn.execute(
+            "ALTER TABLE system_events
+             ADD COLUMN execution_origin TEXT NOT NULL DEFAULT 'unattributed'
+             CHECK (execution_origin IN ('host-native', 'vm-mediated', 'cloud-mediated', 'unattributed'))",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn ensure_artifact_dashboard_visibility_column(conn: &Connection) -> rusqlite::Result<()> {
     let columns = table_columns(conn, "artifact_facts")?;
     if columns.is_empty() || columns.iter().any(|column| column == "dashboard_visible") {
@@ -3056,6 +3073,7 @@ fn map_system_event(row: &Row<'_>) -> rusqlite::Result<SystemEventRecord> {
         event_type: row.get(5)?,
         cwd: row.get(6)?,
         args: row.get(7)?,
+        execution_origin: row.get(8)?,
     })
 }
 
@@ -3195,12 +3213,58 @@ mod tests {
 
     #[test]
     fn schema_checksum_is_tied_to_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(SCHEMA_VERSION, 3);
         let actual = format!("{:x}", Sha256::digest(include_bytes!("../schema.sql")));
         assert_eq!(
-            actual, SCHEMA_V2_SQL_SHA256,
+            actual, SCHEMA_V3_SQL_SHA256,
             "schema.sql changed: bump SCHEMA_VERSION and replace the versioned checksum"
         );
+    }
+
+    #[test]
+    fn schema_v2_adds_validated_system_event_execution_origin() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-origin-migration-test-{}.db",
+            std::process::id()
+        ));
+        remove_sqlite_files(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE system_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pid INTEGER NOT NULL,
+                    request_id INTEGER NOT NULL,
+                    ts INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    args TEXT
+                 );
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = open_store(&test_config(&path)).unwrap();
+        let columns = table_columns(store.connection(), "system_events").unwrap();
+        assert!(columns.iter().any(|column| column == "execution_origin"));
+        store
+            .connection()
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        assert!(store
+            .connection()
+            .execute(
+                "INSERT INTO system_events(
+                    pid, request_id, ts, source, type, cwd, args, execution_origin
+                 ) VALUES (1, 1, 1, 'test', 'open', '', NULL, 'container')",
+                [],
+            )
+            .is_err());
+
+        drop(store);
+        remove_sqlite_files(&path);
     }
 
     #[test]
@@ -3592,6 +3656,7 @@ mod tests {
                 event_type: "open".to_string(),
                 cwd: "/repo".to_string(),
                 args: Some(r#"{"path":"/repo/file.txt"}"#.to_string()),
+                execution_origin: "unattributed".to_string(),
             })
             .unwrap();
 
@@ -3644,6 +3709,19 @@ mod tests {
         assert_eq!(system_events.len(), 1);
         assert_eq!(system_events[0].event_id, system_event_id);
         assert_eq!(system_events[0].event_type, "open");
+        assert_eq!(system_events[0].execution_origin, "unattributed");
+        assert!(store
+            .insert_system_event(&NewSystemEvent {
+                pid: 123,
+                request_id,
+                ts: 112,
+                source: "untrusted".to_string(),
+                event_type: "open".to_string(),
+                cwd: "/repo".to_string(),
+                args: None,
+                execution_origin: "container".to_string(),
+            })
+            .is_err());
 
         let relations = store.relations_for_request(request_id).unwrap();
         assert_eq!(relations.len(), 1);
@@ -3718,6 +3796,7 @@ mod tests {
                 event_type: "open".to_string(),
                 cwd: "/repo".to_string(),
                 args: None,
+                execution_origin: "unattributed".to_string(),
             })
             .unwrap_err();
         assert!(matches!(system_error, SqliteError::Database(_)));
@@ -3767,6 +3846,7 @@ mod tests {
                     event_type: "open".to_string(),
                     cwd: "/repo".to_string(),
                     args: None,
+                    execution_origin: "unattributed".to_string(),
                 })
                 .unwrap();
         }
@@ -3842,6 +3922,7 @@ mod tests {
                 event_type: "open".to_string(),
                 cwd: "/other".to_string(),
                 args: None,
+                execution_origin: "unattributed".to_string(),
             })
             .unwrap();
         assert_eq!(
@@ -3903,6 +3984,7 @@ mod tests {
                     event_type: "write".to_string(),
                     cwd: String::new(),
                     args: None,
+                    execution_origin: "unattributed".to_string(),
                 })
                 .unwrap();
         }
@@ -3990,6 +4072,7 @@ mod tests {
                     event_type: "execve".to_string(),
                     cwd: String::new(),
                     args: None,
+                    execution_origin: "unattributed".to_string(),
                 })
                 .unwrap();
         }

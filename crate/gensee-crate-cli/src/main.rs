@@ -124,6 +124,8 @@ mod falco;
 pub(crate) use falco::*;
 mod replay;
 pub(crate) use replay::*;
+mod cowork;
+pub(crate) use cowork::*;
 
 #[cfg(feature = "bench")]
 mod bench;
@@ -350,6 +352,16 @@ pub(crate) fn run_cli() -> io::Result<()> {
         Some("dashboard-state") => {
             args.remove(0);
             dashboard_state()
+        }
+        Some("cowork-status") => {
+            if args.len() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "usage: gensee cowork-status",
+                ));
+            }
+            println!("{}", EventStore::default_local()?.cowork_status()?);
+            Ok(())
         }
         Some("endpoint-roots") => {
             args.remove(0);
@@ -3413,6 +3425,20 @@ const ENDPOINT_SECURITY_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[
         help: "Absolute executable paths denied to managed agent trees",
         allow_null: false,
     },
+    PolicySetupItem {
+        key: "cowork_endpoint_visibility.enabled",
+        value_type: PolicySetupValueType::Bool,
+        label: "Claude Cowork endpoint visibility",
+        help: "Register the signed Claude Desktop process tree as a managed macOS root",
+        allow_null: false,
+    },
+    PolicySetupItem {
+        key: "cowork_endpoint_visibility.session_mode",
+        value_type: PolicySetupValueType::String,
+        label: "Claude Cowork session mode",
+        help: "local, cloud, or unknown; use unknown unless independently established",
+        allow_null: false,
+    },
 ];
 
 const WATCH_POLICY_SETUP_ITEMS: &[PolicySetupItem] = &[PolicySetupItem {
@@ -3562,6 +3588,8 @@ const SETTABLE_POLICY_KEYS: &[&str] = &[
     "endpoint_security.raw_event_retention_hours",
     "endpoint_security.max_raw_events",
     "endpoint_security.low_severity_retention_hours",
+    "cowork_endpoint_visibility.enabled",
+    "cowork_endpoint_visibility.session_mode",
     "recovery.default_mode",
     "recovery.harnesses.codex",
     "recovery.harnesses.claude-code",
@@ -3629,6 +3657,8 @@ pub(crate) fn telemetry_policy_key_bucket(key: &str) -> &'static str {
         "endpoint_security.low_severity_retention_hours" => {
             "endpoint_security.low_severity_retention_hours"
         }
+        "cowork_endpoint_visibility.enabled" => "cowork_endpoint_visibility.enabled",
+        "cowork_endpoint_visibility.session_mode" => "cowork_endpoint_visibility.session_mode",
         "recovery.default_mode" => "recovery.default_mode",
         "recovery.harnesses.codex" => "recovery.harnesses.codex",
         "recovery.harnesses.claude-code" => "recovery.harnesses.claude-code",
@@ -3709,9 +3739,10 @@ pub(crate) fn handle_ingest(args: Vec<OsString>) -> io::Result<()> {
         Some("eslogger") => ingest_eslogger(),
         Some("endpoint-security") => ingest_endpoint_security(),
         Some("falco") => ingest_falco(args[1..].to_vec()),
+        Some("cowork-audit") => ingest_cowork_audit(args[1..].to_vec()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: gensee ingest eslogger|endpoint-security|falco [--host <name>]",
+            "usage: gensee ingest eslogger|endpoint-security|falco [--host <name>]|cowork-audit [--session-mode local|cloud|unknown]",
         )),
     }
 }
@@ -4110,7 +4141,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
     let mut rejected_in_batch = 0_u64;
     let mut persisted_in_batch = 0_u64;
     let mut suppressed_in_batch = 0_u64;
-    let mut batch_started = Instant::now();
+    let mut batch_started = None;
     let mut recording = Policy::load_current().document().endpoint_security.clone();
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -4123,6 +4154,9 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             continue;
         }
         if let Some(commit) = endpoint_ingest_commit(line)? {
+            // Time ingestion/maintenance, not the idle wait for the host's
+            // next poll. Idle time otherwise looks like storage backpressure.
+            let batch_started = batch_started.take().unwrap_or_else(Instant::now);
             let mut acknowledgement =
                 endpoint_ingest_ack(&commit, received_in_batch, rejected_in_batch)?;
             let mut pruned_system_events = 0_u64;
@@ -4183,13 +4217,13 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
             rejected_in_batch = 0;
             persisted_in_batch = 0;
             suppressed_in_batch = 0;
-            batch_started = Instant::now();
             continue;
         }
         // The host's barrier counts every event line it sent. Rejected lines
         // still belong to that batch; report them in the durable ack so the
         // host can advance past malformed/version-skewed evidence and surface
         // the loss instead of replaying the same poisoned batch forever.
+        batch_started.get_or_insert_with(Instant::now);
         received_in_batch += 1;
         let parsed = match EndpointSecurityEvent::parse(line) {
             Ok(event) => event,
@@ -4273,7 +4307,13 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 evidence: Some(evidence.clone()),
                 observed_at_ms,
             };
-            if let Some(session_id) = active_session_id.as_deref() {
+            if alert.rule_id == "endpoint_security_event_gap" {
+                // Loss is a sensor-health incident, not a finding per affected
+                // file/process. Keep the first alert per minute and retain exact
+                // cumulative counters in sensor health.
+                let key = format!("endpoint-evidence-gap:{}", event.boot_id);
+                record_endpoint_policy_alert(&store, alert, &key, 60_000)?;
+            } else if let Some(session_id) = active_session_id.as_deref() {
                 let path = alert.path.as_deref().unwrap_or("");
                 let key =
                     endpoint_alert_dedupe_key(session_id, &event, path, event.event_type.as_str());
@@ -5439,7 +5479,7 @@ pub(crate) fn option_u32_display(value: Option<u32>) -> String {
 
 pub(crate) fn print_usage() {
     println!(
-        "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--observe-only] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--approach <description>]... [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container> [--json]\n  gensee run summary <fork-id> [--json]\n  gensee run compare <parallel-fork-id> [--json]\n  gensee run choose <parallel-fork-id> <--merge|--promote|--discard-all>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee managed <create-source|delete-source|fork|merge|promote|discard|diff|status|list|reconcile>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list [--json]\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run --runtime tclone --observe-only -- codex\n  gensee run fork run_123 --copies 2 --name try-upgrade --approach 'minimal compatible upgrade' --approach 'aggressive latest-version upgrade' --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
+        "gensee\n\nUSAGE:\n  gensee run [--runtime local|tclone] [--observe-only] [--sandbox none|mac|linux] [--profile cautious] [--workspace-mode direct|staged] [--workspace <path>] [--linux-seccomp|--no-linux-seccomp] [--linux-fanotify] [--linux-network off|allowlist|deny-all|monitor] [--allow-net <ip-or-cidr>]... [--deny-net <ip-or-cidr>]... -- <agent> [args...]\n  gensee run fork <run_id> [--copies N] [--name <prefix>] [--approach <description>]... [--attach tmux:right|tmux:below] [--json]\n  gensee run fork-status <job-id> [--json]\n  gensee run shell <run_id-or-container>\n  gensee run attach <run_id-or-container> [--tmux right|below]\n  gensee run send <run_id-or-container> [--no-enter] -- <prompt>\n  gensee run exec <run_id-or-container> [--json] -- <command> [args...]\n  gensee run diff <run_id-or-container> [--json]\n  gensee run summary <fork-id> [--json]\n  gensee run compare <parallel-fork-id> [--json]\n  gensee run choose <parallel-fork-id> <--merge|--promote|--discard-all>\n  gensee run merge <fork-id> --into <source-id> [--git|--filesystem|--paths <path>...] [--dry-run] [--force]\n  gensee run switch <fork-id>\n  gensee run keep <run_id-or-container> --to <path>\n  gensee run discard <session_id-or-tclone-run>\n  gensee run delete <tclone-run-or-container>|--all\n  gensee managed <create-source|delete-source|fork|merge|promote|discard|diff|status|list|reconcile>\n  gensee watch [--workspace <path>] [--watch-root <path>]... [--backend auto|fsevents|snapshot] [--system-events none|eslogger] [--no-sensitive-roots] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee watch --pid <pid> [--session-id <id>] [--linux-fanotify] [--duration-seconds <seconds>] [--interval-ms <ms>]\n  gensee run list [--json]\n  gensee setup claude-code [--gensee-home <path>]\n  gensee setup codex [--gensee-home <path>]\n  gensee setup antigravity [--gensee-home <path>]\n  gensee setup vscode [--gensee-home <path>]\n  gensee setup cursor [--gensee-home <path>]\n  gensee hook claude-code\n  gensee hook codex\n  gensee hook antigravity\n  gensee hook vscode\n  gensee hook cursor\n  gensee ingest eslogger\n  gensee verify-log\n  gensee dashboard-state\n  gensee cowork-status\n  gensee gateway-alert --session-id <s> [--action <block|warn>] [--evidence-json <json>]\n  gensee telemetry [status|enable|disable|enable-collection|disable-collection|flush]\n  gensee policy [print-default | path | validate <file> | init | setup | get <key> | set <key> <value>]\n  gensee status --json\n  gensee debug [plan|fanotify-plan|fanotify-once|seccomp-profile|network-plan|network-apply] [--json]\n  gensee feedback record --verdict <agree|allow|deny> [--gensee <action>] [--event-key <k>] [--note <n>]\n  gensee feedback list [--json] [--limit <n>]\n  gensee timeline [--latest | --session <session_id> | --path <substring>]\n\nEXAMPLES:\n  gensee setup claude-code\n  gensee setup codex\n  gensee setup antigravity\n  gensee setup vscode\n  gensee setup cursor\n  gensee status --json\n  gensee policy setup\n  gensee watch --workspace . --watch-root ~/Downloads\n  sudo gensee watch --pid $$ --linux-fanotify --duration-seconds 10\n  gensee run --sandbox mac --profile cautious --workspace-mode staged -- claude\n  sudo gensee run --sandbox linux --linux-fanotify -- codex\n  gensee run --runtime tclone -- codex\n  gensee run --runtime tclone --observe-only -- codex\n  gensee run fork run_123 --copies 2 --name try-upgrade --approach 'minimal compatible upgrade' --approach 'aggressive latest-version upgrade' --attach tmux:right --json\n  gensee run fork-status run_123_456_789 --json\n  gensee run shell run_123_fork_0\n  gensee run attach run_123_fork_0 --tmux right\n  gensee run send run_123_fork_0 -- 'Run cargo test and fix failures'\n  gensee run exec run_123_fork_0 -- bash -lc 'cargo test'\n  gensee run merge run_123_fork_0 --into run_123\n  gensee run switch run_123_fork_0\n  gensee run delete --all\n  gensee run --workspace-mode staged -- omnigent run path/to/agent.yaml\n\nCOMPATIBILITY:\n  gensee fork <run_id> [--copies N] [--name <prefix>]\n  gensee session list\n  gensee linux ..."
     );
     println!(
         "GENERIC OPERATION BOUNDARY:\n  gensee boundary catalog public-key|sign|verify ...\n  gensee boundary intent observe|analyze|sign-result|attest|resolve ...\n  gensee boundary context issue|verify|effect-sign|effect-verify ...\n  gensee boundary verifier request|run|attest|sign|verify ...\n  gensee boundary promotion apply ...\n  gensee boundary proof sign|verify ...\n  gensee boundary validate --contract <contract.json> [--json]\n  gensee boundary audit --contract <contract.json> [--json]\n  sudo gensee boundary run --catalog <signed.json> --observation <observation.json> --inference <signed-inference.json> [--workspace <dir>] [--manifest <manifest.json>] -- <command> [args...]\n"
