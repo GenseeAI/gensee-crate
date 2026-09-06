@@ -105,6 +105,36 @@ pub(crate) fn evaluate_pretool_policy_with_policy(
     }
 
     let subjects = policy_subjects(event, file_intents);
+    if let Some(store) = store {
+        for subject in &subjects {
+            let resolved = gensee_crate_core::resolve_concrete_path(&subject.path);
+            let store_root =
+                gensee_crate_core::resolve_concrete_path(&store.root_path().to_string_lossy());
+            let approval_target = |p: &Path| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n == "approvals.json" || n == "approvals.lock" || n.starts_with(".approvals-")
+                })
+            };
+            let protects_store =
+                resolved
+                    .as_ref()
+                    .zip(store_root.as_ref())
+                    .is_some_and(|(p, r)| {
+                        (p.parent() == Some(r.as_path()) && approval_target(p)) || r.starts_with(p)
+                    });
+            if policy_subject_is_mutating(&subject.operation) && protects_store {
+                findings.push(PolicyFinding {
+                    action: PolicyAction::Block,
+                    severity: "high".into(),
+                    rule_id: "policy_approval_store_write".into(),
+                    message: "Approval memory can only be changed through Gensee Settings.".into(),
+                    path: Some(subject.path.clone()),
+                    evidence: json!({"source":"approval_store_protection"}),
+                });
+            }
+        }
+    }
+
     for subject in &subjects {
         findings.extend(policy_findings_for_subject(subject, cwd, policy));
     }
@@ -227,6 +257,14 @@ pub(crate) fn evaluate_pretool_policy_with_policy(
         }
     }
 
+    if let Some(store) = store {
+        approval_memory::apply(event, store, &mut findings);
+        action = findings
+            .iter()
+            .map(|f| f.action)
+            .max()
+            .unwrap_or(PolicyAction::Allow);
+    }
     PolicyDecision { action, findings }
 }
 

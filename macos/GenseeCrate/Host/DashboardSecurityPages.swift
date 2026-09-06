@@ -4,14 +4,12 @@ import SwiftUI
 struct DashboardAlertsPage: View {
     @ObservedObject var model: ConsoleModel
     let searchText: String
-    @State private var severity = "All"
     @State private var action = "All"
     @StateObject private var columns = AlertColumnLayout()
 
     private var alerts: [SecurityAlert] {
         model.snapshot.alerts.filter {
-            (severity == "All" || $0.severity.caseInsensitiveCompare(severity) == .orderedSame)
-            && (action == "All" || $0.action.caseInsensitiveCompare(action) == .orderedSame)
+            (action == "All" || $0.reviewStatus == action)
             && containsSearch(
                 searchText,
                 fields: $0.message, $0.ruleID, $0.path, $0.sessionID,
@@ -25,8 +23,7 @@ struct DashboardAlertsPage: View {
             VStack(alignment: .leading, spacing: 16) {
                 DashboardPageHeader("Alerts", description: "Policy decisions and risk findings across all sessions.") {
                     HStack(spacing: 8) {
-                        Picker("Severity", selection: $severity) { ForEach(["All", "Info", "Low", "Medium", "High", "Critical"], id: \.self, content: Text.init) }.frame(width: 120)
-                        Picker("Action", selection: $action) { ForEach(["All", "Allow", "Warn", "Ask", "Block"], id: \.self, content: Text.init) }.frame(width: 110)
+                        Picker("Status", selection: $action) { ForEach(["All", "Allowed", "Review", "Approval requested", "Blocked"], id: \.self, content: Text.init) }.frame(width: 180)
                         Button { model.markAllAlertsRead() } label: {
                             Label("Mark All as Read", systemImage: "checkmark.circle")
                                 .frame(minWidth: 116)
@@ -57,8 +54,7 @@ struct DashboardAlertsPage: View {
 
 @MainActor
 final class AlertColumnLayout: ObservableObject {
-    @Published var severity: CGFloat = 74
-    @Published var action: CGFloat = 68
+    @Published var status: CGFloat = 160
     @Published var finding: CGFloat = 280
     @Published var path: CGFloat = 176
     @Published var time: CGFloat = 112
@@ -71,8 +67,7 @@ struct AlertListHeader: View {
     var body: some View {
         HStack(spacing: 10) {
             Color.clear.frame(width: 14)
-            ResizableAlertHeaderCell(title: "Severity", width: $layout.severity, range: 62...120)
-            ResizableAlertHeaderCell(title: "Action", width: $layout.action, range: 58...110)
+            ResizableAlertHeaderCell(title: "Status", width: $layout.status, range: 120...220)
             ResizableAlertHeaderCell(title: "Finding", width: $layout.finding, range: 180...520)
             ResizableAlertHeaderCell(title: "Path", width: $layout.path, range: 110...420)
             ResizableAlertHeaderCell(title: "Time", width: $layout.time, range: 92...190)
@@ -156,13 +151,10 @@ struct ExpandableAlertRow: View {
                 .buttonStyle(.plain)
                 .help(expanded ? "Hide finding evidence" : "Show finding evidence")
 
-                    DashboardTag(text: alert.severity, color: severityColor(alert.severity))
-                        .frame(width: layout.severity, alignment: .leading)
-                        .help("Severity: \(alert.severity.uppercased())")
-                    DashboardTag(text: alert.action, color: actionColor(alert.action))
-                        .frame(width: layout.action, alignment: .leading)
-                        .help("Action: \(alert.action.uppercased())")
-                    Text(alert.message)
+                    DashboardTag(text: alert.reviewStatus, color: actionColor(alert.action))
+                        .frame(width: layout.status, alignment: .leading)
+                        .help("Risk: \(alert.severity.capitalized). This records the policy response at the time; approval may no longer be pending.")
+                    Text(alert.findingSummary)
                         .font(.system(size: 12, weight: unread ? .semibold : .medium))
                         .lineLimit(expanded ? 2 : 1)
                     .frame(width: layout.finding, alignment: .leading)
@@ -188,7 +180,7 @@ struct ExpandableAlertRow: View {
             .padding(.vertical, 9)
             .contentShape(Rectangle())
             .background(unread ? Color.dashboardRed.opacity(0.035) : .clear)
-            .accessibilityLabel("\(unread ? "Unread, " : "")\(alert.severity) severity, \(alert.action), \(alert.message)")
+            .accessibilityLabel("\(unread ? "Unread, " : "")\(alert.severity) severity, \(alert.reviewStatus), \(alert.findingSummary)")
             .accessibilityHint(expanded ? "Collapse alert details" : "Expand alert details")
 
             if expanded {
@@ -259,6 +251,9 @@ private struct FindingReviewControl: View {
     let alert: SecurityAlert
     @ObservedObject var model: ConsoleModel
     @State private var pendingChange: PendingRuleTuning?
+    @State private var approvalPreview: RememberedApproval?
+    @State private var savingApproval = false
+    @State private var approvalIssue: String?
 
     private let severities = ["Info", "Low", "Medium", "High", "Critical"]
     private let actions = ["Allow", "Warn", "Ask", "Block"]
@@ -269,6 +264,12 @@ private struct FindingReviewControl: View {
 
     var body: some View {
         Menu {
+            if alert.action.lowercased() == "ask" {
+                Button("Approve similar actions…") {
+                    Task { approvalIssue = nil; approvalPreview = await model.previewApproval(alert) }
+                }
+                Divider()
+            }
             Menu("Set future severity") {
                 ForEach(severities, id: \.self) { severity in
                     Button {
@@ -307,7 +308,28 @@ private struct FindingReviewControl: View {
         .controlSize(.small)
         .fixedSize()
         .disabled(model.feedbackAlertID != nil)
-        .help("Changes this rule for all future paths and sessions. Strict fail-closed keeps the original enforcement floor.")
+        .sheet(item: $approvalPreview) { preview in
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Approve matching actions").font(.headline)
+                Text("\(preview.provider) · \(preview.rule)").font(.caption).foregroundStyle(.secondary)
+                Text(preview.path).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                Text("Project: \(preview.project)").font(.caption)
+                if let input = preview.tool_input_preview {
+                    ScrollView { Text(input).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 120)
+                }
+                if let issue = approvalIssue { Text(issue).font(.caption).foregroundStyle(.red) }
+                Text("Applies to this target and tool input. Executable and credential-read approvals require unchanged file content. This does not execute a historical action; retry it in your harness.").font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Cancel") { approvalPreview = nil }
+                    Spacer()
+                    Button("Allow once") { saveApproval(preview, scope: "once") }
+                    Button("This session") { saveApproval(preview, scope: "session") }
+                    Button("This project") { saveApproval(preview, scope: "project") }
+                }
+                Text("One-use and session approvals expire within 24 hours. Project approvals expire in 30 days. Revoke them in Settings.").font(.caption2).foregroundStyle(.secondary)
+            }.padding(24).frame(width: 600).disabled(savingApproval)
+        }
+        .help("Approve a scoped match, or explicitly tune a rule globally. Strict fail-closed retains its enforcement floor.")
         .alert(
             "Weaken this rule globally?",
             isPresented: Binding(
@@ -323,6 +345,16 @@ private struct FindingReviewControl: View {
             Button("Cancel", role: .cancel) { pendingChange = nil }
         } message: { _ in
             Text("This affects every future match of \(alert.ruleID), across all paths and sessions. Strict and non-interactive fail-closed modes will retain the rule's original enforcement floor.")
+        }
+    }
+
+    private func saveApproval(_ preview: RememberedApproval, scope: String) {
+        guard !savingApproval else { return }
+        savingApproval = true
+        Task {
+            if await model.rememberApproval(alert, preview: preview, scope: scope) { approvalPreview = nil }
+            else { approvalIssue = model.errorMessage }
+            savingApproval = false
         }
     }
 
@@ -381,6 +413,7 @@ private struct AlertMetadata: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
             Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 6) {
+                metadataRow("Risk", alert.severity.capitalized, "Policy response", alert.action.uppercased())
                 metadataRow("Session", alert.sessionID, "Request", alert.requestID.map(String.init))
                 metadataRow("Tool use ID", alert.toolUseID, "Path", alert.path.map(abbreviatedPath))
                 metadataRow("Rule", alert.ruleID, "Alert ID", String(alert.alertID))

@@ -70,6 +70,8 @@ pub(crate) fn is_supported_provider(provider: &str) -> bool {
 
 mod policy_eval;
 pub(crate) use policy_eval::*;
+mod approval_memory;
+mod housekeeping;
 mod preexec;
 pub(crate) use preexec::*;
 mod command_parse;
@@ -340,6 +342,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
         Some(command) if is_linux_top_level_command(command) => {
             args.remove(0);
             handle_linux_top_level(command, args)
+        }
+        Some("approval") => {
+            args.remove(0);
+            approval_memory::handle(args)
         }
         Some("feedback") => {
             args.remove(0);
@@ -4015,11 +4021,31 @@ fn feedback_list(args: Vec<OsString>) -> io::Result<()> {
 
 fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
     let policy = Policy::cached_current();
-    store.set_dashboard_noise_filter(move |rule, path, workspace, operation| {
-        policy.is_routine_scratch_alert(rule, path)
-            || (rule == "hook_bypass_file_mutation"
-                && policy.is_routine_unmatched_mutation(path, workspace, operation))
-    })
+    let candidate_rules = [
+        policy
+            .document()
+            .categories
+            .write_outside_workspace
+            .rule_id
+            .clone(),
+        policy.document().categories.destructive.rule_id.clone(),
+        "hook_bypass_file_mutation".into(),
+    ];
+    store.set_dashboard_noise_filter(
+        &candidate_rules
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        move |rule, path, workspace, operation, evidence| {
+            (operation != "rename" && policy.is_routine_scratch_alert(rule, path))
+                || serde_json::from_str::<Value>(evidence)
+                    .ok()
+                    .is_some_and(|e| housekeeping::is_routine(&policy, rule, path, &e))
+                || (rule == "hook_bypass_file_mutation"
+                    && operation != "rename"
+                    && policy.is_routine_unmatched_mutation(path, workspace, operation))
+        },
+    )
 }
 
 fn dashboard_state() -> io::Result<()> {

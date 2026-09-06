@@ -8,8 +8,22 @@ changes.
 
 ## Unreleased
 
+### Added
+
+- Explicit remembered approvals from Review Queue: allow the next matching action,
+  the same session (up to 24 hours), or the same project (30 days). Matching binds
+  provider, project, rule, target, tool input, and inspected file content. Active
+  approvals can be revoked in Settings; blocks are never overridden.
+
 ### Fixed
 
+- Large-history dashboard refreshes avoid sorting unrelated alerts and use indexed
+  artifact identity lookups; a bounded background refresh retains the previous view.
+- Executable inspection follows shell `cd` when resolving subsequent scripts.
+- Temporary regular-file renames and narrowly identified Claude, Xcode, Git, and
+  Cargo housekeeping no longer create generic mutation/deletion warnings.
+- Review Queue uses one Status column. Risk severity remains in expanded details;
+  observed deletion/rename evidence describes the actual file operation.
 - Harnesses includes hook protection and enabled Cowork visibility in its Protected
   total; installed totals continue to include Cowork.
 - Historical and nested task completions now group their tools and findings under

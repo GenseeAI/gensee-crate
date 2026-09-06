@@ -8327,3 +8327,86 @@ fn test_resource_config() -> ResourceGovernanceConfig {
         egress_allow_hosts: Vec::new(),
     }
 }
+
+#[test]
+fn preexec_resolves_each_script_after_shell_cd() {
+    assert_eq!(executable_targets_from_command("cd /private/tmp/gensee-crate-cowork && python3 scripts/test-endpoint-ingest-gaps.py 2>&1 | tail -2", "/Users/test/repo"),vec!["/private/tmp/gensee-crate-cowork/scripts/test-endpoint-ingest-gaps.py"]);
+    assert_eq!(
+        executable_targets_from_command(
+            "cd '/private/tmp/my project' && python3 run.py && cd sub && bash next.sh",
+            "/repo"
+        ),
+        vec![
+            "/private/tmp/my project/run.py",
+            "/private/tmp/my project/sub/next.sh"
+        ]
+    );
+    assert_eq!(
+        executable_targets_from_command("cd /other | cat; python3 run.py", "/repo"),
+        vec!["/repo/run.py"]
+    );
+    let targets = executable_targets_from_command("cd /other; python3 run.py", "/repo");
+    assert!(targets.contains(&"/repo/run.py".into()));
+    assert!(targets.contains(&"/other/run.py".into()));
+    assert_eq!(
+        executable_targets_from_command("cd /other && cat run.sh | bash", "/repo"),
+        vec!["/other/run.sh"]
+    );
+}
+
+#[test]
+fn approval_store_protection_follows_symlink_parent_and_covers_directory_deletion() {
+    let (store, workspace) = temp_store_and_workspace("approval-protection");
+    let alias = workspace.join("approval-alias");
+    std::os::unix::fs::symlink(store.root_path(), &alias).unwrap();
+    for path in [
+        alias.join("approvals.json"),
+        alias.join("approvals.lock"),
+        alias.join(".approvals-next.tmp"),
+        store.root_path().to_path_buf(),
+    ] {
+        let command = format!("rm -rf '{}'", path.display());
+        let event = build_unattributed_hook_event(
+            &pretool_bash_payload("approval-test", workspace.to_str().unwrap(), &command),
+            "claude-code",
+        )
+        .unwrap();
+        let intents = file_intents_from_hook(&event, Some(&command));
+        let decision = evaluate_pretool_policy_with_store(&event, &intents, Some(&store));
+        assert!(
+            decision
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "policy_approval_store_write"
+                    && f.action == PolicyAction::Block),
+            "{}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn preexec_conditional_cd_keeps_successful_or_branch() {
+    let targets =
+        executable_targets_from_command("cd /first || cd /second && python3 run.py", "/repo");
+    assert!(targets.contains(&"/first/run.py".into()));
+    assert!(targets.contains(&"/second/run.py".into()));
+}
+
+#[test]
+fn excessively_ambiguous_script_directories_require_fresh_review() {
+    let (store, workspace) = temp_store_and_workspace("ambiguous-executable-cwd");
+    let command = format!(
+        "{} python3 run.py",
+        (0..40).map(|i| format!("cd child{i};")).collect::<String>()
+    );
+    let event = build_unattributed_hook_event(
+        &pretool_bash_payload("s", workspace.to_str().unwrap(), &command),
+        "claude-code",
+    )
+    .unwrap();
+    assert!(preexec_artifact_findings(&event, &store)
+        .iter()
+        .any(|f| f.rule_id == "policy_executable_directory_ambiguous"
+            && f.action == PolicyAction::Ask));
+}

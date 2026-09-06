@@ -85,6 +85,18 @@ pub(crate) fn append_system_event_with_policy(
 
 pub(crate) fn record_policy_alert(store: &EventStore, alert: PolicyAlert) -> io::Result<bool> {
     let policy = Policy::load_current();
+    if !matches!(alert.action.as_str(), "block" | "deny")
+        && alert.evidence.as_ref().is_some_and(|e| {
+            housekeeping::is_routine(
+                &policy,
+                &alert.rule_id,
+                alert.path.as_deref().unwrap_or(""),
+                e,
+            )
+        })
+    {
+        return Ok(false);
+    }
     let Some(alert) = prepare_policy_alert(&policy, alert) else {
         return Ok(false);
     };
@@ -99,6 +111,18 @@ pub(crate) fn record_endpoint_policy_alert(
     window_ms: u64,
 ) -> io::Result<bool> {
     let policy = Policy::load_current();
+    if !matches!(alert.action.as_str(), "block" | "deny")
+        && alert.evidence.as_ref().is_some_and(|e| {
+            housekeeping::is_routine(
+                &policy,
+                &alert.rule_id,
+                alert.path.as_deref().unwrap_or(""),
+                e,
+            )
+        })
+    {
+        return Ok(false);
+    }
     let Some(alert) = prepare_policy_alert(&policy, alert) else {
         return Ok(false);
     };
@@ -267,6 +291,132 @@ mod tests {
     }
 
     #[test]
+    fn historical_housekeeping_filter_preserves_actor_source_and_block_boundaries() {
+        let dir = env::temp_dir().join(format!(
+            "gensee-housekeeping-dashboard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "Read",
+                json!({"file_path":"/repo/file"}),
+                1,
+            ))
+            .unwrap();
+        let log = format!(
+            "{}/Library/Logs/Claude/gensee-regression.log",
+            env::var("HOME").unwrap()
+        );
+        for (actor, action, source) in [
+            (true, "warn", "/tmp/from.tmp"),
+            (false, "warn", "/tmp/from.tmp"),
+            (true, "block", "/tmp/from.tmp"),
+            (true, "warn", "/etc/passwd"),
+        ] {
+            let mut a = alert("medium", action);
+            a.rule_id = "hook_bypass_file_mutation".into();
+            a.path = Some(if source == "/etc/passwd" {
+                "/tmp/out.json".into()
+            } else {
+                log.clone()
+            });
+            a.evidence = Some(
+                json!({"logical_operation":if source=="/etc/passwd" {"rename"} else {"mutation"},"actor":{"team_id":if actor {"Q6L2SF6YDW"} else {"FAKE"},"signing_id":"com.anthropic.claudefordesktop"},"file":{"path":source,"mode":0o100644}}),
+            );
+            store.append_policy_alert(&a).unwrap();
+        }
+        let before = store.verify_alert_chain().unwrap();
+        configure_dashboard_noise_filter(&store).unwrap();
+        let state = store.dashboard_state().unwrap();
+        assert_eq!(state["alerts"].as_array().unwrap().len(), 3);
+        let request = state["requests"][0]["request_id"].as_i64().unwrap();
+        assert_eq!(
+            store.dashboard_request(request).unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 4);
+        assert_eq!(store.verify_alert_chain().unwrap(), before);
+    }
+
+    #[test]
+    fn approval_preview_requires_exact_captured_tool_id_and_preceding_event() {
+        let dir = env::temp_dir().join(format!("gensee-approval-context-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "Read",
+                json!({"file_path":"/repo/file"}),
+                1,
+            ))
+            .unwrap();
+        let mut a = alert("medium", "ask");
+        a.rule_id = "policy_credential_content_read".into();
+        a.observed_at_ms = 2;
+        store.append_policy_alert(&a).unwrap();
+        let id = store.dashboard_state().unwrap()["alerts"][0]["alert_id"]
+            .as_i64()
+            .unwrap();
+        let preview = store.approval_context(id).unwrap();
+        assert_eq!(preview["provider"], "cursor");
+        assert_eq!(preview["payload"]["tool_input"]["file_path"], "/repo/file");
+        a.tool_use_id = Some("future-tool".into());
+        store.append_policy_alert(&a).unwrap();
+        let mut future = hook_event("Read", json!({"file_path":"/repo/file"}), 3);
+        future.tool_use_id = Some("future-tool".into());
+        future.raw_json = future.raw_json.replace("\"tool\"", "\"future-tool\"");
+        store.append_hook_event_evidence_only(&future).unwrap();
+        let state = store.dashboard_state().unwrap();
+        for alert in state["alerts"].as_array().unwrap() {
+            let other = alert["alert_id"].as_i64().unwrap();
+            if other != id {
+                assert!(store.approval_context(other).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_alert_projection_deduplicates_only_mutation_warnings() {
+        let dir = env::temp_dir().join(format!("gensee-dashboard-dedupe-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "Read",
+                json!({"file_path":"/repo/file"}),
+                1,
+            ))
+            .unwrap();
+        for (rule, action, time) in [
+            ("hook_bypass_file_mutation", "warn", 1),
+            ("hook_bypass_file_mutation", "warn", 2),
+            ("hook_bypass_file_mutation", "block", 20),
+            ("hook_bypass_file_mutation", "warn", 12003),
+            ("policy_other", "warn", 1),
+            ("policy_other", "warn", 2),
+        ] {
+            let mut a = alert("medium", action);
+            a.rule_id = rule.into();
+            a.observed_at_ms = time;
+            store.append_policy_alert(&a).unwrap();
+        }
+        let state = store.dashboard_state().unwrap();
+        let alerts = state["alerts"].as_array().unwrap();
+        assert_eq!(alerts.len(), 5);
+        assert_eq!(alerts.iter().filter(|a| a["action"] == "block").count(), 1);
+        assert_eq!(
+            alerts
+                .iter()
+                .filter(|a| a["rule_id"] == "policy_other")
+                .count(),
+            2
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 6);
+    }
+
+    #[test]
     fn dashboard_quiets_only_routine_unmatched_mutations() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-dashboard-intent-gap-{}",
@@ -358,9 +508,13 @@ mod tests {
         let chain_before = store.verify_alert_chain().unwrap();
         let policy = policy_with(json!({}));
         store
-            .set_dashboard_noise_filter(move |rule, path, _, _| {
-                policy.is_routine_scratch_alert(rule, path)
-            })
+            .set_dashboard_noise_filter(
+                &[
+                    "policy_write_outside_workspace",
+                    "policy_destructive_file_operation",
+                ],
+                move |rule, path, _, _, _| policy.is_routine_scratch_alert(rule, path),
+            )
             .unwrap();
         let dashboard = store.dashboard_state().unwrap();
         assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 3);

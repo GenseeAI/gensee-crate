@@ -17,7 +17,22 @@ pub(crate) fn preexec_artifact_findings(
     };
     let cwd = event.cwd.as_deref().unwrap_or(".");
     let mut findings = Vec::new();
-    for path in executable_targets_from_command(command, cwd) {
+    let targets = match checked_executable_targets(command, cwd) {
+        Ok(targets) => targets,
+        Err(()) => {
+            return vec![PolicyFinding {
+                action: PolicyAction::Ask,
+                severity: "medium".into(),
+                rule_id: "policy_executable_directory_ambiguous".into(),
+                message:
+                    "Split this command into smaller steps so executable paths can be inspected."
+                        .into(),
+                path: None,
+                evidence: json!({"source":"executable_path_resolution"}),
+            }]
+        }
+    };
+    for path in targets {
         findings.extend(preexec_findings_for_path(event, store, &path));
     }
     findings
@@ -452,21 +467,76 @@ pub(crate) fn content_digest(bytes: &[u8]) -> String {
     format!("sha256:{digest:x}")
 }
 
+#[cfg(test)]
 pub(crate) fn executable_targets_from_command(command: &str, cwd: &str) -> Vec<String> {
+    checked_executable_targets(command, cwd)
+        .expect("test command has bounded directory alternatives")
+}
+
+fn checked_executable_targets(command: &str, cwd: &str) -> Result<Vec<String>, ()> {
     // This resolver intentionally covers common local-script execution forms in
     // the foreground hook. It is not a complete shell parser; EndpointSecurity
     // exec attribution is the durable backstop for obscure eval/subshell cases.
     let mut targets = Vec::new();
-    for segment in split_shell_segments(command) {
-        let tokens = shell_words(&segment);
-        if tokens.is_empty() {
+    let mut directories = vec![cwd.to_string()];
+    let segments = split_shell_segments(command);
+    if segments.len() > 256 {
+        return Err(());
+    }
+    let mut cursor = 0;
+    let mut preceding_pipe = false;
+    let mut preceding_or = false;
+    for (index, segment) in segments.iter().enumerate() {
+        let tokens = shell_words(segment);
+        let end = command[cursor..]
+            .find(segment)
+            .map(|at| cursor + at + segment.len())
+            .unwrap_or(cursor);
+        let suffix = command[end..].trim_start();
+        let pipe = suffix.starts_with('|') && !suffix.starts_with("||");
+        let and = suffix.starts_with("&&");
+        cursor = end;
+        if strip_leading_env_assignments(&tokens)
+            .first()
+            .map(String::as_str)
+            == Some("cd")
+        {
+            let next: Vec<_> = directories
+                .iter()
+                .map(|directory| leading_bash_effective_cwd(segment, directory))
+                .collect();
+            if and && !preceding_pipe && !preceding_or {
+                directories = next;
+            } else if suffix.starts_with(';')
+                || suffix.starts_with("||")
+                || (and && (preceding_pipe || preceding_or))
+            {
+                directories.extend(next);
+            }
+            directories.sort();
+            directories.dedup();
+            if directories.len() > 32 {
+                return Err(());
+            }
+            preceding_pipe = pipe;
+            preceding_or = suffix.starts_with("||");
             continue;
         }
-        collect_input_redirection_targets(&tokens, cwd, &mut targets);
-        collect_direct_execution_targets(&tokens, cwd, &mut targets);
+        for directory in &directories {
+            collect_input_redirection_targets(&tokens, directory, &mut targets);
+            collect_direct_execution_targets(&tokens, directory, &mut targets);
+            if pipe && index + 1 < segments.len() {
+                collect_piped_cat_execution_targets(
+                    &format!("{} | {}", segment, segments[index + 1]),
+                    directory,
+                    &mut targets,
+                );
+            }
+        }
+        preceding_pipe = pipe;
+        preceding_or = suffix.starts_with("||");
     }
-    collect_piped_cat_execution_targets(command, cwd, &mut targets);
-    dedupe_paths(targets)
+    Ok(dedupe_paths(targets))
 }
 
 pub(crate) fn collect_direct_execution_targets(

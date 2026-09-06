@@ -845,6 +845,30 @@ struct DashboardSettingsPage: View {
                     }
                 }
 
+                DashboardCard("Remembered Approvals") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("Scoped permissions for future matching actions.").font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Refresh") { Task { await model.refreshRememberedApprovals() } }
+                        }
+                        if let issue = model.approvalMemoryIssue { Text(issue).font(.caption).foregroundStyle(.orange) }
+                        if model.rememberedApprovals.isEmpty { Text("No active approvals.").font(.caption).foregroundStyle(.secondary) }
+                        ForEach(model.rememberedApprovals) { approval in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("\(approval.provider) · \(approval.scope.capitalized)").font(.system(size: 12, weight: .semibold))
+                                    Text("Project: \(approval.project)").font(.caption2).foregroundStyle(.secondary)
+                                    Text(approval.path).font(.system(size: 10, design: .monospaced)).textSelection(.enabled)
+                                    Text("\(approval.rule) · Expires \(Date(timeIntervalSince1970: TimeInterval(approval.expires_at) / 1000).formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("Revoke") { Task { await model.revokeApproval(approval.id) } }
+                            }
+                        }
+                    }.task { await model.refreshRememberedApprovals() }
+                }
+
                 DashboardCard("Notifications") {
                     notificationSettings
                 }

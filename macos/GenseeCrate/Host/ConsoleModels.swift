@@ -280,6 +280,29 @@ struct SecurityAlert: Decodable, Identifiable {
 
     var id: Int64 { alertID }
 
+    var reviewStatus: String {
+        switch action.lowercased() {
+        case "block", "deny": return "Blocked"
+        case "ask": return "Approval requested"
+        case "warn": return "Review"
+        default: return "Allowed"
+        }
+    }
+
+    var findingSummary: String {
+        guard ruleID == "policy_destructive_file_operation", let evidence,
+              let data = evidence.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let operation = value["logical_operation"] as? String else { return message }
+        let label: String
+        switch operation {
+        case "delete": label = "Observed file removal"
+        case "rename": label = "Observed file rename"
+        default: return message
+        }
+        return path.map { "\(label): \($0)" } ?? label
+    }
+
     enum CodingKeys: String, CodingKey {
         case alertID = "alert_id"
         case requestID = "request_id"
@@ -824,4 +847,17 @@ struct CoworkEvidenceStatus: Decodable {
         evidence.filter { $0.source == source && (origin == nil || $0.origin == origin) }
             .map { Date(timeIntervalSince1970: Double($0.lastEventAt) / 1_000) }.max()
     }
+}
+
+struct RememberedApproval: Decodable, Identifiable {
+    let id: String
+    let key: String
+    let provider: String
+    let project: String
+    let path: String
+    let rule: String
+    let scope: String
+    let session: String
+    let expires_at: UInt64
+    let tool_input_preview: String?
 }

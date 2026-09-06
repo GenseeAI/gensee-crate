@@ -142,6 +142,8 @@
       "filename_contains": [],
       "path_suffixes": [
         "/.gensee/gensee.db",
+        "/.gensee/approvals.json",
+        "/.gensee/approvals.lock",
         "/.omnigent",
         "/.agents/hooks.json",
         "/.gemini/config/hooks.json",

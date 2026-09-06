@@ -3,6 +3,8 @@ import Foundation
 
 @MainActor
 final class ConsoleModel: ObservableObject {
+    @Published private(set) var rememberedApprovals: [RememberedApproval] = []
+    @Published private(set) var approvalMemoryIssue: String?
     @Published private(set) var snapshot = SecuritySnapshot()
     @Published private(set) var runs = RunListResponse()
     @Published private(set) var policy = PolicySummary()
@@ -281,11 +283,10 @@ final class ConsoleModel: ObservableObject {
             let refreshedSnapshot = try await cli.decode(
                 SecuritySnapshot.self,
                 arguments: ["dashboard-state"],
-                // A cold projection of a large encrypted experimental store can
-                // take about a minute; warm refreshes are faster. Preserve a
-                // finite deadline and retry behavior without making first launch
-                // permanently look empty on stores that are still healthy.
-                timeout: hasLoadedDashboardSnapshot ? 45 : 75
+                // Multi-million-event histories can exceed 45 seconds even on
+                // later refreshes. Keep one bounded background refresh in flight
+                // and retain the prior snapshot while the projection completes.
+                timeout: 90
             )
             guard acceptsLiveData(generation: liveGeneration) else { return }
             hasLoadedDashboardSnapshot = true
@@ -893,6 +894,39 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
+    func refreshRememberedApprovals() async {
+        guard !isDemoMode, backendAvailable else { return }
+        do {
+            rememberedApprovals = try await cli.decode([RememberedApproval].self, arguments: ["approval", "list"])
+            approvalMemoryIssue = nil
+        } catch { approvalMemoryIssue = error.localizedDescription }
+    }
+
+    func previewApproval(_ alert: SecurityAlert) async -> RememberedApproval? {
+        guard !isDemoMode, backendAvailable else { return nil }
+        do {
+            return try await cli.decode(RememberedApproval.self, arguments: ["approval", "preview", "--alert-id", String(alert.alertID)])
+        } catch { errorMessage = error.localizedDescription; return nil }
+    }
+
+    func rememberApproval(_ alert: SecurityAlert, preview: RememberedApproval, scope: String) async -> Bool {
+        guard !isDemoMode, backendAvailable else { return false }
+        do {
+            _ = try await cli.run(["approval", "grant", "--alert-id", String(alert.alertID), "--scope", scope, "--expected-key", preview.key])
+            noticeMessage = "Approval saved for future matching actions. Retry the action in your harness."
+            await refreshRememberedApprovals()
+            return true
+        } catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    func revokeApproval(_ id: String) async {
+        guard !isDemoMode, backendAvailable else { return }
+        do {
+            _ = try await cli.run(["approval", "revoke", "--id", id])
+            await refreshRememberedApprovals()
+        } catch { approvalMemoryIssue = error.localizedDescription }
+    }
+
     /// Persist a rule-scoped review adjustment in the active policy. Unlike
     /// thumbs feedback, this changes how the same rule is classified and
     /// enforced for future findings while preserving the immutable alert log.
@@ -1171,7 +1205,8 @@ final class ConsoleModel: ObservableObject {
             }
             let preparedSnapshot = try await cli.decode(
                 SecuritySnapshot.self,
-                arguments: ["dashboard-state"]
+                arguments: ["dashboard-state"],
+                timeout: 90
             )
             hasLoadedDashboardSnapshot = true
             snapshot = preparedSnapshot

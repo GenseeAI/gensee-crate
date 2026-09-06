@@ -317,28 +317,44 @@ impl EventStore {
             sqlite: Arc::new(Mutex::new(sqlite)),
             encryption_key,
         };
-        store.set_dashboard_noise_filter(|_, _, _, _| false)?;
+        store.set_dashboard_noise_filter(&[], |_, _, _, _, _| false)?;
         Ok(store)
     }
 
     /// The caller supplies presentation policy. No stored alerts or hash-chain
     /// fields are changed; raw evidence remains available through alerts APIs.
-    pub fn set_dashboard_noise_filter<F>(&self, is_noise: F) -> io::Result<()>
+    pub fn set_dashboard_noise_filter<F>(
+        &self,
+        candidate_rules: &[&str],
+        is_noise: F,
+    ) -> io::Result<()>
     where
-        F: Fn(&str, &str, &str, &str) -> bool + Send + std::panic::UnwindSafe + 'static,
+        F: Fn(&str, &str, &str, &str, &str) -> bool + Send + std::panic::UnwindSafe + 'static,
     {
+        let candidates: std::collections::HashSet<String> =
+            candidate_rules.iter().map(|r| (*r).to_string()).collect();
+        self.sqlite_store()?
+            .connection()
+            .create_scalar_function(
+                "gensee_dashboard_alert_is_routine_candidate",
+                1,
+                FunctionFlags::SQLITE_UTF8,
+                move |context| Ok(candidates.contains(&context.get::<String>(0)?)),
+            )
+            .map_err(sqlite_error_from_rusqlite)?;
         let cache = Mutex::new(HashMap::new());
         self.sqlite_store()?
             .connection()
             .create_scalar_function(
                 "gensee_dashboard_alert_is_routine",
-                4,
+                5,
                 FunctionFlags::SQLITE_UTF8,
                 move |context| {
                     let rule = context.get::<String>(0)?;
                     let path = context.get::<String>(1)?;
                     let workspace = context.get::<String>(2)?;
                     let operation = context.get::<String>(3)?;
+                    let evidence = context.get::<String>(4)?;
                     let mut cache = cache
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -351,8 +367,11 @@ impl EventStore {
                             path.clone(),
                             workspace.clone(),
                             operation.clone(),
+                            evidence.clone(),
                         ))
-                        .or_insert_with(|| is_noise(&rule, &path, &workspace, &operation)))
+                        .or_insert_with(|| {
+                            is_noise(&rule, &path, &workspace, &operation, &evidence)
+                        }))
                 },
             )
             .map_err(sqlite_error_from_rusqlite)
@@ -700,6 +719,99 @@ impl EventStore {
         db.list_alerts().map_err(sqlite_error)
     }
 
+    /// Session-scoped approvals cannot outlive a recorded session termination.
+    pub fn approval_session_has_ended(&self, session_id: &str) -> io::Result<bool> {
+        Ok(latest_session_by_id(
+            &self.sessions_path(),
+            self.encryption_key.as_ref(),
+            session_id,
+        )?
+        .is_some_and(|session| session.ended_at_ms.is_some()))
+    }
+
+    /// Approval UI requires the exact captured PreToolUse input, never a display summary.
+    pub fn approval_context(&self, alert_id: i64) -> io::Result<Value> {
+        let (rule, path, provider, session, tool_id, timestamp): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        ) = {
+            let db = self.sqlite_store()?;
+            db.connection()
+                .query_row(
+                    "SELECT a.rule_id, a.path, ae.source, r.session_id, ae.tool_use_id, ae.ts
+                 FROM alerts a JOIN requests r ON r.request_id = a.request_id
+                 JOIN agent_events ae ON ae.request_id = a.request_id
+                   AND ae.tool_use_id = json_extract(a.evidence, '$.tool_use_id')
+                   AND ae.type = 'PreToolUse' AND ae.ts <= a.created_at
+                 WHERE a.alert_id = ?1 AND a.action = 'ask'
+                 ORDER BY ae.event_id DESC LIMIT 1",
+                    [alert_id],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
+                )
+                .map_err(sqlite_error_from_rusqlite)?
+        };
+        // SQLite stores a display summary of tool input, which cannot authorize
+        // an exact repeat. Recover the original captured input by exact identity.
+        // This bounded scan runs only for a human preview/grant, never on hooks.
+        use std::io::{Seek, SeekFrom};
+        const SCAN_BYTES: u64 = 64 * 1024 * 1024;
+        let mut file = fs::File::open(self.hooks_path())?;
+        let offset = file.metadata()?.len().saturating_sub(SCAN_BYTES);
+        file.seek(SeekFrom::Start(offset))?;
+        let mut reader = BufReader::new(file.take(SCAN_BYTES));
+        if offset > 0 {
+            let mut partial = Vec::new();
+            reader.read_until(b'\n', &mut partial)?;
+        }
+        let mut payload = None;
+        for line in reader.lines() {
+            let line = line?;
+            let decoded = if line.starts_with(JSONL_ENCRYPTED_PREFIX) {
+                let Some(key) = self.encryption_key.as_ref() else {
+                    continue;
+                };
+                let Ok(decoded) = decrypt_jsonl_line(key, &line) else {
+                    continue;
+                };
+                decoded
+            } else {
+                line
+            };
+            let Ok(event) = serde_json::from_str::<AgentHookEvent>(&decoded) else {
+                continue;
+            };
+            if event.provider == provider
+                && event.session_id.as_deref() == Some(&session)
+                && event.tool_use_id.as_deref() == Some(&tool_id)
+                && event.observed_at_ms == timestamp as u64
+                && event.hook_event_name.as_deref() == Some("PreToolUse")
+            {
+                let mut raw: Value =
+                    serde_json::from_str(&event.raw_json).map_err(io::Error::other)?;
+                raw["session_id"] = json!(session);
+                raw["cwd"] = json!(event.cwd);
+                raw["tool_name"] = json!(event.tool_name);
+                raw["hook_event_name"] = json!("PreToolUse");
+                payload = Some(raw);
+            }
+        }
+        let payload = payload.ok_or_else(|| io::Error::other("The original tool input is no longer available for approval. Retry the action in your harness."))?;
+        Ok(json!({"rule":rule,"path":path,"provider":provider,"payload":payload}))
+    }
+
     pub fn has_recent_file_intent(&self, path: &str, observed_at_ms: u64) -> io::Result<bool> {
         let db = self.sqlite_store()?;
         let ts = to_i64(observed_at_ms)?;
@@ -1006,6 +1118,15 @@ impl EventStore {
     }
 
     pub fn dashboard_state(&self) -> io::Result<Value> {
+        let timing_start = Instant::now();
+        let timing = |phase: &str| {
+            if std::env::var_os("GENSEE_DASHBOARD_TIMING").is_some() {
+                eprintln!(
+                    "dashboard {phase}: {}ms",
+                    timing_start.elapsed().as_millis()
+                );
+            }
+        };
         // Dashboard refresh is outside the agent authorization path and is a
         // natural opportunity to advance one bounded visibility-rules batch.
         // Failure leaves the previous cached classification usable and will be
@@ -1019,7 +1140,9 @@ impl EventStore {
         let db = self.sqlite_store()?;
         let conn = db.connection();
         let groups = DashboardRequestGroups::load(conn)?;
+        timing("groups");
         materialize_dashboard_visible_alerts(conn)?;
+        timing("visible alerts");
         let mut alerts = dashboard_alerts_from_relation(
             conn,
             DashboardAlertQuery {
@@ -1160,7 +1283,9 @@ impl EventStore {
                 "ignored_file_touch_paths": [],
             }))
         })?;
+        timing("request rollups");
         let request_file_touches = dashboard_request_file_touches(conn)?;
+        timing("file touches");
         for request in &mut requests {
             let request_id = request["request_id"].as_i64().unwrap_or_default();
             let observed_touches = request_file_touches
@@ -1177,6 +1302,7 @@ impl EventStore {
                 .collect::<Vec<_>>());
             request["summary_file_touches"] = json!(touches);
         }
+        timing("native touches");
         requests = groups.merge_requests(requests);
         for request in &mut requests {
             let id = request["request_id"].as_i64().unwrap();
@@ -1193,6 +1319,7 @@ impl EventStore {
             request["decision_count"] = json!(decisions);
         }
 
+        timing("group rollups");
         groups.project_events(&mut agent_events);
         groups.project_events(&mut alerts);
         let artifact_query = "SELECT kind, uri, current_digest, last_seen_at,
@@ -1280,6 +1407,7 @@ impl EventStore {
                 }))
             },
         )?;
+        timing("artifacts and relations");
         let dashboard_summary_sql = "SELECT
                 (SELECT COUNT(*) FROM sessions),
                 (SELECT COUNT(*) FROM requests),
@@ -4108,7 +4236,7 @@ fn dashboard_request_file_touches(
          ),
          request_artifacts AS MATERIALIZED (
             SELECT request_relation.src_id AS request_id,
-                   artifacts.artifact_id,
+                   artifacts.artifact_id, artifacts.kind AS artifact_kind, artifacts.uri AS artifact_uri,
                    CASE
                      WHEN artifacts.uri LIKE 'file://%' THEN substr(artifacts.uri, 8)
                      WHEN artifacts.uri LIKE 'file:%' THEN substr(artifacts.uri, 6)
@@ -4161,7 +4289,9 @@ fn dashboard_request_file_touches(
              AND system_events.request_id = request_artifacts.request_id
              AND system_events.source = 'macos-endpoint-security'
             LEFT JOIN artifact_facts
-              ON artifact_facts.current_artifact_id = request_artifacts.artifact_id
+              ON artifact_facts.kind = request_artifacts.artifact_kind
+             AND artifact_facts.uri = request_artifacts.artifact_uri
+             AND artifact_facts.current_artifact_id = request_artifacts.artifact_id
             GROUP BY request_artifacts.request_id, request_artifacts.artifact_id,
                      request_artifacts.path
          ),
@@ -4667,13 +4797,24 @@ fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
     let path = format!("COALESCE({alias}.path, '')");
     let lower_path = format!("lower({path})");
     format!(
-        "NOT ({alias}.rule_id = 'unmatched_system_effect'
+        "NOT (lower({alias}.action) NOT IN ('deny', 'block') AND {alias}.rule_id = 'unmatched_system_effect'
               AND {alias}.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
          AND NOT (lower({alias}.action) NOT IN ('deny', 'block')
-                  AND gensee_dashboard_alert_is_routine({alias}.rule_id, {path},
+                  AND CASE WHEN gensee_dashboard_alert_is_routine_candidate({alias}.rule_id)
+                    THEN gensee_dashboard_alert_is_routine({alias}.rule_id, {path},
                     COALESCE(json_extract({alias}.evidence, '$.attribution.workspace_root'), ''),
-                    COALESCE(json_extract({alias}.evidence, '$.logical_operation'), '')))
-         AND NOT ({alias}.rule_id = 'hook_bypass_file_mutation' AND (
+                    COALESCE(json_extract({alias}.evidence, '$.logical_operation'), ''), json_object(
+                      'logical_operation', json_extract({alias}.evidence, '$.logical_operation'),
+                      'actor', json_object('executable_path', json_extract({alias}.evidence, '$.actor.executable_path'),
+                        'signing_id', json_extract({alias}.evidence, '$.actor.signing_id'),
+                        'team_id', json_extract({alias}.evidence, '$.actor.team_id'),
+                        'platform_binary', json_extract({alias}.evidence, '$.actor.platform_binary')),
+                      'file', json_object('path', json_extract({alias}.evidence, '$.file.path'),
+                        'mode', json_extract({alias}.evidence, '$.file.mode'),
+                        'path_truncated', json_extract({alias}.evidence, '$.file.path_truncated')),
+                      'destination', json_object('path_truncated', json_extract({alias}.evidence, '$.destination.path_truncated')))
+) ELSE 0 END)
+         AND NOT (lower({alias}.action) NOT IN ('deny', 'block') AND {alias}.rule_id = 'hook_bypass_file_mutation' AND (
               {path} GLOB '/dev/*'
               OR {lower_path} LIKE '%/library/application support/codex/%'
               OR {lower_path} LIKE '%/library/application support/claude/%'
@@ -4709,7 +4850,7 @@ fn dashboard_visible_alerts_cte_with_scope(request_scope: Option<&str>) -> Strin
                        ORDER BY alerts.created_at, alerts.alert_id
                    ) AS previous_related_alert_at
             FROM alerts
-            WHERE {base_visibility}
+            WHERE alerts.rule_id = 'hook_bypass_file_mutation' AND {base_visibility}
               {request_scope}
          ),
          visible_alerts AS MATERIALIZED (
@@ -4719,6 +4860,11 @@ fn dashboard_visible_alerts_cte_with_scope(request_scope: Option<&str>) -> Strin
                OR lower(action) IN ('block', 'deny')
                OR previous_related_alert_at IS NULL
                OR created_at - previous_related_alert_at > 10000
+            UNION ALL
+            SELECT alerts.*, NULL AS previous_related_alert_at
+            FROM alerts
+            WHERE alerts.rule_id != 'hook_bypass_file_mutation' AND {base_visibility}
+              {request_scope}
          )"
     )
 }
