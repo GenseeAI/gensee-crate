@@ -42,12 +42,14 @@ final class ConsoleModel: ObservableObject {
     let endpointSensor: EndpointSecuritySensor
     private var cli: GenseeCLI
     private var dashboardRefreshInProgress = false
-    private var policyRefreshInProgress = false
+    private let policyRefresh = CoalescingRefresh()
     private var hasConfirmedEndpointMode = false
     private var readAlertBaselineCount = 0
     private var readThroughAlertID: Int64 = 0
     private var harnessVerificationBaselines: [String: Int64] = [:]
     private var hasLoadedDashboardSnapshot = false
+    var hasLiveDashboardSnapshot: Bool { hasLoadedDashboardSnapshot && !isDemoMode }
+    var onLiveSnapshotLoaded: ((SecuritySnapshot) -> Void)?
     private var lastDashboardRefreshDuration: TimeInterval = 0
     private var snapshotBeforeDemo = SecuritySnapshot()
     private var recoveryPointsBeforeDemo: [Int64: WorkspaceCheckpointRecord] = [:]
@@ -232,18 +234,31 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshPolicy() async {
-        guard !isDemoMode, backendAvailable, !policyRefreshInProgress else { return }
-        policyRefreshInProgress = true
-        defer { policyRefreshInProgress = false }
+        guard !isDemoMode, backendAvailable else { return }
+        await policyRefresh.run { [weak self] in
+            await self?.loadCurrentPolicy()
+        }
+    }
+
+    private func loadCurrentPolicy() async {
+        guard !isDemoMode, backendAvailable else { return }
+        let liveGeneration = dataSourceGeneration
         var next = policy
         do {
             next.source = try await cli.run(["policy", "path"]).stdout
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             next.systemEvents = try await policyString("watch.system_events") ?? next.systemEvents
             next.endpointSecurityMode = try await policyString("endpoint_security.mode") ?? next.endpointSecurityMode
-            policy.endpointSecurityMode = next.endpointSecurityMode
-            hasConfirmedEndpointMode = true
+            guard acceptsLiveData(generation: liveGeneration), !policyRefresh.hasPendingRefresh else { return }
+            // Health alarms can use a confirmed mode even if the full policy
+            // or optional settings fail to load later in this pass.
             endpointSensor.setConfiguredMode(next.endpointSecurityMode)
+            let document = try await loadPolicyDocument()
+            guard acceptsLiveData(generation: liveGeneration), !policyRefresh.hasPendingRefresh else { return }
+            policy.endpointSecurityMode = next.endpointSecurityMode
+            policyDocument = document
+            hasConfirmedEndpointMode = true
+            configureEndpointSensor()
             next.noninteractive = try await policyBool("enforcement.noninteractive") ?? next.noninteractive
             next.requireProxy = try await policyBool("egress.require_proxy") ?? next.requireProxy
             next.maxRuntimeSeconds = try await policyInt("runtime.max_runtime_seconds")
@@ -263,13 +278,16 @@ final class ConsoleModel: ObservableObject {
                    let behavior = RecoveryFailureBehavior(rawValue: value) {
                     recovery.failureBehavior = behavior
                 }
+                guard acceptsLiveData(generation: liveGeneration), !policyRefresh.hasPendingRefresh else { return }
                 recoveryPointSettings = recovery
             }
+            guard acceptsLiveData(generation: liveGeneration), !policyRefresh.hasPendingRefresh else { return }
             policy = next
-            policyDocument = try await loadPolicyDocument()
+            policyDocument = document
             refreshIntegrations()
             configureEndpointSensor()
         } catch {
+            guard acceptsLiveData(generation: liveGeneration), !policyRefresh.hasPendingRefresh else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -298,6 +316,9 @@ final class ConsoleModel: ObservableObject {
             hasLoadedDashboardSnapshot = true
             reconcileReadAlertState(alertCount: refreshedSnapshot.summary.alertsCount)
             snapshot = refreshedSnapshot
+            // Seed synchronously before another MainActor task can merge a
+            // newly completed request into this first validated live snapshot.
+            onLiveSnapshotLoaded?(refreshedSnapshot)
             reconcileHarnessVerification()
             configureEndpointSensor()
             lastUpdated = Date()
@@ -1146,6 +1167,7 @@ final class ConsoleModel: ObservableObject {
             return false
         }
 
+        let liveGeneration = dataSourceGeneration
         runningCommand = "Preparing the local Gensee runtime"
         defer { runningCommand = nil }
         do {
@@ -1173,8 +1195,10 @@ final class ConsoleModel: ObservableObject {
                 arguments: ["dashboard-state"],
                 timeout: 90
             )
+            guard acceptsLiveData(generation: liveGeneration) else { return false }
             hasLoadedDashboardSnapshot = true
             snapshot = preparedSnapshot
+            onLiveSnapshotLoaded?(preparedSnapshot)
             reconcileReadAlertState(alertCount: preparedSnapshot.summary.alertsCount)
             reconcileHarnessVerification()
             await refreshPolicy()

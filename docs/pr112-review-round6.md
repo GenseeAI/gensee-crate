@@ -1,0 +1,10 @@
+# PR #112 review 5126755983
+
+This pass addresses the four macOS lifecycle findings in the review.
+
+- **Delayed extension approval:** the application delegate checks status when the app becomes active and every 15 seconds while the extension is not active. Busy extension operations are left alone. The first active result starts the sensor; subsequent results reconnect only if the sensor reports disconnected, preserving a healthy XPC connection and its continuity state.
+- **Concurrent policy changes:** policy refreshes now coalesce into a shared asynchronous task. Requests received during a pass schedule another pass, and every caller waits until the task drains. Superseded results cannot overwrite or push an older policy. A validated mode and policy document can configure the sensor before optional recovery settings finish loading; custom protected paths are loaded before that push. Demo transitions invalidate in-flight policy results.
+- **Completion startup baseline:** accepting the first live dashboard snapshot synchronously seeds notification history, before another task can merge a completion. Both notification loops use validated live-snapshot readiness instead of the timestamp that demo mode also sets. The local-runtime preparation path uses the same seed and rejects results from an obsolete demo generation. Later snapshots never reseed the baseline.
+- **Monitoring-gap lifetime:** stable health clears availability/stall banners only. An event-loss banner survives subsequent healthy intervals. A repeated outage gets the same grace period before restoring a dismissed banner; notification deduplication remains in effect until stable recovery.
+
+Validation: the macOS harness suite passes 104 tests, including new coverage for overlapping policy refreshes, first-completion eligibility after initial seeding, and persistent event-loss banners. The re-outage test now verifies grace before banner restoration. The unsigned full application build passes. This pass does not activate or replace the installed sensor; approving an extension in System Settings and native notification delivery still require a signed interactive application.

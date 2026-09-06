@@ -894,3 +894,28 @@ struct RememberedApproval: Decodable, Identifiable {
     let read_scope: String?
     var isReadException: Bool { read_scope != nil }
 }
+
+/// Runs one refresh at a time and drains requests received during suspension.
+/// Every caller waits for the final pass, including callers that joined a run.
+@MainActor
+final class CoalescingRefresh {
+    private var task: Task<Void, Never>?
+    private(set) var hasPendingRefresh = false
+
+    func run(_ refresh: @escaping @MainActor () async -> Void) async {
+        hasPendingRefresh = true
+        if let task {
+            await task.value
+            return
+        }
+        let task = Task { @MainActor in
+            repeat {
+                self.hasPendingRefresh = false
+                await refresh()
+            } while self.hasPendingRefresh
+            self.task = nil
+        }
+        self.task = task
+        await task.value
+    }
+}

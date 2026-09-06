@@ -38,7 +38,7 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     private let center = UNUserNotificationCenter.current()
     private let defaults = UserDefaults.standard
     private let logger = Logger(subsystem: "ai.gensee.crate", category: "notifications")
-    private var hasSeededCurrentStore = false
+    private var initialSnapshotBaseline = CompletionNotificationBaseline()
     // Only requests that have actually produced an actionable completion
     // notification belong here. Clean completions must remain eligible to
     // notify later when delayed Endpoint Security evidence turns them into a
@@ -201,19 +201,25 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         }
     }
 
+    /// Called synchronously when the model accepts its first live snapshot.
+    /// Demo snapshots never enter this path, and later refreshes cannot swallow
+    /// new completions into the historical baseline.
+    @discardableResult
+    func seedInitialSnapshot(_ snapshot: SecuritySnapshot) -> Bool {
+        guard initialSnapshotBaseline.seed(
+            snapshot, requestIDs: &notifiedRequestIDs, alertIDs: &notifiedAlertIDs
+        ) else { return false }
+        persistNotifiedRequests()
+        persistNotifiedAlerts()
+        return true
+    }
+
     func process(snapshot: SecuritySnapshot, now: Date = Date()) async {
-        let summaries = AgentCompletionDerivation.summaries(from: snapshot)
-        guard hasSeededCurrentStore else {
-            // The first refresh is history, not a burst of newly completed work.
-            notifiedRequestIDs.formUnion(summaries.map(\.requestID))
-            notifiedAlertIDs.formUnion(snapshot.alerts.map(\.alertID))
-            persistNotifiedRequests()
-            persistNotifiedAlerts()
-            hasSeededCurrentStore = true
+        if seedInitialSnapshot(snapshot) {
             await sendDailyBriefingIfNeeded(snapshot: snapshot, now: now)
             return
         }
-
+        let summaries = AgentCompletionDerivation.summaries(from: snapshot)
         let actionable = Self.newlyActionableSummaries(
             summaries,
             excluding: notifiedRequestIDs
@@ -421,4 +427,18 @@ extension CompletionNotificationCoordinator: UNUserNotificationCenterDelegate {
 
 extension Notification.Name {
     static let genseeOpenAgentReview = Notification.Name("ai.gensee.crate.open-agent-review")
+}
+
+/// Keeps startup history separate from later watcher updates. Independent of
+/// macOS notification delivery so the startup boundary is testable headlessly.
+struct CompletionNotificationBaseline {
+    private var hasSeeded = false
+
+    mutating func seed(_ snapshot: SecuritySnapshot, requestIDs: inout Set<Int64>, alertIDs: inout Set<Int64>) -> Bool {
+        guard !hasSeeded else { return false }
+        requestIDs.formUnion(AgentCompletionDerivation.summaries(from: snapshot).map(\.requestID))
+        alertIDs.formUnion(snapshot.alerts.map(\.alertID))
+        hasSeeded = true
+        return true
+    }
 }

@@ -25,12 +25,29 @@ final class EndpointSensorHealthTests: XCTestCase {
         _ = tracker.observe(health, now: start.advanced(by: .seconds(12)))
         health.connected = false
         XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(32))))
+        XCTAssertEqual(tracker.bannerRevision, dismissedRevision, "A short re-outage must not restore a dismissed alarm")
+        XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(42))))
         XCTAssertGreaterThan(tracker.bannerRevision, dismissedRevision)
         XCTAssertEqual(tracker.bannerIncident, .unavailable)
         health.connected = true
-        _ = tracker.observe(health, now: start.advanced(by: .seconds(40)))
-        _ = tracker.observe(health, now: start.advanced(by: .seconds(70)))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(43)))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(73)))
         XCTAssertNil(tracker.bannerIncident)
+    }
+
+    func testEventLossBannerSurvivesContinuousHealthyRecoveryWindows() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
+        _ = tracker.observe(health, now: start)
+        health.kernelDrops = 100
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(29))), .events(100))
+        let revision = tracker.bannerRevision
+        for second in [30, 60, 90, 120] {
+            XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(second))))
+            XCTAssertEqual(tracker.bannerIncident, .events(100))
+            XCTAssertEqual(tracker.bannerRevision, revision, "Recovery must neither clear nor restore a dismissed event-loss cue")
+        }
     }
 
     func testDeathDuringSleepAlarmsFortyActiveSecondsAfterWake() {

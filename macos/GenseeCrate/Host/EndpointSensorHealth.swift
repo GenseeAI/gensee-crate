@@ -66,6 +66,7 @@ struct MonitoringGapAlarmTracker {
     private var lastAlarm: SuspendingClock.Instant?
     private var unavailableSince: SuspendingClock.Instant?
     private var healthySince: SuspendingClock.Instant?
+    private var restoredOutageBanner = false
     private var interruptions: [SuspendingClock.Instant] = []
     private var alarmedKinds: Set<OutageKind> = []
     private var graceUntil: SuspendingClock.Instant?
@@ -107,18 +108,21 @@ struct MonitoringGapAlarmTracker {
             healthySince = nil
             interruptions.removeAll { $0.duration(to: now) > .seconds(60) }
             let newOutage = unavailableSince == nil
-            if newOutage { unavailableSince = now; interruptions.append(now) }
+            if newOutage {
+                unavailableSince = now
+                interruptions.append(now)
+                restoredOutageBanner = false
+            }
             let kind: OutageKind = unavailable ? .unavailable : .stalled
             let incident: MonitoringHealthIncident = unavailable ? .unavailable : .stalled
-            // A new outage restores a dismissed banner even while notification
-            // delivery is latched. The initial notification still has grace.
-            if newOutage && !alarmedKinds.isEmpty { setBanner(incident, newIncident: true) }
-            if (unavailableSince!.duration(to: now) >= .seconds(10) || interruptions.count >= 3),
-               alarmedKinds.insert(kind).inserted {
-                // One notification per incident kind until stable recovery.
-                // The persistent banner carries the unresolved status.
-                setBanner(incident)
-                return incident
+            if unavailableSince!.duration(to: now) >= .seconds(10) || interruptions.count >= 3 {
+                // A re-outage also gets grace before restoring a dismissed
+                // banner. Native notifications remain latched until recovery.
+                if !restoredOutageBanner || bannerIncident != incident {
+                    setBanner(incident, newIncident: true)
+                    restoredOutageBanner = true
+                }
+                if alarmedKinds.insert(kind).inserted { return incident }
             }
             return nil
         }
@@ -128,7 +132,10 @@ struct MonitoringGapAlarmTracker {
             alarmedKinds.removeAll()
             resetOutageWindow()
             healthySince = now
-            setBanner(nil)
+            // Recovery restores availability, not the missing event history.
+            if bannerIncident == .unavailable || bannerIncident == .stalled {
+                setBanner(nil)
+            }
         }
         defer { previous = health }
         guard let previous, previous.bootID == health.bootID,

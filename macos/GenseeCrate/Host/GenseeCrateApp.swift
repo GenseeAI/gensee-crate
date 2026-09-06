@@ -27,11 +27,15 @@ private final class GenseeAppDelegate: NSObject, NSApplicationDelegate {
     let notifications = CompletionNotificationCoordinator()
     private var extensionSubscription: AnyCancellable?
     private var hasActivatedSensor = false
+    private var activationDiscoveryTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Register the status item from the AppKit application lifecycle. A
         // SwiftUI view can be restored without re-running its appearance
         // callback, which previously left the app without its durable menu.
+        consoleModel.onLiveSnapshotLoaded = { [weak notifications] snapshot in
+            notifications?.seedInitialSnapshot(snapshot)
+        }
         statusItem.start(model: consoleModel)
         notifications.startMonitoringHealth { [weak self] in
             guard let self, self.hasActivatedSensor, !self.consoleModel.isDemoMode else { return nil }
@@ -39,15 +43,42 @@ private final class GenseeAppDelegate: NSObject, NSApplicationDelegate {
         }
         extensionSubscription = extensionManager.$state.sink { [weak self] state in
             guard let self, state == .active else { return }
-            self.hasActivatedSensor = true
-            self.consoleModel.endpointSensor.start()
-            self.consoleModel.endpointSensor.reconnect()
+            if !self.hasActivatedSensor {
+                self.hasActivatedSensor = true
+                self.consoleModel.endpointSensor.start()
+            } else if !self.consoleModel.endpointSensor.health.connected {
+                self.consoleModel.endpointSensor.reconnect()
+            }
         }
         extensionManager.refreshStatus()
+        // Approval can arrive in System Settings after the original activation
+        // request's process has exited, or while every app window is closed.
+        activationDiscoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled, let self else { return }
+                if self.extensionManager.state != .active {
+                    self.refreshExtensionStatusIfIdle()
+                }
+            }
+        }
         Task { [weak model = consoleModel] in
             await model?.refreshStableHookBackendIfNeeded()
             await model?.refreshAll()
         }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        refreshExtensionStatusIfIdle()
+    }
+
+    private func refreshExtensionStatusIfIdle() {
+        guard !extensionManager.state.isBusy else { return }
+        extensionManager.refreshStatus()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        activationDiscoveryTask?.cancel()
     }
 }
 

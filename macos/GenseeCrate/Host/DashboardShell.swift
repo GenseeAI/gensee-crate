@@ -105,7 +105,7 @@ struct DashboardShell: View {
                 // with durable Endpoint Security ingestion under load.
                 try? await Task.sleep(for: .seconds(model.dashboardPollingSeconds))
                 await model.refreshDashboard(reportErrors: false)
-                if !model.isDemoMode, model.lastUpdated != nil {
+                if model.hasLiveDashboardSnapshot {
                     await notifications.process(snapshot: model.snapshot)
                 }
             }
@@ -130,14 +130,14 @@ struct DashboardShell: View {
         .task {
             // Wait for the initial snapshot so stored history becomes the
             // completion watermark rather than triggering old notifications.
-            while model.lastUpdated == nil, !Task.isCancelled {
+            while !model.hasLiveDashboardSnapshot, !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
             }
             guard !Task.isCancelled else { return }
             model.prepareCompletionWatcher()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(200))
-                if await model.refreshRecentCompletionsIfNeeded(), !model.isDemoMode {
+                if model.hasLiveDashboardSnapshot, await model.refreshRecentCompletionsIfNeeded(), model.hasLiveDashboardSnapshot {
                     await notifications.process(snapshot: model.snapshot)
                 }
             }
