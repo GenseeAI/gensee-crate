@@ -10,6 +10,8 @@ changes.
 
 ### Fixed
 
+- Harnesses now summarizes enabled Cowork visibility separately from hook protection
+  and configuration audits; installed totals continue to include Cowork.
 - Claude background-task notifications resume their originating request when
   identifiable; unmatched and historical notifications show as Background activity.
 - Routine writes and scoped cleanup in OS temporary directories are allowed as
