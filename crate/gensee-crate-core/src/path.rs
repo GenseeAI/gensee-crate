@@ -48,6 +48,22 @@ pub fn resolve_routine_scratch_path(path: &str) -> Option<PathBuf> {
     if !beneath_root(input) {
         return None;
     }
+    let resolved = resolve_concrete_path(path)?;
+    beneath_root(&resolved).then_some(resolved)
+}
+
+/// Resolve a concrete absolute path, including missing leaves, without allowing
+/// traversal, globs, dangling links, or inaccessible ancestors.
+pub fn resolve_concrete_path(path: &str) -> Option<PathBuf> {
+    let input = Path::new(path);
+    if !input.is_absolute()
+        || path.contains(['*', '?', '[', ']', '{', '}'])
+        || input
+            .components()
+            .any(|p| matches!(p, Component::ParentDir))
+    {
+        return None;
+    }
     let mut ancestor = input;
     let mut missing = Vec::new();
     let resolved = loop {
@@ -70,7 +86,7 @@ pub fn resolve_routine_scratch_path(path: &str) -> Option<PathBuf> {
     for name in missing.into_iter().rev() {
         resolved.push(name);
     }
-    beneath_root(&resolved).then_some(resolved)
+    Some(resolved)
 }
 
 /// A build-directory name alone is never sufficient to hide Endpoint Security

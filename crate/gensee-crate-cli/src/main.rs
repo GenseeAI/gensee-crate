@@ -4015,7 +4015,11 @@ fn feedback_list(args: Vec<OsString>) -> io::Result<()> {
 
 fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
     let policy = Policy::cached_current();
-    store.set_dashboard_noise_filter(move |rule, path| policy.is_routine_scratch_alert(rule, path))
+    store.set_dashboard_noise_filter(move |rule, path, workspace, operation| {
+        policy.is_routine_scratch_alert(rule, path)
+            || (rule == "hook_bypass_file_mutation"
+                && policy.is_routine_unmatched_mutation(path, workspace, operation))
+    })
 }
 
 fn dashboard_state() -> io::Result<()> {
@@ -4401,6 +4405,11 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                         )?;
                     }
                     if logical_operation != "read"
+                        && !Policy::global().is_routine_unmatched_mutation(
+                            &path,
+                            workspace_root.unwrap_or(""),
+                            policy_operation,
+                        )
                         && !store.has_recent_mutating_file_intent(&path, observed_at_ms)?
                     {
                         record_endpoint_policy_alert(&store, PolicyAlert {
@@ -4409,7 +4418,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                             severity: "medium".to_string(),
                             action: "warn".to_string(),
                             rule_id: "hook_bypass_file_mutation".to_string(),
-                            message: "Agent process mutated a file without a matching hook-level file intent"
+                            message: "File change could not be correlated with a declared tool intent"
                                 .to_string(),
                             path: Some(path),
                             evidence: Some(evidence.clone()),

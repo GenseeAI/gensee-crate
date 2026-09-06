@@ -11,19 +11,11 @@ struct DashboardHarnessesPage: View {
     }
 
     private var protectedCount: Int {
-        model.integrations.filter { $0.installed && $0.isHealthy && $0.supportsDirectHooks }.count
+        model.integrations.filter { $0.installed && (($0.isHealthy && $0.supportsDirectHooks) || ($0.isCowork && $0.configured)) }.count
     }
 
-    private var hookCapableInstalledCount: Int {
-        model.integrations.filter { $0.installed && $0.supportsDirectHooks }.count
-    }
-
-    private var coworkInstalledCount: Int {
-        model.integrations.filter { $0.installed && $0.isCowork }.count
-    }
-
-    private var visibilityEnabledCount: Int {
-        model.integrations.filter { $0.installed && $0.isCowork && $0.configured }.count
+    private var protectionCapableInstalledCount: Int {
+        model.integrations.filter { $0.installed && ($0.supportsDirectHooks || $0.isCowork) }.count
     }
 
     private var auditCapableInstalledCount: Int {
@@ -105,9 +97,9 @@ struct DashboardHarnessesPage: View {
         HStack(spacing: 0) {
             summaryMetric(
                 value: "\(protectedCount)",
-                label: "Hook-protected",
-                detail: "of \(hookCapableInstalledCount) hook-capable",
-                color: protectedCount == hookCapableInstalledCount && hookCapableInstalledCount > 0 ? .dashboardGreen : .dashboardGold
+                label: "Protected",
+                detail: "of \(protectionCapableInstalledCount) protection-capable",
+                color: protectedCount == protectionCapableInstalledCount && protectionCapableInstalledCount > 0 ? .dashboardGreen : .dashboardGold
             )
             Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 48)
             summaryMetric(
@@ -125,15 +117,6 @@ struct DashboardHarnessesPage: View {
                     ? .dashboardGreen
                     : .secondary
             )
-            Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 48)
-            summaryMetric(
-                value: "\(visibilityEnabledCount)",
-                label: "Visibility enabled",
-                detail: "of \(coworkInstalledCount) Cowork installed",
-                color: visibilityEnabledCount > 0 ? .dashboardBlue : .secondary
-            )
-            .help("Cowork endpoint visibility is enabled in local policy. Sensor health and recent evidence are shown in the Cowork row.")
-            .accessibilityIdentifier("harness.summary.coworkVisibility")
             Spacer(minLength: 0)
         }
         .padding(.vertical, 12)

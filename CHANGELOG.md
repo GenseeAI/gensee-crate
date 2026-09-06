@@ -10,10 +10,14 @@ changes.
 
 ### Fixed
 
-- Harnesses now summarizes enabled Cowork visibility separately from hook protection
-  and configuration audits; installed totals continue to include Cowork.
-- Claude background-task notifications resume their originating request when
-  identifiable; unmatched and historical notifications show as Background activity.
+- Harnesses includes hook protection and enabled Cowork visibility in its Protected
+  total; installed totals continue to include Cowork.
+- Historical and nested task completions now group their tools and findings under
+  the originating request. Unlinked completions show the task summary instead of
+  a generic title; raw evidence and original IDs remain intact.
+- Ordinary workspace and temporary-file writes no longer trigger review solely
+  because a hook intent could not be matched. Protected paths, destructive workspace
+  operations, unknown scope, and blocked actions retain review.
 - Routine writes and scoped cleanup in OS temporary directories are allowed as
   informational evidence. Generic historical temp alerts no longer enter Review
   Queue; raw records and alert-chain integrity are preserved.

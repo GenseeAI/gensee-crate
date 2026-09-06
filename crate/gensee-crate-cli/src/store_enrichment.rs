@@ -267,6 +267,53 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_quiets_only_routine_unmatched_mutations() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-dashboard-intent-gap-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "Read",
+                json!({"file_path":"/repo/file"}),
+                1,
+            ))
+            .unwrap();
+        for (path, operation, action) in [
+            ("/repo/src/main.rs", "mutation", "warn"),
+            ("/tmp/gensee-output.txt", "mutation", "warn"),
+            ("/repo/.env", "write", "warn"),
+            ("/elsewhere/config", "write", "warn"),
+            ("/repo/src/main.rs", "delete", "warn"),
+            ("/repo/src/main.rs", "write", "block"),
+        ] {
+            let mut finding = alert("medium", action);
+            finding.rule_id = "hook_bypass_file_mutation".into();
+            finding.path = Some(path.into());
+            finding.evidence = Some(
+                json!({"logical_operation": operation, "attribution": {"workspace_root":"/repo"}}),
+            );
+            store.append_policy_alert(&finding).unwrap();
+        }
+        let chain = store.verify_alert_chain().unwrap();
+        configure_dashboard_noise_filter(&store).unwrap();
+        let state = store.dashboard_state().unwrap();
+        assert_eq!(state["alerts"].as_array().unwrap().len(), 4);
+        let id = state["requests"][0]["request_id"].as_i64().unwrap();
+        assert_eq!(
+            store.dashboard_request(id).unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 6);
+        assert_eq!(store.verify_alert_chain().unwrap(), chain);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn dashboard_quiets_historical_scratch_alerts_without_rewriting_evidence() {
         let dir =
             std::env::temp_dir().join(format!("gensee-dashboard-scratch-{}", std::process::id()));
@@ -311,7 +358,7 @@ mod tests {
         let chain_before = store.verify_alert_chain().unwrap();
         let policy = policy_with(json!({}));
         store
-            .set_dashboard_noise_filter(move |rule, path| {
+            .set_dashboard_noise_filter(move |rule, path, _, _| {
                 policy.is_routine_scratch_alert(rule, path)
             })
             .unwrap();

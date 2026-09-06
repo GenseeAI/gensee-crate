@@ -1180,6 +1180,54 @@ impl Policy {
         true
     }
 
+    /// Missing hook intent is a correlation gap, not a risk by itself. Only
+    /// ordinary writes in the attributed workspace or OS scratch space qualify.
+    pub fn is_routine_unmatched_mutation(
+        &self,
+        path: &str,
+        workspace: &str,
+        operation: &str,
+    ) -> bool {
+        if self
+            .doc
+            .review_overrides
+            .iter()
+            .any(|r| r.rule_id == "hook_bypass_file_mutation")
+        {
+            return false;
+        }
+        let category = if self.is_destructive(operation) {
+            &self.doc.categories.destructive.rule_id
+        } else if matches!(operation, "write" | "create" | "mutation") {
+            &self.doc.categories.write_outside_workspace.rule_id
+        } else {
+            return false;
+        };
+        if self.is_routine_scratch_alert(category, path) {
+            return true;
+        }
+        if !matches!(operation, "write" | "create" | "mutation") {
+            return false;
+        }
+        let Some(resolved) = gensee_crate_core::resolve_concrete_path(path) else {
+            return false;
+        };
+        let Some(root) = gensee_crate_core::resolve_concrete_path(workspace) else {
+            return false;
+        };
+        if root.parent().is_none() || resolved == root || !resolved.starts_with(&root) {
+            return false;
+        }
+        [path, resolved.to_str().unwrap_or(path)]
+            .iter()
+            .all(|candidate| {
+                self.classify_path(candidate).is_none()
+                    && !self.is_persistent_target_path(candidate)
+                    && !self.is_control_plane_path(candidate)
+                    && !self.is_memory_artifact_path(candidate)
+            })
+    }
+
     fn scratch_adjusted_finding(&self, rule: &CategoryRule, path: &str) -> Finding {
         if !self.is_routine_scratch_alert(&rule.rule_id, path) {
             return self.category_finding(rule, path);
@@ -2710,6 +2758,28 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| f.rule_id == "policy_write_outside_workspace" && f.action == Action::Ask));
+    }
+
+    #[test]
+    fn ordinary_workspace_correlation_gaps_are_quiet_but_risks_remain() {
+        let p = policy();
+        assert!(p.is_routine_unmatched_mutation("/repo/src/main.rs", "/repo", "write"));
+        assert!(p.is_routine_unmatched_mutation("/tmp/gensee-result.txt", "/repo", "write"));
+        for (path, root, op) in [
+            ("/repo/.env", "/repo", "write"),
+            ("/repo/.git/hooks/pre-commit", "/repo", "write"),
+            ("/repo/src/main.rs", "/repo", "delete"),
+            ("/repo/src/main.rs", "/repo", "metadata"),
+            ("/other/src/main.rs", "/repo", "write"),
+            ("/repo2/src/main.rs", "/repo", "write"),
+            ("/etc/config", "/", "write"),
+            ("/repo/../etc/config", "/repo", "write"),
+        ] {
+            assert!(
+                !p.is_routine_unmatched_mutation(path, root, op),
+                "{path} {op}"
+            );
+        }
     }
 
     #[test]

@@ -317,7 +317,7 @@ impl EventStore {
             sqlite: Arc::new(Mutex::new(sqlite)),
             encryption_key,
         };
-        store.set_dashboard_noise_filter(|_, _| false)?;
+        store.set_dashboard_noise_filter(|_, _, _, _| false)?;
         Ok(store)
     }
 
@@ -325,18 +325,20 @@ impl EventStore {
     /// fields are changed; raw evidence remains available through alerts APIs.
     pub fn set_dashboard_noise_filter<F>(&self, is_noise: F) -> io::Result<()>
     where
-        F: Fn(&str, &str) -> bool + Send + std::panic::UnwindSafe + 'static,
+        F: Fn(&str, &str, &str, &str) -> bool + Send + std::panic::UnwindSafe + 'static,
     {
         let cache = Mutex::new(HashMap::new());
         self.sqlite_store()?
             .connection()
             .create_scalar_function(
                 "gensee_dashboard_alert_is_routine",
-                2,
+                4,
                 FunctionFlags::SQLITE_UTF8,
                 move |context| {
                     let rule = context.get::<String>(0)?;
                     let path = context.get::<String>(1)?;
+                    let workspace = context.get::<String>(2)?;
+                    let operation = context.get::<String>(3)?;
                     let mut cache = cache
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -344,8 +346,13 @@ impl EventStore {
                         cache.clear();
                     }
                     Ok(*cache
-                        .entry((rule.clone(), path.clone()))
-                        .or_insert_with(|| is_noise(&rule, &path)))
+                        .entry((
+                            rule.clone(),
+                            path.clone(),
+                            workspace.clone(),
+                            operation.clone(),
+                        ))
+                        .or_insert_with(|| is_noise(&rule, &path, &workspace, &operation)))
                 },
             )
             .map_err(sqlite_error_from_rusqlite)
@@ -1011,8 +1018,9 @@ impl EventStore {
         }
         let db = self.sqlite_store()?;
         let conn = db.connection();
+        let groups = DashboardRequestGroups::load(conn)?;
         materialize_dashboard_visible_alerts(conn)?;
-        let alerts = dashboard_alerts_from_relation(
+        let mut alerts = dashboard_alerts_from_relation(
             conn,
             DashboardAlertQuery {
                 relation: "dashboard_visible_alerts",
@@ -1024,7 +1032,7 @@ impl EventStore {
                 raw_event_count_expression: "1",
             },
         )?;
-        let agent_events = query_json_rows(
+        let mut agent_events = query_json_rows(
             conn,
             "SELECT event_id, pid, agent_events.request_id, requests.session_id, ts,
                 source, type, cwd, permission_mode, tool_name, tool_input,
@@ -1054,7 +1062,7 @@ impl EventStore {
         let sessions = query_json_rows(
             conn,
             "SELECT s.session_id, s.agent_id, s.first_event_at, s.last_event_at, s.flagged,
-                (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.session_id),
+                (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.session_id AND r.request_id NOT IN (SELECT source_id FROM dashboard_request_groups)),
                 (SELECT COUNT(*) FROM agent_events ae
                    JOIN requests r ON ae.request_id = r.request_id
                   WHERE r.session_id = s.session_id)
@@ -1074,13 +1082,17 @@ impl EventStore {
             },
         )?;
         let requests_sql =
-            "WITH recent_requests AS MATERIALIZED (
+            "WITH recent_roots AS MATERIALIZED (
+               SELECT COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = r.request_id), r.request_id) AS root_id,
+                      MAX(COALESCE(completed_at, created_at, r.request_id)) AS activity
+               FROM requests r GROUP BY root_id ORDER BY activity DESC, root_id DESC LIMIT 100
+             ), recent_requests AS MATERIALIZED (
                SELECT request_id, session_id,
                       substr(original_user_prompt, 1, 16384) AS original_user_prompt,
                       created_at, completed_at
-               FROM requests
-               ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
-               LIMIT 100
+               FROM requests r
+               WHERE COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = r.request_id), r.request_id)
+                   IN (SELECT root_id FROM recent_roots)
              ),
              event_rollups AS (
                SELECT agent_events.request_id,
@@ -1165,6 +1177,24 @@ impl EventStore {
                 .collect::<Vec<_>>());
             request["summary_file_touches"] = json!(touches);
         }
+        requests = groups.merge_requests(requests);
+        for request in &mut requests {
+            let id = request["request_id"].as_i64().unwrap();
+            if groups.children(id).is_empty() {
+                continue;
+            }
+            let (tools, decisions): (i64, i64) = conn.query_row(
+                "SELECT (SELECT COUNT(DISTINCT CASE WHEN type NOT IN ('PostToolUse', 'PostToolUseFailure') THEN COALESCE(tool_use_id, 'event-' || event_id) END)
+                    FROM agent_events WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)),
+                    (SELECT COUNT(DISTINCT rule_id || '|' || COALESCE(path, '') || '|' || lower(action))
+                    FROM dashboard_visible_alerts WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1))",
+                [id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sqlite_error_from_rusqlite)?;
+            request["tool_call_count"] = json!(tools);
+            request["decision_count"] = json!(decisions);
+        }
+
+        groups.project_events(&mut agent_events);
+        groups.project_events(&mut alerts);
         let artifact_query = "SELECT kind, uri, current_digest, last_seen_at,
                     last_modified_at, last_modified_source,
                     last_modified_session_id, risk_level, risk_rule_id,
@@ -1286,7 +1316,7 @@ impl EventStore {
         let daily_activity_sql =
             "WITH daily_requests AS (
                 SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
-                       COUNT(*) AS count,
+                       COUNT(DISTINCT COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = requests.request_id), requests.request_id)) AS count,
                        COALESCE(SUM(total_tokens), 0) AS tokens
                 FROM requests
                 WHERE created_at IS NOT NULL
@@ -1443,6 +1473,80 @@ impl EventStore {
     /// views must not infer that an older request had no tools merely because
     /// its events fell outside those windows.
     pub fn dashboard_request(&self, request_id: i64) -> io::Result<Value> {
+        let groups = {
+            let db = self.sqlite_store()?;
+            DashboardRequestGroups::load(db.connection())?
+        };
+        let root = groups.root(request_id);
+        let mut result = self.dashboard_request_ungrouped(root)?;
+        result["request"]["original_user_prompt"] =
+            json!(groups.prompts.get(&root).cloned().flatten());
+        for child in groups.children(root) {
+            let extra = self.dashboard_request_ungrouped(child)?;
+            for key in ["agentEvents", "alerts"] {
+                if let Some(rows) = extra[key].as_array() {
+                    result[key]
+                        .as_array_mut()
+                        .unwrap()
+                        .extend(rows.iter().cloned());
+                }
+            }
+            for key in ["file_touches", "ignored_file_touch_paths"] {
+                if let Some(rows) = extra["request"][key].as_array() {
+                    let target = result["request"][key].as_array_mut().unwrap();
+                    for row in rows {
+                        if !target.contains(row) {
+                            target.push(row.clone());
+                        }
+                    }
+                }
+            }
+            result["rawAlertCount"] = json!(
+                result["rawAlertCount"].as_i64().unwrap_or(0)
+                    + extra["rawAlertCount"].as_i64().unwrap_or(0)
+            );
+            result["request"]["ignored_file_touch_events_omitted"] = json!(
+                result["request"]["ignored_file_touch_events_omitted"]
+                    .as_i64()
+                    .unwrap_or(0)
+                    + extra["request"]["ignored_file_touch_events_omitted"]
+                        .as_i64()
+                        .unwrap_or(0)
+            );
+            result["request"]["ignored_file_touch_paths_truncated"] = json!(
+                result["request"]["ignored_file_touch_paths_truncated"]
+                    .as_bool()
+                    .unwrap_or(false)
+                    || extra["request"]["ignored_file_touch_paths_truncated"]
+                        .as_bool()
+                        .unwrap_or(false)
+            );
+            if extra["request"]["completed_at"].as_i64()
+                > result["request"]["completed_at"].as_i64()
+            {
+                result["request"]["completed_at"] = extra["request"]["completed_at"].clone();
+            }
+        }
+        for key in ["agentEvents", "alerts"] {
+            let rows = result[key].as_array_mut().unwrap();
+            groups.project_events(rows);
+            rows.sort_by_key(|r| {
+                (
+                    r["ts"]
+                        .as_i64()
+                        .or_else(|| r["created_at"].as_i64())
+                        .unwrap_or(0),
+                    r["event_id"]
+                        .as_i64()
+                        .or_else(|| r["alert_id"].as_i64())
+                        .unwrap_or(0),
+                )
+            });
+        }
+        Ok(result)
+    }
+
+    fn dashboard_request_ungrouped(&self, request_id: i64) -> io::Result<Value> {
         let db = self.sqlite_store()?;
         let conn = db.connection();
 
@@ -1568,6 +1672,7 @@ impl EventStore {
 
         let db = self.sqlite_store()?;
         let conn = db.connection();
+        let _groups = DashboardRequestGroups::load(conn)?;
         let visible_alerts_cte = dashboard_visible_alerts_cte();
         let valid: i64 = conn
             .query_row("SELECT date(?1) = ?1", [day], |row| row.get(0))
@@ -1585,7 +1690,7 @@ impl EventStore {
                (SELECT COUNT(DISTINCT session_id) FROM requests
                  WHERE session_id != 'system'
                    AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
-               (SELECT COUNT(*) FROM requests
+               (SELECT COUNT(DISTINCT COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = requests.request_id), requests.request_id)) FROM requests
                  WHERE session_id != 'system'
                    AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1
                    AND (original_user_prompt IS NOT NULL OR completed_at IS NOT NULL
@@ -2224,32 +2329,46 @@ impl EventStore {
 
             match event.hook_event_name.as_deref() {
                 Some("UserPromptSubmit") => {
-                    if event.provider == "claude-code" && prompt.as_deref().is_some_and(is_task_notification) {
+                    if event.provider == "claude-code"
+                        && prompt.as_deref().is_some_and(is_task_notification)
+                    {
                         let text = prompt.as_deref().unwrap_or_default();
-                        let origin = notification_field(text, "tool-use-id").map(|tool_id| {
-                            db.connection().query_row(
-                                "SELECT ae.request_id FROM agent_events ae JOIN requests r ON r.request_id = ae.request_id
-                                 WHERE r.session_id = ?1 AND ae.tool_use_id = ?2 ORDER BY ae.event_id DESC LIMIT 1",
-                                rusqlite::params![session_id, tool_id], |row| row.get::<_, i64>(0),
-                            ).optional().map_err(sqlite_error_from_rusqlite)
-                        }).transpose()?.flatten();
+                        let origin = notification_origin_request(
+                            db.connection(),
+                            session_id,
+                            text,
+                            to_i64(event.observed_at_ms)?,
+                            i64::MAX,
+                        )?;
                         let request_id = match origin {
                             Some(id) => id,
                             None => {
-                                let current = db.latest_request_for_session(session_id).map_err(sqlite_error)?;
-                                if let Some(current) = current.filter(|request| request.original_user_prompt.as_deref() == Some("Background activity")) {
+                                let current = db
+                                    .latest_request_for_session(session_id)
+                                    .map_err(sqlite_error)?;
+                                if let Some(current) = current.filter(|request| {
+                                    request.original_user_prompt.as_deref() == Some(text)
+                                }) {
                                     current.request_id
                                 } else {
-                                    let id = db.insert_request(&NewRequest {
-                                        session_id: session_id.into(), original_user_prompt: Some("Background activity".into()),
-                                        final_response: None, events: Some(event.raw_json.clone()), file_accessed_rate: 0.0, network_rate: 0.0,
-                                    }).map_err(sqlite_error)?;
-                                    db.set_request_created_at(id, to_i64(event.observed_at_ms)?).map_err(sqlite_error)?;
+                                    let id = db
+                                        .insert_request(&NewRequest {
+                                            session_id: session_id.into(),
+                                            original_user_prompt: Some(text.into()),
+                                            final_response: None,
+                                            events: Some(event.raw_json.clone()),
+                                            file_accessed_rate: 0.0,
+                                            network_rate: 0.0,
+                                        })
+                                        .map_err(sqlite_error)?;
+                                    db.set_request_created_at(id, to_i64(event.observed_at_ms)?)
+                                        .map_err(sqlite_error)?;
                                     id
                                 }
                             }
                         };
-                        db.set_hook_request_context(session_id, request_id).map_err(sqlite_error)?;
+                        db.set_hook_request_context(session_id, request_id)
+                            .map_err(sqlite_error)?;
                         return Ok(());
                     }
                     let request_id = db
@@ -3979,11 +4098,13 @@ fn dashboard_request_file_touches(
     )
     .map_err(sqlite_error_from_rusqlite)?;
     let sql = format!(
-        "WITH recent_requests AS MATERIALIZED (
-            SELECT request_id
-            FROM requests
-            ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
-            LIMIT 100
+        "WITH recent_roots AS MATERIALIZED (
+            SELECT COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = r.request_id), r.request_id) AS root_id,
+                   MAX(COALESCE(completed_at, created_at, r.request_id)) AS activity
+            FROM requests r GROUP BY root_id ORDER BY activity DESC, root_id DESC LIMIT 100
+         ), recent_requests AS MATERIALIZED (
+            SELECT r.request_id FROM requests r
+            WHERE COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = r.request_id), r.request_id) IN (SELECT root_id FROM recent_roots)
          ),
          request_artifacts AS MATERIALIZED (
             SELECT request_relation.src_id AS request_id,
@@ -4549,7 +4670,9 @@ fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
         "NOT ({alias}.rule_id = 'unmatched_system_effect'
               AND {alias}.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
          AND NOT (lower({alias}.action) NOT IN ('deny', 'block')
-                  AND gensee_dashboard_alert_is_routine({alias}.rule_id, {path}))
+                  AND gensee_dashboard_alert_is_routine({alias}.rule_id, {path},
+                    COALESCE(json_extract({alias}.evidence, '$.attribution.workspace_root'), ''),
+                    COALESCE(json_extract({alias}.evidence, '$.logical_operation'), '')))
          AND NOT ({alias}.rule_id = 'hook_bypass_file_mutation' AND (
               {path} GLOB '/dev/*'
               OR {lower_path} LIKE '%/library/application support/codex/%'
@@ -4593,6 +4716,7 @@ fn dashboard_visible_alerts_cte_with_scope(request_scope: Option<&str>) -> Strin
             SELECT *
             FROM ranked_dashboard_alerts
             WHERE rule_id != 'hook_bypass_file_mutation'
+               OR lower(action) IN ('block', 'deny')
                OR previous_related_alert_at IS NULL
                OR created_at - previous_related_alert_at > 10000
          )"
@@ -5252,6 +5376,219 @@ fn bounded_transaction_text(value: &str) -> String {
     bounded
 }
 
+/// Follow exact launch IDs, including background tasks launched by another
+/// completion. Never infer a parent merely from temporal proximity.
+fn notification_origin_request(
+    conn: &rusqlite::Connection,
+    session: &str,
+    text: &str,
+    observed_at: i64,
+    before_request: i64,
+) -> io::Result<Option<i64>> {
+    let mut notification = text.to_string();
+    let mut before = before_request;
+    let mut timestamp = observed_at;
+    let mut origin = None;
+    for _ in 0..128 {
+        let Some(tool_id) = notification_field(&notification, "tool-use-id") else {
+            break;
+        };
+        let parent = conn
+            .query_row(
+                "SELECT r.request_id, r.original_user_prompt, r.created_at
+             FROM agent_events ae JOIN requests r ON r.request_id = ae.request_id
+             WHERE r.session_id = ?1 AND ae.tool_use_id = ?2
+               AND ae.source = 'claude-code' AND ae.ts <= ?3 AND r.request_id < ?4
+             ORDER BY ae.ts DESC, ae.event_id DESC LIMIT 1",
+                rusqlite::params![session, tool_id, timestamp, before],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error_from_rusqlite)?;
+        let Some((id, prompt, created_at)) = parent else {
+            break;
+        };
+        origin = Some(id);
+        before = id;
+        timestamp = created_at.unwrap_or(timestamp);
+        notification = prompt.unwrap_or_default();
+        if !is_task_notification(&notification) {
+            break;
+        }
+    }
+    Ok(origin)
+}
+
+/// A dashboard-only projection: historical request, event, and alert records
+/// retain their original IDs, including the fields covered by the alert chain.
+struct DashboardRequestGroups {
+    aliases: HashMap<i64, i64>,
+    prompts: HashMap<i64, Option<String>>,
+}
+
+impl DashboardRequestGroups {
+    fn load(conn: &rusqlite::Connection) -> io::Result<Self> {
+        let rows = query_json_rows(
+            conn,
+            "SELECT request_id, session_id,
+                substr(CASE WHEN original_user_prompt = 'Background activity'
+                    THEN COALESCE(json_extract(events, '$.prompt'), original_user_prompt)
+                    ELSE original_user_prompt END, 1, 16384), created_at
+             FROM requests ORDER BY request_id",
+            |r| {
+                Ok(json!([
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?
+                ]))
+            },
+        )?;
+        let mut groups = Self {
+            aliases: HashMap::new(),
+            prompts: HashMap::new(),
+        };
+        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS dashboard_request_groups(source_id INTEGER PRIMARY KEY, request_id INTEGER NOT NULL); DELETE FROM dashboard_request_groups;")
+            .map_err(sqlite_error_from_rusqlite)?;
+        for row in rows {
+            let id = row[0].as_i64().unwrap();
+            let prompt = row[2].as_str();
+            groups.prompts.insert(id, dashboard_request_prompt(prompt));
+            if let Some(text) = prompt.filter(|p| is_task_notification(p)) {
+                if let Some(origin) = notification_origin_request(
+                    conn,
+                    row[1].as_str().unwrap(),
+                    text,
+                    row[3].as_i64().unwrap_or(i64::MAX),
+                    id,
+                )? {
+                    let root = groups.root(origin);
+                    groups.aliases.insert(id, root);
+                    conn.execute(
+                        "INSERT INTO dashboard_request_groups VALUES (?1, ?2)",
+                        [id, root],
+                    )
+                    .map_err(sqlite_error_from_rusqlite)?;
+                }
+            }
+        }
+        Ok(groups)
+    }
+
+    fn root(&self, id: i64) -> i64 {
+        self.aliases.get(&id).copied().unwrap_or(id)
+    }
+
+    fn children(&self, root: i64) -> Vec<i64> {
+        let mut children: Vec<_> = self
+            .aliases
+            .iter()
+            .filter_map(|(&child, &parent)| (parent == root).then_some(child))
+            .collect();
+        children.sort_unstable();
+        children
+    }
+
+    fn project_events(&self, rows: &mut [Value]) {
+        for row in rows {
+            if let Some(id) = row["request_id"].as_i64() {
+                let root = self.root(id);
+                if root != id {
+                    row["original_request_id"] = json!(id);
+                    row["request_id"] = json!(root);
+                }
+                if row
+                    .get("original_user_prompt")
+                    .is_some_and(|value| !value.is_null())
+                {
+                    row["original_user_prompt"] = json!(self.prompts.get(&root).cloned().flatten());
+                }
+            }
+        }
+    }
+
+    fn merge_requests(&self, rows: Vec<Value>) -> Vec<Value> {
+        let mut merged: HashMap<i64, Value> = rows
+            .iter()
+            .filter(|r| {
+                self.root(r["request_id"].as_i64().unwrap()) == r["request_id"].as_i64().unwrap()
+            })
+            .map(|r| (r["request_id"].as_i64().unwrap(), r.clone()))
+            .collect();
+        for row in rows {
+            let id = row["request_id"].as_i64().unwrap();
+            let root = self.root(id);
+            if id == root {
+                continue;
+            }
+            let Some(target) = merged.get_mut(&root) else {
+                continue;
+            };
+            for field in [
+                "tool_call_count",
+                "alert_count",
+                "decision_count",
+                "high_risk_alert_count",
+            ] {
+                target[field] =
+                    json!(target[field].as_i64().unwrap_or(0) + row[field].as_i64().unwrap_or(0));
+            }
+            for (field, ranks) in [
+                (
+                    "strongest_severity",
+                    &["info", "low", "medium", "high", "critical"][..],
+                ),
+                (
+                    "strongest_action",
+                    &["allow", "warn", "ask", "block", "deny"][..],
+                ),
+            ] {
+                if ranks.iter().position(|v| Some(*v) == row[field].as_str())
+                    > ranks
+                        .iter()
+                        .position(|v| Some(*v) == target[field].as_str())
+                {
+                    target[field] = row[field].clone();
+                }
+            }
+            for field in ["summary_file_touch_paths", "summary_file_touches"] {
+                if let Some(items) = row[field].as_array() {
+                    let dest = target[field].as_array_mut().unwrap();
+                    for item in items {
+                        if !dest.contains(item) {
+                            dest.push(item.clone());
+                        }
+                    }
+                }
+            }
+            if row["completed_at"].as_i64() > target["completed_at"].as_i64() {
+                target["completed_at"] = row["completed_at"].clone();
+            }
+        }
+        let mut result: Vec<_> = merged.into_values().collect();
+        for row in &mut result {
+            let id = row["request_id"].as_i64().unwrap();
+            row["original_user_prompt"] = json!(self.prompts.get(&id).cloned().flatten());
+        }
+        result.sort_by_key(|r| {
+            std::cmp::Reverse((
+                r["completed_at"]
+                    .as_i64()
+                    .or(r["created_at"].as_i64())
+                    .unwrap_or(0),
+                r["request_id"].as_i64().unwrap(),
+            ))
+        });
+        result
+    }
+}
+
 fn notification_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let mut body = text
         .trim()
@@ -5294,7 +5631,12 @@ fn is_task_notification(text: &str) -> bool {
 fn dashboard_request_prompt(value: Option<&str>) -> Option<String> {
     let mut prompt = value?.to_string();
     if is_task_notification(&prompt) {
-        return Some("Background activity".into());
+        let summary = notification_field(&prompt, "summary").unwrap_or("Background task completed");
+        let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        return Some(format!(
+            "Unlinked task: {}",
+            summary.chars().take(160).collect::<String>()
+        ));
     }
     const OPEN: &str = "<in-app-browser-context";
     const CLOSE: &str = "</in-app-browser-context>";
@@ -6998,6 +7340,127 @@ mod tests {
     }
 
     #[test]
+    fn historical_nested_notifications_group_under_real_request_without_rewriting_evidence() {
+        let dir =
+            std::env::temp_dir().join(format!("gensee-historical-groups-{}", std::process::id()));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"review code"}"#,
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Bash",
+                "launch-a",
+                r#"{"command":"sleep 1"}"#,
+                101,
+            ))
+            .unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"another request"}"#,
+                102,
+            ))
+            .unwrap();
+        // Simulate records captured before notification routing was introduced.
+        let legacy = |tool: &str, ts: i64| {
+            let text = format!("<task-notification><task-id>job-{ts}</task-id><tool-use-id>{tool}</tool-use-id><status>completed</status><summary>done</summary></task-notification>");
+            let db = store.sqlite_store().unwrap();
+            let id = db
+                .insert_request(&NewRequest {
+                    session_id: "s1".into(),
+                    original_user_prompt: Some(text),
+                    final_response: None,
+                    events: None,
+                    file_accessed_rate: 0.0,
+                    network_rate: 0.0,
+                })
+                .unwrap();
+            db.set_request_created_at(id, ts).unwrap();
+            id
+        };
+        let first = legacy("launch-a", 103);
+        store
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Bash",
+                "launch-b",
+                r#"{"command":"sleep 1"}"#,
+                104,
+            ))
+            .unwrap();
+        let nested = legacy("launch-b", 105);
+        store
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Read",
+                "read-c",
+                r#"{"file_path":"/repo/a.rs"}"#,
+                106,
+            ))
+            .unwrap();
+        store
+            .append_policy_alert(&PolicyAlert {
+                session_id: Some("s1".into()),
+                tool_use_id: Some("read-c".into()),
+                severity: "high".into(),
+                action: "warn".into(),
+                rule_id: "test-finding".into(),
+                message: "Synthetic risk".into(),
+                path: Some("/repo/a.rs".into()),
+                evidence: None,
+                observed_at_ms: 107,
+            })
+            .unwrap();
+        let chain = store.verify_alert_chain().unwrap();
+        let before = store.list_alerts().unwrap();
+        let state = store.dashboard_state().unwrap();
+        assert_eq!(state["requests"].as_array().unwrap().len(), 2);
+        let root = state["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["request_id"] == 1)
+            .unwrap();
+        assert_eq!(root["original_user_prompt"], "review code");
+        assert_eq!(root["tool_call_count"], 3);
+        assert_eq!(root["alert_count"], 1);
+        assert_eq!(state["alerts"][0]["request_id"], 1);
+        assert_eq!(state["alerts"][0]["original_request_id"], nested);
+        assert_eq!(state["sessions"][0]["req_count"], 2);
+        for id in [1, first, nested] {
+            let detail = store.dashboard_request(id).unwrap();
+            assert_eq!(detail["request"]["request_id"], 1);
+            assert_eq!(detail["agentEvents"].as_array().unwrap().len(), 3);
+            assert_eq!(detail["alerts"].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(
+            store.list_alerts().unwrap()[0].request_id,
+            before[0].request_id
+        );
+        assert_eq!(store.verify_alert_chain().unwrap(), chain);
+        // Future completions can also follow a launch stored under a legacy notification.
+        let db = store.sqlite_store().unwrap();
+        let text = "<task-notification><task-id>job</task-id><tool-use-id>launch-b</tool-use-id><status>completed</status></task-notification>";
+        assert_eq!(
+            notification_origin_request(db.connection(), "s1", text, 108, i64::MAX).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            notification_origin_request(db.connection(), "other", text, 108, i64::MAX).unwrap(),
+            None
+        );
+        assert_eq!(
+            notification_origin_request(db.connection(), "s1", text, 99, i64::MAX).unwrap(),
+            None
+        );
+        drop(db);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn notification_routing_ignores_quoted_and_nested_metadata() {
         let text = "<task-notification><task-id>job</task-id><status>completed</status><summary>quoted <tool-use-id>other</tool-use-id></summary></task-notification>";
         assert!(is_task_notification(text));
@@ -7078,7 +7541,7 @@ mod tests {
         drop(db);
         assert_eq!(
             dashboard_request_prompt(Some(text)).as_deref(),
-            Some("Background activity")
+            Some("Unlinked task: done")
         );
         // A tool ID from another session cannot select its request.
         let mut unknown = hook_event("UserPromptSubmit", &payload, 105);
@@ -7091,7 +7554,7 @@ mod tests {
                 .unwrap()
                 .original_user_prompt
                 .as_deref(),
-            Some("Background activity")
+            Some(text)
         );
         reopened
             .append_hook_event_evidence_only(&hook_event(
