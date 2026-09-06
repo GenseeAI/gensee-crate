@@ -107,3 +107,18 @@ existing identity index. The app permits one background projection at a time,
 with a 90-second deadline and the previous snapshot visible while it completes.
 `GENSEE_DASHBOARD_TIMING=1 gensee dashboard-state` writes phase durations to stderr
 for local performance diagnosis.
+
+## Detection feedback and read exceptions
+
+Review Queue has two distinct controls. **This was a false positive** records a
+local triage label; it does not grant permission or change the detector. The label
+can be withdrawn. **Always allow matching reads…** previews a file or containing
+folder exception for the same provider, project and credential-content-read rule.
+It permits changed content, expires in 30 days, and can be revoked in Settings.
+It does not permit writes, execution, other rules, or override blocks. Rule-wide
+severity/action changes are no longer offered on individual findings. Existing
+rule overrides remain visible in Policy and are never silently migrated.
+
+See [scoped feedback and triage](scoped-feedback-triage.md) for matching boundaries
+and the proposed user-confirmed pattern suggestions. No automatic permission
+learning or model backend is enabled.

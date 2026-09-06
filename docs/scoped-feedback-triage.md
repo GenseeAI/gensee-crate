@@ -1,8 +1,22 @@
 # Scoped feedback and local triage proposal
 
-Status: proposed follow-up. The current implementation still supports rule-wide
-review overrides and exact-context remembered approvals. It does not silently learn
-folder exceptions. UI labels now explicitly identify rule-wide overrides.
+Status: the two feedback controls and explicit file/folder read exceptions are
+implemented. Pattern suggestions and model-assisted triage below remain proposals.
+The Review Queue no longer edits rules globally. Existing rule-wide overrides are
+unchanged and can be reset in Policy. Exact-context approvals remain available.
+
+“Always allow matching reads…” previews an exception for the current provider,
+project, credential-content-read rule, and either the file or a selected containing
+folder. The exception permits changing content and expires after 30 days. Settings
+lists and revokes it. Dynamic commands, unresolved files, filesystem/home root
+scopes, and non-read calls are rejected. `/tmp` and `/private/tmp` resolve to the
+same scope on macOS. A separate block or unmatched approval requirement still
+prevents execution. Historical decisions are preserved.
+
+“This was a false positive” stores a separate local feedback label and marks the
+finding read. It does not change policy, grant a permission, or silently suppress
+future findings. The feedback can be withdrawn. Learning suggestions are not yet
+implemented; no model service is called.
 
 ## Separate preference from detection feedback
 

@@ -32,6 +32,12 @@ pub(crate) struct Approval {
     pub content_digest: String,
     #[serde(default)]
     pub key_version: u32,
+    #[serde(default)]
+    pub read_scope: Option<String>,
+    #[serde(default)]
+    pub source_alert_id: Option<i64>,
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 fn eligible(rule: &str) -> bool {
@@ -124,7 +130,145 @@ fn context(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<Approva
         revoked: false,
         content_digest: digest,
         key_version: 2,
+        read_scope: None,
+        source_alert_id: None,
+        created_at: 0,
     })
+}
+
+const SCOPED_READ_RULE: &str = "policy_credential_content_read";
+
+struct ReadTarget {
+    provider: String,
+    project: PathBuf,
+    path: PathBuf,
+}
+
+fn read_target(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<ReadTarget> {
+    if rule != SCOPED_READ_RULE || !is_supported_provider(&event.provider) {
+        return Err(io::Error::other(
+            "This finding does not support a read exception.",
+        ));
+    }
+    let raw: Value = serde_json::from_str(&event.raw_json)?;
+    let input = raw
+        .get("tool_input")
+        .ok_or_else(|| io::Error::other("Missing captured input."))?;
+    if input.to_string().contains("<redacted>") || input.get("truncated") == Some(&json!(true)) {
+        return Err(io::Error::other(
+            "Incomplete input requires a fresh request.",
+        ));
+    }
+    let command = event.tool_input_command.as_deref().unwrap_or("");
+    if command.contains(['$', '`', '\n', '(', ')']) {
+        return Err(io::Error::other(
+            "Dynamic commands require a fresh approval.",
+        ));
+    }
+    let cwd = event
+        .cwd
+        .as_deref()
+        .ok_or_else(|| io::Error::other("Missing project."))?;
+    let project = fs::canonicalize(leading_bash_effective_cwd(command, cwd))?;
+    let path = fs::canonicalize(path)?;
+    if project.parent().is_none() || !path.is_file() {
+        return Err(io::Error::other(
+            "Read exceptions require a concrete file and project.",
+        ));
+    }
+    let intents = file_intents_from_hook(event, event.tool_input_command.as_deref());
+    let subjects = policy_subjects(event, &intents);
+    if !subjects
+        .iter()
+        .any(|s| s.operation == "read" && fs::canonicalize(&s.path).ok().as_ref() == Some(&path))
+    {
+        return Err(io::Error::other(
+            "The original call does not establish a read of this file.",
+        ));
+    }
+    Ok(ReadTarget {
+        provider: event.provider.clone(),
+        project,
+        path,
+    })
+}
+
+fn read_exception(
+    event: &AgentHookEvent,
+    captured: &Value,
+    scope: &str,
+    requested_path: &str,
+    id: i64,
+) -> io::Result<Approval> {
+    let target = read_target(
+        event,
+        captured["rule"].as_str().unwrap_or(""),
+        captured["path"].as_str().unwrap_or(""),
+    )?;
+    let path = fs::canonicalize(requested_path)?;
+    let home = env::var("HOME").ok().and_then(|p| fs::canonicalize(p).ok());
+    let valid = match scope {
+        "file" => path == target.path,
+        "directory" => {
+            path.is_dir()
+                && path.parent().is_some()
+                && home.as_ref() != Some(&path)
+                && path != target.path
+                && target.path.starts_with(&path)
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(io::Error::other(
+            "Choose this file or a containing folder; filesystem and home roots are not supported.",
+        ));
+    }
+    let key = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&json!({
+            "version":3,"provider":target.provider,"project":target.project,"path":path,
+            "read_scope":scope,"rule":SCOPED_READ_RULE,"source_alert_id":id
+        }))?)
+    );
+    Ok(Approval {
+        id: uuid::Uuid::new_v4().to_string(),
+        key,
+        provider: target.provider,
+        project: target.project.to_string_lossy().into_owned(),
+        path: path.to_string_lossy().into_owned(),
+        rule: SCOPED_READ_RULE.into(),
+        scope: "project".into(),
+        session: event.session_id.clone().unwrap_or_default(),
+        expires_at: 0,
+        remaining: None,
+        revoked: false,
+        content_digest: String::new(),
+        key_version: 3,
+        read_scope: Some(scope.into()),
+        source_alert_id: Some(id),
+        created_at: 0,
+    })
+}
+
+fn matches_read_exception(a: &Approval, target: &ReadTarget) -> bool {
+    if a.key_version != 3
+        || a.rule != SCOPED_READ_RULE
+        || a.provider != target.provider
+        || Path::new(&a.project) != target.project
+        || a.scope != "project"
+    {
+        return false;
+    }
+    let root = Path::new(&a.path);
+    // A replaced directory symlink must not redirect an existing permission.
+    if fs::canonicalize(root).ok().as_deref() != Some(root) {
+        return false;
+    }
+    match a.read_scope.as_deref() {
+        Some("file") => root == target.path,
+        Some("directory") => root != target.path && target.path.starts_with(root),
+        _ => false,
+    }
 }
 
 // A single lock covers matching and consuming one-use grants across hook processes.
@@ -205,7 +349,7 @@ fn with_records<T>(
 }
 
 fn active(a: &Approval, now: u64) -> bool {
-    a.key_version == 2 && !a.revoked && a.expires_at > now && a.remaining != Some(0)
+    matches!(a.key_version, 2 | 3) && !a.revoked && a.expires_at > now && a.remaining != Some(0)
 }
 
 pub(crate) fn apply(event: &AgentHookEvent, store: &EventStore, findings: &mut [PolicyFinding]) {
@@ -218,18 +362,25 @@ pub(crate) fn apply(event: &AgentHookEvent, store: &EventStore, findings: &mut [
     let asks: Vec<_> = findings
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.action == PolicyAction::Ask)
+        .filter(|(_, f)| {
+            f.action == PolicyAction::Ask
+                || (f.action == PolicyAction::Warn && f.rule_id == SCOPED_READ_RULE)
+        })
         .collect();
     if asks.is_empty() {
         return;
     }
-    let candidates: io::Result<Vec<_>> = asks
+    let candidates: Vec<_> = asks
         .iter()
-        .map(|(i, f)| context(event, &f.rule_id, f.path.as_deref().unwrap_or("")).map(|c| (*i, c)))
+        .map(|(i, f)| {
+            (
+                *i,
+                f.action == PolicyAction::Ask,
+                context(event, &f.rule_id, f.path.as_deref().unwrap_or("")).ok(),
+                read_target(event, &f.rule_id, f.path.as_deref().unwrap_or("")).ok(),
+            )
+        })
         .collect();
-    let Ok(candidates) = candidates else {
-        return;
-    };
     let now = unix_millis().unwrap_or(u64::MAX);
     let ended = store.approval_session_has_ended(event.session_id.as_deref().unwrap_or(""));
     let Ok(ended) = ended else {
@@ -237,19 +388,46 @@ pub(crate) fn apply(event: &AgentHookEvent, store: &EventStore, findings: &mut [
     };
     let selected = with_records(store.root_path(), |records| {
         let mut selected = Vec::new();
-        for (finding, context) in &candidates {
-            let Some(index) = records.iter().position(|a| {
-                active(a, now)
-                    && a.key == context.key
-                    && (a.scope == "project" || (!ended && a.session == context.session))
-            }) else {
-                return Ok((Vec::new(), false));
+        for (finding, is_ask, exact, read) in &candidates {
+            let index = records
+                .iter()
+                .position(|a| {
+                    active(a, now)
+                        && read
+                            .as_ref()
+                            .is_some_and(|target| matches_read_exception(a, target))
+                })
+                .or_else(|| {
+                    if *is_ask {
+                        records.iter().position(|a| {
+                            active(a, now)
+                                && a.key_version == 2
+                                && exact.as_ref().is_some_and(|context| {
+                                    a.key == context.key
+                                        && (a.scope == "project"
+                                            || (!ended && a.session == context.session))
+                                })
+                        })
+                    } else {
+                        None
+                    }
+                });
+            let Some(index) = index else {
+                if *is_ask {
+                    return Ok((Vec::new(), false));
+                }
+                continue;
             };
-            selected.push((*finding, index, records[index].id.clone()));
+            selected.push((
+                *finding,
+                index,
+                records[index].id.clone(),
+                records[index].read_scope.is_some(),
+            ));
         }
         let mut used = std::collections::HashSet::new();
         let mut consumed = false;
-        for (_, index, _) in &selected {
+        for (_, index, _, _) in &selected {
             if used.insert(*index) {
                 if let Some(remaining) = records[*index].remaining.as_mut() {
                     *remaining -= 1;
@@ -260,11 +438,20 @@ pub(crate) fn apply(event: &AgentHookEvent, store: &EventStore, findings: &mut [
         Ok((selected, consumed))
     });
     if let Ok(selected) = selected {
-        for (index, _, id) in selected {
+        for (index, _, id, is_read_exception) in selected {
+            findings[index].evidence["original_response"] = json!({"action":format!("{:?}", findings[index].action).to_lowercase(),"severity":findings[index].severity,"message":findings[index].message});
+            if is_read_exception {
+                findings[index].evidence["scoped_read_exception_id"] = json!(id);
+            }
             findings[index].action = PolicyAction::Allow;
             findings[index].severity = "info".into();
             findings[index].message = format!(
-                "Allowed by remembered approval: {}",
+                "Allowed by {}: {}",
+                if is_read_exception {
+                    "read exception"
+                } else {
+                    "remembered approval"
+                },
                 findings[index].path.as_deref().unwrap_or("")
             );
             findings[index].evidence["remembered_approval_id"] = json!(id);
@@ -278,7 +465,7 @@ pub(crate) fn handle(args: Vec<OsString>) -> io::Result<()> {
         &args.iter().skip(1).cloned().collect::<Vec<_>>(),
         "approval",
     )?;
-    if matches!(verb, "grant" | "revoke") {
+    if matches!(verb, "grant" | "grant-read" | "revoke") {
         require_app_caller()?;
     }
     let store = EventStore::default_local()?;
@@ -314,6 +501,44 @@ pub(crate) fn handle(args: Vec<OsString>) -> io::Result<()> {
                 a.revoked = true;
                 Ok((json!({"revoked":id}), true))
             })?
+        }
+        "preview-read" | "grant-read" => {
+            let id = flags
+                .get("alert-id")
+                .and_then(|v| v.parse::<i64>().ok())
+                .ok_or_else(|| io::Error::other("Missing alert ID."))?;
+            let captured = store.approval_context(id)?;
+            let event = build_unattributed_hook_event(
+                &captured["payload"].to_string(),
+                captured["provider"].as_str().unwrap_or(""),
+            )?;
+            let scope = flags
+                .get("read-scope")
+                .map(String::as_str)
+                .unwrap_or("file");
+            let path = flags
+                .get("path")
+                .map(String::as_str)
+                .unwrap_or_else(|| captured["path"].as_str().unwrap_or(""));
+            let mut approval = read_exception(&event, &captured, scope, path, id)?;
+            approval.created_at = now;
+            approval.expires_at = now + 30 * 86_400_000;
+            if verb == "preview-read" {
+                json!(approval)
+            } else {
+                if flags.get("expected-key") != Some(&approval.key) {
+                    return Err(io::Error::other(
+                        "Scope changed after preview. Review it again.",
+                    ));
+                }
+                with_records(store.root_path(), |records| {
+                    if records.len() >= 2048 {
+                        return Err(io::Error::other("Approval history is full."));
+                    }
+                    records.push(approval.clone());
+                    Ok((json!(approval), true))
+                })?
+            }
         }
         "preview" | "grant" => {
             let id: i64 = flags
@@ -369,7 +594,7 @@ pub(crate) fn handle(args: Vec<OsString>) -> io::Result<()> {
         }
         _ => {
             return Err(io::Error::other(
-                "Use approval list, preview, grant, or revoke.",
+                "Use approval list, preview, grant, preview-read, grant-read, or revoke.",
             ))
         }
     };
@@ -456,6 +681,161 @@ mod tests {
         })
         .unwrap();
     }
+    fn read_fixture() -> (EventStore, PathBuf, AgentHookEvent, PolicyFinding, Approval) {
+        let (store, workspace, _, _) = fixture();
+        let path = workspace.join("run.py");
+        let event = build_unattributed_hook_event(
+            &json!({
+                "session_id":"read-session", "cwd":workspace, "hook_event_name":"PreToolUse",
+                "tool_name":"Read", "tool_use_id":"read-tool", "tool_input":{"file_path":path}
+            })
+            .to_string(),
+            "claude-code",
+        )
+        .unwrap();
+        let finding = PolicyFinding {
+            action: PolicyAction::Ask,
+            severity: "medium".into(),
+            rule_id: SCOPED_READ_RULE.into(),
+            message: "possible credential".into(),
+            path: Some(path.to_string_lossy().into_owned()),
+            evidence: json!({}),
+        };
+        let captured = json!({"rule":SCOPED_READ_RULE,"path":path});
+        let mut approval = read_exception(
+            &event,
+            &captured,
+            "directory",
+            workspace.to_str().unwrap(),
+            10,
+        )
+        .unwrap();
+        approval.expires_at = unix_millis().unwrap() + 60_000;
+        with_records(store.root_path(), |records| {
+            records.push(approval.clone());
+            Ok(((), true))
+        })
+        .unwrap();
+        (store, workspace, event, finding, approval)
+    }
+
+    #[test]
+    fn scoped_reads_allow_changed_content_and_siblings_but_not_other_projects_or_providers() {
+        let (store, workspace, event, finding, approval) = read_fixture();
+        fs::write(
+            workspace.join("run.py"),
+            "api_key=changed-real-secret-value",
+        )
+        .unwrap();
+        let mut findings = vec![finding.clone()];
+        apply(&event, &store, &mut findings);
+        assert_eq!(findings[0].action, PolicyAction::Allow);
+        assert_eq!(
+            findings[0].evidence["scoped_read_exception_id"],
+            approval.id
+        );
+        assert_eq!(findings[0].evidence["original_response"]["action"], "ask");
+        let sibling = workspace.join("another.txt");
+        fs::write(&sibling, "another-content").unwrap();
+        let mut target =
+            read_target(&event, SCOPED_READ_RULE, finding.path.as_deref().unwrap()).unwrap();
+        target.path = fs::canonicalize(&sibling).unwrap();
+        assert!(matches_read_exception(&approval, &target));
+        target.provider = "codex".into();
+        assert!(!matches_read_exception(&approval, &target));
+        target.provider = "claude-code".into();
+        target.project = workspace.join("different-project");
+        assert!(!matches_read_exception(&approval, &target));
+    }
+
+    #[test]
+    fn scoped_reads_preserve_blocks_other_asks_expiry_and_revocation() {
+        let (store, _, event, finding, _) = read_fixture();
+        for action in [PolicyAction::Block, PolicyAction::Ask] {
+            let mut unrelated = finding.clone();
+            unrelated.rule_id = "policy_sensitive_egress".into();
+            unrelated.action = action;
+            let mut findings = vec![finding.clone(), unrelated];
+            apply(&event, &store, &mut findings);
+            assert_eq!(findings[0].action, PolicyAction::Ask);
+            assert_eq!(findings[1].action, action);
+        }
+        for revoked in [true, false] {
+            with_records(store.root_path(), |records| {
+                records[0].revoked = revoked;
+                if !revoked {
+                    records[0].expires_at = 1;
+                }
+                Ok(((), true))
+            })
+            .unwrap();
+            let mut findings = vec![finding.clone()];
+            apply(&event, &store, &mut findings);
+            assert_eq!(findings[0].action, PolicyAction::Ask);
+        }
+    }
+
+    #[test]
+    fn scoped_reads_reject_symlink_escape_prefix_collisions_and_non_read_calls() {
+        let (store, workspace, mut event, finding, approval) = read_fixture();
+        let outside = store.root_path().join("outside.txt");
+        fs::write(&outside, "outside").unwrap();
+        symlink(&outside, workspace.join("escape.txt")).unwrap();
+        let mut target =
+            read_target(&event, SCOPED_READ_RULE, finding.path.as_deref().unwrap()).unwrap();
+        target.path = fs::canonicalize(workspace.join("escape.txt")).unwrap();
+        assert!(!matches_read_exception(&approval, &target));
+        target.path = PathBuf::from(format!("{}-other/file", approval.path));
+        assert!(!matches_read_exception(&approval, &target));
+        event.tool_name = Some("Write".into());
+        assert!(read_target(&event, SCOPED_READ_RULE, finding.path.as_deref().unwrap()).is_err());
+        let mut findings = vec![finding];
+        apply(&event, &store, &mut findings);
+        assert_eq!(findings[0].action, PolicyAction::Ask);
+    }
+
+    #[test]
+    fn scoped_read_preview_requires_containment_and_resolves_tmp_aliases() {
+        let (_, workspace, event, finding, _) = read_fixture();
+        let captured = json!({"rule":SCOPED_READ_RULE,"path":finding.path});
+        assert!(read_exception(&event, &captured, "directory", "/", 10).is_err());
+        assert!(read_exception(&event, &captured, "directory", "/Applications", 10).is_err());
+        let file = read_exception(
+            &event,
+            &captured,
+            "file",
+            workspace.join("run.py").to_str().unwrap(),
+            10,
+        )
+        .unwrap();
+        let folder = read_exception(
+            &event,
+            &captured,
+            "directory",
+            workspace.to_str().unwrap(),
+            10,
+        )
+        .unwrap();
+        assert_ne!(file.key, folder.key);
+        assert!(file.read_scope.as_deref() == Some("file"));
+        #[cfg(target_os = "macos")]
+        {
+            let temporary = PathBuf::from(format!(
+                "/private/tmp/gensee-read-alias-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::write(&temporary, "test").unwrap();
+            let event = build_unattributed_hook_event(&json!({"session_id":"alias", "cwd":workspace,
+                "hook_event_name":"PreToolUse", "tool_name":"Read", "tool_input":{"file_path":temporary}}).to_string(), "claude-code").unwrap();
+            let captured = json!({"rule":SCOPED_READ_RULE,"path":temporary});
+            let a = read_exception(&event, &captured, "directory", "/tmp", 10).unwrap();
+            let b = read_exception(&event, &captured, "directory", "/private/tmp", 10).unwrap();
+            fs::remove_file(temporary).unwrap();
+            assert_eq!(a.key, b.key);
+            assert_eq!(a.path, "/private/tmp");
+        }
+    }
+
     #[test]
     fn grants_without_original_content_binding_are_inactive() {
         let (store, _, event, finding) = fixture();

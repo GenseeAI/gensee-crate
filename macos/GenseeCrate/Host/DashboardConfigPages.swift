@@ -845,7 +845,7 @@ struct DashboardSettingsPage: View {
                     }
                 }
 
-                DashboardCard("Remembered Approvals") {
+                DashboardCard("Approvals & Read Exceptions") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
                             Text("Scoped permissions for future matching actions.").font(.caption).foregroundStyle(.secondary)
@@ -857,9 +857,13 @@ struct DashboardSettingsPage: View {
                         ForEach(model.rememberedApprovals) { approval in
                             HStack {
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text("\(approval.provider) · \(approval.scope.capitalized)").font(.system(size: 12, weight: .semibold))
+                                    Text("\(approval.provider) · \(approval.isReadException ? "Read exception" : approval.scope.capitalized)").font(.system(size: 12, weight: .semibold))
                                     Text("Project: \(approval.project)").font(.caption2).foregroundStyle(.secondary)
                                     Text(approval.path).font(.system(size: 10, design: .monospaced)).textSelection(.enabled)
+                                    if let scope = approval.read_scope {
+                                        Text(scope == "directory" ? "Reads in this folder and subfolders · Any content" : "Reads of this file · Any content")
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                    }
                                     Text("\(approval.rule) · Expires \(Date(timeIntervalSince1970: TimeInterval(approval.expires_at) / 1000).formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
                                 }
                                 Spacer()

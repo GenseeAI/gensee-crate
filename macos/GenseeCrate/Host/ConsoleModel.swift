@@ -894,6 +894,41 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
+    func labelFalsePositive(_ alert: SecurityAlert, withdraw: Bool = false) async -> Bool {
+        guard !isDemoMode, backendAvailable, feedbackAlertID == nil else { return false }
+        feedbackAlertID = alert.alertID
+        defer { feedbackAlertID = nil }
+        var arguments = ["feedback", "record", "--event-key", "alert:\(alert.alertID)",
+                         "--verdict", withdraw ? "agree" : "allow", "--gensee", alert.action,
+                         "--label", withdraw ? "feedback_withdrawn" : "false_positive",
+                         "--rule", alert.ruleID,
+                         "--note", "Triage feedback only; no permission or policy change."]
+        if let path = alert.path { arguments += ["--path", path] }
+        if let session = alert.sessionID { arguments += ["--session", session] }
+        if let tool = alert.toolUseID { arguments += ["--tool-use-id", tool] }
+        do {
+            _ = try await cli.run(arguments)
+            noticeMessage = withdraw ? "False-positive feedback withdrawn." : "False positive reported. Future permissions are unchanged."
+            markAlertRead(alert.alertID)
+            Task { await refreshDashboard(reportErrors: false) }
+            return true
+        } catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    func previewReadException(_ alert: SecurityAlert, path: String, readScope: String) async throws -> RememberedApproval {
+        guard !isDemoMode, backendAvailable else { throw CocoaError(.featureUnsupported) }
+        return try await cli.decode(RememberedApproval.self, arguments: ["approval", "preview-read",
+            "--alert-id", String(alert.alertID), "--path", path, "--read-scope", readScope])
+    }
+
+    func saveReadException(_ alert: SecurityAlert, preview: RememberedApproval) async throws {
+        guard !isDemoMode, backendAvailable, let scope = preview.read_scope else { throw CocoaError(.featureUnsupported) }
+        _ = try await cli.run(["approval", "grant-read", "--alert-id", String(alert.alertID),
+            "--path", preview.path, "--read-scope", scope, "--expected-key", preview.key])
+        noticeMessage = "Read exception saved for 30 days. Revoke it in Settings."
+        await refreshRememberedApprovals()
+    }
+
     func refreshRememberedApprovals() async {
         guard !isDemoMode, backendAvailable else { return }
         do {
@@ -925,77 +960,6 @@ final class ConsoleModel: ObservableObject {
             _ = try await cli.run(["approval", "revoke", "--id", id])
             await refreshRememberedApprovals()
         } catch { approvalMemoryIssue = error.localizedDescription }
-    }
-
-    /// Persist a rule-scoped review adjustment in the active policy. Unlike
-    /// thumbs feedback, this changes how the same rule is classified and
-    /// enforced for future findings while preserving the immutable alert log.
-    func tuneFinding(
-        _ alert: SecurityAlert,
-        severity: String? = nil,
-        action: String? = nil
-    ) async -> Bool {
-        guard !isDemoMode else {
-            noticeMessage = "Synthetic demo mode never changes your policy."
-            return false
-        }
-        guard feedbackAlertID == nil else { return false }
-        feedbackAlertID = alert.alertID
-        defer { feedbackAlertID = nil }
-
-        do {
-            guard var root = try JSONSerialization.jsonObject(
-                with: Data(policyDocument.utf8)
-            ) as? [String: Any] else {
-                throw CocoaError(.propertyListReadCorrupt)
-            }
-            var overrides = root["review_overrides"] as? [[String: Any]] ?? []
-            var reviewOverride = overrides.first {
-                ($0["rule_id"] as? String) == alert.ruleID
-            } ?? ["rule_id": alert.ruleID]
-            overrides.removeAll { ($0["rule_id"] as? String) == alert.ruleID }
-            if let severity { reviewOverride["severity"] = severity.lowercased() }
-            if let action { reviewOverride["action"] = action.lowercased() }
-            overrides.append(reviewOverride)
-            root["review_overrides"] = overrides
-            let data = try JSONSerialization.data(
-                withJSONObject: root,
-                options: [.prettyPrinted, .sortedKeys]
-            )
-            let saved = await savePolicyDocument(String(decoding: data, as: UTF8.self))
-            guard saved else { return false }
-
-            let effectiveSeverity = (reviewOverride["severity"] as? String) ?? alert.severity.lowercased()
-            let effectiveAction = (reviewOverride["action"] as? String) ?? alert.action.lowercased()
-
-            var feedbackArguments = [
-                "feedback", "record",
-                "--verdict", "agree",
-                "--event-key", "alert:\(alert.alertID)",
-                "--gensee", alert.action,
-                "--label", "rule_tuning",
-                "--rule", alert.ruleID,
-                "--note", "future severity=\(effectiveSeverity); future action=\(effectiveAction)",
-            ]
-            if let sessionID = alert.sessionID, !sessionID.isEmpty {
-                feedbackArguments += ["--session", sessionID]
-            }
-            if let path = alert.path, !path.isEmpty {
-                feedbackArguments += ["--path", path]
-            }
-            var auditNote = ""
-            do {
-                _ = try await cli.run(feedbackArguments)
-            } catch {
-                auditNote = " The policy was saved, but its local audit note could not be recorded."
-            }
-            noticeMessage = "Future \(alert.ruleID) findings will use \(effectiveSeverity.uppercased()) · \(effectiveAction.uppercased()).\(auditNote)"
-            await refreshDashboard(reportErrors: false)
-            return true
-        } catch {
-            errorMessage = error.localizedDescription
-            return false
-        }
     }
 
     var reviewOverrides: [RuleReviewOverride] {

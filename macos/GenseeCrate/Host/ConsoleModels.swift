@@ -871,4 +871,6 @@ struct RememberedApproval: Decodable, Identifiable {
     let session: String
     let expires_at: UInt64
     let tool_input_preview: String?
+    let read_scope: String?
+    var isReadException: Bool { read_scope != nil }
 }

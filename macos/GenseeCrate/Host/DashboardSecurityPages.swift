@@ -250,57 +250,34 @@ struct ExpandableAlertRow: View {
 private struct FindingReviewControl: View {
     let alert: SecurityAlert
     @ObservedObject var model: ConsoleModel
-    @State private var pendingChange: PendingRuleTuning?
     @State private var approvalPreview: RememberedApproval?
     @State private var savingApproval = false
     @State private var approvalIssue: String?
-
-    private let severities = ["Info", "Low", "Medium", "High", "Critical"]
-    private let actions = ["Allow", "Warn", "Ask", "Block"]
-
-    private var currentOverride: RuleReviewOverride? {
-        model.reviewOverride(for: alert.ruleID)
-    }
+    @State private var showReadException = false
+    @State private var feedbackOverride: Bool?
+    private var isFalsePositive: Bool { feedbackOverride ?? (alert.feedbackLabel == "false_positive") }
 
     var body: some View {
         Menu {
+            if isFalsePositive {
+                Button("Undo false-positive feedback") { Task { if await model.labelFalsePositive(alert, withdraw: true) { feedbackOverride = false } } }
+            } else {
+                Button("This was a false positive") { Task { if await model.labelFalsePositive(alert) { feedbackOverride = true } } }
+            }
+            if alert.ruleID == "policy_credential_content_read", ["ask", "warn"].contains(alert.action.lowercased()) {
+                Button("Always allow matching reads…") { showReadException = true }
+            }
             if alert.action.lowercased() == "ask" {
-                Button("Approve similar actions…") {
-                    Task { approvalIssue = nil; approvalPreview = await model.previewApproval(alert) }
-                }
                 Divider()
-            }
-            Menu("Set rule-wide severity") {
-                ForEach(severities, id: \.self) { severity in
-                    Button {
-                        requestTune(severity: severity)
-                    } label: {
-                        if severity.caseInsensitiveCompare(currentOverride?.severity ?? alert.severity) == .orderedSame {
-                            Label(severity, systemImage: "checkmark")
-                        } else {
-                            Text(severity)
-                        }
-                    }
-                }
-            }
-            Menu("Set rule-wide action") {
-                ForEach(actions, id: \.self) { action in
-                    Button {
-                        requestTune(action: action)
-                    } label: {
-                        if action.caseInsensitiveCompare(currentOverride?.action ?? alert.action) == .orderedSame {
-                            Label(action, systemImage: "checkmark")
-                        } else {
-                            Text(action)
-                        }
-                    }
+                Button("Approve this exact action…") {
+                    Task { approvalIssue = nil; approvalPreview = await model.previewApproval(alert) }
                 }
             }
         } label: {
             if model.feedbackAlertID == alert.alertID {
                 ProgressView().controlSize(.small)
             } else {
-                Label(currentOverride == nil ? "Review" : "Rule override", systemImage: "slider.horizontal.3")
+                Label(isFalsePositive ? "Reported false positive" : "Review", systemImage: "slider.horizontal.3")
                     .font(.system(size: 12, weight: .medium))
             }
         }
@@ -329,23 +306,10 @@ private struct FindingReviewControl: View {
                 Text("One-use and session approvals expire within 24 hours. Project approvals expire in 30 days. Revoke them in Settings.").font(.caption2).foregroundStyle(.secondary)
             }.padding(24).frame(width: 600).disabled(savingApproval)
         }
-        .help("Approve a scoped match, or explicitly tune a rule globally. Strict fail-closed retains its enforcement floor.")
-        .alert(
-            "Weaken this rule globally?",
-            isPresented: Binding(
-                get: { pendingChange != nil },
-                set: { if !$0 { pendingChange = nil } }
-            ),
-            presenting: pendingChange
-        ) { change in
-            Button("Apply to Future Matches", role: .destructive) {
-                tune(severity: change.severity, action: change.action)
-                pendingChange = nil
-            }
-            Button("Cancel", role: .cancel) { pendingChange = nil }
-        } message: { _ in
-            Text("This affects every future match of \(alert.ruleID), across all paths and sessions. Strict and non-interactive fail-closed modes will retain the rule's original enforcement floor.")
+        .sheet(isPresented: $showReadException) {
+            ScopedReadExceptionSheet(alert: alert, model: model)
         }
+        .help("Report a detection mistake or explicitly permit matching activity. Feedback does not change permissions.")
     }
 
     private func saveApproval(_ preview: RememberedApproval, scope: String) {
@@ -358,27 +322,70 @@ private struct FindingReviewControl: View {
         }
     }
 
-    private func requestTune(severity: String? = nil, action: String? = nil) {
-        let change = PendingRuleTuning(severity: severity, action: action)
-        let currentSeverity = currentOverride?.severity ?? alert.severity
-        let currentAction = currentOverride?.action ?? alert.action
-        let weakensSeverity = severity.map { PolicyValueRank.severity($0) < PolicyValueRank.severity(currentSeverity) } ?? false
-        let weakensAction = action.map { PolicyValueRank.weakensAction(from: currentAction, to: $0) } ?? false
-        if weakensSeverity || weakensAction {
-            pendingChange = change
-        } else {
-            tune(severity: severity, action: action)
-        }
-    }
+}
 
-    private func tune(severity: String? = nil, action: String? = nil) {
-        Task { _ = await model.tuneFinding(alert, severity: severity, action: action) }
-    }
+private struct ScopedReadExceptionSheet: View {
+    let alert: SecurityAlert
+    @ObservedObject var model: ConsoleModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var readScope = "file"
+    @State private var path = ""
+    @State private var preview: RememberedApproval?
+    @State private var busy = false
+    @State private var issue: String?
 
-    private struct PendingRuleTuning: Identifiable {
-        let severity: String?
-        let action: String?
-        let id = UUID()
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Always allow matching reads").font(.headline)
+            Text("Allow the credential-content check for matching reads, even when file content changes. Other rules still apply.")
+                .font(.caption).foregroundStyle(.secondary)
+            Picker("Applies to", selection: $readScope) {
+                Text("This file").tag("file")
+                Text("Folder and subfolders").tag("directory")
+            }.pickerStyle(.segmented)
+            TextField("Absolute folder path", text: $path).disabled(readScope == "file")
+            if let preview {
+                Text("\(preview.provider) · Reads only").font(.subheadline)
+                Text("Project: \(preview.project)").font(.caption)
+                Text("\(preview.read_scope == "directory" ? "Folder and subfolders" : "File"): \(preview.path)")
+                    .font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                Text("Credential-content check only. Expires in 30 days; revoke in Settings.").font(.caption)
+            }
+            if model.reviewOverride(for: alert.ruleID) != nil {
+                Text("A rule-wide override already exists. Reset it in Policy if you want only this exception to apply.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if let issue { Text(issue).font(.caption).foregroundStyle(.red) }
+            HStack {
+                Button("Cancel") { dismiss() }
+                Spacer()
+                if let preview {
+                    Button("Save read exception") {
+                        busy = true
+                        Task {
+                            do { try await model.saveReadException(alert, preview: preview); dismiss() }
+                            catch { issue = error.localizedDescription }
+                            busy = false
+                        }
+                    }
+                } else {
+                    Button("Preview exception") {
+                        busy = true
+                        Task {
+                            do { preview = try await model.previewReadException(alert, path: path, readScope: readScope); issue = nil }
+                            catch { issue = error.localizedDescription }
+                            busy = false
+                        }
+                    }
+                }
+            }
+        }.padding(24).frame(width: 600).disabled(busy)
+            .onAppear { path = alert.path ?? "" }
+            .onChange(of: path) { _ in preview = nil; issue = nil }
+            .onChange(of: readScope) { scope in
+                preview = nil; issue = nil
+                path = scope == "file" ? (alert.path ?? "") : URL(fileURLWithPath: alert.path ?? "").deletingLastPathComponent().path
+            }
     }
 }
 
