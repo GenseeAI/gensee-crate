@@ -4035,8 +4035,10 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
         "historical-routine-v5:{:x}",
         Sha256::digest(
             format!(
-                "{}:{}:{}",
-                env!("GENSEE_CLASSIFIER_FINGERPRINT"),
+                "{}:{}:{}:{}:{}",
+                env!("GENSEE_SOURCE_FINGERPRINT"),
+                gensee_crate_core::SOURCE_FINGERPRINT,
+                gensee_crate_rules::SOURCE_FINGERPRINT,
                 policy.source_document(),
                 env::var("HOME").unwrap_or_default()
             )
@@ -4062,13 +4064,25 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
                 return false;
             }
             // Hook paths can be symlinks. Only an event-time resolved path is
-            // eligible; legacy unresolved hook evidence stays visible.
-            let sensor_path = e.get("actor").is_some() && e.get("event_type").is_some();
+            // eligible, except legacy records explicitly quieted at evaluation time.
+            let sensor_path = e["source"] == "macos-endpoint-security"
+                // Older raw sensor payloads had no source tag. Require the
+                // kernel-message schema, not merely two optional keys.
+                || (e.get("source").is_none() && e.get("schema_version").is_some()
+                    && e.get("actor").is_some() && e.get("event_type").is_some());
             let path = if sensor_path {
                 path
             } else {
                 match e["resolved_path"].as_str() {
                     Some(resolved) => resolved,
+                    None if e.get("resolved_path").is_none()
+                        && e["_recorded_action"] == "allow"
+                        && e["_recorded_message"].as_str().is_some_and(|m| {
+                            m.starts_with("Routine temporary-file activity: ")
+                        }) =>
+                    {
+                        path
+                    }
                     None => return false,
                 }
             };
@@ -4101,7 +4115,9 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
 fn dashboard_state() -> io::Result<()> {
     let store = EventStore::default_local()?;
     configure_dashboard_noise_filter(&store)?;
-    println!("{}", serde_json::to_string(&store.dashboard_state()?)?);
+    let mut dashboard = store.dashboard_state()?;
+    approval_memory::annotate_dashboard(&mut dashboard);
+    println!("{}", serde_json::to_string(&dashboard)?);
     Ok(())
 }
 
@@ -4168,10 +4184,9 @@ fn dashboard_request(args: Vec<OsString>) -> io::Result<()> {
     }
     let store = EventStore::default_local()?;
     configure_dashboard_noise_filter(&store)?;
-    println!(
-        "{}",
-        serde_json::to_string(&store.dashboard_request(request_id)?)?
-    );
+    let mut dashboard = store.dashboard_request(request_id)?;
+    approval_memory::annotate_dashboard(&mut dashboard);
+    println!("{}", serde_json::to_string(&dashboard)?);
     Ok(())
 }
 
@@ -4187,7 +4202,9 @@ fn dashboard_day(args: Vec<OsString>) -> io::Result<()> {
     })?;
     let store = EventStore::default_local()?;
     configure_dashboard_noise_filter(&store)?;
-    println!("{}", serde_json::to_string(&store.dashboard_day(day)?)?);
+    let mut dashboard = store.dashboard_day(day)?;
+    approval_memory::annotate_dashboard(&mut dashboard);
+    println!("{}", serde_json::to_string(&dashboard)?);
     Ok(())
 }
 
@@ -4377,9 +4394,11 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
         let workspace_root = active_tool.as_ref().map(|tool| tool.cwd.as_str());
         event.attribution.workspace_root = workspace_root.map(str::to_string);
         let bookkeeping = endpoint_security_event_is_bookkeeping(&event, workspace_root);
-        let evidence = serde_json::to_value(&event).map_err(io::Error::other)?;
+        let mut evidence = serde_json::to_value(&event).map_err(io::Error::other)?;
+        evidence["source"] = json!("macos-endpoint-security");
         for finding in findings {
-            if finding.rule_id != "endpoint_security_event_gap"
+            if gensee_crate_store::AlertKind::for_rule(finding.rule_id)
+                != gensee_crate_store::AlertKind::MonitoringHealth
                 && (active_session_id.is_none() || bookkeeping)
             {
                 continue;

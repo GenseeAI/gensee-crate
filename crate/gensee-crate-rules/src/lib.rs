@@ -35,3 +35,6 @@ pub fn sensitive_file_access(event: &AgentEvent) -> Option<RuleMatch> {
 
     None
 }
+
+/// Fingerprint of this packaged crate, independent of workspace layout.
+pub const SOURCE_FINGERPRINT: &str = env!("GENSEE_SOURCE_FINGERPRINT");

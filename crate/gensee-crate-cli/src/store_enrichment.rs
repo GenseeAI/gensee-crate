@@ -322,7 +322,7 @@ mod tests {
             alert.rule_id = "hook_bypass_file_mutation".into();
             alert.path = Some(path.into());
             alert.evidence = Some(json!({"logical_operation":operation, "event_type":"write",
-                "attribution":{"workspace_root":"/repo"}, "actor":{},
+                "attribution":{"workspace_root":"/repo"}, "source":"macos-endpoint-security", "actor":{},
                 "file":{"path":source, "mode":0o100644}}));
             assert!(record_endpoint_policy_alert(
                 &store,
@@ -379,7 +379,7 @@ mod tests {
             a.path = Some(path.into());
             a.evidence = Some(
                 json!({"logical_operation":operation,"event_type":if operation == "delete" {"unlink"} else {"rename"},
-                "action":action,"actor":{},"decision":{"result":result},"file":{"path":path,"mode":mode}}),
+                "action":action,"source":"macos-endpoint-security", "actor":{},"decision":{"result":result},"file":{"path":path,"mode":mode}}),
             );
             record_endpoint_policy_alert(&store, a, &format!("directory-{index}"), 10_000).unwrap();
         }
@@ -428,7 +428,7 @@ mod tests {
                 log.clone()
             });
             a.evidence = Some(
-                json!({"logical_operation":if source=="/etc/passwd" {"rename"} else {"mutation"},"actor":{"team_id":if actor {"Q6L2SF6YDW"} else {"FAKE"},"signing_id":"com.anthropic.claudefordesktop"},"file":{"path":source,"mode":0o100644}}),
+                json!({"logical_operation":if source=="/etc/passwd" {"rename"} else {"mutation"},"source":"macos-endpoint-security", "actor":{"team_id":if actor {"Q6L2SF6YDW"} else {"FAKE"},"signing_id":"com.anthropic.claudefordesktop"},"file":{"path":source,"mode":0o100644}}),
             );
             store.append_policy_alert(&a).unwrap();
         }
@@ -550,6 +550,62 @@ mod tests {
     }
 
     #[test]
+    fn legacy_scratch_fallback_requires_recorded_routine_allow_and_no_failed_resolution() {
+        let dir = env::temp_dir().join(format!("gensee-legacy-scratch-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        for (action, message, evidence) in [
+            (
+                "allow",
+                "Routine temporary-file activity: write",
+                json!({"source":"hook", "operation":"write"}),
+            ),
+            (
+                "ask",
+                "Write outside workspace",
+                json!({"source":"hook", "operation":"write"}),
+            ),
+            (
+                "allow",
+                "Routine temporary-file activity: write",
+                json!({"source":"hook", "operation":"write", "resolved_path":null}),
+            ),
+            (
+                "allow",
+                "Routine temporary-file activity: write",
+                json!({"source":"hook", "operation":"write", "resolved_path":"/Users/test/.ssh/id_rsa"}),
+            ),
+            (
+                "allow",
+                "Unrelated allow",
+                json!({"source":"hook", "operation":"write"}),
+            ),
+            (
+                "ask",
+                "Unresolved hook with unrelated actor fields",
+                json!({"operation":"write", "actor":{}, "event_type":"write"}),
+            ),
+        ] {
+            let mut a = alert("medium", action);
+            a.message = message.into();
+            a.rule_id = "policy_write_outside_workspace".into();
+            a.path = Some("/private/tmp/ordinary-output.txt".into());
+            a.evidence = Some(evidence);
+            store.append_policy_alert(&a).unwrap();
+        }
+        let chain = store.verify_alert_chain().unwrap();
+        configure_dashboard_noise_filter(&store).unwrap();
+        assert_eq!(
+            store.dashboard_state().unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 6);
+        assert_eq!(store.verify_alert_chain().unwrap(), chain);
+    }
+
+    #[test]
     fn dashboard_quiets_only_routine_unmatched_mutations() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-dashboard-intent-gap-{}",
@@ -575,7 +631,7 @@ mod tests {
             finding.rule_id = "hook_bypass_file_mutation".into();
             finding.path = Some(path.into());
             finding.evidence = Some(
-                json!({"logical_operation": operation, "event_type":"write", "actor":{}, "attribution": {"workspace_root":"/repo"}}),
+                json!({"logical_operation": operation, "event_type":"write", "source":"macos-endpoint-security", "actor":{}, "attribution": {"workspace_root":"/repo"}}),
             );
             store.append_policy_alert(&finding).unwrap();
         }

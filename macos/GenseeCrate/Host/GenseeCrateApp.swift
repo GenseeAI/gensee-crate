@@ -19,6 +19,10 @@ struct GenseeCrateApp: App {
                 .frame(minWidth: 1180, minHeight: 720)
                 .onAppear {
                     appDelegate.statusItem.start(model: consoleModel)
+                    notifications.startMonitoringHealth { [weak model = consoleModel] in
+                        guard let model, !model.isDemoMode else { return nil }
+                        return model.endpointSensor.health
+                    }
                 }
         }
         .windowResizability(.contentMinSize)

@@ -118,13 +118,6 @@ struct DashboardShell: View {
             }
         }
         .task {
-            // Health alarms must not wait behind dashboard DB reads or agent completion.
-            while !Task.isCancelled {
-                if !model.isDemoMode { await notifications.processMonitoringHealth(model.endpointSensor.health) }
-                try? await Task.sleep(for: .seconds(1))
-            }
-        }
-        .task {
             while !Task.isCancelled {
                 await model.refreshPendingRecoveryRequest()
                 try? await Task.sleep(for: .seconds(model.pendingRecoveryPollingSeconds))

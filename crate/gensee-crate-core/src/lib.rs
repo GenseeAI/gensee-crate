@@ -21,3 +21,6 @@ pub use path::{
 pub use redact::{redact_text, redact_value};
 pub use sessions::AgentSession;
 pub use vscode::{is_vscode_file_tool_name, parse_vscode_file_intents, VscodeFileIntent};
+
+/// Fingerprint of this packaged crate, independent of workspace layout.
+pub const SOURCE_FINGERPRINT: &str = env!("GENSEE_SOURCE_FINGERPRINT");

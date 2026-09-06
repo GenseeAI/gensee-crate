@@ -4622,6 +4622,10 @@ fn credential_content_scanner_flags_secrets_not_templates() {
     )
     .is_some());
 
+    for placeholder in ["[FILTERED]", "[REDACTED]", "[MASKED]", "[HIDDEN]"] {
+        assert!(content_has_credentials(&format!("password: {placeholder}")).is_none());
+        assert!(content_has_credentials(&format!("token = {placeholder}")).is_none());
+    }
     // Negatives: ERB/env templates and placeholders are NOT live secrets.
     assert!(content_has_credentials("  password: <%= ENV.fetch(\"DB_PASS\") %>\n").is_none());
     assert!(content_has_credentials("password: ${DB_PASSWORD}\n").is_none());

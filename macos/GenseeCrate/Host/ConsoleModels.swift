@@ -277,6 +277,8 @@ struct DashboardSummary: Decodable {
     }
 }
 
+struct ApprovalEligibility: Decodable { let exact: Bool; let read: Bool; let reason: String? }
+
 struct SecurityAlert: Decodable, Identifiable {
     let alertID: Int64
     let requestID: Int64?
@@ -299,13 +301,11 @@ struct SecurityAlert: Decodable, Identifiable {
     let feedbackCreatedAt: Int64?
     let rawEventCount: Int?
 
+    var approvalEligibility: ApprovalEligibility? = nil
     var id: Int64 { alertID }
 
-    var supportsExactApproval: Bool {
-        action.lowercased() == "ask" && ["policy_write_outside_workspace",
-            "policy_credential_content_read", "policy_unmatched_executable_modification",
-            "policy_prior_session_executable_artifact"].contains(ruleID)
-    }
+    var supportsExactApproval: Bool { approvalEligibility?.exact == true }
+    var supportsReadException: Bool { approvalEligibility?.read == true }
 
     var reviewStatus: String {
         switch action.lowercased() {
@@ -334,6 +334,7 @@ struct SecurityAlert: Decodable, Identifiable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case approvalEligibility = "approval_eligibility"
         case alertID = "alert_id"
         case requestID = "request_id"
         case sessionID = "session_id"

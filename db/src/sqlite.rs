@@ -716,8 +716,7 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
 
         // Classifications are rebuildable projections, not evidence. Version 6
         // retains independent classifier versions under a composite key.
-        conn.execute_batch("DROP TABLE IF EXISTS dashboard_alert_classification")
-            .map_err(SqliteError::Schema)?;
+        migrate_dashboard_classification_v6(&conn, schema_version).map_err(SqliteError::Schema)?;
         conn.execute_batch(include_str!("../schema.sql"))
             .map_err(SqliteError::Schema)?;
 
@@ -2783,6 +2782,29 @@ fn backfill_alert_chain_head(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn migrate_dashboard_classification_v6(
+    conn: &Connection,
+    from_version: i64,
+) -> rusqlite::Result<()> {
+    if from_version >= 6 {
+        return Ok(());
+    }
+    let has_progress: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dashboard_projection_progress')", [], |r| r.get(0))?;
+    conn.execute_batch("SAVEPOINT classification_v6")?;
+    let result = (|| {
+        conn.execute_batch("DROP TABLE IF EXISTS dashboard_alert_classification")?;
+        if has_progress {
+            conn.execute("DELETE FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%'", [])?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = conn.execute_batch("ROLLBACK TO classification_v6; RELEASE classification_v6");
+        return Err(error);
+    }
+    conn.execute_batch("RELEASE classification_v6")
+}
+
 /// Add the `tool_use_id` column to a pre-existing `agent_events` table. On a
 /// fresh database the table does not exist yet (columns come back empty), so
 /// `schema.sql` creates it with the column and this is a no-op.
@@ -3420,6 +3442,7 @@ mod tests {
         conn.execute_batch("DROP TABLE dashboard_alert_classification;
             CREATE TABLE dashboard_alert_classification(alert_id INTEGER PRIMARY KEY, policy_key TEXT NOT NULL, routine INTEGER NOT NULL);
             INSERT INTO dashboard_alert_classification VALUES (1, 'old', 1);
+            INSERT INTO dashboard_projection_progress VALUES ('alert-classification:old', 100);
             PRAGMA user_version = 5;").unwrap();
         drop(conn);
         let conn = open(&config).unwrap();
@@ -3432,11 +3455,22 @@ mod tests {
             .unwrap(),
             0
         );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         conn.execute_batch(
             "INSERT INTO dashboard_alert_classification VALUES (1, 'a', 1), (1, 'b', 0);",
         )
         .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM dashboard_alert_classification",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        migrate_dashboard_classification_v6(&conn, 6).unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM dashboard_alert_classification",

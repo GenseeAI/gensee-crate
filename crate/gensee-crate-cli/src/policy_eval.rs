@@ -2011,6 +2011,10 @@ fn looks_like_secret_value(raw: &str) -> bool {
         || lower.contains("xxxx")
         || lower == "null"
         || lower == "none"
+        || matches!(
+            lower.as_str(),
+            "filtered" | "redacted" | "masked" | "hidden"
+        )
     {
         return false;
     }

@@ -1,3 +1,27 @@
+// Centralize request grouping and legacy prompt recovery across dashboard queries.
+macro_rules! grouped_request_sql {
+    ($last:expr) => { $last };
+    ($first:expr, $($rest:expr),+) => {
+        concat!($first, "SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1", grouped_request_sql!($($rest),+))
+    };
+}
+
+macro_rules! recovered_request_prompt_sql {
+    ($prefix:literal) => {
+        concat!(
+            "substr(CASE WHEN ",
+            $prefix,
+            "original_user_prompt = 'Background activity' THEN COALESCE(json_extract(",
+            $prefix,
+            "events, '$.prompt'), ",
+            $prefix,
+            "original_user_prompt) ELSE ",
+            $prefix,
+            "original_user_prompt END, 1, 16384)"
+        )
+    };
+}
+
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
@@ -404,79 +428,102 @@ impl EventStore {
         if !candidate_rules.is_empty() {
             let rules = serde_json::to_string(candidate_rules).map_err(io::Error::other)?;
             let progress_key = format!("alert-classification:{policy_key}");
-            let mut cursor = conn
-                .query_row(
-                    "SELECT cursor FROM dashboard_projection_progress WHERE name = ?1",
-                    [&progress_key],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(sqlite_error_from_rusqlite)?
-                .unwrap_or(0);
             loop {
-                let mut query = conn.prepare("SELECT a.alert_id, a.rule_id, COALESCE(a.path, ''),
-                    COALESCE(json_extract(a.evidence, '$.attribution.workspace_root'), ''),
-                    COALESCE(json_extract(a.evidence, '$.logical_operation'), ''), COALESCE(a.evidence, '{}')
-                    FROM alerts a
-                    WHERE a.alert_id > ?1 AND a.rule_id IN (SELECT value FROM json_each(?2))
-                      AND lower(a.action) NOT IN ('deny', 'block')
-                      AND NOT EXISTS (SELECT 1 FROM dashboard_alert_classification c WHERE c.alert_id = a.alert_id AND c.policy_key = ?3)
-                    ORDER BY a.alert_id LIMIT 2048").map_err(sqlite_error_from_rusqlite)?;
-                let rows = query
-                    .query_map(rusqlite::params![cursor, rules, policy_key], |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, String>(3)?,
-                            r.get::<_, String>(4)?,
-                            r.get::<_, String>(5)?,
-                        ))
-                    })
-                    .map_err(sqlite_error_from_rusqlite)?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sqlite_error_from_rusqlite)?;
-                if rows.is_empty() {
+                let needs_work: bool = conn.query_row("SELECT
+                    EXISTS(SELECT 1 FROM alerts WHERE alert_id > COALESCE((SELECT cursor FROM dashboard_projection_progress WHERE name = ?1), 0)
+                        AND rule_id IN (SELECT value FROM json_each(?2)) AND lower(action) NOT IN ('deny', 'block'))
+                    OR EXISTS(SELECT 1 FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%' AND name != ?1)",
+                    rusqlite::params![progress_key, rules], |r| r.get(0)).map_err(sqlite_error_from_rusqlite)?;
+                if !needs_work {
                     break;
                 }
-                cursor = rows.last().unwrap().0;
-                let classified: Vec<_> = rows
-                    .into_iter()
-                    .map(|(id, rule, path, workspace, operation, evidence)| {
-                        (
-                            id,
-                            is_noise(&rule, &path, &workspace, &operation, &evidence),
-                        )
-                    })
-                    .collect();
-                conn.execute_batch("SAVEPOINT alert_classification")
-                    .map_err(sqlite_error_from_rusqlite)?;
-                let saved = (|| -> rusqlite::Result<()> {
-                    let mut insert = conn.prepare_cached(
-                        "INSERT INTO dashboard_alert_classification VALUES (?1, ?2, ?3)
-                        ON CONFLICT(alert_id, policy_key) DO UPDATE SET routine = excluded.routine",
-                    )?;
-                    for (id, value) in classified {
-                        insert.execute(rusqlite::params![id, policy_key, value])?;
-                    }
-                    conn.execute(
-                        "INSERT INTO dashboard_projection_progress VALUES (?1, ?2)
-                        ON CONFLICT(name) DO UPDATE SET cursor = MAX(cursor, excluded.cursor)",
-                        rusqlite::params![progress_key, cursor],
-                    )?;
-                    Ok(())
-                })();
-                if let Err(error) = saved {
-                    let _ = conn.execute_batch(
-                        "ROLLBACK TO alert_classification; RELEASE alert_classification",
-                    );
+                // Serialize only one bounded batch. Re-read the generation and
+                // cursor under the writer lock: another CLI may have changed
+                // policy while this process was between batches.
+                if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
                     if sqlite_is_busy(&error) {
                         break;
                     }
                     return Err(sqlite_error_from_rusqlite(error));
                 }
-                conn.execute_batch("RELEASE alert_classification")
-                    .map_err(sqlite_error_from_rusqlite)?;
+                let saved = (|| -> rusqlite::Result<bool> {
+                    let obsolete: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%' AND name != ?1)", [&progress_key], |r| r.get(0))?;
+                    if obsolete {
+                        conn.execute(
+                            "DELETE FROM dashboard_alert_classification WHERE policy_key != ?1",
+                            [policy_key],
+                        )?;
+                        conn.execute("DELETE FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%' AND name != ?1", [&progress_key])?;
+                    }
+                    let cursor = conn
+                        .query_row(
+                            "SELECT cursor FROM dashboard_projection_progress WHERE name = ?1",
+                            [&progress_key],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()?
+                        .unwrap_or(0);
+                    let mut query = conn.prepare("SELECT a.alert_id, a.rule_id, COALESCE(a.path, ''),
+                        COALESCE(json_extract(a.evidence, '$.attribution.workspace_root'), ''),
+                        COALESCE(json_extract(a.evidence, '$.logical_operation'), ''),
+                        json_set(COALESCE(a.evidence, '{}'), '$._recorded_action', a.action, '$._recorded_message', a.message)
+                        FROM alerts a WHERE a.alert_id > ?1
+                        AND a.rule_id IN (SELECT value FROM json_each(?2)) AND lower(a.action) NOT IN ('deny', 'block')
+                        ORDER BY a.alert_id LIMIT 2048")?;
+                    let rows = query
+                        .query_map(rusqlite::params![cursor, rules], |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, String>(4)?,
+                                r.get::<_, String>(5)?,
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let next = rows.last().map(|r| r.0);
+                    let mut insert = conn.prepare_cached(
+                        "INSERT INTO dashboard_alert_classification VALUES (?1, ?2, ?3)
+                        ON CONFLICT(alert_id, policy_key) DO UPDATE SET routine = excluded.routine",
+                    )?;
+                    for (id, rule, path, workspace, operation, evidence) in rows {
+                        insert.execute(rusqlite::params![
+                            id,
+                            policy_key,
+                            is_noise(&rule, &path, &workspace, &operation, &evidence)
+                        ])?;
+                    }
+                    if let Some(next) = next {
+                        conn.execute(
+                            "INSERT INTO dashboard_projection_progress VALUES (?1, ?2)
+                            ON CONFLICT(name) DO UPDATE SET cursor = MAX(cursor, excluded.cursor)",
+                            rusqlite::params![progress_key, next],
+                        )?;
+                    }
+                    Ok(next.is_none())
+                })();
+                match saved {
+                    Ok(done) => {
+                        if let Err(error) = conn.execute_batch("COMMIT") {
+                            let _ = conn.execute_batch("ROLLBACK");
+                            if sqlite_is_busy(&error) {
+                                break;
+                            }
+                            return Err(sqlite_error_from_rusqlite(error));
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        if sqlite_is_busy(&error) {
+                            break;
+                        }
+                        return Err(sqlite_error_from_rusqlite(error));
+                    }
+                }
             }
         }
         Ok(())
@@ -1248,7 +1295,7 @@ impl EventStore {
         }
         let db = self.sqlite_store()?;
         let conn = db.connection();
-        let groups = DashboardRequestGroups::load(conn)?;
+        let mut groups = DashboardRequestGroups::load(conn)?;
         timing("groups");
         materialize_dashboard_visible_alerts(conn)?;
         timing("visible alerts");
@@ -1314,13 +1361,13 @@ impl EventStore {
             },
         )?;
         let requests_sql =
-            "WITH recent_roots AS MATERIALIZED (
+            concat!("WITH recent_roots AS MATERIALIZED (
                SELECT COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = r.request_id), r.request_id) AS root_id,
                       MAX(COALESCE(completed_at, created_at, r.request_id)) AS activity
                FROM requests r GROUP BY root_id ORDER BY activity DESC, root_id DESC LIMIT 100
              ), recent_requests AS MATERIALIZED (
                SELECT request_id, session_id,
-                      substr(original_user_prompt, 1, 16384) AS original_user_prompt,
+                      ", recovered_request_prompt_sql!(""), " AS original_user_prompt,
                       created_at, completed_at
                FROM requests r
                WHERE COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = r.request_id), r.request_id)
@@ -1370,7 +1417,7 @@ impl EventStore {
              LEFT JOIN event_rollups ON event_rollups.request_id = recent_requests.request_id
              LEFT JOIN alert_rollups ON alert_rollups.request_id = recent_requests.request_id
              ORDER BY COALESCE(recent_requests.completed_at, recent_requests.created_at, recent_requests.request_id) DESC,
-                      recent_requests.request_id DESC";
+                      recent_requests.request_id DESC");
         let mut requests = query_json_rows(conn, requests_sql, |row| {
             Ok(json!({
                 "request_id": row.get::<_, i64>(0)?,
@@ -1412,6 +1459,12 @@ impl EventStore {
             request["summary_file_touches"] = json!(touches);
         }
         timing("native touches");
+        let visible_ids: Vec<_> = requests
+            .iter()
+            .chain(alerts.iter())
+            .filter_map(|row| row["request_id"].as_i64())
+            .collect();
+        groups.load_prompts(conn, &visible_ids)?;
         requests = groups.merge_requests(requests);
         for request in &mut requests {
             let id = request["request_id"].as_i64().unwrap();
@@ -1419,10 +1472,10 @@ impl EventStore {
                 continue;
             }
             let (tools, decisions): (i64, i64) = conn.query_row(
-                "SELECT (SELECT COUNT(DISTINCT CASE WHEN type NOT IN ('PostToolUse', 'PostToolUseFailure') THEN COALESCE(tool_use_id, 'event-' || event_id) END)
-                    FROM agent_events WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)),
+                grouped_request_sql!("SELECT (SELECT COUNT(DISTINCT CASE WHEN type NOT IN ('PostToolUse', 'PostToolUseFailure') THEN COALESCE(tool_use_id, 'event-' || event_id) END)
+                    FROM agent_events WHERE request_id IN (", ")),
                     (SELECT COUNT(DISTINCT rule_id || '|' || COALESCE(path, '') || '|' || lower(action))
-                    FROM dashboard_visible_alerts WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1))",
+                    FROM dashboard_visible_alerts WHERE request_id IN (", "))"),
                 [id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sqlite_error_from_rusqlite)?;
             request["tool_call_count"] = json!(tools);
             request["decision_count"] = json!(decisions);
@@ -1729,7 +1782,9 @@ impl EventStore {
     pub fn dashboard_request(&self, request_id: i64) -> io::Result<Value> {
         let groups = {
             let db = self.sqlite_store()?;
-            DashboardRequestGroups::load(db.connection())?
+            let mut groups = DashboardRequestGroups::load(db.connection())?;
+            groups.load_prompts(db.connection(), &[request_id])?;
+            groups
         };
         let root = groups.root(request_id);
         let mut result = self.dashboard_request_ungrouped(root)?;
@@ -1765,9 +1820,9 @@ impl EventStore {
 
         let mut request = conn
             .query_row(
-                "SELECT request_id, session_id, substr(original_user_prompt, 1, 16384), created_at, (SELECT MAX(completed_at) FROM requests WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1))
+                grouped_request_sql!(concat!("SELECT request_id, session_id, ", recovered_request_prompt_sql!(""), ", created_at, (SELECT MAX(completed_at) FROM requests WHERE request_id IN ("), "))
                  FROM requests
-                 WHERE request_id = ?1",
+                 WHERE request_id = ?1"),
                 [request_id],
                 |row| {
                     Ok(json!({
@@ -1802,11 +1857,14 @@ impl EventStore {
 
         let agent_events = query_json_rows_with_i64(
             conn,
-            "SELECT event_id, pid, request_id, ts, source, type, cwd,
+            grouped_request_sql!(
+                "SELECT event_id, pid, request_id, ts, source, type, cwd,
                     permission_mode, tool_name, tool_input, tool_response, tool_use_id
              FROM agent_events
-             WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
-             ORDER BY ts, event_id",
+             WHERE request_id IN (",
+                ")
+             ORDER BY ts, event_id"
+            ),
             request_id,
             |row| {
                 Ok(json!({
@@ -4084,7 +4142,8 @@ fn merge_evidence(base: Option<Value>, enrichment: Option<Value>) -> Option<Valu
 fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::Result<Vec<Value>> {
     let touches = query_json_rows_with_i64(
         conn,
-        "SELECT CASE
+        grouped_request_sql!(
+            "SELECT CASE
                     WHEN artifacts.uri LIKE 'file://%' THEN substr(artifacts.uri, 8)
                     WHEN artifacts.uri LIKE 'file:%' THEN substr(artifacts.uri, 6)
                     ELSE artifacts.uri
@@ -4099,7 +4158,8 @@ fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::R
                       AND declared_relation.dst_id = artifacts.artifact_id
                       AND declared_relation.relation_type IN
                           ('produced', 'modified', 'deleted')
-                      AND declaring_event.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
+                      AND declaring_event.request_id IN (",
+            ")
                 ) AS intended_and_verified,
                 MAX(system_events.ts) AS last_observed_at,
                 artifact_facts.risk_level,
@@ -4116,16 +4176,19 @@ fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::R
           AND observed_relation.relation_type IN ('wrote', 'modified', 'deleted')
          JOIN system_events
            ON system_events.event_id = observed_relation.src_id
-          AND system_events.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
+          AND system_events.request_id IN (",
+            ")
           AND system_events.source = 'macos-endpoint-security'
          LEFT JOIN artifact_facts
            ON artifact_facts.current_artifact_id = artifacts.artifact_id
          WHERE request_relation.src_kind = 'request'
-           AND request_relation.src_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
+           AND request_relation.src_id IN (",
+            ")
            AND request_relation.dst_kind = 'artifact'
            AND request_relation.relation_type IN ('produced', 'modified', 'deleted')
          GROUP BY artifacts.artifact_id, artifacts.uri
-         ORDER BY path",
+         ORDER BY path"
+        ),
         request_id,
         |row| {
             Ok(json!({
@@ -4159,14 +4222,16 @@ fn dashboard_completed_native_file_touches(
 ) -> io::Result<Vec<Value>> {
     let rows = query_json_rows_with_i64(
         conn,
-        "WITH completed_tools AS (
+        grouped_request_sql!(
+            "WITH completed_tools AS (
            SELECT started.tool_input, started.cwd, completed.ts
            FROM agent_events AS started
            JOIN agent_events AS completed
              ON completed.request_id = started.request_id
             AND completed.type = 'PostToolUse'
             AND completed.tool_use_id = started.tool_use_id
-           WHERE started.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
+           WHERE started.request_id IN (",
+            ")
              AND started.type = 'PreToolUse'
              AND json_valid(started.tool_input)
          ),
@@ -4183,7 +4248,8 @@ fn dashboard_completed_native_file_touches(
              ON started.request_id = intent.request_id
             AND started.type = 'PreToolUse'
             AND started.tool_use_id = intent.tool_use_id
-           WHERE intent.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
+           WHERE intent.request_id IN (",
+            ")
              AND intent.type = 'file_intent'
              AND json_valid(intent.tool_input)
          ),
@@ -4210,7 +4276,8 @@ fn dashboard_completed_native_file_touches(
          SELECT path, cwd, MAX(completed_at)
          FROM declared_paths
          WHERE path IS NOT NULL AND path != ''
-         GROUP BY path, cwd",
+         GROUP BY path, cwd"
+        ),
         request_id,
         |row| {
             let raw_path = row.get::<_, String>(0)?;
@@ -4515,8 +4582,11 @@ fn dashboard_ignored_file_touch_paths_with_limits(
 ) -> io::Result<DashboardIgnoredFileTouches> {
     let total_event_count = conn
         .query_row(
-            "SELECT COUNT(*) FROM system_events
-             WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1) AND source = 'macos-endpoint-security'",
+            grouped_request_sql!(
+                "SELECT COUNT(*) FROM system_events
+             WHERE request_id IN (",
+                ") AND source = 'macos-endpoint-security'"
+            ),
             [request_id],
             |row| row.get::<_, i64>(0),
         )
@@ -4527,13 +4597,14 @@ fn dashboard_ignored_file_touch_paths_with_limits(
             })
         })?;
     let mut statement = conn
-        .prepare(
+        .prepare(grouped_request_sql!(
             "SELECT pid, ts, source, type, args
              FROM system_events
-             WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1) AND source = 'macos-endpoint-security'
+             WHERE request_id IN (",
+            ") AND source = 'macos-endpoint-security'
              ORDER BY ts, event_id
-             LIMIT ?2",
-        )
+             LIMIT ?2"
+        ))
         .map_err(sqlite_error_from_rusqlite)?;
     let rows = statement
         .query_map(
@@ -4919,7 +4990,10 @@ fn dashboard_visible_alerts_cte() -> String {
 }
 
 fn dashboard_visible_alerts_cte_for_request() -> String {
-    dashboard_visible_alerts_cte_with_scope(Some("AND alerts.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)"))
+    dashboard_visible_alerts_cte_with_scope(Some(grouped_request_sql!(
+        "AND alerts.request_id IN (",
+        ")"
+    )))
 }
 
 fn dashboard_visible_alerts_cte_with_scope(request_scope: Option<&str>) -> String {
@@ -5068,7 +5142,7 @@ fn dashboard_alerts_from_relation(
         raw_event_count_expression,
     } = query;
     let where_clause = request_id
-        .map(|_| "WHERE alerts.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)")
+        .map(|_| grouped_request_sql!("WHERE alerts.request_id IN (", ")"))
         .unwrap_or_default();
     let limit_clause = limit
         .map(|value| format!("LIMIT {value}"))
@@ -5077,7 +5151,7 @@ fn dashboard_alerts_from_relation(
         .map(|cte| format!("WITH {cte}"))
         .unwrap_or_default();
     let request_prompt_expression = if include_request_prompt {
-        "substr(requests.original_user_prompt, 1, 16384)"
+        concat!(recovered_request_prompt_sql!("requests."))
     } else {
         "NULL"
     };
@@ -5192,12 +5266,13 @@ fn enrich_dashboard_alert_context(
     alerts: &mut [Value],
 ) -> io::Result<()> {
     let mut statement = conn
-        .prepare(
+        .prepare(grouped_request_sql!(
             "SELECT event_id, ts, source, type, tool_name, tool_input, tool_use_id, request_id
              FROM agent_events
-             WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
-             ORDER BY ts, event_id",
-        )
+             WHERE request_id IN (",
+            ")
+             ORDER BY ts, event_id"
+        ))
         .map_err(sqlite_error_from_rusqlite)?;
     let rows = statement
         .query_map([request_id], |row| {
@@ -5639,14 +5714,16 @@ fn notification_origin_request(
         };
         let parent = conn
             .query_row(
-                "SELECT r.request_id,
-                CASE WHEN r.original_user_prompt = 'Background activity'
-                    THEN COALESCE(json_extract(r.events, '$.prompt'), r.original_user_prompt)
-                    ELSE r.original_user_prompt END, r.created_at
+                concat!(
+                    "SELECT r.request_id,
+                ",
+                    recovered_request_prompt_sql!("r."),
+                    ", r.created_at
              FROM agent_events ae JOIN requests r ON r.request_id = ae.request_id
              WHERE r.session_id = ?1 AND ae.tool_use_id = ?2
                AND ae.source = 'claude-code' AND ae.ts <= ?3 AND r.request_id < ?4
-             ORDER BY ae.ts DESC, ae.event_id DESC LIMIT 1",
+             ORDER BY ae.ts DESC, ae.event_id DESC LIMIT 1"
+                ),
                 rusqlite::params![session, tool_id, timestamp, before],
                 |r| {
                     Ok((
@@ -5692,11 +5769,14 @@ impl DashboardRequestGroups {
             let rows = query_json_rows(
                 conn,
                 &format!(
-                    "SELECT request_id, session_id,
-                    substr(CASE WHEN original_user_prompt = 'Background activity'
-                        THEN COALESCE(json_extract(events, '$.prompt'), original_user_prompt)
-                        ELSE original_user_prompt END, 1, 16384), created_at
+                    concat!(
+                        "SELECT request_id, session_id,
+                    ",
+                        recovered_request_prompt_sql!(""),
+                        ", created_at
                     FROM requests WHERE request_id > {cursor} ORDER BY request_id LIMIT 2048"
+                    ),
+                    cursor = cursor
                 ),
                 |r| {
                     Ok(json!([
@@ -5774,27 +5854,30 @@ impl DashboardRequestGroups {
                 .or_default()
                 .push(source);
         }
+        Ok(groups)
+    }
+
+    fn load_prompts(&mut self, conn: &rusqlite::Connection, ids: &[i64]) -> io::Result<()> {
+        let roots: BTreeSet<_> = ids.iter().map(|id| self.root(*id)).collect();
         let mut query = conn
-            .prepare(
-                "SELECT r.request_id, substr(CASE WHEN r.original_user_prompt = 'Background activity'
-                THEN COALESCE(json_extract(r.events, '$.prompt'), r.original_user_prompt)
-                ELSE r.original_user_prompt END, 1, 16384)
-            FROM requests r WHERE r.request_id IN (SELECT request_id FROM dashboard_request_groups)
-                OR r.original_user_prompt = 'Background activity'",
+            .prepare(concat!(
+                "SELECT r.request_id, ",
+                recovered_request_prompt_sql!("r."),
+                " FROM requests r WHERE r.request_id IN (SELECT value FROM json_each(?1))"
+            ))
+            .map_err(sqlite_error_from_rusqlite)?;
+        let rows = query
+            .query_map(
+                [serde_json::to_string(&roots).map_err(io::Error::other)?],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
             )
             .map_err(sqlite_error_from_rusqlite)?;
-        for row in query
-            .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
-            })
-            .map_err(sqlite_error_from_rusqlite)?
-        {
+        for row in rows {
             let (root, prompt) = row.map_err(sqlite_error_from_rusqlite)?;
-            groups
-                .prompts
+            self.prompts
                 .insert(root, dashboard_request_prompt(prompt.as_deref()));
         }
-        Ok(groups)
+        Ok(())
     }
 
     fn root(&self, id: i64) -> i64 {
@@ -9138,13 +9221,26 @@ mod tests {
             .set_dashboard_noise_filter_versioned(
                 &["hook_bypass_file_mutation"],
                 "policy-a",
-                |_, _, _, _, _| panic!("switching back reuses its own classifications"),
+                |_, _, _, _, _| true,
             )
             .unwrap();
         assert!(reopened.dashboard_state().unwrap()["alerts"]
             .as_array()
             .unwrap()
             .is_empty());
+        let db = reopened.sqlite_store().unwrap();
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(DISTINCT policy_key) FROM dashboard_alert_classification",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.connection().query_row("SELECT COUNT(*) FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        drop(db);
         assert_eq!(reopened.verify_alert_chain().unwrap(), chain);
         fs::remove_dir_all(dir).ok();
     }

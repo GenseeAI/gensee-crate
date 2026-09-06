@@ -265,8 +265,11 @@ private struct FindingReviewControl: View {
             } else {
                 Button("This was a false positive") { Task { if await model.labelFalsePositive(alert) { feedbackOverride = true } } }
             }
-            if alert.ruleID == "policy_credential_content_read", ["ask", "warn"].contains(alert.action.lowercased()) {
+            if alert.supportsReadException {
                 Button("Always allow matching reads…") { showReadException = true }
+            }
+            if let reason = alert.approvalEligibility?.reason {
+                Button("Fresh approval needed in your harness") {}.disabled(true).help(reason)
             }
             if alert.supportsExactApproval {
                 Divider()
@@ -311,7 +314,9 @@ private struct FindingReviewControl: View {
                 } else if let issue = approvalIssue {
                     Text("This action cannot be remembered").font(.subheadline)
                     Text(issue).font(.callout).textSelection(.enabled)
-                    Text("Retry the action in Claude to get a fresh approval. For a credential-read finding, you can instead use Always allow matching reads from the finding menu to explicitly choose a file or folder.")
+                    Text(alert.supportsReadException
+                        ? "Retry in your harness for a fresh approval, or use Always allow matching reads to choose an explicit file or folder exception."
+                        : "Retry the action in your harness to get a fresh approval.")
                         .font(.caption).foregroundStyle(.secondary)
                     Button("Close") { showExactApproval = false }
                 } else {

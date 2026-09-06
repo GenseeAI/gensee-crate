@@ -94,6 +94,39 @@ fn static_shell_command(command: &str) -> bool {
     quote.is_none() && !escaped
 }
 
+/// Cheap eligibility metadata for the menu, using the same syntax/rule gates
+/// as preview. File availability and digest checks still run at preview time.
+pub(crate) fn annotate_dashboard(value: &mut Value) {
+    if let Some(alerts) = value.get_mut("alerts").and_then(Value::as_array_mut) {
+        for alert in alerts {
+            let input = alert["tool_input"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok());
+            let command = input
+                .as_ref()
+                .and_then(|i| i["command"].as_str())
+                .unwrap_or("");
+            let complete = input.as_ref().is_some_and(|i| {
+                i.is_object() && !i.to_string().contains("<redacted>") && i["truncated"] != true
+            });
+            let static_input = complete && static_shell_command(command);
+            let rule = alert["rule_id"].as_str().unwrap_or("");
+            let action = alert["action"].as_str().unwrap_or("").to_ascii_lowercase();
+            let exact_candidate = action == "ask" && eligible(rule);
+            let read_candidate =
+                matches!(action.as_str(), "ask" | "warn") && rule == SCOPED_READ_RULE;
+            alert["approval_eligibility"] = json!({
+                "exact": static_input && exact_candidate,
+                "read": static_input && read_candidate,
+                "reason": if !exact_candidate && !read_candidate { None }
+                    else if !complete { Some("Captured tool input is unavailable; retry in your harness.") }
+                    else if !static_input { Some("Commands with $ or backticks (including quoted text), subshells, or incomplete quoting require a fresh approval in your harness.") }
+                    else { None }
+            });
+        }
+    }
+}
+
 fn context(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<Approval> {
     if !eligible(rule) || !is_supported_provider(&event.provider) {
         return Err(io::Error::other(
@@ -112,7 +145,7 @@ fn context(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<Approva
     let command = event.tool_input_command.as_deref().unwrap_or("");
     if !static_shell_command(command) {
         return Err(io::Error::other(
-            "Dynamic shell commands require a fresh approval.",
+            "Commands with $ or backticks (including quoted text), subshells, or incomplete quoting require a fresh approval in your harness.",
         ));
     }
     let working_directory = fs::canonicalize(cwd)?;
@@ -205,7 +238,7 @@ fn read_target(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<Rea
     let command = event.tool_input_command.as_deref().unwrap_or("");
     if !static_shell_command(command) {
         return Err(io::Error::other(
-            "Dynamic commands require a fresh approval.",
+            "Commands with $ or backticks (including quoted text), subshells, or incomplete quoting require a fresh approval in your harness.",
         ));
     }
     let cwd = event
@@ -1247,6 +1280,48 @@ mod tests {
         apply(&event, &store, &mut fs);
         assert_eq!(fs[0].action, PolicyAction::Ask);
     }
+    #[test]
+    fn dashboard_menu_uses_the_preview_syntax_and_completeness_gate() {
+        for (command, allowed) in [
+            ("grep 'api_key$' file", false),
+            ("grep \"reconnect()\" file", true),
+            ("echo `whoami`", false),
+            ("cat $(pwd)/file", false),
+            ("cat 'file", false),
+        ] {
+            let mut dashboard = json!({"alerts":[{"rule_id":SCOPED_READ_RULE,"action":"ask",
+                "tool_input":json!({"command":command}).to_string()}]});
+            annotate_dashboard(&mut dashboard);
+            assert_eq!(
+                dashboard["alerts"][0]["approval_eligibility"]["exact"], allowed,
+                "{command}"
+            );
+            assert_eq!(
+                dashboard["alerts"][0]["approval_eligibility"]["read"], allowed,
+                "{command}"
+            );
+            assert_eq!(static_shell_command(command), allowed);
+        }
+        for (input, allowed) in [
+            (json!({"file_path":"/tmp/file"}), true),
+            (json!({"file_path":"/tmp/file", "truncated":true}), false),
+            (json!({"command":"cat <redacted>"}), false),
+            (Value::Null, false),
+        ] {
+            let mut dashboard = json!({"alerts":[{"rule_id":SCOPED_READ_RULE,"action":"warn",
+                "tool_input":input.to_string()}]});
+            annotate_dashboard(&mut dashboard);
+            assert_eq!(
+                dashboard["alerts"][0]["approval_eligibility"]["read"],
+                allowed
+            );
+            assert_eq!(
+                dashboard["alerts"][0]["approval_eligibility"]["exact"],
+                false
+            );
+        }
+    }
+
     #[test]
     fn dynamic_commands_and_unreadable_artifacts_cannot_be_remembered() {
         let (_, _, mut event, finding) = fixture();

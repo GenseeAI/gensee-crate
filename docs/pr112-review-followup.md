@@ -1,6 +1,8 @@
 # PR 112 follow-up review (5125317605)
 
-All ten findings are addressed:
+All ten findings were addressed in that review pass. The [next follow-up](pr112-review-round3.md) corrects the monitoring-task lifetime, narrows the legacy-path fallback, adds cache pruning, and replaces cross-crate fingerprint file reads.
+
+Original change notes:
 
 1. Monitoring gaps have an independent runtime alarm. New kernel/ring losses totaling 100 events raise an in-app banner and an optional native notification, coalesced to at most one per minute. Startup counter history is seeded silently. Health sampling does not wait on dashboard database reads. These incidents stay out of agent request warnings.
 2. Observe mode retains AUTH attempts targeting protected paths, as well as denials. Routine AUTH events still avoid serialization; NOTIFY remains their evidence source. This is a targeted attempt trail, not complete coverage of every failed syscall.

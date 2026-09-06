@@ -248,6 +248,8 @@ final class EndpointSecuritySensor: ObservableObject {
                     failure: { error in continuation.resume(throwing: error) }
                 )
             }
+            health.lastSuccessfulPollAt = Date()
+            health.connected = true
             let pendingCursor = response.1
             let didRewind = applyHealth(
                 response.2,

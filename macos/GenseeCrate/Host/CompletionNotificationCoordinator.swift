@@ -19,6 +19,7 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         didSet { defaults.set(monitoringHealthNotificationsEnabled, forKey: "gensee.notifications.monitoringHealth") }
     }
     private var monitoringTracker = MonitoringGapAlarmTracker()
+    private var monitoringTask: Task<Void, Never>?
     @Published var completionNotificationsEnabled: Bool {
         didSet { defaults.set(completionNotificationsEnabled, forKey: Self.completionEnabledKey) }
     }
@@ -148,9 +149,27 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    deinit { monitoringTask?.cancel() }
+
+    func startMonitoringHealth(readHealth: @escaping @MainActor () -> EndpointSensorHealth?) {
+        guard monitoringTask == nil else { return }
+        // Owned by this app-lifetime coordinator, not a dashboard view task.
+        monitoringTask = Task { [weak self] in
+            while !Task.isCancelled {
+                if let health = readHealth() { await self?.processMonitoringHealth(health) }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
     func processMonitoringHealth(_ health: EndpointSensorHealth, now: Date = Date()) async {
-        guard let count = monitoringTracker.observe(health, now: now) else { return }
-        let message = "Gensee lost \(count) monitoring events. Activity coverage is incomplete; check sensor health in Settings."
+        guard let incident = monitoringTracker.observe(health, now: now) else { return }
+        let message: String
+        switch incident {
+        case .events(let count): message = "Gensee lost \(count) monitoring events. Activity coverage is incomplete; check sensor health in Settings."
+        case .unavailable: message = "Gensee monitoring is unavailable. The sensor is stopped or disconnected; check Settings."
+        case .stalled: message = "Gensee monitoring has stopped making progress. Event collection or storage may be stalled; check Settings."
+        }
         monitoringHealthAlarm = message
         guard monitoringHealthNotificationsEnabled else { return }
         await refreshAuthorizationStatus()

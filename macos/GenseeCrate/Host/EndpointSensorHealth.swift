@@ -29,6 +29,7 @@ struct EndpointSensorHealth: Equatable {
     var configuredMaxAuthorizationLatencyUS: UInt64 = 10_000
     var managedProcesses: UInt64 = 0
     var lastEventAt: Date?
+    var lastSuccessfulPollAt: Date?
     var error: String?
     var configurationWarning: String?
     var ingestionWarning: String?
@@ -51,13 +52,32 @@ struct EndpointSensorHealth: Equatable {
     }
 }
 
+enum MonitoringHealthIncident: Equatable {
+    case events(UInt64), unavailable, stalled
+}
+
 // Runtime deltas only: restarting the app must not alarm on historical counters.
 struct MonitoringGapAlarmTracker {
     private var previous: EndpointSensorHealth?
     private var pending: UInt64 = 0
     private var lastAlarm: Date?
-    mutating func observe(_ health: EndpointSensorHealth, now: Date) -> UInt64? {
-        guard health.connected, health.running else { return nil }
+    private var unavailableSince: Date?
+    private var interruptions: [Date] = []
+    private var lastOutageAlarm: Date?
+    mutating func observe(_ health: EndpointSensorHealth, now: Date) -> MonitoringHealthIncident? {
+        guard health.mode != "off" else { self = Self(); return nil }
+        let stale = health.lastSuccessfulPollAt.map { now.timeIntervalSince($0) >= 15 } ?? false
+        if !health.connected || !health.running || stale {
+            interruptions.removeAll { now.timeIntervalSince($0) > 60 }
+            if unavailableSince == nil { unavailableSince = now; interruptions.append(now) }
+            if (now.timeIntervalSince(unavailableSince!) >= 10 || interruptions.count >= 3),
+               lastOutageAlarm.map({ now.timeIntervalSince($0) >= 60 }) ?? true {
+                lastOutageAlarm = now
+                return stale ? .stalled : .unavailable
+            }
+            return nil
+        }
+        unavailableSince = nil
         defer { previous = health }
         guard let previous, previous.bootID == health.bootID,
               health.kernelDrops >= previous.kernelDrops, health.ringDrops >= previous.ringDrops else {
@@ -69,6 +89,6 @@ struct MonitoringGapAlarmTracker {
         guard pending >= 100, lastAlarm.map({ now.timeIntervalSince($0) >= 60 }) ?? true else { return nil }
         let count = pending
         pending = 0; lastAlarm = now
-        return count
+        return .events(count)
     }
 }
