@@ -368,21 +368,11 @@ impl EventStore {
             sqlite: Arc::new(Mutex::new(sqlite)),
             encryption_key,
         };
-        store.set_dashboard_noise_filter_versioned(&[], "unconfigured", |_, _, _, _, _| false)?;
+        store.install_dashboard_sql_functions(None)?;
         Ok(store)
     }
 
-    /// Cache immutable alert classifications across CLI processes. Callers must
-    /// provide a policy/version key and a classifier that performs no disk I/O.
-    pub fn set_dashboard_noise_filter_versioned<F>(
-        &self,
-        candidate_rules: &[&str],
-        policy_key: &str,
-        is_noise: F,
-    ) -> io::Result<()>
-    where
-        F: Fn(&str, &str, &str, &str, &str) -> bool + Send + std::panic::UnwindSafe + 'static,
-    {
+    fn install_dashboard_sql_functions(&self, policy_key: Option<&str>) -> io::Result<()> {
         let db = self.sqlite_store()?;
         let conn = db.connection();
         conn.create_scalar_function(
@@ -396,7 +386,7 @@ impl EventStore {
             },
         )
         .map_err(sqlite_error_from_rusqlite)?;
-        let key = policy_key.to_owned();
+        let key = policy_key.map(str::to_owned);
         conn.create_scalar_function(
             "gensee_dashboard_policy_key",
             0,
@@ -404,6 +394,26 @@ impl EventStore {
             move |_| Ok(key.clone()),
         )
         .map_err(sqlite_error_from_rusqlite)?;
+        Ok(())
+    }
+
+    /// Cache immutable alert classifications across CLI processes. Callers must
+    /// provide a policy/version key and a classifier that performs no disk I/O.
+    pub fn set_dashboard_noise_filter_versioned<F>(
+        &self,
+        candidate_rules: &[&str],
+        policy_key: &str,
+        is_noise: F,
+    ) -> io::Result<()>
+    where
+        F: Fn(&str, &str, &str, &str, &str) -> bool + Send + std::panic::UnwindSafe + 'static,
+    {
+        if policy_key.is_empty() {
+            return Err(io::Error::other("A stable classifier key is required"));
+        }
+        self.install_dashboard_sql_functions(Some(policy_key))?;
+        let db = self.sqlite_store()?;
+        let conn = db.connection();
         if !candidate_rules.is_empty() {
             let rules = serde_json::to_string(candidate_rules).map_err(io::Error::other)?;
             let progress_key = format!("alert-classification:{policy_key}");
@@ -411,7 +421,7 @@ impl EventStore {
                 let needs_work: bool = conn.query_row("SELECT
                     EXISTS(SELECT 1 FROM alerts WHERE alert_id > COALESCE((SELECT cursor FROM dashboard_projection_progress WHERE name = ?1), 0)
                         AND rule_id IN (SELECT value FROM json_each(?2)) AND lower(action) NOT IN ('deny', 'block'))
-                    OR NOT EXISTS(SELECT 1 FROM dashboard_classifier_generations WHERE policy_key = ?3)",
+                    OR COALESCE((SELECT generation FROM dashboard_classifier_generations WHERE policy_key = ?3), -1) != COALESCE((SELECT MAX(generation) FROM dashboard_classifier_generations), 0)",
                     rusqlite::params![progress_key, rules, policy_key], |r| r.get(0)).map_err(sqlite_error_from_rusqlite)?;
                 if !needs_work {
                     break;
@@ -426,10 +436,14 @@ impl EventStore {
                     return Err(sqlite_error_from_rusqlite(error));
                 }
                 let saved = (|| -> rusqlite::Result<bool> {
-                    let registered = conn.execute(
-                        "INSERT OR IGNORE INTO dashboard_classifier_generations(policy_key) VALUES (?1)", [policy_key])?;
-                    if registered != 0 {
-                        // Eight recently registered contexts can coexist. Never
+                    conn.execute("INSERT OR REPLACE INTO dashboard_classifier_generations(policy_key) VALUES (?1)", [policy_key])?;
+                    let prune: bool = conn.query_row(
+                        "SELECT COUNT(*) > 8 FROM dashboard_classifier_generations",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if prune {
+                        // Eight recently used contexts can coexist. Never
                         // delete another context merely because it differs.
                         conn.execute("DELETE FROM dashboard_classifier_generations WHERE generation NOT IN
                             (SELECT generation FROM dashboard_classifier_generations ORDER BY generation DESC LIMIT 8)", [])?;
@@ -869,37 +883,39 @@ impl EventStore {
 
     /// Approval UI requires the exact captured PreToolUse input, never a display summary.
     pub fn approval_context(&self, alert_id: i64) -> io::Result<Value> {
-        let (rule, path, provider, session, tool_id, timestamp, digest): (
-            String,
-            String,
-            String,
-            String,
-            String,
-            i64,
-            Option<String>,
-        ) = {
+        struct Capture {
+            rule: String,
+            path: String,
+            provider: String,
+            session: String,
+            tool_id: Option<String>,
+            timestamp: i64,
+            digest: Option<String>,
+            tool_name: Option<String>,
+            cwd: String,
+        }
+        let Capture {
+            rule,
+            path,
+            provider,
+            session,
+            tool_id,
+            timestamp,
+            digest,
+            tool_name,
+            cwd,
+        } = {
             let db = self.sqlite_store()?;
             db.connection()
                 .query_row(
-                    "SELECT a.rule_id, a.path, ae.source, r.session_id, ae.tool_use_id, ae.ts, json_extract(a.evidence, '$.approval_content_digest')
+                    &format!("SELECT a.rule_id, a.path, ae.source, r.session_id, ae.tool_use_id, ae.ts, json_extract(a.evidence, '$.approval_content_digest'), ae.tool_name, ae.cwd
                  FROM alerts a JOIN requests r ON r.request_id = a.request_id
-                 JOIN agent_events ae ON ae.request_id = a.request_id
-                   AND ae.tool_use_id = json_extract(a.evidence, '$.tool_use_id')
-                   AND ae.type = 'PreToolUse' AND ae.ts <= a.created_at
+                 JOIN agent_events ae ON ae.event_id = {exact}
                  WHERE a.alert_id = ?1 AND a.action = 'ask'
-                 ORDER BY ae.event_id DESC LIMIT 1",
+                 ORDER BY ae.event_id DESC LIMIT 1", exact = exact_alert_event_sql("a")),
                     [alert_id],
-                    |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                        ))
-                    },
+                    |r| Ok(Capture { rule: r.get(0)?, path: r.get(1)?, provider: r.get(2)?, session: r.get(3)?,
+                        tool_id: r.get(4)?, timestamp: r.get(5)?, digest: r.get(6)?, tool_name: r.get(7)?, cwd: r.get(8)? }),
                 )
                 .map_err(sqlite_error_from_rusqlite)?
         };
@@ -935,7 +951,9 @@ impl EventStore {
             };
             if event.provider == provider
                 && event.session_id.as_deref() == Some(&session)
-                && event.tool_use_id.as_deref() == Some(&tool_id)
+                && event.tool_use_id == tool_id
+                && event.tool_name == tool_name
+                && event.cwd.as_deref().unwrap_or("") == cwd
                 && event.observed_at_ms == timestamp as u64
                 && event.hook_event_name.as_deref() == Some("PreToolUse")
             {
@@ -945,6 +963,11 @@ impl EventStore {
                 raw["cwd"] = json!(event.cwd);
                 raw["tool_name"] = json!(event.tool_name);
                 raw["hook_event_name"] = json!("PreToolUse");
+                if payload.as_ref().is_some_and(|previous| previous != &raw) {
+                    return Err(io::Error::other(
+                        "Captured tool identity is ambiguous; retry in your harness.",
+                    ));
+                }
                 payload = Some(raw);
             }
         }
@@ -5071,19 +5094,18 @@ fn dashboard_alerts(
                     WHERE representative_rank = 1
                  )"
             );
-            let mut alerts = dashboard_alerts_from_relation(
+            let alerts = dashboard_alerts_from_relation(
                 conn,
                 DashboardAlertQuery {
                     relation: "request_alerts",
                     request_id,
                     limit,
                     visible_alerts_cte: Some(&grouped_alerts_cte),
-                    include_trigger_context: false,
+                    include_trigger_context: true,
                     include_request_prompt: false,
                     raw_event_count_expression: "alerts.raw_event_count",
                 },
             )?;
-            enrich_dashboard_alert_context(conn, request_id.unwrap(), &mut alerts)?;
             Ok(alerts)
         }
         None => {
@@ -5102,6 +5124,21 @@ fn dashboard_alerts(
             )
         }
     }
+}
+
+fn exact_alert_event_sql(alert: &str) -> String {
+    format!(
+        "COALESCE(
+        (SELECT candidate.event_id FROM agent_events candidate
+         WHERE {alert}.entity_kind = 'agent_event' AND candidate.event_id = {alert}.entity_id
+           AND candidate.request_id = {alert}.request_id AND candidate.type = 'PreToolUse'
+           AND candidate.ts <= {alert}.created_at),
+        (SELECT candidate.event_id FROM agent_events candidate
+         WHERE candidate.request_id = {alert}.request_id AND candidate.type = 'PreToolUse'
+           AND candidate.ts <= {alert}.created_at
+           AND candidate.tool_use_id = json_extract({alert}.evidence, '$.tool_use_id')
+         ORDER BY candidate.ts DESC, candidate.event_id DESC LIMIT 1))"
+    )
 }
 
 struct DashboardAlertQuery<'a> {
@@ -5147,14 +5184,7 @@ fn dashboard_alerts_from_relation(
              trigger_event.tool_input, trigger_event.tool_use_id",
             "LEFT JOIN agent_events AS trigger_event
            ON trigger_event.event_id = COALESCE(
-             (
-               SELECT candidate.event_id FROM agent_events AS candidate
-               WHERE candidate.request_id = alerts.request_id
-                 AND candidate.tool_use_id = json_extract(alerts.evidence, '$.tool_use_id')
-                 AND candidate.type = 'PreToolUse' AND candidate.ts <= alerts.created_at
-               ORDER BY candidate.ts DESC, candidate.event_id DESC
-               LIMIT 1
-             ),
+             alerts.exact_event_id,
              CASE WHEN alerts.entity_kind = 'agent_event' THEN alerts.entity_id END,
              (
                SELECT candidate.event_id FROM agent_events AS candidate
@@ -5177,11 +5207,14 @@ fn dashboard_alerts_from_relation(
         ("NULL, NULL, NULL, NULL, NULL", "")
     };
     let exact_context = if include_trigger_context {
-        "COALESCE(trigger_event.request_id = alerts.request_id AND trigger_event.type = 'PreToolUse'
-            AND trigger_event.ts <= alerts.created_at
-            AND trigger_event.tool_use_id = json_extract(alerts.evidence, '$.tool_use_id'), 0)"
+        "alerts.exact_event_id IS NOT NULL"
     } else {
         "0"
+    };
+    let exact_event = if include_trigger_context {
+        exact_alert_event_sql("base")
+    } else {
+        "NULL".into()
     };
     let sql = format!(
         "{with_clause}
@@ -5192,7 +5225,7 @@ fn dashboard_alerts_from_relation(
                 {trigger_event_columns},
                 feedback.human_verdict, feedback.label, feedback.created_at,
                 {raw_event_count_expression}, {exact_context}
-         FROM {alert_relation} AS alerts
+         FROM (SELECT base.*, {exact_event} AS exact_event_id FROM {alert_relation} base) AS alerts
          LEFT JOIN requests ON requests.request_id = alerts.request_id
          {trigger_event_join}
          LEFT JOIN human_feedback AS feedback
@@ -5241,125 +5274,6 @@ fn dashboard_alerts_from_relation(
         Some(request_id) => query_json_rows_with_i64(conn, &sql, request_id, mapper),
         None => query_json_rows(conn, &sql, mapper),
     }
-}
-
-#[derive(Clone)]
-struct DashboardAgentEventContext {
-    event_id: i64,
-    ts: i64,
-    source: String,
-    event_type: String,
-    tool_name: Option<String>,
-    tool_input: Option<String>,
-    tool_use_id: Option<String>,
-}
-
-fn enrich_dashboard_alert_context(
-    conn: &rusqlite::Connection,
-    request_id: i64,
-    alerts: &mut [Value],
-) -> io::Result<()> {
-    let mut statement = conn
-        .prepare(grouped_request_sql!(
-            "SELECT event_id, ts, source, type, tool_name, tool_input, tool_use_id, request_id
-             FROM agent_events
-             WHERE request_id IN (",
-            ")
-             ORDER BY ts, event_id"
-        ))
-        .map_err(sqlite_error_from_rusqlite)?;
-    let rows = statement
-        .query_map([request_id], |row| {
-            Ok((
-                row.get::<_, i64>(7)?,
-                DashboardAgentEventContext {
-                    event_id: row.get(0)?,
-                    ts: row.get(1)?,
-                    source: row.get(2)?,
-                    event_type: row.get(3)?,
-                    tool_name: row.get(4)?,
-                    tool_input: row.get(5)?,
-                    tool_use_id: row.get(6)?,
-                },
-            ))
-        })
-        .map_err(sqlite_error_from_rusqlite)?;
-    let events = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sqlite_error_from_rusqlite)?;
-    let mut events_by_request: HashMap<i64, Vec<DashboardAgentEventContext>> = HashMap::new();
-    for (id, event) in events {
-        events_by_request.entry(id).or_default().push(event);
-    }
-    for (source_request, events) in events_by_request {
-        let pre_tool_events = events
-            .iter()
-            .filter(|event| event.event_type == "PreToolUse")
-            .cloned()
-            .collect::<Vec<_>>();
-        let by_id = events
-            .iter()
-            .map(|event| (event.event_id, event.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut by_tool_use_id = HashMap::<String, Vec<DashboardAgentEventContext>>::new();
-        for event in &pre_tool_events {
-            if let Some(id) = &event.tool_use_id {
-                by_tool_use_id
-                    .entry(id.clone())
-                    .or_default()
-                    .push(event.clone());
-            }
-        }
-
-        for alert in alerts
-            .iter_mut()
-            .filter(|a| a["request_id"].as_i64() == Some(source_request))
-        {
-            let created_at = alert["created_at"].as_i64().unwrap_or(i64::MAX);
-            let entity_event = (alert["entity_kind"].as_str() == Some("agent_event"))
-                .then(|| alert["entity_id"].as_i64())
-                .flatten()
-                .and_then(|event_id| by_id.get(&event_id));
-            let evidence_tool_use_id = alert["evidence"]
-                .as_str()
-                .and_then(|evidence| serde_json::from_str::<Value>(evidence).ok())
-                .and_then(|evidence| {
-                    evidence
-                        .get("tool_use_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-            let tool_event = evidence_tool_use_id
-                .as_ref()
-                .and_then(|tool_use_id| by_tool_use_id.get(tool_use_id))
-                .and_then(|events| latest_dashboard_event_at_or_before(events, created_at));
-            let latest_pre_tool = latest_dashboard_event_at_or_before(&pre_tool_events, created_at);
-            let latest_event = latest_dashboard_event_at_or_before(&events, created_at);
-            let Some(context) = tool_event
-                .or(entity_event)
-                .or(latest_pre_tool)
-                .or(latest_event)
-            else {
-                continue;
-            };
-            alert["approval_context_exact"] =
-                json!(tool_event.is_some_and(|exact| exact.event_id == context.event_id));
-            alert["event_source"] = json!(context.source);
-            alert["event_type"] = json!(context.event_type);
-            alert["tool_name"] = json!(context.tool_name);
-            alert["tool_input"] = json!(context.tool_input);
-            alert["tool_use_id"] = json!(context.tool_use_id);
-        }
-    }
-    Ok(())
-}
-
-fn latest_dashboard_event_at_or_before(
-    events: &[DashboardAgentEventContext],
-    timestamp: i64,
-) -> Option<&DashboardAgentEventContext> {
-    let index = events.partition_point(|event| (event.ts, event.event_id) <= (timestamp, i64::MAX));
-    index.checked_sub(1).and_then(|index| events.get(index))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6435,7 +6349,7 @@ fn hex_value(byte: u8) -> io::Result<u8> {
 
 /// Bump when this crate changes historical alert classification semantics or
 /// the evidence supplied to it. See docs/classifier-cache-contract.md.
-pub const CLASSIFIER_CONTRACT_VERSION: u32 = 1;
+pub const CLASSIFIER_CONTRACT_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -9301,6 +9215,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for generation in 10..20 {
+            reopened
+                .set_dashboard_noise_filter_versioned(
+                    &["hook_bypass_file_mutation"],
+                    &format!("cold-{generation}"),
+                    |_, _, _, _, _| false,
+                )
+                .unwrap();
+            reopened
+                .set_dashboard_noise_filter_versioned(
+                    &["hook_bypass_file_mutation"],
+                    "policy-a",
+                    |_, _, _, _, _| panic!("frequently used policy must survive cold-key churn"),
+                )
+                .unwrap();
+        }
+        assert!(reopened.dashboard_state().unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(reopened.verify_alert_chain().unwrap(), chain);
         fs::remove_dir_all(dir).ok();
     }

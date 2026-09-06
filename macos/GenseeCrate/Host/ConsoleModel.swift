@@ -42,6 +42,8 @@ final class ConsoleModel: ObservableObject {
     let endpointSensor: EndpointSecuritySensor
     private var cli: GenseeCLI
     private var dashboardRefreshInProgress = false
+    private var policyRefreshInProgress = false
+    private var hasConfirmedEndpointMode = false
     private var readAlertBaselineCount = 0
     private var readThroughAlertID: Int64 = 0
     private var harnessVerificationBaselines: [String: Int64] = [:]
@@ -230,14 +232,18 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshPolicy() async {
-        guard !isDemoMode else { return }
-        guard backendAvailable else { return }
+        guard !isDemoMode, backendAvailable, !policyRefreshInProgress else { return }
+        policyRefreshInProgress = true
+        defer { policyRefreshInProgress = false }
         var next = policy
         do {
             next.source = try await cli.run(["policy", "path"]).stdout
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             next.systemEvents = try await policyString("watch.system_events") ?? next.systemEvents
             next.endpointSecurityMode = try await policyString("endpoint_security.mode") ?? next.endpointSecurityMode
+            policy.endpointSecurityMode = next.endpointSecurityMode
+            hasConfirmedEndpointMode = true
+            endpointSensor.setConfiguredMode(next.endpointSecurityMode)
             next.noninteractive = try await policyBool("enforcement.noninteractive") ?? next.noninteractive
             next.requireProxy = try await policyBool("egress.require_proxy") ?? next.requireProxy
             next.maxRuntimeSeconds = try await policyInt("runtime.max_runtime_seconds")
@@ -1873,6 +1879,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     private func configureEndpointSensor() {
+        guard hasConfirmedEndpointMode else { return }
         // A failed dashboard query must not clear the system extension's
         // existing process roots. Without a validated snapshot, an empty
         // in-memory model means "unknown", not "no active sessions".

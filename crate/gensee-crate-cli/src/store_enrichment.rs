@@ -135,6 +135,7 @@ fn observation_enrichment(
             continue;
         }
         for finding in policy.evaluate_observation(&operation, &path) {
+            let evidence = finding_path_evidence(&finding, "observation", &operation, &path);
             let alert = PolicyAlert {
                 session_id: session_id.map(str::to_string),
                 tool_use_id: tool_use_id.map(str::to_string),
@@ -143,7 +144,7 @@ fn observation_enrichment(
                 rule_id: finding.rule_id,
                 message: finding.message,
                 path: finding.path.or_else(|| Some(path.clone())),
-                evidence: None,
+                evidence: Some(evidence),
                 observed_at_ms,
             };
             let Some(alert) = prepare_policy_alert(policy, alert) else {
@@ -446,6 +447,78 @@ mod tests {
         );
         assert_eq!(store.list_alerts().unwrap().len(), 4);
         assert_eq!(store.verify_alert_chain().unwrap(), before);
+    }
+
+    #[test]
+    fn idless_entity_event_is_exact_on_both_dashboards_and_recovers_input() {
+        let dir = env::temp_dir().join(format!("gensee-idless-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        let mut event = hook_event("Read", json!({"file_path":"/repo/file"}), 1);
+        event.tool_use_id = None;
+        let mut raw: Value = serde_json::from_str(&event.raw_json).unwrap();
+        raw.as_object_mut().unwrap().remove("tool_use_id");
+        event.raw_json = raw.to_string();
+        let mut finding = alert("medium", "ask");
+        finding.rule_id = "policy_credential_content_read".into();
+        finding.tool_use_id = None;
+        store
+            .append_hook_event_with_enrichment(
+                &event,
+                &ObservationEnrichment {
+                    alerts: vec![finding],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let state = store.dashboard_state().unwrap();
+        let row = &state["alerts"][0];
+        let request_id = row["request_id"].as_i64().unwrap();
+        let id = row["alert_id"].as_i64().unwrap();
+        for mut payload in [state, store.dashboard_request(request_id).unwrap()] {
+            approval_memory::annotate_dashboard(&mut payload);
+            assert_eq!(payload["alerts"][0]["approval_context_exact"], true);
+            assert_eq!(payload["alerts"][0]["approval_eligibility"]["read"], true);
+        }
+        assert_eq!(
+            store.approval_context(id).unwrap()["payload"]["tool_input"]["file_path"],
+            "/repo/file"
+        );
+        let mut other = event.clone();
+        other.raw_json = event.raw_json.replace("/repo/file", "/repo/other");
+        store.append_hook_event_evidence_only(&other).unwrap();
+        assert!(
+            store.approval_context(id).is_err(),
+            "ambiguous ID-less capture must fail closed"
+        );
+    }
+
+    #[test]
+    fn observation_scratch_adjustment_is_recorded_and_ignores_display_copy() {
+        let store = EventStore::new(
+            env::temp_dir().join(format!("gensee-observation-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let policy = policy_with(json!({}));
+        let mut enrichment = observation_enrichment(
+            &policy,
+            Some("s1"),
+            None,
+            1,
+            [("delete".into(), "/tmp/gensee-scratch/output.txt".into())],
+            true,
+        );
+        assert!(!enrichment.alerts.is_empty());
+        for alert in &mut enrichment.alerts {
+            assert_eq!(alert.evidence.as_ref().unwrap()["scratch_adjusted"], true);
+            assert!(alert.evidence.as_ref().unwrap()["resolved_path"].is_string());
+            alert.message = "Localized routine message".into();
+            store.append_policy_alert(alert).unwrap();
+        }
+        configure_dashboard_noise_filter(&store).unwrap();
+        assert!(store.dashboard_state().unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

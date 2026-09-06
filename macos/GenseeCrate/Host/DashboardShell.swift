@@ -97,22 +97,15 @@ struct DashboardShell: View {
             model.requestedDashboardDestination = nil
         }
         .task {
-            extensionManager.refreshStatus()
-            await model.refreshStableHookBackendIfNeeded()
-            model.endpointSensor.start()
             await notifications.refreshAuthorizationStatus()
-            await model.refreshAll()
             await model.refreshPendingRecoveryRequest()
-            if !model.isDemoMode {
-                await notifications.process(snapshot: model.snapshot)
-            }
             while !Task.isCancelled {
                 // Dashboard queries intentionally run less frequently than the
                 // sensor poll. This keeps UI projection work from competing
                 // with durable Endpoint Security ingestion under load.
                 try? await Task.sleep(for: .seconds(model.dashboardPollingSeconds))
                 await model.refreshDashboard(reportErrors: false)
-                if !model.isDemoMode {
+                if !model.isDemoMode, model.lastUpdated != nil {
                     await notifications.process(snapshot: model.snapshot)
                 }
             }

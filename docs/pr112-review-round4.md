@@ -1,6 +1,6 @@
 # PR 112 review follow-up (5126198557)
 
-This supersedes the affected lifecycle, cache, fingerprint, and scratch-evidence details in the round-3 notes.
+This superseded the affected details in round 3. The [next follow-up](pr112-review-round5.md) further corrects banner state, startup readiness, ID-less approvals, observation evidence, and cache recency.
 
 1. AppKit's `applicationDidFinishLaunching` starts the sensor, policy load, status item, and monitoring sampler. The delegate owns the shared model and coordinator. Starting health sampling no longer depends on a SwiftUI window appearing.
 2. The host records its configured monitoring mode before attempting an XPC update. That mode controls intentional-off suppression. A stale off report from the extension cannot silence an enabled monitor. Intentional pauses preserve accumulated event losses and their baseline/cooldown.

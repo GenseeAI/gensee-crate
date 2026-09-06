@@ -106,6 +106,8 @@ final class EndpointSecuritySensor: ObservableObject {
         health.launchContinuityIssue = nil
     }
 
+    func setConfiguredMode(_ mode: String) { health.configuredMode = mode }
+
     func updateConfiguration(
         mode: String,
         protectedPaths: [String],

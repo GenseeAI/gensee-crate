@@ -3094,6 +3094,17 @@ fn unparsed_permission_request_finding(event: &AgentHookEvent) -> Option<PolicyF
 /// Adapt the shared data-driven policy engine's findings to the CLI's
 /// `PolicyFinding` (which carries agent-hook evidence). All rule content lives
 /// in the policy document; this function only maps and attaches evidence.
+pub(crate) fn finding_path_evidence(
+    finding: &policy::Finding,
+    source: &str,
+    operation: &str,
+    path: &str,
+) -> Value {
+    json!({"source":source, "operation":operation,
+        "resolved_path":gensee_crate_core::resolve_concrete_path(path),
+        "scratch_adjusted":finding.scratch_adjusted})
+}
+
 pub(crate) fn policy_findings_for_subject(
     subject: &PolicySubject,
     cwd: Option<&str>,
@@ -3103,12 +3114,8 @@ pub(crate) fn policy_findings_for_subject(
         .evaluate_pretool(&subject.operation, &subject.path, cwd)
         .into_iter()
         .map(|finding| {
-            let mut evidence = json!({
-                "source": subject.source,
-                "operation": subject.operation,
-                "resolved_path": gensee_crate_core::resolve_concrete_path(&subject.path),
-                "scratch_adjusted": finding.scratch_adjusted,
-            });
+            let mut evidence =
+                finding_path_evidence(&finding, subject.source, &subject.operation, &subject.path);
             if finding.rule_id == "policy_write_outside_workspace" {
                 evidence["workspace"] = json!(cwd);
             }

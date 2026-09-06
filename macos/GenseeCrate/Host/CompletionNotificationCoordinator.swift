@@ -21,6 +21,7 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     private var monitoringTracker = MonitoringGapAlarmTracker()
     private var monitoringTask: Task<Void, Never>?
     private var wakeObserver: NSObjectProtocol?
+    private var lastMonitoringBannerRevision: UInt64 = 0
     @Published var completionNotificationsEnabled: Bool {
         didSet { defaults.set(completionNotificationsEnabled, forKey: Self.completionEnabledKey) }
     }
@@ -172,14 +173,13 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     }
 
     func processMonitoringHealth(_ health: EndpointSensorHealth, now: SuspendingClock.Instant = .now) async {
-        guard let incident = monitoringTracker.observe(health, now: now) else { return }
-        let message: String
-        switch incident {
-        case .events(let count): message = "Gensee lost \(count) monitoring events. Activity coverage is incomplete; check sensor health in Settings."
-        case .unavailable: message = "Gensee monitoring is unavailable. The sensor is stopped or disconnected; check Settings."
-        case .stalled: message = "Gensee monitoring has stopped making progress. Event collection or storage may be stalled; check Settings."
+        let incident = monitoringTracker.observe(health, now: now)
+        if lastMonitoringBannerRevision != monitoringTracker.bannerRevision {
+            lastMonitoringBannerRevision = monitoringTracker.bannerRevision
+            monitoringHealthAlarm = monitoringTracker.bannerIncident.map(Self.monitoringMessage)
         }
-        monitoringHealthAlarm = message
+        guard let incident else { return }
+        let message = Self.monitoringMessage(incident)
         guard monitoringHealthNotificationsEnabled else { return }
         await refreshAuthorizationStatus()
         guard isAuthorized else { return }
@@ -191,6 +191,14 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         do {
             try await center.add(UNNotificationRequest(identifier: "gensee-monitoring-health", content: content, trigger: nil))
         } catch { lastDeliveryError = error.localizedDescription }
+    }
+
+    private static func monitoringMessage(_ incident: MonitoringHealthIncident) -> String {
+        switch incident {
+        case .events(let count): "Gensee lost \(count) monitoring events. Activity coverage is incomplete; check sensor health in Settings."
+        case .unavailable: "Gensee monitoring is unavailable. The sensor is stopped or disconnected; check Settings."
+        case .stalled: "Gensee monitoring has stopped making progress. Event collection or storage may be stalled; check Settings."
+        }
     }
 
     func process(snapshot: SecuritySnapshot, now: Date = Date()) async {

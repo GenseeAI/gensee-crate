@@ -8519,3 +8519,66 @@ fn scratch_adjustment_is_carried_as_structured_evidence() {
         .iter()
         .all(|f| f.evidence["scratch_adjusted"] == false));
 }
+
+#[test]
+fn classifier_behavior_corpus_is_pinned_to_contract_versions() {
+    let policy = Policy::from_json(policy::default_policy_json()).unwrap();
+    let mut outputs = Vec::new();
+    for rule in [
+        "policy_write_outside_workspace",
+        "policy_destructive_file_operation",
+        "hook_bypass_file_mutation",
+    ] {
+        for path in [
+            "/tmp/output.txt",
+            "/tmp/.ssh/id_rsa",
+            "/repo/src/main.rs",
+            "/repo/target/debug/build/out",
+            "/tmp/tool.py",
+            "/dev/null",
+            "/etc/passwd",
+            "/tmp",
+        ] {
+            for operation in ["write", "delete", "rename"] {
+                for evidence in [
+                    json!({"source":"hook","resolved_path":path,"scratch_adjusted":true,"_recorded_action":"allow"}),
+                    json!({"source":"observation","resolved_path":path,"scratch_adjusted":false,"_recorded_action":"allow"}),
+                    json!({"source":"hook","resolved_path":null,"scratch_adjusted":true,"_recorded_action":"allow"}),
+                    json!({"source":"hook","_recorded_action":"allow","_recorded_message":"Routine temporary-file activity: x"}),
+                    json!({"source":"macos-endpoint-security","event_type":"unlink","action":"notify","file":{"path":path,"mode":0o100644}}),
+                    json!({"source":"macos-endpoint-security","event_type":"unlink","action":"notify","file":{"path":path,"mode":0o040755}}),
+                    json!({"source":"macos-endpoint-security","decision":{"result":"deny"}}),
+                    json!({"source":"macos-endpoint-security","file":{"path_truncated":true}}),
+                ] {
+                    outputs.push(historical_alert_is_routine(
+                        &policy,
+                        rule,
+                        path,
+                        "/repo",
+                        operation,
+                        &evidence.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    let contracts = [
+        CLASSIFIER_CONTRACT_VERSION,
+        gensee_crate_core::CLASSIFIER_CONTRACT_VERSION,
+        gensee_crate_rules::CLASSIFIER_CONTRACT_VERSION,
+        gensee_crate_store::CLASSIFIER_CONTRACT_VERSION,
+    ];
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(contracts, outputs)).unwrap())
+    );
+    assert_eq!(digest, "05d0504298afb7c91152f49546d60d6c1eaea64b6ee323b92729a07d06b39ed7", "Classifier behavior changed: bump the contributing contract version, review the corpus changes, and update this pin together.");
+}
+
+#[test]
+fn classifier_policy_key_ignores_json_formatting_and_key_order() {
+    assert_eq!(
+        historical_classifier_cache_key([2, 1, 1, 2], r#"{"a":1,"b":{"x":2}}"#, "/home"),
+        historical_classifier_cache_key([2, 1, 1, 2], "{ \"b\": {\"x\": 2}, \"a\": 1 }", "/home")
+    );
+}

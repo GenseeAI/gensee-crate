@@ -5,7 +5,7 @@ struct EndpointSensorHealth: Equatable {
     var connected = false
     var running = false
     var mode = "observe"
-    var configuredMode = "observe"
+    var configuredMode: String?
     var receivedMessages: UInt64 = 0
     var maxCallbackLatencyUS: UInt64 = 0
     var pendingEvidence: UInt64 = 0
@@ -69,43 +69,67 @@ struct MonitoringGapAlarmTracker {
     private var interruptions: [SuspendingClock.Instant] = []
     private var alarmedKinds: Set<OutageKind> = []
     private var graceUntil: SuspendingClock.Instant?
+    private(set) var bannerIncident: MonitoringHealthIncident?
+    private(set) var bannerRevision: UInt64 = 0
 
-    mutating func resumeAfterSleep(now: SuspendingClock.Instant) {
+    private mutating func resetOutageWindow() {
         unavailableSince = nil
         healthySince = nil
         interruptions.removeAll()
+    }
+
+    private mutating func setBanner(_ incident: MonitoringHealthIncident?, newIncident: Bool = false) {
+        if bannerIncident != incident || newIncident { bannerRevision &+= 1 }
+        bannerIncident = incident
+    }
+
+    mutating func resumeAfterSleep(now: SuspendingClock.Instant) {
+        resetOutageWindow()
         graceUntil = now.advanced(by: .seconds(30))
     }
 
     mutating func observe(_ health: EndpointSensorHealth, now: SuspendingClock.Instant) -> MonitoringHealthIncident? {
         // Only an intentional host configuration can silence monitoring. A
         // stale/off report from the extension cannot disable its own alarm.
-        guard health.configuredMode != "off" else {
-            unavailableSince = nil
-            healthySince = nil
-            interruptions.removeAll()
+        guard let configuredMode = health.configuredMode, configuredMode != "off" else {
+            resetOutageWindow()
             alarmedKinds.removeAll()
+            setBanner(nil)
             return nil
         }
-        if let graceUntil, now < graceUntil { return nil }
+        if let graceUntil {
+            if now < graceUntil { return nil }
+            self.graceUntil = nil
+        }
         let stale = health.lastSuccessfulPollAt.map { $0.duration(to: now) >= .seconds(15) } ?? false
         let unavailable = !health.connected || !health.running || health.mode == "off"
         if unavailable || stale {
             healthySince = nil
             interruptions.removeAll { $0.duration(to: now) > .seconds(60) }
-            if unavailableSince == nil { unavailableSince = now; interruptions.append(now) }
+            let newOutage = unavailableSince == nil
+            if newOutage { unavailableSince = now; interruptions.append(now) }
             let kind: OutageKind = unavailable ? .unavailable : .stalled
+            let incident: MonitoringHealthIncident = unavailable ? .unavailable : .stalled
+            // A new outage restores a dismissed banner even while notification
+            // delivery is latched. The initial notification still has grace.
+            if newOutage && !alarmedKinds.isEmpty { setBanner(incident, newIncident: true) }
             if (unavailableSince!.duration(to: now) >= .seconds(10) || interruptions.count >= 3),
                alarmedKinds.insert(kind).inserted {
                 // One notification per incident kind until stable recovery.
                 // The persistent banner carries the unresolved status.
-                return kind == .stalled ? .stalled : .unavailable
+                setBanner(incident)
+                return incident
             }
             return nil
         }
         unavailableSince = nil
         if healthySince == nil { healthySince = now }
-        if healthySince!.duration(to: now) >= .seconds(30) { alarmedKinds.removeAll() }
+        if healthySince!.duration(to: now) >= .seconds(30) {
+            alarmedKinds.removeAll()
+            resetOutageWindow()
+            healthySince = now
+            setBanner(nil)
+        }
         defer { previous = health }
         guard let previous, previous.bootID == health.bootID,
               health.kernelDrops >= previous.kernelDrops, health.ringDrops >= previous.ringDrops else {
@@ -116,6 +140,7 @@ struct MonitoringGapAlarmTracker {
         guard pending >= 100, lastAlarm.map({ $0.duration(to: now) >= .seconds(60) }) ?? true else { return nil }
         let count = pending
         pending = 0; lastAlarm = now
+        setBanner(.events(count), newIncident: true)
         return .events(count)
     }
 }

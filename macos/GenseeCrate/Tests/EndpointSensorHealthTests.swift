@@ -1,6 +1,50 @@
 import XCTest
 
 final class EndpointSensorHealthTests: XCTestCase {
+    func testUnknownModeIsSilentAndConfirmedOffDoesNotAlarm() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(mode: "off")
+        XCTAssertNil(tracker.observe(health, now: start))
+        XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(100))))
+        health.configuredMode = "off"
+        XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(200))))
+        XCTAssertNil(tracker.bannerIncident)
+    }
+
+    func testNewOutageRestoresDismissedBannerWithoutRepeatingNotification() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(configuredMode: "observe")
+        _ = tracker.observe(health, now: start)
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(10))), .unavailable)
+        let dismissedRevision = tracker.bannerRevision
+        XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(11))))
+        XCTAssertEqual(tracker.bannerRevision, dismissedRevision)
+        health.connected = true; health.running = true
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(12)))
+        health.connected = false
+        XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(32))))
+        XCTAssertGreaterThan(tracker.bannerRevision, dismissedRevision)
+        XCTAssertEqual(tracker.bannerIncident, .unavailable)
+        health.connected = true
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(40)))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(70)))
+        XCTAssertNil(tracker.bannerIncident)
+    }
+
+    func testDeathDuringSleepAlarmsFortyActiveSecondsAfterWake() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
+        health.lastSuccessfulPollAt = start
+        _ = tracker.observe(health, now: start)
+        tracker.resumeAfterSleep(now: start)
+        XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(29))))
+        XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(30))))
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(40))), .stalled)
+    }
+
     func testConfiguredModeControlsAlarmsEvenWhenSensorReportIsStaleOff() {
         let start = SuspendingClock.now
         var tracker = MonitoringGapAlarmTracker()
@@ -14,7 +58,7 @@ final class EndpointSensorHealthTests: XCTestCase {
     func testPersistentOutageLatchesEachKindAndStableRecoveryRearms() {
         let start = SuspendingClock.now
         var tracker = MonitoringGapAlarmTracker()
-        var health = EndpointSensorHealth()
+        var health = EndpointSensorHealth(configuredMode: "observe")
         XCTAssertNil(tracker.observe(health, now: start))
         XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(10))), .unavailable)
         for second in [70, 300, 3600] {
@@ -34,7 +78,7 @@ final class EndpointSensorHealthTests: XCTestCase {
     func testIntentionalOffPreservesPendingLosses() {
         let start = SuspendingClock.now
         var tracker = MonitoringGapAlarmTracker()
-        var health = EndpointSensorHealth(connected: true, running: true)
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
         XCTAssertNil(tracker.observe(health, now: start))
         health.kernelDrops = 60
         XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(1))))
@@ -47,7 +91,7 @@ final class EndpointSensorHealthTests: XCTestCase {
     func testWakeGraceAndConnectionFlappingUseMonotonicDurations() {
         let start = SuspendingClock.now
         var tracker = MonitoringGapAlarmTracker()
-        var health = EndpointSensorHealth(connected: true, running: true)
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
         health.lastSuccessfulPollAt = start
         _ = tracker.observe(health, now: start)
         tracker.resumeAfterSleep(now: start.advanced(by: .seconds(2)))
@@ -66,7 +110,7 @@ final class EndpointSensorHealthTests: XCTestCase {
 
     func testRuntimeGapAlarmsSeedHistoryCoalesceBurstsAndResetOnBoot() {
         var tracker = MonitoringGapAlarmTracker()
-        var health = EndpointSensorHealth()
+        var health = EndpointSensorHealth(configuredMode: "observe")
         health.connected = true; health.running = true; health.bootID = "a"; health.kernelDrops = 10000
         let start = SuspendingClock.now
         XCTAssertNil(tracker.observe(health, now: start))
@@ -83,7 +127,7 @@ final class EndpointSensorHealthTests: XCTestCase {
     }
 
     func testConfigurationAndIngestionWarningsRemainIndependent() {
-        var health = EndpointSensorHealth(connected: true, running: true)
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
         health.configurationWarning = "Invalid Cowork entries skipped."
         health.ingestionWarning = EndpointIngestBatchPolicy.warning(forRejectedEvents: 3)
         XCTAssertTrue(health.isAvailable)
@@ -102,7 +146,7 @@ final class EndpointSensorHealthTests: XCTestCase {
     }
 
     func testConfigurationCorrectionDoesNotClearEvidenceWarning() {
-        var health = EndpointSensorHealth(connected: true, running: true)
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
         health.configurationWarning = "Invalid Cowork entries skipped."
         health.ingestionWarning = EndpointIngestBatchPolicy.warning(forRejectedEvents: 1)
         health.configurationWarning = nil

@@ -4021,11 +4021,12 @@ fn feedback_list(args: Vec<OsString>) -> io::Result<()> {
 
 // Bump for changes to this classifier, housekeeping, scratch triage, or their
 // CLI helpers (including approval-store path exclusions). See the cache contract.
-const CLASSIFIER_CONTRACT_VERSION: u32 = 1;
+const CLASSIFIER_CONTRACT_VERSION: u32 = 2;
 
 fn historical_classifier_cache_key(contracts: [u32; 4], policy: &str, home: &str) -> String {
     // Structured boundaries prevent different policy/home pairs sharing a key.
-    let document = serde_json::to_vec(&(contracts, policy, home)).expect("classifier key");
+    let canonical = serde_json::from_str::<Value>(policy).unwrap_or_else(|_| json!(policy));
+    let document = serde_json::to_vec(&(contracts, canonical, home)).expect("classifier key");
     format!("historical-routine-v6:{:x}", Sha256::digest(document))
 }
 
@@ -4058,71 +4059,92 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
             .collect::<Vec<_>>(),
         &version,
         move |rule, path, workspace, operation, evidence| {
-            let Ok(e) = serde_json::from_str::<Value>(evidence) else {
-                return false;
-            };
-            if e.pointer("/decision/result").and_then(Value::as_str) == Some("deny")
-                || e.pointer("/file/path_truncated")
-                    .is_some_and(|v| v == &json!(true) || v == &json!(1))
-                || e.pointer("/destination/path_truncated")
-                    .is_some_and(|v| v == &json!(true) || v == &json!(1))
-            {
-                return false;
-            }
-            // Hook paths can be symlinks. Only an event-time resolved path is
-            // eligible, except legacy records explicitly quieted at evaluation time.
-            let sensor_path = e["source"] == "macos-endpoint-security"
-                // Older raw sensor payloads had no source tag. Require the
-                // kernel-message schema, not merely two optional keys.
-                || (e.get("source").is_none() && e.get("schema_version").is_some()
-                    && e.get("actor").is_some() && e.get("event_type").is_some());
-            let path = if sensor_path {
-                path
-            } else {
-                match e["resolved_path"].as_str() {
-                    Some(resolved) => resolved,
-                    None if e.get("resolved_path").is_none()
-                        && e["_recorded_action"] == "allow"
-                        && (e["scratch_adjusted"] == true
-                            || (e.get("scratch_adjusted").is_none()
-                                && matches!(
-                                    rule,
-                                    "policy_write_outside_workspace"
-                                        | "policy_destructive_file_operation"
-                                )
-                                && e["_recorded_message"].as_str().is_some_and(|m| {
-                                    m.starts_with("Routine temporary-file activity: ")
-                                }))) =>
-                    {
-                        path
-                    }
-                    None => return false,
-                }
-            };
-            let ordinary_write = (rule
-                == policy.document().categories.write_outside_workspace.rule_id
-                || rule == "hook_bypass_file_mutation")
-                && matches!(operation, "" | "write" | "create" | "mutation");
-            let scratch_delete = (rule == policy.document().categories.destructive.rule_id
-                || rule == "hook_bypass_file_mutation")
-                && operation == "delete"
-                && gensee_crate_core::recorded_scratch_path(path).is_some()
-                && e.pointer("/file/mode")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|m| {
-                        m & 0o170000 == 0o100000
-                            // Recorded unlink of an ordinary scratch directory is
-                            // cleanup too. Child-file findings remain independently
-                            // classified; this never grants recursive-delete access.
-                            || (m & 0o170000 == 0o040000
-                                && e["event_type"] == "unlink"
-                                && matches!(e["action"].as_str(), Some("notify" | "auth")))
-                    });
-            ((ordinary_write || scratch_delete)
-                && policy.is_routine_recorded_write(rule, path, workspace))
-                || housekeeping::is_routine(&policy, rule, path, &e)
+            historical_alert_is_routine(&policy, rule, path, workspace, operation, evidence)
         },
     )
+}
+
+fn historical_alert_is_routine(
+    policy: &Policy,
+    rule: &str,
+    path: &str,
+    workspace: &str,
+    operation: &str,
+    evidence: &str,
+) -> bool {
+    let Ok(e) = serde_json::from_str::<Value>(evidence) else {
+        return false;
+    };
+    if e.pointer("/decision/result").and_then(Value::as_str) == Some("deny")
+        || e.pointer("/file/path_truncated")
+            .is_some_and(|v| v == &json!(true) || v == &json!(1))
+        || e.pointer("/destination/path_truncated")
+            .is_some_and(|v| v == &json!(true) || v == &json!(1))
+    {
+        return false;
+    }
+    // Hook paths can be symlinks. Only an event-time resolved path is
+    // eligible, except legacy records explicitly quieted at evaluation time.
+    let sensor_path = e["source"] == "macos-endpoint-security"
+            // Older raw sensor payloads had no source tag. Require the
+            // kernel-message schema, not merely two optional keys.
+            || (e.get("source").is_none() && e.get("schema_version").is_some()
+                && e.get("actor").is_some() && e.get("event_type").is_some());
+    // Modern policy records carry the event-time decision. An explicit
+    // non-routine result cannot be overridden by lexical scratch heuristics.
+    if !sensor_path && e.get("scratch_adjusted").is_some() && e["scratch_adjusted"] != true {
+        return false;
+    }
+    let path = if sensor_path {
+        path
+    } else {
+        match e["resolved_path"].as_str() {
+            Some(resolved) => resolved,
+            None if e.get("resolved_path").is_none()
+                && e["_recorded_action"] == "allow"
+                && (e["scratch_adjusted"] == true
+                    || (e.get("scratch_adjusted").is_none()
+                        && matches!(
+                            rule,
+                            "policy_write_outside_workspace" | "policy_destructive_file_operation"
+                        )
+                        && e["_recorded_message"].as_str().is_some_and(|m| {
+                            m.starts_with("Routine temporary-file activity: ")
+                        }))) =>
+            {
+                path
+            }
+            None => return false,
+        }
+    };
+    if !sensor_path
+        && e["scratch_adjusted"] == true
+        && e["_recorded_action"] == "allow"
+        && (rule == policy.document().categories.write_outside_workspace.rule_id
+            || rule == policy.document().categories.destructive.rule_id)
+    {
+        return policy.is_routine_recorded_write(rule, path, workspace);
+    }
+    let ordinary_write = (rule == policy.document().categories.write_outside_workspace.rule_id
+        || rule == "hook_bypass_file_mutation")
+        && matches!(operation, "" | "write" | "create" | "mutation");
+    let scratch_delete = (rule == policy.document().categories.destructive.rule_id
+        || rule == "hook_bypass_file_mutation")
+        && operation == "delete"
+        && gensee_crate_core::recorded_scratch_path(path).is_some()
+        && e.pointer("/file/mode")
+            .and_then(Value::as_u64)
+            .is_some_and(|m| {
+                m & 0o170000 == 0o100000
+                        // Recorded unlink of an ordinary scratch directory is
+                        // cleanup too. Child-file findings remain independently
+                        // classified; this never grants recursive-delete access.
+                        || (m & 0o170000 == 0o040000
+                            && e["event_type"] == "unlink"
+                            && matches!(e["action"].as_str(), Some("notify" | "auth")))
+            });
+    ((ordinary_write || scratch_delete) && policy.is_routine_recorded_write(rule, path, workspace))
+        || housekeeping::is_routine(policy, rule, path, &e)
 }
 
 fn dashboard_state() -> io::Result<()> {
