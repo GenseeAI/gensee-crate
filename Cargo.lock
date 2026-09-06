@@ -376,7 +376,6 @@ version = "0.3.2"
 dependencies = [
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -435,7 +434,6 @@ dependencies = [
  "gensee-crate-core",
  "serde",
  "serde_json",
- "sha2",
  "url",
 ]
 

@@ -4019,6 +4019,16 @@ fn feedback_list(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
+// Bump for changes to this classifier, housekeeping, scratch triage, or their
+// CLI helpers (including approval-store path exclusions). See the cache contract.
+const CLASSIFIER_CONTRACT_VERSION: u32 = 1;
+
+fn historical_classifier_cache_key(contracts: [u32; 4], policy: &str, home: &str) -> String {
+    // Structured boundaries prevent different policy/home pairs sharing a key.
+    let document = serde_json::to_vec(&(contracts, policy, home)).expect("classifier key");
+    format!("historical-routine-v6:{:x}", Sha256::digest(document))
+}
+
 fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
     let policy = Policy::cached_current();
     let candidate_rules = [
@@ -4031,19 +4041,15 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
         policy.document().categories.destructive.rule_id.clone(),
         "hook_bypass_file_mutation".into(),
     ];
-    let version = format!(
-        "historical-routine-v5:{:x}",
-        Sha256::digest(
-            format!(
-                "{}:{}:{}:{}:{}",
-                env!("GENSEE_SOURCE_FINGERPRINT"),
-                gensee_crate_core::SOURCE_FINGERPRINT,
-                gensee_crate_rules::SOURCE_FINGERPRINT,
-                policy.source_document(),
-                env::var("HOME").unwrap_or_default()
-            )
-            .as_bytes()
-        )
+    let version = historical_classifier_cache_key(
+        [
+            CLASSIFIER_CONTRACT_VERSION,
+            gensee_crate_core::CLASSIFIER_CONTRACT_VERSION,
+            gensee_crate_rules::CLASSIFIER_CONTRACT_VERSION,
+            gensee_crate_store::CLASSIFIER_CONTRACT_VERSION,
+        ],
+        policy.source_document(),
+        &env::var("HOME").unwrap_or_default(),
     );
     store.set_dashboard_noise_filter_versioned(
         &candidate_rules
@@ -4077,9 +4083,16 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
                     Some(resolved) => resolved,
                     None if e.get("resolved_path").is_none()
                         && e["_recorded_action"] == "allow"
-                        && e["_recorded_message"].as_str().is_some_and(|m| {
-                            m.starts_with("Routine temporary-file activity: ")
-                        }) =>
+                        && (e["scratch_adjusted"] == true
+                            || (e.get("scratch_adjusted").is_none()
+                                && matches!(
+                                    rule,
+                                    "policy_write_outside_workspace"
+                                        | "policy_destructive_file_operation"
+                                )
+                                && e["_recorded_message"].as_str().is_some_and(|m| {
+                                    m.starts_with("Routine temporary-file activity: ")
+                                }))) =>
                     {
                         path
                     }

@@ -99,6 +99,12 @@ fn static_shell_command(command: &str) -> bool {
 pub(crate) fn annotate_dashboard(value: &mut Value) {
     if let Some(alerts) = value.get_mut("alerts").and_then(Value::as_array_mut) {
         for alert in alerts {
+            // Nearest-event display context must never drive approval controls.
+            if alert["approval_context_exact"] != true {
+                alert["approval_eligibility"] = Value::Null;
+                continue;
+            }
+            let supported = is_supported_provider(alert["event_source"].as_str().unwrap_or(""));
             let input = alert["tool_input"]
                 .as_str()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok());
@@ -116,9 +122,10 @@ pub(crate) fn annotate_dashboard(value: &mut Value) {
             let read_candidate =
                 matches!(action.as_str(), "ask" | "warn") && rule == SCOPED_READ_RULE;
             alert["approval_eligibility"] = json!({
-                "exact": static_input && exact_candidate,
-                "read": static_input && read_candidate,
+                "exact": supported && static_input && exact_candidate,
+                "read": supported && static_input && read_candidate,
                 "reason": if !exact_candidate && !read_candidate { None }
+                    else if !supported { Some("This harness does not support remembered approvals.") }
                     else if !complete { Some("Captured tool input is unavailable; retry in your harness.") }
                     else if !static_input { Some("Commands with $ or backticks (including quoted text), subshells, or incomplete quoting require a fresh approval in your harness.") }
                     else { None }
@@ -1281,6 +1288,32 @@ mod tests {
         assert_eq!(fs[0].action, PolicyAction::Ask);
     }
     #[test]
+    fn dashboard_eligibility_requires_supported_provider_and_exact_attribution() {
+        for (provider, exact, allowed) in [
+            ("claude-code", true, true),
+            ("unknown-harness", true, false),
+            ("claude-code", false, false),
+        ] {
+            let mut dashboard = json!({"alerts":[{"rule_id":SCOPED_READ_RULE,"action":"ask",
+                "event_source":provider, "approval_context_exact":exact,
+                "tool_input":json!({"file_path":"/tmp/file"}).to_string()}]});
+            annotate_dashboard(&mut dashboard);
+            if !exact {
+                assert!(dashboard["alerts"][0]["approval_eligibility"].is_null());
+            } else {
+                assert_eq!(
+                    dashboard["alerts"][0]["approval_eligibility"]["exact"],
+                    allowed
+                );
+                assert_eq!(
+                    dashboard["alerts"][0]["approval_eligibility"]["read"],
+                    allowed
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dashboard_menu_uses_the_preview_syntax_and_completeness_gate() {
         for (command, allowed) in [
             ("grep 'api_key$' file", false),
@@ -1289,7 +1322,7 @@ mod tests {
             ("cat $(pwd)/file", false),
             ("cat 'file", false),
         ] {
-            let mut dashboard = json!({"alerts":[{"rule_id":SCOPED_READ_RULE,"action":"ask",
+            let mut dashboard = json!({"alerts":[{"approval_context_exact":true,"event_source":"claude-code","rule_id":SCOPED_READ_RULE,"action":"ask",
                 "tool_input":json!({"command":command}).to_string()}]});
             annotate_dashboard(&mut dashboard);
             assert_eq!(
@@ -1308,7 +1341,7 @@ mod tests {
             (json!({"command":"cat <redacted>"}), false),
             (Value::Null, false),
         ] {
-            let mut dashboard = json!({"alerts":[{"rule_id":SCOPED_READ_RULE,"action":"warn",
+            let mut dashboard = json!({"alerts":[{"approval_context_exact":true,"event_source":"claude-code","rule_id":SCOPED_READ_RULE,"action":"warn",
                 "tool_input":input.to_string()}]});
             annotate_dashboard(&mut dashboard);
             assert_eq!(

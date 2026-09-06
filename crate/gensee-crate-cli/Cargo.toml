@@ -40,6 +40,3 @@ zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-
-[build-dependencies]
-sha2 = "0.10"

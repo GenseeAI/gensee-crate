@@ -54,6 +54,8 @@ pub enum PathClass {
 /// A single policy finding produced by the evaluator.
 #[derive(Debug, Clone)]
 pub struct Finding {
+    /// Event-time scratch classification, independent of display copy.
+    pub scratch_adjusted: bool,
     pub action: Action,
     pub severity: String,
     /// Classification before a developer review override. Fail-closed callers
@@ -1049,6 +1051,7 @@ impl Policy {
                     &secret.protected.message_mutate
                 };
                 Finding {
+                    scratch_adjusted: false,
                     action: secret.protected.action,
                     severity: secret.protected.severity.clone(),
                     pre_review_action: secret.protected.action,
@@ -1059,6 +1062,7 @@ impl Policy {
                 }
             }
             PathClass::CredentialHint => Finding {
+                scratch_adjusted: false,
                 action: secret.credential_hint.action,
                 severity: secret.credential_hint.severity.clone(),
                 pre_review_action: secret.credential_hint.action,
@@ -1073,6 +1077,7 @@ impl Policy {
 
     fn category_finding(&self, rule: &CategoryRule, path: &str) -> Finding {
         self.tune_finding(Finding {
+            scratch_adjusted: false,
             action: rule.action,
             severity: rule.severity.clone(),
             pre_review_action: rule.action,
@@ -1258,6 +1263,7 @@ impl Policy {
             return self.category_finding(rule, path);
         }
         self.tune_finding(Finding {
+            scratch_adjusted: true,
             action: Action::Allow,
             severity: "info".into(),
             pre_review_action: Action::Allow,
@@ -1322,6 +1328,7 @@ impl Policy {
             let persistence = &self.doc.persistence_writes;
             if self.path_matches(&persistence.matcher, path) {
                 findings.push(self.tune_finding(Finding {
+                    scratch_adjusted: false,
                     action: persistence.action,
                     severity: persistence.severity.clone(),
                     pre_review_action: persistence.action,
@@ -1376,6 +1383,7 @@ impl Policy {
                 hosts.iter().any(|host| host_matches_rule(host, &needle))
             }) {
                 findings.push(self.tune_finding(Finding {
+                    scratch_adjusted: false,
                     action: rule.action,
                     severity: rule.severity.clone(),
                     pre_review_action: rule.action,
@@ -1409,6 +1417,7 @@ impl Policy {
                     .all(|needle| command.contains(needle.as_str()));
             if raw_any || raw_all {
                 findings.push(self.tune_finding(Finding {
+                    scratch_adjusted: false,
                     action: rule.action,
                     severity: rule.severity.clone(),
                     pre_review_action: rule.action,
@@ -1453,6 +1462,7 @@ impl Policy {
             });
             if let Some(name) = matched {
                 findings.push(self.tune_finding(Finding {
+                    scratch_adjusted: false,
                     action: rule.action,
                     severity: rule.severity.clone(),
                     pre_review_action: rule.action,
@@ -1485,7 +1495,8 @@ impl Policy {
         let dd_applies = path.is_none_or(|path| self.is_executable_artifact_path(path));
         if dd_applies && dangerous_dd_wipe_content(&collapsed, &compact) {
             findings.push(self.tune_finding(Finding {
-                action: Action::Block,
+                scratch_adjusted: false,
+            action: Action::Block,
                 severity: "critical".to_string(),
                 pre_review_action: Action::Block,
                 pre_review_severity: "critical".to_string(),
@@ -1515,6 +1526,7 @@ impl Policy {
             let label = any_hit.or_else(|| all_hit.then(|| rule.all_of.join(" + ")));
             if let Some(label) = label {
                 findings.push(self.tune_finding(Finding {
+                    scratch_adjusted: false,
                     action: rule.action,
                     severity: rule.severity.clone(),
                     pre_review_action: rule.action,
@@ -2002,6 +2014,7 @@ mod tests {
         let policy = Policy::from_json(&doc.to_string()).expect("override parses");
 
         let tuned = policy.tune_finding(Finding {
+            scratch_adjusted: false,
             action: Action::Block,
             severity: "critical".to_string(),
             pre_review_action: Action::Block,
@@ -2016,6 +2029,7 @@ mod tests {
         assert_eq!(tuned.pre_review_action, Action::Block);
 
         let untouched = policy.tune_finding(Finding {
+            scratch_adjusted: false,
             action: Action::Ask,
             severity: "medium".to_string(),
             pre_review_action: Action::Ask,
@@ -2816,7 +2830,7 @@ mod tests {
             assert!(!findings.is_empty());
             assert!(findings
                 .iter()
-                .all(|f| f.action == Action::Allow && f.severity == "info"));
+                .all(|f| f.action == Action::Allow && f.severity == "info" && f.scratch_adjusted));
         }
         assert!(policy
             .evaluate_pretool("write", "/dev/null", Some("/repo"))

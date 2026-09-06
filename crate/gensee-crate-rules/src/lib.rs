@@ -36,5 +36,6 @@ pub fn sensitive_file_access(event: &AgentEvent) -> Option<RuleMatch> {
     None
 }
 
-/// Fingerprint of this packaged crate, independent of workspace layout.
-pub const SOURCE_FINGERPRINT: &str = env!("GENSEE_SOURCE_FINGERPRINT");
+/// Bump when this crate changes historical alert classification semantics or
+/// the evidence supplied to it. See docs/classifier-cache-contract.md.
+pub const CLASSIFIER_CONTRACT_VERSION: u32 = 1;

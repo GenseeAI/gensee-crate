@@ -1,6 +1,6 @@
 # PR 112 review follow-up (5125873920)
 
-This update addresses the nine review findings.
+This update addressed the nine review findings. The [next follow-up](pr112-review-round4.md) supersedes its monitoring startup, timer, cache-retention, fingerprint, and scratch-evidence mechanisms.
 
 1. **Migration lifecycle.** The classification-table rebuild runs only for databases older than schema 6. It clears classification progress in the same savepoint. Future unrelated schema upgrades retain the cache and its cursor together.
 2. **Monitoring lifetime and outages.** The app-owned notification coordinator samples health independently of dashboard windows and database reads. A stopped/disconnected sensor lasting 10 seconds, three connection interruptions in 60 seconds, or stalled polling raises a monitoring-health alarm. Polling becomes stale after 15 seconds without a response and uses the same 10-second outage grace. Alarms are rate-limited; intentional off mode is silent. The host records receipt time before waiting for ingestion, so stalled storage cannot masquerade as fresh sensor health. Existing event-loss baseline/cooldown behavior remains.

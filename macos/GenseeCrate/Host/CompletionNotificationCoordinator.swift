@@ -20,6 +20,7 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     }
     private var monitoringTracker = MonitoringGapAlarmTracker()
     private var monitoringTask: Task<Void, Never>?
+    private var wakeObserver: NSObjectProtocol?
     @Published var completionNotificationsEnabled: Bool {
         didSet { defaults.set(completionNotificationsEnabled, forKey: Self.completionEnabledKey) }
     }
@@ -149,10 +150,18 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
-    deinit { monitoringTask?.cancel() }
+    deinit {
+        monitoringTask?.cancel()
+        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
+    }
 
     func startMonitoringHealth(readHealth: @escaping @MainActor () -> EndpointSensorHealth?) {
         guard monitoringTask == nil else { return }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.monitoringTracker.resumeAfterSleep(now: .now) }
+        }
         // Owned by this app-lifetime coordinator, not a dashboard view task.
         monitoringTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -162,7 +171,7 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         }
     }
 
-    func processMonitoringHealth(_ health: EndpointSensorHealth, now: Date = Date()) async {
+    func processMonitoringHealth(_ health: EndpointSensorHealth, now: SuspendingClock.Instant = .now) async {
         guard let incident = monitoringTracker.observe(health, now: now) else { return }
         let message: String
         switch incident {

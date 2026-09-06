@@ -470,3 +470,9 @@ CREATE TABLE IF NOT EXISTS dashboard_alert_classification (
 );
 CREATE INDEX IF NOT EXISTS idx_dashboard_alert_classification_policy
     ON dashboard_alert_classification(policy_key, routine, alert_id);
+
+-- Retain a bounded set of coexisting policy contexts, in registration order.
+CREATE TABLE IF NOT EXISTS dashboard_classifier_generations (
+    generation INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_key TEXT NOT NULL UNIQUE
+);

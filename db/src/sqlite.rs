@@ -11,12 +11,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // already-initialized store must not rerun CREATE/ALTER statements on every
 // short-lived hook or dashboard process: schema DDL needs a writer lock and can
 // otherwise starve behind the long-lived Endpoint Security ingester.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 // This checksum intentionally names the schema version. If schema.sql changes,
 // bump SCHEMA_VERSION and replace this with the checksum for the new version.
 #[cfg(test)]
-const SCHEMA_V6_SQL_SHA256: &str =
-    "4f3f4bf6b4c8564c1ecb3ea4cee4e4b768addaf696d2c5612f0803fa48ea5919";
+const SCHEMA_V7_SQL_SHA256: &str =
+    "8f87ac5c88671364d6eeb771d12fcf1e8be1fb2ece359946f41e6707f51890fd";
 // Increment whenever dashboard artifact visibility rules change. Existing
 // stores are reclassified by bounded background maintenance before this
 // version is stamped on their cached count.
@@ -3260,10 +3260,10 @@ mod tests {
 
     #[test]
     fn schema_checksum_is_tied_to_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 7);
         let actual = format!("{:x}", Sha256::digest(include_bytes!("../schema.sql")));
         assert_eq!(
-            actual, SCHEMA_V6_SQL_SHA256,
+            actual, SCHEMA_V7_SQL_SHA256,
             "schema.sql changed: bump SCHEMA_VERSION and replace the versioned checksum"
         );
     }
@@ -3479,6 +3479,30 @@ mod tests {
             )
             .unwrap(),
             2
+        );
+        conn.execute_batch("DROP TABLE dashboard_classifier_generations;
+            INSERT INTO dashboard_projection_progress VALUES ('alert-classification:a', 1), ('alert-classification:b', 1);
+            PRAGMA user_version = 6;").unwrap();
+        drop(conn);
+        let conn = open(&config).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM dashboard_alert_classification",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%'", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM dashboard_classifier_generations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
         );
         drop(conn);
         remove_sqlite_files(&path);

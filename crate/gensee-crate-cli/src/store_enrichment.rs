@@ -476,10 +476,18 @@ mod tests {
         future.raw_json = future.raw_json.replace("\"tool\"", "\"future-tool\"");
         store.append_hook_event_evidence_only(&future).unwrap();
         let state = store.dashboard_state().unwrap();
-        for alert in state["alerts"].as_array().unwrap() {
-            let other = alert["alert_id"].as_i64().unwrap();
-            if other != id {
-                assert!(store.approval_context(other).is_err());
+        let request_id = state["alerts"][0]["request_id"].as_i64().unwrap();
+        for mut payload in [state, store.dashboard_request(request_id).unwrap()] {
+            approval_memory::annotate_dashboard(&mut payload);
+            for alert in payload["alerts"].as_array().unwrap() {
+                let other = alert["alert_id"].as_i64().unwrap();
+                assert_eq!(alert["approval_context_exact"], other == id);
+                if other != id {
+                    assert!(store.approval_context(other).is_err());
+                    assert!(alert["approval_eligibility"].is_null());
+                } else {
+                    assert_eq!(alert["approval_eligibility"]["read"], true);
+                }
             }
         }
     }
@@ -584,6 +592,21 @@ mod tests {
                 "Unresolved hook with unrelated actor fields",
                 json!({"operation":"write", "actor":{}, "event_type":"write"}),
             ),
+            (
+                "allow",
+                "New localized message",
+                json!({"source":"hook", "operation":"write", "scratch_adjusted":true}),
+            ),
+            (
+                "allow",
+                "Routine temporary-file activity: write",
+                json!({"source":"hook", "operation":"write", "scratch_adjusted":false}),
+            ),
+            (
+                "allow",
+                "Routine temporary-file activity: write",
+                json!({"source":"hook", "operation":"write", "scratch_adjusted":"true"}),
+            ),
         ] {
             let mut a = alert("medium", action);
             a.message = message.into();
@@ -599,9 +622,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            5
+            7
         );
-        assert_eq!(store.list_alerts().unwrap().len(), 6);
+        assert_eq!(store.list_alerts().unwrap().len(), 9);
         assert_eq!(store.verify_alert_chain().unwrap(), chain);
     }
 
@@ -697,11 +720,12 @@ mod tests {
         let chain_before = store.verify_alert_chain().unwrap();
         let policy = policy_with(json!({}));
         store
-            .set_dashboard_noise_filter(
+            .set_dashboard_noise_filter_versioned(
                 &[
                     "policy_write_outside_workspace",
                     "policy_destructive_file_operation",
                 ],
+                "scratch-projection-test-v1",
                 move |rule, path, _, _, _| policy.is_routine_scratch_alert(rule, path),
             )
             .unwrap();

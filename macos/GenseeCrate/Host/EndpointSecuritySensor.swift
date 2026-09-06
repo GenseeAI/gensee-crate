@@ -114,6 +114,7 @@ final class EndpointSecuritySensor: ObservableObject {
         failClosedManagedOnly: Bool,
         maxAuthorizationLatencyMS: UInt64
     ) {
+        health.configuredMode = mode
         let configuration: [String: Any] = [
             "schema_version": 1,
             "mode": mode,
@@ -248,7 +249,7 @@ final class EndpointSecuritySensor: ObservableObject {
                     failure: { error in continuation.resume(throwing: error) }
                 )
             }
-            health.lastSuccessfulPollAt = Date()
+            health.lastSuccessfulPollAt = SuspendingClock.now
             health.connected = true
             let pendingCursor = response.1
             let didRewind = applyHealth(

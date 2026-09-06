@@ -5,25 +5,15 @@ import SwiftUI
 @main
 struct GenseeCrateApp: App {
     @NSApplicationDelegateAdaptor(GenseeAppDelegate.self) private var appDelegate
-    @StateObject private var extensionManager = EndpointSecurityExtensionManager()
-    @StateObject private var consoleModel = ConsoleModel()
-    @StateObject private var notifications = CompletionNotificationCoordinator()
 
     var body: some Scene {
         WindowGroup("Gensee Crate", id: "main") {
             ContentView(
-                extensionManager: extensionManager,
-                model: consoleModel,
-                notifications: notifications
+                extensionManager: appDelegate.extensionManager,
+                model: appDelegate.consoleModel,
+                notifications: appDelegate.notifications
             )
                 .frame(minWidth: 1180, minHeight: 720)
-                .onAppear {
-                    appDelegate.statusItem.start(model: consoleModel)
-                    notifications.startMonitoringHealth { [weak model = consoleModel] in
-                        guard let model, !model.isDemoMode else { return nil }
-                        return model.endpointSensor.health
-                    }
-                }
         }
         .windowResizability(.contentMinSize)
     }
@@ -32,12 +22,22 @@ struct GenseeCrateApp: App {
 @MainActor
 private final class GenseeAppDelegate: NSObject, NSApplicationDelegate {
     let statusItem = GenseeStatusItemController()
+    let extensionManager = EndpointSecurityExtensionManager()
+    let consoleModel = ConsoleModel()
+    let notifications = CompletionNotificationCoordinator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Register the status item from the AppKit application lifecycle. A
         // SwiftUI view can be restored without re-running its appearance
         // callback, which previously left the app without its durable menu.
-        statusItem.install()
+        statusItem.start(model: consoleModel)
+        notifications.startMonitoringHealth { [weak model = consoleModel] in
+            guard let model, !model.isDemoMode else { return nil }
+            return model.endpointSensor.health
+        }
+        extensionManager.refreshStatus()
+        consoleModel.endpointSensor.start()
+        Task { [weak model = consoleModel] in await model?.refreshPolicy() }
     }
 }
 

@@ -22,5 +22,6 @@ pub use redact::{redact_text, redact_value};
 pub use sessions::AgentSession;
 pub use vscode::{is_vscode_file_tool_name, parse_vscode_file_intents, VscodeFileIntent};
 
-/// Fingerprint of this packaged crate, independent of workspace layout.
-pub const SOURCE_FINGERPRINT: &str = env!("GENSEE_SOURCE_FINGERPRINT");
+/// Bump when this crate changes historical alert classification semantics or
+/// the evidence supplied to it. See docs/classifier-cache-contract.md.
+pub const CLASSIFIER_CONTRACT_VERSION: u32 = 1;

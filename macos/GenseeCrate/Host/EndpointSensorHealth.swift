@@ -5,6 +5,7 @@ struct EndpointSensorHealth: Equatable {
     var connected = false
     var running = false
     var mode = "observe"
+    var configuredMode = "observe"
     var receivedMessages: UInt64 = 0
     var maxCallbackLatencyUS: UInt64 = 0
     var pendingEvidence: UInt64 = 0
@@ -29,7 +30,7 @@ struct EndpointSensorHealth: Equatable {
     var configuredMaxAuthorizationLatencyUS: UInt64 = 10_000
     var managedProcesses: UInt64 = 0
     var lastEventAt: Date?
-    var lastSuccessfulPollAt: Date?
+    var lastSuccessfulPollAt: SuspendingClock.Instant?
     var error: String?
     var configurationWarning: String?
     var ingestionWarning: String?
@@ -56,37 +57,63 @@ enum MonitoringHealthIncident: Equatable {
     case events(UInt64), unavailable, stalled
 }
 
-// Runtime deltas only: restarting the app must not alarm on historical counters.
+// SuspendingClock is monotonic and excludes system sleep. Wall-clock changes
+// cannot extend cooldowns. Counters survive pauses; outage timers get wake grace.
 struct MonitoringGapAlarmTracker {
+    private enum OutageKind: Hashable { case unavailable, stalled }
     private var previous: EndpointSensorHealth?
     private var pending: UInt64 = 0
-    private var lastAlarm: Date?
-    private var unavailableSince: Date?
-    private var interruptions: [Date] = []
-    private var lastOutageAlarm: Date?
-    mutating func observe(_ health: EndpointSensorHealth, now: Date) -> MonitoringHealthIncident? {
-        guard health.mode != "off" else { self = Self(); return nil }
-        let stale = health.lastSuccessfulPollAt.map { now.timeIntervalSince($0) >= 15 } ?? false
-        if !health.connected || !health.running || stale {
-            interruptions.removeAll { now.timeIntervalSince($0) > 60 }
+    private var lastAlarm: SuspendingClock.Instant?
+    private var unavailableSince: SuspendingClock.Instant?
+    private var healthySince: SuspendingClock.Instant?
+    private var interruptions: [SuspendingClock.Instant] = []
+    private var alarmedKinds: Set<OutageKind> = []
+    private var graceUntil: SuspendingClock.Instant?
+
+    mutating func resumeAfterSleep(now: SuspendingClock.Instant) {
+        unavailableSince = nil
+        healthySince = nil
+        interruptions.removeAll()
+        graceUntil = now.advanced(by: .seconds(30))
+    }
+
+    mutating func observe(_ health: EndpointSensorHealth, now: SuspendingClock.Instant) -> MonitoringHealthIncident? {
+        // Only an intentional host configuration can silence monitoring. A
+        // stale/off report from the extension cannot disable its own alarm.
+        guard health.configuredMode != "off" else {
+            unavailableSince = nil
+            healthySince = nil
+            interruptions.removeAll()
+            alarmedKinds.removeAll()
+            return nil
+        }
+        if let graceUntil, now < graceUntil { return nil }
+        let stale = health.lastSuccessfulPollAt.map { $0.duration(to: now) >= .seconds(15) } ?? false
+        let unavailable = !health.connected || !health.running || health.mode == "off"
+        if unavailable || stale {
+            healthySince = nil
+            interruptions.removeAll { $0.duration(to: now) > .seconds(60) }
             if unavailableSince == nil { unavailableSince = now; interruptions.append(now) }
-            if (now.timeIntervalSince(unavailableSince!) >= 10 || interruptions.count >= 3),
-               lastOutageAlarm.map({ now.timeIntervalSince($0) >= 60 }) ?? true {
-                lastOutageAlarm = now
-                return stale ? .stalled : .unavailable
+            let kind: OutageKind = unavailable ? .unavailable : .stalled
+            if (unavailableSince!.duration(to: now) >= .seconds(10) || interruptions.count >= 3),
+               alarmedKinds.insert(kind).inserted {
+                // One notification per incident kind until stable recovery.
+                // The persistent banner carries the unresolved status.
+                return kind == .stalled ? .stalled : .unavailable
             }
             return nil
         }
         unavailableSince = nil
+        if healthySince == nil { healthySince = now }
+        if healthySince!.duration(to: now) >= .seconds(30) { alarmedKinds.removeAll() }
         defer { previous = health }
         guard let previous, previous.bootID == health.bootID,
               health.kernelDrops >= previous.kernelDrops, health.ringDrops >= previous.ringDrops else {
-            pending = 0; lastAlarm = nil
+            self.pending = 0
             return nil
         }
-        pending += health.kernelDrops - previous.kernelDrops
-        pending += health.ringDrops - previous.ringDrops
-        guard pending >= 100, lastAlarm.map({ now.timeIntervalSince($0) >= 60 }) ?? true else { return nil }
+        pending += health.kernelDrops - previous.kernelDrops + health.ringDrops - previous.ringDrops
+        guard pending >= 100, lastAlarm.map({ $0.duration(to: now) >= .seconds(60) }) ?? true else { return nil }
         let count = pending
         pending = 0; lastAlarm = now
         return .events(count)

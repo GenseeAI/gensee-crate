@@ -3107,6 +3107,7 @@ pub(crate) fn policy_findings_for_subject(
                 "source": subject.source,
                 "operation": subject.operation,
                 "resolved_path": gensee_crate_core::resolve_concrete_path(&subject.path),
+                "scratch_adjusted": finding.scratch_adjusted,
             });
             if finding.rule_id == "policy_write_outside_workspace" {
                 evidence["workspace"] = json!(cwd);

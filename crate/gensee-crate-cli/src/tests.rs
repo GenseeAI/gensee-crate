@@ -8463,3 +8463,59 @@ fn excessively_ambiguous_script_directories_require_fresh_review() {
         .any(|f| f.rule_id == "policy_executable_directory_ambiguous"
             && f.action == PolicyAction::Ask));
 }
+
+#[test]
+fn classifier_contract_key_includes_every_contributing_crate() {
+    let versions = [1, 1, 1, 1];
+    let key = historical_classifier_cache_key(versions, "policy", "/home");
+    assert_eq!(
+        key,
+        historical_classifier_cache_key(versions, "policy", "/home")
+    );
+    for index in 0..4 {
+        let mut changed = versions;
+        changed[index] += 1;
+        assert_ne!(
+            key,
+            historical_classifier_cache_key(changed, "policy", "/home")
+        );
+    }
+    assert_ne!(
+        key,
+        historical_classifier_cache_key(versions, "other-policy", "/home")
+    );
+    assert_ne!(
+        key,
+        historical_classifier_cache_key(versions, "policy", "/other-home")
+    );
+}
+
+#[test]
+fn scratch_adjustment_is_carried_as_structured_evidence() {
+    let findings = policy_findings_for_subject(
+        &PolicySubject {
+            source: "hook",
+            operation: "write".into(),
+            path: "/tmp/gensee-scratch/output.txt".into(),
+        },
+        Some("/repo"),
+        &Policy::from_json(policy::default_policy_json()).unwrap(),
+    );
+    assert!(!findings.is_empty());
+    assert!(findings
+        .iter()
+        .all(|f| f.evidence["scratch_adjusted"] == true));
+    let outside = policy_findings_for_subject(
+        &PolicySubject {
+            source: "hook",
+            operation: "write".into(),
+            path: "/opt/output.txt".into(),
+        },
+        Some("/repo"),
+        &Policy::from_json(policy::default_policy_json()).unwrap(),
+    );
+    assert!(!outside.is_empty());
+    assert!(outside
+        .iter()
+        .all(|f| f.evidence["scratch_adjusted"] == false));
+}
