@@ -1112,6 +1112,89 @@ impl Policy {
         self.path_matches(&self.doc.artifact_registries.control_plane, path)
     }
 
+    /// Quiet only generic scratch-file findings. Sensitive and policy-control
+    /// paths retain their own checks even when stored under an OS temp root.
+    pub fn is_routine_scratch_alert(&self, rule_id: &str, path: &str) -> bool {
+        let generic_write = rule_id == self.doc.categories.write_outside_workspace.rule_id;
+        let generic_delete = rule_id == self.doc.categories.destructive.rule_id;
+        if !generic_write && !generic_delete {
+            return false;
+        }
+        if self
+            .doc
+            .review_overrides
+            .iter()
+            .any(|entry| entry.rule_id == rule_id)
+        {
+            return false;
+        }
+        if generic_write && path == "/dev/null" {
+            return true;
+        }
+        let Some(resolved) = gensee_crate_core::resolve_routine_scratch_path(path) else {
+            return false;
+        };
+        let unprotected = |candidate: &str| {
+            self.classify_path(candidate).is_none()
+                && !self.is_persistent_target_path(candidate)
+                && !self.is_control_plane_path(candidate)
+                && !self.is_memory_artifact_path(candidate)
+        };
+        if ![path, resolved.to_str().unwrap_or(path)]
+            .iter()
+            .all(|candidate| unprotected(candidate))
+        {
+            return false;
+        }
+        if generic_delete && resolved.is_dir() {
+            // Recursive cleanup must not hide protected descendants. Bound the
+            // metadata-only walk; uncertain or oversized trees retain review.
+            let mut pending = vec![resolved];
+            let mut budget = 1024;
+            while let Some(directory) = pending.pop() {
+                let Ok(entries) = fs::read_dir(directory) else {
+                    return false;
+                };
+                for entry in entries {
+                    if budget == 0 {
+                        return false;
+                    }
+                    budget -= 1;
+                    let Ok(entry) = entry else {
+                        return false;
+                    };
+                    let child = entry.path();
+                    if !unprotected(&child.to_string_lossy()) {
+                        return false;
+                    }
+                    let Ok(kind) = entry.file_type() else {
+                        return false;
+                    };
+                    // rm removes symlinks themselves; it does not follow them.
+                    if kind.is_dir() {
+                        pending.push(child);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn scratch_adjusted_finding(&self, rule: &CategoryRule, path: &str) -> Finding {
+        if !self.is_routine_scratch_alert(&rule.rule_id, path) {
+            return self.category_finding(rule, path);
+        }
+        self.tune_finding(Finding {
+            action: Action::Allow,
+            severity: "info".into(),
+            pre_review_action: Action::Allow,
+            pre_review_severity: "info".into(),
+            rule_id: rule.rule_id.clone(),
+            message: format!("Routine temporary-file activity: {path}"),
+            path: Some(path.into()),
+        })
+    }
+
     /// Active `PreToolUse` evaluation for a single (operation, path) subject.
     /// `workspace_root`, when present, scopes the write-outside-workspace rule.
     ///
@@ -1150,13 +1233,14 @@ impl Policy {
             }
         }
         if self.is_destructive(operation) {
-            findings.push(self.category_finding(&self.doc.categories.destructive, path));
+            findings.push(self.scratch_adjusted_finding(&self.doc.categories.destructive, path));
         }
         if self.is_mutating(operation)
             && workspace_root.is_some_and(|root| !path_is_within_root(path, root))
         {
-            findings
-                .push(self.category_finding(&self.doc.categories.write_outside_workspace, path));
+            findings.push(
+                self.scratch_adjusted_finding(&self.doc.categories.write_outside_workspace, path),
+            );
         }
         if self.is_metadata(operation) {
             findings.push(self.category_finding(&self.doc.categories.metadata, path));
@@ -1195,7 +1279,7 @@ impl Policy {
             findings.push(finding);
         }
         if self.is_destructive(operation) {
-            findings.push(self.category_finding(&self.doc.categories.destructive, path));
+            findings.push(self.scratch_adjusted_finding(&self.doc.categories.destructive, path));
         } else if self.is_metadata(operation) {
             findings.push(self.category_finding(&self.doc.categories.metadata, path));
         }
@@ -2626,6 +2710,79 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| f.rule_id == "policy_write_outside_workspace" && f.action == Action::Ask));
+    }
+
+    #[test]
+    fn routine_scratch_activity_is_informational_but_protections_remain() {
+        let policy = policy();
+        for operation in ["write", "delete"] {
+            let findings =
+                policy.evaluate_pretool(operation, "/tmp/gensee-scratch/output.txt", Some("/repo"));
+            assert!(!findings.is_empty());
+            assert!(findings
+                .iter()
+                .all(|f| f.action == Action::Allow && f.severity == "info"));
+        }
+        assert!(policy
+            .evaluate_pretool("write", "/dev/null", Some("/repo"))
+            .iter()
+            .all(|f| f.action == Action::Allow));
+        for path in [
+            "/tmp",
+            "/tmp/../etc/passwd",
+            "/tmp/*",
+            "/tmp/.ssh/id_rsa",
+            "/tmp/.git/hooks/pre-commit",
+            "/tmp/.env",
+        ] {
+            assert!(
+                policy
+                    .evaluate_pretool("delete", path, Some("/repo"))
+                    .iter()
+                    .any(|f| f.action != Action::Allow),
+                "{path}"
+            );
+        }
+        assert!(policy
+            .evaluate_pretool("delete", "/dev/null", Some("/repo"))
+            .iter()
+            .any(|f| f.action != Action::Allow));
+        assert!(policy
+            .evaluate_pretool("metadata", "/tmp/gensee-scratch/output.txt", Some("/repo"))
+            .iter()
+            .any(|f| f.rule_id == "policy_metadata_file_operation" && f.action != Action::Allow));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scratch_symlinks_cannot_hide_external_or_protected_targets() {
+        let dir = env::temp_dir().join(format!("gensee-scratch-policy-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("/etc", dir.join("escape")).unwrap();
+        fs::write(dir.join(".env"), "synthetic").unwrap();
+        std::os::unix::fs::symlink(dir.join(".env"), dir.join("ordinary.txt")).unwrap();
+        for path in [dir.join("escape/new-file"), dir.join("ordinary.txt")] {
+            assert!(!policy().is_routine_scratch_alert(
+                "policy_write_outside_workspace",
+                path.to_str().unwrap()
+            ));
+        }
+        assert!(policy().is_routine_scratch_alert(
+            "policy_write_outside_workspace",
+            dir.join("new/file.txt").to_str().unwrap()
+        ));
+        assert!(!policy().is_routine_scratch_alert(
+            "endpoint_security_event_gap",
+            dir.join("new/file.txt").to_str().unwrap()
+        ));
+        assert!(
+            !policy().is_routine_scratch_alert(
+                "policy_destructive_file_operation",
+                dir.to_str().unwrap()
+            ),
+            "directory cleanup must retain protected descendant checks"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

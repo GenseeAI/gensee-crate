@@ -8,7 +8,15 @@ changes.
 
 ## Unreleased
 
-No changes yet.
+### Fixed
+
+- Claude background-task notifications resume their originating request when
+  identifiable; unmatched and historical notifications show as Background activity.
+- Routine writes and scoped cleanup in OS temporary directories are allowed as
+  informational evidence. Generic historical temp alerts no longer enter Review
+  Queue; raw records and alert-chain integrity are preserved.
+- Protected paths, symlink escapes, broad cleanup, explicit review overrides,
+  blocked operations, and sensor evidence-loss alerts retain their protections.
 
 ## 0.3.2 - 2026-09-05
 

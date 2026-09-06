@@ -14,7 +14,10 @@ pub use events::{
 };
 pub use hooks::{AgentHookEvent, FileIntent, ProcessObservation};
 pub use mcp::{parse_mcp_file_intents, McpFileIntent};
-pub use path::{endpoint_security_path_is_known_build_output, normalize_agent_path};
+pub use path::{
+    endpoint_security_path_is_known_build_output, normalize_agent_path,
+    resolve_routine_scratch_path,
+};
 pub use redact::{redact_text, redact_value};
 pub use sessions::AgentSession;
 pub use vscode::{is_vscode_file_tool_name, parse_vscode_file_intents, VscodeFileIntent};

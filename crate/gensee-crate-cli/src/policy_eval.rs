@@ -375,8 +375,61 @@ fn fork_suggestion_finding_with_policy(
     current_run_id: Option<&str>,
     policy: &Policy,
 ) -> Option<PolicyFinding> {
+    if event
+        .tool_input_command
+        .as_deref()
+        .is_some_and(|command| routine_scratch_cleanup_command(command, policy))
+    {
+        return None;
+    }
     let finding = build_fork_suggestion_finding(event, subjects, current_run_id)?;
     Some(apply_capability_delegation_override(finding, policy))
+}
+
+// Only plain rm with concrete absolute scratch targets is exempt from the
+// destructive-workspace isolation requirement. Do not infer safety for shell
+// programs, pipelines, substitutions, glob expansions, or partial intent sets.
+fn routine_scratch_cleanup_command(command: &str, policy: &Policy) -> bool {
+    if policy
+        .document()
+        .review_overrides
+        .iter()
+        .any(|entry| entry.rule_id == "policy_capability_delegation_required")
+    {
+        return false;
+    }
+    if command.contains([';', '&', '|', '$', '`', '<', '>', '\n', '(', ')', '\\']) {
+        return false;
+    }
+    let words = shellish_words(command);
+    if !matches!(
+        words.first().map(String::as_str),
+        Some("rm" | "/bin/rm" | "/usr/bin/rm")
+    ) {
+        return false;
+    }
+    let mut targets = 0;
+    let mut options = true;
+    for word in words.iter().skip(1) {
+        if options && word == "--" {
+            options = false;
+            continue;
+        }
+        if options
+            && matches!(
+                word.as_str(),
+                "-r" | "-R" | "-f" | "-rf" | "-fr" | "-Rf" | "-fR"
+            )
+        {
+            continue;
+        }
+        options = false;
+        if !policy.is_routine_scratch_alert("policy_destructive_file_operation", word) {
+            return false;
+        }
+        targets += 1;
+    }
+    targets > 0
 }
 
 fn build_fork_suggestion_finding(

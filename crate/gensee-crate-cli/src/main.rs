@@ -4013,8 +4013,14 @@ fn feedback_list(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
+fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
+    let policy = Policy::cached_current();
+    store.set_dashboard_noise_filter(move |rule, path| policy.is_routine_scratch_alert(rule, path))
+}
+
 fn dashboard_state() -> io::Result<()> {
     let store = EventStore::default_local()?;
+    configure_dashboard_noise_filter(&store)?;
     println!("{}", serde_json::to_string(&store.dashboard_state()?)?);
     Ok(())
 }
@@ -4081,6 +4087,7 @@ fn dashboard_request(args: Vec<OsString>) -> io::Result<()> {
         ));
     }
     let store = EventStore::default_local()?;
+    configure_dashboard_noise_filter(&store)?;
     println!(
         "{}",
         serde_json::to_string(&store.dashboard_request(request_id)?)?
@@ -4099,6 +4106,7 @@ fn dashboard_day(args: Vec<OsString>) -> io::Result<()> {
         io::Error::new(io::ErrorKind::InvalidInput, "dashboard day must be UTF-8")
     })?;
     let store = EventStore::default_local()?;
+    configure_dashboard_noise_filter(&store)?;
     println!("{}", serde_json::to_string(&store.dashboard_day(day)?)?);
     Ok(())
 }

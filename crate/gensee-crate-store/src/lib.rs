@@ -312,11 +312,43 @@ impl EventStore {
         let encryption_key = store_encryption_key(&root)?;
         let sqlite = open_store(&sqlite_config_for_root(&root, encryption_key.as_ref()))
             .map_err(sqlite_error)?;
-        Ok(Self {
+        let store = Self {
             root,
             sqlite: Arc::new(Mutex::new(sqlite)),
             encryption_key,
-        })
+        };
+        store.set_dashboard_noise_filter(|_, _| false)?;
+        Ok(store)
+    }
+
+    /// The caller supplies presentation policy. No stored alerts or hash-chain
+    /// fields are changed; raw evidence remains available through alerts APIs.
+    pub fn set_dashboard_noise_filter<F>(&self, is_noise: F) -> io::Result<()>
+    where
+        F: Fn(&str, &str) -> bool + Send + std::panic::UnwindSafe + 'static,
+    {
+        let cache = Mutex::new(HashMap::new());
+        self.sqlite_store()?
+            .connection()
+            .create_scalar_function(
+                "gensee_dashboard_alert_is_routine",
+                2,
+                FunctionFlags::SQLITE_UTF8,
+                move |context| {
+                    let rule = context.get::<String>(0)?;
+                    let path = context.get::<String>(1)?;
+                    let mut cache = cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if cache.len() >= 8192 {
+                        cache.clear();
+                    }
+                    Ok(*cache
+                        .entry((rule.clone(), path.clone()))
+                        .or_insert_with(|| is_noise(&rule, &path)))
+                },
+            )
+            .map_err(sqlite_error_from_rusqlite)
     }
 
     /// Open a distinct SQLite connection to the same event-store root. Long-running
@@ -2192,6 +2224,34 @@ impl EventStore {
 
             match event.hook_event_name.as_deref() {
                 Some("UserPromptSubmit") => {
+                    if event.provider == "claude-code" && prompt.as_deref().is_some_and(is_task_notification) {
+                        let text = prompt.as_deref().unwrap_or_default();
+                        let origin = notification_field(text, "tool-use-id").map(|tool_id| {
+                            db.connection().query_row(
+                                "SELECT ae.request_id FROM agent_events ae JOIN requests r ON r.request_id = ae.request_id
+                                 WHERE r.session_id = ?1 AND ae.tool_use_id = ?2 ORDER BY ae.event_id DESC LIMIT 1",
+                                rusqlite::params![session_id, tool_id], |row| row.get::<_, i64>(0),
+                            ).optional().map_err(sqlite_error_from_rusqlite)
+                        }).transpose()?.flatten();
+                        let request_id = match origin {
+                            Some(id) => id,
+                            None => {
+                                let current = db.latest_request_for_session(session_id).map_err(sqlite_error)?;
+                                if let Some(current) = current.filter(|request| request.original_user_prompt.as_deref() == Some("Background activity")) {
+                                    current.request_id
+                                } else {
+                                    let id = db.insert_request(&NewRequest {
+                                        session_id: session_id.into(), original_user_prompt: Some("Background activity".into()),
+                                        final_response: None, events: Some(event.raw_json.clone()), file_accessed_rate: 0.0, network_rate: 0.0,
+                                    }).map_err(sqlite_error)?;
+                                    db.set_request_created_at(id, to_i64(event.observed_at_ms)?).map_err(sqlite_error)?;
+                                    id
+                                }
+                            }
+                        };
+                        db.set_hook_request_context(session_id, request_id).map_err(sqlite_error)?;
+                        return Ok(());
+                    }
                     let request_id = db
                         .insert_request(&NewRequest {
                             session_id: session_id.to_string(),
@@ -4488,6 +4548,8 @@ fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
     format!(
         "NOT ({alias}.rule_id = 'unmatched_system_effect'
               AND {alias}.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
+         AND NOT (lower({alias}.action) NOT IN ('deny', 'block')
+                  AND gensee_dashboard_alert_is_routine({alias}.rule_id, {path}))
          AND NOT ({alias}.rule_id = 'hook_bypass_file_mutation' AND (
               {path} GLOB '/dev/*'
               OR {lower_path} LIKE '%/library/application support/codex/%'
@@ -5190,8 +5252,50 @@ fn bounded_transaction_text(value: &str) -> String {
     bounded
 }
 
+fn notification_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let mut body = text
+        .trim()
+        .strip_prefix("<task-notification>")?
+        .strip_suffix("</task-notification>")?;
+    let mut found = None;
+    while !body.trim().is_empty() {
+        let (tag, rest) = body.trim_start().strip_prefix('<')?.split_once('>')?;
+        if tag.is_empty()
+            || !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return None;
+        }
+        let close = format!("</{tag}>");
+        let (value, rest) = rest.split_once(&close)?;
+        if tag == name {
+            if found.is_some() || value.trim().is_empty() || value.contains(['<', '>']) {
+                return None;
+            }
+            found = Some(value.trim());
+        }
+        body = rest;
+    }
+    found
+}
+
+fn is_task_notification(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("<task-notification>")
+        && text.ends_with("</task-notification>")
+        && notification_field(text, "task-id").is_some()
+        && matches!(
+            notification_field(text, "status"),
+            Some("completed" | "failed" | "killed")
+        )
+}
+
 fn dashboard_request_prompt(value: Option<&str>) -> Option<String> {
     let mut prompt = value?.to_string();
+    if is_task_notification(&prompt) {
+        return Some("Background activity".into());
+    }
     const OPEN: &str = "<in-app-browser-context";
     const CLOSE: &str = "</in-app-browser-context>";
 
@@ -6891,6 +6995,122 @@ mod tests {
             assert_eq!(calls.get(), 1, "raw fields must still be parsed once");
         }
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn notification_routing_ignores_quoted_and_nested_metadata() {
+        let text = "<task-notification><task-id>job</task-id><status>completed</status><summary>quoted <tool-use-id>other</tool-use-id></summary></task-notification>";
+        assert!(is_task_notification(text));
+        assert_eq!(notification_field(text, "tool-use-id"), None);
+        assert!(!is_task_notification(&format!("Explain this: {text}")));
+        assert!(!is_task_notification("<task-notification><summary><task-id>job</task-id><status>completed</status></summary></task-notification>"));
+    }
+
+    #[test]
+    fn task_notifications_resume_the_origin_without_creating_user_requests() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-notification-routing-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"first request"}"#,
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Bash",
+                "launch-one",
+                r#"{"command":"sleep 1"}"#,
+                101,
+            ))
+            .unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"second request"}"#,
+                102,
+            ))
+            .unwrap();
+        let text = "<task-notification><task-id>job-1</task-id><tool-use-id>launch-one</tool-use-id><status>completed</status><summary>done</summary></task-notification>";
+        let payload = json!({"prompt": text}).to_string();
+        store
+            .append_hook_event_evidence_only(&hook_event("UserPromptSubmit", &payload, 103))
+            .unwrap();
+        assert_eq!(
+            store
+                .active_request_context("s1")
+                .unwrap()
+                .unwrap()
+                .original_user_prompt
+                .as_deref(),
+            Some("first request")
+        );
+        let reopened = store.independent_connection().unwrap();
+        assert_eq!(
+            reopened
+                .active_request_context("s1")
+                .unwrap()
+                .unwrap()
+                .original_user_prompt
+                .as_deref(),
+            Some("first request")
+        );
+        reopened
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Read",
+                "follow-up",
+                r#"{"file_path":"/repo/a.txt"}"#,
+                104,
+            ))
+            .unwrap();
+        let db = reopened.sqlite_store().unwrap();
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT count(*) FROM requests", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(db.agent_events_for_request(1).unwrap().len(), 2);
+        drop(db);
+        assert_eq!(
+            dashboard_request_prompt(Some(text)).as_deref(),
+            Some("Background activity")
+        );
+        // A tool ID from another session cannot select its request.
+        let mut unknown = hook_event("UserPromptSubmit", &payload, 105);
+        unknown.session_id = Some("other-session".into());
+        reopened.append_hook_event_evidence_only(&unknown).unwrap();
+        assert_eq!(
+            reopened
+                .active_request_context("other-session")
+                .unwrap()
+                .unwrap()
+                .original_user_prompt
+                .as_deref(),
+            Some("Background activity")
+        );
+        reopened
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"third request"}"#,
+                106,
+            ))
+            .unwrap();
+        assert_eq!(
+            reopened
+                .active_request_context("s1")
+                .unwrap()
+                .unwrap()
+                .original_user_prompt
+                .as_deref(),
+            Some("third request")
+        );
+        assert!(std::fs::read_to_string(store.hooks_path()).is_ok());
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

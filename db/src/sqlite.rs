@@ -11,12 +11,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // already-initialized store must not rerun CREATE/ALTER statements on every
 // short-lived hook or dashboard process: schema DDL needs a writer lock and can
 // otherwise starve behind the long-lived Endpoint Security ingester.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 // This checksum intentionally names the schema version. If schema.sql changes,
 // bump SCHEMA_VERSION and replace this with the checksum for the new version.
 #[cfg(test)]
-const SCHEMA_V3_SQL_SHA256: &str =
-    "7deebdddb91badc4a083a3b2edd0d06586353ab2203dbbfe7a14e249b035d90b";
+const SCHEMA_V4_SQL_SHA256: &str =
+    "a504bd2204e3c577354f6b4189639e1208bec540ad8f9f2e7e49e329e9727fd7";
 // Increment whenever dashboard artifact visibility rules change. Existing
 // stores are reclassified by bounded background maintenance before this
 // version is stamped on their cached count.
@@ -875,7 +875,25 @@ impl SqliteStore {
             )
             .map_err(SqliteError::Database)?;
 
-        Ok(self.conn.last_insert_rowid())
+        let request_id = self.conn.last_insert_rowid();
+        self.set_hook_request_context(&request.session_id, request_id)?;
+        Ok(request_id)
+    }
+
+    pub fn set_hook_request_context(
+        &self,
+        session_id: &str,
+        request_id: i64,
+    ) -> Result<(), SqliteError> {
+        self.conn
+            .execute(
+                "INSERT INTO hook_request_contexts(session_id, request_id)
+             SELECT session_id, request_id FROM requests WHERE session_id = ?1 AND request_id = ?2
+             ON CONFLICT(session_id) DO UPDATE SET request_id = excluded.request_id",
+                params![session_id, request_id],
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Database)
     }
 
     pub fn get_request(&self, request_id: i64) -> Result<Option<RequestRecord>, SqliteError> {
@@ -901,9 +919,9 @@ impl SqliteStore {
                 "SELECT request_id, session_id, original_user_prompt, final_response,
                     events, file_accessed_rate, network_rate
                  FROM requests
-                 WHERE session_id = ?1
-                 ORDER BY request_id DESC
-                 LIMIT 1",
+                 WHERE session_id = ?1 AND request_id = COALESCE(
+                     (SELECT request_id FROM hook_request_contexts WHERE session_id = ?1),
+                     (SELECT MAX(request_id) FROM requests WHERE session_id = ?1))",
                 [session_id],
                 map_request,
             )
@@ -3213,10 +3231,10 @@ mod tests {
 
     #[test]
     fn schema_checksum_is_tied_to_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 3);
+        assert_eq!(SCHEMA_VERSION, 4);
         let actual = format!("{:x}", Sha256::digest(include_bytes!("../schema.sql")));
         assert_eq!(
-            actual, SCHEMA_V3_SQL_SHA256,
+            actual, SCHEMA_V4_SQL_SHA256,
             "schema.sql changed: bump SCHEMA_VERSION and replace the versioned checksum"
         );
     }

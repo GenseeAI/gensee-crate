@@ -267,6 +267,71 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_quiets_historical_scratch_alerts_without_rewriting_evidence() {
+        let dir =
+            std::env::temp_dir().join(format!("gensee-dashboard-scratch-{}", std::process::id()));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "Read",
+                json!({"file_path":"/repo/file"}),
+                1,
+            ))
+            .unwrap();
+        for (rule, path, action) in [
+            (
+                "policy_write_outside_workspace",
+                "/tmp/gensee-scratch/out.txt",
+                "ask",
+            ),
+            (
+                "policy_destructive_file_operation",
+                "/tmp/gensee-scratch/out.txt",
+                "warn",
+            ),
+            ("policy_write_outside_workspace", "/dev/null", "ask"),
+            ("policy_write_outside_workspace", "/tmp/.env", "ask"),
+            (
+                "endpoint_security_event_gap",
+                "/tmp/gensee-scratch/out.txt",
+                "warn",
+            ),
+            (
+                "policy_write_outside_workspace",
+                "/tmp/gensee-scratch/blocked.txt",
+                "block",
+            ),
+        ] {
+            let mut finding = alert("high", action);
+            finding.rule_id = rule.into();
+            finding.path = Some(path.into());
+            store.append_policy_alert(&finding).unwrap();
+        }
+        let before = store.list_alerts().unwrap();
+        let chain_before = store.verify_alert_chain().unwrap();
+        let policy = policy_with(json!({}));
+        store
+            .set_dashboard_noise_filter(move |rule, path| {
+                policy.is_routine_scratch_alert(rule, path)
+            })
+            .unwrap();
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 3);
+        assert_eq!(dashboard["requests"][0]["high_risk_alert_count"], 3);
+        let request_id = dashboard["requests"][0]["request_id"].as_i64().unwrap();
+        assert_eq!(
+            store.dashboard_request(request_id).unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), before.len());
+        assert_eq!(store.verify_alert_chain().unwrap(), chain_before);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn preparation_applies_recording_threshold_before_store_write() {
         let policy = policy_with(json!({
             "endpoint_security": {

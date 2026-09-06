@@ -2453,7 +2453,7 @@ fn antigravity_pretool_returns_top_level_decision() {
         "toolCall": {
             "name": "run_command",
             "args": {
-                "CommandLine": "echo hi > /tmp/gensee-outside.txt",
+                "CommandLine": "echo hi > /opt/gensee-outside.txt",
                 "Cwd": workspace
             }
         },
@@ -3099,7 +3099,7 @@ fn codex_ask_pretool_records_warn_and_returns_no_hook_output() {
     let payload = pretool_bash_payload(
         "s1",
         workspace.to_str().unwrap(),
-        "echo hi > /tmp/gensee-outside.txt",
+        "echo hi > /opt/gensee-outside.txt",
     );
     let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
 
@@ -5727,8 +5727,51 @@ fn policy_load_failure_denies_by_default() {
 }
 
 #[test]
+fn pretool_policy_keeps_routine_scratch_operations_silent() {
+    for command in [
+        "echo hi > /tmp/gensee-scratch/out.txt",
+        "echo hi > /dev/null",
+        "rm -rf /tmp/gensee-scratch/output",
+    ] {
+        let payload = pretool_bash_payload("s1", "/repo", command);
+        let event = build_agent_hook_event(&payload).unwrap();
+        let intents = file_intents_from_hook(&event, original_bash_command(&payload).as_deref());
+        let decision = evaluate_pretool_policy(&event, &intents);
+        assert_eq!(
+            decision.action,
+            PolicyAction::Allow,
+            "{command}: {:?}",
+            decision.findings
+        );
+        assert!(decision
+            .findings
+            .iter()
+            .all(|finding| finding.severity == "info"));
+    }
+}
+
+#[test]
+fn scratch_cleanup_does_not_exempt_broad_or_compound_commands() {
+    for command in [
+        "rm -rf /tmp",
+        "rm -rf /tmp/gensee-scratch /opt/important",
+        "rm -rf /tmp/gensee-*",
+        "rm -rf /tmp/gensee-scratch; rm -rf /opt/important",
+    ] {
+        let payload = pretool_bash_payload("s1", "/repo", command);
+        let event = build_agent_hook_event(&payload).unwrap();
+        let intents = file_intents_from_hook(&event, original_bash_command(&payload).as_deref());
+        assert_ne!(
+            evaluate_pretool_policy(&event, &intents).action,
+            PolicyAction::Allow,
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn pretool_policy_blocks_writes_outside_workspace() {
-    let payload = r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"echo hi > /tmp/out.txt"}}"#;
+    let payload = r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"echo hi > /opt/gensee-outside.txt"}}"#;
     let event = build_agent_hook_event(payload).unwrap();
     let intents = file_intents_from_hook(&event, original_bash_command(payload).as_deref());
 

@@ -444,3 +444,9 @@ CREATE INDEX IF NOT EXISTS idx_transaction_events_source
 
 CREATE INDEX IF NOT EXISTS idx_transaction_events_target
     ON transaction_events(target_run_id, occurred_at);
+
+-- The current hook turn can resume an older request after a background task.
+CREATE TABLE IF NOT EXISTS hook_request_contexts (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    request_id INTEGER NOT NULL REFERENCES requests(request_id) ON DELETE CASCADE
+);
