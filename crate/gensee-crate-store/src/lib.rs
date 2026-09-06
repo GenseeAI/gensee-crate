@@ -1580,6 +1580,22 @@ impl EventStore {
             }))
         })?;
         let json_sessions = self.list_sessions()?;
+        // Sensor delivery failures are Gensee health incidents. Project legacy
+        // records separately without rewriting their immutable evidence or
+        // carrying forward the request/tool context attached by older builds.
+        let monitoring_gaps = query_json_rows(
+            conn,
+            "SELECT alert_id, created_at, json_extract(evidence, '$.dropped_events')
+             FROM alerts WHERE rule_id = 'endpoint_security_event_gap'
+             ORDER BY created_at DESC, alert_id DESC LIMIT 100",
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "observedAt": row.get::<_, i64>(1)?,
+                    "missingEvents": row.get::<_, Option<i64>>(2)?,
+                }))
+            },
+        )?;
         Ok(json!({
             "source": "gensee",
             "summary": dashboard_summary,
@@ -1593,6 +1609,7 @@ impl EventStore {
             "dailyActivity": daily_activity,
             "recentActivity": recent_activity,
             "jsonSessions": json_sessions,
+            "monitoringGaps": monitoring_gaps,
         }))
     }
 
@@ -1902,13 +1919,17 @@ impl EventStore {
 
     pub fn append_policy_alert(&self, alert: &PolicyAlert) -> io::Result<()> {
         self.with_sqlite_transaction(|db| {
-            let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
-            ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
-            let request_id = latest_or_create_request(db, session_id)?;
+            let request_id = if alert.rule_id == "endpoint_security_event_gap" {
+                None
+            } else {
+                let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
+                ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
+                Some(latest_or_create_request(db, session_id)?)
+            };
             insert_alert(
                 db,
                 AlertInput {
-                    request_id: Some(request_id),
+                    request_id,
                     entity: None,
                     severity: &alert.severity,
                     action: &alert.action,
@@ -1923,7 +1944,9 @@ impl EventStore {
                 },
             )?;
             if alert.rule_id == "policy_network_egress" {
-                refresh_request_resource_rates(db, request_id)?;
+                if let Some(request_id) = request_id {
+                    refresh_request_resource_rates(db, request_id)?;
+                }
             }
             Ok(())
         })
@@ -1940,9 +1963,13 @@ impl EventStore {
         window_ms: u64,
     ) -> io::Result<bool> {
         self.with_sqlite_transaction(|db| {
-            let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
-            ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
-            let request_id = latest_or_create_request(db, session_id)?;
+            let request_id = if alert.rule_id == "endpoint_security_event_gap" {
+                None
+            } else {
+                let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
+                ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
+                Some(latest_or_create_request(db, session_id)?)
+            };
             let created_at = to_i64(alert.observed_at_ms)?;
             let window = to_i64(window_ms)?;
             let duplicate = db
@@ -1976,7 +2003,7 @@ impl EventStore {
             insert_alert(
                 db,
                 AlertInput {
-                    request_id: Some(request_id),
+                    request_id,
                     entity: None,
                     severity: &alert.severity,
                     action: &alert.action,
@@ -4797,7 +4824,8 @@ fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
     let path = format!("COALESCE({alias}.path, '')");
     let lower_path = format!("lower({path})");
     format!(
-        "NOT (lower({alias}.action) NOT IN ('deny', 'block') AND {alias}.rule_id = 'unmatched_system_effect'
+        "{alias}.rule_id != 'endpoint_security_event_gap'
+         AND NOT (lower({alias}.action) NOT IN ('deny', 'block') AND {alias}.rule_id = 'unmatched_system_effect'
               AND {alias}.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
          AND NOT (lower({alias}.action) NOT IN ('deny', 'block')
                   AND CASE WHEN gensee_dashboard_alert_is_routine_candidate({alias}.rule_id)
@@ -8879,39 +8907,98 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_surfaces_endpoint_sequence_gap_alerts() {
+    fn dashboard_separates_monitoring_gaps_from_request_findings() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-store-test-endpoint-gap-dashboard-{}",
             std::process::id()
         ));
         let store = EventStore::new(&dir).unwrap();
+        store.append_hook_event_evidence_only(&hook_event(
+            "UserPromptSubmit",
+            r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"review code"}"#,
+            100,
+        )).unwrap();
         let db = store.sqlite_store().unwrap();
-        insert_alert(
-            &db,
-            AlertInput {
-                request_id: None,
-                entity: None,
-                severity: "high",
-                action: "warn",
-                rule_id: "endpoint_security_event_gap",
-                message: "legacy prototype sequence gap",
-                path: None,
-                evidence: None,
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64,
-            },
-        )
-        .unwrap();
+        let request_id: i64 = db
+            .connection()
+            .query_row("SELECT request_id FROM requests LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        // Reproduce legacy records incorrectly attached to a real request.
+        for (rule, count) in [
+            ("endpoint_security_event_gap", Some(2727)),
+            ("endpoint_security_event_gap", None),
+            ("policy_destructive_file_operation", None),
+        ] {
+            insert_alert(
+                &db,
+                AlertInput {
+                    request_id: Some(request_id),
+                    entity: None,
+                    severity: "high",
+                    action: "warn",
+                    rule_id: rule,
+                    message: "legacy evidence",
+                    path: None,
+                    evidence: count.map(|count| json!({"dropped_events": count})),
+                    created_at: 200,
+                },
+            )
+            .unwrap();
+        }
         drop(db);
-
+        let before = store.verify_alert_chain().unwrap();
         let dashboard = store.dashboard_state().unwrap();
         assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 1);
         assert_eq!(dashboard["summary"]["alerts_count"], 1);
-        assert_eq!(dashboard["summary"]["recent_high_alerts"], 1);
         assert_eq!(dashboard["summary"]["high_alerts_count"], 1);
+        assert_eq!(dashboard["requests"][0]["high_risk_alert_count"], 1);
+        let gaps = dashboard["monitoringGaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 2);
+        assert!(gaps.iter().any(|gap| gap["missingEvents"] == 2727));
+        assert!(gaps.iter().any(|gap| gap["missingEvents"].is_null()));
+        assert!(gaps
+            .iter()
+            .all(|gap| gap.get("request_id").is_none() && gap.get("tool_input").is_none()));
+        let detail = store.dashboard_request(request_id).unwrap();
+        assert_eq!(detail["alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["rawAlertCount"], 1);
+        assert_eq!(store.list_alerts().unwrap().len(), 3);
+        assert_eq!(store.verify_alert_chain().unwrap(), before);
 
+        // New health incidents never create a synthetic request or attach to
+        // a caller-provided session, even if the caller supplies stale context.
+        let gap = PolicyAlert {
+            session_id: Some("s1".into()),
+            tool_use_id: Some("old-tool".into()),
+            severity: "info".into(),
+            action: "allow".into(),
+            rule_id: "endpoint_security_event_gap".into(),
+            message: "Gensee monitoring gap".into(),
+            path: None,
+            evidence: Some(json!({"dropped_events": 4})),
+            observed_at_ms: 300,
+        };
+        store
+            .append_endpoint_policy_alert(&gap, "gap-test", 60_000)
+            .unwrap();
+        store.append_policy_alert(&gap).unwrap();
+        let db = store.sqlite_store().unwrap();
+        let unassigned: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM alerts WHERE request_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unassigned, 2);
+        let requests: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(requests, 1);
         fs::remove_dir_all(&dir).ok();
     }
 

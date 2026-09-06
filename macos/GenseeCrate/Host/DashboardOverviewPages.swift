@@ -55,8 +55,11 @@ struct DashboardOverviewPage: View {
                             Spacer()
                             if sensor.health.launchContinuityIssue != nil {
                                 DashboardTag(text: "Event gaps detected", color: .dashboardRed)
-                            } else if sensor.health.kernelDrops > 0 || sensor.health.ringDrops > 0 || sensor.health.rejectedEvents > 0 {
-                                DashboardTag(text: "Historical drops", color: .dashboardGold)
+                            } else if !model.snapshot.monitoringGaps.isEmpty || sensor.health.kernelDrops > 0 || sensor.health.ringDrops > 0 || sensor.health.rejectedEvents > 0 {
+                                DashboardTag(text: "Gensee monitoring gaps", color: .dashboardGold)
+                                    .help("Collection gaps are recorded in Settings under Endpoint Security. They are not agent findings.")
+                            } else if !sensor.health.connected || !sensor.health.running {
+                                DashboardTag(text: "Coverage unavailable", color: .dashboardGold)
                             } else {
                                 DashboardTag(text: "No event gaps", color: .green)
                             }

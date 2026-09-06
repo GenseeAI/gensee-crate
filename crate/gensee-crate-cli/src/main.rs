@@ -4335,10 +4335,21 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 continue;
             }
             let alert = PolicyAlert {
-                session_id: active_session_id.clone(),
-                tool_use_id: tool_use_id.clone(),
+                // A client-wide delivery gap cannot be attributed to the tool
+                // whose next retained event happened to carry the drop delta.
+                session_id: (finding.rule_id != "endpoint_security_event_gap")
+                    .then(|| active_session_id.clone())
+                    .flatten(),
+                tool_use_id: (finding.rule_id != "endpoint_security_event_gap")
+                    .then(|| tool_use_id.clone())
+                    .flatten(),
                 severity: finding.severity.to_string(),
-                action: "warn".to_string(),
+                action: if finding.rule_id == "endpoint_security_event_gap" {
+                    "allow"
+                } else {
+                    "warn"
+                }
+                .to_string(),
                 rule_id: finding.rule_id.to_string(),
                 message: finding.message,
                 path: finding.path,

@@ -1,6 +1,6 @@
 # Review Queue and remembered approvals
 
-The queue shows one **Status**: **Blocked**, **Approval requested**, **Review**, or
+The queue shows one **Status**: **Blocked**, **Approval requested**, **Warning**, or
 **Allowed**. Expanded details retain the original risk severity and policy response.
 A status describes the decision when the event happened; an old approval request
 is not necessarily still waiting in the harness.
@@ -9,9 +9,36 @@ Endpoint Security can observe a child process removing or renaming files even
 when the displayed shell command contains no `rm`. Build tools and Git perform
 such operations internally. Ordinary workspace writes, temporary regular-file
 renames, and narrowly identified runtime housekeeping stay quiet. Protected paths,
-unsafe rename sources, directory moves, unknown scope, blocks, and collection gaps
+unsafe rename sources, directory moves, unknown scope, and blocks
 still require attention. Historical filtering preserves raw records and their hash
 chain.
+
+## Gensee monitoring gaps
+
+**Settings → Endpoint Security → Gensee monitoring gaps** contains the latest 100
+retained sensor delivery-gap reports. Overview shows a monitoring-health indicator.
+These records are excluded from agent findings, request warning counts, and review
+notifications, including historical records that older versions attached to a tool.
+The raw historical evidence and its hash chain remain unchanged. New reports have
+no request association and bypass the agent minimum-severity filter.
+
+The sensor detects kernel delivery loss using the client's unfiltered
+`global_seq_num`. Apple's [sequence-number documentation](https://developer.apple.com/documentation/endpointsecurity/es_message_t/global_seq_num)
+explains that this generally means the kernel produced more events than the client
+could handle. Gensee's ingester does not infer loss from the filtered agent stream.
+The next retained event carries the accumulated missing-event count; its process,
+file, and active tool do not identify the cause or ownership of the missing events.
+Reports are rate-limited per sensor boot, so summing their counts does not give an
+exact total. Live sensor health has separate kernel-loss and replay-buffer counters.
+
+The sensor currently subscribes to frequent system-wide file notifications and
+authorization events, then filters unmanaged activity in its callback. Build bursts
+can stress that path. Historical gap records alone cannot identify a specific
+callback bottleneck; diagnosing it requires live throughput and latency profiling.
+If the sensor is disconnected, zero counters are not proof of complete coverage.
+Check the connection and Full Disk Access before interpreting them. Full Disk Access
+denial prevents the sensor from starting and is distinct from a running sensor's
+event-delivery loss.
 
 ## Approve a repeat
 

@@ -19,10 +19,12 @@ struct SecuritySnapshot: Decodable {
     var jsonSessions: [AgentSessionRecord] = []
     var dailyActivity: [DailyActivity] = []
     var recentActivity: [RecentActivityBucket] = []
+    var monitoringGaps: [MonitoringGap] = []
 
     enum CodingKeys: String, CodingKey {
         case summary, alerts, agentEvents, sessions, requests, artifacts
         case relations, humanFeedback, workspaceEffects, jsonSessions, dailyActivity, recentActivity
+        case monitoringGaps
     }
 
     init() {}
@@ -41,7 +43,16 @@ struct SecuritySnapshot: Decodable {
         jsonSessions = try values.decodeIfPresent([AgentSessionRecord].self, forKey: .jsonSessions) ?? []
         dailyActivity = try values.decodeIfPresent([DailyActivity].self, forKey: .dailyActivity) ?? []
         recentActivity = try values.decodeIfPresent([RecentActivityBucket].self, forKey: .recentActivity) ?? []
+        monitoringGaps = try values.decodeIfPresent([MonitoringGap].self, forKey: .monitoringGaps) ?? []
     }
+}
+
+struct MonitoringGap: Decodable, Identifiable {
+    let id: Int64
+    let observedAt: Int64
+    let missingEvents: Int64?
+
+    var date: Date { Date(timeIntervalSince1970: Double(observedAt) / 1_000) }
 }
 
 struct RecentActivityBucket: Decodable, Identifiable {

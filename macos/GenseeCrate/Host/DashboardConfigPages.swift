@@ -1094,8 +1094,12 @@ struct DashboardSettingsPage: View {
                 Text("Ingestion health").font(.system(size: 11))
                 Spacer()
                 DashboardTag(
-                    text: sensor.health.hasBackpressure ? "Backpressure" : "Healthy",
-                    color: sensor.health.hasBackpressure ? .dashboardGold : .green
+                    text: !sensor.health.connected ? "Disconnected" :
+                        (!sensor.health.running ? "Not running" :
+                            (sensor.health.ingestionWarning != nil ? "Ingestion interrupted" :
+                                (sensor.health.hasBackpressure ? "Backpressure" : "Healthy"))),
+                    color: !sensor.health.connected || !sensor.health.running ||
+                        sensor.health.ingestionWarning != nil || sensor.health.hasBackpressure ? .dashboardGold : .green
                 )
             }
             settingsLine("Extension backlog", sensor.health.backlogEvents.formatted())
@@ -1161,6 +1165,29 @@ struct DashboardSettingsPage: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dashboardRed)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if !model.snapshot.monitoringGaps.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Gensee monitoring gaps").font(.system(size: 12, weight: .semibold))
+                    Text("Some sensor activity was not recorded. These are Gensee collection issues, not agent findings.")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    DisclosureGroup("Recent gap reports (\(model.snapshot.monitoringGaps.count))") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(model.snapshot.monitoringGaps) { gap in
+                                HStack {
+                                    Text(gap.date.formatted(date: .abbreviated, time: .standard))
+                                    Spacer()
+                                    Text(gap.missingEvents.map { "\($0.formatted()) events not delivered" } ?? "Missing event count unavailable")
+                                }.font(.system(size: 10))
+                            }
+                            Text("Latest 100 retained reports. Counts are per report, not a total. The sensor detected delivery gaps before Gensee received the events; the lost events cannot be assigned to a request.")
+                                .font(.system(size: 10)).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }.padding(.top, 6)
+                    }.font(.system(size: 11))
+                }
             }
             HStack {
                 Button("Full Disk Access") { model.openFullDiskAccess() }

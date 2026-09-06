@@ -185,6 +185,15 @@ fn observation_enrichment(
 }
 
 fn prepare_policy_alert(policy: &Policy, mut alert: PolicyAlert) -> Option<PolicyAlert> {
+    // Monitoring health must remain visible even when the user suppresses
+    // low-severity agent findings or has tuned a legacy gap-warning rule.
+    if alert.rule_id == "endpoint_security_event_gap" {
+        alert.session_id = None;
+        alert.tool_use_id = None;
+        alert.severity = "info".into();
+        alert.action = "allow".into();
+        return Some(alert);
+    }
     let tuned = policy.tuned_alert_values(&alert.rule_id, &alert.severity, &alert.action);
     if !policy
         .document()
@@ -288,6 +297,20 @@ mod tests {
             evidence: None,
             observed_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn monitoring_health_bypasses_agent_severity_filter_and_attribution() {
+        let policy =
+            policy_with(json!({"endpoint_security": {"minimum_recorded_severity": "high"}}));
+        let mut gap = alert("info", "warn");
+        gap.rule_id = "endpoint_security_event_gap".into();
+        let prepared = prepare_policy_alert(&policy, gap).unwrap();
+        assert_eq!(prepared.action, "allow");
+        assert_eq!(prepared.severity, "info");
+        assert!(prepared.session_id.is_none());
+        assert!(prepared.tool_use_id.is_none());
+        assert!(prepare_policy_alert(&policy, alert("info", "allow")).is_none());
     }
 
     #[test]
@@ -517,15 +540,15 @@ mod tests {
             )
             .unwrap();
         let dashboard = store.dashboard_state().unwrap();
-        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 3);
-        assert_eq!(dashboard["requests"][0]["high_risk_alert_count"], 3);
+        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 2);
+        assert_eq!(dashboard["requests"][0]["high_risk_alert_count"], 2);
         let request_id = dashboard["requests"][0]["request_id"].as_i64().unwrap();
         assert_eq!(
             store.dashboard_request(request_id).unwrap()["alerts"]
                 .as_array()
                 .unwrap()
                 .len(),
-            3
+            2
         );
         assert_eq!(store.list_alerts().unwrap().len(), before.len());
         assert_eq!(store.verify_alert_chain().unwrap(), chain_before);
