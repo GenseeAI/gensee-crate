@@ -8,8 +8,9 @@ changes.
 
 ## Unreleased
 
-Use this section for user-visible changes after the initial open-source
-release.
+No changes yet.
+
+## 0.3.2 - 2026-09-05
 
 ### Added
 
@@ -17,6 +18,19 @@ release.
   `host-native`, `vm-mediated`, `cloud-mediated`, and `unattributed` execution
   origins, opt-in signed process-tree management, local audit ingestion,
   VM/cloud limitation evidence, and timeline labels.
+
+- Added a separate Claude Cowork item in the macOS Harnesses tab, with opt-in
+  endpoint visibility, audit setup guidance, and bounded evidence checks.
+
+### Fixed
+
+- Improved Cowork VM attribution, malformed configuration isolation, and PID
+  reassignment handling.
+- Preserved sensor loss reporting across replay, revocation, and ingestion
+  restarts, and separated configuration warnings from sensor availability.
+- Reduced redundant JSON parsing and moved hook-field preparation outside the
+  database write transaction.
+- Kept evidence durable when policy enrichment fails.
 
 ### Changed
 
