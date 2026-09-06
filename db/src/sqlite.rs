@@ -11,12 +11,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // already-initialized store must not rerun CREATE/ALTER statements on every
 // short-lived hook or dashboard process: schema DDL needs a writer lock and can
 // otherwise starve behind the long-lived Endpoint Security ingester.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 // This checksum intentionally names the schema version. If schema.sql changes,
 // bump SCHEMA_VERSION and replace this with the checksum for the new version.
 #[cfg(test)]
-const SCHEMA_V4_SQL_SHA256: &str =
-    "a504bd2204e3c577354f6b4189639e1208bec540ad8f9f2e7e49e329e9727fd7";
+const SCHEMA_V5_SQL_SHA256: &str =
+    "8efa67f1e7f5de10a5e04b0873a5550341ccc5ca360ce81031e2d07fc306e38f";
 // Increment whenever dashboard artifact visibility rules change. Existing
 // stores are reclassified by bounded background maintenance before this
 // version is stamped on their cached count.
@@ -944,6 +944,9 @@ impl SqliteStore {
             .map_err(SqliteError::Database)
     }
 
+    /// Requests are mutable current-state projections. A resumed background
+    /// turn supersedes the displayed response; the original Stop events remain
+    /// in the append-only hook journal owned by EventStore.
     pub fn set_request_response(
         &self,
         request_id: i64,
@@ -3231,10 +3234,10 @@ mod tests {
 
     #[test]
     fn schema_checksum_is_tied_to_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(SCHEMA_VERSION, 5);
         let actual = format!("{:x}", Sha256::digest(include_bytes!("../schema.sql")));
         assert_eq!(
-            actual, SCHEMA_V4_SQL_SHA256,
+            actual, SCHEMA_V5_SQL_SHA256,
             "schema.sql changed: bump SCHEMA_VERSION and replace the versioned checksum"
         );
     }
@@ -3359,6 +3362,48 @@ mod tests {
             std::fs::remove_file(path.with_file_name(format!("{}-wal", db_name.to_string_lossy())));
         let _ =
             std::fs::remove_file(path.with_file_name(format!("{}-shm", db_name.to_string_lossy())));
+    }
+
+    #[test]
+    fn schema_v5_upgrades_existing_projection_tables_without_touching_requests() {
+        let path =
+            std::env::temp_dir().join(format!("gensee-db-v5-upgrade-{}.db", std::process::id()));
+        remove_sqlite_files(&path);
+        let config = test_config(&path);
+        let conn = open(&config).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions VALUES ('test', 'claude-code', 1, 100, NULL, 0);
+            INSERT INTO requests(session_id, original_user_prompt) VALUES ('test', 'keep original');
+            DROP TABLE dashboard_request_groups;
+            DROP TABLE dashboard_projection_progress;
+            DROP TABLE dashboard_alert_classification;
+            PRAGMA user_version=4;",
+        )
+        .unwrap();
+        drop(conn);
+        let conn = open(&config).unwrap();
+        for table in [
+            "dashboard_request_groups",
+            "dashboard_projection_progress",
+            "dashboard_alert_classification",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+        let prompt: String = conn
+            .query_row("SELECT original_user_prompt FROM requests", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(prompt, "keep original");
+        drop(conn);
+        remove_sqlite_files(&path);
     }
 
     #[test]

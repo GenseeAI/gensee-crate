@@ -318,7 +318,7 @@ private struct FindingReviewControl: View {
                     ScrollView { Text(input).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 120)
                 }
                 if let issue = approvalIssue { Text(issue).font(.caption).foregroundStyle(.red) }
-                Text("Applies to this target and tool input. Executable and credential-read approvals require unchanged file content. This does not execute a historical action; retry it in your harness.").font(.caption).foregroundStyle(.secondary)
+                Text("Applies to this target and tool input. Executable and credential-read approvals require the content inspected for this alert to remain unchanged. This does not execute a historical action; retry it in your harness.").font(.caption).foregroundStyle(.secondary)
                 HStack {
                     Button("Cancel") { approvalPreview = nil }
                     Spacer()

@@ -4031,19 +4031,49 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
         policy.document().categories.destructive.rule_id.clone(),
         "hook_bypass_file_mutation".into(),
     ];
-    store.set_dashboard_noise_filter(
+    let version = format!(
+        "historical-routine-v4:{:x}",
+        Sha256::digest(
+            format!(
+                "{}:{}",
+                policy.source_document(),
+                env::var("HOME").unwrap_or_default()
+            )
+            .as_bytes()
+        )
+    );
+    store.set_dashboard_noise_filter_versioned(
         &candidate_rules
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
+        &version,
         move |rule, path, workspace, operation, evidence| {
-            (operation != "rename" && policy.is_routine_scratch_alert(rule, path))
-                || serde_json::from_str::<Value>(evidence)
-                    .ok()
-                    .is_some_and(|e| housekeeping::is_routine(&policy, rule, path, &e))
-                || (rule == "hook_bypass_file_mutation"
-                    && operation != "rename"
-                    && policy.is_routine_unmatched_mutation(path, workspace, operation))
+            let Ok(e) = serde_json::from_str::<Value>(evidence) else {
+                return false;
+            };
+            if e.pointer("/decision/result").and_then(Value::as_str) == Some("deny")
+                || e.pointer("/file/path_truncated")
+                    .is_some_and(|v| v == &json!(true) || v == &json!(1))
+                || e.pointer("/destination/path_truncated")
+                    .is_some_and(|v| v == &json!(true) || v == &json!(1))
+            {
+                return false;
+            }
+            let ordinary_write = (rule
+                == policy.document().categories.write_outside_workspace.rule_id
+                || rule == "hook_bypass_file_mutation")
+                && matches!(operation, "" | "write" | "create" | "mutation");
+            let regular_scratch_delete = (rule == policy.document().categories.destructive.rule_id
+                || rule == "hook_bypass_file_mutation")
+                && operation == "delete"
+                && gensee_crate_core::recorded_scratch_path(path).is_some()
+                && e.pointer("/file/mode")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|m| m & 0o170000 == 0o100000);
+            ((ordinary_write || regular_scratch_delete)
+                && policy.is_routine_recorded_write(rule, path, workspace))
+                || housekeeping::is_routine(&policy, rule, path, &e)
         },
     )
 }
@@ -4442,11 +4472,6 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                         )?;
                     }
                     if logical_operation != "read"
-                        && !Policy::global().is_routine_unmatched_mutation(
-                            &path,
-                            workspace_root.unwrap_or(""),
-                            policy_operation,
-                        )
                         && !store.has_recent_mutating_file_intent(&path, observed_at_ms)?
                     {
                         record_endpoint_policy_alert(&store, PolicyAlert {

@@ -85,18 +85,6 @@ pub(crate) fn append_system_event_with_policy(
 
 pub(crate) fn record_policy_alert(store: &EventStore, alert: PolicyAlert) -> io::Result<bool> {
     let policy = Policy::load_current();
-    if !matches!(alert.action.as_str(), "block" | "deny")
-        && alert.evidence.as_ref().is_some_and(|e| {
-            housekeeping::is_routine(
-                &policy,
-                &alert.rule_id,
-                alert.path.as_deref().unwrap_or(""),
-                e,
-            )
-        })
-    {
-        return Ok(false);
-    }
     let Some(alert) = prepare_policy_alert(&policy, alert) else {
         return Ok(false);
     };
@@ -111,18 +99,6 @@ pub(crate) fn record_endpoint_policy_alert(
     window_ms: u64,
 ) -> io::Result<bool> {
     let policy = Policy::load_current();
-    if !matches!(alert.action.as_str(), "block" | "deny")
-        && alert.evidence.as_ref().is_some_and(|e| {
-            housekeeping::is_routine(
-                &policy,
-                &alert.rule_id,
-                alert.path.as_deref().unwrap_or(""),
-                e,
-            )
-        })
-    {
-        return Ok(false);
-    }
     let Some(alert) = prepare_policy_alert(&policy, alert) else {
         return Ok(false);
     };
@@ -311,6 +287,68 @@ mod tests {
         assert!(prepared.session_id.is_none());
         assert!(prepared.tool_use_id.is_none());
         assert!(prepare_policy_alert(&policy, alert("info", "allow")).is_none());
+    }
+
+    #[test]
+    fn routine_mutations_keep_durable_alerts_and_executable_staging_stays_visible() {
+        let dir = env::temp_dir().join(format!(
+            "gensee-durable-housekeeping-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        for (index, path, operation, source) in [
+            (0, "/repo/src/main.rs", "write", "/repo/src/main.rs"),
+            (
+                1,
+                "/private/tmp/output.json",
+                "rename",
+                "/private/tmp/output.tmp",
+            ),
+            (
+                2,
+                "/private/tmp/tools/setup.py",
+                "rename",
+                "/private/tmp/payload.tmp",
+            ),
+            (
+                3,
+                "/private/tmp/claude-task.output",
+                "delete",
+                "/private/tmp/claude-task.output",
+            ),
+            (4, "/repo/src/deleted.rs", "delete", "/repo/src/deleted.rs"),
+        ] {
+            let mut alert = alert("medium", "warn");
+            alert.rule_id = "hook_bypass_file_mutation".into();
+            alert.path = Some(path.into());
+            alert.evidence = Some(json!({"logical_operation":operation,
+                "attribution":{"workspace_root":"/repo"}, "actor":{},
+                "file":{"path":source, "mode":0o100644}}));
+            assert!(record_endpoint_policy_alert(
+                &store,
+                alert,
+                &format!("durable-{index}"),
+                10_000
+            )
+            .unwrap());
+        }
+        assert_eq!(store.list_alerts().unwrap().len(), 5);
+        let chain = store.verify_alert_chain().unwrap();
+        configure_dashboard_noise_filter(&store).unwrap();
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 2);
+        let paths: HashSet<_> = dashboard["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a["path"].as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            HashSet::from(["/private/tmp/tools/setup.py", "/repo/src/deleted.rs"])
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 5);
+        assert_eq!(store.verify_alert_chain().unwrap(), chain);
     }
 
     #[test]

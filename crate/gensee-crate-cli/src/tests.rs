@@ -8355,6 +8355,46 @@ fn preexec_resolves_each_script_after_shell_cd() {
 }
 
 #[test]
+fn approval_store_ancestors_allow_metadata_and_destination_creation() {
+    let (store, workspace) = temp_store_and_workspace("approval-ancestor-metadata");
+    let parent = store.root_path().parent().unwrap();
+    for command in [
+        format!("chmod 700 '{}'", parent.display()),
+        format!("mv report.txt '{}'", parent.display()),
+    ] {
+        let event = build_unattributed_hook_event(
+            &pretool_bash_payload("approval-parent", workspace.to_str().unwrap(), &command),
+            "claude-code",
+        )
+        .unwrap();
+        let intents = file_intents_from_hook(&event, Some(&command));
+        let result = evaluate_pretool_policy_with_store(&event, &intents, Some(&store));
+        assert!(
+            !result
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "policy_approval_store_write"),
+            "{command}: {result:?}"
+        );
+    }
+    let command = format!("rm -rf '{}'", parent.display());
+    let event = build_unattributed_hook_event(
+        &pretool_bash_payload("approval-parent", workspace.to_str().unwrap(), &command),
+        "claude-code",
+    )
+    .unwrap();
+    let result = evaluate_pretool_policy_with_store(
+        &event,
+        &file_intents_from_hook(&event, Some(&command)),
+        Some(&store),
+    );
+    assert!(result
+        .findings
+        .iter()
+        .any(|f| f.rule_id == "policy_approval_store_write"));
+}
+
+#[test]
 fn approval_store_protection_follows_symlink_parent_and_covers_directory_deletion() {
     let (store, workspace) = temp_store_and_workspace("approval-protection");
     let alias = workspace.join("approval-alias");

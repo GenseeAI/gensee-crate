@@ -670,6 +670,7 @@ pub struct ContentRule {
 #[derive(Debug, Clone)]
 pub struct Policy {
     doc: PolicyDocument,
+    source_document: String,
     /// Set when `GENSEE_POLICY_FILE` was explicitly configured but could not be
     /// read or parsed. The engine falls back to the embedded default rules, but
     /// enforcement callers should fail closed rather than silently run a policy
@@ -769,6 +770,7 @@ impl Policy {
                  policy document or the binary"
             ));
         }
+        let source_document = value.to_string();
         let doc: PolicyDocument = serde_json::from_value(value)
             .map_err(|err| format!("invalid policy document: {err}"))?;
         if !doc.endpoint_security.fail_closed_managed_only {
@@ -824,7 +826,12 @@ impl Policy {
         Ok(Self {
             doc,
             override_error: None,
+            source_document,
         })
+    }
+
+    pub fn source_document(&self) -> &str {
+        &self.source_document
     }
 
     /// The policy compiled from the bundled default document.
@@ -1112,6 +1119,35 @@ impl Policy {
         self.path_matches(&self.doc.artifact_registries.control_plane, path)
     }
 
+    pub fn is_unprotected_path(&self, path: &str) -> bool {
+        self.classify_path(path).is_none()
+            && !self.is_persistent_target_path(path)
+            && !self.is_control_plane_path(path)
+            && !self.is_memory_artifact_path(path)
+    }
+
+    /// Presentation-only classification using recorded paths, never live disk
+    /// state. Deletions need separate regular-file evidence from the caller.
+    pub fn is_routine_recorded_write(&self, rule: &str, path: &str, workspace: &str) -> bool {
+        if self.doc.review_overrides.iter().any(|r| r.rule_id == rule)
+            || !self.is_unprotected_path(path)
+        {
+            return false;
+        }
+        if path == "/dev/null" {
+            return true;
+        }
+        if gensee_crate_core::recorded_scratch_path(path).is_some() {
+            return true;
+        }
+        rule == "hook_bypass_file_mutation"
+            && gensee_crate_core::recorded_concrete_path(path)
+                .zip(gensee_crate_core::recorded_concrete_path(workspace))
+                .is_some_and(|(path, root)| {
+                    root.parent().is_some() && path != root && path.starts_with(root)
+                })
+    }
+
     /// Quiet only generic scratch-file findings. Sensitive and policy-control
     /// paths retain their own checks even when stored under an OS temp root.
     pub fn is_routine_scratch_alert(&self, rule_id: &str, path: &str) -> bool {
@@ -1134,15 +1170,9 @@ impl Policy {
         let Some(resolved) = gensee_crate_core::resolve_routine_scratch_path(path) else {
             return false;
         };
-        let unprotected = |candidate: &str| {
-            self.classify_path(candidate).is_none()
-                && !self.is_persistent_target_path(candidate)
-                && !self.is_control_plane_path(candidate)
-                && !self.is_memory_artifact_path(candidate)
-        };
         if ![path, resolved.to_str().unwrap_or(path)]
             .iter()
-            .all(|candidate| unprotected(candidate))
+            .all(|candidate| self.is_unprotected_path(candidate))
         {
             return false;
         }
@@ -1164,7 +1194,7 @@ impl Policy {
                         return false;
                     };
                     let child = entry.path();
-                    if !unprotected(&child.to_string_lossy()) {
+                    if !self.is_unprotected_path(&child.to_string_lossy()) {
                         return false;
                     }
                     let Ok(kind) = entry.file_type() else {
@@ -1220,12 +1250,7 @@ impl Policy {
         }
         [path, resolved.to_str().unwrap_or(path)]
             .iter()
-            .all(|candidate| {
-                self.classify_path(candidate).is_none()
-                    && !self.is_persistent_target_path(candidate)
-                    && !self.is_control_plane_path(candidate)
-                    && !self.is_memory_artifact_path(candidate)
-            })
+            .all(|candidate| self.is_unprotected_path(candidate))
     }
 
     fn scratch_adjusted_finding(&self, rule: &CategoryRule, path: &str) -> Finding {

@@ -11,7 +11,18 @@ such operations internally. Ordinary workspace writes, temporary regular-file
 renames, and narrowly identified runtime housekeeping stay quiet. Protected paths,
 unsafe rename sources, directory moves, unknown scope, and blocks
 still require attention. Historical filtering preserves raw records and their hash
-chain.
+chain. Routine hook-correlation and housekeeping alerts are persisted under the
+configured severity/retention policy, then hidden only in the dashboard. Scratch
+renames involving executable-registry paths remain visible.
+
+Request rows are mutable current-state projections: a background continuation
+updates its originating request's latest response and completion time. Earlier
+responses remain in the append-only hook journal. Historical notification-to-origin
+links are backfilled once in batches and retained in a derived table. Grouped detail
+queries gather all members together. Alert display classifications are cached by
+alert ID and policy/version; policy changes invalidate them. Historical classification
+uses recorded paths and metadata, with no present-day filesystem reads or directory
+walks. These presentation classifications must never authorize access.
 
 ## Gensee monitoring gaps
 
@@ -58,7 +69,11 @@ permissions with expiry, project, and target; **Revoke** stops future matches.
 
 Matching requires the same provider, tool name and input (apart from the tool-call
 ID), canonical project and target, and rule. Executable and credential-content
-read approvals also require an unchanged complete file digest. Different arguments,
+read approvals also require a complete digest captured during the original policy
+inspection to match at preview, grant, and reuse. Changed content and older alerts
+without that digest require a fresh request; unavailable-content alerts cannot be
+remembered. Approval keys are versioned, so grants made before this content-binding
+fix no longer match. Different arguments,
 content, targets, providers, or projects require another decision. All ASK findings
 for a call must match before a one-use approval is consumed. Block findings,
 including strict/noninteractive enforcement floors, are never bypassed.

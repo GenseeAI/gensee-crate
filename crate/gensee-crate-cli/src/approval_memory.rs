@@ -2,14 +2,18 @@ use crate::*;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 
-fn current_unix_millis() -> io::Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(io::Error::other)?
-        .as_millis() as u64)
-}
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
+
+pub(crate) const FILE_NAME: &str = "approvals.json";
+pub(crate) const LOCK_FILE_NAME: &str = "approvals.lock";
+const TEMP_PREFIX: &str = ".approvals-";
+
+pub(crate) fn is_store_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == FILE_NAME || n == LOCK_FILE_NAME || n.starts_with(TEMP_PREFIX))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Approval {
@@ -24,6 +28,10 @@ pub(crate) struct Approval {
     pub expires_at: u64,
     pub remaining: Option<u64>,
     pub revoked: bool,
+    #[serde(default)]
+    pub content_digest: String,
+    #[serde(default)]
+    pub key_version: u32,
 }
 
 fn eligible(rule: &str) -> bool {
@@ -98,7 +106,7 @@ fn context(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<Approva
     let key = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&json!({
-            "provider":event.provider,"tool":event.tool_name,"input":input,"rule":rule,
+            "version":2,"provider":event.provider,"tool":event.tool_name,"input":input,"rule":rule,
             "project":project,"working_directory":working_directory,"path":path,"digest":digest
         }))?)
     );
@@ -114,6 +122,8 @@ fn context(event: &AgentHookEvent, rule: &str, path: &str) -> io::Result<Approva
         expires_at: 0,
         remaining: Some(1),
         revoked: false,
+        content_digest: digest,
+        key_version: 2,
     })
 }
 
@@ -137,7 +147,7 @@ fn with_records<T>(
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(root.join("approvals.lock"))?;
+        .open(root.join(LOCK_FILE_NAME))?;
     let meta = lock.metadata()?;
     if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
         return Err(io::Error::other("Unsafe approval lock permissions."));
@@ -147,7 +157,7 @@ fn with_records<T>(
             "Approval store is busy; retry the action.",
         ));
     }
-    let path = root.join("approvals.json");
+    let path = root.join(FILE_NAME);
     let mut records: Vec<Approval> = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -169,10 +179,11 @@ fn with_records<T>(
     };
     let (result, dirty) = action(&mut records)?;
     if dirty {
-        let temp = root.join(format!(".approvals-{}.tmp", uuid::Uuid::new_v4()));
+        let temp = root.join(format!("{TEMP_PREFIX}{}.tmp", uuid::Uuid::new_v4()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .mode(0o600)
             .open(&temp)?;
         let save = (|| {
@@ -194,11 +205,11 @@ fn with_records<T>(
 }
 
 fn active(a: &Approval, now: u64) -> bool {
-    !a.revoked && a.expires_at > now && a.remaining != Some(0)
+    a.key_version == 2 && !a.revoked && a.expires_at > now && a.remaining != Some(0)
 }
 
 pub(crate) fn apply(event: &AgentHookEvent, store: &EventStore, findings: &mut [PolicyFinding]) {
-    if !store.root_path().join("approvals.json").exists() {
+    if !store.root_path().join(FILE_NAME).exists() {
         return;
     }
     if findings.iter().any(|f| f.action == PolicyAction::Block) {
@@ -219,7 +230,7 @@ pub(crate) fn apply(event: &AgentHookEvent, store: &EventStore, findings: &mut [
     let Ok(candidates) = candidates else {
         return;
     };
-    let now = current_unix_millis().unwrap_or(u64::MAX);
+    let now = unix_millis().unwrap_or(u64::MAX);
     let ended = store.approval_session_has_ended(event.session_id.as_deref().unwrap_or(""));
     let Ok(ended) = ended else {
         return;
@@ -271,7 +282,7 @@ pub(crate) fn handle(args: Vec<OsString>) -> io::Result<()> {
         require_app_caller()?;
     }
     let store = EventStore::default_local()?;
-    let now = current_unix_millis()?;
+    let now = unix_millis()?;
     let value = match verb {
         "list" => {
             let ended: HashSet<_> = store
@@ -320,6 +331,7 @@ pub(crate) fn handle(args: Vec<OsString>) -> io::Result<()> {
                 captured["rule"].as_str().unwrap_or(""),
                 captured["path"].as_str().unwrap_or(""),
             )?;
+            verify_captured_digest(&approval, &captured)?;
             if verb == "preview" {
                 let mut preview = json!(approval);
                 preview["tool_input_preview"] =
@@ -362,6 +374,15 @@ pub(crate) fn handle(args: Vec<OsString>) -> io::Result<()> {
         }
     };
     println!("{value}");
+    Ok(())
+}
+
+fn verify_captured_digest(approval: &Approval, captured: &Value) -> io::Result<()> {
+    if approval.rule != "policy_write_outside_workspace"
+        && captured["approval_content_digest"].as_str() != Some(approval.content_digest.as_str())
+    {
+        return Err(io::Error::other("The file changed since the alert, or its original content was not fully inspected. Retry the action to capture a new approval request."));
+    }
     Ok(())
 }
 
@@ -419,7 +440,7 @@ mod tests {
             rule_id: "policy_unmatched_executable_modification".into(),
             message: "inspect".into(),
             path: Some(path.to_string_lossy().into_owned()),
-            evidence: json!({}),
+            evidence: json!({"approval_content_digest": content_digest(b"print('hello')\n")}),
         };
         (store, workspace, event, finding)
     }
@@ -427,7 +448,7 @@ mod tests {
         let mut approval =
             context(event, &finding.rule_id, finding.path.as_deref().unwrap()).unwrap();
         approval.scope = scope.into();
-        approval.expires_at = current_unix_millis().unwrap() + 60_000;
+        approval.expires_at = unix_millis().unwrap() + 60_000;
         approval.remaining = (scope == "once").then_some(1);
         with_records(store.root_path(), |records| {
             records.push(approval);
@@ -435,6 +456,79 @@ mod tests {
         })
         .unwrap();
     }
+    #[test]
+    fn grants_without_original_content_binding_are_inactive() {
+        let (store, _, event, finding) = fixture();
+        grant(&store, &event, &finding, "session");
+        with_records(store.root_path(), |records| {
+            records[0].key_version = 0;
+            assert!(!active(&records[0], unix_millis()?));
+            Ok(((), true))
+        })
+        .unwrap();
+        let mut findings = vec![finding];
+        apply(&event, &store, &mut findings);
+        assert_eq!(findings[0].action, PolicyAction::Ask);
+    }
+
+    #[test]
+    fn grant_rejects_changed_or_uninspected_alert_content() {
+        let (store, workspace, event, finding) = fixture();
+        store.append_hook_event_evidence_only(&event).unwrap();
+        store
+            .append_policy_alert(&finding.to_policy_alert(&event))
+            .unwrap();
+        let id = store.dashboard_state().unwrap()["alerts"][0]["alert_id"]
+            .as_i64()
+            .unwrap();
+        let captured = store.approval_context(id).unwrap();
+        let original = context(&event, &finding.rule_id, finding.path.as_deref().unwrap()).unwrap();
+        verify_captured_digest(&original, &captured).unwrap();
+        fs::write(workspace.join("run.py"), "print('changed before preview')").unwrap();
+        let changed = context(&event, &finding.rule_id, finding.path.as_deref().unwrap()).unwrap();
+        assert!(verify_captured_digest(&changed, &captured).is_err());
+        assert!(verify_captured_digest(&original, &json!({})).is_err());
+        let mut write = original;
+        write.rule = "policy_write_outside_workspace".into();
+        verify_captured_digest(&write, &json!({})).unwrap();
+    }
+
+    #[test]
+    fn remembered_approval_allowed_egress_is_accounted_once() {
+        let (store, workspace, _, _) = fixture();
+        let event = build_unattributed_hook_event(
+            &json!({
+                "session_id":"network-session", "cwd":workspace, "hook_event_name":"PreToolUse",
+                "tool_name":"Bash", "tool_use_id":"network-tool",
+                "tool_input":{"command":"curl https://example.com > /gensee-review-output.txt"}
+            })
+            .to_string(),
+            "claude-code",
+        )
+        .unwrap();
+        let intents = file_intents_from_hook(&event, event.tool_input_command.as_deref());
+        let policy = Policy::embedded_default();
+        let first = evaluate_pretool_policy_with_policy(&event, &intents, Some(&store), &policy);
+        assert_eq!(first.action, PolicyAction::Ask, "{first:?}");
+        for finding in first
+            .findings
+            .iter()
+            .filter(|f| f.action == PolicyAction::Ask)
+        {
+            grant(&store, &event, finding, "session");
+        }
+        let allowed = evaluate_pretool_policy_with_policy(&event, &intents, Some(&store), &policy);
+        assert_eq!(allowed.action, PolicyAction::Allow, "{allowed:?}");
+        assert_eq!(
+            allowed
+                .findings
+                .iter()
+                .filter(|f| f.rule_id == "policy_network_egress")
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn persisted_capture_reconstructs_the_same_approval_key() {
         let (store, _, event, finding) = fixture();
@@ -550,7 +644,7 @@ mod tests {
             .unwrap();
             if state == "permissions" {
                 fs::set_permissions(
-                    store.root_path().join("approvals.json"),
+                    store.root_path().join(FILE_NAME),
                     fs::Permissions::from_mode(0o666),
                 )
                 .unwrap();
@@ -559,8 +653,8 @@ mod tests {
             apply(&event, &store, &mut fs);
             assert_eq!(fs[0].action, PolicyAction::Ask, "{state}");
         }
-        fs::remove_file(store.root_path().join("approvals.json")).unwrap();
-        symlink("approvals.lock", store.root_path().join("approvals.json")).unwrap();
+        fs::remove_file(store.root_path().join(FILE_NAME)).unwrap();
+        symlink("approvals.lock", store.root_path().join(FILE_NAME)).unwrap();
         assert!(with_records(store.root_path(), |_| Ok(((), false))).is_err());
     }
     #[test]

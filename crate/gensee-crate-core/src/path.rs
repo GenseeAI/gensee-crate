@@ -29,27 +29,44 @@ pub fn resolve_routine_scratch_path(path: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    fn beneath_root(path: &Path) -> bool {
-        for root in ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"] {
-            if path != Path::new(root) && path.starts_with(root) {
-                return true;
-            }
-        }
-        for prefix in ["/var/folders", "/private/var/folders"] {
-            if let Ok(tail) = path.strip_prefix(prefix) {
-                let parts: Vec<_> = tail.components().collect();
-                if parts.len() > 3 && parts[2].as_os_str() == "T" {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-    if !beneath_root(input) {
+    if !is_scratch_descendant(input) {
         return None;
     }
     let resolved = resolve_concrete_path(path)?;
-    beneath_root(&resolved).then_some(resolved)
+    is_scratch_descendant(&resolved).then_some(resolved)
+}
+
+fn is_scratch_descendant(path: &Path) -> bool {
+    for root in ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"] {
+        if path != Path::new(root) && path.starts_with(root) {
+            return true;
+        }
+    }
+    for prefix in ["/var/folders", "/private/var/folders"] {
+        if let Ok(tail) = path.strip_prefix(prefix) {
+            let parts: Vec<_> = tail.components().collect();
+            if parts.len() > 3 && parts[2].as_os_str() == "T" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Lexical classification of recorded evidence only. Never use this to grant
+/// filesystem access: historical paths must not trigger present-day filesystem I/O.
+pub fn recorded_concrete_path(path: &str) -> Option<PathBuf> {
+    let input = Path::new(path);
+    (input.is_absolute()
+        && !path.contains(['*', '?', '[', ']', '{', '}'])
+        && !input
+            .components()
+            .any(|p| matches!(p, Component::ParentDir)))
+    .then(|| input.to_path_buf())
+}
+
+pub fn recorded_scratch_path(path: &str) -> Option<PathBuf> {
+    recorded_concrete_path(path).filter(|p| is_scratch_descendant(p))
 }
 
 /// Resolve a concrete absolute path, including missing leaves, without allowing

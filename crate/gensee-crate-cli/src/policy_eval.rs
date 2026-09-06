@@ -110,17 +110,15 @@ pub(crate) fn evaluate_pretool_policy_with_policy(
             let resolved = gensee_crate_core::resolve_concrete_path(&subject.path);
             let store_root =
                 gensee_crate_core::resolve_concrete_path(&store.root_path().to_string_lossy());
-            let approval_target = |p: &Path| {
-                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n == "approvals.json" || n == "approvals.lock" || n.starts_with(".approvals-")
-                })
-            };
             let protects_store =
                 resolved
                     .as_ref()
                     .zip(store_root.as_ref())
                     .is_some_and(|(p, r)| {
-                        (p.parent() == Some(r.as_path()) && approval_target(p)) || r.starts_with(p)
+                        (p.parent() == Some(r.as_path()) && approval_memory::is_store_file(p))
+                            || p == r
+                            || (matches!(subject.operation.as_str(), "delete" | "rename")
+                                && r.starts_with(p))
                     });
             if policy_subject_is_mutating(&subject.operation) && protects_store {
                 findings.push(PolicyFinding {
@@ -224,11 +222,6 @@ pub(crate) fn evaluate_pretool_policy_with_policy(
     if store.is_some() && !matches!(action, PolicyAction::Block) {
         findings.extend(sensitive_read_findings(&subjects, policy));
     }
-    if store.is_some() && matches!(action, PolicyAction::Allow) {
-        if let Some(finding) = network_egress_marker_finding(event) {
-            findings.push(finding);
-        }
-    }
     if !matches!(action, PolicyAction::Block) {
         if let Some(finding) = tclone_fork_command_finding(event, store) {
             findings.push(finding);
@@ -264,6 +257,11 @@ pub(crate) fn evaluate_pretool_policy_with_policy(
             .map(|f| f.action)
             .max()
             .unwrap_or(PolicyAction::Allow);
+    }
+    if store.is_some() && matches!(action, PolicyAction::Allow) {
+        if let Some(finding) = network_egress_marker_finding(event) {
+            findings.push(finding);
+        }
     }
     PolicyDecision { action, findings }
 }
@@ -2046,6 +2044,7 @@ pub(crate) fn credential_content_findings(subjects: &[PolicySubject]) -> Vec<Pol
                 evidence: json!({
                     "source": "credential_content",
                     "indicator": indicator,
+                    "approval_content_digest": if snapshot.truncated { None } else { Some(&snapshot.digest) },
                 }),
             });
         }

@@ -1,6 +1,7 @@
 use crate::*;
 
-/// Quiet specific runtime housekeeping, never a blanket directory allow rule.
+/// Presentation-only classification from recorded paths and sensor metadata.
+/// Never use this function to discard evidence or authorize access.
 pub(crate) fn is_routine(policy: &Policy, rule: &str, path: &str, evidence: &Value) -> bool {
     if !matches!(
         rule,
@@ -30,17 +31,10 @@ pub(crate) fn is_routine(policy: &Policy, rule: &str, path: &str, evidence: &Val
         return false;
     }
     let safe_file = |p: &str| {
-        if Path::new(p)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| {
-                n == "approvals.json" || n == "approvals.lock" || n.starts_with(".approvals-")
-            })
-        {
+        if approval_memory::is_store_file(Path::new(p)) {
             return false;
         }
-        let parent = Path::new(p).parent().and_then(Path::to_str).unwrap_or("");
-        policy.is_routine_unmatched_mutation(p, parent, "write") && !Path::new(p).is_dir()
+        gensee_crate_core::recorded_concrete_path(p).is_some() && policy.is_unprotected_path(p)
     };
     if !safe_file(path)
         || evidence
@@ -60,16 +54,10 @@ pub(crate) fn is_routine(policy: &Policy, rule: &str, path: &str, evidence: &Val
         if !safe_file(source) {
             return false;
         }
-        // A rename may move an entire tree. Only regular-file evidence qualifies.
-        if evidence
-            .pointer("/file/mode")
-            .and_then(Value::as_u64)
-            .is_none_or(|m| m & 0o170000 != 0o100000)
-        {
-            return false;
-        }
-        if gensee_crate_core::resolve_routine_scratch_path(path).is_some()
-            && gensee_crate_core::resolve_routine_scratch_path(source).is_some()
+        if !policy.is_executable_artifact_path(path)
+            && !policy.is_executable_artifact_path(source)
+            && gensee_crate_core::recorded_scratch_path(path).is_some()
+            && gensee_crate_core::recorded_scratch_path(source).is_some()
         {
             return true;
         }
@@ -84,8 +72,8 @@ pub(crate) fn is_routine(policy: &Policy, rule: &str, path: &str, evidence: &Val
         return false;
     }
     let within = |p: &str, root: &str| {
-        gensee_crate_core::resolve_concrete_path(p)
-            .zip(gensee_crate_core::resolve_concrete_path(root))
+        gensee_crate_core::recorded_concrete_path(p)
+            .zip(gensee_crate_core::recorded_concrete_path(root))
             .is_some_and(|(p, r)| p != r && p.starts_with(r))
     };
     let both_within =
@@ -192,6 +180,28 @@ mod tests {
         e["decision"] = json!({"result":"deny"});
         assert!(!is_routine(&policy, "hook_bypass_file_mutation", &to, &e));
     }
+    #[test]
+    fn scratch_executable_staging_is_never_quieted() {
+        let policy = Policy::embedded_default();
+        for (source, destination) in [
+            ("/private/tmp/payload.tmp", "/private/tmp/tools/setup.py"),
+            ("/private/tmp/setup.sh", "/private/tmp/output.tmp"),
+        ] {
+            assert!(!is_routine(
+                &policy,
+                "hook_bypass_file_mutation",
+                destination,
+                &evidence("rename", source)
+            ));
+            assert!(!is_routine(
+                &policy,
+                "policy_destructive_file_operation",
+                destination,
+                &evidence("rename", source)
+            ));
+        }
+    }
+
     #[test]
     fn claude_logs_need_expected_signed_actor_and_narrow_location() {
         let p = Policy::load_current();

@@ -331,50 +331,105 @@ impl EventStore {
     where
         F: Fn(&str, &str, &str, &str, &str) -> bool + Send + std::panic::UnwindSafe + 'static,
     {
-        let candidates: std::collections::HashSet<String> =
-            candidate_rules.iter().map(|r| (*r).to_string()).collect();
-        self.sqlite_store()?
-            .connection()
-            .create_scalar_function(
-                "gensee_dashboard_alert_is_routine_candidate",
-                1,
-                FunctionFlags::SQLITE_UTF8,
-                move |context| Ok(candidates.contains(&context.get::<String>(0)?)),
-            )
-            .map_err(sqlite_error_from_rusqlite)?;
-        let cache = Mutex::new(HashMap::new());
-        self.sqlite_store()?
-            .connection()
-            .create_scalar_function(
-                "gensee_dashboard_alert_is_routine",
-                5,
-                FunctionFlags::SQLITE_UTF8,
-                move |context| {
-                    let rule = context.get::<String>(0)?;
-                    let path = context.get::<String>(1)?;
-                    let workspace = context.get::<String>(2)?;
-                    let operation = context.get::<String>(3)?;
-                    let evidence = context.get::<String>(4)?;
-                    let mut cache = cache
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if cache.len() >= 8192 {
-                        cache.clear();
-                    }
-                    Ok(*cache
-                        .entry((
-                            rule.clone(),
-                            path.clone(),
-                            workspace.clone(),
-                            operation.clone(),
-                            evidence.clone(),
+        self.set_dashboard_noise_filter_versioned(
+            candidate_rules,
+            &format!(
+                "unversioned:{}:{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+            ),
+            is_noise,
+        )
+    }
+
+    /// Cache immutable alert classifications across CLI processes. Callers must
+    /// provide a policy/version key and a classifier that performs no disk I/O.
+    pub fn set_dashboard_noise_filter_versioned<F>(
+        &self,
+        candidate_rules: &[&str],
+        policy_key: &str,
+        is_noise: F,
+    ) -> io::Result<()>
+    where
+        F: Fn(&str, &str, &str, &str, &str) -> bool + Send + std::panic::UnwindSafe + 'static,
+    {
+        let db = self.sqlite_store()?;
+        let conn = db.connection();
+        let mut routine = HashSet::new();
+        if !candidate_rules.is_empty() {
+            let rules = serde_json::to_string(candidate_rules).map_err(io::Error::other)?;
+            let mut cursor = 0_i64;
+            loop {
+                let mut query = conn.prepare("SELECT a.alert_id, a.rule_id, COALESCE(a.path, ''),
+                    COALESCE(json_extract(a.evidence, '$.attribution.workspace_root'), ''),
+                    COALESCE(json_extract(a.evidence, '$.logical_operation'), ''), COALESCE(a.evidence, '{}')
+                    FROM alerts a
+                    WHERE a.alert_id > ?1 AND a.rule_id IN (SELECT value FROM json_each(?2))
+                      AND lower(a.action) NOT IN ('deny', 'block')
+                      AND NOT EXISTS (SELECT 1 FROM dashboard_alert_classification c WHERE c.alert_id = a.alert_id AND c.policy_key = ?3)
+                    ORDER BY a.alert_id LIMIT 2048").map_err(sqlite_error_from_rusqlite)?;
+                let rows = query
+                    .query_map(rusqlite::params![cursor, rules, policy_key], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
                         ))
-                        .or_insert_with(|| {
-                            is_noise(&rule, &path, &workspace, &operation, &evidence)
-                        }))
-                },
-            )
-            .map_err(sqlite_error_from_rusqlite)
+                    })
+                    .map_err(sqlite_error_from_rusqlite)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sqlite_error_from_rusqlite)?;
+                if rows.is_empty() {
+                    break;
+                }
+                cursor = rows.last().unwrap().0;
+                let classified: Vec<_> = rows
+                    .into_iter()
+                    .map(|(id, rule, path, workspace, operation, evidence)| {
+                        (
+                            id,
+                            is_noise(&rule, &path, &workspace, &operation, &evidence),
+                        )
+                    })
+                    .collect();
+                conn.execute_batch("SAVEPOINT alert_classification")
+                    .map_err(sqlite_error_from_rusqlite)?;
+                let saved = (|| -> rusqlite::Result<()> {
+                    let mut insert = conn.prepare_cached("INSERT INTO dashboard_alert_classification VALUES (?1, ?2, ?3)
+                        ON CONFLICT(alert_id) DO UPDATE SET policy_key = excluded.policy_key, routine = excluded.routine")?;
+                    for (id, value) in classified {
+                        insert.execute(rusqlite::params![id, policy_key, value])?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = saved {
+                    let _ = conn.execute_batch(
+                        "ROLLBACK TO alert_classification; RELEASE alert_classification",
+                    );
+                    return Err(sqlite_error_from_rusqlite(error));
+                }
+                conn.execute_batch("RELEASE alert_classification")
+                    .map_err(sqlite_error_from_rusqlite)?;
+            }
+            let mut query = conn.prepare("SELECT alert_id FROM dashboard_alert_classification WHERE policy_key = ?1 AND routine = 1")
+                .map_err(sqlite_error_from_rusqlite)?;
+            for id in query
+                .query_map([policy_key], |r| r.get::<_, i64>(0))
+                .map_err(sqlite_error_from_rusqlite)?
+            {
+                routine.insert(id.map_err(sqlite_error_from_rusqlite)?);
+            }
+        }
+        conn.create_scalar_function(
+            "gensee_dashboard_alert_is_routine",
+            1,
+            FunctionFlags::SQLITE_UTF8,
+            move |context| Ok(routine.contains(&context.get::<i64>(0)?)),
+        )
+        .map_err(sqlite_error_from_rusqlite)
     }
 
     /// Open a distinct SQLite connection to the same event-store root. Long-running
@@ -731,18 +786,19 @@ impl EventStore {
 
     /// Approval UI requires the exact captured PreToolUse input, never a display summary.
     pub fn approval_context(&self, alert_id: i64) -> io::Result<Value> {
-        let (rule, path, provider, session, tool_id, timestamp): (
+        let (rule, path, provider, session, tool_id, timestamp, digest): (
             String,
             String,
             String,
             String,
             String,
             i64,
+            Option<String>,
         ) = {
             let db = self.sqlite_store()?;
             db.connection()
                 .query_row(
-                    "SELECT a.rule_id, a.path, ae.source, r.session_id, ae.tool_use_id, ae.ts
+                    "SELECT a.rule_id, a.path, ae.source, r.session_id, ae.tool_use_id, ae.ts, json_extract(a.evidence, '$.approval_content_digest')
                  FROM alerts a JOIN requests r ON r.request_id = a.request_id
                  JOIN agent_events ae ON ae.request_id = a.request_id
                    AND ae.tool_use_id = json_extract(a.evidence, '$.tool_use_id')
@@ -758,6 +814,7 @@ impl EventStore {
                             r.get(3)?,
                             r.get(4)?,
                             r.get(5)?,
+                            r.get(6)?,
                         ))
                     },
                 )
@@ -809,7 +866,9 @@ impl EventStore {
             }
         }
         let payload = payload.ok_or_else(|| io::Error::other("The original tool input is no longer available for approval. Retry the action in your harness."))?;
-        Ok(json!({"rule":rule,"path":path,"provider":provider,"payload":payload}))
+        Ok(
+            json!({"rule":rule,"path":path,"provider":provider,"payload":payload,"approval_content_digest":digest}),
+        )
     }
 
     pub fn has_recent_file_intent(&self, path: &str, observed_at_ms: u64) -> io::Result<bool> {
@@ -1624,54 +1683,13 @@ impl EventStore {
         };
         let root = groups.root(request_id);
         let mut result = self.dashboard_request_ungrouped(root)?;
-        result["request"]["original_user_prompt"] =
-            json!(groups.prompts.get(&root).cloned().flatten());
-        for child in groups.children(root) {
-            let extra = self.dashboard_request_ungrouped(child)?;
-            for key in ["agentEvents", "alerts"] {
-                if let Some(rows) = extra[key].as_array() {
-                    result[key]
-                        .as_array_mut()
-                        .unwrap()
-                        .extend(rows.iter().cloned());
-                }
-            }
-            for key in ["file_touches", "ignored_file_touch_paths"] {
-                if let Some(rows) = extra["request"][key].as_array() {
-                    let target = result["request"][key].as_array_mut().unwrap();
-                    for row in rows {
-                        if !target.contains(row) {
-                            target.push(row.clone());
-                        }
-                    }
-                }
-            }
-            result["rawAlertCount"] = json!(
-                result["rawAlertCount"].as_i64().unwrap_or(0)
-                    + extra["rawAlertCount"].as_i64().unwrap_or(0)
-            );
-            result["request"]["ignored_file_touch_events_omitted"] = json!(
-                result["request"]["ignored_file_touch_events_omitted"]
-                    .as_i64()
-                    .unwrap_or(0)
-                    + extra["request"]["ignored_file_touch_events_omitted"]
-                        .as_i64()
-                        .unwrap_or(0)
-            );
-            result["request"]["ignored_file_touch_paths_truncated"] = json!(
-                result["request"]["ignored_file_touch_paths_truncated"]
-                    .as_bool()
-                    .unwrap_or(false)
-                    || extra["request"]["ignored_file_touch_paths_truncated"]
-                        .as_bool()
-                        .unwrap_or(false)
-            );
-            if extra["request"]["completed_at"].as_i64()
-                > result["request"]["completed_at"].as_i64()
-            {
-                result["request"]["completed_at"] = extra["request"]["completed_at"].clone();
-            }
-        }
+        result["request"]["original_user_prompt"] = json!(groups
+            .prompts
+            .get(&root)
+            .cloned()
+            .unwrap_or_else(|| dashboard_request_prompt(
+                result["request"]["original_user_prompt"].as_str()
+            )));
         for key in ["agentEvents", "alerts"] {
             let rows = result[key].as_array_mut().unwrap();
             groups.project_events(rows);
@@ -1697,7 +1715,7 @@ impl EventStore {
 
         let mut request = conn
             .query_row(
-                "SELECT request_id, session_id, substr(original_user_prompt, 1, 16384), created_at, completed_at
+                "SELECT request_id, session_id, substr(original_user_prompt, 1, 16384), created_at, (SELECT MAX(completed_at) FROM requests WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1))
                  FROM requests
                  WHERE request_id = ?1",
                 [request_id],
@@ -1737,7 +1755,7 @@ impl EventStore {
             "SELECT event_id, pid, request_id, ts, source, type, cwd,
                     permission_mode, tool_name, tool_input, tool_response, tool_use_id
              FROM agent_events
-             WHERE request_id = ?1
+             WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
              ORDER BY ts, event_id",
             request_id,
             |row| {
@@ -4031,7 +4049,7 @@ fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::R
                       AND declared_relation.dst_id = artifacts.artifact_id
                       AND declared_relation.relation_type IN
                           ('produced', 'modified', 'deleted')
-                      AND declaring_event.request_id = ?1
+                      AND declaring_event.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
                 ) AS intended_and_verified,
                 MAX(system_events.ts) AS last_observed_at,
                 artifact_facts.risk_level,
@@ -4048,12 +4066,12 @@ fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::R
           AND observed_relation.relation_type IN ('wrote', 'modified', 'deleted')
          JOIN system_events
            ON system_events.event_id = observed_relation.src_id
-          AND system_events.request_id = ?1
+          AND system_events.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
           AND system_events.source = 'macos-endpoint-security'
          LEFT JOIN artifact_facts
            ON artifact_facts.current_artifact_id = artifacts.artifact_id
          WHERE request_relation.src_kind = 'request'
-           AND request_relation.src_id = ?1
+           AND request_relation.src_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
            AND request_relation.dst_kind = 'artifact'
            AND request_relation.relation_type IN ('produced', 'modified', 'deleted')
          GROUP BY artifacts.artifact_id, artifacts.uri
@@ -4098,7 +4116,7 @@ fn dashboard_completed_native_file_touches(
              ON completed.request_id = started.request_id
             AND completed.type = 'PostToolUse'
             AND completed.tool_use_id = started.tool_use_id
-           WHERE started.request_id = ?1
+           WHERE started.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
              AND started.type = 'PreToolUse'
              AND json_valid(started.tool_input)
          ),
@@ -4115,7 +4133,7 @@ fn dashboard_completed_native_file_touches(
              ON started.request_id = intent.request_id
             AND started.type = 'PreToolUse'
             AND started.tool_use_id = intent.tool_use_id
-           WHERE intent.request_id = ?1
+           WHERE intent.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
              AND intent.type = 'file_intent'
              AND json_valid(intent.tool_input)
          ),
@@ -4448,7 +4466,7 @@ fn dashboard_ignored_file_touch_paths_with_limits(
     let total_event_count = conn
         .query_row(
             "SELECT COUNT(*) FROM system_events
-             WHERE request_id = ?1 AND source = 'macos-endpoint-security'",
+             WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1) AND source = 'macos-endpoint-security'",
             [request_id],
             |row| row.get::<_, i64>(0),
         )
@@ -4462,7 +4480,7 @@ fn dashboard_ignored_file_touch_paths_with_limits(
         .prepare(
             "SELECT pid, ts, source, type, args
              FROM system_events
-             WHERE request_id = ?1 AND source = 'macos-endpoint-security'
+             WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1) AND source = 'macos-endpoint-security'
              ORDER BY ts, event_id
              LIMIT ?2",
         )
@@ -4825,24 +4843,11 @@ fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
     let lower_path = format!("lower({path})");
     format!(
         "{alias}.rule_id != 'endpoint_security_event_gap'
-         AND NOT (lower({alias}.action) NOT IN ('deny', 'block') AND {alias}.rule_id = 'unmatched_system_effect'
+         AND NOT (lower({alias}.action) NOT IN ('deny', 'block') AND COALESCE(json_extract({alias}.evidence, '$.decision.result'), '') != 'deny' AND {alias}.rule_id = 'unmatched_system_effect'
               AND {alias}.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-         AND NOT (lower({alias}.action) NOT IN ('deny', 'block')
-                  AND CASE WHEN gensee_dashboard_alert_is_routine_candidate({alias}.rule_id)
-                    THEN gensee_dashboard_alert_is_routine({alias}.rule_id, {path},
-                    COALESCE(json_extract({alias}.evidence, '$.attribution.workspace_root'), ''),
-                    COALESCE(json_extract({alias}.evidence, '$.logical_operation'), ''), json_object(
-                      'logical_operation', json_extract({alias}.evidence, '$.logical_operation'),
-                      'actor', json_object('executable_path', json_extract({alias}.evidence, '$.actor.executable_path'),
-                        'signing_id', json_extract({alias}.evidence, '$.actor.signing_id'),
-                        'team_id', json_extract({alias}.evidence, '$.actor.team_id'),
-                        'platform_binary', json_extract({alias}.evidence, '$.actor.platform_binary')),
-                      'file', json_object('path', json_extract({alias}.evidence, '$.file.path'),
-                        'mode', json_extract({alias}.evidence, '$.file.mode'),
-                        'path_truncated', json_extract({alias}.evidence, '$.file.path_truncated')),
-                      'destination', json_object('path_truncated', json_extract({alias}.evidence, '$.destination.path_truncated')))
-) ELSE 0 END)
-         AND NOT (lower({alias}.action) NOT IN ('deny', 'block') AND {alias}.rule_id = 'hook_bypass_file_mutation' AND (
+         AND NOT (lower({alias}.action) NOT IN ('deny', 'block') AND COALESCE(json_extract({alias}.evidence, '$.decision.result'), '') != 'deny'
+                  AND gensee_dashboard_alert_is_routine({alias}.alert_id))
+         AND NOT (lower({alias}.action) NOT IN ('deny', 'block') AND COALESCE(json_extract({alias}.evidence, '$.decision.result'), '') != 'deny' AND {alias}.rule_id = 'hook_bypass_file_mutation' AND (
               {path} GLOB '/dev/*'
               OR {lower_path} LIKE '%/library/application support/codex/%'
               OR {lower_path} LIKE '%/library/application support/claude/%'
@@ -4860,7 +4865,7 @@ fn dashboard_visible_alerts_cte() -> String {
 }
 
 fn dashboard_visible_alerts_cte_for_request() -> String {
-    dashboard_visible_alerts_cte_with_scope(Some("AND alerts.request_id = ?1"))
+    dashboard_visible_alerts_cte_with_scope(Some("AND alerts.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)"))
 }
 
 fn dashboard_visible_alerts_cte_with_scope(request_scope: Option<&str>) -> String {
@@ -5010,7 +5015,7 @@ fn dashboard_alerts_from_relation(
         raw_event_count_expression,
     } = query;
     let where_clause = request_id
-        .map(|_| "WHERE alerts.request_id = ?1")
+        .map(|_| "WHERE alerts.request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)")
         .unwrap_or_default();
     let limit_clause = limit
         .map(|value| format!("LIMIT {value}"))
@@ -5135,85 +5140,97 @@ fn enrich_dashboard_alert_context(
 ) -> io::Result<()> {
     let mut statement = conn
         .prepare(
-            "SELECT event_id, ts, source, type, tool_name, tool_input, tool_use_id
+            "SELECT event_id, ts, source, type, tool_name, tool_input, tool_use_id, request_id
              FROM agent_events
-             WHERE request_id = ?1
+             WHERE request_id IN (SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1)
              ORDER BY ts, event_id",
         )
         .map_err(sqlite_error_from_rusqlite)?;
     let rows = statement
         .query_map([request_id], |row| {
-            Ok(DashboardAgentEventContext {
-                event_id: row.get(0)?,
-                ts: row.get(1)?,
-                source: row.get(2)?,
-                event_type: row.get(3)?,
-                tool_name: row.get(4)?,
-                tool_input: row.get(5)?,
-                tool_use_id: row.get(6)?,
-            })
+            Ok((
+                row.get::<_, i64>(7)?,
+                DashboardAgentEventContext {
+                    event_id: row.get(0)?,
+                    ts: row.get(1)?,
+                    source: row.get(2)?,
+                    event_type: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    tool_input: row.get(5)?,
+                    tool_use_id: row.get(6)?,
+                },
+            ))
         })
         .map_err(sqlite_error_from_rusqlite)?;
     let events = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(sqlite_error_from_rusqlite)?;
-    let pre_tool_events = events
-        .iter()
-        .filter(|event| event.event_type == "PreToolUse")
-        .cloned()
-        .collect::<Vec<_>>();
-    let by_id = events
-        .iter()
-        .map(|event| (event.event_id, event.clone()))
-        .collect::<HashMap<_, _>>();
-    let mut by_tool_use_id = HashMap::<String, DashboardAgentEventContext>::new();
-    for event in &events {
-        let Some(tool_use_id) = event.tool_use_id.as_ref() else {
-            continue;
-        };
-        let replace = by_tool_use_id.get(tool_use_id).is_none_or(|existing| {
-            let event_is_pre = event.event_type == "PreToolUse";
-            let existing_is_pre = existing.event_type == "PreToolUse";
-            (event_is_pre, event.ts, event.event_id)
-                > (existing_is_pre, existing.ts, existing.event_id)
-        });
-        if replace {
-            by_tool_use_id.insert(tool_use_id.clone(), event.clone());
-        }
+    let mut events_by_request: HashMap<i64, Vec<DashboardAgentEventContext>> = HashMap::new();
+    for (id, event) in events {
+        events_by_request.entry(id).or_default().push(event);
     }
-
-    for alert in alerts {
-        let created_at = alert["created_at"].as_i64().unwrap_or(i64::MAX);
-        let entity_event = (alert["entity_kind"].as_str() == Some("agent_event"))
-            .then(|| alert["entity_id"].as_i64())
-            .flatten()
-            .and_then(|event_id| by_id.get(&event_id));
-        let evidence_tool_use_id = alert["evidence"]
-            .as_str()
-            .and_then(|evidence| serde_json::from_str::<Value>(evidence).ok())
-            .and_then(|evidence| {
-                evidence
-                    .get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
+    for (source_request, events) in events_by_request {
+        let pre_tool_events = events
+            .iter()
+            .filter(|event| event.event_type == "PreToolUse")
+            .cloned()
+            .collect::<Vec<_>>();
+        let by_id = events
+            .iter()
+            .map(|event| (event.event_id, event.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut by_tool_use_id = HashMap::<String, DashboardAgentEventContext>::new();
+        for event in &events {
+            let Some(tool_use_id) = event.tool_use_id.as_ref() else {
+                continue;
+            };
+            let replace = by_tool_use_id.get(tool_use_id).is_none_or(|existing| {
+                let event_is_pre = event.event_type == "PreToolUse";
+                let existing_is_pre = existing.event_type == "PreToolUse";
+                (event_is_pre, event.ts, event.event_id)
+                    > (existing_is_pre, existing.ts, existing.event_id)
             });
-        let tool_event = evidence_tool_use_id
-            .as_ref()
-            .and_then(|tool_use_id| by_tool_use_id.get(tool_use_id));
-        let latest_pre_tool = latest_dashboard_event_at_or_before(&pre_tool_events, created_at);
-        let latest_event = latest_dashboard_event_at_or_before(&events, created_at);
-        let Some(context) = entity_event
-            .or(tool_event)
-            .or(latest_pre_tool)
-            .or(latest_event)
-        else {
-            continue;
-        };
-        alert["event_source"] = json!(context.source);
-        alert["event_type"] = json!(context.event_type);
-        alert["tool_name"] = json!(context.tool_name);
-        alert["tool_input"] = json!(context.tool_input);
-        alert["tool_use_id"] = json!(context.tool_use_id);
+            if replace {
+                by_tool_use_id.insert(tool_use_id.clone(), event.clone());
+            }
+        }
+
+        for alert in alerts
+            .iter_mut()
+            .filter(|a| a["request_id"].as_i64() == Some(source_request))
+        {
+            let created_at = alert["created_at"].as_i64().unwrap_or(i64::MAX);
+            let entity_event = (alert["entity_kind"].as_str() == Some("agent_event"))
+                .then(|| alert["entity_id"].as_i64())
+                .flatten()
+                .and_then(|event_id| by_id.get(&event_id));
+            let evidence_tool_use_id = alert["evidence"]
+                .as_str()
+                .and_then(|evidence| serde_json::from_str::<Value>(evidence).ok())
+                .and_then(|evidence| {
+                    evidence
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+            let tool_event = evidence_tool_use_id
+                .as_ref()
+                .and_then(|tool_use_id| by_tool_use_id.get(tool_use_id));
+            let latest_pre_tool = latest_dashboard_event_at_or_before(&pre_tool_events, created_at);
+            let latest_event = latest_dashboard_event_at_or_before(&events, created_at);
+            let Some(context) = entity_event
+                .or(tool_event)
+                .or(latest_pre_tool)
+                .or(latest_event)
+            else {
+                continue;
+            };
+            alert["event_source"] = json!(context.source);
+            alert["event_type"] = json!(context.event_type);
+            alert["tool_name"] = json!(context.tool_name);
+            alert["tool_input"] = json!(context.tool_input);
+            alert["tool_use_id"] = json!(context.tool_use_id);
+        }
     }
     Ok(())
 }
@@ -5569,7 +5586,10 @@ fn notification_origin_request(
         };
         let parent = conn
             .query_row(
-                "SELECT r.request_id, r.original_user_prompt, r.created_at
+                "SELECT r.request_id,
+                CASE WHEN r.original_user_prompt = 'Background activity'
+                    THEN COALESCE(json_extract(r.events, '$.prompt'), r.original_user_prompt)
+                    ELSE r.original_user_prompt END, r.created_at
              FROM agent_events ae JOIN requests r ON r.request_id = ae.request_id
              WHERE r.session_id = ?1 AND ae.tool_use_id = ?2
                AND ae.source = 'claude-code' AND ae.ts <= ?3 AND r.request_id < ?4
@@ -5603,54 +5623,118 @@ fn notification_origin_request(
 /// retain their original IDs, including the fields covered by the alert chain.
 struct DashboardRequestGroups {
     aliases: HashMap<i64, i64>,
+    children_by_root: HashMap<i64, Vec<i64>>,
     prompts: HashMap<i64, Option<String>>,
 }
 
 impl DashboardRequestGroups {
     fn load(conn: &rusqlite::Connection) -> io::Result<Self> {
-        let rows = query_json_rows(
-            conn,
-            "SELECT request_id, session_id,
-                substr(CASE WHEN original_user_prompt = 'Background activity'
-                    THEN COALESCE(json_extract(events, '$.prompt'), original_user_prompt)
-                    ELSE original_user_prompt END, 1, 16384), created_at
-             FROM requests ORDER BY request_id",
-            |r| {
-                Ok(json!([
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, Option<i64>>(3)?
-                ]))
-            },
-        )?;
-        let mut groups = Self {
-            aliases: HashMap::new(),
-            prompts: HashMap::new(),
-        };
-        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS dashboard_request_groups(source_id INTEGER PRIMARY KEY, request_id INTEGER NOT NULL); DELETE FROM dashboard_request_groups;")
-            .map_err(sqlite_error_from_rusqlite)?;
-        for row in rows {
-            let id = row[0].as_i64().unwrap();
-            let prompt = row[2].as_str();
-            groups.prompts.insert(id, dashboard_request_prompt(prompt));
-            if let Some(text) = prompt.filter(|p| is_task_notification(p)) {
-                if let Some(origin) = notification_origin_request(
-                    conn,
-                    row[1].as_str().unwrap(),
-                    text,
-                    row[3].as_i64().unwrap_or(i64::MAX),
-                    id,
-                )? {
-                    let root = groups.root(origin);
-                    groups.aliases.insert(id, root);
-                    conn.execute(
-                        "INSERT INTO dashboard_request_groups VALUES (?1, ?2)",
-                        [id, root],
-                    )
-                    .map_err(sqlite_error_from_rusqlite)?;
+        // Process immutable historical rows once, in bounded batches. Persist
+        // progress with each batch so another short-lived CLI resumes the scan.
+        loop {
+            let cursor = conn.query_row(
+                "SELECT cursor FROM dashboard_projection_progress WHERE name = 'request-groups-v2'",
+                [], |r| r.get::<_, i64>(0)
+            ).optional().map_err(sqlite_error_from_rusqlite)?.unwrap_or(0);
+            let rows = query_json_rows(
+                conn,
+                &format!(
+                    "SELECT request_id, session_id,
+                    substr(CASE WHEN original_user_prompt = 'Background activity'
+                        THEN COALESCE(json_extract(events, '$.prompt'), original_user_prompt)
+                        ELSE original_user_prompt END, 1, 16384), created_at
+                    FROM requests WHERE request_id > {cursor} ORDER BY request_id LIMIT 2048"
+                ),
+                |r| {
+                    Ok(json!([
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<i64>>(3)?
+                    ]))
+                },
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut links = Vec::new();
+            for row in &rows {
+                let id = row[0].as_i64().unwrap();
+                if let Some(text) = row[2].as_str().filter(|p| is_task_notification(p)) {
+                    if let Some(origin) = notification_origin_request(
+                        conn,
+                        row[1].as_str().unwrap(),
+                        text,
+                        row[3].as_i64().unwrap_or(i64::MAX),
+                        id,
+                    )? {
+                        links.push((id, origin));
+                    }
                 }
             }
+            conn.execute_batch("SAVEPOINT request_group_backfill")
+                .map_err(sqlite_error_from_rusqlite)?;
+            let saved = (|| -> rusqlite::Result<()> {
+                for (id, origin) in links {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO dashboard_request_groups VALUES (?1,
+                            COALESCE((SELECT request_id FROM dashboard_request_groups WHERE source_id = ?2), ?2))",
+                        [id, origin],
+                    )?;
+                }
+                conn.execute(
+                    "INSERT INTO dashboard_projection_progress VALUES ('request-groups-v2', ?1)
+                    ON CONFLICT(name) DO UPDATE SET cursor = MAX(cursor, excluded.cursor)",
+                    [rows.last().unwrap()[0].as_i64().unwrap()],
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = saved {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO request_group_backfill; RELEASE request_group_backfill",
+                );
+                return Err(sqlite_error_from_rusqlite(error));
+            }
+            conn.execute_batch("RELEASE request_group_backfill")
+                .map_err(sqlite_error_from_rusqlite)?;
+        }
+        let mut groups = Self {
+            aliases: HashMap::new(),
+            children_by_root: HashMap::new(),
+            prompts: HashMap::new(),
+        };
+        let mut query = conn
+            .prepare("SELECT source_id, request_id FROM dashboard_request_groups")
+            .map_err(sqlite_error_from_rusqlite)?;
+        for row in query
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(sqlite_error_from_rusqlite)?
+        {
+            let (source, root) = row.map_err(sqlite_error_from_rusqlite)?;
+            groups.aliases.insert(source, root);
+            groups
+                .children_by_root
+                .entry(root)
+                .or_default()
+                .push(source);
+        }
+        let mut query = conn
+            .prepare(
+                "SELECT r.request_id, substr(r.original_user_prompt, 1, 16384)
+            FROM requests r JOIN (SELECT DISTINCT request_id FROM dashboard_request_groups) g
+                ON g.request_id = r.request_id",
+            )
+            .map_err(sqlite_error_from_rusqlite)?;
+        for row in query
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .map_err(sqlite_error_from_rusqlite)?
+        {
+            let (root, prompt) = row.map_err(sqlite_error_from_rusqlite)?;
+            groups
+                .prompts
+                .insert(root, dashboard_request_prompt(prompt.as_deref()));
         }
         Ok(groups)
     }
@@ -5660,11 +5744,11 @@ impl DashboardRequestGroups {
     }
 
     fn children(&self, root: i64) -> Vec<i64> {
-        let mut children: Vec<_> = self
-            .aliases
-            .iter()
-            .filter_map(|(&child, &parent)| (parent == root).then_some(child))
-            .collect();
+        let mut children = self
+            .children_by_root
+            .get(&root)
+            .cloned()
+            .unwrap_or_default();
         children.sort_unstable();
         children
     }
@@ -5681,7 +5765,10 @@ impl DashboardRequestGroups {
                     .get("original_user_prompt")
                     .is_some_and(|value| !value.is_null())
                 {
-                    row["original_user_prompt"] = json!(self.prompts.get(&root).cloned().flatten());
+                    row["original_user_prompt"] =
+                        json!(self.prompts.get(&root).cloned().unwrap_or_else(|| {
+                            dashboard_request_prompt(row["original_user_prompt"].as_str())
+                        }));
                 }
             }
         }
@@ -5748,7 +5835,11 @@ impl DashboardRequestGroups {
         let mut result: Vec<_> = merged.into_values().collect();
         for row in &mut result {
             let id = row["request_id"].as_i64().unwrap();
-            row["original_user_prompt"] = json!(self.prompts.get(&id).cloned().flatten());
+            row["original_user_prompt"] = json!(self
+                .prompts
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| dashboard_request_prompt(row["original_user_prompt"].as_str())));
         }
         result.sort_by_key(|r| {
             std::cmp::Reverse((
@@ -7566,6 +7657,11 @@ mod tests {
                 104,
             ))
             .unwrap();
+        // An earlier UI version retained the notification only in events.
+        {
+            let db = store.sqlite_store().unwrap();
+            db.connection().execute("UPDATE requests SET events = json_object('prompt', original_user_prompt), original_user_prompt = 'Background activity' WHERE request_id = ?1", [first]).unwrap();
+        }
         let nested = legacy("launch-b", 105);
         store
             .append_hook_event_evidence_only(&native_tool_event(
@@ -7615,6 +7711,11 @@ mod tests {
             before[0].request_id
         );
         assert_eq!(store.verify_alert_chain().unwrap(), chain);
+        let reopened = EventStore::new(&dir).unwrap();
+        assert_eq!(
+            reopened.dashboard_request(nested).unwrap()["request"]["request_id"],
+            1
+        );
         // Future completions can also follow a launch stored under a legacy notification.
         let db = store.sqlite_store().unwrap();
         let text = "<task-notification><task-id>job</task-id><tool-use-id>launch-b</tool-use-id><status>completed</status></task-notification>";
@@ -8904,6 +9005,74 @@ mod tests {
         assert!(dashboard["summary"].get("system_events_count").is_none());
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn historical_classification_cache_survives_reopen_and_invalidates_on_policy_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-classification-cache-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let alert = PolicyAlert {
+            session_id: Some("cache-session".into()),
+            tool_use_id: None,
+            severity: "medium".into(),
+            action: "warn".into(),
+            rule_id: "hook_bypass_file_mutation".into(),
+            message: "test".into(),
+            path: Some("/dead-mount/file.txt".into()),
+            evidence: Some(json!({"decision":{"result":"allow"}, "custom_evidence":"preserved"})),
+            observed_at_ms: 1,
+        };
+        store.append_policy_alert(&alert).unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        store
+            .set_dashboard_noise_filter_versioned(
+                &["hook_bypass_file_mutation"],
+                "policy-a",
+                move |_, _, _, _, evidence| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let evidence: Value = serde_json::from_str(evidence).unwrap();
+                    assert_eq!(evidence["decision"]["result"], "allow");
+                    assert_eq!(evidence["custom_evidence"], "preserved");
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let chain = store.verify_alert_chain().unwrap();
+        drop(store);
+        let reopened = EventStore::new(&dir).unwrap();
+        reopened
+            .set_dashboard_noise_filter_versioned(
+                &["hook_bypass_file_mutation"],
+                "policy-a",
+                |_, _, _, _, _| panic!("cached evidence must not be reclassified"),
+            )
+            .unwrap();
+        assert!(reopened.dashboard_state().unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        reopened
+            .set_dashboard_noise_filter_versioned(
+                &["hook_bypass_file_mutation"],
+                "policy-b",
+                |_, _, _, _, _| false,
+            )
+            .unwrap();
+        assert_eq!(
+            reopened.dashboard_state().unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(reopened.verify_alert_chain().unwrap(), chain);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

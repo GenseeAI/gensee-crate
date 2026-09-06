@@ -209,7 +209,11 @@ pub(crate) fn preexec_findings_for_path(
         ));
     }
     let _ = record_artifact_snapshot_and_tags(event, store, path, &snapshot, &content_findings);
-
+    if !snapshot.truncated {
+        for finding in &mut findings {
+            finding.evidence["approval_content_digest"] = json!(snapshot.digest);
+        }
+    }
     findings
 }
 
