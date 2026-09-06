@@ -148,6 +148,37 @@ static void TestReassignedPIDsTakePrecedenceOverRestoration(void)
     }
 }
 
+static void TestWholeSessionValidationPrecedesPIDMerge(void)
+{
+    // Every ordering of the same three entries must preserve the valid new
+    // session's claim, even though the old helper entry is valid on its own.
+    NSArray *entries = @[NamedCoworkRoot(@700, @700, @"new"),
+                         NamedCoworkRoot(@501, @700, @"new"), CoworkRoot(@501)];
+    for (NSUInteger first = 0; first < 3; first++) {
+        for (NSUInteger second = 0; second < 3; second++) {
+            if (second == first) continue;
+            NSUInteger third = 3 - first - second;
+            GenseeSensorService *service = [[GenseeSensorService alloc] init];
+            NSCAssert(Configure(service, @[CoworkRoot(@500), CoworkRoot(@501)]), @"initial scope");
+            es_process_t helper = CoworkProcess(501, "com.anthropic.claudefordesktop.helper.Renderer", "Q6L2SF6YDW");
+            NSCAssert([[service sessionForProcessLocked:&helper messageVersion:4] isEqual:@"cowork"], @"cache prior owner");
+            NSCAssert(Configure(service, @[entries[first], entries[second], entries[third]]), @"mixed update accepted");
+            NSCAssert([service.managedRoots[@501] isEqual:@"new"] && [service.managedRoots[@700] isEqual:@"new"], @"invalid session cannot overwrite a valid PID claim in any order");
+            NSCAssert([[service sessionForProcessLocked:&helper messageVersion:4] isEqual:@"new"], @"process attribution follows the valid claim");
+            NSCAssert([service.managedRoots[@500] isEqual:@"cowork"], @"unclaimed prior scope survives invalid update");
+            NSCAssert(service.configurationWarning.length > 0, @"partial update warns");
+        }
+    }
+    // Two otherwise valid sessions cannot win a shared PID by array order.
+    for (NSNumber *reverse in @[@NO, @YES]) {
+        GenseeSensorService *service = [[GenseeSensorService alloc] init];
+        NSArray *conflict = @[NamedCoworkRoot(@500, @500, @"one"), NamedCoworkRoot(@501, @500, @"one"),
+                              NamedCoworkRoot(@700, @700, @"two"), NamedCoworkRoot(@501, @700, @"two")];
+        NSCAssert(Configure(service, reverse.boolValue ? conflict.reverseObjectEnumerator.allObjects : conflict), @"ambiguous config handled");
+        NSCAssert(service.managedRoots.count == 0 && service.configurationWarning.length > 0, @"ambiguous new sessions excluded consistently");
+    }
+}
+
 static void TestRevocationPreservesLoss(void)
 {
     GenseeSensorService *service = [[GenseeSensorService alloc] init];
@@ -197,6 +228,7 @@ int main(int argc, const char *argv[])
         TestInvalidConfigurationPreservesScopeAndEvidence();
         TestUnidentifiedEntriesDoNotFreezeOtherSessions();
         TestReassignedPIDsTakePrecedenceOverRestoration();
+        TestWholeSessionValidationPrecedesPIDMerge();
         TestRevocationPreservesLoss();
         NSCAssert(argc == 2, @"shared signing fixture path required");
         NSData *fixtureData = [NSData dataWithContentsOfFile:@(argv[1])];

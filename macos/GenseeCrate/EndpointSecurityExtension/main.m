@@ -827,6 +827,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     }
     NSMutableDictionary<NSNumber *, NSString *> *roots = [NSMutableDictionary dictionary];
     NSMutableSet<NSNumber *> *coworkRootPIDs = [NSMutableSet set];
+    NSMutableDictionary<NSString *, NSMutableSet<NSNumber *> *> *coworkCandidates = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSString *, NSString *> *coworkSessionModes = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSString *, NSNumber *> *coworkCanonicalRootPIDs = [NSMutableDictionary dictionary];
     NSMutableSet<NSString *> *invalidCoworkSessions = [NSMutableSet set];
@@ -861,28 +862,46 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
                     [invalidCoworkSessions addObject:sessionID];
                     continue;
                 }
-                [coworkRootPIDs addObject:pid];
+                if (coworkCandidates[sessionID] == nil) coworkCandidates[sessionID] = [NSMutableSet set];
+                [coworkCandidates[sessionID] addObject:pid];
                 coworkSessionModes[sessionID] = sessionMode;
                 coworkCanonicalRootPIDs[sessionID] = canonicalRoot;
+            } else {
+                roots[pid] = sessionID;
             }
-            roots[pid] = sessionID;
         }
     }
     for (NSString *sessionID in coworkCanonicalRootPIDs) {
         NSNumber *canonicalRoot = coworkCanonicalRootPIDs[sessionID];
-        if (![roots[canonicalRoot] isEqualToString:sessionID] || ![coworkRootPIDs containsObject:canonicalRoot]) {
+        if (![coworkCandidates[sessionID] containsObject:canonicalRoot]) {
             [invalidCoworkSessions addObject:sessionID];
         }
     }
-    @synchronized (self) {
-        // An unreadable session ID cannot retain any prior session. Ignore
-        // that entry while applying named updates and removals normally.
-        for (NSNumber *pid in [roots.allKeys copy]) {
-            if ([invalidCoworkSessions containsObject:roots[pid]]) {
-                [roots removeObjectForKey:pid];
-                [coworkRootPIDs removeObject:pid];
+    // Validate complete sessions before merging any Cowork PID claims. A
+    // discarded session must never erase a valid candidate from another one.
+    NSMutableDictionary<NSNumber *, NSString *> *claims = [NSMutableDictionary dictionary];
+    NSSet<NSString *> *invalidBeforeMerge = [invalidCoworkSessions copy];
+    for (NSString *sessionID in coworkCandidates) {
+        if ([invalidBeforeMerge containsObject:sessionID]) continue;
+        for (NSNumber *pid in coworkCandidates[sessionID]) {
+            if (roots[pid] != nil || claims[pid] != nil) {
+                [invalidCoworkSessions addObject:sessionID];
+                if (claims[pid] != nil) [invalidCoworkSessions addObject:claims[pid]];
+            } else {
+                claims[pid] = sessionID;
             }
         }
+    }
+    for (NSString *sessionID in coworkCandidates) {
+        if ([invalidCoworkSessions containsObject:sessionID]) continue;
+        for (NSNumber *pid in coworkCandidates[sessionID]) {
+            roots[pid] = sessionID;
+            [coworkRootPIDs addObject:pid];
+        }
+    }
+    @synchronized (self) {
+        // Unreadable IDs cannot retain prior sessions. Only identifiable,
+        // invalid sessions can restore unclaimed roots from the prior scope.
         for (NSString *sessionID in invalidCoworkSessions) {
             [coworkSessionModes removeObjectForKey:sessionID];
             [coworkCanonicalRootPIDs removeObjectForKey:sessionID];

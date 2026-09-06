@@ -2171,6 +2171,22 @@ impl EventStore {
             } else {
                 None
             };
+        // Resolve only the fields this event consumes before taking the SQLite
+        // writer lock. Enriched file operations still never parse raw JSON.
+        let (prompt, response, tool_input) = match event.hook_event_name.as_deref() {
+            Some("UserPromptSubmit") => (
+                text_from_raw_value(parsed.raw(), &["prompt", "user_prompt", "message"]),
+                None,
+                None,
+            ),
+            Some("Stop") => (
+                None,
+                text_from_raw_value(parsed.raw(), &["last_assistant_message"]),
+                None,
+            ),
+            _ if is_agent_event(event) => (None, None, tool_input_json(parsed, file_operations)),
+            _ => (None, None, None),
+        };
         self.with_sqlite_transaction(|db| {
             ensure_session(db, session_id, &event.provider, event.observed_at_ms)?;
 
@@ -2179,10 +2195,7 @@ impl EventStore {
                     let request_id = db
                         .insert_request(&NewRequest {
                             session_id: session_id.to_string(),
-                            original_user_prompt: text_from_raw_value(
-                                parsed.raw(),
-                                &["prompt", "user_prompt", "message"],
-                            ),
+                            original_user_prompt: prompt,
                             final_response: None,
                             events: Some(event.raw_json.clone()),
                             file_accessed_rate: 0.0,
@@ -2198,7 +2211,6 @@ impl EventStore {
                             .ok()
                             .and(update.total)
                     });
-                    let response = text_from_raw_value(parsed.raw(), &["last_assistant_message"]);
                     let request_id = if let Some(request) = db
                         .latest_request_for_session(session_id)
                         .map_err(sqlite_error)?
@@ -2242,7 +2254,7 @@ impl EventStore {
                         cwd: event.cwd.clone().unwrap_or_default(),
                         permission_mode: event.permission_mode.clone(),
                         tool_name: event.tool_name.clone(),
-                        tool_input: tool_input_json(parsed, file_operations),
+                        tool_input,
                         tool_response: tool_response_json(event),
                         tool_use_id: event.tool_use_id.clone(),
                     };
@@ -4980,6 +4992,8 @@ fn file_uri(path: &str) -> String {
 struct ParsedHookEvent<'a> {
     event: &'a AgentHookEvent,
     raw: OnceCell<Option<Value>>,
+    #[cfg(test)]
+    before_parse: Option<&'a dyn Fn()>,
 }
 
 impl<'a> ParsedHookEvent<'a> {
@@ -4987,6 +5001,8 @@ impl<'a> ParsedHookEvent<'a> {
         Self {
             event,
             raw: OnceCell::new(),
+            #[cfg(test)]
+            before_parse: None,
         }
     }
 
@@ -4994,7 +5010,13 @@ impl<'a> ParsedHookEvent<'a> {
     // malformed input too so multiple consumers never retry a failed parse.
     fn raw(&self) -> Option<&Value> {
         self.raw
-            .get_or_init(|| serde_json::from_str(&self.event.raw_json).ok())
+            .get_or_init(|| {
+                #[cfg(test)]
+                if let Some(before_parse) = self.before_parse {
+                    before_parse();
+                }
+                serde_json::from_str(&self.event.raw_json).ok()
+            })
             .as_ref()
     }
 }
@@ -6836,6 +6858,38 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("/repo/large.txt"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hook_raw_fields_are_parsed_before_database_lock() {
+        let dir =
+            std::env::temp_dir().join(format!("gensee-hook-parse-lock-{}", std::process::id()));
+        let store = EventStore::new(&dir).unwrap();
+        let mut vscode =
+            native_tool_event("file_search", "search-vscode", r#"{"query":"*.rs"}"#, 101);
+        vscode.provider = "vscode".into();
+        for event in [
+            native_tool_event("WebSearch", "search-1", r#"{"query":"test"}"#, 100),
+            vscode,
+            hook_event("UserPromptSubmit", r#"{"prompt":"hello"}"#, 102),
+            hook_event("Stop", r#"{"last_assistant_message":"done"}"#, 103),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let before_parse = || {
+                assert!(
+                    store.sqlite.try_lock().is_ok(),
+                    "JSON parsing must precede the store mutex and write transaction"
+                );
+                calls.set(calls.get() + 1);
+            };
+            let mut parsed = ParsedHookEvent::new(&event);
+            parsed.before_parse = Some(&before_parse);
+            store
+                .append_hook_event_database(&parsed, &ObservationEnrichment::default(), &[])
+                .unwrap();
+            assert_eq!(calls.get(), 1, "raw fields must still be parsed once");
+        }
         fs::remove_dir_all(&dir).ok();
     }
 
