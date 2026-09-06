@@ -1,6 +1,7 @@
 import Foundation
 
 struct EndpointSensorHealth: Equatable {
+    var bootID = ""
     var connected = false
     var running = false
     var mode = "observe"
@@ -47,5 +48,27 @@ struct EndpointSensorHealth: Equatable {
     var hasBackpressure: Bool { backlogEvents >= 1_000 || pendingEvidence >= 1_000 || lastBatchDurationMS >= 1_000 }
     var exceedsAuthorizationLatencyBudget: Bool {
         maxAuthorizationLatencyUS > configuredMaxAuthorizationLatencyUS
+    }
+}
+
+// Runtime deltas only: restarting the app must not alarm on historical counters.
+struct MonitoringGapAlarmTracker {
+    private var previous: EndpointSensorHealth?
+    private var pending: UInt64 = 0
+    private var lastAlarm: Date?
+    mutating func observe(_ health: EndpointSensorHealth, now: Date) -> UInt64? {
+        guard health.connected, health.running else { return nil }
+        defer { previous = health }
+        guard let previous, previous.bootID == health.bootID,
+              health.kernelDrops >= previous.kernelDrops, health.ringDrops >= previous.ringDrops else {
+            pending = 0; lastAlarm = nil
+            return nil
+        }
+        pending += health.kernelDrops - previous.kernelDrops
+        pending += health.ringDrops - previous.ringDrops
+        guard pending >= 100, lastAlarm.map({ now.timeIntervalSince($0) >= 60 }) ?? true else { return nil }
+        let count = pending
+        pending = 0; lastAlarm = now
+        return count
     }
 }

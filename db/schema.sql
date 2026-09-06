@@ -463,9 +463,10 @@ CREATE TABLE IF NOT EXISTS dashboard_projection_progress (
 );
 
 CREATE TABLE IF NOT EXISTS dashboard_alert_classification (
-    alert_id INTEGER PRIMARY KEY REFERENCES alerts(alert_id) ON DELETE CASCADE,
+    alert_id INTEGER NOT NULL REFERENCES alerts(alert_id) ON DELETE CASCADE,
     policy_key TEXT NOT NULL,
-    routine INTEGER NOT NULL
+    routine INTEGER NOT NULL,
+    PRIMARY KEY (alert_id, policy_key)
 );
 CREATE INDEX IF NOT EXISTS idx_dashboard_alert_classification_policy
     ON dashboard_alert_classification(policy_key, routine, alert_id);

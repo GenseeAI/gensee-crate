@@ -87,8 +87,9 @@ file contains a live credential; report “possible credentials” unless valida
 ## Historical findings and approval previews
 
 A quoted search pattern such as `"reconnect()"` is static shell input. Approval
-previews distinguish it from substitution, backticks and unquoted subshells; those
-continue to require a fresh approval. Preview failures remain in the approval
+previews accept literal parentheses but conservatively reject dollar signs and
+backticks even inside quotes, because a child interpreter can expand them. Unquoted
+subshells also require a fresh approval. Preview failures remain in the approval
 sheet with recovery guidance instead of opening a generic application error.
 
 An explicit read exception can refer to a cleaned-up temporary file or project.

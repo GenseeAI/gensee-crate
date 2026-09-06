@@ -248,8 +248,27 @@ static void TestSequenceAccountingDoesNotQueueSystemWideWork(void)
     });
 }
 
+static void TestObserveAuthorizationEvidence(void)
+{
+    GenseeSensorService *service = [[GenseeSensorService alloc] init];
+    service.protectedPaths = @[@"/Users/test/.ssh"];
+    es_file_t file = {0};
+    const char *secret = "/Users/test/.ssh/id_rsa";
+    file.path = (es_string_token_t){strlen(secret), secret};
+    es_message_t message = {0};
+    message.event_type = ES_EVENT_TYPE_AUTH_OPEN;
+    message.event.open.file = &file;
+    NSCAssert([service shouldRecordAuthorization:&message mode:@"observe" result:@"allow" ruleID:nil], @"protected attempts survive missing NOTIFY");
+    const char *ordinary = "/Users/test/.ssh-backup/output";
+    file.path = (es_string_token_t){strlen(ordinary), ordinary};
+    NSCAssert(![service shouldRecordAuthorization:&message mode:@"observe" result:@"allow" ruleID:nil], @"ordinary prefix sibling skips AUTH");
+    NSCAssert([service shouldRecordAuthorization:&message mode:@"observe" result:@"deny" ruleID:nil], @"denials retained");
+    NSCAssert(![service shouldRecordAuthorization:&message mode:@"off" result:@"allow" ruleID:nil], @"off stays off");
+}
+
 int main(int argc, const char *argv[])
 {
+    TestObserveAuthorizationEvidence();
     @autoreleasepool {
         TestSequenceAccountingDoesNotQueueSystemWideWork();
         TestInvalidConfigurationPreservesScopeAndEvidence();

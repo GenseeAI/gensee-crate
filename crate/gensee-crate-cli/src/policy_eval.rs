@@ -1943,6 +1943,7 @@ const CREDENTIAL_CONTENT_KEYS: &[&str] = &[
     "password",
     "passwd",
     "api_key",
+    "api_keys",
     "apikey",
     "secret_key",
     "secretkey",
@@ -1959,8 +1960,35 @@ const CREDENTIAL_CONTENT_KEYS: &[&str] = &[
 fn looks_like_secret_value(raw: &str) -> bool {
     // A literal secret is a single contiguous token, so judge the first
     // whitespace-delimited word only (kills prose like "your password here").
-    let first = raw.split_whitespace().next().unwrap_or("");
-    let v = first.trim_matches(['"', '\'', '`', ',']).trim();
+    let first = raw
+        .trim_start()
+        .trim_start_matches('[')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    let quoted = first.starts_with(['"', '\'']);
+    let v = if quoted {
+        // Array closing brackets are outside the closing quote; brackets
+        // inside a quoted password are part of its value and length.
+        first[1..]
+            .split(first.chars().next().unwrap())
+            .next()
+            .unwrap_or("")
+    } else {
+        first.trim_matches(['`', ',', ']']).trim()
+    };
+    // Reject source expressions such as document["secret_paths"], while
+    // retaining quoted literal passwords (including brackets) and arrays.
+    if !quoted
+        && v.find('[').is_some_and(|i| {
+            i > 0
+                && v[..i]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.'))
+        })
+    {
+        return false;
+    }
     if v.len() < 8 {
         return false;
     }
@@ -1970,7 +1998,7 @@ fn looks_like_secret_value(raw: &str) -> bool {
     }
     // Code / markup syntax -> a source reference, not a literal secret
     // (e.g. `password = read_input();`).
-    if v.contains(['(', ')', ';', '{', '}', '<', '>', '[', ']']) {
+    if v.contains(['(', ')', ';', '{', '}', '<', '>']) {
         return false;
     }
     let lower = v.to_ascii_lowercase();
@@ -3074,6 +3102,7 @@ pub(crate) fn policy_findings_for_subject(
             let mut evidence = json!({
                 "source": subject.source,
                 "operation": subject.operation,
+                "resolved_path": gensee_crate_core::resolve_concrete_path(&subject.path),
             });
             if finding.rule_id == "policy_write_outside_workspace" {
                 evidence["workspace"] = json!(cwd);

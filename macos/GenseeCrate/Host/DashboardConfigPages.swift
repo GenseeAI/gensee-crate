@@ -981,6 +981,7 @@ struct DashboardSettingsPage: View {
             Divider()
 
             HStack(spacing: 24) {
+                Toggle("Gensee monitoring gaps", isOn: $notifications.monitoringHealthNotificationsEnabled)
                 Toggle("Security findings", isOn: $notifications.alertNotificationsEnabled)
                     .toggleStyle(.switch)
                     .disabled(!notifications.isAuthorized)

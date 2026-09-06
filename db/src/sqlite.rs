@@ -11,12 +11,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // already-initialized store must not rerun CREATE/ALTER statements on every
 // short-lived hook or dashboard process: schema DDL needs a writer lock and can
 // otherwise starve behind the long-lived Endpoint Security ingester.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 // This checksum intentionally names the schema version. If schema.sql changes,
 // bump SCHEMA_VERSION and replace this with the checksum for the new version.
 #[cfg(test)]
-const SCHEMA_V5_SQL_SHA256: &str =
-    "8efa67f1e7f5de10a5e04b0873a5550341ccc5ca360ce81031e2d07fc306e38f";
+const SCHEMA_V6_SQL_SHA256: &str =
+    "4f3f4bf6b4c8564c1ecb3ea4cee4e4b768addaf696d2c5612f0803fa48ea5919";
 // Increment whenever dashboard artifact visibility rules change. Existing
 // stores are reclassified by bounded background maintenance before this
 // version is stamped on their cached count.
@@ -714,6 +714,10 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
         ensure_artifact_dashboard_visibility_column(&conn).map_err(SqliteError::Schema)?;
         ensure_dashboard_artifact_count_rules_version_column(&conn).map_err(SqliteError::Schema)?;
 
+        // Classifications are rebuildable projections, not evidence. Version 6
+        // retains independent classifier versions under a composite key.
+        conn.execute_batch("DROP TABLE IF EXISTS dashboard_alert_classification")
+            .map_err(SqliteError::Schema)?;
         conn.execute_batch(include_str!("../schema.sql"))
             .map_err(SqliteError::Schema)?;
 
@@ -3234,10 +3238,10 @@ mod tests {
 
     #[test]
     fn schema_checksum_is_tied_to_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
         let actual = format!("{:x}", Sha256::digest(include_bytes!("../schema.sql")));
         assert_eq!(
-            actual, SCHEMA_V5_SQL_SHA256,
+            actual, SCHEMA_V6_SQL_SHA256,
             "schema.sql changed: bump SCHEMA_VERSION and replace the versioned checksum"
         );
     }
@@ -3402,6 +3406,46 @@ mod tests {
             })
             .unwrap();
         assert_eq!(prompt, "keep original");
+        drop(conn);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn schema_v6_rebuilds_only_classification_cache_with_independent_versions() {
+        let path =
+            std::env::temp_dir().join(format!("gensee-v6-migration-{}.db", std::process::id()));
+        remove_sqlite_files(&path);
+        let config = test_config(&path);
+        let conn = open(&config).unwrap();
+        conn.execute_batch("DROP TABLE dashboard_alert_classification;
+            CREATE TABLE dashboard_alert_classification(alert_id INTEGER PRIMARY KEY, policy_key TEXT NOT NULL, routine INTEGER NOT NULL);
+            INSERT INTO dashboard_alert_classification VALUES (1, 'old', 1);
+            PRAGMA user_version = 5;").unwrap();
+        drop(conn);
+        let conn = open(&config).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM dashboard_alert_classification",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute_batch(
+            "INSERT INTO dashboard_alert_classification VALUES (1, 'a', 1), (1, 'b', 0);",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM dashboard_alert_classification",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
         drop(conn);
         remove_sqlite_files(&path);
     }

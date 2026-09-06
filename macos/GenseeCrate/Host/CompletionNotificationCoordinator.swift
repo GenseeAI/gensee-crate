@@ -14,6 +14,11 @@ struct AlertNotificationDigest: Equatable {
 final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published private(set) var lastDeliveryError: String?
+    @Published var monitoringHealthAlarm: String?
+    @Published var monitoringHealthNotificationsEnabled = UserDefaults.standard.object(forKey: "gensee.notifications.monitoringHealth") as? Bool ?? true {
+        didSet { defaults.set(monitoringHealthNotificationsEnabled, forKey: "gensee.notifications.monitoringHealth") }
+    }
+    private var monitoringTracker = MonitoringGapAlarmTracker()
     @Published var completionNotificationsEnabled: Bool {
         didSet { defaults.set(completionNotificationsEnabled, forKey: Self.completionEnabledKey) }
     }
@@ -141,6 +146,23 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     func openSystemNotificationSettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    func processMonitoringHealth(_ health: EndpointSensorHealth, now: Date = Date()) async {
+        guard let count = monitoringTracker.observe(health, now: now) else { return }
+        let message = "Gensee lost \(count) monitoring events. Activity coverage is incomplete; check sensor health in Settings."
+        monitoringHealthAlarm = message
+        guard monitoringHealthNotificationsEnabled else { return }
+        await refreshAuthorizationStatus()
+        guard isAuthorized else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Gensee monitoring gap"
+        content.body = message
+        content.sound = .default
+        content.interruptionLevel = .active
+        do {
+            try await center.add(UNNotificationRequest(identifier: "gensee-monitoring-health", content: content, trigger: nil))
+        } catch { lastDeliveryError = error.localizedDescription }
     }
 
     func process(snapshot: SecuritySnapshot, now: Date = Date()) async {

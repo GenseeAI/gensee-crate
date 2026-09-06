@@ -301,6 +301,12 @@ struct SecurityAlert: Decodable, Identifiable {
 
     var id: Int64 { alertID }
 
+    var supportsExactApproval: Bool {
+        action.lowercased() == "ask" && ["policy_write_outside_workspace",
+            "policy_credential_content_read", "policy_unmatched_executable_modification",
+            "policy_prior_session_executable_artifact"].contains(ruleID)
+    }
+
     var reviewStatus: String {
         switch action.lowercased() {
         case "block", "deny": return "Blocked"

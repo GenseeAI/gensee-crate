@@ -163,7 +163,7 @@ fn observation_enrichment(
 fn prepare_policy_alert(policy: &Policy, mut alert: PolicyAlert) -> Option<PolicyAlert> {
     // Monitoring health must remain visible even when the user suppresses
     // low-severity agent findings or has tuned a legacy gap-warning rule.
-    if alert.rule_id == "endpoint_security_event_gap" {
+    if alert.kind() == gensee_crate_store::AlertKind::MonitoringHealth {
         alert.session_id = None;
         alert.tool_use_id = None;
         alert.severity = "info".into();
@@ -321,7 +321,7 @@ mod tests {
             let mut alert = alert("medium", "warn");
             alert.rule_id = "hook_bypass_file_mutation".into();
             alert.path = Some(path.into());
-            alert.evidence = Some(json!({"logical_operation":operation,
+            alert.evidence = Some(json!({"logical_operation":operation, "event_type":"write",
                 "attribution":{"workspace_root":"/repo"}, "actor":{},
                 "file":{"path":source, "mode":0o100644}}));
             assert!(record_endpoint_policy_alert(
@@ -379,7 +379,7 @@ mod tests {
             a.path = Some(path.into());
             a.evidence = Some(
                 json!({"logical_operation":operation,"event_type":if operation == "delete" {"unlink"} else {"rename"},
-                "action":action,"decision":{"result":result},"file":{"path":path,"mode":mode}}),
+                "action":action,"actor":{},"decision":{"result":result},"file":{"path":path,"mode":mode}}),
             );
             record_endpoint_policy_alert(&store, a, &format!("directory-{index}"), 10_000).unwrap();
         }
@@ -523,6 +523,33 @@ mod tests {
     }
 
     #[test]
+    fn lexical_scratch_hook_paths_do_not_hide_protected_symlink_targets() {
+        let dir = env::temp_dir().join(format!("gensee-hook-resolved-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        for resolved in [
+            Some("/Users/test/.ssh/id_rsa"),
+            None,
+            Some("/tmp/ordinary-output"),
+        ] {
+            let mut a = alert("high", "ask");
+            a.rule_id = "policy_write_outside_workspace".into();
+            a.path = Some("/tmp/link".into());
+            a.evidence =
+                Some(json!({"source":"hook","operation":"write","resolved_path":resolved}));
+            store.append_policy_alert(&a).unwrap();
+        }
+        configure_dashboard_noise_filter(&store).unwrap();
+        assert_eq!(
+            store.dashboard_state().unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 3);
+    }
+
+    #[test]
     fn dashboard_quiets_only_routine_unmatched_mutations() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-dashboard-intent-gap-{}",
@@ -548,7 +575,7 @@ mod tests {
             finding.rule_id = "hook_bypass_file_mutation".into();
             finding.path = Some(path.into());
             finding.evidence = Some(
-                json!({"logical_operation": operation, "attribution": {"workspace_root":"/repo"}}),
+                json!({"logical_operation": operation, "event_type":"write", "actor":{}, "attribution": {"workspace_root":"/repo"}}),
             );
             store.append_policy_alert(&finding).unwrap();
         }

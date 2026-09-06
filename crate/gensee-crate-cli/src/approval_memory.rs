@@ -45,7 +45,6 @@ fn eligible(rule: &str) -> bool {
         rule,
         "policy_write_outside_workspace"
             | "policy_credential_content_read"
-            | "policy_executable_content_unavailable"
             | "policy_unmatched_executable_modification"
             | "policy_prior_session_executable_artifact"
     )
@@ -54,6 +53,12 @@ fn eligible(rule: &str) -> bool {
 // Inspect shell syntax before tokenization removes quote information. Quoted
 // search patterns such as "reconnect()" are literals, not command substitution.
 fn static_shell_command(command: &str) -> bool {
+    // Quoting does not make text static when a child interpreter evaluates it.
+    // Keep expansion markers ineligible even in literal arguments; proving all
+    // interpreter/wrapper semantics is outside remembered approval matching.
+    if command.contains(['$', '`']) {
+        return false;
+    }
     let mut quote = None;
     let mut escaped = false;
     for c in command.chars() {
@@ -697,13 +702,13 @@ mod tests {
     fn static_commands_distinguish_literal_search_patterns_from_expansion() {
         for command in [
             r#"grep -rn "health.error\|reconnect()" Host/*.swift | head"#,
-            r#"grep '$HOME `literal` ()' file"#,
-            r#"grep "escaped \$HOME" file"#,
             r#"sed -n 1140,1175p file; echo ---; grep updateConfiguration Host/*.swift"#,
         ] {
             assert!(static_shell_command(command), "{command}");
         }
         for command in [
+            r#"grep '$HOME `literal` ()' file"#,
+            r#"grep "escaped \$HOME" file"#,
             "cat $(get-path)",
             "cat `get-path`",
             "(cat file)",
@@ -717,6 +722,21 @@ mod tests {
         ] {
             assert!(!static_shell_command(command), "{command}");
         }
+    }
+
+    #[test]
+    fn interpreter_wrappers_cannot_hide_dynamic_expansion_in_quotes() {
+        for command in [
+            "bash -c 'cat $CREDS_FILE'",
+            "sh -c 'echo `id`'",
+            "env bash -c 'cat $FILE'",
+            "xargs -I{} sh -c 'echo $FILE'",
+            "python3 -c 'import os; os.system(\"cat $FILE\")'",
+        ] {
+            assert!(!static_shell_command(command), "{command}");
+        }
+        assert!(!static_shell_command("grep '$FILE' file"));
+        assert!(!eligible("policy_executable_content_unavailable"));
     }
 
     fn fixture() -> (EventStore, PathBuf, AgentHookEvent, PolicyFinding) {

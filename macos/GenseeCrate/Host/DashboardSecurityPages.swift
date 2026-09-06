@@ -268,7 +268,7 @@ private struct FindingReviewControl: View {
             if alert.ruleID == "policy_credential_content_read", ["ask", "warn"].contains(alert.action.lowercased()) {
                 Button("Always allow matching reads…") { showReadException = true }
             }
-            if alert.action.lowercased() == "ask" {
+            if alert.supportsExactApproval {
                 Divider()
                 Button("Approve this exact action…") {
                     approvalIssue = nil

@@ -4633,7 +4633,11 @@ fn credential_content_scanner_flags_secrets_not_templates() {
     )
     .is_none());
     assert!(content_has_credentials(r#"token = credentials["token"]"#).is_none());
-    // source ref
+    assert!(content_has_credentials(r#"api_key = ["sk-live-abcdefghijk"]"#).is_some());
+    assert!(content_has_credentials(r#"api_keys = ["sk-live-abcdefghijk"]"#).is_some());
+    assert!(content_has_credentials(r#"password = "Abc[123456789]""#).is_some());
+    assert!(content_has_credentials(r#"password = "[Abcd12]""#).is_some());
+    assert!(content_has_credentials(r#"password = [ "Abcdefghijk" ]"#).is_some());
 }
 
 #[test]

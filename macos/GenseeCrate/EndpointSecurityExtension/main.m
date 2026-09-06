@@ -518,6 +518,21 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     return GenseeIsOwnProcess(process);
 }
 
+// Keep attempted protected accesses in observe mode without restoring
+// system-wide AUTH serialization or ancestry work for routine paths.
+- (BOOL)shouldRecordAuthorization:(const es_message_t *)message mode:(NSString *)mode result:(NSString *)result ruleID:(NSString *)ruleID
+{
+    if (ruleID != nil || [result isEqualToString:@"deny"]) return YES;
+    if ([mode isEqualToString:@"protect"] || [mode isEqualToString:@"strict"]) return YES;
+    if (![mode isEqualToString:@"observe"]) return NO;
+    NSString *path = GenseeAuthorizationPath(message);
+    NSString *secondary = GenseeSecondaryAuthorizationPath(message);
+    @synchronized (self) {
+        return (path.length > 0 && [self path:path hasProtectedPrefixLocked:self.protectedPaths]) ||
+               (secondary.length > 0 && [self path:secondary hasProtectedPrefixLocked:self.protectedPaths]);
+    }
+}
+
 - (void)authorizeMessage:(const es_message_t *)message
                    result:(NSString **)result
                    ruleID:(NSString **)ruleID
@@ -1017,9 +1032,9 @@ int main(int argc, const char *argv[])
                                     ruleID:&ruleID
                                     reason:&reason
                                  latencyUS:&latency];
-                // Successful observed operations arrive as NOTIFY too. Keep
-                // AUTH evidence only when enforcement decisions are relevant.
-                if ([mode isEqualToString:@"protect"] || [mode isEqualToString:@"strict"] || ruleID != nil) {
+                // Routine successful operations use NOTIFY. Protected probes
+                // retain AUTH evidence even if the operation later fails.
+                if ([service shouldRecordAuthorization:message mode:mode result:decision ruleID:ruleID]) {
                     [service recordMessage:message mode:mode result:decision ruleID:ruleID reason:reason latencyUS:latency];
                 }
             } else if (![mode isEqualToString:@"off"]) {

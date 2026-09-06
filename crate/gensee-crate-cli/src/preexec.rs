@@ -190,7 +190,13 @@ pub(crate) fn preexec_findings_for_path(
         if !content_tags.is_empty() {
             return content_tags
                 .iter()
-                .map(|tag| policy_finding_from_tag(tag))
+                .map(|tag| {
+                    let mut finding = policy_finding_from_tag(tag);
+                    if !snapshot.truncated {
+                        finding.evidence["approval_content_digest"] = json!(snapshot.digest);
+                    }
+                    finding
+                })
                 .collect();
         }
     }

@@ -113,6 +113,27 @@ struct TranscriptTokenUpdate {
     record: TranscriptTokenStateRecord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertKind {
+    Agent,
+    MonitoringHealth,
+}
+impl AlertKind {
+    pub fn for_rule(rule: &str) -> Self {
+        if rule == "endpoint_security_event_gap" {
+            Self::MonitoringHealth
+        } else {
+            Self::Agent
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::MonitoringHealth => "monitoring_health",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyAlert {
     pub session_id: Option<String>,
@@ -124,6 +145,12 @@ pub struct PolicyAlert {
     pub path: Option<String>,
     pub evidence: Option<Value>,
     pub observed_at_ms: u64,
+}
+
+impl PolicyAlert {
+    pub fn kind(&self) -> AlertKind {
+        AlertKind::for_rule(&self.rule_id)
+    }
 }
 
 /// Policy-derived data supplied by an ingestion caller.
@@ -355,10 +382,37 @@ impl EventStore {
     {
         let db = self.sqlite_store()?;
         let conn = db.connection();
-        let mut routine = HashSet::new();
+        conn.create_scalar_function(
+            "gensee_alert_kind",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                Ok(AlertKind::for_rule(&ctx.get::<String>(0)?)
+                    .as_str()
+                    .to_owned())
+            },
+        )
+        .map_err(sqlite_error_from_rusqlite)?;
+        let key = policy_key.to_owned();
+        conn.create_scalar_function(
+            "gensee_dashboard_policy_key",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_| Ok(key.clone()),
+        )
+        .map_err(sqlite_error_from_rusqlite)?;
         if !candidate_rules.is_empty() {
             let rules = serde_json::to_string(candidate_rules).map_err(io::Error::other)?;
-            let mut cursor = 0_i64;
+            let progress_key = format!("alert-classification:{policy_key}");
+            let mut cursor = conn
+                .query_row(
+                    "SELECT cursor FROM dashboard_projection_progress WHERE name = ?1",
+                    [&progress_key],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(sqlite_error_from_rusqlite)?
+                .unwrap_or(0);
             loop {
                 let mut query = conn.prepare("SELECT a.alert_id, a.rule_id, COALESCE(a.path, ''),
                     COALESCE(json_extract(a.evidence, '$.attribution.workspace_root'), ''),
@@ -398,38 +452,34 @@ impl EventStore {
                 conn.execute_batch("SAVEPOINT alert_classification")
                     .map_err(sqlite_error_from_rusqlite)?;
                 let saved = (|| -> rusqlite::Result<()> {
-                    let mut insert = conn.prepare_cached("INSERT INTO dashboard_alert_classification VALUES (?1, ?2, ?3)
-                        ON CONFLICT(alert_id) DO UPDATE SET policy_key = excluded.policy_key, routine = excluded.routine")?;
+                    let mut insert = conn.prepare_cached(
+                        "INSERT INTO dashboard_alert_classification VALUES (?1, ?2, ?3)
+                        ON CONFLICT(alert_id, policy_key) DO UPDATE SET routine = excluded.routine",
+                    )?;
                     for (id, value) in classified {
                         insert.execute(rusqlite::params![id, policy_key, value])?;
                     }
+                    conn.execute(
+                        "INSERT INTO dashboard_projection_progress VALUES (?1, ?2)
+                        ON CONFLICT(name) DO UPDATE SET cursor = MAX(cursor, excluded.cursor)",
+                        rusqlite::params![progress_key, cursor],
+                    )?;
                     Ok(())
                 })();
                 if let Err(error) = saved {
                     let _ = conn.execute_batch(
                         "ROLLBACK TO alert_classification; RELEASE alert_classification",
                     );
+                    if sqlite_is_busy(&error) {
+                        break;
+                    }
                     return Err(sqlite_error_from_rusqlite(error));
                 }
                 conn.execute_batch("RELEASE alert_classification")
                     .map_err(sqlite_error_from_rusqlite)?;
             }
-            let mut query = conn.prepare("SELECT alert_id FROM dashboard_alert_classification WHERE policy_key = ?1 AND routine = 1")
-                .map_err(sqlite_error_from_rusqlite)?;
-            for id in query
-                .query_map([policy_key], |r| r.get::<_, i64>(0))
-                .map_err(sqlite_error_from_rusqlite)?
-            {
-                routine.insert(id.map_err(sqlite_error_from_rusqlite)?);
-            }
         }
-        conn.create_scalar_function(
-            "gensee_dashboard_alert_is_routine",
-            1,
-            FunctionFlags::SQLITE_UTF8,
-            move |context| Ok(routine.contains(&context.get::<i64>(0)?)),
-        )
-        .map_err(sqlite_error_from_rusqlite)
+        Ok(())
     }
 
     /// Open a distinct SQLite connection to the same event-store root. Long-running
@@ -1645,7 +1695,7 @@ impl EventStore {
         let monitoring_gaps = query_json_rows(
             conn,
             "SELECT alert_id, created_at, json_extract(evidence, '$.dropped_events')
-             FROM alerts WHERE rule_id = 'endpoint_security_event_gap'
+             FROM alerts WHERE gensee_alert_kind(rule_id) = 'monitoring_health'
              ORDER BY created_at DESC, alert_id DESC LIMIT 100",
             |row| {
                 Ok(json!({
@@ -1937,7 +1987,7 @@ impl EventStore {
 
     pub fn append_policy_alert(&self, alert: &PolicyAlert) -> io::Result<()> {
         self.with_sqlite_transaction(|db| {
-            let request_id = if alert.rule_id == "endpoint_security_event_gap" {
+            let request_id = if alert.kind() == AlertKind::MonitoringHealth {
                 None
             } else {
                 let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
@@ -1981,7 +2031,7 @@ impl EventStore {
         window_ms: u64,
     ) -> io::Result<bool> {
         self.with_sqlite_transaction(|db| {
-            let request_id = if alert.rule_id == "endpoint_security_event_gap" {
+            let request_id = if alert.kind() == AlertKind::MonitoringHealth {
                 None
             } else {
                 let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
@@ -4842,21 +4892,25 @@ fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
     let path = format!("COALESCE({alias}.path, '')");
     let lower_path = format!("lower({path})");
     format!(
-        "{alias}.rule_id != 'endpoint_security_event_gap'
-         AND NOT (lower({alias}.action) NOT IN ('deny', 'block') AND COALESCE(json_extract({alias}.evidence, '$.decision.result'), '') != 'deny' AND {alias}.rule_id = 'unmatched_system_effect'
-              AND {alias}.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-         AND NOT (lower({alias}.action) NOT IN ('deny', 'block') AND COALESCE(json_extract({alias}.evidence, '$.decision.result'), '') != 'deny'
-                  AND gensee_dashboard_alert_is_routine({alias}.alert_id))
-         AND NOT (lower({alias}.action) NOT IN ('deny', 'block') AND COALESCE(json_extract({alias}.evidence, '$.decision.result'), '') != 'deny' AND {alias}.rule_id = 'hook_bypass_file_mutation' AND (
-              {path} GLOB '/dev/*'
-              OR {lower_path} LIKE '%/library/application support/codex/%'
-              OR {lower_path} LIKE '%/library/application support/claude/%'
-              OR {lower_path} LIKE '%/crashpad/%'
-              OR {lower_path} LIKE '%/diagnosticreports/%'
-              OR {lower_path} LIKE '%/crash reports/%'
-              OR {lower_path} LIKE '%/.codex/sessions/%.jsonl'
-              OR {lower_path} LIKE '%/.claude/projects/%.jsonl'
-         ))"
+        "gensee_alert_kind({alias}.rule_id) != 'monitoring_health'
+         AND (lower({alias}.action) IN ('deny', 'block')
+              OR COALESCE(json_extract({alias}.evidence, '$.decision.result'), '') = 'deny'
+              OR NOT (
+                  ({alias}.rule_id = 'unmatched_system_effect'
+                   AND COALESCE({alias}.evidence, '') LIKE '%\"source\":\"macos-endpoint-security\"%')
+                  OR EXISTS (SELECT 1 FROM dashboard_alert_classification c
+                      WHERE c.alert_id = {alias}.alert_id AND c.policy_key = gensee_dashboard_policy_key() AND c.routine = 1)
+                  OR ({alias}.rule_id = 'hook_bypass_file_mutation' AND (
+                      {path} GLOB '/dev/*'
+                      OR {lower_path} LIKE '%/library/application support/codex/%'
+                      OR {lower_path} LIKE '%/library/application support/claude/%'
+                      OR {lower_path} LIKE '%/crashpad/%'
+                      OR {lower_path} LIKE '%/diagnosticreports/%'
+                      OR {lower_path} LIKE '%/crash reports/%'
+                      OR {lower_path} LIKE '%/.codex/sessions/%.jsonl'
+                      OR {lower_path} LIKE '%/.claude/projects/%.jsonl'
+                  ))
+              ))"
     )
 }
 
@@ -4889,8 +4943,7 @@ fn dashboard_visible_alerts_cte_with_scope(request_scope: Option<&str>) -> Strin
          visible_alerts AS MATERIALIZED (
             SELECT *
             FROM ranked_dashboard_alerts
-            WHERE rule_id != 'hook_bypass_file_mutation'
-               OR lower(action) IN ('block', 'deny')
+            WHERE lower(action) IN ('block', 'deny')
                OR previous_related_alert_at IS NULL
                OR created_at - previous_related_alert_at > 10000
             UNION ALL
@@ -5693,6 +5746,9 @@ impl DashboardRequestGroups {
                 let _ = conn.execute_batch(
                     "ROLLBACK TO request_group_backfill; RELEASE request_group_backfill",
                 );
+                if sqlite_is_busy(&error) {
+                    break;
+                }
                 return Err(sqlite_error_from_rusqlite(error));
             }
             conn.execute_batch("RELEASE request_group_backfill")
@@ -5720,9 +5776,11 @@ impl DashboardRequestGroups {
         }
         let mut query = conn
             .prepare(
-                "SELECT r.request_id, substr(r.original_user_prompt, 1, 16384)
-            FROM requests r JOIN (SELECT DISTINCT request_id FROM dashboard_request_groups) g
-                ON g.request_id = r.request_id",
+                "SELECT r.request_id, substr(CASE WHEN r.original_user_prompt = 'Background activity'
+                THEN COALESCE(json_extract(r.events, '$.prompt'), r.original_user_prompt)
+                ELSE r.original_user_prompt END, 1, 16384)
+            FROM requests r WHERE r.request_id IN (SELECT request_id FROM dashboard_request_groups)
+                OR r.original_user_prompt = 'Background activity'",
             )
             .map_err(sqlite_error_from_rusqlite)?;
         for row in query
@@ -6003,6 +6061,11 @@ fn current_unix_millis() -> io::Result<u64> {
 
 fn sqlite_error(error: gensee_crate_db::sqlite::SqliteError) -> io::Error {
     io::Error::other(error)
+}
+
+fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
+    matches!(error, rusqlite::Error::SqliteFailure(code, _) if matches!(code.code,
+        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }
 
 fn sqlite_error_from_rusqlite(error: rusqlite::Error) -> io::Error {
@@ -9071,8 +9134,122 @@ mod tests {
                 .len(),
             1
         );
+        reopened
+            .set_dashboard_noise_filter_versioned(
+                &["hook_bypass_file_mutation"],
+                "policy-a",
+                |_, _, _, _, _| panic!("switching back reuses its own classifications"),
+            )
+            .unwrap();
+        assert!(reopened.dashboard_state().unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(reopened.verify_alert_chain().unwrap(), chain);
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dashboard_remains_readable_while_projection_writer_is_busy() {
+        let dir = env::temp_dir().join(format!("gensee-busy-projection-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        let make = |time| PolicyAlert {
+            session_id: Some("busy-session".into()),
+            tool_use_id: None,
+            severity: "medium".into(),
+            action: "warn".into(),
+            rule_id: "test-busy".into(),
+            message: "test".into(),
+            path: Some("/tmp/test".into()),
+            evidence: None,
+            observed_at_ms: time,
+        };
+        store.append_policy_alert(&make(1)).unwrap();
+        store
+            .set_dashboard_noise_filter_versioned(&["test-busy"], "busy-policy", |_, _, _, _, _| {
+                true
+            })
+            .unwrap();
+        store.append_policy_alert(&make(2)).unwrap();
+        let writer = store.independent_connection().unwrap();
+        let lock = writer.sqlite_store().unwrap();
+        lock.connection().execute_batch("BEGIN IMMEDIATE").unwrap();
+        store
+            .sqlite_store()
+            .unwrap()
+            .connection()
+            .busy_timeout(std::time::Duration::from_millis(10))
+            .unwrap();
+        store
+            .set_dashboard_noise_filter_versioned(&["test-busy"], "busy-policy", |_, _, _, _, _| {
+                true
+            })
+            .unwrap();
+        let state = store.dashboard_state().unwrap();
+        // Existing classifications work; unclassified evidence stays visible.
+        assert_eq!(state["alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(store.sqlite_store().unwrap().connection().query_row(
+            "SELECT cursor FROM dashboard_projection_progress WHERE name = 'alert-classification:busy-policy'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        lock.connection().execute_batch("ROLLBACK").unwrap();
+        store
+            .set_dashboard_noise_filter_versioned(&["test-busy"], "busy-policy", |_, _, _, _, _| {
+                true
+            })
+            .unwrap();
+        assert!(store.dashboard_state().unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn legacy_unlinked_root_recovers_prompt_on_all_dashboard_surfaces() {
+        let dir = env::temp_dir().join(format!("gensee-legacy-prompt-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"review my changes"}"#,
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Read",
+                "read1",
+                r#"{"file_path":"/repo/file"}"#,
+                101,
+            ))
+            .unwrap();
+        store
+            .append_policy_alert(&PolicyAlert {
+                session_id: Some("s1".into()),
+                tool_use_id: Some("read1".into()),
+                severity: "high".into(),
+                action: "warn".into(),
+                rule_id: "test-legacy".into(),
+                message: "test".into(),
+                path: None,
+                evidence: None,
+                observed_at_ms: 102,
+            })
+            .unwrap();
+        store.sqlite_store().unwrap().connection().execute("UPDATE requests SET events = json_object('prompt', original_user_prompt), original_user_prompt = 'Background activity' WHERE request_id = 1", []).unwrap();
+        let state = store.dashboard_state().unwrap();
+        assert_eq!(
+            state["requests"][0]["original_user_prompt"],
+            "review my changes"
+        );
+        assert_eq!(
+            state["alerts"][0]["original_user_prompt"],
+            "review my changes"
+        );
+        assert_eq!(
+            store.dashboard_request(1).unwrap()["request"]["original_user_prompt"],
+            "review my changes"
+        );
     }
 
     #[test]

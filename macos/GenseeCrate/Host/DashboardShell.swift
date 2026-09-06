@@ -36,6 +36,14 @@ struct DashboardShell: View {
     var body: some View {
         VStack(spacing: 0) {
             topBar
+            if let alarm = notifications.monitoringHealthAlarm, !model.isDemoMode {
+                HStack {
+                    Label(alarm, systemImage: "exclamationmark.shield.fill").foregroundStyle(.red)
+                    Spacer()
+                    Button("Sensor health") { selection = .settings }
+                    Button("Dismiss") { notifications.monitoringHealthAlarm = nil }
+                }.font(.callout).padding(12).background(Color.red.opacity(0.08))
+            }
             if model.isDemoMode {
                 demoBanner
             }
@@ -107,6 +115,13 @@ struct DashboardShell: View {
                 if !model.isDemoMode {
                     await notifications.process(snapshot: model.snapshot)
                 }
+            }
+        }
+        .task {
+            // Health alarms must not wait behind dashboard DB reads or agent completion.
+            while !Task.isCancelled {
+                if !model.isDemoMode { await notifications.processMonitoringHealth(model.endpointSensor.health) }
+                try? await Task.sleep(for: .seconds(1))
             }
         }
         .task {

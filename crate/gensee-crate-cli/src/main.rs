@@ -4035,7 +4035,8 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
         "historical-routine-v5:{:x}",
         Sha256::digest(
             format!(
-                "{}:{}",
+                "{}:{}:{}",
+                env!("GENSEE_CLASSIFIER_FINGERPRINT"),
                 policy.source_document(),
                 env::var("HOME").unwrap_or_default()
             )
@@ -4060,6 +4061,17 @@ fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
             {
                 return false;
             }
+            // Hook paths can be symlinks. Only an event-time resolved path is
+            // eligible; legacy unresolved hook evidence stays visible.
+            let sensor_path = e.get("actor").is_some() && e.get("event_type").is_some();
+            let path = if sensor_path {
+                path
+            } else {
+                match e["resolved_path"].as_str() {
+                    Some(resolved) => resolved,
+                    None => return false,
+                }
+            };
             let ordinary_write = (rule
                 == policy.document().categories.write_outside_workspace.rule_id
                 || rule == "hook_bypass_file_mutation")
@@ -4373,28 +4385,17 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 continue;
             }
             let alert = PolicyAlert {
-                // A client-wide delivery gap cannot be attributed to the tool
-                // whose next retained event happened to carry the drop delta.
-                session_id: (finding.rule_id != "endpoint_security_event_gap")
-                    .then(|| active_session_id.clone())
-                    .flatten(),
-                tool_use_id: (finding.rule_id != "endpoint_security_event_gap")
-                    .then(|| tool_use_id.clone())
-                    .flatten(),
+                session_id: active_session_id.clone(),
+                tool_use_id: tool_use_id.clone(),
                 severity: finding.severity.to_string(),
-                action: if finding.rule_id == "endpoint_security_event_gap" {
-                    "allow"
-                } else {
-                    "warn"
-                }
-                .to_string(),
+                action: "warn".to_string(),
                 rule_id: finding.rule_id.to_string(),
                 message: finding.message,
                 path: finding.path,
                 evidence: Some(evidence.clone()),
                 observed_at_ms,
             };
-            if alert.rule_id == "endpoint_security_event_gap" {
+            if alert.kind() == gensee_crate_store::AlertKind::MonitoringHealth {
                 // Loss is a sensor-health incident, not a finding per affected
                 // file/process. Keep the first alert per minute and retain exact
                 // cumulative counters in sensor health.

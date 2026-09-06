@@ -341,6 +341,7 @@ final class EndpointSecuritySensor: ObservableObject {
                 ? (nextCursor > 0 ? nextCursor - 1 : 0)
                 : (oldestCursor > 0 ? oldestCursor - 1 : 0)
         }
+        health.bootID = dictionary["boot_id"] as? String ?? ""
         health.running = (dictionary["running"] as? Bool) ?? false
         health.mode = (dictionary["mode"] as? String) ?? "observe"
         health.receivedMessages = number(dictionary["received_messages"])
