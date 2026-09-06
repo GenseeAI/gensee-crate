@@ -25,6 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fmt;
@@ -438,7 +439,7 @@ impl EventStore {
         let operations = match enrichment.file_operations.as_deref() {
             Some(operations) => operations,
             None => {
-                extracted = hook_file_operations_from(event, parsed.raw.as_ref());
+                extracted = hook_file_operations_from(event, parsed.raw());
                 &extracted
             }
         };
@@ -2179,7 +2180,7 @@ impl EventStore {
                         .insert_request(&NewRequest {
                             session_id: session_id.to_string(),
                             original_user_prompt: text_from_raw_value(
-                                parsed.raw.as_ref(),
+                                parsed.raw(),
                                 &["prompt", "user_prompt", "message"],
                             ),
                             final_response: None,
@@ -2197,8 +2198,7 @@ impl EventStore {
                             .ok()
                             .and(update.total)
                     });
-                    let response =
-                        text_from_raw_value(parsed.raw.as_ref(), &["last_assistant_message"]);
+                    let response = text_from_raw_value(parsed.raw(), &["last_assistant_message"]);
                     let request_id = if let Some(request) = db
                         .latest_request_for_session(session_id)
                         .map_err(sqlite_error)?
@@ -2242,7 +2242,7 @@ impl EventStore {
                         cwd: event.cwd.clone().unwrap_or_default(),
                         permission_mode: event.permission_mode.clone(),
                         tool_name: event.tool_name.clone(),
-                        tool_input: tool_input_json(event, file_operations, parsed.raw.as_ref()),
+                        tool_input: tool_input_json(parsed, file_operations),
                         tool_response: tool_response_json(event),
                         tool_use_id: event.tool_use_id.clone(),
                     };
@@ -4979,21 +4979,29 @@ fn file_uri(path: &str) -> String {
 /// second parser with subtly different tool or path handling.
 struct ParsedHookEvent<'a> {
     event: &'a AgentHookEvent,
-    raw: Option<Value>,
+    raw: OnceCell<Option<Value>>,
 }
 
 impl<'a> ParsedHookEvent<'a> {
     fn new(event: &'a AgentHookEvent) -> Self {
         Self {
             event,
-            raw: serde_json::from_str(&event.raw_json).ok(),
+            raw: OnceCell::new(),
         }
+    }
+
+    // Enriched hooks often need no raw fields. Parse only on demand, and cache
+    // malformed input too so multiple consumers never retry a failed parse.
+    fn raw(&self) -> Option<&Value> {
+        self.raw
+            .get_or_init(|| serde_json::from_str(&self.event.raw_json).ok())
+            .as_ref()
     }
 }
 
 pub fn hook_file_operations(event: &AgentHookEvent) -> Vec<FileOperation> {
     let parsed = ParsedHookEvent::new(event);
-    hook_file_operations_from(event, parsed.raw.as_ref())
+    hook_file_operations_from(event, parsed.raw())
 }
 
 fn hook_file_operations_from(event: &AgentHookEvent, raw: Option<&Value>) -> Vec<FileOperation> {
@@ -5059,11 +5067,8 @@ fn resolve_tool_path(path: &str, cwd: Option<&str>) -> String {
     normalize_agent_path(path, cwd.unwrap_or("."))
 }
 
-fn tool_input_json(
-    event: &AgentHookEvent,
-    tools: &[FileOperation],
-    raw: Option<&Value>,
-) -> Option<String> {
+fn tool_input_json(parsed: &ParsedHookEvent<'_>, tools: &[FileOperation]) -> Option<String> {
+    let event = parsed.event;
     match tools {
         [] => {
             if event.tool_input_command.is_some() || event.tool_input_description.is_some() {
@@ -5078,7 +5083,7 @@ fn tool_input_json(
             // they can include prompts, command arguments, or secret material.
             let tool_name = event.tool_name.as_deref()?;
             if event.provider == "vscode" && matches!(tool_name, "file_search" | "grep_search") {
-                let value = raw?;
+                let value = parsed.raw()?;
                 let query = value
                     .get("tool_input")?
                     .get("query")?
@@ -5092,7 +5097,7 @@ fn tool_input_json(
             if !matches!(tool_name, "WebSearch" | "WebFetch" | "ToolSearch") {
                 return None;
             }
-            let value = raw?;
+            let value = parsed.raw()?;
             let input = value.get("tool_input")?;
             if input.is_null() {
                 return None;
@@ -6796,6 +6801,60 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enriched_hook_database_skips_unused_raw_parse() {
+        let dir =
+            std::env::temp_dir().join(format!("gensee-store-lazy-hook-{}", std::process::id()));
+        let store = EventStore::new(&dir).unwrap();
+        // A large Read response must not be parsed again after the policy
+        // caller has supplied its file operations.
+        let mut event =
+            native_tool_event("Read", "read-1", r#"{"file_path":"/repo/large.txt"}"#, 100);
+        event.raw_json = json!({"tool_response": "x".repeat(2 * 1024 * 1024)}).to_string();
+        let parsed = ParsedHookEvent::new(&event);
+        let operations = vec![FileOperation {
+            operation: "read".into(),
+            path: "/repo/large.txt".into(),
+        }];
+        store
+            .append_hook_event_database(&parsed, &ObservationEnrichment::default(), &operations)
+            .unwrap();
+        assert!(
+            parsed.raw.get().is_none(),
+            "enriched Read must not parse raw JSON"
+        );
+        let events = store
+            .sqlite_store()
+            .unwrap()
+            .agent_events_for_request(1)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0]
+            .tool_input
+            .as_deref()
+            .unwrap()
+            .contains("/repo/large.txt"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hook_raw_consumers_share_a_lazy_parse() {
+        let event = native_tool_event("WebSearch", "search-1", r#"{"query":"test"}"#, 100);
+        let parsed = ParsedHookEvent::new(&event);
+        assert!(parsed.raw.get().is_none());
+        let input = tool_input_json(&parsed, &[]).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&input).unwrap()["query"],
+            "test"
+        );
+        let first = parsed.raw().unwrap();
+        assert!(std::ptr::eq(first, parsed.raw().unwrap()));
+        let invalid = hook_event("Stop", "invalid JSON", 101);
+        let parsed = ParsedHookEvent::new(&invalid);
+        assert!(parsed.raw().is_none());
+        assert_eq!(parsed.raw.get(), Some(&None));
     }
 
     #[test]

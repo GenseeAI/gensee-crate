@@ -1,41 +1,5 @@
 import Foundation
 
-struct EndpointSensorHealth: Equatable {
-    var connected = false
-    var running = false
-    var mode = "observe"
-    var totalEvents: UInt64 = 0
-    var bufferedEvents: UInt64 = 0
-    var backlogEvents: UInt64 = 0
-    var kernelDrops: UInt64 = 0
-    var ringDrops: UInt64 = 0
-    var lastGlobalSequence: UInt64 = 0
-    var ingestedEvents: UInt64 = 0
-    var persistedEvents: UInt64 = 0
-    var suppressedEvents: UInt64 = 0
-    var prunedSystemEvents: UInt64 = 0
-    var prunedLowSeverityAlerts: UInt64 = 0
-    var lastBatchDurationMS: UInt64 = 0
-    var rejectedEvents: UInt64 = 0
-    var authorizationCount: UInt64 = 0
-    var deniedCount: UInt64 = 0
-    var maxAuthorizationLatencyUS: UInt64 = 0
-    var configuredMaxAuthorizationLatencyUS: UInt64 = 10_000
-    var managedProcesses: UInt64 = 0
-    var lastEventAt: Date?
-    var error: String?
-    var configurationWarning: String?
-    var launchContinuityIssue: EndpointEvidenceContinuityIssue?
-
-    var hasDataLoss: Bool {
-        kernelDrops > 0 || ringDrops > 0 || rejectedEvents > 0 || launchContinuityIssue != nil
-    }
-    var hasBackpressure: Bool { backlogEvents >= 1_000 || lastBatchDurationMS >= 1_000 }
-    var exceedsAuthorizationLatencyBudget: Bool {
-        maxAuthorizationLatencyUS > configuredMaxAuthorizationLatencyUS
-    }
-}
-
 /// Pulls bounded event batches from the root system extension and streams them
 /// to one long-lived `gensee ingest endpoint-security` process. The Rust side
 /// owns durable storage, process graph attribution, findings, and correlation.
@@ -67,7 +31,6 @@ final class EndpointSecuritySensor: ObservableObject {
     private var configurationNeedsPush = false
     private var ingestErrorBuffer = Data()
     private var ingestAcknowledgementBuffer = Data()
-    private var ingestionWarning: String?
 
     init(homeURL: URL, executableURL: URL?) {
         self.homeURL = homeURL
@@ -301,12 +264,12 @@ final class EndpointSecuritySensor: ObservableObject {
                 )
                 cursor = pendingCursor
                 persistCursor()
-                ingestionWarning = EndpointIngestBatchPolicy.warning(
+                health.ingestionWarning = EndpointIngestBatchPolicy.warning(
                     forRejectedEvents: rejectedEvents
                 )
             }
             health.connected = true
-            health.error = health.configurationWarning ?? ingestionWarning
+            health.error = nil
         } catch {
             health.connected = false
             health.error = error.localizedDescription
@@ -455,7 +418,7 @@ final class EndpointSecuritySensor: ObservableObject {
                 eventCount: UInt64(events.count)
             )
         } catch {
-            ingestionWarning = error.localizedDescription
+            health.ingestionWarning = error.localizedDescription
             stopIngester()
             throw error
         }

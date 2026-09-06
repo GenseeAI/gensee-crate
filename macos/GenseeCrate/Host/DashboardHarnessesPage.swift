@@ -390,7 +390,7 @@ private struct CoworkHarnessRow: View {
     @State private var expanded = false
 
     private var sensorReady: Bool {
-        sensor.health.connected && sensor.health.running && sensor.health.error == nil
+        sensor.health.isAvailable
     }
 
     var body: some View {
@@ -430,7 +430,7 @@ private struct CoworkHarnessRow: View {
                     Label(sensorReady ? "Sensor connected" : "Sensor unavailable", systemImage: sensorReady ? "checkmark.circle" : "exclamationmark.circle")
                     Link("Set up audit collection ↗", destination: URL(string: "https://github.com/GenseeAI/gensee-crate/blob/main/integrations/claude-cowork/README.md#local-audit-ingestion")!)
                         .help("Audit collection runs separately in your terminal. Stop it there when finished.")
-                    if !sensorReady || sensor.health.hasDataLoss || sensor.health.hasBackpressure {
+                    if sensor.health.needsAttention {
                         Button("Review sensor health") { model.requestedDashboardDestination = .settings }
                             .buttonStyle(.link)
                             .foregroundStyle(Color.dashboardGold)

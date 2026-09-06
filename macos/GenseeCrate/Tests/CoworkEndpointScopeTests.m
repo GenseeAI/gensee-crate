@@ -88,6 +88,66 @@ static void TestInvalidConfigurationPreservesScopeAndEvidence(void)
     NSCAssert(service.managedRoots.count == 0 && service.configurationWarning.length > 0, @"new malformed sessions are never partially adopted");
 }
 
+static NSDictionary *NamedCoworkRoot(NSNumber *pid, NSNumber *canonical, NSString *session)
+{
+    return @{@"pid": pid, @"root_pid": canonical, @"session_id": session,
+             @"kind": @"claude-cowork", @"cowork_session_mode": @"local"};
+}
+
+static void TestUnidentifiedEntriesDoNotFreezeOtherSessions(void)
+{
+    GenseeSensorService *service = [[GenseeSensorService alloc] init];
+    NSDictionary *removedRoot = NamedCoworkRoot(@600, @600, @"removed");
+    NSCAssert(Configure(service, @[CoworkRoot(@500), removedRoot]), @"initial sessions");
+    es_process_t removed = CoworkProcess(600, "com.anthropic.claudefordesktop", "Q6L2SF6YDW");
+    NSCAssert([[service sessionForProcessLocked:&removed messageVersion:4] isEqual:@"removed"], @"cache removed session");
+    dispatch_sync(service.queue, ^{
+        [service appendEventLocked:@{@"attribution": @{@"session_id": @"removed"}, @"file": @{@"path": @"/test/removed"}}];
+    });
+    NSDictionary *relaunched = NamedCoworkRoot(@510, @510, @"cowork");
+    NSDictionary *newSession = NamedCoworkRoot(@700, @700, @"new");
+    NSMutableDictionary *unidentified = [CoworkRoot(@800) mutableCopy];
+    [unidentified removeObjectForKey:@"session_id"];
+    NSCAssert(Configure(service, @[relaunched, newSession, unidentified]), @"mixed update accepted");
+    NSCAssert(service.configurationWarning.length > 0, @"unidentified entry warns");
+    NSCAssert(([service.managedRoots isEqual:@{@510: @"cowork", @700: @"new"}]), @"valid relaunch and new session both apply; absent session revoked");
+    es_process_t live = CoworkProcess(510, "com.anthropic.claudefordesktop", "Q6L2SF6YDW");
+    NSCAssert([[service sessionForProcessLocked:&live messageVersion:4] isEqual:@"cowork"], @"relaunch is observable");
+    NSCAssert([service sessionForProcessLocked:&removed messageVersion:4] == nil, @"revocation clears cached generation despite malformed neighbor");
+    dispatch_sync(service.queue, ^{ NSCAssert([service eventAtOffsetLocked:0][@"sensor_revoked"] != nil, @"revocation erases buffered payload"); });
+    NSCAssert(Configure(service, @[unidentified]), @"only unreadable entry");
+    NSCAssert(service.managedRoots.count == 0, @"unreadable entry cannot preserve absent sessions");
+}
+
+static void TestReassignedPIDsTakePrecedenceOverRestoration(void)
+{
+    // Exercise both helper reassignment and canonical-root replacement. In
+    // either order, malformed prior metadata cannot overwrite a valid claim.
+    for (NSNumber *claimedPID in @[@501, @500]) {
+        for (NSNumber *invalidFirst in @[@NO, @YES]) {
+            GenseeSensorService *service = [[GenseeSensorService alloc] init];
+            NSCAssert(Configure(service, @[CoworkRoot(@500), CoworkRoot(@501)]), @"initial scope");
+            es_process_t claimed = CoworkProcess(claimedPID.intValue, "com.anthropic.claudefordesktop", "Q6L2SF6YDW");
+            NSCAssert([[service sessionForProcessLocked:&claimed messageVersion:4] isEqual:@"cowork"], @"cache prior owner");
+            dispatch_sync(service.queue, ^{
+                [service appendEventLocked:@{@"attribution": @{@"session_id": @"cowork"}, @"file": @{@"path": @"/test/prior"}}];
+            });
+            NSDictionary *newRoot = NamedCoworkRoot(claimedPID, claimedPID, @"cowork-2");
+            NSMutableDictionary *malformed = [CoworkRoot(claimedPID) mutableCopy];
+            malformed[@"cowork_session_mode"] = @"invalid";
+            NSArray *update = invalidFirst.boolValue ? @[malformed, newRoot] : @[newRoot, malformed];
+            NSCAssert(Configure(service, update), @"valid rekey alongside malformed prior entry");
+            NSCAssert([service.managedRoots[claimedPID] isEqual:@"cowork-2"], @"valid PID mapping always wins");
+            NSCAssert([[service sessionForProcessLocked:&claimed messageVersion:4] isEqual:@"cowork-2"], @"cached generation cannot override new PID claim");
+            BOOL superseded = claimedPID.intValue == 500;
+            NSCAssert((service.coworkSessionModes[@"cowork"] == nil) == superseded, @"canonical reassignment supersedes whole session; helper reassignment retains remaining scope");
+            dispatch_sync(service.queue, ^{
+                NSCAssert(([service eventAtOffsetLocked:0][@"file"] == nil) == superseded, @"final adopted scope alone determines payload retention");
+            });
+        }
+    }
+}
+
 static void TestRevocationPreservesLoss(void)
 {
     GenseeSensorService *service = [[GenseeSensorService alloc] init];
@@ -135,6 +195,8 @@ int main(int argc, const char *argv[])
 {
     @autoreleasepool {
         TestInvalidConfigurationPreservesScopeAndEvidence();
+        TestUnidentifiedEntriesDoNotFreezeOtherSessions();
+        TestReassignedPIDsTakePrecedenceOverRestoration();
         TestRevocationPreservesLoss();
         NSCAssert(argc == 2, @"shared signing fixture path required");
         NSData *fixtureData = [NSData dataWithContentsOfFile:@(argv[1])];

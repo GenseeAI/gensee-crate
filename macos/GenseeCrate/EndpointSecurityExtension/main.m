@@ -845,7 +845,6 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
             continue;
         }
         {
-            roots[pid] = sessionID;
             if (cowork) {
                 NSString *sessionMode = root[@"cowork_session_mode"];
                 if (![sessionMode isKindOfClass:NSString.class] ||
@@ -866,6 +865,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
                 coworkSessionModes[sessionID] = sessionMode;
                 coworkCanonicalRootPIDs[sessionID] = canonicalRoot;
             }
+            roots[pid] = sessionID;
         }
     }
     for (NSString *sessionID in coworkCanonicalRootPIDs) {
@@ -875,12 +875,8 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         }
     }
     @synchronized (self) {
-        // If a malformed entry cannot identify its session, preserve all known
-        // Cowork sessions; an explicit opt-out (no Cowork entries) still revokes.
-        if (unidentifiedCoworkSession) {
-            [invalidCoworkSessions addObjectsFromArray:self.coworkSessionModes.allKeys];
-            [invalidCoworkSessions addObjectsFromArray:coworkSessionModes.allKeys];
-        }
+        // An unreadable session ID cannot retain any prior session. Ignore
+        // that entry while applying named updates and removals normally.
         for (NSNumber *pid in [roots.allKeys copy]) {
             if ([invalidCoworkSessions containsObject:roots[pid]]) {
                 [roots removeObjectForKey:pid];
@@ -891,22 +887,31 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
             [coworkSessionModes removeObjectForKey:sessionID];
             [coworkCanonicalRootPIDs removeObjectForKey:sessionID];
             if (self.coworkSessionModes[sessionID] == nil) continue;
+            NSNumber *priorCanonicalRoot = self.coworkCanonicalRootPIDs[sessionID];
+            // A valid reassignment of the canonical root supersedes the old
+            // session, including its cached descendants and buffered payloads.
+            if (roots[priorCanonicalRoot] != nil && ![roots[priorCanonicalRoot] isEqualToString:sessionID]) continue;
             coworkSessionModes[sessionID] = self.coworkSessionModes[sessionID];
-            coworkCanonicalRootPIDs[sessionID] = self.coworkCanonicalRootPIDs[sessionID];
+            coworkCanonicalRootPIDs[sessionID] = priorCanonicalRoot;
             for (NSNumber *pid in self.managedRoots) {
-                if ([self.managedRoots[pid] isEqualToString:sessionID]) {
+                if ([self.managedRoots[pid] isEqualToString:sessionID] && roots[pid] == nil) {
                     roots[pid] = sessionID;
                     if ([self.coworkRootPIDs containsObject:pid]) [coworkRootPIDs addObject:pid];
                 }
             }
         }
         self.configurationWarning = invalidCoworkSessions.count > 0 || unidentifiedCoworkSession
-            ? @"Invalid Cowork configuration; retaining prior scope and evidence. New sessions are excluded until corrected."
+            ? @"Invalid Cowork entries skipped. Prior scope is retained unless removed or reassigned."
             : nil;
         NSSet<NSString *> *activeSessions = [NSSet setWithArray:roots.allValues];
         NSMutableDictionary<NSString *, NSString *> *activeProcesses = [NSMutableDictionary dictionary];
         [self.managedProcesses enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *sessionID, BOOL *stop) {
-            if ([activeSessions containsObject:sessionID]) activeProcesses[key] = sessionID;
+            NSNumber *pid = @([key componentsSeparatedByString:@":"].firstObject.intValue);
+            NSString *claimedSession = roots[pid];
+            if ([activeSessions containsObject:sessionID] &&
+                (claimedSession == nil || [claimedSession isEqualToString:sessionID])) {
+                activeProcesses[key] = sessionID;
+            }
         }];
         self.mode = requestedMode;
         self.protectedPaths = [(protectedPaths ?: @[]) valueForKey:@"stringByStandardizingPath"];
@@ -918,12 +923,14 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         self.coworkCanonicalRootPIDs = coworkCanonicalRootPIDs;
         self.maxAuthorizationLatencyUS = (maxAuthorizationLatencyMS ?: @10).unsignedLongLongValue * 1000ULL;
     }
+    // Only the final adopted scope determines evidence retention: restored
+    // sessions stay active; removed or superseded sessions lose their payloads.
     NSSet<NSString *> *activeSessions = [NSSet setWithArray:roots.allValues];
     dispatch_sync(self.queue, ^{
         for (NSUInteger offset = 0; offset < self.events.count; offset++) {
             NSDictionary *event = [self eventAtOffsetLocked:offset];
             NSString *sessionID = event[@"attribution"][@"session_id"];
-            if (sessionID.length > 0 && ![activeSessions containsObject:sessionID] && ![invalidCoworkSessions containsObject:sessionID]) {
+            if (sessionID.length > 0 && ![activeSessions containsObject:sessionID]) {
                 NSUInteger index = (self.ringStart + offset) % self.events.count;
                 self.events[index] = @{@"sensor_cursor": event[@"sensor_cursor"], @"sensor_revoked": @YES,
                                        @"dropped_events": event[@"dropped_events"] ?: @0,

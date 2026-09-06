@@ -213,8 +213,12 @@ policy or claiming that a finite buffer can absorb unlimited load.
 ## Configuration compatibility
 
 Malformed or incompatible Cowork updates retain the affected session's last
-valid roots, verified process generations, and buffered evidence. New invalid
-sessions are excluded. Unrelated sensor policy and root updates still apply.
+valid roots, verified process generations, and buffered evidence, except where a
+valid update reassigns those PIDs. Reassigning a session's canonical root
+supersedes that session and revokes its scope and buffered payloads. New invalid
+sessions are excluded. Entries without a readable session ID are ignored; they
+cannot retain absent sessions or block valid updates. Unrelated sensor policy
+and root updates still apply.
 The reply and sensor health report a configuration warning until corrected;
 explicitly removing the session still revokes its scope and buffered payloads.
 The shared `signing-identity-fixture.json` is asserted by both the Rust classifier

@@ -1126,6 +1126,18 @@ struct DashboardSettingsPage: View {
                     .foregroundStyle(sensor.health.connected && sensor.health.running ? Color.secondary : Color.dashboardRed)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let warning = sensor.health.configurationWarning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.dashboardGold)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let warning = sensor.health.ingestionWarning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.dashboardRed)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack {
                 Button("Full Disk Access") { model.openFullDiskAccess() }
                 if extensionManager.state == .awaitingApproval {
