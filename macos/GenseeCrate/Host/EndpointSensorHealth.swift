@@ -67,6 +67,8 @@ struct MonitoringGapAlarmTracker {
     private var unavailableSince: SuspendingClock.Instant?
     private var healthySince: SuspendingClock.Instant?
     private var restoredOutageBanner = false
+    private var displayedOutageKind: OutageKind?
+    private var eventLossBanner: MonitoringHealthIncident?
     private var interruptions: [SuspendingClock.Instant] = []
     private var alarmedKinds: Set<OutageKind> = []
     private var graceUntil: SuspendingClock.Instant?
@@ -84,6 +86,23 @@ struct MonitoringGapAlarmTracker {
         bannerIncident = incident
     }
 
+    mutating func dismissBanner() {
+        if case .events = bannerIncident {
+            eventLossBanner = nil
+            setBanner(nil)
+        } else {
+            // Dismiss the visible outage only; an undisclosed history gap
+            // remains independently actionable and becomes visible underneath.
+            setBanner(eventLossBanner)
+        }
+    }
+
+    private mutating func clearOutageBanner() {
+        if bannerIncident == .unavailable || bannerIncident == .stalled {
+            setBanner(eventLossBanner)
+        }
+    }
+
     mutating func resumeAfterSleep(now: SuspendingClock.Instant) {
         resetOutageWindow()
         graceUntil = now.advanced(by: .seconds(30))
@@ -95,7 +114,7 @@ struct MonitoringGapAlarmTracker {
         guard let configuredMode = health.configuredMode, configuredMode != "off" else {
             resetOutageWindow()
             alarmedKinds.removeAll()
-            setBanner(nil)
+            clearOutageBanner()
             return nil
         }
         if let graceUntil {
@@ -112,15 +131,17 @@ struct MonitoringGapAlarmTracker {
                 unavailableSince = now
                 interruptions.append(now)
                 restoredOutageBanner = false
+                displayedOutageKind = nil
             }
             let kind: OutageKind = unavailable ? .unavailable : .stalled
             let incident: MonitoringHealthIncident = unavailable ? .unavailable : .stalled
             if unavailableSince!.duration(to: now) >= .seconds(10) || interruptions.count >= 3 {
                 // A re-outage also gets grace before restoring a dismissed
                 // banner. Native notifications remain latched until recovery.
-                if !restoredOutageBanner || bannerIncident != incident {
+                if !restoredOutageBanner || displayedOutageKind != kind {
                     setBanner(incident, newIncident: true)
                     restoredOutageBanner = true
+                    displayedOutageKind = kind
                 }
                 if alarmedKinds.insert(kind).inserted { return incident }
             }
@@ -133,9 +154,7 @@ struct MonitoringGapAlarmTracker {
             resetOutageWindow()
             healthySince = now
             // Recovery restores availability, not the missing event history.
-            if bannerIncident == .unavailable || bannerIncident == .stalled {
-                setBanner(nil)
-            }
+            clearOutageBanner()
         }
         defer { previous = health }
         guard let previous, previous.bootID == health.bootID,
@@ -147,7 +166,32 @@ struct MonitoringGapAlarmTracker {
         guard pending >= 100, lastAlarm.map({ $0.duration(to: now) >= .seconds(60) }) ?? true else { return nil }
         let count = pending
         pending = 0; lastAlarm = now
-        setBanner(.events(count), newIncident: true)
+        let previousLoss: UInt64
+        if case .events(let existing) = eventLossBanner { previousLoss = existing } else { previousLoss = 0 }
+        eventLossBanner = .events(previousLoss + count)
+        if bannerIncident != .unavailable && bannerIncident != .stalled {
+            setBanner(eventLossBanner, newIncident: true)
+        }
         return .events(count)
+    }
+}
+
+/// Transport identity is independent of the last displayed health sample.
+/// Late callbacks from replaced XPC connections cannot invalidate their successor.
+struct EndpointConnectionRecovery {
+    private(set) var generation: UInt64 = 0
+    private(set) var needsConnection = true
+
+    mutating func installed() -> UInt64 {
+        generation &+= 1
+        needsConnection = false
+        return generation
+    }
+
+    @discardableResult
+    mutating func failed(generation: UInt64) -> Bool {
+        guard generation == self.generation else { return false }
+        needsConnection = true
+        return true
     }
 }

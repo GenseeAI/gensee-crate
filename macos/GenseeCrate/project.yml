@@ -155,6 +155,8 @@ targets:
       - Tests/HarnessConfigurationHealthTests.swift
       - Tests/EndpointIngestAcknowledgementIOTests.swift
       - Tests/EndpointSensorHealthTests.swift
+      - Host/EndpointSecurityExtensionManager.swift
+      - Tests/EndpointSecurityLifecycleTests.swift
       - Tests/HarnessActivationGuidanceTests.swift
       - Tests/AlertSeverityBreakdownTests.swift
       - Tests/TimelineModelsTests.swift

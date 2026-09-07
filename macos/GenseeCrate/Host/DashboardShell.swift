@@ -41,7 +41,7 @@ struct DashboardShell: View {
                     Label(alarm, systemImage: "exclamationmark.shield.fill").foregroundStyle(.red)
                     Spacer()
                     Button("Sensor health") { selection = .settings }
-                    Button("Dismiss") { notifications.monitoringHealthAlarm = nil }
+                    Button("Dismiss") { notifications.dismissMonitoringHealthAlarm() }
                 }.font(.callout).padding(12).background(Color.red.opacity(0.08))
             }
             if model.isDemoMode {

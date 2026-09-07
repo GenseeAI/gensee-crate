@@ -46,8 +46,6 @@ private final class GenseeAppDelegate: NSObject, NSApplicationDelegate {
             if !self.hasActivatedSensor {
                 self.hasActivatedSensor = true
                 self.consoleModel.endpointSensor.start()
-            } else if !self.consoleModel.endpointSensor.health.connected {
-                self.consoleModel.endpointSensor.reconnect()
             }
         }
         extensionManager.refreshStatus()
@@ -58,7 +56,7 @@ private final class GenseeAppDelegate: NSObject, NSApplicationDelegate {
                 try? await Task.sleep(for: .seconds(15))
                 guard !Task.isCancelled, let self else { return }
                 if self.extensionManager.state != .active {
-                    self.refreshExtensionStatusIfIdle()
+                    self.extensionManager.probeStatus()
                 }
             }
         }
@@ -69,12 +67,7 @@ private final class GenseeAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        refreshExtensionStatusIfIdle()
-    }
-
-    private func refreshExtensionStatusIfIdle() {
-        guard !extensionManager.state.isBusy else { return }
-        extensionManager.refreshStatus()
+        extensionManager.probeStatus()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

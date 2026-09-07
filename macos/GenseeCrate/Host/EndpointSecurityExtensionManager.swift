@@ -81,6 +81,52 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
     @Published private(set) var state: State = .checking
     @Published private(set) var approvalSettingsFallbackMessage: String?
     private var attemptedAutomaticUpgrade = false
+    private var probe: EndpointSecurityStatusProbe?
+    private var probeID: UUID?
+    private let submitProbe: ((@escaping (State?) -> Void) -> Void)?
+
+    init(
+        initialState: State = .checking,
+        approvalSettingsFallbackMessage: String? = nil,
+        submitProbe: ((@escaping (State?) -> Void) -> Void)? = nil
+    ) {
+        self.state = initialState
+        self.approvalSettingsFallbackMessage = approvalSettingsFallbackMessage
+        self.submitProbe = submitProbe
+        super.init()
+    }
+
+    /// Discover external approvals without clearing actionable onboarding
+    /// guidance or publishing a transient checking/busy state.
+    func probeStatus() {
+        switch state {
+        case .notInstalled, .awaitingApproval, .active: break
+        default: return
+        }
+        guard probeID == nil else { return }
+        let id = UUID()
+        probeID = id
+        let completion: (State?) -> Void = { [weak self] observed in
+            guard let self, self.probeID == id else { return }
+            self.probeID = nil
+            self.probe = nil
+            guard let observed, observed != self.state else { return }
+            self.state = observed
+            if observed != .awaitingApproval { self.approvalSettingsFallbackMessage = nil }
+        }
+        if let submitProbe {
+            submitProbe(completion)
+        } else {
+            let probe = EndpointSecurityStatusProbe(completion: completion)
+            self.probe = probe
+            probe.start()
+        }
+    }
+
+    private func cancelProbe() {
+        probeID = nil
+        probe = nil
+    }
 
     var guidanceDetail: String {
         approvalSettingsFallbackMessage ?? state.detail
@@ -91,6 +137,7 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
     }
 
     func refreshStatus() {
+        cancelProbe()
         approvalSettingsFallbackMessage = nil
         state = .checking
         let request = OSSystemExtensionRequest.propertiesRequest(
@@ -102,6 +149,7 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
     }
 
     func activate() {
+        cancelProbe()
         approvalSettingsFallbackMessage = nil
         guard isRunningFromApplications else {
             state = .failed("Gensee Crate must run from /Applications before macOS can activate its extension.")
@@ -118,6 +166,7 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
     }
 
     func deactivate() {
+        cancelProbe()
         approvalSettingsFallbackMessage = nil
         state = .deactivating
         let request = OSSystemExtensionRequest.deactivationRequest(
@@ -154,11 +203,13 @@ extension EndpointSecurityExtensionManager: OSSystemExtensionRequestDelegate {
     }
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
+        cancelProbe()
         state = .awaitingApproval
         openApprovalSettings()
     }
 
     func request(_ request: OSSystemExtensionRequest, didFinishWithResult result: OSSystemExtensionRequest.Result) {
+        cancelProbe()
         switch result {
         case .completed:
             if state == .deactivating {
@@ -175,6 +226,7 @@ extension EndpointSecurityExtensionManager: OSSystemExtensionRequestDelegate {
     }
 
     func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
+        cancelProbe()
         state = .failed(error.localizedDescription)
     }
 
@@ -212,4 +264,42 @@ extension EndpointSecurityExtensionManager: OSSystemExtensionRequestDelegate {
             .appendingPathComponent("Contents/Info.plist")
         return (NSDictionary(contentsOf: infoURL)?["CFBundleVersion"] as? String)
     }
+}
+
+/// A properties-only delegate keeps passive discovery out of activation and
+/// deactivation callbacks. Probe errors preserve the existing presentation.
+private final class EndpointSecurityStatusProbe: NSObject, OSSystemExtensionRequestDelegate {
+    private let completion: (EndpointSecurityExtensionManager.State?) -> Void
+
+    init(completion: @escaping (EndpointSecurityExtensionManager.State?) -> Void) {
+        self.completion = completion
+    }
+
+    func start() {
+        let request = OSSystemExtensionRequest.propertiesRequest(
+            forExtensionWithIdentifier: EndpointSecurityExtensionManager.extensionIdentifier, queue: .main
+        )
+        request.delegate = self
+        OSSystemExtensionManager.shared.submitRequest(request)
+    }
+
+    func request(_ request: OSSystemExtensionRequest, foundProperties properties: [OSSystemExtensionProperties]) {
+        guard let record = properties.first(where: \.isEnabled) ?? properties.first else {
+            completion(.notInstalled)
+            return
+        }
+        if record.isEnabled { completion(.active) }
+        else if record.isAwaitingUserApproval { completion(.awaitingApproval) }
+        else if record.isUninstalling { completion(.deactivating) }
+        else { completion(.notInstalled) }
+    }
+
+    func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) { completion(nil) }
+    func request(_ request: OSSystemExtensionRequest, didFinishWithResult result: OSSystemExtensionRequest.Result) {}
+    func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {}
+    func request(
+        _ request: OSSystemExtensionRequest,
+        actionForReplacingExtension existing: OSSystemExtensionProperties,
+        withExtension ext: OSSystemExtensionProperties
+    ) -> OSSystemExtensionRequest.ReplacementAction { .cancel }
 }

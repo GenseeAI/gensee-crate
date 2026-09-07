@@ -14,6 +14,7 @@ final class EndpointSecuritySensor: ObservableObject {
     private let kernelDropsDefaultsKey: String
     private let acknowledgedContinuityDefaultsKey: String
     private var connection: GenseeEndpointSecurityBridge?
+    private var connectionRecovery = EndpointConnectionRecovery()
     private var ingestProcess: Process?
     private var ingestInput: FileHandle?
     private var ingestAcknowledgements: FileHandle?
@@ -57,47 +58,34 @@ final class EndpointSecuritySensor: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
-        do {
-            try startIngester()
-            try connect()
-            pollingTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    let previousCursor = self?.cursor
-                    await self?.pollOnce()
-                    // A durable acknowledgement bounds each batch. Drain a
-                    // backlog promptly instead of throttling the slow consumer
-                    // further; errors and idle streams retain the normal delay.
-                    let draining = EndpointIngestBatchPolicy.shouldDrainImmediately(
-                        connected: self?.health.connected == true,
-                        backlog: self?.health.backlogEvents ?? 0,
-                        previousCursor: previousCursor ?? 0,
-                        currentCursor: self?.cursor ?? 0
-                    )
-                    try? await Task.sleep(for: .milliseconds(draining ? 10 : 500))
-                }
+        // The loop owns startup and reconnection retries, even if the first
+        // ingester launch fails or the extension goes away in the background.
+        pollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let draining = await self?.pollAndCheckBacklog() ?? false
+                try? await Task.sleep(for: .milliseconds(draining ? 10 : 500))
             }
-        } catch {
-            health.error = error.localizedDescription
         }
     }
 
+    private func pollAndCheckBacklog() async -> Bool {
+        let previousCursor = cursor
+        await pollOnce()
+        return EndpointIngestBatchPolicy.shouldDrainImmediately(
+            connected: health.connected,
+            backlog: health.backlogEvents,
+            previousCursor: previousCursor,
+            currentCursor: cursor
+        )
+    }
+
     func reconnect() {
+        // Serialize replacement with polling instead of tearing down a healthy
+        // connection on a lagging UI status observation.
+        connectionRecovery.failed(generation: connectionRecovery.generation)
+        health.connected = false
         connection?.invalidate()
-        connection = nil
-        checkedLaunchContinuity = false
-        do {
-            try connect()
-            health.error = nil
-        } catch {
-            health.connected = false
-            health.error = error.localizedDescription
-            // Extension upgrades and service restarts invalidate the Mach
-            // connection permanently. Recreate it so polling recovers without
-            // requiring the user to relaunch the console.
-            connection?.invalidate()
-            connection = nil
-            try? connect()
-        }
+        start()
     }
 
     func acknowledgeLaunchContinuityIssue() {
@@ -152,17 +140,30 @@ final class EndpointSecuritySensor: ObservableObject {
             machServiceName: try machServiceName(),
             codeSigningRequirement: "anchor apple generic and certificate leaf[subject.OU] = \"3KWVB4M63F\" and identifier \"ai.gensee.crate.endpoint-security\""
         )
+        let generation = connectionRecovery.installed()
         next.interruptionHandler = { [weak self] in
             Task { @MainActor in
-                self?.health.connected = false
-                self?.health.error = "The Endpoint Security sensor connection was interrupted."
+                self?.connectionFailed(generation: generation, message: "The Endpoint Security sensor connection was interrupted.")
             }
         }
         next.invalidationHandler = { [weak self] in
-            Task { @MainActor in self?.health.connected = false }
+            Task { @MainActor in
+                self?.connectionFailed(generation: generation, message: "The Endpoint Security sensor connection was invalidated.")
+            }
         }
-        next.activate()
+        let previousConnection = connection
         connection = next
+        checkedLaunchContinuity = false
+        configurationNeedsPush = pendingConfigurationData != nil
+        health.connected = false
+        next.activate()
+        previousConnection?.invalidate()
+    }
+
+    private func connectionFailed(generation: UInt64, message: String) {
+        guard connectionRecovery.failed(generation: generation) else { return }
+        health.connected = false
+        health.error = message
     }
 
     private func startIngester() throws {
@@ -216,6 +217,8 @@ final class EndpointSecuritySensor: ObservableObject {
 
     private func pollOnce() async {
         do {
+            if connectionRecovery.needsConnection || connection == nil { try connect() }
+            let generation = connectionRecovery.generation
             if ingestProcess == nil { try startIngester() }
             guard let connection else {
                 throw NSError(
@@ -228,8 +231,9 @@ final class EndpointSecuritySensor: ObservableObject {
             // from a just-disabled harness can be delivered after the user has
             // turned protection off.
             if configurationNeedsPush {
-                try await pushConfiguration(using: connection)
+                try await pushConfiguration(using: connection, generation: generation)
             }
+            guard !configurationNeedsPush, !connectionRecovery.needsConnection else { return }
             let response = try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<([[String: Any]], UInt64, [String: Any]), Error>) in
                 connection.fetchEvents(
@@ -248,9 +252,15 @@ final class EndpointSecuritySensor: ObservableObject {
                         }
                         continuation.resume(returning: (events, nextCursor, health))
                     },
-                    failure: { error in continuation.resume(throwing: error) }
+                    failure: { [weak self] error in
+                        Task { @MainActor in
+                            self?.connectionFailed(generation: generation, message: error.localizedDescription)
+                            continuation.resume(throwing: error)
+                        }
+                    }
                 )
             }
+            guard generation == connectionRecovery.generation, !connectionRecovery.needsConnection else { return }
             health.lastSuccessfulPollAt = SuspendingClock.now
             health.connected = true
             let pendingCursor = response.1
@@ -273,16 +283,19 @@ final class EndpointSecuritySensor: ObservableObject {
                     forRejectedEvents: rejectedEvents
                 )
             }
-            health.connected = true
-            health.error = nil
+            if generation == connectionRecovery.generation, !connectionRecovery.needsConnection {
+                health.connected = true
+                health.error = nil
+            }
         } catch {
             health.connected = false
             health.error = error.localizedDescription
         }
     }
 
-    private func pushConfiguration(using connection: GenseeEndpointSecurityBridge) async throws {
+    private func pushConfiguration(using connection: GenseeEndpointSecurityBridge, generation: UInt64) async throws {
         let configuration = pendingConfiguration
+        let configurationData = pendingConfigurationData
         let warning = try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<String?, Error>) in
             connection.updateConfiguration(
@@ -298,11 +311,17 @@ final class EndpointSecuritySensor: ObservableObject {
                         ))
                     }
                 },
-                failure: { error in continuation.resume(throwing: error) }
+                failure: { [weak self] error in
+                    Task { @MainActor in
+                        self?.connectionFailed(generation: generation, message: error.localizedDescription)
+                        continuation.resume(throwing: error)
+                    }
+                }
             )
         }
+        guard generation == connectionRecovery.generation, !connectionRecovery.needsConnection else { return }
         health.configurationWarning = warning
-        configurationNeedsPush = false
+        configurationNeedsPush = pendingConfigurationData != configurationData
     }
 
     @discardableResult

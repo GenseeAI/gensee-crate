@@ -14,7 +14,7 @@ struct AlertNotificationDigest: Equatable {
 final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published private(set) var lastDeliveryError: String?
-    @Published var monitoringHealthAlarm: String?
+    @Published private(set) var monitoringHealthAlarm: String?
     @Published var monitoringHealthNotificationsEnabled = UserDefaults.standard.object(forKey: "gensee.notifications.monitoringHealth") as? Bool ?? true {
         didSet { defaults.set(monitoringHealthNotificationsEnabled, forKey: "gensee.notifications.monitoringHealth") }
     }
@@ -172,12 +172,20 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         }
     }
 
+    func dismissMonitoringHealthAlarm() {
+        monitoringTracker.dismissBanner()
+        updateMonitoringHealthBanner()
+    }
+
+    private func updateMonitoringHealthBanner() {
+        guard lastMonitoringBannerRevision != monitoringTracker.bannerRevision else { return }
+        lastMonitoringBannerRevision = monitoringTracker.bannerRevision
+        monitoringHealthAlarm = monitoringTracker.bannerIncident.map(Self.monitoringMessage)
+    }
+
     func processMonitoringHealth(_ health: EndpointSensorHealth, now: SuspendingClock.Instant = .now) async {
         let incident = monitoringTracker.observe(health, now: now)
-        if lastMonitoringBannerRevision != monitoringTracker.bannerRevision {
-            lastMonitoringBannerRevision = monitoringTracker.bannerRevision
-            monitoringHealthAlarm = monitoringTracker.bannerIncident.map(Self.monitoringMessage)
-        }
+        updateMonitoringHealthBanner()
         guard let incident else { return }
         let message = Self.monitoringMessage(incident)
         guard monitoringHealthNotificationsEnabled else { return }

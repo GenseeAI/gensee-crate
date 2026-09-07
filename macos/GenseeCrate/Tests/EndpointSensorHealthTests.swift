@@ -18,6 +18,7 @@ final class EndpointSensorHealthTests: XCTestCase {
         var health = EndpointSensorHealth(configuredMode: "observe")
         _ = tracker.observe(health, now: start)
         XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(10))), .unavailable)
+        tracker.dismissBanner()
         let dismissedRevision = tracker.bannerRevision
         XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(11))))
         XCTAssertEqual(tracker.bannerRevision, dismissedRevision)
@@ -48,6 +49,70 @@ final class EndpointSensorHealthTests: XCTestCase {
             XCTAssertEqual(tracker.bannerIncident, .events(100))
             XCTAssertEqual(tracker.bannerRevision, revision, "Recovery must neither clear nor restore a dismissed event-loss cue")
         }
+    }
+
+    func testUndismissedLossReturnsAfterOutageRecoveryAcrossSensorRestart() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
+        health.bootID = "before"
+        _ = tracker.observe(health, now: start)
+        health.kernelDrops = 100
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(1)))
+        health.connected = false
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(2)))
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(12))), .unavailable)
+        XCTAssertEqual(tracker.bannerIncident, .unavailable)
+        health.connected = true; health.bootID = "after"; health.kernelDrops = 0
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(13)))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(43)))
+        XCTAssertEqual(tracker.bannerIncident, .events(100))
+        tracker.dismissBanner()
+        XCTAssertNil(tracker.bannerIncident)
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(80)))
+        XCTAssertNil(tracker.bannerIncident)
+        health.kernelDrops = 100
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(81))), .events(100))
+    }
+
+    func testDismissingOutageRevealsLossWithoutRestoringTheSameOutage() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
+        _ = tracker.observe(health, now: start)
+        health.kernelDrops = 100
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(1)))
+        health.connected = false
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(2)))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(12)))
+        tracker.dismissBanner()
+        XCTAssertEqual(tracker.bannerIncident, .events(100))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(13)))
+        XCTAssertEqual(tracker.bannerIncident, .events(100))
+        tracker.dismissBanner()
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(14)))
+        XCTAssertNil(tracker.bannerIncident)
+        health.connected = true
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(15)))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(45)))
+        XCTAssertNil(tracker.bannerIncident, "Dismissed history must not return after recovery")
+    }
+
+    func testLossDismissedBeforeOutageDoesNotReturnOnRecovery() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
+        _ = tracker.observe(health, now: start)
+        health.kernelDrops = 100
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(1)))
+        tracker.dismissBanner()
+        health.connected = false
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(2)))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(12)))
+        health.connected = true
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(13)))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(43)))
+        XCTAssertNil(tracker.bannerIncident)
     }
 
     func testDeathDuringSleepAlarmsFortyActiveSecondsAfterWake() {
