@@ -1789,12 +1789,16 @@ impl EventStore {
     /// views must not infer that an older request had no tools merely because
     /// its events fell outside those windows.
     pub fn dashboard_request(&self, request_id: i64) -> io::Result<Value> {
+        let timer = Instant::now();
         let groups = {
             let db = self.sqlite_store()?;
             let mut groups = DashboardRequestGroups::load(db.connection())?;
             groups.load_prompts(db.connection(), &[request_id])?;
             groups
         };
+        if std::env::var_os("GENSEE_DASHBOARD_TIMING").is_some() {
+            eprintln!("request groups: {}ms", timer.elapsed().as_millis());
+        }
         let root = groups.root(request_id);
         let mut result = self.dashboard_request_ungrouped(root)?;
         result["request"]["original_user_prompt"] = json!(groups
@@ -1827,6 +1831,12 @@ impl EventStore {
         let db = self.sqlite_store()?;
         let conn = db.connection();
 
+        let timer = Instant::now();
+        let timing = |phase: &str| {
+            if std::env::var_os("GENSEE_DASHBOARD_TIMING").is_some() {
+                eprintln!("request detail {phase}: {}ms", timer.elapsed().as_millis());
+            }
+        };
         let mut request = conn
             .query_row(
                 grouped_request_sql!(concat!("SELECT request_id, session_id, ", recovered_request_prompt_sql!(""), ", created_at, (SELECT MAX(completed_at) FROM requests WHERE request_id IN ("), "))
@@ -1854,16 +1864,19 @@ impl EventStore {
                 )
             })?;
 
+        timing("request metadata");
         request["file_touches"] = Value::Array(merge_harness_declared_file_touches(
             dashboard_file_touches(conn, request_id)?,
             dashboard_completed_native_file_touches(conn, request_id)?,
         ));
+        timing("file touches");
         let ignored_file_touches = dashboard_ignored_file_touch_paths(conn, request_id)?;
         request["ignored_file_touch_paths"] = json!(ignored_file_touches.paths);
         request["ignored_file_touch_events_omitted"] =
             json!(ignored_file_touches.omitted_event_count);
         request["ignored_file_touch_paths_truncated"] = json!(ignored_file_touches.paths_truncated);
 
+        timing("ignored paths");
         let agent_events = query_json_rows_with_i64(
             conn,
             grouped_request_sql!(
@@ -1896,7 +1909,9 @@ impl EventStore {
             },
         )?;
 
+        timing("agent events");
         let alerts = dashboard_alerts(conn, Some(request_id), None)?;
+        timing("alerts");
         let raw_alert_count = alerts
             .iter()
             .map(|alert| alert["raw_event_count"].as_i64().unwrap_or(1))
@@ -4151,52 +4166,51 @@ fn merge_evidence(base: Option<Value>, enrichment: Option<Value>) -> Option<Valu
 fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::Result<Vec<Value>> {
     let touches = query_json_rows_with_i64(
         conn,
+        // Scope both sides of lineage to the request before joining artifacts.
+        // Looking up every historical relation for an artifact can revisit
+        // millions of unrelated records for each path in a long-running store.
         grouped_request_sql!(
-            "SELECT CASE
+            "WITH declared_artifacts AS MATERIALIZED (
+                SELECT DISTINCT relation.dst_id AS artifact_id
+                FROM agent_events AS event INDEXED BY idx_agent_events_request_ts
+                CROSS JOIN relations AS relation INDEXED BY idx_relations_src
+                  ON relation.src_kind = 'agent_event' AND relation.src_id = event.event_id
+                WHERE event.request_id IN (",
+            ") AND relation.dst_kind = 'artifact'
+                  AND relation.relation_type IN ('produced', 'modified', 'deleted')
+             ), observed_artifacts AS MATERIALIZED (
+                SELECT relation.dst_id AS artifact_id, MAX(event.ts) AS last_observed_at
+                FROM system_events AS event INDEXED BY idx_system_events_dashboard_visibility
+                CROSS JOIN relations AS relation INDEXED BY idx_relations_src
+                  ON relation.src_kind = 'system_event' AND relation.src_id = event.event_id
+                WHERE event.source = 'macos-endpoint-security' AND event.request_id IN (",
+            ") AND relation.dst_kind = 'artifact'
+                  AND relation.relation_type IN ('wrote', 'modified', 'deleted')
+                  AND EXISTS (
+                    SELECT 1 FROM relations AS request_relation
+                    WHERE request_relation.src_kind = 'request' AND request_relation.src_id IN (",
+            ") AND request_relation.dst_kind = 'artifact'
+                      AND request_relation.dst_id = relation.dst_id
+                      AND request_relation.relation_type IN ('produced', 'modified', 'deleted')
+                  )
+                GROUP BY relation.dst_id
+             )
+             SELECT CASE
                     WHEN artifacts.uri LIKE 'file://%' THEN substr(artifacts.uri, 8)
                     WHEN artifacts.uri LIKE 'file:%' THEN substr(artifacts.uri, 6)
                     ELSE artifacts.uri
                 END AS path,
-                EXISTS (
-                    SELECT 1
-                    FROM relations AS declared_relation
-                    JOIN agent_events AS declaring_event
-                      ON declaring_event.event_id = declared_relation.src_id
-                    WHERE declared_relation.src_kind = 'agent_event'
-                      AND declared_relation.dst_kind = 'artifact'
-                      AND declared_relation.dst_id = artifacts.artifact_id
-                      AND declared_relation.relation_type IN
-                          ('produced', 'modified', 'deleted')
-                      AND declaring_event.request_id IN (",
-            ")
-                ) AS intended_and_verified,
-                MAX(system_events.ts) AS last_observed_at,
-                artifact_facts.risk_level,
-                artifact_facts.risk_rule_id,
+                EXISTS (SELECT 1 FROM declared_artifacts WHERE artifact_id = artifacts.artifact_id),
+                observed_artifacts.last_observed_at,
+                artifact_facts.risk_level, artifact_facts.risk_rule_id,
                 COALESCE(artifact_facts.is_memory_artifact, 0),
                 COALESCE(artifact_facts.is_persistent_target, 0),
                 COALESCE(artifact_facts.is_control_plane, 0)
-         FROM relations AS request_relation INDEXED BY idx_relations_src
-         JOIN artifacts ON artifacts.artifact_id = request_relation.dst_id
-         JOIN relations AS observed_relation INDEXED BY idx_relations_dst
-           ON observed_relation.src_kind = 'system_event'
-          AND observed_relation.dst_kind = 'artifact'
-          AND observed_relation.dst_id = artifacts.artifact_id
-          AND observed_relation.relation_type IN ('wrote', 'modified', 'deleted')
-         JOIN system_events
-           ON system_events.event_id = observed_relation.src_id
-          AND system_events.request_id IN (",
-            ")
-          AND system_events.source = 'macos-endpoint-security'
-         LEFT JOIN artifact_facts
-           ON artifact_facts.current_artifact_id = artifacts.artifact_id
-         WHERE request_relation.src_kind = 'request'
-           AND request_relation.src_id IN (",
-            ")
-           AND request_relation.dst_kind = 'artifact'
-           AND request_relation.relation_type IN ('produced', 'modified', 'deleted')
-         GROUP BY artifacts.artifact_id, artifacts.uri
-         ORDER BY path"
+             FROM observed_artifacts
+             JOIN artifacts ON artifacts.artifact_id = observed_artifacts.artifact_id
+             LEFT JOIN artifact_facts ON artifact_facts.current_artifact_id = artifacts.artifact_id
+             GROUP BY artifacts.artifact_id, artifacts.uri
+             ORDER BY path"
         ),
         request_id,
         |row| {
@@ -4429,36 +4443,49 @@ fn dashboard_request_file_touches(
                   ) = 0
             GROUP BY request_relation.src_id, artifacts.artifact_id, artifacts.uri
          ),
+         declared_artifacts AS MATERIALIZED (
+            SELECT DISTINCT event.request_id, relation.dst_id AS artifact_id
+            FROM recent_requests
+            CROSS JOIN agent_events AS event INDEXED BY idx_agent_events_request_ts
+              ON event.request_id = recent_requests.request_id
+            CROSS JOIN relations AS relation INDEXED BY idx_relations_src
+              ON relation.src_kind = 'agent_event' AND relation.src_id = event.event_id
+            WHERE relation.dst_kind = 'artifact'
+              AND relation.relation_type IN ('produced', 'modified', 'deleted')
+         ),
+         observed_artifacts AS MATERIALIZED (
+            SELECT event.request_id, relation.dst_id AS artifact_id,
+                   MAX(event.ts) AS last_observed_at
+            FROM recent_requests
+            CROSS JOIN system_events AS event INDEXED BY idx_system_events_dashboard_visibility
+              ON event.source = 'macos-endpoint-security'
+             AND event.request_id = recent_requests.request_id
+            CROSS JOIN relations AS relation INDEXED BY idx_relations_src
+              ON relation.src_kind = 'system_event' AND relation.src_id = event.event_id
+            JOIN request_artifacts
+              ON request_artifacts.request_id = event.request_id
+             AND request_artifacts.artifact_id = relation.dst_id
+            WHERE relation.dst_kind = 'artifact'
+              AND relation.relation_type IN ('wrote', 'modified', 'deleted')
+            GROUP BY event.request_id, relation.dst_id
+         ),
          raw_touches AS (
             SELECT request_artifacts.request_id,
                    request_artifacts.path,
-                   EXISTS (
-                     SELECT 1
-                     FROM relations AS declared_relation
-                     JOIN agent_events AS declaring_event
-                       ON declaring_event.event_id = declared_relation.src_id
-                     WHERE declared_relation.src_kind = 'agent_event'
-                       AND declared_relation.dst_kind = 'artifact'
-                       AND declared_relation.dst_id = request_artifacts.artifact_id
-                       AND declared_relation.relation_type IN ('produced', 'modified', 'deleted')
-                       AND declaring_event.request_id = request_artifacts.request_id
+                   EXISTS (SELECT 1 FROM declared_artifacts
+                     WHERE declared_artifacts.request_id = request_artifacts.request_id
+                       AND declared_artifacts.artifact_id = request_artifacts.artifact_id
                    ) AS intended_and_verified,
-                   MAX(system_events.ts) AS last_observed_at,
+                   observed_artifacts.last_observed_at,
                    artifact_facts.risk_level,
                    artifact_facts.risk_rule_id,
                    COALESCE(artifact_facts.is_memory_artifact, 0) AS is_memory_artifact,
                    COALESCE(artifact_facts.is_persistent_target, 0) AS is_persistent_target,
                    COALESCE(artifact_facts.is_control_plane, 0) AS is_control_plane
             FROM request_artifacts
-            JOIN relations AS observed_relation INDEXED BY idx_relations_dst
-              ON observed_relation.src_kind = 'system_event'
-             AND observed_relation.dst_kind = 'artifact'
-             AND observed_relation.dst_id = request_artifacts.artifact_id
-             AND observed_relation.relation_type IN ('wrote', 'modified', 'deleted')
-            JOIN system_events
-              ON system_events.event_id = observed_relation.src_id
-             AND system_events.request_id = request_artifacts.request_id
-             AND system_events.source = 'macos-endpoint-security'
+            JOIN observed_artifacts
+              ON observed_artifacts.request_id = request_artifacts.request_id
+             AND observed_artifacts.artifact_id = request_artifacts.artifact_id
             LEFT JOIN artifact_facts
               ON artifact_facts.kind = request_artifacts.artifact_kind
              AND artifact_facts.uri = request_artifacts.artifact_uri
@@ -4607,12 +4634,17 @@ fn dashboard_ignored_file_touch_paths_with_limits(
         })?;
     let mut statement = conn
         .prepare(grouped_request_sql!(
-            "SELECT pid, ts, source, type, args
-             FROM system_events
-             WHERE request_id IN (",
+            "SELECT event.pid, event.ts, event.source, event.type, event.args
+             FROM (
+                 SELECT event_id, ts
+                 FROM system_events INDEXED BY idx_system_events_dashboard_visibility
+                 WHERE request_id IN (",
             ") AND source = 'macos-endpoint-security'
-             ORDER BY ts, event_id
-             LIMIT ?2"
+                 ORDER BY ts, event_id
+                 LIMIT ?2
+             ) AS selected
+             CROSS JOIN system_events AS event ON event.event_id = selected.event_id
+             ORDER BY selected.ts, selected.event_id"
         ))
         .map_err(sqlite_error_from_rusqlite)?;
     let rows = statement
@@ -6866,6 +6898,64 @@ mod tests {
         assert_eq!(dashboard["requests"][0]["strongest_action"], "deny");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn request_file_evidence_keeps_group_scope_and_chronological_limits() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-request-evidence-scope-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let db = store.sqlite_store().unwrap();
+        let conn = db.connection();
+        conn.execute_batch(r#"
+            INSERT INTO sessions(session_id,agent_id,first_event_at) VALUES ('scope','test',0);
+            INSERT INTO requests(request_id,session_id,original_user_prompt,created_at)
+                VALUES (1,'scope','root',0),(2,'scope','child',0),(3,'scope','unrelated',0);
+            INSERT INTO dashboard_request_groups(source_id,request_id) VALUES (2,1);
+            INSERT INTO artifacts(artifact_id,kind,uri) VALUES (1,'file','/repo/shared.txt');
+            INSERT INTO artifact_facts(kind,uri,current_artifact_id,last_seen_at,risk_level)
+                VALUES ('file','/repo/shared.txt',1,200,'high');
+            INSERT INTO agent_events(event_id,pid,request_id,ts,source,type,cwd)
+                VALUES (1,1,3,80,'test','file_intent','/repo');
+            INSERT INTO system_events(event_id,pid,request_id,ts,source,type,cwd,args) VALUES
+                (1,1,2,100,'macos-endpoint-security','write','/repo','{"file":{"path":"/repo/shared.txt"}}'),
+                (2,1,3,200,'macos-endpoint-security','write','/repo','{"file":{"path":"/repo/shared.txt"}}'),
+                (3,1,1,90,'macos-endpoint-security','write','/repo','{"file":{"path":"/Users/test/.gensee/first"}}'),
+                (4,1,2,110,'macos-endpoint-security','write','/repo','{"file":{"path":"/Users/test/.gensee/last"}}');
+            INSERT INTO relations(src_kind,src_id,dst_kind,dst_id,relation_type,created_at) VALUES
+                ('agent_event',1,'artifact',1,'modified',80),
+                ('request',2,'artifact',1,'modified',100),
+                ('system_event',1,'artifact',1,'modified',100),
+                ('system_event',2,'artifact',1,'modified',200);
+        "#).unwrap();
+        let touches = dashboard_file_touches(conn, 1).unwrap();
+        assert_eq!(touches.len(), 1);
+        assert_eq!(touches[0]["last_observed_at"], 100);
+        assert_eq!(touches[0]["risk_level"], "high");
+        // An intent from another request must never verify this group's write.
+        assert_eq!(touches[0]["intended_and_verified"], false);
+        conn.execute_batch("INSERT INTO agent_events(event_id,pid,request_id,ts,source,type,cwd)
+            VALUES (2,1,1,95,'test','file_intent','/repo');
+            INSERT INTO relations(src_kind,src_id,dst_kind,dst_id,relation_type,created_at)
+            VALUES ('agent_event',2,'artifact',1,'modified',95);").unwrap();
+        assert_eq!(dashboard_file_touches(conn, 1).unwrap()[0]["intended_and_verified"], true);
+        let overview = dashboard_request_file_touches(conn).unwrap();
+        // Overview summaries remain scoped to each contributing request;
+        // another request's intent and later timestamp must not leak into it.
+        assert_eq!(overview[&2][0]["intended_and_verified"], false);
+        assert_eq!(overview[&2][0]["last_observed_at"], 100);
+        assert_eq!(overview[&2][0]["risk_level"], "high");
+        let bounded = dashboard_ignored_file_touch_paths_with_limits(conn, 1, 2, 500).unwrap();
+        assert_eq!(bounded.paths, vec!["/Users/test/.gensee/first".to_string()]);
+        assert_eq!(bounded.omitted_event_count, 1);
+        let complete = dashboard_ignored_file_touch_paths_with_limits(conn, 1, 10, 500).unwrap();
+        assert_eq!(complete.paths, vec!["/Users/test/.gensee/first".to_string(), "/Users/test/.gensee/last".to_string()]);
+        assert_eq!(complete.omitted_event_count, 0);
+        drop(db);
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

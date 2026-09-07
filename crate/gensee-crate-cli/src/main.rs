@@ -4217,10 +4217,20 @@ fn dashboard_request(args: Vec<OsString>) -> io::Result<()> {
             "request ID must be positive",
         ));
     }
+    let timer = std::time::Instant::now();
+    let timing = |phase: &str| {
+        if env::var_os("GENSEE_DASHBOARD_TIMING").is_some() {
+            eprintln!("dashboard-request {phase}: {}ms", timer.elapsed().as_millis());
+        }
+    };
     let store = EventStore::default_local()?;
+    timing("open");
     configure_dashboard_noise_filter(&store)?;
+    timing("noise filter");
     let mut dashboard = store.dashboard_request(request_id)?;
+    timing("detail");
     approval_memory::annotate_dashboard(&mut dashboard);
+    timing("annotation");
     println!("{}", serde_json::to_string(&dashboard)?);
     Ok(())
 }

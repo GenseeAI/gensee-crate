@@ -179,6 +179,28 @@ static void TestWholeSessionValidationPrecedesPIDMerge(void)
     }
 }
 
+static void TestKernelLossIsReportedOnlyWhenItIncreases(void)
+{
+    GenseeSensorService *service = [[GenseeSensorService alloc] init];
+    dispatch_sync(service.queue, ^{
+        service.kernelDrops = 3;
+        [service appendEventLocked:@{}];
+        for (NSUInteger i = 0; i < 1000; i++) [service appendEventLocked:@{}];
+        NSCAssert([[service eventAtOffsetLocked:0][@"dropped_events"] unsignedLongLongValue] == 3,
+                  @"new loss must be reported");
+        for (NSUInteger i = 1; i < service.events.count; i++) {
+            NSCAssert([[service eventAtOffsetLocked:i][@"dropped_events"] unsignedLongLongValue] == 0,
+                      @"unchanged cumulative loss must not generate repeated gap alerts");
+        }
+        service.kernelDrops = 5;
+        [service appendEventLocked:@{}];
+        NSCAssert([[service eventAtOffsetLocked:service.events.count - 1][@"dropped_events"] unsignedLongLongValue] == 2,
+                  @"a later real gap must still report its exact new loss");
+        NSCAssert([[service healthLocked][@"kernel_drops"] unsignedLongLongValue] == 5,
+                  @"health retains the full cumulative loss");
+    });
+}
+
 static void TestRevocationPreservesLoss(void)
 {
     GenseeSensorService *service = [[GenseeSensorService alloc] init];
@@ -275,6 +297,7 @@ int main(int argc, const char *argv[])
         TestUnidentifiedEntriesDoNotFreezeOtherSessions();
         TestReassignedPIDsTakePrecedenceOverRestoration();
         TestWholeSessionValidationPrecedesPIDMerge();
+        TestKernelLossIsReportedOnlyWhenItIncreases();
         TestRevocationPreservesLoss();
         NSCAssert(argc == 2, @"shared signing fixture path required");
         NSData *fixtureData = [NSData dataWithContentsOfFile:@(argv[1])];
