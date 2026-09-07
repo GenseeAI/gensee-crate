@@ -1998,14 +1998,18 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
+                // Probe the full relation key for each human request. Starting
+                // with relations can scan every historical request edge merely
+                // to satisfy ORDER BY src_id on a large event store.
                 "SELECT DISTINCT relations.src_id
-                 FROM relations
-                 JOIN requests ON requests.request_id = relations.src_id
-                 WHERE src_kind = 'request'
-                   AND dst_kind = 'artifact'
-                   AND dst_id = ?1
-                   AND relation_type = 'produced'
-                   AND requests.original_user_prompt IS NOT NULL
+                 FROM requests
+                 CROSS JOIN relations INDEXED BY sqlite_autoindex_relations_1
+                   ON relations.src_kind = 'request'
+                  AND relations.src_id = requests.request_id
+                  AND relations.dst_kind = 'artifact'
+                  AND relations.dst_id = ?1
+                  AND relations.relation_type = 'produced'
+                 WHERE requests.original_user_prompt IS NOT NULL
                  ORDER BY relations.src_id",
             )
             .map_err(SqliteError::Database)?;
@@ -2043,17 +2047,18 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT DISTINCT
-                    CASE
-                        WHEN src_kind = 'artifact' THEN src_id
-                        ELSE dst_id
-                    END AS artifact_id
-                 FROM relations
-                 WHERE relation_type = ?2
-                   AND (
-                        (src_kind = 'artifact' AND dst_kind = 'request' AND dst_id = ?1)
-                     OR (src_kind = 'request' AND src_id = ?1 AND dst_kind = 'artifact')
-                   )
+                // Split the two directions so each lookup starts at the
+                // request, rather than scanning every edge of this type.
+                // UNION preserves distinct, sorted IDs across both directions.
+                "SELECT src_id AS artifact_id
+                 FROM relations INDEXED BY idx_relations_dst
+                 WHERE src_kind = 'artifact' AND dst_kind = 'request'
+                   AND dst_id = ?1 AND relation_type = ?2
+                 UNION
+                 SELECT dst_id AS artifact_id
+                 FROM relations INDEXED BY idx_relations_src
+                 WHERE src_kind = 'request' AND src_id = ?1
+                   AND dst_kind = 'artifact' AND relation_type = ?2
                  ORDER BY artifact_id",
             )
             .map_err(SqliteError::Database)?;
@@ -4107,6 +4112,59 @@ mod tests {
             vec![1000, 2000]
         );
 
+        drop(store);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn lineage_lookups_preserve_direction_scope_and_human_producers() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-db-lineage-lookups-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = open_store(&test_config(&path)).unwrap();
+        store.connection().execute_batch(
+            "INSERT INTO sessions(session_id, agent_id, first_event_at)
+                VALUES ('lineage', 'test', 0);
+             INSERT INTO requests(request_id, session_id, original_user_prompt, created_at)
+                VALUES (1, 'lineage', 'first', 0), (2, 'lineage', 'second', 0),
+                       (3, 'lineage', NULL, 0), (4, 'lineage', '', 0);
+             INSERT INTO relations(src_kind, src_id, dst_kind, dst_id, relation_type, created_at)
+                VALUES ('request', 1, 'artifact', 10, 'produced', 0),
+                       ('artifact', 10, 'request', 1, 'produced', 0),
+                       ('artifact', 11, 'request', 1, 'modified', 0),
+                       ('request', 1, 'artifact', 10, 'modified', 0),
+                       ('request', 1, 'artifact', 12, 'deleted', 0),
+                       ('request', 2, 'artifact', 13, 'produced', 0),
+                       ('artifact', 20, 'request', 1, 'consumed_by', 0),
+                       ('request', 1, 'artifact', 20, 'consumed_by', 0),
+                       ('request', 1, 'artifact', 21, 'consumed_by', 0),
+                       ('artifact', 22, 'request', 2, 'consumed_by', 0),
+                       ('system_event', 1, 'artifact', 30, 'produced', 0),
+                       ('request', 1, 'system_event', 31, 'produced', 0),
+                       ('request', 2, 'artifact', 10, 'produced', 0),
+                       ('request', 3, 'artifact', 10, 'produced', 0),
+                       ('request', 4, 'artifact', 10, 'produced', 0),
+                       ('request', 99, 'artifact', 10, 'produced', 0);"
+        ).unwrap();
+
+        assert_eq!(store.produced_artifact_ids_for_request(1).unwrap(), vec![10, 11]);
+        assert_eq!(store.consumed_artifact_ids_for_request(1).unwrap(), vec![20, 21]);
+        assert_eq!(store.produced_artifact_ids_for_request(2).unwrap(), vec![10, 13]);
+        assert_eq!(store.producer_request_ids_for_artifact(10).unwrap(), vec![1, 2, 4]);
+        // A reverse edge or modification alone is not a producer request.
+        assert!(store.producer_request_ids_for_artifact(11).unwrap().is_empty());
+        assert!(store.producer_request_ids_for_artifact(999).unwrap().is_empty());
+        assert!(store.produced_artifact_ids_for_request(999).unwrap().is_empty());
+        assert!(store.consumed_artifact_ids_for_request(999).unwrap().is_empty());
+
+        // The per-event reuse must not become a cache across later writes.
+        store.connection().execute_batch(
+            "INSERT INTO relations(src_kind, src_id, dst_kind, dst_id, relation_type, created_at)
+                VALUES ('request', 1, 'artifact', 14, 'modified', 1);"
+        ).unwrap();
+        assert_eq!(store.produced_artifact_ids_for_request(1).unwrap(), vec![10, 11, 14]);
         drop(store);
         remove_sqlite_files(&path);
     }

@@ -3902,7 +3902,10 @@ fn record_request_artifact_relation(
 ) -> io::Result<()> {
     match relation_type {
         "consumed_by" => {
-            if request_has_output_artifact(db, request_id, artifact_id)? {
+            let produced_artifact_ids = db
+                .produced_artifact_ids_for_request(request_id)
+                .map_err(sqlite_error)?;
+            if produced_artifact_ids.contains(&artifact_id) {
                 return Ok(());
             }
             insert_entity_relation(
@@ -3917,10 +3920,7 @@ fn record_request_artifact_relation(
             if !is_human_request(db, request_id)? {
                 return Ok(());
             }
-            for produced_artifact_id in db
-                .produced_artifact_ids_for_request(request_id)
-                .map_err(sqlite_error)?
-            {
+            for produced_artifact_id in produced_artifact_ids {
                 record_artifact_derivation(
                     db,
                     artifact_id,
@@ -3975,18 +3975,6 @@ fn record_request_artifact_relation(
     }
 
     Ok(())
-}
-
-fn request_has_output_artifact(
-    db: &SqliteStore,
-    request_id: i64,
-    artifact_id: i64,
-) -> io::Result<bool> {
-    Ok(db
-        .produced_artifact_ids_for_request(request_id)
-        .map_err(sqlite_error)?
-        .into_iter()
-        .any(|produced_artifact_id| produced_artifact_id == artifact_id))
 }
 
 fn record_artifact_derivation(
