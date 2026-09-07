@@ -1,5 +1,8 @@
 # Claude Code hooks
 
+For Claude Desktop’s Cowork mode, use the separate [Claude Cowork guide](claude-cowork.md).
+Cowork visibility does not install Claude Code hooks.
+
 Claude Code hooks record prompts and tool intent and enforce the deterministic
 [safety policy](policy.md). Hooks are separate from
 [`gensee watch`](watch.md): `watch` observes filesystem effects and macOS system

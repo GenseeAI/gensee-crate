@@ -23,8 +23,9 @@ reject symlinks and special objects. `structured_result` also requires JSON.
 
 These checks do **not** prove semantic correctness or absence of malicious
 content. The manifest therefore reports `semantically_verified: false` and the
-runtime does not promote anything. A later verifier-receipt layer must bind a
-product-class verifier to the exact product digest. Even then, executable
+runtime does not promote anything. The separate [semantic-verifier layer](semantic-verifier.md) binds a
+product-class verifier to the exact product digest; [transactional promotion](transactional-promotion.md)
+is an explicit subsequent command, not part of `boundary run`. Even then, executable
 products must run under a consumer capability envelope.
 
 ## Commands

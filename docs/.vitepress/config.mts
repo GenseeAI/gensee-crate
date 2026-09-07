@@ -2,7 +2,7 @@ import { defineConfig } from 'vitepress'
 
 export default defineConfig({
   title: 'Gensee Crate',
-  description: 'Control agent work on developer laptops and self-hosted Linux environments.',
+  description: 'Operation-bound protection, long-horizon understanding, and cross-layer detection for autonomous AI agents.',
   lang: 'en-US',
   cleanUrls: true,
   lastUpdated: true,
@@ -15,7 +15,7 @@ export default defineConfig({
       'meta',
       {
         property: 'og:description',
-        content: 'Control agent work on developer laptops and self-hosted Linux environments.'
+        content: 'Operation-bound protection, long-horizon understanding, and cross-layer detection for autonomous AI agents.'
       }
     ]
   ],
@@ -45,6 +45,7 @@ export default defineConfig({
           { text: 'Gensee Crate Personal', link: '/personal' },
           { text: 'Gensee Crate Team', link: '/team' },
           { text: 'Architecture', link: '/architecture' },
+          { text: 'What’s New', link: '/whats-new' },
           { text: 'Roadmap', link: '/roadmap' }
         ]
       },
@@ -52,10 +53,29 @@ export default defineConfig({
         text: 'Personal',
         items: [
           { text: 'macOS App', link: '/macos-app' },
+          { text: 'Review Queue & Approvals', link: '/review-queue-approvals' },
+          { text: 'Feedback & Read Exceptions', link: '/scoped-feedback-triage' },
           { text: 'Config Audit', link: '/config-audit' },
           { text: 'Safety Policy', link: '/policy' },
           { text: 'gensee watch', link: '/watch' },
           { text: 'gensee run', link: '/run-and-sandbox' }
+        ]
+      },
+      {
+        text: 'Operation-bound Protection',
+        items: [
+          { text: 'Operation Boundary', link: '/operation-boundary' },
+          { text: 'End-to-end Demo', link: '/generic-end-to-end-demo' },
+          { text: 'Contract Catalogs', link: '/contract-catalog' },
+          { text: 'Operation Supervisor', link: '/operation-supervisor' },
+          { text: 'Network Boundary', link: '/operation-network-boundary' },
+          { text: 'Capability Providers', link: '/generic-capability-providers' },
+          { text: 'Capability Faults', link: '/capability-faults' },
+          { text: 'Distributed Operation Context', link: '/operation-context' },
+          { text: 'Semantic Verification', link: '/semantic-verifier' },
+          { text: 'Transactional Promotion', link: '/transactional-promotion' },
+          { text: 'Boundary Extension Authoring', link: '/boundary-extension-authoring' },
+          { text: 'Boundary Conformance Proof', link: '/generic-boundary-proof' }
         ]
       },
       {
@@ -72,6 +92,7 @@ export default defineConfig({
         text: 'Agent Integrations',
         items: [
           { text: 'Claude Code Hooks', link: '/claude-code-hooks' },
+          { text: 'Claude Cowork', link: '/claude-cowork' },
           { text: 'Codex Hooks', link: '/codex-support' },
           { text: 'Antigravity Support', link: '/antigravity-support' },
           { text: 'VS Code / GitHub Copilot', link: '/vscode-support' },
@@ -81,7 +102,10 @@ export default defineConfig({
       {
         text: 'Evidence And Operations',
         items: [
-          { text: 'Dashboard', link: '/dashboard' },
+          { text: 'Long-horizon Understanding', link: '/long-horizon-understanding' },
+          { text: 'Cross-platform Dashboard', link: '/dashboard' },
+          { text: 'Authenticated Replay', link: '/replay' },
+          { text: 'Security Traces & Evaluation', link: '/security-traces' },
           { text: 'SQLite Lineage Graph', link: '/lineage-graph' },
           { text: 'Endpoint Security', link: '/endpoint-security' }
         ]

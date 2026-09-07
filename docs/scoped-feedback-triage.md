@@ -1,7 +1,8 @@
-# Scoped feedback and local triage proposal
+# False-positive feedback and scoped read exceptions
 
-Status: the two feedback controls and explicit file/folder read exceptions are
+The two feedback controls and explicit file/folder read exceptions are
 implemented. Pattern suggestions and model-assisted triage below remain proposals.
+Manage saved permissions in **Settings → Approvals & Read Exceptions**.
 The Review Queue no longer edits rules globally. Existing rule-wide overrides are
 unchanged and can be reset in Policy. Exact-context approvals remain available.
 
@@ -27,7 +28,7 @@ to original evidence. Do not infer that this approves future actions.
 “Always allow matching reads…” means an explicit preference even if the detector
 is correct. Open a preview of a new exception, rather than modifying the base rule.
 Default scope is the provider, read operation, triggering rule, current project and
-exact target. Offer an explicit directory-descendants scope and optional expiry.
+exact target. Offer an explicit directory-descendants scope with the current 30-day expiry.
 For the reported case the user may choose `/private/tmp/` descendants; this applies
 to the credential-content-read finding, not writes, execution, credential-path
 protection, egress or other rules. Show this boundary in plain language.

@@ -1,8 +1,8 @@
 # Gensee Crate Personal
 
-Gensee Crate Personal is a local-first macOS app and CLI for individual
-developers who delegate work to Codex, Claude Code, Cursor, GitHub Copilot,
-Antigravity, or Omnigent. It lets routine work continue quietly and brings you
+Gensee Crate Personal is a macOS app and CLI for people who delegate work to
+AI agents, including Codex, Claude Code, Claude Cowork, Cursor, GitHub Copilot,
+Antigravity, and Omnigent. It lets routine work continue quietly and brings you
 back when the outcome needs a decision: scope drift, missing or stale
 verification, a blocked or high-risk operation, or incomplete evidence.
 
@@ -38,6 +38,17 @@ Endpoint Security and Full Disk Access are optional. Hook-based reviews, smart
 recovery points, and Config Audit provide value before you grant broad system
 access. Enable the independent sensor later when you want operating-system
 verification of supported process and file activity.
+
+## Cowork and approval controls
+
+[Claude Cowork](claude-cowork.md) has its own endpoint-visibility row in Harnesses.
+Enable it separately and follow the per-session audit setup. Its host/VM-boundary
+coverage differs from direct-hook integrations.
+
+[Remember approvals](review-queue-approvals.md) for matching actions, or choose a
+[scoped read exception](scoped-feedback-triage.md). False-positive feedback is
+separate from permission. Sensor loss appears in Settings as a Gensee monitoring
+gap, outside the agent review queue.
 
 ## See it in use
 

@@ -1,6 +1,6 @@
 # Architecture
 
-Gensee Crate is an open-source control layer for AI coding agents. It has two
+Gensee Crate is an open-source control layer for AI agents. It has two
 deployment paths built on the same deterministic policy and evidence model:
 
 - **[Gensee Crate Personal](personal.md)** reviews local agent work, creates
@@ -10,7 +10,29 @@ deployment paths built on the same deterministic policy and evidence model:
   disposable workspace forks, scoped capabilities, short-lived leases,
   host-owned credentials, and evidence-gated promotion.
 
+## Three core capabilities
+
+1. **Operation-bound protection.** The [transactional runtime](operation-boundary.md)
+   admits an operation under an approved contract, bounds execution authority, and
+   stages its product. [Semantic receipts](semantic-verifier.md) and
+   [transactional promotion](transactional-promotion.md) gate installation of
+   supported products. Host and effect-class limits remain explicit.
+2. **Long-horizon understanding.** [Artifact provenance, request continuity, and
+   verification freshness](long-horizon-understanding.md) retain risk-relevant
+   context across tasks and sessions. Deterministic checks and bounded analyzers
+   do not confer unrestricted authority.
+3. **Cross-layer detection.** Tool intent and independent process/file evidence
+   support attribution and policy findings. [Cowork](claude-cowork.md) has explicit
+   native/VM/cloud/unknown labels and narrower visibility than a guest sensor.
+   Monitoring gaps describe Gensee coverage, not agent wrongdoing.
+
+## Entry points
+
 The current implementation exposes these core workflows:
+
+- `gensee boundary` — contract admission, scoped execution, signed service context,
+  verification, and evidence-gated product promotion. Start with the
+  [end-to-end demo](generic-end-to-end-demo.md).
 
 - `gensee watch` — sidecar audit of workspace effects and macOS system events
   for users who do not want Gensee launching their agent. See [watch.md](watch.md).
@@ -54,9 +76,10 @@ and cgroup/nftables network controls. See
 | `macos/GenseeCrate` | Native Swift security console and signed Endpoint Security system extension |
 | `crate/gensee-crate-linux` | Experimental Linux capability detection, `/proc` monitoring, policy decisions, fanotify planning/debug probes, seccomp launcher profiles, and cgroup/nftables egress controls |
 | `crate/gensee-crate-cli` | `gensee` CLI entry point, including run/watch/timeline/policy commands |
-| `crate/gensee-crate-config-audit` | Static, read-only coding-agent configuration inventory and security/privacy rules; Codex is the first adapter |
+| `crate/gensee-crate-config-audit` | Static, read-only AI-agent configuration inventory and security/privacy rules; Codex is the first adapter |
 | `crate/gensee-crate-ml` | Behavioral model experiments |
 | `integrations/claude-code` | Claude Code hook bridge |
+| `integrations/claude-cowork` | macOS host/VM-boundary visibility and local audit adapter |
 | `integrations/codex` | Codex hook bridge |
 | `integrations/omnigent` | Thin Omnigent sidecar/managed-launch integration |
 | `integrations/vscode` | VS Code / GitHub Copilot hook bridge and setup guide |

@@ -38,7 +38,10 @@ it does not prove that bytes were consumed.
 
 ## Modes
 
-Configure the sensor in the native Policy page or with:
+Choose **Settings → Protection Level** for Mac-wide Fast (Observe), Review
+(Protect), or Sensitive (Strict) presets. Sensitive also changes hook interactivity;
+a sensor mode alone is not a per-harness permission. Use Policy for advanced edits,
+or set the sensor mode directly with:
 
 ```bash
 gensee policy set endpoint_security.mode observe
@@ -79,13 +82,15 @@ The macOS host sends only active roots for harnesses whose protection toggle is
 enabled. Removing a root also evicts its queued events and inherited process
 attribution from the extension.
 
-The Rust ingester attaches an event to a request only while that session has an
+For hook-correlated activity, the Rust ingester attaches an event to a request
+only while that session has an
 unfinished `PreToolUse` or `PermissionRequest` event no more than 60 seconds old.
 `PostToolUse`, `PostToolUseFailure`, a blocking decision, or expiry closes that
 window. Outside it, the OS event still updates the ingester's in-memory ancestry
 graph, but it is not written to the product event store and cannot produce a
-hook-bypass finding. This prevents idle host telemetry from growing the local
-database or delaying the dashboard.
+hook-bypass finding. Cowork opt-in evidence and monitoring-gap records have
+separate handling; a gap must remain durable even when it has no user request.
+See [Cowork coverage](claude-cowork.md) and [monitoring-gap semantics](review-queue-approvals.md#gensee-monitoring-gaps).
 
 Before findings are stored, known harness bookkeeping (including Crashpad,
 transcripts, compiler/build output, test results, and harness SQLite sidecars)
@@ -123,3 +128,31 @@ They distinguish callback pressure, ring-queue pressure, and host ingestion back
 they cannot reconstruct the cause of an older gap. Full Disk Access fixes client
 startup permission, not throughput. Error 4 from `es_new_client` means TCC still
 rejects the extension even when it is listed as activated.
+
+## Health and Reconnect
+
+Open **Settings → Endpoint Security** to inspect connection status, ingestion
+health, backlog, dropped/rejected events, and **Sensor throughput diagnostics**.
+The **Gensee monitoring gaps** section retains recent gap reports. These are not
+agent policy violations and do not contribute to request warning counts.
+
+A kernel-delivery gap means the sensor missed events before processing them. A
+replay-buffer gap means the consumer fell behind retained history. The tool shown
+near an old gap is not proof that it caused the loss. Use live diagnostics to
+investigate current pressure; historical records cannot identify an exact past
+bottleneck. Full Disk Access enables client startup but does not solve overload.
+
+**Reconnect** interrupts the current XPC wait and retry delay. Event fetching and
+configuration calls have five-second deadlines; failed connections recover with
+backoff. A retry during durable ingestion waits for that bounded write to finish
+so cursor ordering is preserved. Late replies from replaced connections cannot
+complete a newer request. Configuration rejection remains separate from transport
+failure.
+
+Availability and loss evidence are separate: a recovered connection does not
+restore missing history. Monitoring-loss banners therefore survive recovery until
+acknowledged. In published v0.3.3 build 12, the **Sensor health** banner action only
+selects Settings, and queued loss counts can restore a dismissed banner. Scroll to
+Endpoint Security to inspect details. [Build 13 / PR #115](https://github.com/GenseeAI/gensee-crate/pull/115)
+adds direct navigation and episode-aware dismissal; it is not yet in the public
+build 12 download.

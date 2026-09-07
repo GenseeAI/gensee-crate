@@ -1,8 +1,18 @@
 # Gensee Crate documentation
 
-Gensee Crate is an open-source control layer for AI coding agents. Start with
+Gensee Crate is an open-source control layer for AI agents. Start with
 [Gensee Crate Personal](personal.md) for local laptop protection and review, or
 [Gensee Crate Team](team.md) for self-hosted remote Linux agent environments.
+
+## Start here
+
+- [What’s new](whats-new.md) — merged release features and current availability.
+- [Long-horizon understanding](long-horizon-understanding.md) — request continuity,
+  artifact provenance, and verification freshness across sessions.
+- [Review Queue and approvals](review-queue-approvals.md) — status meanings and
+  repeat approvals with explicit scope.
+- [Feedback and read exceptions](scoped-feedback-triage.md) — separate detector
+  feedback from permission; understand what is implemented and what is planned.
 
 ## Guides
 
@@ -21,6 +31,7 @@ Gensee Crate is an open-source control layer for AI coding agents. Start with
 - [Roadmap](roadmap.md) — current host controls and planned sandbox, sensor, ML policy, and integration work.
 - [Linux host support](linux.md) — `/proc` process attribution, fanotify sensitive-path enforcement, seccomp launcher profiles, cgroup/nftables egress controls, and Linux capability planning.
 - [Tclone runtime integration](tclone.md) — launch agents in cloneable Linux containers, fork live source containers, inspect diffs, keep workspaces, and discard forks.
+- [Security traces and evaluation](security-traces.md) — study, animated timeline, datasets, and observe-only evidence limits.
 - [Authenticated telemetry replay](replay.md) — merge heterogeneous evidence with explicit clock semantics, verify signed replay bundles, and evaluate bounded causal rules.
 - [Operation network boundary](operation-network-boundary.md) — operation-scoped network envelopes, temporary in-place leases, a read-only HTTP mediator, revocation, and effect evidence.
 - [Operation supervisor](operation-supervisor.md) — durable operation identity, lifecycle, process lineage, cgroup ownership, active envelopes, leases, and boundary-effect coordination.
@@ -30,7 +41,7 @@ Gensee Crate is an open-source control layer for AI coding agents. Start with
 - [`gensee policy`](gensee-policy.md) — inspect, initialize, validate, and edit local policy settings.
 - [`gensee audit`](config-audit.md) — statically review Codex and VS Code agent permissions, privacy, MCP, skills, hooks, extensions, rules, and instructions.
 - [Claude Code hooks](claude-code-hooks.md) — wire Claude Code prompts and tool intent into Gensee, and read the combined timeline.
-- [Claude Cowork endpoint visibility](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/claude-cowork) — macOS pilot contract, local audit adapter, execution-origin labels, and explicit VM/cloud limitations.
+- [Claude Cowork endpoint visibility](claude-cowork.md) — macOS pilot contract, local audit adapter, execution-origin labels, and explicit VM/cloud limitations.
 - [Codex hooks](codex-support.md) — wire Codex prompts and tool intent into Gensee, and read the combined timeline.
 - [Codex integration](https://github.com/GenseeAI/gensee-crate/tree/main/integrations/codex) — setup commands, hook samples, and smoke-test payloads.
 - [Antigravity support](antigravity-support.md) — global hook setup, `.agents` policy coverage, and sidecar audit.
@@ -52,3 +63,19 @@ Database design references (rendered by
 - Schema relationships — [SVG](gensee_database_schema_relationships.svg) · [PNG](gensee_database_schema_relationships.png)
 - Policy flagging — [SVG](gensee_database_policy_flagging.svg) · [PNG](gensee_database_policy_flagging.png)
 - Full design — [PDF](gensee_database_design.pdf)
+
+## Keeping the published site current
+
+The site builds from `docs/.vitepress/config.mts` and Markdown under `docs/`.
+Adding a repository integration README does not add a guide to the site sidebar.
+For a user-facing feature, update its guide, navigation, macOS/Personal overview
+where applicable, and `whats-new.md`. Link to technical adapter contracts rather
+than relying on a repository-only README for onboarding. Label unmerged candidates
+and planned functionality separately from the downloadable release.
+
+Downloadable diagrams and the audit-report schema are mirrored in `docs/public/`;
+refresh those copies when their source artifacts change.
+
+Run `npm run docs:build` before merging. The Docs workflow publishes merged `main`
+changes to [crate-docs.gensee.ai](https://crate-docs.gensee.ai); a PR build validates
+the site but does not deploy it.

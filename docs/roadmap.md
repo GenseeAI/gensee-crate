@@ -17,6 +17,33 @@ fanotify sensitive-path enforcement, seccomp launcher profiles, and
 cgroup-scoped nftables egress controls. This roadmap is directional and may
 change as agent interfaces and operating-system controls evolve.
 
+## Operation-bound protection
+
+Available now in the explicit boundary runtime:
+
+- [Approved operation contracts and admission](operation-boundary.md), with signed
+  catalogs and bounded intent inference.
+- Scoped network authority, execution-subject ownership, typed capability-provider
+  leases, and authenticated downstream operation context.
+- Staged product inspection, isolated semantic verifier receipts, and
+  [transactional promotion](transactional-promotion.md) with digest revalidation,
+  terminal authority, compare-and-swap selection, and crash recovery.
+
+This is implemented for the documented host controls and effect classes. It is
+not automatic transactional containment for every Cowork or hook-mediated action.
+Expansion to additional effect classes and integrations remains planned.
+
+## Long-horizon understanding and quieter reviews
+
+Available now: cross-session artifact provenance, digest-bound execution checks,
+verification freshness, background-task request attribution, scoped approvals,
+explicit read exceptions, and separate false-positive feedback. See
+[long-horizon understanding](long-horizon-understanding.md) and
+[the v0.3.3 guide](whats-new.md).
+
+Pattern suggestions and optional model-assisted triage are planned. Repeated
+approvals do not silently expand a permission, and feedback does not grant access.
+
 ## Linux System Enforcement
 
 Gensee Crate's Linux support will continue covering AI agents running directly
@@ -94,8 +121,8 @@ Planned work includes:
 - Reviewable staged workspace writes before changes reach the real project.
 - Policy-aware sandbox modes for file access, network access, and command
   execution.
-- Transactional or speculative execution experiments for AI agent workflows,
-  where risky actions can be evaluated before their effects are committed.
+- Expand the existing operation-bound runtime to additional effect classes and
+  workflows, with explicit containment, verification, and promotion semantics.
 - Better support for managed Linux runtimes and cloud-based agent workspaces.
 
 ## ML-Based Policy and Rules

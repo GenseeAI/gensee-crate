@@ -1,7 +1,6 @@
 # Gensee Crate Personal for macOS
 
-Gensee Crate Personal is a local companion for developers who delegate work to
-AI coding agents. It groups completed work into a calm review queue, surfaces
+Gensee Crate Personal helps people supervise work delegated to AI agents. It groups completed work into a calm review queue, surfaces
 scope drift and verification gaps, creates recovery points before risky
 workspace changes, and audits configuration that can influence agent behavior.
 Your activity and policy stay on your Mac.
@@ -39,8 +38,10 @@ console.
 - Navigation to Full Disk Access, which macOS requires for complete protected
   file visibility.
 - Endpoint Security `off`, `observe`, `protect`, and `strict` policy modes.
-- Harness protection for Codex, Claude Code, Antigravity, Cursor, GitHub
-  Copilot, and Omnigent.
+- Harness controls for Codex, Claude Code, Claude Cowork, Antigravity, Cursor,
+  GitHub Copilot, and Omnigent. Cowork uses a separate endpoint-visibility opt-in.
+- [Remembered approvals and scoped read exceptions](review-queue-approvals.md),
+  distinct false-positive feedback, and Gensee monitoring-gap reporting.
 - Per-harness Config Audit actions backed by the shared OSS Rust audit library
   for static, read-only review of Codex and VS Code/Copilot configuration,
   including a saved local baseline and drift from the previous audit.
@@ -61,8 +62,8 @@ On first launch, the setup assistant:
 4. Guides the user through optional Endpoint Security approval and Full Disk
    Access. These are Apple-controlled approvals and cannot be silently granted
    by the app.
-5. Scans Codex, Claude Code, Antigravity, Cursor, GitHub Copilot for VS Code,
-   and Omnigent, leaving unavailable harnesses visible but disabled.
+5. Scans Codex, Claude Code, Claude Cowork, Antigravity, Cursor, GitHub Copilot
+   for VS Code, and Omnigent, leaving unavailable harnesses visible but disabled.
 6. Offers individual setup or **Enable All Installed** for direct-hook
    harnesses and provides the required reload step for each provider.
 7. Waits for a real post-setup harness event before showing that integration as
@@ -99,13 +100,14 @@ configuration layer cannot be reconstructed.
 
 ## Harness controls
 
-The **Harnesses** page scans the Mac and always displays all six supported
+The **Harnesses** page scans the Mac and always displays all seven supported
 harnesses:
 
 | Harness | Protection path |
 | --- | --- |
 | Codex | Direct Gensee hooks |
 | Claude Code | Direct Gensee hooks |
+| [Claude Cowork](claude-cowork.md) | Endpoint visibility and manual local audit collection |
 | Antigravity | Direct Gensee hooks |
 | Cursor | Direct Gensee hooks |
 | GitHub Copilot | VS Code agent hooks |
@@ -133,6 +135,24 @@ event from that provider reaches the active store; only then does it become
 Omnigent currently has no direct hook protection action. Launch it with `gensee run` to
 place its process tree under Gensee monitoring and supported policy
 enforcement.
+
+The **Protected** summary combines installed direct-hook integrations with healthy
+configuration and installed Cowork with visibility enabled. This is a coverage
+summary, not a claim that every integration has the same enforcement capability.
+Cowork retains its **Visibility enabled** label and separate Verify workflow.
+
+## Review status and approvals
+
+Findings show **Blocked**, **Approval requested**, **Warning**, or **Allowed**.
+Risk severity remains in expanded evidence. Historical approval requests record
+the decision at that time; saving a repeat approval does not execute an old command.
+
+Use **Approve similar actions…** for a matching one-action, session, or project
+permission. **Always allow matching reads…** creates an explicit file/folder read
+exception, while **This was a false positive** only records feedback. Manage active
+permissions under **Settings → Approvals & Read Exceptions**. Global rule overrides
+belong in Policy. See the [approval guide](review-queue-approvals.md) for expiry,
+content binding, unsupported previews, and protected cases.
 
 ## Daily activity and token totals
 
@@ -180,7 +200,11 @@ or transactional guarantee as the Linux tclone runtime.
 ## Endpoint Security modes
 
 The bundled system extension records exact process identity and supported
-process/file events. Configure its mode on the **Policy** page or with:
+process/file events. Choose the Mac-wide preset in **Settings → Protection Level**:
+**Fast** uses Observe, **Review** uses Protect, and **Sensitive** uses Strict and
+noninteractive denial of risky hook approvals. These settings apply across enabled
+harnesses; they are not per-harness controls. Advanced mode edits remain available
+in Policy or with:
 
 ```bash
 gensee policy set endpoint_security.mode observe
@@ -208,6 +232,11 @@ findings require a bounded active tool-call window and pass through bookkeeping
 filters, logical-operation coalescing, and durable deduplication. Raw OS events
 are still observed in memory to maintain ancestry, but events outside an active
 tool window are not persisted or surfaced as alerts.
+
+For connection status, Full Disk Access, loss counters, throughput diagnostics,
+and **Reconnect**, open **Settings → Endpoint Security**. Gensee monitoring gaps
+are coverage issues, separate from agent findings. Reconnect cancels stalled
+transport waits and retry delays without deleting recorded evidence.
 
 See the [Endpoint Security sensor](endpoint-security.md) guide for captured
 events, policy keys, safety boundaries, and rollback.
