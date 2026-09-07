@@ -8,15 +8,36 @@ changes.
 
 ## Unreleased
 
+## 0.3.3 - 2026-09-06
+
+A quieter Review Queue and clearer controls for autonomous AI work. This release
+reduces routine file-operation warnings, groups background work with its request,
+and makes repeated approvals and sensor recovery easier to manage.
+
 ### Added
 
 - Explicit remembered approvals from Review Queue: allow the next matching action,
   the same session (up to 24 hours), or the same project (30 days). Matching binds
   provider, project, rule, target, tool input, and inspected file content. Active
   approvals can be revoked in Settings; blocks are never overridden.
+- Separate **This was a false positive** feedback and **Always allow matching
+  reads…** controls. Read exceptions are explicitly scoped to a file or folder,
+  provider, and project, expire after 30 days, and can be revoked.
+- Dedicated Gensee monitoring-gap reporting, so incomplete sensor coverage is
+  explained separately from agent actions and request warnings.
 
 ### Fixed
 
+- Sensor Reconnect interrupts stalled XPC waits and retry delays. Event-fetch and
+  configuration requests time out after five seconds, with automatic recovery
+  and safe handling of late replies.
+- Background extension checks preserve approval and restart guidance. Startup
+  and concurrent policy refreshes retain the latest settings, and completion
+  notifications correctly distinguish stored history from newly completed work.
+- Monitoring-loss banners remain available after an outage recovers and can be
+  dismissed independently from availability warnings.
+- Credential-content and executable findings use more precise source, path, and
+  captured-evidence handling to reduce false positives and incorrect attribution.
 - Large-history dashboard refreshes avoid sorting unrelated alerts and use indexed
   artifact identity lookups; a bounded background refresh retains the previous view.
 - Executable inspection follows shell `cd` when resolving subsequent scripts.
@@ -35,8 +56,8 @@ changes.
 - Routine writes and scoped cleanup in OS temporary directories are allowed as
   informational evidence. Generic historical temp alerts no longer enter Review
   Queue; raw records and alert-chain integrity are preserved.
-- Protected paths, symlink escapes, broad cleanup, explicit review overrides,
-  blocked operations, and sensor evidence-loss alerts retain their protections.
+- Protected paths, symlink escapes, broad cleanup, and blocked operations retain
+  their protections. Monitoring gaps remain visible as Gensee health issues.
 
 ## 0.3.2 - 2026-09-05
 
