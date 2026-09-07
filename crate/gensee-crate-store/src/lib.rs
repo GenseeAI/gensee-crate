@@ -1797,7 +1797,10 @@ impl EventStore {
             groups
         };
         if std::env::var_os("GENSEE_DASHBOARD_TIMING").is_some() {
-            eprintln!("request groups: {}ms", timer.elapsed().as_millis());
+            eprintln!(
+                "dashboard-request store groups: {}ms",
+                timer.elapsed().as_millis()
+            );
         }
         let root = groups.root(request_id);
         let mut result = self.dashboard_request_ungrouped(root)?;
@@ -1834,7 +1837,10 @@ impl EventStore {
         let timer = Instant::now();
         let timing = |phase: &str| {
             if std::env::var_os("GENSEE_DASHBOARD_TIMING").is_some() {
-                eprintln!("request detail {phase}: {}ms", timer.elapsed().as_millis());
+                eprintln!(
+                    "dashboard-request store detail {phase}: {}ms",
+                    timer.elapsed().as_millis()
+                );
             }
         };
         let mut request = conn
@@ -6889,10 +6895,65 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual overview cost-shape benchmark"]
+    fn benchmark_overview_file_touches_with_noisy_sensor_history() {
+        let dir =
+            std::env::temp_dir().join(format!("gensee-overview-cost-shape-{}", std::process::id()));
+        let store = EventStore::new(&dir).unwrap();
+        let db = store.sqlite_store().unwrap();
+        let conn = db.connection();
+        conn.execute_batch(
+            "INSERT INTO sessions(session_id,agent_id,first_event_at) VALUES ('bench','test',0);
+             INSERT INTO requests(request_id,session_id,original_user_prompt,created_at)
+                VALUES (1,'bench','synthetic',0);
+             INSERT INTO artifacts(artifact_id,kind,uri) VALUES (1,'file','/repo/visible.txt');
+             INSERT INTO system_events(event_id,pid,request_id,ts,source,type,cwd,args)
+                VALUES (1,1,1,1,'macos-endpoint-security','write','/repo','{}');
+             INSERT INTO relations(src_kind,src_id,dst_kind,dst_id,relation_type,created_at)
+                VALUES ('request',1,'artifact',1,'modified',0),
+                       ('system_event',1,'artifact',1,'modified',0);",
+        )
+        .unwrap();
+        let expected = dashboard_request_file_touches(conn).unwrap();
+        let mut previous = 1;
+        for count in [1, 10_000, 100_000, 500_000] {
+            if count > previous {
+                conn.execute(
+                    "WITH RECURSIVE ids(n) AS (VALUES(?1) UNION ALL SELECT n+1 FROM ids WHERE n<?2)
+                     INSERT INTO system_events(event_id,pid,request_id,ts,source,type,cwd,args)
+                        SELECT n,1,1,n,'macos-endpoint-security','open','/repo','{}' FROM ids",
+                    rusqlite::params![previous + 1, count],
+                )
+                .unwrap();
+            }
+            let mut timings = Vec::new();
+            for _ in 0..5 {
+                let started = Instant::now();
+                let result = dashboard_request_file_touches(conn).unwrap();
+                timings.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(result, expected);
+            }
+            timings.sort_by(f64::total_cmp);
+            println!(
+                "overview_cost_shape events={count} artifacts=1 median_ms={:.3} max_ms={:.3}",
+                timings[2], timings[4]
+            );
+            previous = count;
+        }
+        drop(db);
+        drop(store);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn request_file_evidence_keeps_group_scope_and_chronological_limits() {
         let dir = std::env::temp_dir().join(format!(
-            "gensee-request-evidence-scope-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            "gensee-request-evidence-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let store = EventStore::new(&dir).unwrap();
         let db = store.sqlite_store().unwrap();
@@ -6924,11 +6985,17 @@ mod tests {
         assert_eq!(touches[0]["risk_level"], "high");
         // An intent from another request must never verify this group's write.
         assert_eq!(touches[0]["intended_and_verified"], false);
-        conn.execute_batch("INSERT INTO agent_events(event_id,pid,request_id,ts,source,type,cwd)
+        conn.execute_batch(
+            "INSERT INTO agent_events(event_id,pid,request_id,ts,source,type,cwd)
             VALUES (2,1,1,95,'test','file_intent','/repo');
             INSERT INTO relations(src_kind,src_id,dst_kind,dst_id,relation_type,created_at)
-            VALUES ('agent_event',2,'artifact',1,'modified',95);").unwrap();
-        assert_eq!(dashboard_file_touches(conn, 1).unwrap()[0]["intended_and_verified"], true);
+            VALUES ('agent_event',2,'artifact',1,'modified',95);",
+        )
+        .unwrap();
+        assert_eq!(
+            dashboard_file_touches(conn, 1).unwrap()[0]["intended_and_verified"],
+            true
+        );
         let overview = dashboard_request_file_touches(conn).unwrap();
         // Overview summaries remain scoped to each contributing request;
         // another request's intent and later timestamp must not leak into it.
@@ -6939,11 +7006,17 @@ mod tests {
         assert_eq!(bounded.paths, vec!["/Users/test/.gensee/first".to_string()]);
         assert_eq!(bounded.omitted_event_count, 1);
         let complete = dashboard_ignored_file_touch_paths_with_limits(conn, 1, 10, 500).unwrap();
-        assert_eq!(complete.paths, vec!["/Users/test/.gensee/first".to_string(), "/Users/test/.gensee/last".to_string()]);
+        assert_eq!(
+            complete.paths,
+            vec![
+                "/Users/test/.gensee/first".to_string(),
+                "/Users/test/.gensee/last".to_string()
+            ]
+        );
         assert_eq!(complete.omitted_event_count, 0);
         drop(db);
         drop(store);
-        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

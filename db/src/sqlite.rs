@@ -11,12 +11,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // already-initialized store must not rerun CREATE/ALTER statements on every
 // short-lived hook or dashboard process: schema DDL needs a writer lock and can
 // otherwise starve behind the long-lived Endpoint Security ingester.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 // This checksum intentionally names the schema version. If schema.sql changes,
 // bump SCHEMA_VERSION and replace this with the checksum for the new version.
 #[cfg(test)]
-const SCHEMA_V7_SQL_SHA256: &str =
-    "8f87ac5c88671364d6eeb771d12fcf1e8be1fb2ece359946f41e6707f51890fd";
+const SCHEMA_V8_SQL_SHA256: &str =
+    "bab261f379a9c66d27cb44f25cef5dcad435225529785539661b9abf3c211106";
 // Increment whenever dashboard artifact visibility rules change. Existing
 // stores are reclassified by bounded background maintenance before this
 // version is stamped on their cached count.
@@ -1998,18 +1998,14 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                // Probe the full relation key for each human request. Starting
-                // with relations can scan every historical request edge merely
-                // to satisfy ORDER BY src_id on a large event store.
+                // The named covering index bounds work to this artifact's
+                // producer edges, even with many requests or sensor edges.
                 "SELECT DISTINCT relations.src_id
-                 FROM requests
-                 CROSS JOIN relations INDEXED BY sqlite_autoindex_relations_1
-                   ON relations.src_kind = 'request'
-                  AND relations.src_id = requests.request_id
-                  AND relations.dst_kind = 'artifact'
-                  AND relations.dst_id = ?1
-                  AND relations.relation_type = 'produced'
-                 WHERE requests.original_user_prompt IS NOT NULL
+                 FROM relations INDEXED BY idx_relations_artifact_producer
+                 CROSS JOIN requests ON requests.request_id = relations.src_id
+                 WHERE relations.dst_kind = 'artifact' AND relations.dst_id = ?1
+                   AND relations.src_kind = 'request' AND relations.relation_type = 'produced'
+                   AND requests.original_user_prompt IS NOT NULL
                  ORDER BY relations.src_id",
             )
             .map_err(SqliteError::Database)?;
@@ -3265,10 +3261,10 @@ mod tests {
 
     #[test]
     fn schema_checksum_is_tied_to_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 7);
+        assert_eq!(SCHEMA_VERSION, 8);
         let actual = format!("{:x}", Sha256::digest(include_bytes!("../schema.sql")));
         assert_eq!(
-            actual, SCHEMA_V7_SQL_SHA256,
+            actual, SCHEMA_V8_SQL_SHA256,
             "schema.sql changed: bump SCHEMA_VERSION and replace the versioned checksum"
         );
     }
@@ -4117,6 +4113,65 @@ mod tests {
     }
 
     #[test]
+    fn schema_v8_adds_covering_producer_index_without_rewriting_evidence() {
+        let path = std::env::temp_dir().join(format!(
+            "gensee-v8-producer-index-{}.db",
+            std::process::id()
+        ));
+        remove_sqlite_files(&path);
+        let config = test_config(&path);
+        let store = open_store(&config).unwrap();
+        store.connection().execute_batch(
+            "INSERT INTO sessions(session_id, agent_id, first_event_at) VALUES ('v7', 'test', 0);
+             INSERT INTO requests(request_id, session_id, original_user_prompt, created_at)
+                VALUES (1, 'v7', 'preserved prompt', 42);
+             INSERT INTO relations(relation_id, src_kind, src_id, dst_kind, dst_id,
+                                   relation_type, evidence, created_at)
+                VALUES (7, 'request', 1, 'artifact', 10, 'produced', '{\"preserved\":true}', 43);
+             DROP INDEX idx_relations_artifact_producer;
+             PRAGMA user_version = 7;"
+        ).unwrap();
+        drop(store);
+        let store = open_store(&config).unwrap();
+        assert_eq!(
+            store.producer_request_ids_for_artifact(10).unwrap(),
+            vec![1]
+        );
+        let row: (i64, String, i64) = store
+            .connection()
+            .query_row(
+                "SELECT relation_id, evidence, created_at FROM relations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (7, "{\"preserved\":true}".to_string(), 43));
+        let prompt: String = store
+            .connection()
+            .query_row(
+                "SELECT original_user_prompt FROM requests WHERE request_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompt, "preserved prompt");
+        let version: i64 = store
+            .connection()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(store);
+        // Reopening an upgraded store must retain the new query and its data.
+        let reopened = open_store(&config).unwrap();
+        assert_eq!(
+            reopened.producer_request_ids_for_artifact(10).unwrap(),
+            vec![1]
+        );
+        drop(reopened);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
     fn lineage_lookups_preserve_direction_scope_and_human_producers() {
         let path = std::env::temp_dir().join(format!(
             "gensee-db-lineage-lookups-{}.db",
@@ -4124,8 +4179,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let store = open_store(&test_config(&path)).unwrap();
-        store.connection().execute_batch(
-            "INSERT INTO sessions(session_id, agent_id, first_event_at)
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO sessions(session_id, agent_id, first_event_at)
                 VALUES ('lineage', 'test', 0);
              INSERT INTO requests(request_id, session_id, original_user_prompt, created_at)
                 VALUES (1, 'lineage', 'first', 0), (2, 'lineage', 'second', 0),
@@ -4146,25 +4203,56 @@ mod tests {
                        ('request', 2, 'artifact', 10, 'produced', 0),
                        ('request', 3, 'artifact', 10, 'produced', 0),
                        ('request', 4, 'artifact', 10, 'produced', 0),
-                       ('request', 99, 'artifact', 10, 'produced', 0);"
-        ).unwrap();
+                       ('request', 99, 'artifact', 10, 'produced', 0);",
+            )
+            .unwrap();
 
-        assert_eq!(store.produced_artifact_ids_for_request(1).unwrap(), vec![10, 11]);
-        assert_eq!(store.consumed_artifact_ids_for_request(1).unwrap(), vec![20, 21]);
-        assert_eq!(store.produced_artifact_ids_for_request(2).unwrap(), vec![10, 13]);
-        assert_eq!(store.producer_request_ids_for_artifact(10).unwrap(), vec![1, 2, 4]);
+        assert_eq!(
+            store.produced_artifact_ids_for_request(1).unwrap(),
+            vec![10, 11]
+        );
+        assert_eq!(
+            store.consumed_artifact_ids_for_request(1).unwrap(),
+            vec![20, 21]
+        );
+        assert_eq!(
+            store.produced_artifact_ids_for_request(2).unwrap(),
+            vec![10, 13]
+        );
+        // Preserve the historical non-NULL producer filter, including blank
+        // prompts. is_human_request applies a stricter check to the consumer;
+        // changing producer eligibility is outside this performance fix.
+        assert_eq!(
+            store.producer_request_ids_for_artifact(10).unwrap(),
+            vec![1, 2, 4]
+        );
         // A reverse edge or modification alone is not a producer request.
-        assert!(store.producer_request_ids_for_artifact(11).unwrap().is_empty());
-        assert!(store.producer_request_ids_for_artifact(999).unwrap().is_empty());
-        assert!(store.produced_artifact_ids_for_request(999).unwrap().is_empty());
-        assert!(store.consumed_artifact_ids_for_request(999).unwrap().is_empty());
+        assert!(store
+            .producer_request_ids_for_artifact(11)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .producer_request_ids_for_artifact(999)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .produced_artifact_ids_for_request(999)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .consumed_artifact_ids_for_request(999)
+            .unwrap()
+            .is_empty());
 
         // The per-event reuse must not become a cache across later writes.
         store.connection().execute_batch(
             "INSERT INTO relations(src_kind, src_id, dst_kind, dst_id, relation_type, created_at)
                 VALUES ('request', 1, 'artifact', 14, 'modified', 1);"
         ).unwrap();
-        assert_eq!(store.produced_artifact_ids_for_request(1).unwrap(), vec![10, 11, 14]);
+        assert_eq!(
+            store.produced_artifact_ids_for_request(1).unwrap(),
+            vec![10, 11, 14]
+        );
         drop(store);
         remove_sqlite_files(&path);
     }

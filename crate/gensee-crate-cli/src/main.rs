@@ -4220,7 +4220,10 @@ fn dashboard_request(args: Vec<OsString>) -> io::Result<()> {
     let timer = std::time::Instant::now();
     let timing = |phase: &str| {
         if env::var_os("GENSEE_DASHBOARD_TIMING").is_some() {
-            eprintln!("dashboard-request {phase}: {}ms", timer.elapsed().as_millis());
+            eprintln!(
+                "dashboard-request {phase}: {}ms",
+                timer.elapsed().as_millis()
+            );
         }
     };
     let store = EventStore::default_local()?;
