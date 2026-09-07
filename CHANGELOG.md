@@ -8,6 +8,18 @@ changes.
 
 ## Unreleased
 
+### Fixed
+
+- Sensor health opens Settings at the Endpoint Security section, including when
+  Settings is already selected.
+- Dismissing a monitoring-loss banner or native notification acknowledges losses
+  counted so far, including queued counts. Later losses can raise both surfaces
+  again at the existing 100-event threshold and 60-second cooldown, without
+  waiting for recovery. Health counters and separate outage alarms remain intact.
+  Only explicit dismissal acknowledges an incident; notification timeout or
+  opening it does not. Dismissing an outage acknowledges that matching outage
+  across both surfaces while preserving independent event-loss history.
+
 ## 0.3.3 - 2026-09-06
 
 A quieter Review Queue and clearer controls for autonomous AI work. This release

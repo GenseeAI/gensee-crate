@@ -55,6 +55,14 @@ struct EndpointSensorHealth: Equatable {
 
 enum MonitoringHealthIncident: Equatable {
     case events(UInt64), unavailable, stalled
+
+    var notificationKind: String {
+        switch self {
+        case .events: "events"
+        case .unavailable: "unavailable"
+        case .stalled: "stalled"
+        }
+    }
 }
 
 // SuspendingClock is monotonic and excludes system sleep. Wall-clock changes
@@ -88,12 +96,32 @@ struct MonitoringGapAlarmTracker {
 
     mutating func dismissBanner() {
         if case .events = bannerIncident {
-            eventLossBanner = nil
-            setBanner(nil)
+            dismissEventLoss()
         } else {
             // Dismiss the visible outage only; an undisclosed history gap
             // remains independently actionable and becomes visible underneath.
             setBanner(eventLossBanner)
+        }
+    }
+
+    private mutating func dismissEventLoss() {
+        // Acknowledge everything counted so far, including the cooldown queue.
+        // Subsequent loss still uses the existing threshold and cooldown.
+        pending = 0
+        eventLossBanner = nil
+        if case .events = bannerIncident { setBanner(nil) }
+    }
+
+    // Explicit dismissal is shared by both surfaces for every incident kind.
+    // Outage acknowledgement affects only the matching visible outage; it does
+    // not acknowledge independent event loss or reset the outage's alarm latch.
+    mutating func dismissNotification(kind: String) {
+        switch kind {
+        case "events": dismissEventLoss()
+        case "unavailable" where bannerIncident == .unavailable,
+             "stalled" where bannerIncident == .stalled:
+            dismissBanner()
+        default: break
         }
     }
 
@@ -162,7 +190,8 @@ struct MonitoringGapAlarmTracker {
             self.pending = 0
             return nil
         }
-        pending += health.kernelDrops - previous.kernelDrops + health.ringDrops - previous.ringDrops
+        let newLoss = health.kernelDrops - previous.kernelDrops + health.ringDrops - previous.ringDrops
+        pending += newLoss
         guard pending >= 100, lastAlarm.map({ $0.duration(to: now) >= .seconds(60) }) ?? true else { return nil }
         let count = pending
         pending = 0; lastAlarm = now
