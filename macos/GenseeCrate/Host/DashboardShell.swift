@@ -31,6 +31,7 @@ struct DashboardShell: View {
     @Binding var showsSetupAssistant: Bool
     @State private var selection: DashboardDestination = .overview
     @State private var searchText = ""
+    @State private var sensorHealthRequest: UUID?
     @AppStorage("gensee.dashboard.darkMode") private var darkMode = false
 
     var body: some View {
@@ -40,7 +41,10 @@ struct DashboardShell: View {
                 HStack {
                     Label(alarm, systemImage: "exclamationmark.shield.fill").foregroundStyle(.red)
                     Spacer()
-                    Button("Sensor health") { selection = .settings }
+                    Button("Sensor health") {
+                        sensorHealthRequest = UUID()
+                        selection = .settings
+                    }
                     Button("Dismiss") { notifications.dismissMonitoringHealthAlarm() }
                 }.font(.callout).padding(12).background(Color.red.opacity(0.08))
             }
@@ -299,6 +303,7 @@ struct DashboardShell: View {
                 sensor: model.endpointSensor,
                 notifications: notifications,
                 darkMode: $darkMode,
+                sensorHealthRequest: $sensorHealthRequest,
                 onRunSetupAssistant: { showsSetupAssistant = true }
             )
             }

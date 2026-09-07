@@ -8,6 +8,15 @@ changes.
 
 ## Unreleased
 
+### Fixed
+
+- Sensor health opens Settings at the Endpoint Security section, including when
+  Settings is already selected.
+- Dismissing a monitoring-loss banner acknowledges queued counts and the ongoing
+  loss episode. Health details retain the counters; loss banners rearm after a
+  minute of healthy loss-free polling or a sensor restart. Separate outages still
+  raise their own alarms.
+
 ## 0.3.3 - 2026-09-06
 
 A quieter Review Queue and clearer controls for autonomous AI work. This release

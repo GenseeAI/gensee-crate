@@ -71,8 +71,68 @@ final class EndpointSensorHealthTests: XCTestCase {
         XCTAssertNil(tracker.bannerIncident)
         _ = tracker.observe(health, now: start.advanced(by: .seconds(80)))
         XCTAssertNil(tracker.bannerIncident)
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(140)))
         health.kernelDrops = 100
-        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(81))), .events(100))
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(141))), .events(100))
+    }
+
+    func testDismissAcknowledgesQueuedLossAndContinuedEpisode() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
+        health.bootID = "a"
+        _ = tracker.observe(health, now: start)
+        health.kernelDrops = 100
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(1))), .events(100))
+        health.kernelDrops = 500
+        XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(2))))
+        tracker.dismissBanner()
+        let revision = tracker.bannerRevision
+        for second in [3, 30, 61, 90, 120] {
+            health.kernelDrops += 200
+            XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(second))))
+            XCTAssertNil(tracker.bannerIncident)
+            XCTAssertEqual(tracker.bannerRevision, revision)
+        }
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(121)))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(180)))
+        health.ringDrops = 100
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(181))), .events(100))
+    }
+
+    func testDismissedQueuedLossDoesNotReturnAtCooldown() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
+        _ = tracker.observe(health, now: start)
+        health.kernelDrops = 100
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(1)))
+        health.kernelDrops = 500
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(2)))
+        tracker.dismissBanner()
+        for second in [3, 61, 120, 180] {
+            XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(second))))
+            XCTAssertNil(tracker.bannerIncident)
+        }
+    }
+
+    func testDismissedLossRearmsOnSensorRestartButOutageIsIndependent() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
+        health.bootID = "a"
+        _ = tracker.observe(health, now: start)
+        health.kernelDrops = 100
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(1)))
+        tracker.dismissBanner()
+        health.connected = false
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(2)))
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(12))), .unavailable)
+        tracker.dismissBanner()
+        health.connected = true; health.bootID = "b"; health.kernelDrops = 0
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(60)))
+        health.kernelDrops = 100
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(61))), .events(100))
     }
 
     func testDismissingOutageRevealsLossWithoutRestoringTheSameOutage() {

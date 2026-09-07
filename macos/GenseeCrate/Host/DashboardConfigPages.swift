@@ -764,10 +764,17 @@ struct DashboardSettingsPage: View {
     @ObservedObject var sensor: EndpointSecuritySensor
     @ObservedObject var notifications: CompletionNotificationCoordinator
     @Binding var darkMode: Bool
+    @Binding var sensorHealthRequest: UUID?
     let onRunSetupAssistant: () -> Void
     @State private var confirmRemoval = false
     @State private var confirmRecoveryCleanup = false
     @State private var pendingProtectionLevel: ProtectionLevel?
+
+    private func revealSensorHealth(using scroll: ScrollViewProxy) {
+        guard sensorHealthRequest != nil else { return }
+        withAnimation { scroll.scrollTo("sensor-health", anchor: .top) }
+        sensorHealthRequest = nil
+    }
 
     private var appVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
@@ -780,134 +787,139 @@ struct DashboardSettingsPage: View {
     }
 
     var body: some View {
-        DashboardPage {
-            VStack(alignment: .leading, spacing: 16) {
-                DashboardPageHeader("Settings", description: "Local-store security, appearance, and advanced configuration.")
-                if model.databaseExists && !model.databaseEncrypted {
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Plaintext local database detected").font(.system(size: 13, weight: .semibold))
-                            Text("Telemetry is not encrypted at rest. Create or migrate to a new Gensee home with encryption enabled; automatic in-place encryption is not offered because it could corrupt the active security store.").font(.system(size: 11)).foregroundStyle(.secondary)
-                        }
-                    }.padding(12).background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 5)).overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.orange.opacity(0.35)))
-                }
-
-                DashboardCard("Protection Level") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Choose the developer workflow you want: Fast for flow, Review for interactive guardrails, or Sensitive for tightly controlled work. Decision rules remain editable in Policy.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
+        ScrollViewReader { scroll in
+            DashboardPage {
+                VStack(alignment: .leading, spacing: 16) {
+                    DashboardPageHeader("Settings", description: "Local-store security, appearance, and advanced configuration.")
+                    if model.databaseExists && !model.databaseEncrypted {
                         HStack(alignment: .top, spacing: 10) {
-                            ForEach(ProtectionLevel.allCases) { level in
-                                Button {
-                                    if model.wouldLowerProtection(level) {
-                                        pendingProtectionLevel = level
-                                    } else {
-                                        Task { _ = await model.applyProtectionLevel(level) }
-                                    }
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 5) {
-                                        HStack {
-                                            Image(systemName: level.symbol)
-                                            Text(level.title).fontWeight(.semibold)
-                                            Spacer()
-                                            if model.protectionLevel == level {
-                                                Image(systemName: "checkmark.circle.fill")
-                                            }
-                                        }
-                                        .foregroundStyle(level.tint)
-                                        Text(level.tagline)
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.secondary)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                    .padding(12)
-                                    .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .background(
-                                    model.protectionLevel == level ? level.tint.opacity(0.09) : Color.dashboardMutedFill,
-                                    in: RoundedRectangle(cornerRadius: 7)
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 7)
-                                        .stroke(model.protectionLevel == level ? level.tint.opacity(0.45) : Color.dashboardLine)
-                                )
-                                .disabled(model.runningCommand != nil)
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Plaintext local database detected").font(.system(size: 13, weight: .semibold))
+                                Text("Telemetry is not encrypted at rest. Create or migrate to a new Gensee home with encryption enabled; automatic in-place encryption is not offered because it could corrupt the active security store.").font(.system(size: 11)).foregroundStyle(.secondary)
                             }
+                        }.padding(12).background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 5)).overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.orange.opacity(0.35)))
+                    }
+
+                    DashboardCard("Protection Level") {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Choose the developer workflow you want: Fast for flow, Review for interactive guardrails, or Sensitive for tightly controlled work. Decision rules remain editable in Policy.")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                            HStack(alignment: .top, spacing: 10) {
+                                ForEach(ProtectionLevel.allCases) { level in
+                                    Button {
+                                        if model.wouldLowerProtection(level) {
+                                            pendingProtectionLevel = level
+                                        } else {
+                                            Task { _ = await model.applyProtectionLevel(level) }
+                                        }
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            HStack {
+                                                Image(systemName: level.symbol)
+                                                Text(level.title).fontWeight(.semibold)
+                                                Spacer()
+                                                if model.protectionLevel == level {
+                                                    Image(systemName: "checkmark.circle.fill")
+                                                }
+                                            }
+                                            .foregroundStyle(level.tint)
+                                            Text(level.tagline)
+                                                .font(.system(size: 10))
+                                                .foregroundStyle(.secondary)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                        }
+                                        .padding(12)
+                                        .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .background(
+                                        model.protectionLevel == level ? level.tint.opacity(0.09) : Color.dashboardMutedFill,
+                                        in: RoundedRectangle(cornerRadius: 7)
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 7)
+                                            .stroke(model.protectionLevel == level ? level.tint.opacity(0.45) : Color.dashboardLine)
+                                    )
+                                    .disabled(model.runningCommand != nil)
+                                }
+                            }
+                            Text(model.protectionLevel?.detail
+                                ?? "Custom policy: Endpoint Security mode and noninteractive enforcement do not match a preset. Gensee preserves both settings until you explicitly choose a profile.")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
                         }
-                        Text(model.protectionLevel?.detail
-                            ?? "Custom policy: Endpoint Security mode and noninteractive enforcement do not match a preset. Gensee preserves both settings until you explicitly choose a profile.")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
+                    }
+
+                    DashboardCard("Approvals & Read Exceptions") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text("Scoped permissions for future matching actions.").font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                                Button("Refresh") { Task { await model.refreshRememberedApprovals() } }
+                            }
+                            if let issue = model.approvalMemoryIssue { Text(issue).font(.caption).foregroundStyle(.orange) }
+                            if model.rememberedApprovals.isEmpty { Text("No active approvals.").font(.caption).foregroundStyle(.secondary) }
+                            ForEach(model.rememberedApprovals) { approval in
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("\(approval.provider) · \(approval.isReadException ? "Read exception" : approval.scope.capitalized)").font(.system(size: 12, weight: .semibold))
+                                        Text("Project: \(approval.project)").font(.caption2).foregroundStyle(.secondary)
+                                        Text(approval.path).font(.system(size: 10, design: .monospaced)).textSelection(.enabled)
+                                        if let scope = approval.read_scope {
+                                            Text(scope == "directory" ? "Reads in this folder and subfolders · Any content" : "Reads of this file · Any content")
+                                                .font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                        Text("\(approval.rule) · Expires \(Date(timeIntervalSince1970: TimeInterval(approval.expires_at) / 1000).formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Button("Revoke") { Task { await model.revokeApproval(approval.id) } }
+                                }
+                            }
+                        }.task { await model.refreshRememberedApprovals() }
+                    }
+
+                    DashboardCard("Notifications") {
+                        notificationSettings
+                    }
+
+                    DashboardCard("Recovery Points") {
+                        recoveryPointSettings
+                    }
+
+                    HStack(alignment: .top, spacing: 16) {
+                        DashboardCard("Endpoint Security") { endpointSecurity }.frame(maxWidth: .infinity)
+                        DashboardCard("Local Store") { localStore }.frame(maxWidth: .infinity)
+                    }
+                    .id("sensor-health")
+                    HStack(alignment: .top, spacing: 16) {
+                        DashboardCard("Appearance") {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Toggle("Dark mode", isOn: $darkMode).toggleStyle(.switch)
+                                Divider()
+                                Text("The theme preference is saved locally and applied across the security console.").font(.system(size: 11)).foregroundStyle(.secondary)
+                            }
+                        }.frame(maxWidth: .infinity)
+                        DashboardCard("About") {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Gensee Crate v\(appVersion) build \(appBuild)\nNative macOS security console\n\nGensee backend: \(model.backendAvailable ? "Connected" : "Unavailable")")
+                                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                                Divider()
+                                Button {
+                                    onRunSetupAssistant()
+                                } label: {
+                                    Label("Run Setup Assistant", systemImage: "checklist")
+                                }
+                                .controlSize(.small)
+                            }
+                        }.frame(maxWidth: .infinity)
                     }
                 }
-
-                DashboardCard("Approvals & Read Exceptions") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Text("Scoped permissions for future matching actions.").font(.caption).foregroundStyle(.secondary)
-                            Spacer()
-                            Button("Refresh") { Task { await model.refreshRememberedApprovals() } }
-                        }
-                        if let issue = model.approvalMemoryIssue { Text(issue).font(.caption).foregroundStyle(.orange) }
-                        if model.rememberedApprovals.isEmpty { Text("No active approvals.").font(.caption).foregroundStyle(.secondary) }
-                        ForEach(model.rememberedApprovals) { approval in
-                            HStack {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text("\(approval.provider) · \(approval.isReadException ? "Read exception" : approval.scope.capitalized)").font(.system(size: 12, weight: .semibold))
-                                    Text("Project: \(approval.project)").font(.caption2).foregroundStyle(.secondary)
-                                    Text(approval.path).font(.system(size: 10, design: .monospaced)).textSelection(.enabled)
-                                    if let scope = approval.read_scope {
-                                        Text(scope == "directory" ? "Reads in this folder and subfolders · Any content" : "Reads of this file · Any content")
-                                            .font(.caption2).foregroundStyle(.secondary)
-                                    }
-                                    Text("\(approval.rule) · Expires \(Date(timeIntervalSince1970: TimeInterval(approval.expires_at) / 1000).formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Button("Revoke") { Task { await model.revokeApproval(approval.id) } }
-                            }
-                        }
-                    }.task { await model.refreshRememberedApprovals() }
-                }
-
-                DashboardCard("Notifications") {
-                    notificationSettings
-                }
-
-                DashboardCard("Recovery Points") {
-                    recoveryPointSettings
-                }
-
-                HStack(alignment: .top, spacing: 16) {
-                    DashboardCard("Endpoint Security") { endpointSecurity }.frame(maxWidth: .infinity)
-                    DashboardCard("Local Store") { localStore }.frame(maxWidth: .infinity)
-                }
-                HStack(alignment: .top, spacing: 16) {
-                    DashboardCard("Appearance") {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Toggle("Dark mode", isOn: $darkMode).toggleStyle(.switch)
-                            Divider()
-                            Text("The theme preference is saved locally and applied across the security console.").font(.system(size: 11)).foregroundStyle(.secondary)
-                        }
-                    }.frame(maxWidth: .infinity)
-                    DashboardCard("About") {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("Gensee Crate v\(appVersion) build \(appBuild)\nNative macOS security console\n\nGensee backend: \(model.backendAvailable ? "Connected" : "Unavailable")")
-                                .font(.system(size: 11)).foregroundStyle(.secondary)
-                            Divider()
-                            Button {
-                                onRunSetupAssistant()
-                            } label: {
-                                Label("Run Setup Assistant", systemImage: "checklist")
-                            }
-                            .controlSize(.small)
-                        }
-                    }.frame(maxWidth: .infinity)
-                }
             }
+            .onAppear { revealSensorHealth(using: scroll) }
+            .onChange(of: sensorHealthRequest) { _ in revealSensorHealth(using: scroll) }
         }
         .alert("Remove the Endpoint Security extension?", isPresented: $confirmRemoval) {
             Button("Cancel", role: .cancel) {}
