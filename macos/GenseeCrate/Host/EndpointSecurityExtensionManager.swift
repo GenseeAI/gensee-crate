@@ -78,21 +78,65 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
         }
     }
 
+    /// The subset of `OSSystemExtensionProperties` that state derivation reads,
+    /// so both delegates share one derivation and it can be unit-tested.
+    struct ObservedRecord: Equatable {
+        var isEnabled = false
+        var isAwaitingUserApproval = false
+        var isUninstalling = false
+        var bundleVersion = ""
+
+        init(isEnabled: Bool = false, isAwaitingUserApproval: Bool = false, isUninstalling: Bool = false, bundleVersion: String = "") {
+            self.isEnabled = isEnabled
+            self.isAwaitingUserApproval = isAwaitingUserApproval
+            self.isUninstalling = isUninstalling
+            self.bundleVersion = bundleVersion
+        }
+
+        init(_ properties: OSSystemExtensionProperties) {
+            isEnabled = properties.isEnabled
+            isAwaitingUserApproval = properties.isAwaitingUserApproval
+            isUninstalling = properties.isUninstalling
+            bundleVersion = properties.bundleVersion
+        }
+    }
+
+    /// One derivation for the explicit status refresh and the passive probe.
+    /// A record awaiting approval outranks a still-enabled predecessor, so an
+    /// upgrade the user has not yet approved is never reported as active. An
+    /// enabled record whose version differs from the bundled extension returns
+    /// nil: only the explicit activation path may act on that.
+    static func observedState(from records: [ObservedRecord], bundledVersion: String?) -> State? {
+        if records.contains(where: \.isAwaitingUserApproval) { return .awaitingApproval }
+        guard let record = records.first(where: \.isEnabled) ?? records.first else { return .notInstalled }
+        if record.isEnabled {
+            if let bundledVersion, record.bundleVersion != bundledVersion { return nil }
+            return .active
+        }
+        // macOS finishes removing an extension at the next restart; there is no
+        // in-flight request to move a busy state forward.
+        if record.isUninstalling { return .rebootRequired("removal") }
+        return .notInstalled
+    }
+
     @Published private(set) var state: State = .checking
     @Published private(set) var approvalSettingsFallbackMessage: String?
     private var attemptedAutomaticUpgrade = false
     private var probe: EndpointSecurityStatusProbe?
     private var probeID: UUID?
     private let submitProbe: ((@escaping (State?) -> Void) -> Void)?
+    private let probeTimeout: Duration
 
     init(
         initialState: State = .checking,
         approvalSettingsFallbackMessage: String? = nil,
-        submitProbe: ((@escaping (State?) -> Void) -> Void)? = nil
+        submitProbe: ((@escaping (State?) -> Void) -> Void)? = nil,
+        probeTimeout: Duration = .seconds(30)
     ) {
         self.state = initialState
         self.approvalSettingsFallbackMessage = approvalSettingsFallbackMessage
         self.submitProbe = submitProbe
+        self.probeTimeout = probeTimeout
         super.init()
     }
 
@@ -120,6 +164,14 @@ final class EndpointSecurityExtensionManager: NSObject, ObservableObject {
             let probe = EndpointSecurityStatusProbe(completion: completion)
             self.probe = probe
             probe.start()
+        }
+        // The request's lifetime belongs to the system; a reply that never
+        // arrives must not hold passive discovery closed for the whole session.
+        let timeout = probeTimeout
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard let self, self.probeID == id else { return }
+            self.cancelProbe()
         }
     }
 
@@ -231,33 +283,25 @@ extension EndpointSecurityExtensionManager: OSSystemExtensionRequestDelegate {
     }
 
     func request(_ request: OSSystemExtensionRequest, foundProperties properties: [OSSystemExtensionProperties]) {
-        // macOS retains superseded versions as "waiting to uninstall on
-        // reboot". Prefer the enabled record so that an obsolete first entry
-        // cannot suppress an automatic upgrade of the active extension.
-        guard let extensionProperties = properties.first(where: \.isEnabled) ?? properties.first else {
-            state = .notInstalled
+        let observed = Self.observedState(
+            from: properties.map(ObservedRecord.init),
+            bundledVersion: Self.bundledExtensionVersion
+        )
+        guard let observed else {
+            // An enabled extension at another version: upgrade once, then treat
+            // the running version as active so a refused upgrade cannot loop.
+            if attemptedAutomaticUpgrade {
+                state = .active
+            } else {
+                attemptedAutomaticUpgrade = true
+                DispatchQueue.main.async { self.activate() }
+            }
             return
         }
-
-        if extensionProperties.isEnabled,
-           !attemptedAutomaticUpgrade,
-           let bundledVersion = bundledExtensionVersion,
-           extensionProperties.bundleVersion != bundledVersion
-        {
-            attemptedAutomaticUpgrade = true
-            DispatchQueue.main.async { self.activate() }
-        } else if extensionProperties.isEnabled {
-            state = .active
-        } else if extensionProperties.isAwaitingUserApproval {
-            state = .awaitingApproval
-        } else if extensionProperties.isUninstalling {
-            state = .deactivating
-        } else {
-            state = .notInstalled
-        }
+        state = observed
     }
 
-    private var bundledExtensionVersion: String? {
+    static var bundledExtensionVersion: String? {
         let infoURL = Bundle.main.bundleURL
             .appendingPathComponent("Contents/Library/SystemExtensions")
             .appendingPathComponent("\(Self.extensionIdentifier).systemextension")
@@ -284,14 +328,10 @@ private final class EndpointSecurityStatusProbe: NSObject, OSSystemExtensionRequ
     }
 
     func request(_ request: OSSystemExtensionRequest, foundProperties properties: [OSSystemExtensionProperties]) {
-        guard let record = properties.first(where: \.isEnabled) ?? properties.first else {
-            completion(.notInstalled)
-            return
-        }
-        if record.isEnabled { completion(.active) }
-        else if record.isAwaitingUserApproval { completion(.awaitingApproval) }
-        else if record.isUninstalling { completion(.deactivating) }
-        else { completion(.notInstalled) }
+        completion(EndpointSecurityExtensionManager.observedState(
+            from: properties.map(EndpointSecurityExtensionManager.ObservedRecord.init),
+            bundledVersion: EndpointSecurityExtensionManager.bundledExtensionVersion
+        ))
     }
 
     func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) { completion(nil) }

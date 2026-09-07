@@ -24,6 +24,8 @@ final class EndpointSecuritySensor: ObservableObject {
     private var persistedKernelDrops: UInt64?
     private var checkedLaunchContinuity = false
     private var started = false
+    private var consecutiveFailures = 0
+    private var lastPollFailed = false
     private var pendingConfiguration: [String: Any] = ["mode": "observe"]
     private var pendingConfigurationData: Data?
     // Do not replace the extension's last known managed roots with an empty
@@ -62,29 +64,37 @@ final class EndpointSecuritySensor: ObservableObject {
         // ingester launch fails or the extension goes away in the background.
         pollingTask = Task { [weak self] in
             while !Task.isCancelled {
-                let draining = await self?.pollAndCheckBacklog() ?? false
-                try? await Task.sleep(for: .milliseconds(draining ? 10 : 500))
+                let delay = await self?.pollAndChooseDelay() ?? .milliseconds(500)
+                try? await Task.sleep(for: delay)
             }
         }
     }
 
-    private func pollAndCheckBacklog() async -> Bool {
+    private func pollAndChooseDelay() async -> Duration {
         let previousCursor = cursor
         await pollOnce()
-        return EndpointIngestBatchPolicy.shouldDrainImmediately(
+        // A missing extension or ingester must not be retried at full rate:
+        // each attempt builds a privileged XPC connection or spawns a process.
+        if lastPollFailed {
+            return EndpointIngestBatchPolicy.retryDelay(afterConsecutiveFailures: consecutiveFailures)
+        }
+        let draining = EndpointIngestBatchPolicy.shouldDrainImmediately(
             connected: health.connected,
             backlog: health.backlogEvents,
             previousCursor: previousCursor,
             currentCursor: cursor
         )
+        return .milliseconds(draining ? 10 : 500)
     }
 
     func reconnect() {
-        // Serialize replacement with polling instead of tearing down a healthy
-        // connection on a lagging UI status observation.
+        // Mark the transport for replacement and let the polling loop install
+        // the successor before invalidating the current connection, so a
+        // healthy connection is never torn down ahead of its replacement and
+        // the health tracker never observes an interruption for a manual retry.
+        guard !connectionRecovery.needsConnection else { return }
         connectionRecovery.failed(generation: connectionRecovery.generation)
-        health.connected = false
-        connection?.invalidate()
+        consecutiveFailures = 0
         start()
     }
 
@@ -155,7 +165,9 @@ final class EndpointSecuritySensor: ObservableObject {
         connection = next
         checkedLaunchContinuity = false
         configurationNeedsPush = pendingConfigurationData != nil
-        health.connected = false
+        // `health.connected` is left to the next fetch result: a failed
+        // predecessor already cleared it, and a voluntary replacement of a
+        // healthy transport is not an interruption.
         next.activate()
         previousConnection?.invalidate()
     }
@@ -216,6 +228,7 @@ final class EndpointSecuritySensor: ObservableObject {
     }
 
     private func pollOnce() async {
+        lastPollFailed = false
         do {
             if connectionRecovery.needsConnection || connection == nil { try connect() }
             let generation = connectionRecovery.generation
@@ -286,8 +299,11 @@ final class EndpointSecuritySensor: ObservableObject {
             if generation == connectionRecovery.generation, !connectionRecovery.needsConnection {
                 health.connected = true
                 health.error = nil
+                consecutiveFailures = 0
             }
         } catch {
+            lastPollFailed = true
+            consecutiveFailures += 1
             health.connected = false
             health.error = error.localizedDescription
         }

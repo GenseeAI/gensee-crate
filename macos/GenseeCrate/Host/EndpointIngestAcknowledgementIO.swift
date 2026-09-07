@@ -6,6 +6,13 @@ enum EndpointIngestBatchPolicy {
         connected && backlog > 0 && currentCursor > previousCursor
     }
 
+    /// Doubles from the normal poll interval up to a 30-second ceiling while
+    /// the sensor cannot connect or launch its ingester.
+    static func retryDelay(afterConsecutiveFailures failures: Int) -> Duration {
+        let exponent = min(max(failures - 1, 0), 6)
+        return .milliseconds(min(500 << exponent, 30_000))
+    }
+
     private static let minimumAcknowledgementTimeout: TimeInterval = 5
     private static let acknowledgementTimeoutPerEvent: TimeInterval = 0.1
     private static let maximumAcknowledgementTimeout: TimeInterval = 60

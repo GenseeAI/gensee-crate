@@ -75,6 +75,60 @@ final class EndpointSecurityLifecycleTests: XCTestCase {
         XCTAssertEqual(manager.state, failure)
     }
 
+    func testObservedStatePrefersPendingApprovalOverAnEnabledPredecessor() {
+        typealias Record = EndpointSecurityExtensionManager.ObservedRecord
+        let upgradeAwaitingApproval = [
+            Record(isEnabled: true, bundleVersion: "41"),
+            Record(isAwaitingUserApproval: true, bundleVersion: "42"),
+        ]
+        XCTAssertEqual(
+            EndpointSecurityExtensionManager.observedState(from: upgradeAwaitingApproval, bundledVersion: "42"),
+            .awaitingApproval,
+            "A passive probe must not report the old version as active while the upgrade awaits the user"
+        )
+        XCTAssertNil(
+            EndpointSecurityExtensionManager.observedState(from: [Record(isEnabled: true, bundleVersion: "41")], bundledVersion: "42"),
+            "Only the explicit activation path may act on a version mismatch"
+        )
+        XCTAssertEqual(
+            EndpointSecurityExtensionManager.observedState(from: [Record(isEnabled: true, bundleVersion: "42")], bundledVersion: "42"),
+            .active
+        )
+        XCTAssertEqual(
+            EndpointSecurityExtensionManager.observedState(from: [Record(isEnabled: true, bundleVersion: "42")], bundledVersion: nil),
+            .active,
+            "An unknown bundled version cannot be a mismatch"
+        )
+        XCTAssertEqual(
+            EndpointSecurityExtensionManager.observedState(from: [Record(isUninstalling: true)], bundledVersion: "42"),
+            .rebootRequired("removal"),
+            "Pending removal is a restart, not a busy state no request can finish"
+        )
+        XCTAssertEqual(
+            EndpointSecurityExtensionManager.observedState(from: [], bundledVersion: "42"),
+            .notInstalled
+        )
+    }
+
+    func testProbeWithoutAReplyReleasesItselfSoDiscoveryCanRetry() async throws {
+        var completions: [(EndpointSecurityExtensionManager.State?) -> Void] = []
+        let manager = EndpointSecurityExtensionManager(
+            initialState: .notInstalled,
+            submitProbe: { completions.append($0) },
+            probeTimeout: .milliseconds(50)
+        )
+        manager.probeStatus()
+        manager.probeStatus()
+        XCTAssertEqual(completions.count, 1)
+        try await Task.sleep(for: .milliseconds(250))
+        manager.probeStatus()
+        XCTAssertEqual(completions.count, 2, "A stalled probe must time out instead of blocking discovery for the session")
+        completions[0](.active)
+        XCTAssertEqual(manager.state, .notInstalled, "A reply from the timed-out probe is ignored")
+        completions[1](.active)
+        XCTAssertEqual(manager.state, .active)
+    }
+
     func testConnectionRecoveryIgnoresCallbacksFromReplacedTransport() {
         var recovery = EndpointConnectionRecovery()
         XCTAssertTrue(recovery.needsConnection)

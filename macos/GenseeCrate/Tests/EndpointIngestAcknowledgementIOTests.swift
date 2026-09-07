@@ -9,6 +9,15 @@ final class EndpointIngestAcknowledgementIOTests: XCTestCase {
         XCTAssertFalse(EndpointIngestBatchPolicy.shouldDrainImmediately(connected: true, backlog: 0, previousCursor: 1, currentCursor: 501))
     }
 
+    func testRetryDelayDoublesFromThePollIntervalToAThirtySecondCeiling() {
+        XCTAssertEqual(EndpointIngestBatchPolicy.retryDelay(afterConsecutiveFailures: 0), .milliseconds(500))
+        XCTAssertEqual(EndpointIngestBatchPolicy.retryDelay(afterConsecutiveFailures: 1), .milliseconds(500))
+        XCTAssertEqual(EndpointIngestBatchPolicy.retryDelay(afterConsecutiveFailures: 2), .milliseconds(1_000))
+        XCTAssertEqual(EndpointIngestBatchPolicy.retryDelay(afterConsecutiveFailures: 4), .milliseconds(4_000))
+        XCTAssertEqual(EndpointIngestBatchPolicy.retryDelay(afterConsecutiveFailures: 7), .milliseconds(30_000))
+        XCTAssertEqual(EndpointIngestBatchPolicy.retryDelay(afterConsecutiveFailures: 1_000), .milliseconds(30_000))
+    }
+
     func testAcknowledgementTimeoutScalesForBacklogBatches() {
         XCTAssertEqual(
             EndpointIngestBatchPolicy.acknowledgementTimeout(forEventCount: 0),
