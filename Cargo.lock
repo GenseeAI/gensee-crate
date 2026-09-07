@@ -327,14 +327,14 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-attribution"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "gensee-crate-core",
 ]
 
 [[package]]
 name = "gensee-crate-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-config-audit"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "percent-encoding",
  "serde",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-db"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "gensee-crate-core",
  "rusqlite",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-linux"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "gensee-crate-core",
  "libc",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-macos"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "gensee-crate-core",
  "serde",
@@ -410,11 +410,11 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-ml"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "gensee-crate-replay"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-rules"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "gensee-crate-core",
  "serde",
@@ -439,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "gensee-crate-store"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chacha20poly1305",
  "gensee-crate-core",
