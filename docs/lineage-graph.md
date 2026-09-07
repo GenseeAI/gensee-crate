@@ -95,9 +95,10 @@ order by r.relation_id;
 - agent intent to read, write, copy, delete, or move files from hooks and
   parsed Bash commands
 - native file-tool access when hooks include tool input
-- runtime [policy](policy.md) decisions for `PreToolUse`, with `deny` for
-  sensitive reads, destructive operations, and writes outside the current
-  workspace
+- runtime [policy](policy.md) decisions for `PreToolUse`, with configured
+  approval or denial for sensitive reads, destructive operations, and writes
+  outside the permitted scope; routine workspace and temporary writes do not
+  become violations solely because hook intent could not be matched
 - dangerous content inside a script at execution time (assembled across
   fragments/sessions), via digest-keyed pre-execution inspection
 - provenance-aware `ask` for executing an artifact authored in another session
@@ -159,8 +160,9 @@ key the agent cannot reach or shipped to an append-only / off-box sink (planned)
 ## What is not solved yet
 
 - FSEvents does not prove which process caused a file effect; it is path/time
-  correlation only, so "modified outside the agent" is a heuristic and drives
-  `ask`, not `deny` (EndpointSecurity exec attribution is the planned upgrade).
+  correlation only. The shipped Endpoint Security sensor adds exact process
+  identity on supported macOS paths, but missing actor evidence must not be
+  upgraded to certainty. Cowork audit-to-sensor causal joining remains unavailable.
 - Hook enforcement is deterministic and path/tool based; it does not yet use
   semantic prompt analysis or user/session-specific policy files.
 - Content rules are deterministic substring/shape matches over normalized

@@ -1,7 +1,7 @@
 # Gensee Crate Team
 
 Gensee Crate Team is the self-hosted path for small teams and businesses that
-operate coding agents on prepared remote Linux hosts. The team keeps control of
+operate AI agents on prepared remote Linux hosts. The team keeps control of
 its source, policy, credentials, runtime, evidence, and lifecycle decisions.
 
 The goal is not merely to record what an agent did. It is to decide what

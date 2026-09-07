@@ -1,5 +1,8 @@
 # Cross-platform dashboard
 
+For the downloadable macOS app, see [macOS setup](macos-app.md) and the
+[native Review Queue and approvals](review-queue-approvals.md) guide.
+
 The React/Tauri Gensee Crate dashboard is a local desktop application for
 inspecting the same `GENSEE_HOME` store used by `gensee watch`, agent hooks,
 `gensee run`, and `gensee timeline`.

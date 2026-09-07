@@ -146,7 +146,7 @@ gensee policy validate "$GENSEE_HOME/policy.json"
 - destructive operations and writes outside the current workspace (paths are
   lexically normalized first, so `..` traversal and globs cannot escape);
 - requests to cloud instance-metadata (IMDS) endpoints — see
-  [URL/host matching](#urlhost-matching) below;
+  [URL/host matching](#url-host-matching) below;
 - **dangerous content inside a script being executed** — disk wipes, in-script
   credential reads, reverse shells — see
   [pre-execution artifact inspection](#pre-execution-artifact-inspection);
@@ -447,3 +447,17 @@ For `PreToolUse`, stdout is reserved for the agent hook policy response:
 
 Findings are also persisted to the SQLite `alerts` table and shown in
 `gensee timeline`.
+
+## App protection levels and scoped permissions
+
+**Settings → Protection Level** applies Mac-wide presets across enabled harnesses:
+Fast uses Observe, Review uses Protect, and Sensitive uses Strict with
+noninteractive denial for risky hook approvals. Per-harness visibility toggles do
+not select a separate Mac-wide level. See [macOS modes](macos-app.md#endpoint-security-modes).
+
+Policy’s rule-wide overrides apply to the whole matching rule. Older overrides
+may appear as **Tuned**. Review Queue now offers narrower
+[remembered approvals](review-queue-approvals.md) and
+[file/folder read exceptions](scoped-feedback-triage.md) rather than changing a
+rule globally. Existing global overrides remain until deliberately reset in Policy.
+False-positive feedback alone changes neither permissions nor future detection.

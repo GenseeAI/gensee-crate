@@ -42,10 +42,12 @@ file, and active tool do not identify the cause or ownership of the missing even
 Reports are rate-limited per sensor boot, so summing their counts does not give an
 exact total. Live sensor health has separate kernel-loss and replay-buffer counters.
 
-The sensor currently subscribes to frequent system-wide file notifications and
-authorization events, then filters unmanaged activity in its callback. Build bursts
-can stress that path. Historical gap records alone cannot identify a specific
-callback bottleneck; diagnosing it requires live throughput and latency profiling.
+The sensor accounts for sequence numbers before filtering system-wide events.
+Observe/off authorization callbacks return promptly without ancestry/path work;
+unrelated traffic does not enqueue evidence tasks. Build bursts can still stress a
+finite pipeline. [Throughput diagnostics](endpoint-security.md#throughput-diagnostics)
+separate callback pressure, pending evidence, and host ingestion. Historical gap
+records alone cannot identify a specific callback bottleneck.
 If the sensor is disconnected, zero counters are not proof of complete coverage.
 Check the connection and Full Disk Access before interpreting them. Full Disk Access
 denial prevents the sensor from starting and is distinct from a running sensor's
@@ -64,7 +66,7 @@ actions…**. Review the captured tool input, target, and project before choosin
 
 Saving an approval does not execute a historical command. Retry the action in the
 harness. No approval is inferred from a successful execution, a PostToolUse event,
-or a positive finding review. Settings → **Remembered Approvals** lists active
+or a positive finding review. Settings → **Approvals & Read Exceptions** lists active
 permissions with expiry, project, and target; **Revoke** stops future matches.
 
 Matching requires the same provider, tool name and input (apart from the tool-call
@@ -122,3 +124,22 @@ rule overrides remain visible in Policy and are never silently migrated.
 See [scoped feedback and triage](scoped-feedback-triage.md) for matching boundaries
 and the proposed user-confirmed pattern suggestions. No automatic permission
 learning or model backend is enabled.
+
+## Why a warning can look benign
+
+An observed file removal can come from a compiler, Git, or another child process
+inside a tool call; the displayed shell command need not contain a deletion.
+It records an observed operation, not proof of malicious intent. Routine scratch
+cleanup is filtered conservatively. A temporary directory is not a universal
+allowlist for credentials, executable content, symlink escapes, or broad deletion.
+
+A credential-content finding means an inspection matched a possible credential
+pattern. It does not prove a live secret exists. Source code and templates can
+match; use **This was a false positive** for detector feedback, or a scoped read
+exception when you deliberately want matching reads allowed.
+
+**Warning** means the policy reported a finding without requiring approval.
+**Approval requested** means the policy selected Ask. Severity describes risk;
+action describes the configured response, so a high-severity warning and a
+medium-severity approval request are possible. The single status column avoids
+showing both as competing primary labels.

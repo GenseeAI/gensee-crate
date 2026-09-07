@@ -16,6 +16,8 @@ Execution-origin labels describe the available evidence:
 | `cloud-mediated` | The session was explicitly identified as cloud mode. Crate records only effects bridged back through the endpoint; cloud execution is outside endpoint visibility. |
 | `unattributed` | Available evidence cannot establish the execution surface. Crate does not guess. |
 
+For app setup and everyday use, see the [published Cowork guide](https://crate-docs.gensee.ai/claude-cowork).
+
 ## Pilot contract
 
 1. Crate records Cowork's local audit stream and independently observed process
@@ -55,7 +57,8 @@ VM, cloud, and unknown audit boundaries; no evidence in this bounded sample does
 not mean no evidence exists in older history. The same metadata-only diagnostics
 are available as `gensee cowork-status`.
 
-The app does not start an audit collector or mark Cowork “Protected.” Start each
+The app does not start an audit collector. The Cowork row says “Visibility enabled”;
+the combined Protected summary counts that opt-in alongside healthy hook integrations. Start each
 manual stream below separately, stop it in its terminal when finished, and
 restart it after changing session mode. Disabling endpoint visibility does not
 terminate independently started CLI collectors. Historical evidence is not a
