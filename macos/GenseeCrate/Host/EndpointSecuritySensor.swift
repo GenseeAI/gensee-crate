@@ -19,6 +19,7 @@ final class EndpointSecuritySensor: ObservableObject {
     private var ingestInput: FileHandle?
     private var ingestAcknowledgements: FileHandle?
     private var pollingTask: Task<Void, Never>?
+    private let polling = EndpointSensorPolling()
     private var cursor: UInt64 = 0
     private var bootID = ""
     private var persistedKernelDrops: UInt64?
@@ -65,7 +66,7 @@ final class EndpointSecuritySensor: ObservableObject {
         pollingTask = Task { [weak self] in
             while !Task.isCancelled {
                 let delay = await self?.pollAndChooseDelay() ?? .milliseconds(500)
-                try? await Task.sleep(for: delay)
+                await self?.polling.wait(for: delay)
             }
         }
     }
@@ -88,13 +89,12 @@ final class EndpointSecuritySensor: ObservableObject {
     }
 
     func reconnect() {
-        // Mark the transport for replacement and let the polling loop install
-        // the successor before invalidating the current connection, so a
-        // healthy connection is never torn down ahead of its replacement and
-        // the health tracker never observes an interruption for a manual retry.
-        guard !connectionRecovery.needsConnection else { return }
+        // Cancel a pending XPC wait or backoff sleep now. The one polling loop
+        // still owns replacement and durable ingestion, so retries cannot race
+        // another batch or advance its cursor twice.
         connectionRecovery.failed(generation: connectionRecovery.generation)
         consecutiveFailures = 0
+        polling.retryNow()
         start()
     }
 
@@ -247,8 +247,7 @@ final class EndpointSecuritySensor: ObservableObject {
                 try await pushConfiguration(using: connection, generation: generation)
             }
             guard !configurationNeedsPush, !connectionRecovery.needsConnection else { return }
-            let response = try await withCheckedThrowingContinuation {
-                (continuation: CheckedContinuation<([[String: Any]], UInt64, [String: Any]), Error>) in
+            let response: ([[String: Any]], UInt64, [String: Any]) = try await sensorRequest(generation: generation) { complete in
                 connection.fetchEvents(
                     afterCursor: cursor,
                     limit: 500,
@@ -256,21 +255,16 @@ final class EndpointSecuritySensor: ObservableObject {
                         guard let events = events as? [[String: Any]],
                               let health = health as? [String: Any]
                         else {
-                            continuation.resume(throwing: NSError(
+                            complete(.failure(NSError(
                                 domain: "ai.gensee.crate.endpoint-security",
                                 code: 2,
                                 userInfo: [NSLocalizedDescriptionKey: "Endpoint Security returned malformed XPC data."]
-                            ))
+                            )))
                             return
                         }
-                        continuation.resume(returning: (events, nextCursor, health))
+                        complete(.success((events, nextCursor, health)))
                     },
-                    failure: { [weak self] error in
-                        Task { @MainActor in
-                            self?.connectionFailed(generation: generation, message: error.localizedDescription)
-                            continuation.resume(throwing: error)
-                        }
-                    }
+                    failure: { complete(.failure($0)) }
                 )
             }
             guard generation == connectionRecovery.generation, !connectionRecovery.needsConnection else { return }
@@ -301,6 +295,9 @@ final class EndpointSecuritySensor: ObservableObject {
                 health.error = nil
                 consecutiveFailures = 0
             }
+        } catch is CancellationError {
+            // An explicit retry is not evidence of a transport outage.
+            return
         } catch {
             lastPollFailed = true
             consecutiveFailures += 1
@@ -312,32 +309,35 @@ final class EndpointSecuritySensor: ObservableObject {
     private func pushConfiguration(using connection: GenseeEndpointSecurityBridge, generation: UInt64) async throws {
         let configuration = pendingConfiguration
         let configurationData = pendingConfigurationData
-        let warning = try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<String?, Error>) in
+        let response: (Bool, String?) = try await sensorRequest(generation: generation) { complete in
             connection.updateConfiguration(
                 configuration,
-                reply: { accepted, message in
-                    if accepted {
-                        continuation.resume(returning: message)
-                    } else {
-                        continuation.resume(throwing: NSError(
-                            domain: "ai.gensee.crate.endpoint-security",
-                            code: 4,
-                            userInfo: [NSLocalizedDescriptionKey: message ?? "Sensor rejected its configuration."]
-                        ))
-                    }
-                },
-                failure: { [weak self] error in
-                    Task { @MainActor in
-                        self?.connectionFailed(generation: generation, message: error.localizedDescription)
-                        continuation.resume(throwing: error)
-                    }
-                }
+                reply: { complete(.success(($0, $1))) },
+                failure: { complete(.failure($0)) }
             )
         }
+        guard response.0 else {
+            // A semantic configuration rejection is not a transport failure.
+            throw NSError(domain: "ai.gensee.crate.endpoint-security", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: response.1 ?? "Sensor rejected its configuration."])
+        }
         guard generation == connectionRecovery.generation, !connectionRecovery.needsConnection else { return }
-        health.configurationWarning = warning
+        health.configurationWarning = response.1
         configurationNeedsPush = pendingConfigurationData != configurationData
+    }
+
+    private func sensorRequest<Value>(
+        generation: UInt64,
+        submit: (@escaping (Result<Value, Error>) -> Void) -> Void
+    ) async throws -> Value {
+        do {
+            return try await polling.request(submit: submit)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            connectionFailed(generation: generation, message: error.localizedDescription)
+            throw error
+        }
     }
 
     @discardableResult
