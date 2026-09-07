@@ -12,10 +12,10 @@ changes.
 
 - Sensor health opens Settings at the Endpoint Security section, including when
   Settings is already selected.
-- Dismissing a monitoring-loss banner acknowledges queued counts and the ongoing
-  loss episode. Health details retain the counters; loss banners rearm after a
-  minute of healthy loss-free polling or a sensor restart. Separate outages still
-  raise their own alarms.
+- Dismissing a monitoring-loss banner or native notification acknowledges losses
+  counted so far, including queued counts. Later losses can raise both surfaces
+  again at the existing 100-event threshold and 60-second cooldown, without
+  waiting for recovery. Health counters and separate outage alarms remain intact.
 
 ## 0.3.3 - 2026-09-06
 

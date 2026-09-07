@@ -918,7 +918,10 @@ struct DashboardSettingsPage: View {
                     }
                 }
             }
-            .onAppear { revealSensorHealth(using: scroll) }
+            .onAppear {
+                // Let a newly created Settings page register its scroll target.
+                Task { @MainActor in revealSensorHealth(using: scroll) }
+            }
             .onChange(of: sensorHealthRequest) { _ in revealSensorHealth(using: scroll) }
         }
         .alert("Remove the Endpoint Security extension?", isPresented: $confirmRemoval) {

@@ -22,6 +22,7 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     private var monitoringTask: Task<Void, Never>?
     private var wakeObserver: NSObjectProtocol?
     private var lastMonitoringBannerRevision: UInt64 = 0
+    private var monitoringAcknowledgementRevisions: [String: UInt64] = [:]
     @Published var completionNotificationsEnabled: Bool {
         didSet { defaults.set(completionNotificationsEnabled, forKey: Self.completionEnabledKey) }
     }
@@ -84,6 +85,12 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
                     ),
                 ],
                 intentIdentifiers: []
+            ),
+            UNNotificationCategory(
+                identifier: Self.monitoringCategoryIdentifier,
+                actions: [],
+                intentIdentifiers: [],
+                options: [.customDismissAction]
             ),
         ])
     }
@@ -173,8 +180,15 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     }
 
     func dismissMonitoringHealthAlarm() {
+        let kind = monitoringTracker.bannerIncident?.notificationKind
         monitoringTracker.dismissBanner()
+        if let kind { acknowledgeMonitoringNotification(kind: kind) }
         updateMonitoringHealthBanner()
+    }
+
+    private func acknowledgeMonitoringNotification(kind: String) {
+        monitoringAcknowledgementRevisions[kind, default: 0] &+= 1
+        center.removeDeliveredNotifications(withIdentifiers: [Self.monitoringNotificationIdentifier(kind: kind)])
     }
 
     private func updateMonitoringHealthBanner() {
@@ -189,15 +203,25 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         guard let incident else { return }
         let message = Self.monitoringMessage(incident)
         guard monitoringHealthNotificationsEnabled else { return }
+        let kind = incident.notificationKind
+        let acknowledgementRevision = monitoringAcknowledgementRevisions[kind, default: 0]
+        let notificationIdentifier = Self.monitoringNotificationIdentifier(kind: kind)
         await refreshAuthorizationStatus()
-        guard isAuthorized else { return }
+        // A dismiss received while authorization was being refreshed must not
+        // publish the already acknowledged incident afterward.
+        guard isAuthorized, acknowledgementRevision == monitoringAcknowledgementRevisions[kind, default: 0] else { return }
         let content = UNMutableNotificationContent()
+        content.categoryIdentifier = Self.monitoringCategoryIdentifier
+        content.userInfo = ["monitoring_kind": kind]
         content.title = "Gensee monitoring gap"
         content.body = message
         content.sound = .default
         content.interruptionLevel = .active
         do {
-            try await center.add(UNNotificationRequest(identifier: "gensee-monitoring-health", content: content, trigger: nil))
+            try await center.add(UNNotificationRequest(identifier: notificationIdentifier, content: content, trigger: nil))
+            if acknowledgementRevision != monitoringAcknowledgementRevisions[kind, default: 0] {
+                center.removeDeliveredNotifications(withIdentifiers: [notificationIdentifier])
+            }
         } catch { lastDeliveryError = error.localizedDescription }
     }
 
@@ -387,6 +411,10 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     private static let notifiedRequestsKey = "gensee.notifications.actionable-request-ids.v2"
     private static let notifiedAlertsKey = "gensee.notifications.alert-ids"
     private static let lastDailyBriefingKey = "gensee.notifications.last-daily-briefing"
+    private static let monitoringCategoryIdentifier = "gensee.monitoring-health"
+    private static func monitoringNotificationIdentifier(kind: String) -> String {
+        "gensee-monitoring-health-\(kind)"
+    }
     private static let agentReviewCategoryIdentifier = "gensee.agent-review"
     private static let openReviewActionIdentifier = "gensee.open-review"
     private static let dayFormatter: DateFormatter = {
@@ -405,6 +433,17 @@ extension CompletionNotificationCoordinator: UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         Task { @MainActor in
+            let content = response.notification.request.content
+            if response.actionIdentifier == UNNotificationDismissActionIdentifier {
+                if content.categoryIdentifier == Self.monitoringCategoryIdentifier,
+                   let kind = content.userInfo["monitoring_kind"] as? String {
+                    monitoringTracker.dismissNotification(kind: kind)
+                    acknowledgeMonitoringNotification(kind: kind)
+                    updateMonitoringHealthBanner()
+                }
+                completionHandler()
+                return
+            }
             let requestID: Int64? = {
                 let value = response.notification.request.content.userInfo["request_id"]
                 if let number = value as? NSNumber { return number.int64Value }

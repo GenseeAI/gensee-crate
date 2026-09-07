@@ -55,6 +55,14 @@ struct EndpointSensorHealth: Equatable {
 
 enum MonitoringHealthIncident: Equatable {
     case events(UInt64), unavailable, stalled
+
+    var notificationKind: String {
+        switch self {
+        case .events: "events"
+        case .unavailable: "unavailable"
+        case .stalled: "stalled"
+        }
+    }
 }
 
 // SuspendingClock is monotonic and excludes system sleep. Wall-clock changes
@@ -63,8 +71,6 @@ struct MonitoringGapAlarmTracker {
     private enum OutageKind: Hashable { case unavailable, stalled }
     private var previous: EndpointSensorHealth?
     private var pending: UInt64 = 0
-    private var dismissedLossBootID: String?
-    private var lossQuietSince: SuspendingClock.Instant?
     private var lastAlarm: SuspendingClock.Instant?
     private var unavailableSince: SuspendingClock.Instant?
     private var healthySince: SuspendingClock.Instant?
@@ -90,18 +96,29 @@ struct MonitoringGapAlarmTracker {
 
     mutating func dismissBanner() {
         if case .events = bannerIncident {
-            // Acknowledge the entire observed episode, including loss counts
-            // waiting for the notification cooldown. Continued loss remains in
-            // sensor health; only a new episode should interrupt again.
-            pending = 0
-            dismissedLossBootID = previous?.bootID
-            lossQuietSince = nil
-            eventLossBanner = nil
-            setBanner(nil)
+            dismissEventLoss()
         } else {
             // Dismiss the visible outage only; an undisclosed history gap
             // remains independently actionable and becomes visible underneath.
             setBanner(eventLossBanner)
+        }
+    }
+
+    private mutating func dismissEventLoss() {
+        // Acknowledge everything counted so far, including the cooldown queue.
+        // Subsequent loss still uses the existing threshold and cooldown.
+        pending = 0
+        eventLossBanner = nil
+        if case .events = bannerIncident { setBanner(nil) }
+    }
+
+    mutating func dismissNotification(kind: String) {
+        switch kind {
+        case "events": dismissEventLoss()
+        case "unavailable" where bannerIncident == .unavailable,
+             "stalled" where bannerIncident == .stalled:
+            dismissBanner()
+        default: break
         }
     }
 
@@ -121,7 +138,6 @@ struct MonitoringGapAlarmTracker {
         // stale/off report from the extension cannot disable its own alarm.
         guard let configuredMode = health.configuredMode, configuredMode != "off" else {
             resetOutageWindow()
-            lossQuietSince = nil
             alarmedKinds.removeAll()
             clearOutageBanner()
             return nil
@@ -133,7 +149,6 @@ struct MonitoringGapAlarmTracker {
         let stale = health.lastSuccessfulPollAt.map { $0.duration(to: now) >= .seconds(15) } ?? false
         let unavailable = !health.connected || !health.running || health.mode == "off"
         if unavailable || stale {
-            lossQuietSince = nil
             healthySince = nil
             interruptions.removeAll { $0.duration(to: now) > .seconds(60) }
             let newOutage = unavailableSince == nil
@@ -170,23 +185,9 @@ struct MonitoringGapAlarmTracker {
         guard let previous, previous.bootID == health.bootID,
               health.kernelDrops >= previous.kernelDrops, health.ringDrops >= previous.ringDrops else {
             self.pending = 0
-            dismissedLossBootID = nil
-            lossQuietSince = nil
             return nil
         }
         let newLoss = health.kernelDrops - previous.kernelDrops + health.ringDrops - previous.ringDrops
-        if dismissedLossBootID == health.bootID {
-            // Require a full minute of healthy, loss-free polling before a
-            // later loss can be a new episode. Outages interrupt this window.
-            if let quietSince = lossQuietSince, quietSince.duration(to: now) >= .seconds(60) {
-                dismissedLossBootID = nil
-                lossQuietSince = nil
-            } else {
-                if newLoss > 0 { lossQuietSince = nil }
-                else if lossQuietSince == nil { lossQuietSince = now }
-                return nil
-            }
-        }
         pending += newLoss
         guard pending >= 100, lastAlarm.map({ $0.duration(to: now) >= .seconds(60) }) ?? true else { return nil }
         let count = pending

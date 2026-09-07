@@ -71,12 +71,11 @@ final class EndpointSensorHealthTests: XCTestCase {
         XCTAssertNil(tracker.bannerIncident)
         _ = tracker.observe(health, now: start.advanced(by: .seconds(80)))
         XCTAssertNil(tracker.bannerIncident)
-        _ = tracker.observe(health, now: start.advanced(by: .seconds(140)))
         health.kernelDrops = 100
-        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(141))), .events(100))
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(81))), .events(100))
     }
 
-    func testDismissAcknowledgesQueuedLossAndContinuedEpisode() {
+    func testDismissAcknowledgesPastLossButContinuousNewLossRenotifies() {
         let start = SuspendingClock.now
         var tracker = MonitoringGapAlarmTracker()
         var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
@@ -88,16 +87,56 @@ final class EndpointSensorHealthTests: XCTestCase {
         XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(2))))
         tracker.dismissBanner()
         let revision = tracker.bannerRevision
-        for second in [3, 30, 61, 90, 120] {
+        for second in [3, 30] {
             health.kernelDrops += 200
             XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(second))))
             XCTAssertNil(tracker.bannerIncident)
             XCTAssertEqual(tracker.bannerRevision, revision)
         }
-        _ = tracker.observe(health, now: start.advanced(by: .seconds(121)))
-        _ = tracker.observe(health, now: start.advanced(by: .seconds(180)))
+        health.kernelDrops += 200
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(61))), .events(600))
+        XCTAssertEqual(tracker.bannerIncident, .events(600), "Only post-dismiss loss belongs to the new banner")
+        tracker.dismissNotification(kind: "events")
+        // A sustained loss stream must keep producing both a banner and a
+        // notification incident, without ever needing a quiet/recovery window.
+        for second in 62...3601 {
+            health.ringDrops += 100
+            let incident = tracker.observe(health, now: start.advanced(by: .seconds(second)))
+            if (second - 61) % 60 == 0 {
+                XCTAssertEqual(incident, .events(6000))
+                XCTAssertEqual(tracker.bannerIncident, .events(6000))
+                tracker.dismissNotification(kind: "events")
+            } else {
+                XCTAssertNil(incident)
+                XCTAssertNil(tracker.bannerIncident)
+            }
+        }
+    }
+
+    func testNativeLossDismissAcknowledgesQueuedCountsWithoutDismissingOutage() {
+        let start = SuspendingClock.now
+        var tracker = MonitoringGapAlarmTracker()
+        var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
+        _ = tracker.observe(health, now: start)
+        health.kernelDrops = 100
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(1)))
+        health.kernelDrops = 500
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(2)))
+        tracker.dismissNotification(kind: "unknown")
+        XCTAssertEqual(tracker.bannerIncident, .events(100))
+        health.connected = false
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(3)))
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(13)))
+        tracker.dismissNotification(kind: "events")
+        XCTAssertEqual(tracker.bannerIncident, .unavailable)
+        health.connected = true
+        _ = tracker.observe(health, now: start.advanced(by: .seconds(20)))
+        XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(61))))
+        XCTAssertNil(tracker.bannerIncident, "Acknowledged loss must not return at cooldown or recovery")
         health.ringDrops = 100
-        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(181))), .events(100))
+        XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(62))), .events(100))
+        tracker.dismissNotification(kind: "unavailable")
+        XCTAssertEqual(tracker.bannerIncident, .events(100), "An old outage notification cannot dismiss new loss")
     }
 
     func testDismissedQueuedLossDoesNotReturnAtCooldown() {
