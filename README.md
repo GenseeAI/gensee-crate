@@ -4,19 +4,23 @@
 </h1>
 
 <p align="center">
-  <strong>Keep agent work moving. Keep authority and effects under control.</strong>
+  <strong>Let autonomous AI work. Stay in control.</strong>
 </p>
 
 <p align="center">
-  Gensee Crate is an open-source control layer for AI coding agents. On a
-  developer laptop, it reviews completed work, surfaces scope drift, creates
-  recovery points, and audits the configuration that can influence an agent.
-  On a self-hosted Linux environment, it adds disposable workspace forks,
-  scoped capabilities, short-lived leases, host-side observation, and
-  evidence-gated promotion. Both deployment paths use the same policy and
-  evidence model: connect what the user asked for to the authority the agent
-  received, the effects that occurred, and the changes that were allowed to
-  persist.
+  Gensee Crate is an open-source safety and control layer for autonomous AI.
+  See what your AI agents did, set boundaries on what they can access and change,
+  and focus your attention on work that needs a decision. Gensee connects each
+  request to the available evidence of agent actions, policy decisions, and
+  outcomes, while keeping routine activity quiet.
+</p>
+
+<p align="center">
+  Personal brings local protection, request-based review, and recovery points
+  to your Mac. Team adds isolated workspaces and scoped authority on self-hosted
+  Linux environments. The goal is practical autonomy for research, analysis,
+  document work, software development, and business operations—with controls
+  that fit the agent and environment you use.
 </p>
 
 <p align="center">
@@ -45,15 +49,23 @@
 
 ## Why Gensee Crate
 
-- **Review decisions, not agent transcripts.** Personal directs your attention
-  to scope drift, failed verification, blocked work, and other exceptions while
-  keeping clean completions quiet.
-- **Explore risky work without risking the source environment.** Team can fork
-  a complete Linux workspace, run one or several approaches, and let a human
-  merge, promote, or discard the result.
-- **Make agent authority explainable.** Gensee connects intent, policy,
-  capability decisions, process and file effects, evidence, cleanup, and the
-  final persistence decision.
+- **Keep attention on the work that needs you.** The Review Queue groups
+  supported background activity with its originating request and surfaces
+  scope drift, blocked actions, approval requests, and failed verification.
+  Routine activity stays in history.
+- **Set boundaries before risky actions.** Local policy can allow, ask, or block
+  supported tool actions and protect sensitive paths. Enforcement depends on
+  the integration and execution environment.
+- **Reduce repeated interruptions.** Remember explicitly approved actions within
+  a session or project, or allow matching reads to a chosen file or folder.
+  False-positive feedback is separate from permission: it does not silently
+  grant access or weaken a rule.
+- **Review and recover changes.** Personal creates recovery points for supported
+  Git-workspace changes. Team provides disposable Linux workspace forks that
+  you can inspect, merge, promote, or discard.
+- **Know what was observed.** Review action evidence alongside policy decisions.
+  Gensee reports monitoring gaps as its own coverage issues, separately from
+  agent warnings.
 
 ## Benchmark results
 
@@ -70,23 +82,32 @@ runtime overhead.
 
 ### What it is
 
-Gensee Crate Personal is a local-first macOS app and CLI for individual
-developers using Codex, Claude Code, Cursor, GitHub Copilot, Antigravity, or
-Omnigent. Your policy, agent events, reviews, and feedback remain in your local
-Gensee store.
+Gensee Crate Personal is a local-first macOS app and CLI for people working
+with AI agents. Current integrations include Codex, Claude Code, Cursor,
+GitHub Copilot, Antigravity, and Omnigent, plus a macOS endpoint-visibility
+pilot for **Claude Cowork**. Your policy, agent events, reviews, and feedback
+remain in your local Gensee store.
+
+Coverage varies by integration. Cowork records supported host activity and VM
+boundaries; guest commands and cloud execution remain outside endpoint coverage.
+See the [Cowork integration guide](integrations/claude-cowork/README.md) for setup
+and limits.
 
 ### What it adds
 
 - A **Review Queue** that groups work by request and shows what needs attention.
 - **Scope-drift detection** that compares declared tool intent with file
-  mutations independently observed by macOS Endpoint Security.
+  mutations independently observed by macOS Endpoint Security, while keeping
+  routine workspace and temporary-file activity quiet.
 - **Smart recovery points** before risky Git-workspace changes, with restore
   actions in the review.
 - **Configuration audit** for instructions, skills, MCP servers, hooks,
   permissions, plugins, command rules, and other inputs that can change agent
   behavior.
-- Local policy enforcement, actionable findings, verification freshness,
-  activity highlights, notifications, and a menu-bar summary.
+- **Scoped, revocable approvals** for supported repeated actions, plus separate
+  **false-positive feedback** for triage. See [review and approval controls](docs/review-queue-approvals.md).
+- Local policy enforcement, verification freshness, activity highlights,
+  notifications, a menu-bar summary, and visible sensor health.
 
 ### Download the macOS app
 
@@ -165,9 +186,8 @@ for the complete command-line workflow.
 
 Gensee Crate Team is the self-hosted path for small teams and businesses that
 want to operate their own Gensee deployment and agent environments. Agents run
-on a prepared remote Linux host rather than developer laptops. The team keeps
-control of its source, policy, credentials, runtime, evidence, and lifecycle
-decisions.
+on a prepared remote Linux host. The team keeps control of its workspace,
+policy, credentials, runtime, evidence, and lifecycle decisions.
 
 ### What it adds
 
@@ -326,8 +346,10 @@ network replay.
 - **Team:** more capability adapters and trusted mediators, a generalized
   dispatcher across effect domains, stronger remote evidence export, and
   counterfactual replay before policy changes.
-- **Both:** keep deterministic policy and evidence portable while making the
-  default workflow require less supervision—not more.
+- **Integrations (planned):** Glean Agents and n8n workflows, expanding coverage
+  for knowledge work and business automation.
+- **Both:** keep deterministic policy and evidence portable while reducing the
+  supervision needed for routine work.
 
 Follow the detailed [project roadmap](docs/roadmap.md) and [open
 issues](https://github.com/GenseeAI/gensee-crate/issues) for current work.

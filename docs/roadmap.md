@@ -1,14 +1,17 @@
 # Roadmap
 
-Gensee Crate has two deployment paths built on the same policy and evidence
-model. **Personal** reviews local agent work, creates recovery points, audits
-configuration, and can independently verify supported macOS process and file
+Gensee Crate is expanding protection for autonomous AI across personal tasks,
+knowledge work, software development, and business automation. It has two
+deployment paths built on the same policy and evidence model. **Personal**
+reviews local agent work, creates recovery points, audits configuration, and can independently verify supported macOS process and file
 activity. **Team** runs agents on prepared Linux hosts with disposable
 workspace forks, scoped capabilities, short-lived leases, host-side evidence,
 and human-controlled promotion.
 
-Both paths support Claude Code, Codex, Antigravity, Cursor, and VS Code / GitHub
-Copilot integrations, with managed-launch coverage for Omnigent.
+Current integrations include Claude Code, Codex, Antigravity, Cursor, and
+VS Code / GitHub Copilot, with managed-launch coverage for Omnigent. The macOS
+Claude Cowork pilot adds host activity and VM-boundary visibility; guest commands
+and cloud execution remain outside endpoint coverage.
 Linux host support includes `/proc` process attribution, capability planning,
 fanotify sensitive-path enforcement, seccomp launcher profiles, and
 cgroup-scoped nftables egress controls. This roadmap is directional and may
@@ -16,8 +19,8 @@ change as agent interfaces and operating-system controls evolve.
 
 ## Linux System Enforcement
 
-Gensee Crate's Linux support will focus on agents running directly on developer
-machines, not only inside containers.
+Gensee Crate's Linux support will continue covering AI agents running directly
+on workstations and self-hosted servers, as well as agents in containers.
 
 Available now:
 
@@ -91,7 +94,7 @@ Planned work includes:
 - Reviewable staged workspace writes before changes reach the real project.
 - Policy-aware sandbox modes for file access, network access, and command
   execution.
-- Transactional or speculative execution experiments for coding-agent workflows,
+- Transactional or speculative execution experiments for AI agent workflows,
   where risky actions can be evaluated before their effects are committed.
 - Better support for managed Linux runtimes and cloud-based agent workspaces.
 
@@ -113,15 +116,35 @@ Planned work includes:
 
 ## Integrations
 
-Gensee Crate aims to work with the agent and security tools developers already
-use.
+Gensee Crate aims to work with the AI agents, workflow platforms, and security
+tools people already use. Glean and n8n support below is planned; neither adapter
+ships today.
 
 Planned integration areas include:
 
-- Additional coding agents and assistants such as ChatGPT and Gemini. Cursor
+- **Glean Agents:** bring agent runs and available action/data-access evidence
+  into request-based review. Explore scoped policy checks and approvals for
+  actions mediated through supported integration points. Distinguish Glean's
+  service-provided evidence from independently observed endpoint effects.
+  Integration design will follow the documented [Glean Agents and actions](https://docs.glean.com/agents)
+  interfaces and customer access permissions.
+- **n8n:** connect workflow executions, AI agent tool calls, retries, and
+  sub-workflows to their originating trigger or request. Start with self-hosted
+  workflows and explicit policy/approval steps before external actions, then
+  assess n8n Cloud coverage through supported APIs and workflow integration
+  points. See [n8n's AI agent workflow overview](https://blog.n8n.io/how-to-build-ai-agent/).
+- Additional AI agents and assistants such as ChatGPT and Gemini. Cursor
   and GitHub Copilot hook support are available today.
-- Agent orchestration frameworks such as Omnigent.
+- Broader agent orchestration support beyond Omnigent's current managed-launch
+  coverage.
 - Security tooling such as CrowdStrike and other endpoint or detection systems.
 - LLM gateways, MCP servers, and policy/control-plane tools.
 - Export formats for sharing local audit trails, alerts, and policy decisions
   with external systems.
+
+For Glean and n8n, the first milestone is a documented coverage map and an
+observe-first pilot with request attribution. Enforcement will be added only
+where the integration can reliably intercept an action. Each adapter should
+keep routine activity quiet, support explicit scoped approvals, and make missing
+evidence and unsupported execution surfaces visible. SaaS activity will not be
+presented as fully covered by a laptop sensor.
