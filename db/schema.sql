@@ -400,6 +400,11 @@ CREATE INDEX IF NOT EXISTS idx_relations_src
 CREATE INDEX IF NOT EXISTS idx_relations_dst
     ON relations(dst_kind, dst_id);
 
+-- Resolve producer requests without scanning unrelated requests or the many
+-- system-event edges of a popular artifact. The remaining key is output order.
+CREATE INDEX IF NOT EXISTS idx_relations_artifact_producer
+    ON relations(dst_kind, dst_id, src_kind, relation_type, src_id);
+
 CREATE INDEX IF NOT EXISTS idx_relations_type
     ON relations(relation_type);
 
