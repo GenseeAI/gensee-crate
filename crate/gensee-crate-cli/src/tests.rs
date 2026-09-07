@@ -2453,7 +2453,7 @@ fn antigravity_pretool_returns_top_level_decision() {
         "toolCall": {
             "name": "run_command",
             "args": {
-                "CommandLine": "echo hi > /tmp/gensee-outside.txt",
+                "CommandLine": "echo hi > /opt/gensee-outside.txt",
                 "Cwd": workspace
             }
         },
@@ -3099,7 +3099,7 @@ fn codex_ask_pretool_records_warn_and_returns_no_hook_output() {
     let payload = pretool_bash_payload(
         "s1",
         workspace.to_str().unwrap(),
-        "echo hi > /tmp/gensee-outside.txt",
+        "echo hi > /opt/gensee-outside.txt",
     );
     let event = super::build_hook_event(&payload, PROVIDER_CODEX).unwrap();
 
@@ -4622,13 +4622,26 @@ fn credential_content_scanner_flags_secrets_not_templates() {
     )
     .is_some());
 
+    for placeholder in ["[FILTERED]", "[REDACTED]", "[MASKED]", "[HIDDEN]"] {
+        assert!(content_has_credentials(&format!("password: {placeholder}")).is_none());
+        assert!(content_has_credentials(&format!("token = {placeholder}")).is_none());
+    }
     // Negatives: ERB/env templates and placeholders are NOT live secrets.
     assert!(content_has_credentials("  password: <%= ENV.fetch(\"DB_PASS\") %>\n").is_none());
     assert!(content_has_credentials("password: ${DB_PASSWORD}\n").is_none());
     assert!(content_has_credentials("api_key=changeme\n").is_none()); // < 8 + placeholder
     assert!(content_has_credentials("# set your password in the dashboard\n").is_none());
     assert!(content_has_credentials("let password = read_input();\n").is_none());
-    // source ref
+    assert!(content_has_credentials(
+        r#"if let secret = document["secret_paths"] as? [String: Any] {"#
+    )
+    .is_none());
+    assert!(content_has_credentials(r#"token = credentials["token"]"#).is_none());
+    assert!(content_has_credentials(r#"api_key = ["sk-live-abcdefghijk"]"#).is_some());
+    assert!(content_has_credentials(r#"api_keys = ["sk-live-abcdefghijk"]"#).is_some());
+    assert!(content_has_credentials(r#"password = "Abc[123456789]""#).is_some());
+    assert!(content_has_credentials(r#"password = "[Abcd12]""#).is_some());
+    assert!(content_has_credentials(r#"password = [ "Abcdefghijk" ]"#).is_some());
 }
 
 #[test]
@@ -5727,8 +5740,51 @@ fn policy_load_failure_denies_by_default() {
 }
 
 #[test]
+fn pretool_policy_keeps_routine_scratch_operations_silent() {
+    for command in [
+        "echo hi > /tmp/gensee-scratch/out.txt",
+        "echo hi > /dev/null",
+        "rm -rf /tmp/gensee-scratch/output",
+    ] {
+        let payload = pretool_bash_payload("s1", "/repo", command);
+        let event = build_agent_hook_event(&payload).unwrap();
+        let intents = file_intents_from_hook(&event, original_bash_command(&payload).as_deref());
+        let decision = evaluate_pretool_policy(&event, &intents);
+        assert_eq!(
+            decision.action,
+            PolicyAction::Allow,
+            "{command}: {:?}",
+            decision.findings
+        );
+        assert!(decision
+            .findings
+            .iter()
+            .all(|finding| finding.severity == "info"));
+    }
+}
+
+#[test]
+fn scratch_cleanup_does_not_exempt_broad_or_compound_commands() {
+    for command in [
+        "rm -rf /tmp",
+        "rm -rf /tmp/gensee-scratch /opt/important",
+        "rm -rf /tmp/gensee-*",
+        "rm -rf /tmp/gensee-scratch; rm -rf /opt/important",
+    ] {
+        let payload = pretool_bash_payload("s1", "/repo", command);
+        let event = build_agent_hook_event(&payload).unwrap();
+        let intents = file_intents_from_hook(&event, original_bash_command(&payload).as_deref());
+        assert_ne!(
+            evaluate_pretool_policy(&event, &intents).action,
+            PolicyAction::Allow,
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn pretool_policy_blocks_writes_outside_workspace() {
-    let payload = r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"echo hi > /tmp/out.txt"}}"#;
+    let payload = r#"{"session_id":"s1","hook_event_name":"PreToolUse","cwd":"/repo","tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"echo hi > /opt/gensee-outside.txt"}}"#;
     let event = build_agent_hook_event(payload).unwrap();
     let intents = file_intents_from_hook(&event, original_bash_command(payload).as_deref());
 
@@ -8283,4 +8339,246 @@ fn test_resource_config() -> ResourceGovernanceConfig {
         egress_proxy_url: None,
         egress_allow_hosts: Vec::new(),
     }
+}
+
+#[test]
+fn preexec_resolves_each_script_after_shell_cd() {
+    assert_eq!(executable_targets_from_command("cd /private/tmp/gensee-crate-cowork && python3 scripts/test-endpoint-ingest-gaps.py 2>&1 | tail -2", "/Users/test/repo"),vec!["/private/tmp/gensee-crate-cowork/scripts/test-endpoint-ingest-gaps.py"]);
+    assert_eq!(
+        executable_targets_from_command(
+            "cd '/private/tmp/my project' && python3 run.py && cd sub && bash next.sh",
+            "/repo"
+        ),
+        vec![
+            "/private/tmp/my project/run.py",
+            "/private/tmp/my project/sub/next.sh"
+        ]
+    );
+    assert_eq!(
+        executable_targets_from_command("cd /other | cat; python3 run.py", "/repo"),
+        vec!["/repo/run.py"]
+    );
+    let targets = executable_targets_from_command("cd /other; python3 run.py", "/repo");
+    assert!(targets.contains(&"/repo/run.py".into()));
+    assert!(targets.contains(&"/other/run.py".into()));
+    assert_eq!(
+        executable_targets_from_command("cd /other && cat run.sh | bash", "/repo"),
+        vec!["/other/run.sh"]
+    );
+}
+
+#[test]
+fn approval_store_ancestors_allow_metadata_and_destination_creation() {
+    let (store, workspace) = temp_store_and_workspace("approval-ancestor-metadata");
+    let parent = store.root_path().parent().unwrap();
+    for command in [
+        format!("chmod 700 '{}'", parent.display()),
+        format!("mv report.txt '{}'", parent.display()),
+    ] {
+        let event = build_unattributed_hook_event(
+            &pretool_bash_payload("approval-parent", workspace.to_str().unwrap(), &command),
+            "claude-code",
+        )
+        .unwrap();
+        let intents = file_intents_from_hook(&event, Some(&command));
+        let result = evaluate_pretool_policy_with_store(&event, &intents, Some(&store));
+        assert!(
+            !result
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "policy_approval_store_write"),
+            "{command}: {result:?}"
+        );
+    }
+    let command = format!("rm -rf '{}'", parent.display());
+    let event = build_unattributed_hook_event(
+        &pretool_bash_payload("approval-parent", workspace.to_str().unwrap(), &command),
+        "claude-code",
+    )
+    .unwrap();
+    let result = evaluate_pretool_policy_with_store(
+        &event,
+        &file_intents_from_hook(&event, Some(&command)),
+        Some(&store),
+    );
+    assert!(result
+        .findings
+        .iter()
+        .any(|f| f.rule_id == "policy_approval_store_write"));
+}
+
+#[test]
+fn approval_store_protection_follows_symlink_parent_and_covers_directory_deletion() {
+    let (store, workspace) = temp_store_and_workspace("approval-protection");
+    let alias = workspace.join("approval-alias");
+    std::os::unix::fs::symlink(store.root_path(), &alias).unwrap();
+    for path in [
+        alias.join("approvals.json"),
+        alias.join("approvals.lock"),
+        alias.join(".approvals-next.tmp"),
+        store.root_path().to_path_buf(),
+    ] {
+        let command = format!("rm -rf '{}'", path.display());
+        let event = build_unattributed_hook_event(
+            &pretool_bash_payload("approval-test", workspace.to_str().unwrap(), &command),
+            "claude-code",
+        )
+        .unwrap();
+        let intents = file_intents_from_hook(&event, Some(&command));
+        let decision = evaluate_pretool_policy_with_store(&event, &intents, Some(&store));
+        assert!(
+            decision
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "policy_approval_store_write"
+                    && f.action == PolicyAction::Block),
+            "{}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn preexec_conditional_cd_keeps_successful_or_branch() {
+    let targets =
+        executable_targets_from_command("cd /first || cd /second && python3 run.py", "/repo");
+    assert!(targets.contains(&"/first/run.py".into()));
+    assert!(targets.contains(&"/second/run.py".into()));
+}
+
+#[test]
+fn excessively_ambiguous_script_directories_require_fresh_review() {
+    let (store, workspace) = temp_store_and_workspace("ambiguous-executable-cwd");
+    let command = format!(
+        "{} python3 run.py",
+        (0..40).map(|i| format!("cd child{i};")).collect::<String>()
+    );
+    let event = build_unattributed_hook_event(
+        &pretool_bash_payload("s", workspace.to_str().unwrap(), &command),
+        "claude-code",
+    )
+    .unwrap();
+    assert!(preexec_artifact_findings(&event, &store)
+        .iter()
+        .any(|f| f.rule_id == "policy_executable_directory_ambiguous"
+            && f.action == PolicyAction::Ask));
+}
+
+#[test]
+fn classifier_contract_key_includes_every_contributing_crate() {
+    let versions = [1, 1, 1, 1];
+    let key = historical_classifier_cache_key(versions, "policy", "/home");
+    assert_eq!(
+        key,
+        historical_classifier_cache_key(versions, "policy", "/home")
+    );
+    for index in 0..4 {
+        let mut changed = versions;
+        changed[index] += 1;
+        assert_ne!(
+            key,
+            historical_classifier_cache_key(changed, "policy", "/home")
+        );
+    }
+    assert_ne!(
+        key,
+        historical_classifier_cache_key(versions, "other-policy", "/home")
+    );
+    assert_ne!(
+        key,
+        historical_classifier_cache_key(versions, "policy", "/other-home")
+    );
+}
+
+#[test]
+fn scratch_adjustment_is_carried_as_structured_evidence() {
+    let findings = policy_findings_for_subject(
+        &PolicySubject {
+            source: "hook",
+            operation: "write".into(),
+            path: "/tmp/gensee-scratch/output.txt".into(),
+        },
+        Some("/repo"),
+        &Policy::from_json(policy::default_policy_json()).unwrap(),
+    );
+    assert!(!findings.is_empty());
+    assert!(findings
+        .iter()
+        .all(|f| f.evidence["scratch_adjusted"] == true));
+    let outside = policy_findings_for_subject(
+        &PolicySubject {
+            source: "hook",
+            operation: "write".into(),
+            path: "/opt/output.txt".into(),
+        },
+        Some("/repo"),
+        &Policy::from_json(policy::default_policy_json()).unwrap(),
+    );
+    assert!(!outside.is_empty());
+    assert!(outside
+        .iter()
+        .all(|f| f.evidence["scratch_adjusted"] == false));
+}
+
+#[test]
+fn classifier_behavior_corpus_is_pinned_to_contract_versions() {
+    let policy = Policy::from_json(policy::default_policy_json()).unwrap();
+    let mut outputs = Vec::new();
+    for rule in [
+        "policy_write_outside_workspace",
+        "policy_destructive_file_operation",
+        "hook_bypass_file_mutation",
+    ] {
+        for path in [
+            "/tmp/output.txt",
+            "/tmp/.ssh/id_rsa",
+            "/repo/src/main.rs",
+            "/repo/target/debug/build/out",
+            "/tmp/tool.py",
+            "/dev/null",
+            "/etc/passwd",
+            "/tmp",
+        ] {
+            for operation in ["write", "delete", "rename"] {
+                for evidence in [
+                    json!({"source":"hook","resolved_path":path,"scratch_adjusted":true,"_recorded_action":"allow"}),
+                    json!({"source":"observation","resolved_path":path,"scratch_adjusted":false,"_recorded_action":"allow"}),
+                    json!({"source":"hook","resolved_path":null,"scratch_adjusted":true,"_recorded_action":"allow"}),
+                    json!({"source":"hook","_recorded_action":"allow","_recorded_message":"Routine temporary-file activity: x"}),
+                    json!({"source":"macos-endpoint-security","event_type":"unlink","action":"notify","file":{"path":path,"mode":0o100644}}),
+                    json!({"source":"macos-endpoint-security","event_type":"unlink","action":"notify","file":{"path":path,"mode":0o040755}}),
+                    json!({"source":"macos-endpoint-security","decision":{"result":"deny"}}),
+                    json!({"source":"macos-endpoint-security","file":{"path_truncated":true}}),
+                ] {
+                    outputs.push(historical_alert_is_routine(
+                        &policy,
+                        rule,
+                        path,
+                        "/repo",
+                        operation,
+                        &evidence.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    let contracts = [
+        CLASSIFIER_CONTRACT_VERSION,
+        gensee_crate_core::CLASSIFIER_CONTRACT_VERSION,
+        gensee_crate_rules::CLASSIFIER_CONTRACT_VERSION,
+        gensee_crate_store::CLASSIFIER_CONTRACT_VERSION,
+    ];
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(contracts, outputs)).unwrap())
+    );
+    assert_eq!(digest, "05d0504298afb7c91152f49546d60d6c1eaea64b6ee323b92729a07d06b39ed7", "Classifier behavior changed: bump the contributing contract version, review the corpus changes, and update this pin together.");
+}
+
+#[test]
+fn classifier_policy_key_ignores_json_formatting_and_key_order() {
+    assert_eq!(
+        historical_classifier_cache_key([2, 1, 1, 2], r#"{"a":1,"b":{"x":2}}"#, "/home"),
+        historical_classifier_cache_key([2, 1, 1, 2], "{ \"b\": {\"x\": 2}, \"a\": 1 }", "/home")
+    );
 }

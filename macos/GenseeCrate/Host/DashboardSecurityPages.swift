@@ -4,14 +4,12 @@ import SwiftUI
 struct DashboardAlertsPage: View {
     @ObservedObject var model: ConsoleModel
     let searchText: String
-    @State private var severity = "All"
     @State private var action = "All"
     @StateObject private var columns = AlertColumnLayout()
 
     private var alerts: [SecurityAlert] {
         model.snapshot.alerts.filter {
-            (severity == "All" || $0.severity.caseInsensitiveCompare(severity) == .orderedSame)
-            && (action == "All" || $0.action.caseInsensitiveCompare(action) == .orderedSame)
+            (action == "All" || $0.reviewStatus == action)
             && containsSearch(
                 searchText,
                 fields: $0.message, $0.ruleID, $0.path, $0.sessionID,
@@ -25,8 +23,7 @@ struct DashboardAlertsPage: View {
             VStack(alignment: .leading, spacing: 16) {
                 DashboardPageHeader("Alerts", description: "Policy decisions and risk findings across all sessions.") {
                     HStack(spacing: 8) {
-                        Picker("Severity", selection: $severity) { ForEach(["All", "Info", "Low", "Medium", "High", "Critical"], id: \.self, content: Text.init) }.frame(width: 120)
-                        Picker("Action", selection: $action) { ForEach(["All", "Allow", "Warn", "Ask", "Block"], id: \.self, content: Text.init) }.frame(width: 110)
+                        Picker("Status", selection: $action) { ForEach(["All", "Allowed", "Warning", "Approval requested", "Blocked"], id: \.self, content: Text.init) }.frame(width: 180)
                         Button { model.markAllAlertsRead() } label: {
                             Label("Mark All as Read", systemImage: "checkmark.circle")
                                 .frame(minWidth: 116)
@@ -57,8 +54,7 @@ struct DashboardAlertsPage: View {
 
 @MainActor
 final class AlertColumnLayout: ObservableObject {
-    @Published var severity: CGFloat = 74
-    @Published var action: CGFloat = 68
+    @Published var status: CGFloat = 160
     @Published var finding: CGFloat = 280
     @Published var path: CGFloat = 176
     @Published var time: CGFloat = 112
@@ -71,8 +67,7 @@ struct AlertListHeader: View {
     var body: some View {
         HStack(spacing: 10) {
             Color.clear.frame(width: 14)
-            ResizableAlertHeaderCell(title: "Severity", width: $layout.severity, range: 62...120)
-            ResizableAlertHeaderCell(title: "Action", width: $layout.action, range: 58...110)
+            ResizableAlertHeaderCell(title: "Status", width: $layout.status, range: 120...220)
             ResizableAlertHeaderCell(title: "Finding", width: $layout.finding, range: 180...520)
             ResizableAlertHeaderCell(title: "Path", width: $layout.path, range: 110...420)
             ResizableAlertHeaderCell(title: "Time", width: $layout.time, range: 92...190)
@@ -156,13 +151,10 @@ struct ExpandableAlertRow: View {
                 .buttonStyle(.plain)
                 .help(expanded ? "Hide finding evidence" : "Show finding evidence")
 
-                    DashboardTag(text: alert.severity, color: severityColor(alert.severity))
-                        .frame(width: layout.severity, alignment: .leading)
-                        .help("Severity: \(alert.severity.uppercased())")
-                    DashboardTag(text: alert.action, color: actionColor(alert.action))
-                        .frame(width: layout.action, alignment: .leading)
-                        .help("Action: \(alert.action.uppercased())")
-                    Text(alert.message)
+                    DashboardTag(text: alert.reviewStatus, color: actionColor(alert.action))
+                        .frame(width: layout.status, alignment: .leading)
+                        .help("Risk: \(alert.severity.capitalized). This records the policy response at the time; approval may no longer be pending.")
+                    Text(alert.findingSummary)
                         .font(.system(size: 12, weight: unread ? .semibold : .medium))
                         .lineLimit(expanded ? 2 : 1)
                     .frame(width: layout.finding, alignment: .leading)
@@ -188,7 +180,7 @@ struct ExpandableAlertRow: View {
             .padding(.vertical, 9)
             .contentShape(Rectangle())
             .background(unread ? Color.dashboardRed.opacity(0.035) : .clear)
-            .accessibilityLabel("\(unread ? "Unread, " : "")\(alert.severity) severity, \(alert.action), \(alert.message)")
+            .accessibilityLabel("\(unread ? "Unread, " : "")\(alert.severity) severity, \(alert.reviewStatus), \(alert.findingSummary)")
             .accessibilityHint(expanded ? "Collapse alert details" : "Expand alert details")
 
             if expanded {
@@ -258,48 +250,40 @@ struct ExpandableAlertRow: View {
 private struct FindingReviewControl: View {
     let alert: SecurityAlert
     @ObservedObject var model: ConsoleModel
-    @State private var pendingChange: PendingRuleTuning?
-
-    private let severities = ["Info", "Low", "Medium", "High", "Critical"]
-    private let actions = ["Allow", "Warn", "Ask", "Block"]
-
-    private var currentOverride: RuleReviewOverride? {
-        model.reviewOverride(for: alert.ruleID)
-    }
+    @State private var approvalPreview: RememberedApproval?
+    @State private var showExactApproval = false
+    @State private var savingApproval = false
+    @State private var approvalIssue: String?
+    @State private var showReadException = false
+    @State private var feedbackOverride: Bool?
+    private var isFalsePositive: Bool { feedbackOverride ?? (alert.feedbackLabel == "false_positive") }
 
     var body: some View {
         Menu {
-            Menu("Set future severity") {
-                ForEach(severities, id: \.self) { severity in
-                    Button {
-                        requestTune(severity: severity)
-                    } label: {
-                        if severity.caseInsensitiveCompare(currentOverride?.severity ?? alert.severity) == .orderedSame {
-                            Label(severity, systemImage: "checkmark")
-                        } else {
-                            Text(severity)
-                        }
-                    }
-                }
+            if isFalsePositive {
+                Button("Undo false-positive feedback") { Task { if await model.labelFalsePositive(alert, withdraw: true) { feedbackOverride = false } } }
+            } else {
+                Button("This was a false positive") { Task { if await model.labelFalsePositive(alert) { feedbackOverride = true } } }
             }
-            Menu("Set future action") {
-                ForEach(actions, id: \.self) { action in
-                    Button {
-                        requestTune(action: action)
-                    } label: {
-                        if action.caseInsensitiveCompare(currentOverride?.action ?? alert.action) == .orderedSame {
-                            Label(action, systemImage: "checkmark")
-                        } else {
-                            Text(action)
-                        }
-                    }
+            if alert.supportsReadException {
+                Button("Always allow matching reads…") { showReadException = true }
+            }
+            if let reason = alert.approvalEligibility?.reason {
+                Button("Fresh approval needed in your harness") {}.disabled(true).help(reason)
+            }
+            if alert.supportsExactApproval {
+                Divider()
+                Button("Approve this exact action…") {
+                    approvalIssue = nil
+                    approvalPreview = nil
+                    showExactApproval = true
                 }
             }
         } label: {
             if model.feedbackAlertID == alert.alertID {
                 ProgressView().controlSize(.small)
             } else {
-                Label(currentOverride == nil ? "Review" : "Tuned", systemImage: "slider.horizontal.3")
+                Label(isFalsePositive ? "Reported false positive" : "Review", systemImage: "slider.horizontal.3")
                     .font(.system(size: 12, weight: .medium))
             }
         }
@@ -307,46 +291,126 @@ private struct FindingReviewControl: View {
         .controlSize(.small)
         .fixedSize()
         .disabled(model.feedbackAlertID != nil)
-        .help("Changes this rule for all future paths and sessions. Strict fail-closed keeps the original enforcement floor.")
-        .alert(
-            "Weaken this rule globally?",
-            isPresented: Binding(
-                get: { pendingChange != nil },
-                set: { if !$0 { pendingChange = nil } }
-            ),
-            presenting: pendingChange
-        ) { change in
-            Button("Apply to Future Matches", role: .destructive) {
-                tune(severity: change.severity, action: change.action)
-                pendingChange = nil
+        .sheet(isPresented: $showExactApproval) {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Approve this exact action").font(.headline)
+                if let preview = approvalPreview {
+                    Text("\(preview.provider) · \(preview.rule)").font(.caption).foregroundStyle(.secondary)
+                    Text(preview.path).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                    Text("Project: \(preview.project)").font(.caption)
+                    if let input = preview.tool_input_preview {
+                        ScrollView { Text(input).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 120)
+                    }
+                    if let issue = approvalIssue { Text(issue).font(.caption).foregroundStyle(.red) }
+                    Text("Applies to this target and tool input. Executable and credential-read approvals require the content inspected for this alert to remain unchanged. This does not execute a historical action; retry it in your harness.").font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("Cancel") { showExactApproval = false }
+                        Spacer()
+                        Button("Allow once") { saveApproval(preview, scope: "once") }
+                        Button("This session") { saveApproval(preview, scope: "session") }
+                        Button("This project") { saveApproval(preview, scope: "project") }
+                    }
+                    Text("One-use and session approvals expire within 24 hours. Project approvals expire in 30 days. Revoke them in Settings.").font(.caption2).foregroundStyle(.secondary)
+                } else if let issue = approvalIssue {
+                    Text("This action cannot be remembered").font(.subheadline)
+                    Text(issue).font(.callout).textSelection(.enabled)
+                    Text(alert.supportsReadException
+                        ? "Retry in your harness for a fresh approval, or use Always allow matching reads to choose an explicit file or folder exception."
+                        : "Retry the action in your harness to get a fresh approval.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Close") { showExactApproval = false }
+                } else {
+                    ProgressView("Checking recorded action…")
+                    Button("Cancel") { showExactApproval = false }
+                }
+            }.padding(24).frame(width: 600).disabled(savingApproval)
+                .task {
+                    do { approvalPreview = try await model.previewApproval(alert) }
+                    catch { approvalIssue = GenseeCLIError.userFacingApprovalMessage(error) }
+                }
+        }
+        .sheet(isPresented: $showReadException) {
+            ScopedReadExceptionSheet(alert: alert, model: model)
+        }
+        .help("Report a detection mistake or explicitly permit matching activity. Feedback does not change permissions.")
+    }
+
+    private func saveApproval(_ preview: RememberedApproval, scope: String) {
+        guard !savingApproval else { return }
+        savingApproval = true
+        Task {
+            do {
+                try await model.rememberApproval(alert, preview: preview, scope: scope)
+                showExactApproval = false
+            } catch { approvalIssue = GenseeCLIError.userFacingApprovalMessage(error) }
+            savingApproval = false
+        }
+    }
+
+}
+
+private struct ScopedReadExceptionSheet: View {
+    let alert: SecurityAlert
+    @ObservedObject var model: ConsoleModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var readScope = "file"
+    @State private var path = ""
+    @State private var preview: RememberedApproval?
+    @State private var busy = false
+    @State private var issue: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Always allow matching reads").font(.headline)
+            Text("Allow the credential-content check for matching reads, even when file content changes. Other rules still apply.")
+                .font(.caption).foregroundStyle(.secondary)
+            Picker("Applies to", selection: $readScope) {
+                Text("This file").tag("file")
+                Text("Folder and subfolders").tag("directory")
+            }.pickerStyle(.segmented)
+            TextField("Absolute folder path", text: $path).disabled(readScope == "file")
+            if let preview {
+                Text("\(preview.provider) · Reads only").font(.subheadline)
+                Text("Project: \(preview.project)").font(.caption)
+                Text("\(preview.read_scope == "directory" ? "Folder and subfolders" : "File"): \(preview.path)")
+                    .font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                Text("Credential-content check only. Expires in 30 days; revoke in Settings.").font(.caption)
             }
-            Button("Cancel", role: .cancel) { pendingChange = nil }
-        } message: { _ in
-            Text("This affects every future match of \(alert.ruleID), across all paths and sessions. Strict and non-interactive fail-closed modes will retain the rule's original enforcement floor.")
-        }
-    }
-
-    private func requestTune(severity: String? = nil, action: String? = nil) {
-        let change = PendingRuleTuning(severity: severity, action: action)
-        let currentSeverity = currentOverride?.severity ?? alert.severity
-        let currentAction = currentOverride?.action ?? alert.action
-        let weakensSeverity = severity.map { PolicyValueRank.severity($0) < PolicyValueRank.severity(currentSeverity) } ?? false
-        let weakensAction = action.map { PolicyValueRank.weakensAction(from: currentAction, to: $0) } ?? false
-        if weakensSeverity || weakensAction {
-            pendingChange = change
-        } else {
-            tune(severity: severity, action: action)
-        }
-    }
-
-    private func tune(severity: String? = nil, action: String? = nil) {
-        Task { _ = await model.tuneFinding(alert, severity: severity, action: action) }
-    }
-
-    private struct PendingRuleTuning: Identifiable {
-        let severity: String?
-        let action: String?
-        let id = UUID()
+            if model.reviewOverride(for: alert.ruleID) != nil {
+                Text("A rule-wide override already exists. Reset it in Policy if you want only this exception to apply.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if let issue { Text(issue).font(.caption).foregroundStyle(.red) }
+            HStack {
+                Button("Cancel") { dismiss() }
+                Spacer()
+                if let preview {
+                    Button("Save read exception") {
+                        busy = true
+                        Task {
+                            do { try await model.saveReadException(alert, preview: preview); dismiss() }
+                            catch { issue = GenseeCLIError.userFacingApprovalMessage(error) }
+                            busy = false
+                        }
+                    }
+                } else {
+                    Button("Preview exception") {
+                        busy = true
+                        Task {
+                            do { preview = try await model.previewReadException(alert, path: path, readScope: readScope); issue = nil }
+                            catch { issue = GenseeCLIError.userFacingApprovalMessage(error) }
+                            busy = false
+                        }
+                    }
+                }
+            }
+        }.padding(24).frame(width: 600).disabled(busy)
+            .onAppear { path = alert.path ?? "" }
+            .onChange(of: path) { _ in preview = nil; issue = nil }
+            .onChange(of: readScope) { scope in
+                preview = nil; issue = nil
+                path = scope == "file" ? (alert.path ?? "") : URL(fileURLWithPath: alert.path ?? "").deletingLastPathComponent().path
+            }
     }
 }
 
@@ -377,10 +441,15 @@ private struct AlertMetadata: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if alert.ruleID == "policy_credential_content_read" {
+                Text("A credential-like pattern matched file content. This does not verify that a credential is real or active. Source code and test data can match; report those as false positives.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Label("Alert evidence", systemImage: "list.bullet.rectangle")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
             Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 6) {
+                metadataRow("Risk", alert.severity.capitalized, "Policy response", alert.action.uppercased())
                 metadataRow("Session", alert.sessionID, "Request", alert.requestID.map(String.init))
                 metadataRow("Tool use ID", alert.toolUseID, "Path", alert.path.map(abbreviatedPath))
                 metadataRow("Rule", alert.ruleID, "Alert ID", String(alert.alertID))

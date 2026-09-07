@@ -8,7 +8,35 @@ changes.
 
 ## Unreleased
 
-No changes yet.
+### Added
+
+- Explicit remembered approvals from Review Queue: allow the next matching action,
+  the same session (up to 24 hours), or the same project (30 days). Matching binds
+  provider, project, rule, target, tool input, and inspected file content. Active
+  approvals can be revoked in Settings; blocks are never overridden.
+
+### Fixed
+
+- Large-history dashboard refreshes avoid sorting unrelated alerts and use indexed
+  artifact identity lookups; a bounded background refresh retains the previous view.
+- Executable inspection follows shell `cd` when resolving subsequent scripts.
+- Temporary regular-file renames and narrowly identified Claude, Xcode, Git, and
+  Cargo housekeeping no longer create generic mutation/deletion warnings.
+- Review Queue uses one Status column. Risk severity remains in expanded details;
+  observed deletion/rename evidence describes the actual file operation.
+- Harnesses includes hook protection and enabled Cowork visibility in its Protected
+  total; installed totals continue to include Cowork.
+- Historical and nested task completions now group their tools and findings under
+  the originating request. Unlinked completions show the task summary instead of
+  a generic title; raw evidence and original IDs remain intact.
+- Ordinary workspace and temporary-file writes no longer trigger review solely
+  because a hook intent could not be matched. Protected paths, destructive workspace
+  operations, unknown scope, and blocked actions retain review.
+- Routine writes and scoped cleanup in OS temporary directories are allowed as
+  informational evidence. Generic historical temp alerts no longer enter Review
+  Queue; raw records and alert-chain integrity are preserved.
+- Protected paths, symlink escapes, broad cleanup, explicit review overrides,
+  blocked operations, and sensor evidence-loss alerts retain their protections.
 
 ## 0.3.2 - 2026-09-05
 

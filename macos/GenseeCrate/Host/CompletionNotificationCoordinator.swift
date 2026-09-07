@@ -14,6 +14,14 @@ struct AlertNotificationDigest: Equatable {
 final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published private(set) var lastDeliveryError: String?
+    @Published private(set) var monitoringHealthAlarm: String?
+    @Published var monitoringHealthNotificationsEnabled = UserDefaults.standard.object(forKey: "gensee.notifications.monitoringHealth") as? Bool ?? true {
+        didSet { defaults.set(monitoringHealthNotificationsEnabled, forKey: "gensee.notifications.monitoringHealth") }
+    }
+    private var monitoringTracker = MonitoringGapAlarmTracker()
+    private var monitoringTask: Task<Void, Never>?
+    private var wakeObserver: NSObjectProtocol?
+    private var lastMonitoringBannerRevision: UInt64 = 0
     @Published var completionNotificationsEnabled: Bool {
         didSet { defaults.set(completionNotificationsEnabled, forKey: Self.completionEnabledKey) }
     }
@@ -30,7 +38,7 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
     private let center = UNUserNotificationCenter.current()
     private let defaults = UserDefaults.standard
     private let logger = Logger(subsystem: "ai.gensee.crate", category: "notifications")
-    private var hasSeededCurrentStore = false
+    private var initialSnapshotBaseline = CompletionNotificationBaseline()
     // Only requests that have actually produced an actionable completion
     // notification belong here. Clean completions must remain eligible to
     // notify later when delayed Endpoint Security evidence turns them into a
@@ -143,19 +151,83 @@ final class CompletionNotificationCoordinator: NSObject, ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    deinit {
+        monitoringTask?.cancel()
+        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
+    }
+
+    func startMonitoringHealth(readHealth: @escaping @MainActor () -> EndpointSensorHealth?) {
+        guard monitoringTask == nil else { return }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.monitoringTracker.resumeAfterSleep(now: .now) }
+        }
+        // Owned by this app-lifetime coordinator, not a dashboard view task.
+        monitoringTask = Task { [weak self] in
+            while !Task.isCancelled {
+                if let health = readHealth() { await self?.processMonitoringHealth(health) }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    func dismissMonitoringHealthAlarm() {
+        monitoringTracker.dismissBanner()
+        updateMonitoringHealthBanner()
+    }
+
+    private func updateMonitoringHealthBanner() {
+        guard lastMonitoringBannerRevision != monitoringTracker.bannerRevision else { return }
+        lastMonitoringBannerRevision = monitoringTracker.bannerRevision
+        monitoringHealthAlarm = monitoringTracker.bannerIncident.map(Self.monitoringMessage)
+    }
+
+    func processMonitoringHealth(_ health: EndpointSensorHealth, now: SuspendingClock.Instant = .now) async {
+        let incident = monitoringTracker.observe(health, now: now)
+        updateMonitoringHealthBanner()
+        guard let incident else { return }
+        let message = Self.monitoringMessage(incident)
+        guard monitoringHealthNotificationsEnabled else { return }
+        await refreshAuthorizationStatus()
+        guard isAuthorized else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Gensee monitoring gap"
+        content.body = message
+        content.sound = .default
+        content.interruptionLevel = .active
+        do {
+            try await center.add(UNNotificationRequest(identifier: "gensee-monitoring-health", content: content, trigger: nil))
+        } catch { lastDeliveryError = error.localizedDescription }
+    }
+
+    private static func monitoringMessage(_ incident: MonitoringHealthIncident) -> String {
+        switch incident {
+        case .events(let count): "Gensee lost \(count) monitoring events. Activity coverage is incomplete; check sensor health in Settings."
+        case .unavailable: "Gensee monitoring is unavailable. The sensor is stopped or disconnected; check Settings."
+        case .stalled: "Gensee monitoring has stopped making progress. Event collection or storage may be stalled; check Settings."
+        }
+    }
+
+    /// Called synchronously when the model accepts its first live snapshot.
+    /// Demo snapshots never enter this path, and later refreshes cannot swallow
+    /// new completions into the historical baseline.
+    @discardableResult
+    func seedInitialSnapshot(_ snapshot: SecuritySnapshot) -> Bool {
+        guard initialSnapshotBaseline.seed(
+            snapshot, requestIDs: &notifiedRequestIDs, alertIDs: &notifiedAlertIDs
+        ) else { return false }
+        persistNotifiedRequests()
+        persistNotifiedAlerts()
+        return true
+    }
+
     func process(snapshot: SecuritySnapshot, now: Date = Date()) async {
-        let summaries = AgentCompletionDerivation.summaries(from: snapshot)
-        guard hasSeededCurrentStore else {
-            // The first refresh is history, not a burst of newly completed work.
-            notifiedRequestIDs.formUnion(summaries.map(\.requestID))
-            notifiedAlertIDs.formUnion(snapshot.alerts.map(\.alertID))
-            persistNotifiedRequests()
-            persistNotifiedAlerts()
-            hasSeededCurrentStore = true
+        if seedInitialSnapshot(snapshot) {
             await sendDailyBriefingIfNeeded(snapshot: snapshot, now: now)
             return
         }
-
+        let summaries = AgentCompletionDerivation.summaries(from: snapshot)
         let actionable = Self.newlyActionableSummaries(
             summaries,
             excluding: notifiedRequestIDs
@@ -363,4 +435,18 @@ extension CompletionNotificationCoordinator: UNUserNotificationCenterDelegate {
 
 extension Notification.Name {
     static let genseeOpenAgentReview = Notification.Name("ai.gensee.crate.open-agent-review")
+}
+
+/// Keeps startup history separate from later watcher updates. Independent of
+/// macOS notification delivery so the startup boundary is testable headlessly.
+struct CompletionNotificationBaseline {
+    private var hasSeeded = false
+
+    mutating func seed(_ snapshot: SecuritySnapshot, requestIDs: inout Set<Int64>, alertIDs: inout Set<Int64>) -> Bool {
+        guard !hasSeeded else { return false }
+        requestIDs.formUnion(AgentCompletionDerivation.summaries(from: snapshot).map(\.requestID))
+        alertIDs.formUnion(snapshot.alerts.map(\.alertID))
+        hasSeeded = true
+        return true
+    }
 }

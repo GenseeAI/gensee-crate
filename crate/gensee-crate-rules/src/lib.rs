@@ -35,3 +35,7 @@ pub fn sensitive_file_access(event: &AgentEvent) -> Option<RuleMatch> {
 
     None
 }
+
+/// Bump when this crate changes historical alert classification semantics or
+/// the evidence supplied to it. See docs/classifier-cache-contract.md.
+pub const CLASSIFIER_CONTRACT_VERSION: u32 = 1;

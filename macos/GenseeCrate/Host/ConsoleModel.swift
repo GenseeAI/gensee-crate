@@ -3,6 +3,8 @@ import Foundation
 
 @MainActor
 final class ConsoleModel: ObservableObject {
+    @Published private(set) var rememberedApprovals: [RememberedApproval] = []
+    @Published private(set) var approvalMemoryIssue: String?
     @Published private(set) var snapshot = SecuritySnapshot()
     @Published private(set) var runs = RunListResponse()
     @Published private(set) var policy = PolicySummary()
@@ -40,10 +42,14 @@ final class ConsoleModel: ObservableObject {
     let endpointSensor: EndpointSecuritySensor
     private var cli: GenseeCLI
     private var dashboardRefreshInProgress = false
+    private let policyRefresh = CoalescingRefresh()
+    private var hasConfirmedEndpointMode = false
     private var readAlertBaselineCount = 0
     private var readThroughAlertID: Int64 = 0
     private var harnessVerificationBaselines: [String: Int64] = [:]
     private var hasLoadedDashboardSnapshot = false
+    var hasLiveDashboardSnapshot: Bool { hasLoadedDashboardSnapshot && !isDemoMode }
+    var onLiveSnapshotLoaded: ((SecuritySnapshot) -> Void)?
     private var lastDashboardRefreshDuration: TimeInterval = 0
     private var snapshotBeforeDemo = SecuritySnapshot()
     private var recoveryPointsBeforeDemo: [Int64: WorkspaceCheckpointRecord] = [:]
@@ -228,14 +234,31 @@ final class ConsoleModel: ObservableObject {
     }
 
     func refreshPolicy() async {
-        guard !isDemoMode else { return }
-        guard backendAvailable else { return }
+        guard !isDemoMode, backendAvailable else { return }
+        await policyRefresh.run { [weak self] in
+            await self?.loadCurrentPolicy()
+        }
+    }
+
+    private func loadCurrentPolicy() async {
+        guard !isDemoMode, backendAvailable else { return }
+        let liveGeneration = dataSourceGeneration
         var next = policy
         do {
             next.source = try await cli.run(["policy", "path"]).stdout
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             next.systemEvents = try await policyString("watch.system_events") ?? next.systemEvents
             next.endpointSecurityMode = try await policyString("endpoint_security.mode") ?? next.endpointSecurityMode
+            guard acceptsLiveData(generation: liveGeneration), !policyRefresh.hasPendingRefresh else { return }
+            // Health alarms can use a confirmed mode even if the full policy
+            // or optional settings fail to load later in this pass.
+            endpointSensor.setConfiguredMode(next.endpointSecurityMode)
+            let document = try await loadPolicyDocument()
+            guard acceptsLiveData(generation: liveGeneration), !policyRefresh.hasPendingRefresh else { return }
+            policy.endpointSecurityMode = next.endpointSecurityMode
+            policyDocument = document
+            hasConfirmedEndpointMode = true
+            configureEndpointSensor()
             next.noninteractive = try await policyBool("enforcement.noninteractive") ?? next.noninteractive
             next.requireProxy = try await policyBool("egress.require_proxy") ?? next.requireProxy
             next.maxRuntimeSeconds = try await policyInt("runtime.max_runtime_seconds")
@@ -255,13 +278,16 @@ final class ConsoleModel: ObservableObject {
                    let behavior = RecoveryFailureBehavior(rawValue: value) {
                     recovery.failureBehavior = behavior
                 }
+                guard acceptsLiveData(generation: liveGeneration), !policyRefresh.hasPendingRefresh else { return }
                 recoveryPointSettings = recovery
             }
+            guard acceptsLiveData(generation: liveGeneration), !policyRefresh.hasPendingRefresh else { return }
             policy = next
-            policyDocument = try await loadPolicyDocument()
+            policyDocument = document
             refreshIntegrations()
             configureEndpointSensor()
         } catch {
+            guard acceptsLiveData(generation: liveGeneration), !policyRefresh.hasPendingRefresh else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -281,16 +307,18 @@ final class ConsoleModel: ObservableObject {
             let refreshedSnapshot = try await cli.decode(
                 SecuritySnapshot.self,
                 arguments: ["dashboard-state"],
-                // A cold projection of a large encrypted experimental store can
-                // take about a minute; warm refreshes are faster. Preserve a
-                // finite deadline and retry behavior without making first launch
-                // permanently look empty on stores that are still healthy.
-                timeout: hasLoadedDashboardSnapshot ? 45 : 75
+                // Multi-million-event histories can exceed 45 seconds even on
+                // later refreshes. Keep one bounded background refresh in flight
+                // and retain the prior snapshot while the projection completes.
+                timeout: 90
             )
             guard acceptsLiveData(generation: liveGeneration) else { return }
             hasLoadedDashboardSnapshot = true
             reconcileReadAlertState(alertCount: refreshedSnapshot.summary.alertsCount)
             snapshot = refreshedSnapshot
+            // Seed synchronously before another MainActor task can merge a
+            // newly completed request into this first validated live snapshot.
+            onLiveSnapshotLoaded?(refreshedSnapshot)
             reconcileHarnessVerification()
             configureEndpointSensor()
             lastUpdated = Date()
@@ -893,75 +921,67 @@ final class ConsoleModel: ObservableObject {
         }
     }
 
-    /// Persist a rule-scoped review adjustment in the active policy. Unlike
-    /// thumbs feedback, this changes how the same rule is classified and
-    /// enforced for future findings while preserving the immutable alert log.
-    func tuneFinding(
-        _ alert: SecurityAlert,
-        severity: String? = nil,
-        action: String? = nil
-    ) async -> Bool {
-        guard !isDemoMode else {
-            noticeMessage = "Synthetic demo mode never changes your policy."
-            return false
-        }
-        guard feedbackAlertID == nil else { return false }
+    func labelFalsePositive(_ alert: SecurityAlert, withdraw: Bool = false) async -> Bool {
+        guard !isDemoMode, backendAvailable, feedbackAlertID == nil else { return false }
         feedbackAlertID = alert.alertID
         defer { feedbackAlertID = nil }
-
+        var arguments = ["feedback", "record", "--event-key", "alert:\(alert.alertID)",
+                         "--verdict", withdraw ? "agree" : "allow", "--gensee", alert.action,
+                         "--label", withdraw ? "feedback_withdrawn" : "false_positive",
+                         "--rule", alert.ruleID,
+                         "--note", "Triage feedback only; no permission or policy change."]
+        if let path = alert.path { arguments += ["--path", path] }
+        if let session = alert.sessionID { arguments += ["--session", session] }
+        if let tool = alert.toolUseID { arguments += ["--tool-use-id", tool] }
         do {
-            guard var root = try JSONSerialization.jsonObject(
-                with: Data(policyDocument.utf8)
-            ) as? [String: Any] else {
-                throw CocoaError(.propertyListReadCorrupt)
-            }
-            var overrides = root["review_overrides"] as? [[String: Any]] ?? []
-            var reviewOverride = overrides.first {
-                ($0["rule_id"] as? String) == alert.ruleID
-            } ?? ["rule_id": alert.ruleID]
-            overrides.removeAll { ($0["rule_id"] as? String) == alert.ruleID }
-            if let severity { reviewOverride["severity"] = severity.lowercased() }
-            if let action { reviewOverride["action"] = action.lowercased() }
-            overrides.append(reviewOverride)
-            root["review_overrides"] = overrides
-            let data = try JSONSerialization.data(
-                withJSONObject: root,
-                options: [.prettyPrinted, .sortedKeys]
-            )
-            let saved = await savePolicyDocument(String(decoding: data, as: UTF8.self))
-            guard saved else { return false }
-
-            let effectiveSeverity = (reviewOverride["severity"] as? String) ?? alert.severity.lowercased()
-            let effectiveAction = (reviewOverride["action"] as? String) ?? alert.action.lowercased()
-
-            var feedbackArguments = [
-                "feedback", "record",
-                "--verdict", "agree",
-                "--event-key", "alert:\(alert.alertID)",
-                "--gensee", alert.action,
-                "--label", "rule_tuning",
-                "--rule", alert.ruleID,
-                "--note", "future severity=\(effectiveSeverity); future action=\(effectiveAction)",
-            ]
-            if let sessionID = alert.sessionID, !sessionID.isEmpty {
-                feedbackArguments += ["--session", sessionID]
-            }
-            if let path = alert.path, !path.isEmpty {
-                feedbackArguments += ["--path", path]
-            }
-            var auditNote = ""
-            do {
-                _ = try await cli.run(feedbackArguments)
-            } catch {
-                auditNote = " The policy was saved, but its local audit note could not be recorded."
-            }
-            noticeMessage = "Future \(alert.ruleID) findings will use \(effectiveSeverity.uppercased()) · \(effectiveAction.uppercased()).\(auditNote)"
-            await refreshDashboard(reportErrors: false)
+            _ = try await cli.run(arguments)
+            noticeMessage = withdraw ? "False-positive feedback withdrawn." : "False positive reported. Future permissions are unchanged."
+            markAlertRead(alert.alertID)
+            Task { await refreshDashboard(reportErrors: false) }
             return true
-        } catch {
-            errorMessage = error.localizedDescription
-            return false
-        }
+        } catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    func previewReadException(_ alert: SecurityAlert, path: String, readScope: String) async throws -> RememberedApproval {
+        guard !isDemoMode, backendAvailable else { throw CocoaError(.featureUnsupported) }
+        return try await cli.decode(RememberedApproval.self, arguments: ["approval", "preview-read",
+            "--alert-id", String(alert.alertID), "--path", path, "--read-scope", readScope])
+    }
+
+    func saveReadException(_ alert: SecurityAlert, preview: RememberedApproval) async throws {
+        guard !isDemoMode, backendAvailable, let scope = preview.read_scope else { throw CocoaError(.featureUnsupported) }
+        _ = try await cli.run(["approval", "grant-read", "--alert-id", String(alert.alertID),
+            "--path", preview.path, "--read-scope", scope, "--expected-key", preview.key])
+        noticeMessage = "Read exception saved for 30 days. Revoke it in Settings."
+        await refreshRememberedApprovals()
+    }
+
+    func refreshRememberedApprovals() async {
+        guard !isDemoMode, backendAvailable else { return }
+        do {
+            rememberedApprovals = try await cli.decode([RememberedApproval].self, arguments: ["approval", "list"])
+            approvalMemoryIssue = nil
+        } catch { approvalMemoryIssue = error.localizedDescription }
+    }
+
+    func previewApproval(_ alert: SecurityAlert) async throws -> RememberedApproval {
+        guard !isDemoMode, backendAvailable else { throw CocoaError(.featureUnsupported) }
+        return try await cli.decode(RememberedApproval.self, arguments: ["approval", "preview", "--alert-id", String(alert.alertID)])
+    }
+
+    func rememberApproval(_ alert: SecurityAlert, preview: RememberedApproval, scope: String) async throws {
+        guard !isDemoMode, backendAvailable else { throw CocoaError(.featureUnsupported) }
+        _ = try await cli.run(["approval", "grant", "--alert-id", String(alert.alertID), "--scope", scope, "--expected-key", preview.key])
+        noticeMessage = "Approval saved for future matching actions. Retry the action in your harness."
+        await refreshRememberedApprovals()
+    }
+
+    func revokeApproval(_ id: String) async {
+        guard !isDemoMode, backendAvailable else { return }
+        do {
+            _ = try await cli.run(["approval", "revoke", "--id", id])
+            await refreshRememberedApprovals()
+        } catch { approvalMemoryIssue = error.localizedDescription }
     }
 
     var reviewOverrides: [RuleReviewOverride] {
@@ -1147,6 +1167,7 @@ final class ConsoleModel: ObservableObject {
             return false
         }
 
+        let liveGeneration = dataSourceGeneration
         runningCommand = "Preparing the local Gensee runtime"
         defer { runningCommand = nil }
         do {
@@ -1171,10 +1192,13 @@ final class ConsoleModel: ObservableObject {
             }
             let preparedSnapshot = try await cli.decode(
                 SecuritySnapshot.self,
-                arguments: ["dashboard-state"]
+                arguments: ["dashboard-state"],
+                timeout: 90
             )
+            guard acceptsLiveData(generation: liveGeneration) else { return false }
             hasLoadedDashboardSnapshot = true
             snapshot = preparedSnapshot
+            onLiveSnapshotLoaded?(preparedSnapshot)
             reconcileReadAlertState(alertCount: preparedSnapshot.summary.alertsCount)
             reconcileHarnessVerification()
             await refreshPolicy()
@@ -1879,6 +1903,7 @@ final class ConsoleModel: ObservableObject {
     }
 
     private func configureEndpointSensor() {
+        guard hasConfirmedEndpointMode else { return }
         // A failed dashboard query must not clear the system extension's
         // existing process roots. Without a validated snapshot, an empty
         // in-memory model means "unknown", not "no active sessions".
@@ -1922,7 +1947,7 @@ final class ConsoleModel: ObservableObject {
             }
             .map { ["pid": $0.rootPID, "session_id": $0.sessionID] as [String: Any] }
         if coworkEndpointVisibilityEnabled {
-            roots += NSWorkspace.shared.runningApplications.flatMap { application -> [[String: Any]] in
+            let coworkRoots = NSWorkspace.shared.runningApplications.flatMap { application -> [[String: Any]] in
                 guard application.bundleIdentifier == "com.anthropic.claudefordesktop",
                       application.processIdentifier > 0
                 else { return [] }
@@ -1940,6 +1965,7 @@ final class ConsoleModel: ObservableObject {
                     ] as [String: Any]
                 }
             }
+            roots = EndpointSessionScope.mergingRoots(roots, cowork: coworkRoots)
         }
         endpointSensor.updateConfiguration(
             mode: policy.endpointSecurityMode,

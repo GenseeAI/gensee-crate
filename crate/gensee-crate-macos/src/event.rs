@@ -594,9 +594,9 @@ impl EndpointSecurityIngestor {
         if event.dropped_events > 0 {
             findings.push(EndpointSecurityFinding {
                 rule_id: "endpoint_security_event_gap",
-                severity: "high",
+                severity: "info",
                 message: format!(
-                    "Endpoint Security dropped {} event(s) before this message",
+                    "Gensee monitoring gap: {} sensor events were not delivered",
                     event.dropped_events
                 ),
                 path: None,

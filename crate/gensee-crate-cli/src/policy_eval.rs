@@ -105,6 +105,34 @@ pub(crate) fn evaluate_pretool_policy_with_policy(
     }
 
     let subjects = policy_subjects(event, file_intents);
+    if let Some(store) = store {
+        for subject in &subjects {
+            let resolved = gensee_crate_core::resolve_concrete_path(&subject.path);
+            let store_root =
+                gensee_crate_core::resolve_concrete_path(&store.root_path().to_string_lossy());
+            let protects_store =
+                resolved
+                    .as_ref()
+                    .zip(store_root.as_ref())
+                    .is_some_and(|(p, r)| {
+                        (p.parent() == Some(r.as_path()) && approval_memory::is_store_file(p))
+                            || p == r
+                            || (matches!(subject.operation.as_str(), "delete" | "rename")
+                                && r.starts_with(p))
+                    });
+            if policy_subject_is_mutating(&subject.operation) && protects_store {
+                findings.push(PolicyFinding {
+                    action: PolicyAction::Block,
+                    severity: "high".into(),
+                    rule_id: "policy_approval_store_write".into(),
+                    message: "Approval memory can only be changed through Gensee Settings.".into(),
+                    path: Some(subject.path.clone()),
+                    evidence: json!({"source":"approval_store_protection"}),
+                });
+            }
+        }
+    }
+
     for subject in &subjects {
         findings.extend(policy_findings_for_subject(subject, cwd, policy));
     }
@@ -194,11 +222,6 @@ pub(crate) fn evaluate_pretool_policy_with_policy(
     if store.is_some() && !matches!(action, PolicyAction::Block) {
         findings.extend(sensitive_read_findings(&subjects, policy));
     }
-    if store.is_some() && matches!(action, PolicyAction::Allow) {
-        if let Some(finding) = network_egress_marker_finding(event) {
-            findings.push(finding);
-        }
-    }
     if !matches!(action, PolicyAction::Block) {
         if let Some(finding) = tclone_fork_command_finding(event, store) {
             findings.push(finding);
@@ -227,6 +250,19 @@ pub(crate) fn evaluate_pretool_policy_with_policy(
         }
     }
 
+    if let Some(store) = store {
+        approval_memory::apply(event, store, &mut findings);
+        action = findings
+            .iter()
+            .map(|f| f.action)
+            .max()
+            .unwrap_or(PolicyAction::Allow);
+    }
+    if store.is_some() && matches!(action, PolicyAction::Allow) {
+        if let Some(finding) = network_egress_marker_finding(event) {
+            findings.push(finding);
+        }
+    }
     PolicyDecision { action, findings }
 }
 
@@ -375,8 +411,61 @@ fn fork_suggestion_finding_with_policy(
     current_run_id: Option<&str>,
     policy: &Policy,
 ) -> Option<PolicyFinding> {
+    if event
+        .tool_input_command
+        .as_deref()
+        .is_some_and(|command| routine_scratch_cleanup_command(command, policy))
+    {
+        return None;
+    }
     let finding = build_fork_suggestion_finding(event, subjects, current_run_id)?;
     Some(apply_capability_delegation_override(finding, policy))
+}
+
+// Only plain rm with concrete absolute scratch targets is exempt from the
+// destructive-workspace isolation requirement. Do not infer safety for shell
+// programs, pipelines, substitutions, glob expansions, or partial intent sets.
+fn routine_scratch_cleanup_command(command: &str, policy: &Policy) -> bool {
+    if policy
+        .document()
+        .review_overrides
+        .iter()
+        .any(|entry| entry.rule_id == "policy_capability_delegation_required")
+    {
+        return false;
+    }
+    if command.contains([';', '&', '|', '$', '`', '<', '>', '\n', '(', ')', '\\']) {
+        return false;
+    }
+    let words = shellish_words(command);
+    if !matches!(
+        words.first().map(String::as_str),
+        Some("rm" | "/bin/rm" | "/usr/bin/rm")
+    ) {
+        return false;
+    }
+    let mut targets = 0;
+    let mut options = true;
+    for word in words.iter().skip(1) {
+        if options && word == "--" {
+            options = false;
+            continue;
+        }
+        if options
+            && matches!(
+                word.as_str(),
+                "-r" | "-R" | "-f" | "-rf" | "-fr" | "-Rf" | "-fR"
+            )
+        {
+            continue;
+        }
+        options = false;
+        if !policy.is_routine_scratch_alert("policy_destructive_file_operation", word) {
+            return false;
+        }
+        targets += 1;
+    }
+    targets > 0
 }
 
 fn build_fork_suggestion_finding(
@@ -1854,6 +1943,7 @@ const CREDENTIAL_CONTENT_KEYS: &[&str] = &[
     "password",
     "passwd",
     "api_key",
+    "api_keys",
     "apikey",
     "secret_key",
     "secretkey",
@@ -1870,8 +1960,35 @@ const CREDENTIAL_CONTENT_KEYS: &[&str] = &[
 fn looks_like_secret_value(raw: &str) -> bool {
     // A literal secret is a single contiguous token, so judge the first
     // whitespace-delimited word only (kills prose like "your password here").
-    let first = raw.split_whitespace().next().unwrap_or("");
-    let v = first.trim_matches(['"', '\'', '`', ',']).trim();
+    let first = raw
+        .trim_start()
+        .trim_start_matches('[')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    let quoted = first.starts_with(['"', '\'']);
+    let v = if quoted {
+        // Array closing brackets are outside the closing quote; brackets
+        // inside a quoted password are part of its value and length.
+        first[1..]
+            .split(first.chars().next().unwrap())
+            .next()
+            .unwrap_or("")
+    } else {
+        first.trim_matches(['`', ',', ']']).trim()
+    };
+    // Reject source expressions such as document["secret_paths"], while
+    // retaining quoted literal passwords (including brackets) and arrays.
+    if !quoted
+        && v.find('[').is_some_and(|i| {
+            i > 0
+                && v[..i]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.'))
+        })
+    {
+        return false;
+    }
     if v.len() < 8 {
         return false;
     }
@@ -1894,6 +2011,10 @@ fn looks_like_secret_value(raw: &str) -> bool {
         || lower.contains("xxxx")
         || lower == "null"
         || lower == "none"
+        || matches!(
+            lower.as_str(),
+            "filtered" | "redacted" | "masked" | "hidden"
+        )
     {
         return false;
     }
@@ -1950,11 +2071,12 @@ pub(crate) fn credential_content_findings(subjects: &[PolicySubject]) -> Vec<Pol
                 action: PolicyAction::Ask,
                 severity: "medium".to_string(),
                 rule_id: "policy_credential_content_read".to_string(),
-                message: format!("Read of file containing live credentials: {}", subject.path),
+                message: format!("Read of file containing possible credentials: {}", subject.path),
                 path: Some(subject.path.clone()),
                 evidence: json!({
                     "source": "credential_content",
                     "indicator": indicator,
+                    "approval_content_digest": if snapshot.truncated { None } else { Some(&snapshot.digest) },
                 }),
             });
         }
@@ -2972,6 +3094,17 @@ fn unparsed_permission_request_finding(event: &AgentHookEvent) -> Option<PolicyF
 /// Adapt the shared data-driven policy engine's findings to the CLI's
 /// `PolicyFinding` (which carries agent-hook evidence). All rule content lives
 /// in the policy document; this function only maps and attaches evidence.
+pub(crate) fn finding_path_evidence(
+    finding: &policy::Finding,
+    source: &str,
+    operation: &str,
+    path: &str,
+) -> Value {
+    json!({"source":source, "operation":operation,
+        "resolved_path":gensee_crate_core::resolve_concrete_path(path),
+        "scratch_adjusted":finding.scratch_adjusted})
+}
+
 pub(crate) fn policy_findings_for_subject(
     subject: &PolicySubject,
     cwd: Option<&str>,
@@ -2981,10 +3114,8 @@ pub(crate) fn policy_findings_for_subject(
         .evaluate_pretool(&subject.operation, &subject.path, cwd)
         .into_iter()
         .map(|finding| {
-            let mut evidence = json!({
-                "source": subject.source,
-                "operation": subject.operation,
-            });
+            let mut evidence =
+                finding_path_evidence(&finding, subject.source, &subject.operation, &subject.path);
             if finding.rule_id == "policy_write_outside_workspace" {
                 evidence["workspace"] = json!(cwd);
             }

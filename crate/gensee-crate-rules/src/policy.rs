@@ -54,6 +54,8 @@ pub enum PathClass {
 /// A single policy finding produced by the evaluator.
 #[derive(Debug, Clone)]
 pub struct Finding {
+    /// Event-time scratch classification, independent of display copy.
+    pub scratch_adjusted: bool,
     pub action: Action,
     pub severity: String,
     /// Classification before a developer review override. Fail-closed callers
@@ -670,6 +672,7 @@ pub struct ContentRule {
 #[derive(Debug, Clone)]
 pub struct Policy {
     doc: PolicyDocument,
+    source_document: String,
     /// Set when `GENSEE_POLICY_FILE` was explicitly configured but could not be
     /// read or parsed. The engine falls back to the embedded default rules, but
     /// enforcement callers should fail closed rather than silently run a policy
@@ -769,6 +772,7 @@ impl Policy {
                  policy document or the binary"
             ));
         }
+        let source_document = value.to_string();
         let doc: PolicyDocument = serde_json::from_value(value)
             .map_err(|err| format!("invalid policy document: {err}"))?;
         if !doc.endpoint_security.fail_closed_managed_only {
@@ -824,7 +828,12 @@ impl Policy {
         Ok(Self {
             doc,
             override_error: None,
+            source_document,
         })
+    }
+
+    pub fn source_document(&self) -> &str {
+        &self.source_document
     }
 
     /// The policy compiled from the bundled default document.
@@ -1042,6 +1051,7 @@ impl Policy {
                     &secret.protected.message_mutate
                 };
                 Finding {
+                    scratch_adjusted: false,
                     action: secret.protected.action,
                     severity: secret.protected.severity.clone(),
                     pre_review_action: secret.protected.action,
@@ -1052,6 +1062,7 @@ impl Policy {
                 }
             }
             PathClass::CredentialHint => Finding {
+                scratch_adjusted: false,
                 action: secret.credential_hint.action,
                 severity: secret.credential_hint.severity.clone(),
                 pre_review_action: secret.credential_hint.action,
@@ -1066,6 +1077,7 @@ impl Policy {
 
     fn category_finding(&self, rule: &CategoryRule, path: &str) -> Finding {
         self.tune_finding(Finding {
+            scratch_adjusted: false,
             action: rule.action,
             severity: rule.severity.clone(),
             pre_review_action: rule.action,
@@ -1112,6 +1124,156 @@ impl Policy {
         self.path_matches(&self.doc.artifact_registries.control_plane, path)
     }
 
+    pub fn is_unprotected_path(&self, path: &str) -> bool {
+        self.classify_path(path).is_none()
+            && !self.is_persistent_target_path(path)
+            && !self.is_control_plane_path(path)
+            && !self.is_memory_artifact_path(path)
+    }
+
+    /// Presentation-only classification using recorded paths, never live disk
+    /// state. Deletions need separate regular-file evidence from the caller.
+    pub fn is_routine_recorded_write(&self, rule: &str, path: &str, workspace: &str) -> bool {
+        if self.doc.review_overrides.iter().any(|r| r.rule_id == rule)
+            || !self.is_unprotected_path(path)
+        {
+            return false;
+        }
+        if path == "/dev/null" {
+            return true;
+        }
+        if gensee_crate_core::recorded_scratch_path(path).is_some() {
+            return true;
+        }
+        rule == "hook_bypass_file_mutation"
+            && gensee_crate_core::recorded_concrete_path(path)
+                .zip(gensee_crate_core::recorded_concrete_path(workspace))
+                .is_some_and(|(path, root)| {
+                    root.parent().is_some() && path != root && path.starts_with(root)
+                })
+    }
+
+    /// Quiet only generic scratch-file findings. Sensitive and policy-control
+    /// paths retain their own checks even when stored under an OS temp root.
+    pub fn is_routine_scratch_alert(&self, rule_id: &str, path: &str) -> bool {
+        let generic_write = rule_id == self.doc.categories.write_outside_workspace.rule_id;
+        let generic_delete = rule_id == self.doc.categories.destructive.rule_id;
+        if !generic_write && !generic_delete {
+            return false;
+        }
+        if self
+            .doc
+            .review_overrides
+            .iter()
+            .any(|entry| entry.rule_id == rule_id)
+        {
+            return false;
+        }
+        if generic_write && path == "/dev/null" {
+            return true;
+        }
+        let Some(resolved) = gensee_crate_core::resolve_routine_scratch_path(path) else {
+            return false;
+        };
+        if ![path, resolved.to_str().unwrap_or(path)]
+            .iter()
+            .all(|candidate| self.is_unprotected_path(candidate))
+        {
+            return false;
+        }
+        if generic_delete && resolved.is_dir() {
+            // Recursive cleanup must not hide protected descendants. Bound the
+            // metadata-only walk; uncertain or oversized trees retain review.
+            let mut pending = vec![resolved];
+            let mut budget = 1024;
+            while let Some(directory) = pending.pop() {
+                let Ok(entries) = fs::read_dir(directory) else {
+                    return false;
+                };
+                for entry in entries {
+                    if budget == 0 {
+                        return false;
+                    }
+                    budget -= 1;
+                    let Ok(entry) = entry else {
+                        return false;
+                    };
+                    let child = entry.path();
+                    if !self.is_unprotected_path(&child.to_string_lossy()) {
+                        return false;
+                    }
+                    let Ok(kind) = entry.file_type() else {
+                        return false;
+                    };
+                    // rm removes symlinks themselves; it does not follow them.
+                    if kind.is_dir() {
+                        pending.push(child);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Missing hook intent is a correlation gap, not a risk by itself. Only
+    /// ordinary writes in the attributed workspace or OS scratch space qualify.
+    pub fn is_routine_unmatched_mutation(
+        &self,
+        path: &str,
+        workspace: &str,
+        operation: &str,
+    ) -> bool {
+        if self
+            .doc
+            .review_overrides
+            .iter()
+            .any(|r| r.rule_id == "hook_bypass_file_mutation")
+        {
+            return false;
+        }
+        let category = if self.is_destructive(operation) {
+            &self.doc.categories.destructive.rule_id
+        } else if matches!(operation, "write" | "create" | "mutation") {
+            &self.doc.categories.write_outside_workspace.rule_id
+        } else {
+            return false;
+        };
+        if self.is_routine_scratch_alert(category, path) {
+            return true;
+        }
+        if !matches!(operation, "write" | "create" | "mutation") {
+            return false;
+        }
+        let Some(resolved) = gensee_crate_core::resolve_concrete_path(path) else {
+            return false;
+        };
+        let Some(root) = gensee_crate_core::resolve_concrete_path(workspace) else {
+            return false;
+        };
+        if root.parent().is_none() || resolved == root || !resolved.starts_with(&root) {
+            return false;
+        }
+        [path, resolved.to_str().unwrap_or(path)]
+            .iter()
+            .all(|candidate| self.is_unprotected_path(candidate))
+    }
+
+    fn scratch_adjusted_finding(&self, rule: &CategoryRule, path: &str) -> Finding {
+        if !self.is_routine_scratch_alert(&rule.rule_id, path) {
+            return self.category_finding(rule, path);
+        }
+        self.tune_finding(Finding {
+            scratch_adjusted: true,
+            action: Action::Allow,
+            severity: "info".into(),
+            pre_review_action: Action::Allow,
+            pre_review_severity: "info".into(),
+            rule_id: rule.rule_id.clone(),
+            message: format!("Routine temporary-file activity: {path}"),
+            path: Some(path.into()),
+        })
+    }
+
     /// Active `PreToolUse` evaluation for a single (operation, path) subject.
     /// `workspace_root`, when present, scopes the write-outside-workspace rule.
     ///
@@ -1150,13 +1312,14 @@ impl Policy {
             }
         }
         if self.is_destructive(operation) {
-            findings.push(self.category_finding(&self.doc.categories.destructive, path));
+            findings.push(self.scratch_adjusted_finding(&self.doc.categories.destructive, path));
         }
         if self.is_mutating(operation)
             && workspace_root.is_some_and(|root| !path_is_within_root(path, root))
         {
-            findings
-                .push(self.category_finding(&self.doc.categories.write_outside_workspace, path));
+            findings.push(
+                self.scratch_adjusted_finding(&self.doc.categories.write_outside_workspace, path),
+            );
         }
         if self.is_metadata(operation) {
             findings.push(self.category_finding(&self.doc.categories.metadata, path));
@@ -1165,6 +1328,7 @@ impl Policy {
             let persistence = &self.doc.persistence_writes;
             if self.path_matches(&persistence.matcher, path) {
                 findings.push(self.tune_finding(Finding {
+                    scratch_adjusted: false,
                     action: persistence.action,
                     severity: persistence.severity.clone(),
                     pre_review_action: persistence.action,
@@ -1195,7 +1359,7 @@ impl Policy {
             findings.push(finding);
         }
         if self.is_destructive(operation) {
-            findings.push(self.category_finding(&self.doc.categories.destructive, path));
+            findings.push(self.scratch_adjusted_finding(&self.doc.categories.destructive, path));
         } else if self.is_metadata(operation) {
             findings.push(self.category_finding(&self.doc.categories.metadata, path));
         }
@@ -1219,6 +1383,7 @@ impl Policy {
                 hosts.iter().any(|host| host_matches_rule(host, &needle))
             }) {
                 findings.push(self.tune_finding(Finding {
+                    scratch_adjusted: false,
                     action: rule.action,
                     severity: rule.severity.clone(),
                     pre_review_action: rule.action,
@@ -1252,6 +1417,7 @@ impl Policy {
                     .all(|needle| command.contains(needle.as_str()));
             if raw_any || raw_all {
                 findings.push(self.tune_finding(Finding {
+                    scratch_adjusted: false,
                     action: rule.action,
                     severity: rule.severity.clone(),
                     pre_review_action: rule.action,
@@ -1296,6 +1462,7 @@ impl Policy {
             });
             if let Some(name) = matched {
                 findings.push(self.tune_finding(Finding {
+                    scratch_adjusted: false,
                     action: rule.action,
                     severity: rule.severity.clone(),
                     pre_review_action: rule.action,
@@ -1328,7 +1495,8 @@ impl Policy {
         let dd_applies = path.is_none_or(|path| self.is_executable_artifact_path(path));
         if dd_applies && dangerous_dd_wipe_content(&collapsed, &compact) {
             findings.push(self.tune_finding(Finding {
-                action: Action::Block,
+                scratch_adjusted: false,
+            action: Action::Block,
                 severity: "critical".to_string(),
                 pre_review_action: Action::Block,
                 pre_review_severity: "critical".to_string(),
@@ -1358,6 +1526,7 @@ impl Policy {
             let label = any_hit.or_else(|| all_hit.then(|| rule.all_of.join(" + ")));
             if let Some(label) = label {
                 findings.push(self.tune_finding(Finding {
+                    scratch_adjusted: false,
                     action: rule.action,
                     severity: rule.severity.clone(),
                     pre_review_action: rule.action,
@@ -1845,6 +2014,7 @@ mod tests {
         let policy = Policy::from_json(&doc.to_string()).expect("override parses");
 
         let tuned = policy.tune_finding(Finding {
+            scratch_adjusted: false,
             action: Action::Block,
             severity: "critical".to_string(),
             pre_review_action: Action::Block,
@@ -1859,6 +2029,7 @@ mod tests {
         assert_eq!(tuned.pre_review_action, Action::Block);
 
         let untouched = policy.tune_finding(Finding {
+            scratch_adjusted: false,
             action: Action::Ask,
             severity: "medium".to_string(),
             pre_review_action: Action::Ask,
@@ -2626,6 +2797,101 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| f.rule_id == "policy_write_outside_workspace" && f.action == Action::Ask));
+    }
+
+    #[test]
+    fn ordinary_workspace_correlation_gaps_are_quiet_but_risks_remain() {
+        let p = policy();
+        assert!(p.is_routine_unmatched_mutation("/repo/src/main.rs", "/repo", "write"));
+        assert!(p.is_routine_unmatched_mutation("/tmp/gensee-result.txt", "/repo", "write"));
+        for (path, root, op) in [
+            ("/repo/.env", "/repo", "write"),
+            ("/repo/.git/hooks/pre-commit", "/repo", "write"),
+            ("/repo/src/main.rs", "/repo", "delete"),
+            ("/repo/src/main.rs", "/repo", "metadata"),
+            ("/other/src/main.rs", "/repo", "write"),
+            ("/repo2/src/main.rs", "/repo", "write"),
+            ("/etc/config", "/", "write"),
+            ("/repo/../etc/config", "/repo", "write"),
+        ] {
+            assert!(
+                !p.is_routine_unmatched_mutation(path, root, op),
+                "{path} {op}"
+            );
+        }
+    }
+
+    #[test]
+    fn routine_scratch_activity_is_informational_but_protections_remain() {
+        let policy = policy();
+        for operation in ["write", "delete"] {
+            let findings =
+                policy.evaluate_pretool(operation, "/tmp/gensee-scratch/output.txt", Some("/repo"));
+            assert!(!findings.is_empty());
+            assert!(findings
+                .iter()
+                .all(|f| f.action == Action::Allow && f.severity == "info" && f.scratch_adjusted));
+        }
+        assert!(policy
+            .evaluate_pretool("write", "/dev/null", Some("/repo"))
+            .iter()
+            .all(|f| f.action == Action::Allow));
+        for path in [
+            "/tmp",
+            "/tmp/../etc/passwd",
+            "/tmp/*",
+            "/tmp/.ssh/id_rsa",
+            "/tmp/.git/hooks/pre-commit",
+            "/tmp/.env",
+        ] {
+            assert!(
+                policy
+                    .evaluate_pretool("delete", path, Some("/repo"))
+                    .iter()
+                    .any(|f| f.action != Action::Allow),
+                "{path}"
+            );
+        }
+        assert!(policy
+            .evaluate_pretool("delete", "/dev/null", Some("/repo"))
+            .iter()
+            .any(|f| f.action != Action::Allow));
+        assert!(policy
+            .evaluate_pretool("metadata", "/tmp/gensee-scratch/output.txt", Some("/repo"))
+            .iter()
+            .any(|f| f.rule_id == "policy_metadata_file_operation" && f.action != Action::Allow));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scratch_symlinks_cannot_hide_external_or_protected_targets() {
+        let dir = env::temp_dir().join(format!("gensee-scratch-policy-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("/etc", dir.join("escape")).unwrap();
+        fs::write(dir.join(".env"), "synthetic").unwrap();
+        std::os::unix::fs::symlink(dir.join(".env"), dir.join("ordinary.txt")).unwrap();
+        for path in [dir.join("escape/new-file"), dir.join("ordinary.txt")] {
+            assert!(!policy().is_routine_scratch_alert(
+                "policy_write_outside_workspace",
+                path.to_str().unwrap()
+            ));
+        }
+        assert!(policy().is_routine_scratch_alert(
+            "policy_write_outside_workspace",
+            dir.join("new/file.txt").to_str().unwrap()
+        ));
+        assert!(!policy().is_routine_scratch_alert(
+            "endpoint_security_event_gap",
+            dir.join("new/file.txt").to_str().unwrap()
+        ));
+        assert!(
+            !policy().is_routine_scratch_alert(
+                "policy_destructive_file_operation",
+                dir.to_str().unwrap()
+            ),
+            "directory cleanup must retain protected descendant checks"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

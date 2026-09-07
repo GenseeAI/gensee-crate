@@ -70,6 +70,8 @@ pub(crate) fn is_supported_provider(provider: &str) -> bool {
 
 mod policy_eval;
 pub(crate) use policy_eval::*;
+mod approval_memory;
+mod housekeeping;
 mod preexec;
 pub(crate) use preexec::*;
 mod command_parse;
@@ -340,6 +342,10 @@ pub(crate) fn run_cli() -> io::Result<()> {
         Some(command) if is_linux_top_level_command(command) => {
             args.remove(0);
             handle_linux_top_level(command, args)
+        }
+        Some("approval") => {
+            args.remove(0);
+            approval_memory::handle(args)
         }
         Some("feedback") => {
             args.remove(0);
@@ -4013,9 +4019,140 @@ fn feedback_list(args: Vec<OsString>) -> io::Result<()> {
     Ok(())
 }
 
+// Bump for changes to this classifier, housekeeping, scratch triage, or their
+// CLI helpers (including approval-store path exclusions). See the cache contract.
+const CLASSIFIER_CONTRACT_VERSION: u32 = 2;
+
+fn historical_classifier_cache_key(contracts: [u32; 4], policy: &str, home: &str) -> String {
+    // Structured boundaries prevent different policy/home pairs sharing a key.
+    let canonical = serde_json::from_str::<Value>(policy).unwrap_or_else(|_| json!(policy));
+    let document = serde_json::to_vec(&(contracts, canonical, home)).expect("classifier key");
+    format!("historical-routine-v6:{:x}", Sha256::digest(document))
+}
+
+fn configure_dashboard_noise_filter(store: &EventStore) -> io::Result<()> {
+    let policy = Policy::cached_current();
+    let candidate_rules = [
+        policy
+            .document()
+            .categories
+            .write_outside_workspace
+            .rule_id
+            .clone(),
+        policy.document().categories.destructive.rule_id.clone(),
+        "hook_bypass_file_mutation".into(),
+    ];
+    let version = historical_classifier_cache_key(
+        [
+            CLASSIFIER_CONTRACT_VERSION,
+            gensee_crate_core::CLASSIFIER_CONTRACT_VERSION,
+            gensee_crate_rules::CLASSIFIER_CONTRACT_VERSION,
+            gensee_crate_store::CLASSIFIER_CONTRACT_VERSION,
+        ],
+        policy.source_document(),
+        &env::var("HOME").unwrap_or_default(),
+    );
+    store.set_dashboard_noise_filter_versioned(
+        &candidate_rules
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        &version,
+        move |rule, path, workspace, operation, evidence| {
+            historical_alert_is_routine(&policy, rule, path, workspace, operation, evidence)
+        },
+    )
+}
+
+fn historical_alert_is_routine(
+    policy: &Policy,
+    rule: &str,
+    path: &str,
+    workspace: &str,
+    operation: &str,
+    evidence: &str,
+) -> bool {
+    let Ok(e) = serde_json::from_str::<Value>(evidence) else {
+        return false;
+    };
+    if e.pointer("/decision/result").and_then(Value::as_str) == Some("deny")
+        || e.pointer("/file/path_truncated")
+            .is_some_and(|v| v == &json!(true) || v == &json!(1))
+        || e.pointer("/destination/path_truncated")
+            .is_some_and(|v| v == &json!(true) || v == &json!(1))
+    {
+        return false;
+    }
+    // Hook paths can be symlinks. Only an event-time resolved path is
+    // eligible, except legacy records explicitly quieted at evaluation time.
+    let sensor_path = e["source"] == "macos-endpoint-security"
+            // Older raw sensor payloads had no source tag. Require the
+            // kernel-message schema, not merely two optional keys.
+            || (e.get("source").is_none() && e.get("schema_version").is_some()
+                && e.get("actor").is_some() && e.get("event_type").is_some());
+    // Modern policy records carry the event-time decision. An explicit
+    // non-routine result cannot be overridden by lexical scratch heuristics.
+    if !sensor_path && e.get("scratch_adjusted").is_some() && e["scratch_adjusted"] != true {
+        return false;
+    }
+    let path = if sensor_path {
+        path
+    } else {
+        match e["resolved_path"].as_str() {
+            Some(resolved) => resolved,
+            None if e.get("resolved_path").is_none()
+                && e["_recorded_action"] == "allow"
+                && (e["scratch_adjusted"] == true
+                    || (e.get("scratch_adjusted").is_none()
+                        && matches!(
+                            rule,
+                            "policy_write_outside_workspace" | "policy_destructive_file_operation"
+                        )
+                        && e["_recorded_message"].as_str().is_some_and(|m| {
+                            m.starts_with("Routine temporary-file activity: ")
+                        }))) =>
+            {
+                path
+            }
+            None => return false,
+        }
+    };
+    if !sensor_path
+        && e["scratch_adjusted"] == true
+        && e["_recorded_action"] == "allow"
+        && (rule == policy.document().categories.write_outside_workspace.rule_id
+            || rule == policy.document().categories.destructive.rule_id)
+    {
+        return policy.is_routine_recorded_write(rule, path, workspace);
+    }
+    let ordinary_write = (rule == policy.document().categories.write_outside_workspace.rule_id
+        || rule == "hook_bypass_file_mutation")
+        && matches!(operation, "" | "write" | "create" | "mutation");
+    let scratch_delete = (rule == policy.document().categories.destructive.rule_id
+        || rule == "hook_bypass_file_mutation")
+        && operation == "delete"
+        && gensee_crate_core::recorded_scratch_path(path).is_some()
+        && e.pointer("/file/mode")
+            .and_then(Value::as_u64)
+            .is_some_and(|m| {
+                m & 0o170000 == 0o100000
+                        // Recorded unlink of an ordinary scratch directory is
+                        // cleanup too. Child-file findings remain independently
+                        // classified; this never grants recursive-delete access.
+                        || (m & 0o170000 == 0o040000
+                            && e["event_type"] == "unlink"
+                            && matches!(e["action"].as_str(), Some("notify" | "auth")))
+            });
+    ((ordinary_write || scratch_delete) && policy.is_routine_recorded_write(rule, path, workspace))
+        || housekeeping::is_routine(policy, rule, path, &e)
+}
+
 fn dashboard_state() -> io::Result<()> {
     let store = EventStore::default_local()?;
-    println!("{}", serde_json::to_string(&store.dashboard_state()?)?);
+    configure_dashboard_noise_filter(&store)?;
+    let mut dashboard = store.dashboard_state()?;
+    approval_memory::annotate_dashboard(&mut dashboard);
+    println!("{}", serde_json::to_string(&dashboard)?);
     Ok(())
 }
 
@@ -4081,10 +4218,10 @@ fn dashboard_request(args: Vec<OsString>) -> io::Result<()> {
         ));
     }
     let store = EventStore::default_local()?;
-    println!(
-        "{}",
-        serde_json::to_string(&store.dashboard_request(request_id)?)?
-    );
+    configure_dashboard_noise_filter(&store)?;
+    let mut dashboard = store.dashboard_request(request_id)?;
+    approval_memory::annotate_dashboard(&mut dashboard);
+    println!("{}", serde_json::to_string(&dashboard)?);
     Ok(())
 }
 
@@ -4099,7 +4236,10 @@ fn dashboard_day(args: Vec<OsString>) -> io::Result<()> {
         io::Error::new(io::ErrorKind::InvalidInput, "dashboard day must be UTF-8")
     })?;
     let store = EventStore::default_local()?;
-    println!("{}", serde_json::to_string(&store.dashboard_day(day)?)?);
+    configure_dashboard_noise_filter(&store)?;
+    let mut dashboard = store.dashboard_day(day)?;
+    approval_memory::annotate_dashboard(&mut dashboard);
+    println!("{}", serde_json::to_string(&dashboard)?);
     Ok(())
 }
 
@@ -4289,9 +4429,11 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
         let workspace_root = active_tool.as_ref().map(|tool| tool.cwd.as_str());
         event.attribution.workspace_root = workspace_root.map(str::to_string);
         let bookkeeping = endpoint_security_event_is_bookkeeping(&event, workspace_root);
-        let evidence = serde_json::to_value(&event).map_err(io::Error::other)?;
+        let mut evidence = serde_json::to_value(&event).map_err(io::Error::other)?;
+        evidence["source"] = json!("macos-endpoint-security");
         for finding in findings {
-            if finding.rule_id != "endpoint_security_event_gap"
+            if gensee_crate_store::AlertKind::for_rule(finding.rule_id)
+                != gensee_crate_store::AlertKind::MonitoringHealth
                 && (active_session_id.is_none() || bookkeeping)
             {
                 continue;
@@ -4307,7 +4449,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                 evidence: Some(evidence.clone()),
                 observed_at_ms,
             };
-            if alert.rule_id == "endpoint_security_event_gap" {
+            if alert.kind() == gensee_crate_store::AlertKind::MonitoringHealth {
                 // Loss is a sensor-health incident, not a finding per affected
                 // file/process. Keep the first alert per minute and retain exact
                 // cumulative counters in sensor health.
@@ -4401,7 +4543,7 @@ pub(crate) fn ingest_endpoint_security() -> io::Result<()> {
                             severity: "medium".to_string(),
                             action: "warn".to_string(),
                             rule_id: "hook_bypass_file_mutation".to_string(),
-                            message: "Agent process mutated a file without a matching hook-level file intent"
+                            message: "File change could not be correlated with a declared tool intent"
                                 .to_string(),
                             path: Some(path),
                             evidence: Some(evidence.clone()),

@@ -36,6 +36,14 @@ struct DashboardShell: View {
     var body: some View {
         VStack(spacing: 0) {
             topBar
+            if let alarm = notifications.monitoringHealthAlarm, !model.isDemoMode {
+                HStack {
+                    Label(alarm, systemImage: "exclamationmark.shield.fill").foregroundStyle(.red)
+                    Spacer()
+                    Button("Sensor health") { selection = .settings }
+                    Button("Dismiss") { notifications.dismissMonitoringHealthAlarm() }
+                }.font(.callout).padding(12).background(Color.red.opacity(0.08))
+            }
             if model.isDemoMode {
                 demoBanner
             }
@@ -89,22 +97,15 @@ struct DashboardShell: View {
             model.requestedDashboardDestination = nil
         }
         .task {
-            extensionManager.refreshStatus()
-            await model.refreshStableHookBackendIfNeeded()
-            model.endpointSensor.start()
             await notifications.refreshAuthorizationStatus()
-            await model.refreshAll()
             await model.refreshPendingRecoveryRequest()
-            if !model.isDemoMode {
-                await notifications.process(snapshot: model.snapshot)
-            }
             while !Task.isCancelled {
                 // Dashboard queries intentionally run less frequently than the
                 // sensor poll. This keeps UI projection work from competing
                 // with durable Endpoint Security ingestion under load.
                 try? await Task.sleep(for: .seconds(model.dashboardPollingSeconds))
                 await model.refreshDashboard(reportErrors: false)
-                if !model.isDemoMode {
+                if model.hasLiveDashboardSnapshot {
                     await notifications.process(snapshot: model.snapshot)
                 }
             }
@@ -129,14 +130,14 @@ struct DashboardShell: View {
         .task {
             // Wait for the initial snapshot so stored history becomes the
             // completion watermark rather than triggering old notifications.
-            while model.lastUpdated == nil, !Task.isCancelled {
+            while !model.hasLiveDashboardSnapshot, !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
             }
             guard !Task.isCancelled else { return }
             model.prepareCompletionWatcher()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(200))
-                if await model.refreshRecentCompletionsIfNeeded(), !model.isDemoMode {
+                if model.hasLiveDashboardSnapshot, await model.refreshRecentCompletionsIfNeeded(), model.hasLiveDashboardSnapshot {
                     await notifications.process(snapshot: model.snapshot)
                 }
             }

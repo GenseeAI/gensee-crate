@@ -157,7 +157,7 @@ private struct PolicySettingsView: View {
             if !reviewOverrides.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        Text("Tuned rules")
+                        Text("Rule-wide overrides")
                             .font(.system(size: 13, weight: .semibold))
                         Text("\(reviewOverrides.count)")
                             .font(.system(size: 10, weight: .semibold))
@@ -845,6 +845,34 @@ struct DashboardSettingsPage: View {
                     }
                 }
 
+                DashboardCard("Approvals & Read Exceptions") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("Scoped permissions for future matching actions.").font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Refresh") { Task { await model.refreshRememberedApprovals() } }
+                        }
+                        if let issue = model.approvalMemoryIssue { Text(issue).font(.caption).foregroundStyle(.orange) }
+                        if model.rememberedApprovals.isEmpty { Text("No active approvals.").font(.caption).foregroundStyle(.secondary) }
+                        ForEach(model.rememberedApprovals) { approval in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("\(approval.provider) · \(approval.isReadException ? "Read exception" : approval.scope.capitalized)").font(.system(size: 12, weight: .semibold))
+                                    Text("Project: \(approval.project)").font(.caption2).foregroundStyle(.secondary)
+                                    Text(approval.path).font(.system(size: 10, design: .monospaced)).textSelection(.enabled)
+                                    if let scope = approval.read_scope {
+                                        Text(scope == "directory" ? "Reads in this folder and subfolders · Any content" : "Reads of this file · Any content")
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                    Text("\(approval.rule) · Expires \(Date(timeIntervalSince1970: TimeInterval(approval.expires_at) / 1000).formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("Revoke") { Task { await model.revokeApproval(approval.id) } }
+                            }
+                        }
+                    }.task { await model.refreshRememberedApprovals() }
+                }
+
                 DashboardCard("Notifications") {
                     notificationSettings
                 }
@@ -953,6 +981,7 @@ struct DashboardSettingsPage: View {
             Divider()
 
             HStack(spacing: 24) {
+                Toggle("Gensee monitoring gaps", isOn: $notifications.monitoringHealthNotificationsEnabled)
                 Toggle("Security findings", isOn: $notifications.alertNotificationsEnabled)
                     .toggleStyle(.switch)
                     .disabled(!notifications.isAuthorized)
@@ -1070,8 +1099,12 @@ struct DashboardSettingsPage: View {
                 Text("Ingestion health").font(.system(size: 11))
                 Spacer()
                 DashboardTag(
-                    text: sensor.health.hasBackpressure ? "Backpressure" : "Healthy",
-                    color: sensor.health.hasBackpressure ? .dashboardGold : .green
+                    text: !sensor.health.connected ? "Disconnected" :
+                        (!sensor.health.running ? "Not running" :
+                            (sensor.health.ingestionWarning != nil ? "Ingestion interrupted" :
+                                (sensor.health.hasBackpressure ? "Backpressure" : "Healthy"))),
+                    color: !sensor.health.connected || !sensor.health.running ||
+                        sensor.health.ingestionWarning != nil || sensor.health.hasBackpressure ? .dashboardGold : .green
                 )
             }
             settingsLine("Extension backlog", sensor.health.backlogEvents.formatted())
@@ -1119,6 +1152,12 @@ struct DashboardSettingsPage: View {
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Color.dashboardGold)
             }
+            DisclosureGroup("Sensor throughput diagnostics") {
+                settingsLine("Messages received", sensor.health.receivedMessages.formatted())
+                settingsLine("Max callback time", "\(sensor.health.maxCallbackLatencyUS) µs")
+                settingsLine("Evidence waiting / peak", "\(sensor.health.pendingEvidence) / \(sensor.health.maxPendingEvidence)")
+                settingsLine("Max evidence queue delay", "\(sensor.health.maxQueueDelayUS) µs")
+            }
             settingsLine("Managed processes", sensor.health.managedProcesses.formatted())
             if let sensorMessage = endpointSensorMessage {
                 Text(sensorMessage)
@@ -1137,6 +1176,29 @@ struct DashboardSettingsPage: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dashboardRed)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if !model.snapshot.monitoringGaps.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Gensee monitoring gaps").font(.system(size: 12, weight: .semibold))
+                    Text("Some sensor activity was not recorded. These are Gensee collection issues, not agent findings.")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    DisclosureGroup("Recent gap reports (\(model.snapshot.monitoringGaps.count))") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(model.snapshot.monitoringGaps) { gap in
+                                HStack {
+                                    Text(gap.date.formatted(date: .abbreviated, time: .standard))
+                                    Spacer()
+                                    Text(gap.missingEvents.map { "\($0.formatted()) events not delivered" } ?? "Missing event count unavailable")
+                                }.font(.system(size: 10))
+                            }
+                            Text("Latest 100 retained reports. Counts are per report, not a total. The sensor detected delivery gaps before Gensee received the events; the lost events cannot be assigned to a request.")
+                                .font(.system(size: 10)).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }.padding(.top, 6)
+                    }.font(.system(size: 11))
+                }
             }
             HStack {
                 Button("Full Disk Access") { model.openFullDiskAccess() }

@@ -19,10 +19,12 @@ struct SecuritySnapshot: Decodable {
     var jsonSessions: [AgentSessionRecord] = []
     var dailyActivity: [DailyActivity] = []
     var recentActivity: [RecentActivityBucket] = []
+    var monitoringGaps: [MonitoringGap] = []
 
     enum CodingKeys: String, CodingKey {
         case summary, alerts, agentEvents, sessions, requests, artifacts
         case relations, humanFeedback, workspaceEffects, jsonSessions, dailyActivity, recentActivity
+        case monitoringGaps
     }
 
     init() {}
@@ -41,7 +43,16 @@ struct SecuritySnapshot: Decodable {
         jsonSessions = try values.decodeIfPresent([AgentSessionRecord].self, forKey: .jsonSessions) ?? []
         dailyActivity = try values.decodeIfPresent([DailyActivity].self, forKey: .dailyActivity) ?? []
         recentActivity = try values.decodeIfPresent([RecentActivityBucket].self, forKey: .recentActivity) ?? []
+        monitoringGaps = try values.decodeIfPresent([MonitoringGap].self, forKey: .monitoringGaps) ?? []
     }
+}
+
+struct MonitoringGap: Decodable, Identifiable {
+    let id: Int64
+    let observedAt: Int64
+    let missingEvents: Int64?
+
+    var date: Date { Date(timeIntervalSince1970: Double(observedAt) / 1_000) }
 }
 
 struct RecentActivityBucket: Decodable, Identifiable {
@@ -165,6 +176,16 @@ struct AgentSessionRecord: Decodable, Identifiable {
 }
 
 enum EndpointSessionScope {
+    // A current desktop process tree takes precedence over historical hook PID
+    // claims. Never send conflicting claims: the sensor rejects that Cowork scope.
+    static func mergingRoots(_ sessions: [[String: Any]], cowork: [[String: Any]]) -> [[String: Any]] {
+        let coworkPIDs = Set(cowork.compactMap { ($0["pid"] as? NSNumber)?.uint32Value })
+        return sessions.filter { root in
+            guard let pid = (root["pid"] as? NSNumber)?.uint32Value else { return false }
+            return !coworkPIDs.contains(pid)
+        } + cowork
+    }
+
     static func isEnabled(
         _ session: AgentSessionRecord,
         enabledHarnesses: Set<String>
@@ -256,6 +277,8 @@ struct DashboardSummary: Decodable {
     }
 }
 
+struct ApprovalEligibility: Decodable { let exact: Bool; let read: Bool; let reason: String? }
+
 struct SecurityAlert: Decodable, Identifiable {
     let alertID: Int64
     let requestID: Int64?
@@ -278,9 +301,40 @@ struct SecurityAlert: Decodable, Identifiable {
     let feedbackCreatedAt: Int64?
     let rawEventCount: Int?
 
+    var approvalEligibility: ApprovalEligibility? = nil
     var id: Int64 { alertID }
 
+    var supportsExactApproval: Bool { approvalEligibility?.exact == true }
+    var supportsReadException: Bool { approvalEligibility?.read == true }
+
+    var reviewStatus: String {
+        switch action.lowercased() {
+        case "block", "deny": return "Blocked"
+        case "ask": return "Approval requested"
+        case "warn": return "Warning"
+        default: return "Allowed"
+        }
+    }
+
+    var findingSummary: String {
+        if ruleID == "policy_credential_content_read" {
+            return path.map { "Possible credentials in read file: \($0)" } ?? "Possible credentials in read file"
+        }
+        guard ruleID == "policy_destructive_file_operation", let evidence,
+              let data = evidence.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let operation = value["logical_operation"] as? String else { return message }
+        let label: String
+        switch operation {
+        case "delete": label = "Observed file removal"
+        case "rename": label = "Observed file rename"
+        default: return message
+        }
+        return path.map { "\(label): \($0)" } ?? label
+    }
+
     enum CodingKeys: String, CodingKey {
+        case approvalEligibility = "approval_eligibility"
         case alertID = "alert_id"
         case requestID = "request_id"
         case sessionID = "session_id"
@@ -823,5 +877,45 @@ struct CoworkEvidenceStatus: Decodable {
     func lastEvent(source: String, origin: String? = nil) -> Date? {
         evidence.filter { $0.source == source && (origin == nil || $0.origin == origin) }
             .map { Date(timeIntervalSince1970: Double($0.lastEventAt) / 1_000) }.max()
+    }
+}
+
+struct RememberedApproval: Decodable, Identifiable {
+    let id: String
+    let key: String
+    let provider: String
+    let project: String
+    let path: String
+    let rule: String
+    let scope: String
+    let session: String
+    let expires_at: UInt64
+    let tool_input_preview: String?
+    let read_scope: String?
+    var isReadException: Bool { read_scope != nil }
+}
+
+/// Runs one refresh at a time and drains requests received during suspension.
+/// Every caller waits for the final pass, including callers that joined a run.
+@MainActor
+final class CoalescingRefresh {
+    private var task: Task<Void, Never>?
+    private(set) var hasPendingRefresh = false
+
+    func run(_ refresh: @escaping @MainActor () async -> Void) async {
+        hasPendingRefresh = true
+        if let task {
+            await task.value
+            return
+        }
+        let task = Task { @MainActor in
+            repeat {
+                self.hasPendingRefresh = false
+                await refresh()
+            } while self.hasPendingRefresh
+            self.task = nil
+        }
+        self.task = task
+        await task.value
     }
 }

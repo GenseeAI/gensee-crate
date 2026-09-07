@@ -5,21 +5,15 @@ import SwiftUI
 @main
 struct GenseeCrateApp: App {
     @NSApplicationDelegateAdaptor(GenseeAppDelegate.self) private var appDelegate
-    @StateObject private var extensionManager = EndpointSecurityExtensionManager()
-    @StateObject private var consoleModel = ConsoleModel()
-    @StateObject private var notifications = CompletionNotificationCoordinator()
 
     var body: some Scene {
         WindowGroup("Gensee Crate", id: "main") {
             ContentView(
-                extensionManager: extensionManager,
-                model: consoleModel,
-                notifications: notifications
+                extensionManager: appDelegate.extensionManager,
+                model: appDelegate.consoleModel,
+                notifications: appDelegate.notifications
             )
                 .frame(minWidth: 1180, minHeight: 720)
-                .onAppear {
-                    appDelegate.statusItem.start(model: consoleModel)
-                }
         }
         .windowResizability(.contentMinSize)
     }
@@ -28,12 +22,56 @@ struct GenseeCrateApp: App {
 @MainActor
 private final class GenseeAppDelegate: NSObject, NSApplicationDelegate {
     let statusItem = GenseeStatusItemController()
+    let extensionManager = EndpointSecurityExtensionManager()
+    let consoleModel = ConsoleModel()
+    let notifications = CompletionNotificationCoordinator()
+    private var extensionSubscription: AnyCancellable?
+    private var hasActivatedSensor = false
+    private var activationDiscoveryTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Register the status item from the AppKit application lifecycle. A
         // SwiftUI view can be restored without re-running its appearance
         // callback, which previously left the app without its durable menu.
-        statusItem.install()
+        consoleModel.onLiveSnapshotLoaded = { [weak notifications] snapshot in
+            notifications?.seedInitialSnapshot(snapshot)
+        }
+        statusItem.start(model: consoleModel)
+        notifications.startMonitoringHealth { [weak self] in
+            guard let self, self.hasActivatedSensor, !self.consoleModel.isDemoMode else { return nil }
+            return self.consoleModel.endpointSensor.health
+        }
+        extensionSubscription = extensionManager.$state.sink { [weak self] state in
+            guard let self, state == .active else { return }
+            if !self.hasActivatedSensor {
+                self.hasActivatedSensor = true
+                self.consoleModel.endpointSensor.start()
+            }
+        }
+        extensionManager.refreshStatus()
+        // Approval can arrive in System Settings after the original activation
+        // request's process has exited, or while every app window is closed.
+        activationDiscoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled, let self else { return }
+                if self.extensionManager.state != .active {
+                    self.extensionManager.probeStatus()
+                }
+            }
+        }
+        Task { [weak model = consoleModel] in
+            await model?.refreshStableHookBackendIfNeeded()
+            await model?.refreshAll()
+        }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        extensionManager.probeStatus()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        activationDiscoveryTask?.cancel()
     }
 }
 
@@ -304,169 +342,4 @@ private final class GenseeStatusItemController: NSObject, ObservableObject, NSMe
 /// menu, including directly over the badge.
 private final class GenseeStatusBadgeView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
-}
-
-private struct GenseeMenuBarLabel: View {
-    @ObservedObject var model: ConsoleModel
-    @Environment(\.openWindow) private var openWindow
-    let actionableReviewCount: Int
-
-    var body: some View {
-        ZStack(alignment: .topTrailing) {
-            // Status-bar images are rendered as monochrome templates by
-            // macOS. BrandEye is the full-color application artwork, whose
-            // opaque pixels can collapse into an invisible square here. Use a
-            // purpose-built transparent glyph so the eye stays legible in
-            // light, dark, and highlighted menu-bar states.
-            Image("MenuBarEye")
-                .renderingMode(.template)
-                .resizable()
-                .scaledToFit()
-                .frame(width: 17, height: 17)
-            if actionableReviewCount > 0 {
-                Circle()
-                    .fill(Color.dashboardGold)
-                    .frame(width: 5, height: 5)
-                    .offset(x: 2, y: -1)
-            }
-        }
-        .frame(width: 20, height: 18)
-        .accessibilityLabel("Gensee Crate, \(actionableReviewCount) requests to review")
-        .onReceive(NotificationCenter.default.publisher(for: .genseeOpenAgentReview)) { notification in
-            guard let requestID = (notification.userInfo?["request_id"] as? NSNumber)?.int64Value else { return }
-            model.requestedReviewRequestID = requestID
-            model.requestedDashboardDestination = .reviews
-            openWindow(id: "main")
-            NSApp.activate(ignoringOtherApps: true)
-        }
-    }
-}
-
-private struct GenseeMenuBarView: View {
-    @ObservedObject var model: ConsoleModel
-    @ObservedObject var extensionManager: EndpointSecurityExtensionManager
-    @Environment(\.openWindow) private var openWindow
-
-    private var reviews: [AgentCompletionSummary] {
-        AgentCompletionDerivation.summaries(from: model.snapshot)
-    }
-
-    private var actionableReviews: [AgentCompletionSummary] {
-        reviews.filter { model.reviewNeedsAttention($0) }
-    }
-
-    private var attentionByHarness: [(harness: String, count: Int)] {
-        Dictionary(grouping: actionableReviews, by: \.harness)
-            .map { (harness: $0.key, count: $0.value.count) }
-            .sorted { lhs, rhs in
-                lhs.count == rhs.count ? lhs.harness < rhs.harness : lhs.count > rhs.count
-            }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 9) {
-                BrandEye(size: 28)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Gensee Crate").font(.system(size: 13, weight: .semibold))
-                    Text(statusLine).font(.system(size: 10)).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Circle()
-                    .fill(model.endpointSensor.health.connected ? Color.dashboardGreen : Color.dashboardGold)
-                    .frame(width: 8, height: 8)
-            }
-
-            Divider()
-
-            if actionableReviews.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("No reviews pending", systemImage: "checkmark.circle.fill")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Color.dashboardGreen)
-                    Text("Completed requests remain available under All.")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                    Button("Open History") { openMain(.reviews) }
-                        .controlSize(.small)
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("TO REVIEW").font(.system(size: 8, weight: .bold)).tracking(0.8).foregroundStyle(.secondary)
-                    HStack(spacing: 7) {
-                        ForEach(attentionByHarness, id: \.harness) { item in
-                            Text("\(item.harness) \(item.count)")
-                                .font(.system(size: 9, weight: .semibold))
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 3)
-                                .background(Color.dashboardGold.opacity(0.12), in: Capsule())
-                        }
-                    }
-
-                    ForEach(actionableReviews.prefix(4)) { request in
-                        Button {
-                            model.requestedReviewRequestID = request.requestID
-                            openMain(.reviews)
-                        } label: {
-                            HStack(alignment: .top, spacing: 8) {
-                                Image(systemName: request.attentionSignal?.systemImage ?? "exclamationmark.triangle")
-                                    .foregroundStyle(Color.dashboardGold)
-                                    .frame(width: 15)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack {
-                                        Text(request.attentionSignal?.title ?? "Needs review")
-                                            .font(.system(size: 10, weight: .semibold))
-                                        Spacer()
-                                        Text(request.harness)
-                                            .font(.system(size: 9))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Text(request.prompt)
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-
-            Divider()
-
-            HStack {
-                Label(
-                    actionableReviews.isEmpty ? "All agents clear" : "\(actionableReviews.count) to review",
-                    systemImage: actionableReviews.isEmpty ? "checkmark.circle" : "bell.badge"
-                )
-                    .font(.system(size: 10, weight: .medium))
-                Spacer()
-                Button(actionableReviews.isEmpty ? "Open Gensee" : "Open Review Queue") {
-                    openMain(actionableReviews.isEmpty ? .overview : .reviews)
-                }
-                    .controlSize(.small)
-            }
-        }
-        .padding(14)
-        .frame(width: 360)
-        .task {
-            extensionManager.refreshStatus()
-            model.endpointSensor.start()
-            await model.refreshDashboard(reportErrors: false)
-        }
-    }
-
-    private var statusLine: String {
-        if !model.endpointSensor.health.connected { return "OS verification is off — open Settings to connect" }
-        if let issue = model.dashboardRefreshIssue { return issue }
-        return "Independent verification is active"
-    }
-
-    private func openMain(_ destination: DashboardDestination) {
-        model.requestedDashboardDestination = destination
-        openWindow(id: "main")
-        NSApp.activate(ignoringOtherApps: true)
-    }
 }

@@ -378,6 +378,11 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 @property(nonatomic) uint64_t lastGlobalSequence;
 @property(nonatomic) uint64_t kernelDrops;
 @property(nonatomic) uint64_t reportedDrops;
+@property(nonatomic) uint64_t receivedMessages;
+@property(nonatomic) uint64_t maximumCallbackLatency;
+@property(nonatomic) uint64_t pendingEvidence;
+@property(nonatomic) uint64_t maximumPendingEvidence;
+@property(nonatomic) uint64_t maximumQueueDelay;
 @property(nonatomic) NSString *mode;
 @property(nonatomic) NSString *configurationWarning;
 @property(nonatomic) NSString *instanceID;
@@ -513,6 +518,21 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     return GenseeIsOwnProcess(process);
 }
 
+// Keep attempted protected accesses in observe mode without restoring
+// system-wide AUTH serialization or ancestry work for routine paths.
+- (BOOL)shouldRecordAuthorization:(const es_message_t *)message mode:(NSString *)mode result:(NSString *)result ruleID:(NSString *)ruleID
+{
+    if (ruleID != nil || [result isEqualToString:@"deny"]) return YES;
+    if ([mode isEqualToString:@"protect"] || [mode isEqualToString:@"strict"]) return YES;
+    if (![mode isEqualToString:@"observe"]) return NO;
+    NSString *path = GenseeAuthorizationPath(message);
+    NSString *secondary = GenseeSecondaryAuthorizationPath(message);
+    @synchronized (self) {
+        return (path.length > 0 && [self path:path hasProtectedPrefixLocked:self.protectedPaths]) ||
+               (secondary.length > 0 && [self path:secondary hasProtectedPrefixLocked:self.protectedPaths]);
+    }
+}
+
 - (void)authorizeMessage:(const es_message_t *)message
                    result:(NSString **)result
                    ruleID:(NSString **)ruleID
@@ -526,9 +546,11 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
     __block uint64_t authorizationBudgetUS = 10000;
     @synchronized (self) {
         authorizationBudgetUS = self.maxAuthorizationLatencyUS;
-        NSString *session = [self sessionForProcessLocked:message->process messageVersion:message->version];
         BOOL enforcing = [self.mode isEqualToString:@"protect"] || [self.mode isEqualToString:@"strict"];
-        BOOL ownExecTarget = message->event_type == ES_EVENT_TYPE_AUTH_EXEC &&
+        // Observe/off never deny: skip system-wide ancestry and path work.
+        NSString *session = enforcing
+            ? [self sessionForProcessLocked:message->process messageVersion:message->version] : nil;
+        BOOL ownExecTarget = enforcing && message->event_type == ES_EVENT_TYPE_AUTH_EXEC &&
             [self isOwnProcessLocked:message->event.exec.target];
         if (enforcing && session != nil && ![self isOwnProcessLocked:message->process] && !ownExecTarget) {
             NSString *path = GenseeAuthorizationPath(message);
@@ -655,7 +677,16 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
             @"tool_surface": actorCoworkToolSurface,
         };
     }
+    uint64_t queuedAt = mach_absolute_time();
+    @synchronized (self) {
+        self.pendingEvidence += 1;
+        self.maximumPendingEvidence = MAX(self.maximumPendingEvidence, self.pendingEvidence);
+    }
     dispatch_async(self.queue, ^{
+        @synchronized (self) {
+            self.pendingEvidence -= 1;
+            self.maximumQueueDelay = MAX(self.maximumQueueDelay, GenseeElapsedMicroseconds(queuedAt));
+        }
         [self appendEventLocked:serialized];
     });
 }
@@ -664,8 +695,10 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 {
     NSMutableDictionary *withCursor = [event mutableCopy];
     withCursor[@"sensor_cursor"] = @(self.nextCursor++);
-    withCursor[@"dropped_events"] = @(self.kernelDrops - self.reportedDrops);
-    self.reportedDrops = self.kernelDrops;
+    @synchronized (self) {
+        withCursor[@"dropped_events"] = @(self.kernelDrops - self.reportedDrops);
+        self.reportedDrops = self.kernelDrops;
+    }
     if (self.events.count < GenseeRingCapacity) {
         [self.events addObject:withCursor];
     } else {
@@ -685,13 +718,16 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
 - (void)observeGlobalSequence:(const es_message_t *)message
 {
     uint64_t globalSequence = message->version >= 4 ? message->global_seq_num : 0;
-    if (globalSequence == 0) return;
-    dispatch_async(self.queue, ^{
+    // ES invokes this client's callback serially. Count before filtering, but
+    // never enqueue work for every unrelated system-wide notification.
+    @synchronized (self) {
+        self.receivedMessages += 1;
+        if (globalSequence == 0) return;
         if (self.lastGlobalSequence > 0 && globalSequence > self.lastGlobalSequence + 1) {
             self.kernelDrops += globalSequence - self.lastGlobalSequence - 1;
         }
         self.lastGlobalSequence = MAX(self.lastGlobalSequence, globalSequence);
-    });
+    }
 }
 
 - (NSDictionary *)healthLocked
@@ -705,8 +741,14 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         mode = self.mode;
         configurationWarning = self.configurationWarning ?: @"";
     }
+    @synchronized (self) {
     return @{
         @"schema_version": @1,
+        @"received_messages": @(self.receivedMessages),
+        @"max_callback_latency_us": @(self.maximumCallbackLatency),
+        @"pending_evidence": @(self.pendingEvidence),
+        @"max_pending_evidence": @(self.maximumPendingEvidence),
+        @"max_queue_delay_us": @(self.maximumQueueDelay),
         @"configuration_warning": configurationWarning,
         @"mode": mode,
         @"boot_id": GenseeBootID(),
@@ -724,6 +766,7 @@ static NSDictionary *GenseeSerializeMessage(const es_message_t *message,
         @"configured_max_authorization_latency_us": @(self.maxAuthorizationLatencyUS),
         @"managed_processes": @(managedProcessCount),
     };
+    }
 }
 
 - (void)fetchEventsAfterCursor:(uint64_t)cursor
@@ -974,6 +1017,8 @@ int main(int argc, const char *argv[])
             es_client_t *eventClient,
             const es_message_t *message
         ) {
+            @autoreleasepool {
+            uint64_t callbackStarted = mach_absolute_time();
             [service observeGlobalSequence:message];
             NSString *mode;
             @synchronized (service) { mode = service.mode; }
@@ -987,14 +1032,24 @@ int main(int argc, const char *argv[])
                                     ruleID:&ruleID
                                     reason:&reason
                                  latencyUS:&latency];
-                if (![mode isEqualToString:@"off"]) {
+                // Routine successful operations use NOTIFY. Protected probes
+                // retain AUTH evidence even if the operation later fails.
+                if ([service shouldRecordAuthorization:message mode:mode result:decision ruleID:ruleID]) {
                     [service recordMessage:message mode:mode result:decision ruleID:ruleID reason:reason latencyUS:latency];
                 }
             } else if (![mode isEqualToString:@"off"]) {
                 [service recordMessage:message mode:mode result:@"observed" ruleID:nil reason:nil latencyUS:0];
             }
+            @synchronized (service) {
+                service.maximumCallbackLatency = MAX(service.maximumCallbackLatency,
+                    GenseeElapsedMicroseconds(callbackStarted));
+            }
+            }
         });
         if (result != ES_NEW_CLIENT_RESULT_SUCCESS || client == NULL) {
+            if (result == ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED) {
+                os_log_error(GenseeLog(), "Full Disk Access is required for Gensee Crate Endpoint Security; approving only the host app does not grant sensor access.");
+            }
             os_log_error(GenseeLog(), "es_new_client failed with result=%d", result);
             return EXIT_FAILURE;
         }

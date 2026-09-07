@@ -444,3 +444,35 @@ CREATE INDEX IF NOT EXISTS idx_transaction_events_source
 
 CREATE INDEX IF NOT EXISTS idx_transaction_events_target
     ON transaction_events(target_run_id, occurred_at);
+
+-- The current hook turn can resume an older request after a background task.
+CREATE TABLE IF NOT EXISTS hook_request_contexts (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    request_id INTEGER NOT NULL REFERENCES requests(request_id) ON DELETE CASCADE
+);
+
+-- Derived presentation links; source evidence and alert-chain IDs stay intact.
+CREATE TABLE IF NOT EXISTS dashboard_request_groups (
+    source_id INTEGER PRIMARY KEY REFERENCES requests(request_id) ON DELETE CASCADE,
+    request_id INTEGER NOT NULL REFERENCES requests(request_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dashboard_request_group_root ON dashboard_request_groups(request_id, source_id);
+CREATE TABLE IF NOT EXISTS dashboard_projection_progress (
+    name TEXT PRIMARY KEY,
+    cursor INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dashboard_alert_classification (
+    alert_id INTEGER NOT NULL REFERENCES alerts(alert_id) ON DELETE CASCADE,
+    policy_key TEXT NOT NULL,
+    routine INTEGER NOT NULL,
+    PRIMARY KEY (alert_id, policy_key)
+);
+CREATE INDEX IF NOT EXISTS idx_dashboard_alert_classification_policy
+    ON dashboard_alert_classification(policy_key, routine, alert_id);
+
+-- Retain a bounded set of coexisting policy contexts, in registration order.
+CREATE TABLE IF NOT EXISTS dashboard_classifier_generations (
+    generation INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_key TEXT NOT NULL UNIQUE
+);

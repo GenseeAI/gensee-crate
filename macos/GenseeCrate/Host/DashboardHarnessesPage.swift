@@ -11,11 +11,11 @@ struct DashboardHarnessesPage: View {
     }
 
     private var protectedCount: Int {
-        model.integrations.filter { $0.installed && $0.isHealthy && $0.supportsDirectHooks }.count
+        model.integrations.filter { $0.installed && (($0.isHealthy && $0.supportsDirectHooks) || ($0.isCowork && $0.configured)) }.count
     }
 
-    private var hookCapableInstalledCount: Int {
-        model.integrations.filter { $0.installed && $0.supportsDirectHooks }.count
+    private var protectionCapableInstalledCount: Int {
+        model.integrations.filter { $0.installed && ($0.supportsDirectHooks || $0.isCowork) }.count
     }
 
     private var auditCapableInstalledCount: Int {
@@ -98,8 +98,8 @@ struct DashboardHarnessesPage: View {
             summaryMetric(
                 value: "\(protectedCount)",
                 label: "Protected",
-                detail: "of \(hookCapableInstalledCount) hook-capable",
-                color: protectedCount == hookCapableInstalledCount && hookCapableInstalledCount > 0 ? .dashboardGreen : .dashboardGold
+                detail: "of \(protectionCapableInstalledCount) protection-capable",
+                color: protectedCount == protectionCapableInstalledCount && protectionCapableInstalledCount > 0 ? .dashboardGreen : .dashboardGold
             )
             Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 48)
             summaryMetric(
@@ -117,21 +117,7 @@ struct DashboardHarnessesPage: View {
                     ? .dashboardGreen
                     : .secondary
             )
-            Rectangle().fill(Color.dashboardLine).frame(width: 1, height: 48)
-            HStack(spacing: 10) {
-                Image(systemName: "checkmark.shield")
-                    .font(.system(size: 19, weight: .medium))
-                    .foregroundStyle(Color.dashboardRed)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Policy-backed protection")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text("Monitoring and pre-tool decisions use the same local Gensee policy.")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(.horizontal, 18)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            Spacer(minLength: 0)
         }
         .padding(.vertical, 12)
         .background(Color.dashboardPanel)

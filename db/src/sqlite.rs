@@ -11,12 +11,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // already-initialized store must not rerun CREATE/ALTER statements on every
 // short-lived hook or dashboard process: schema DDL needs a writer lock and can
 // otherwise starve behind the long-lived Endpoint Security ingester.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 7;
 // This checksum intentionally names the schema version. If schema.sql changes,
 // bump SCHEMA_VERSION and replace this with the checksum for the new version.
 #[cfg(test)]
-const SCHEMA_V3_SQL_SHA256: &str =
-    "7deebdddb91badc4a083a3b2edd0d06586353ab2203dbbfe7a14e249b035d90b";
+const SCHEMA_V7_SQL_SHA256: &str =
+    "8f87ac5c88671364d6eeb771d12fcf1e8be1fb2ece359946f41e6707f51890fd";
 // Increment whenever dashboard artifact visibility rules change. Existing
 // stores are reclassified by bounded background maintenance before this
 // version is stamped on their cached count.
@@ -714,6 +714,9 @@ pub fn open(config: &SqliteConfig) -> Result<Connection, SqliteError> {
         ensure_artifact_dashboard_visibility_column(&conn).map_err(SqliteError::Schema)?;
         ensure_dashboard_artifact_count_rules_version_column(&conn).map_err(SqliteError::Schema)?;
 
+        // Classifications are rebuildable projections, not evidence. Version 6
+        // retains independent classifier versions under a composite key.
+        migrate_dashboard_classification_v6(&conn, schema_version).map_err(SqliteError::Schema)?;
         conn.execute_batch(include_str!("../schema.sql"))
             .map_err(SqliteError::Schema)?;
 
@@ -875,7 +878,25 @@ impl SqliteStore {
             )
             .map_err(SqliteError::Database)?;
 
-        Ok(self.conn.last_insert_rowid())
+        let request_id = self.conn.last_insert_rowid();
+        self.set_hook_request_context(&request.session_id, request_id)?;
+        Ok(request_id)
+    }
+
+    pub fn set_hook_request_context(
+        &self,
+        session_id: &str,
+        request_id: i64,
+    ) -> Result<(), SqliteError> {
+        self.conn
+            .execute(
+                "INSERT INTO hook_request_contexts(session_id, request_id)
+             SELECT session_id, request_id FROM requests WHERE session_id = ?1 AND request_id = ?2
+             ON CONFLICT(session_id) DO UPDATE SET request_id = excluded.request_id",
+                params![session_id, request_id],
+            )
+            .map(|_| ())
+            .map_err(SqliteError::Database)
     }
 
     pub fn get_request(&self, request_id: i64) -> Result<Option<RequestRecord>, SqliteError> {
@@ -901,9 +922,9 @@ impl SqliteStore {
                 "SELECT request_id, session_id, original_user_prompt, final_response,
                     events, file_accessed_rate, network_rate
                  FROM requests
-                 WHERE session_id = ?1
-                 ORDER BY request_id DESC
-                 LIMIT 1",
+                 WHERE session_id = ?1 AND request_id = COALESCE(
+                     (SELECT request_id FROM hook_request_contexts WHERE session_id = ?1),
+                     (SELECT MAX(request_id) FROM requests WHERE session_id = ?1))",
                 [session_id],
                 map_request,
             )
@@ -926,6 +947,9 @@ impl SqliteStore {
             .map_err(SqliteError::Database)
     }
 
+    /// Requests are mutable current-state projections. A resumed background
+    /// turn supersedes the displayed response; the original Stop events remain
+    /// in the append-only hook journal owned by EventStore.
     pub fn set_request_response(
         &self,
         request_id: i64,
@@ -2758,6 +2782,29 @@ fn backfill_alert_chain_head(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn migrate_dashboard_classification_v6(
+    conn: &Connection,
+    from_version: i64,
+) -> rusqlite::Result<()> {
+    if from_version >= 6 {
+        return Ok(());
+    }
+    let has_progress: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dashboard_projection_progress')", [], |r| r.get(0))?;
+    conn.execute_batch("SAVEPOINT classification_v6")?;
+    let result = (|| {
+        conn.execute_batch("DROP TABLE IF EXISTS dashboard_alert_classification")?;
+        if has_progress {
+            conn.execute("DELETE FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%'", [])?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = conn.execute_batch("ROLLBACK TO classification_v6; RELEASE classification_v6");
+        return Err(error);
+    }
+    conn.execute_batch("RELEASE classification_v6")
+}
+
 /// Add the `tool_use_id` column to a pre-existing `agent_events` table. On a
 /// fresh database the table does not exist yet (columns come back empty), so
 /// `schema.sql` creates it with the column and this is a no-op.
@@ -3213,10 +3260,10 @@ mod tests {
 
     #[test]
     fn schema_checksum_is_tied_to_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 3);
+        assert_eq!(SCHEMA_VERSION, 7);
         let actual = format!("{:x}", Sha256::digest(include_bytes!("../schema.sql")));
         assert_eq!(
-            actual, SCHEMA_V3_SQL_SHA256,
+            actual, SCHEMA_V7_SQL_SHA256,
             "schema.sql changed: bump SCHEMA_VERSION and replace the versioned checksum"
         );
     }
@@ -3341,6 +3388,124 @@ mod tests {
             std::fs::remove_file(path.with_file_name(format!("{}-wal", db_name.to_string_lossy())));
         let _ =
             std::fs::remove_file(path.with_file_name(format!("{}-shm", db_name.to_string_lossy())));
+    }
+
+    #[test]
+    fn schema_v5_upgrades_existing_projection_tables_without_touching_requests() {
+        let path =
+            std::env::temp_dir().join(format!("gensee-db-v5-upgrade-{}.db", std::process::id()));
+        remove_sqlite_files(&path);
+        let config = test_config(&path);
+        let conn = open(&config).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions VALUES ('test', 'claude-code', 1, 100, NULL, 0);
+            INSERT INTO requests(session_id, original_user_prompt) VALUES ('test', 'keep original');
+            DROP TABLE dashboard_request_groups;
+            DROP TABLE dashboard_projection_progress;
+            DROP TABLE dashboard_alert_classification;
+            PRAGMA user_version=4;",
+        )
+        .unwrap();
+        drop(conn);
+        let conn = open(&config).unwrap();
+        for table in [
+            "dashboard_request_groups",
+            "dashboard_projection_progress",
+            "dashboard_alert_classification",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+        let prompt: String = conn
+            .query_row("SELECT original_user_prompt FROM requests", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(prompt, "keep original");
+        drop(conn);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn schema_v6_rebuilds_only_classification_cache_with_independent_versions() {
+        let path =
+            std::env::temp_dir().join(format!("gensee-v6-migration-{}.db", std::process::id()));
+        remove_sqlite_files(&path);
+        let config = test_config(&path);
+        let conn = open(&config).unwrap();
+        conn.execute_batch("DROP TABLE dashboard_alert_classification;
+            CREATE TABLE dashboard_alert_classification(alert_id INTEGER PRIMARY KEY, policy_key TEXT NOT NULL, routine INTEGER NOT NULL);
+            INSERT INTO dashboard_alert_classification VALUES (1, 'old', 1);
+            INSERT INTO dashboard_projection_progress VALUES ('alert-classification:old', 100);
+            PRAGMA user_version = 5;").unwrap();
+        drop(conn);
+        let conn = open(&config).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM dashboard_alert_classification",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute_batch(
+            "INSERT INTO dashboard_alert_classification VALUES (1, 'a', 1), (1, 'b', 0);",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM dashboard_alert_classification",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        migrate_dashboard_classification_v6(&conn, 6).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM dashboard_alert_classification",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        conn.execute_batch("DROP TABLE dashboard_classifier_generations;
+            INSERT INTO dashboard_projection_progress VALUES ('alert-classification:a', 1), ('alert-classification:b', 1);
+            PRAGMA user_version = 6;").unwrap();
+        drop(conn);
+        let conn = open(&config).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM dashboard_alert_classification",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%'", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM dashboard_classifier_generations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        remove_sqlite_files(&path);
     }
 
     #[test]

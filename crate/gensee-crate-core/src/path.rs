@@ -15,6 +15,97 @@ pub fn normalize_agent_path(raw_path: &str, cwd: &str) -> String {
     normalized
 }
 
+/// Recognize concrete descendants of OS scratch roots, resolving existing
+/// ancestors so a symlink cannot turn a temp exception into a workspace escape.
+/// Root-wide cleanup, globs, traversal, and arbitrary TMPDIR overrides are not
+/// covered. Missing leaf files are allowed only beneath a resolvable ancestor.
+pub fn resolve_routine_scratch_path(path: &str) -> Option<PathBuf> {
+    let input = Path::new(path);
+    if !input.is_absolute()
+        || path.contains(['*', '?', '[', ']', '{', '}'])
+        || input
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return None;
+    }
+    if !is_scratch_descendant(input) {
+        return None;
+    }
+    let resolved = resolve_concrete_path(path)?;
+    is_scratch_descendant(&resolved).then_some(resolved)
+}
+
+fn is_scratch_descendant(path: &Path) -> bool {
+    for root in ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"] {
+        if path != Path::new(root) && path.starts_with(root) {
+            return true;
+        }
+    }
+    for prefix in ["/var/folders", "/private/var/folders"] {
+        if let Ok(tail) = path.strip_prefix(prefix) {
+            let parts: Vec<_> = tail.components().collect();
+            if parts.len() > 3 && parts[2].as_os_str() == "T" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Lexical classification of recorded evidence only. Never use this to grant
+/// filesystem access: historical paths must not trigger present-day filesystem I/O.
+pub fn recorded_concrete_path(path: &str) -> Option<PathBuf> {
+    let input = Path::new(path);
+    (input.is_absolute()
+        && !path.contains(['*', '?', '[', ']', '{', '}'])
+        && !input
+            .components()
+            .any(|p| matches!(p, Component::ParentDir)))
+    .then(|| input.to_path_buf())
+}
+
+pub fn recorded_scratch_path(path: &str) -> Option<PathBuf> {
+    recorded_concrete_path(path).filter(|p| is_scratch_descendant(p))
+}
+
+/// Resolve a concrete absolute path, including missing leaves, without allowing
+/// traversal, globs, dangling links, or inaccessible ancestors.
+pub fn resolve_concrete_path(path: &str) -> Option<PathBuf> {
+    let input = Path::new(path);
+    if !input.is_absolute()
+        || path.contains(['*', '?', '[', ']', '{', '}'])
+        || input
+            .components()
+            .any(|p| matches!(p, Component::ParentDir))
+    {
+        return None;
+    }
+    let mut ancestor = input;
+    let mut missing = Vec::new();
+    let resolved = loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(path) => break path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink is not an ordinary missing leaf.
+                if std::fs::symlink_metadata(ancestor).is_ok() {
+                    return None;
+                }
+                let name = ancestor.file_name()?;
+                missing.push(name);
+                let parent = ancestor.parent()?;
+                ancestor = parent;
+            }
+            Err(_) => return None,
+        }
+    };
+    let mut resolved = resolved;
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    Some(resolved)
+}
+
 /// A build-directory name alone is never sufficient to hide Endpoint Security
 /// evidence. Suppression requires a trusted build executable and a fixed
 /// top-level build root beneath the active workspace.

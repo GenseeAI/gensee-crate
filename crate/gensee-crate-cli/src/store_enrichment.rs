@@ -135,6 +135,7 @@ fn observation_enrichment(
             continue;
         }
         for finding in policy.evaluate_observation(&operation, &path) {
+            let evidence = finding_path_evidence(&finding, "observation", &operation, &path);
             let alert = PolicyAlert {
                 session_id: session_id.map(str::to_string),
                 tool_use_id: tool_use_id.map(str::to_string),
@@ -143,7 +144,7 @@ fn observation_enrichment(
                 rule_id: finding.rule_id,
                 message: finding.message,
                 path: finding.path.or_else(|| Some(path.clone())),
-                evidence: None,
+                evidence: Some(evidence),
                 observed_at_ms,
             };
             let Some(alert) = prepare_policy_alert(policy, alert) else {
@@ -161,6 +162,15 @@ fn observation_enrichment(
 }
 
 fn prepare_policy_alert(policy: &Policy, mut alert: PolicyAlert) -> Option<PolicyAlert> {
+    // Monitoring health must remain visible even when the user suppresses
+    // low-severity agent findings or has tuned a legacy gap-warning rule.
+    if alert.kind() == gensee_crate_store::AlertKind::MonitoringHealth {
+        alert.session_id = None;
+        alert.tool_use_id = None;
+        alert.severity = "info".into();
+        alert.action = "allow".into();
+        return Some(alert);
+    }
     let tuned = policy.tuned_alert_values(&alert.rule_id, &alert.severity, &alert.action);
     if !policy
         .document()
@@ -264,6 +274,548 @@ mod tests {
             evidence: None,
             observed_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn monitoring_health_bypasses_agent_severity_filter_and_attribution() {
+        let policy =
+            policy_with(json!({"endpoint_security": {"minimum_recorded_severity": "high"}}));
+        let mut gap = alert("info", "warn");
+        gap.rule_id = "endpoint_security_event_gap".into();
+        let prepared = prepare_policy_alert(&policy, gap).unwrap();
+        assert_eq!(prepared.action, "allow");
+        assert_eq!(prepared.severity, "info");
+        assert!(prepared.session_id.is_none());
+        assert!(prepared.tool_use_id.is_none());
+        assert!(prepare_policy_alert(&policy, alert("info", "allow")).is_none());
+    }
+
+    #[test]
+    fn routine_mutations_keep_durable_alerts_and_executable_staging_stays_visible() {
+        let dir = env::temp_dir().join(format!(
+            "gensee-durable-housekeeping-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        for (index, path, operation, source) in [
+            (0, "/repo/src/main.rs", "write", "/repo/src/main.rs"),
+            (
+                1,
+                "/private/tmp/output.json",
+                "rename",
+                "/private/tmp/output.tmp",
+            ),
+            (
+                2,
+                "/private/tmp/tools/setup.py",
+                "rename",
+                "/private/tmp/payload.tmp",
+            ),
+            (
+                3,
+                "/private/tmp/claude-task.output",
+                "delete",
+                "/private/tmp/claude-task.output",
+            ),
+            (4, "/repo/src/deleted.rs", "delete", "/repo/src/deleted.rs"),
+        ] {
+            let mut alert = alert("medium", "warn");
+            alert.rule_id = "hook_bypass_file_mutation".into();
+            alert.path = Some(path.into());
+            alert.evidence = Some(json!({"logical_operation":operation, "event_type":"write",
+                "attribution":{"workspace_root":"/repo"}, "source":"macos-endpoint-security", "actor":{},
+                "file":{"path":source, "mode":0o100644}}));
+            assert!(record_endpoint_policy_alert(
+                &store,
+                alert,
+                &format!("durable-{index}"),
+                10_000
+            )
+            .unwrap());
+        }
+        assert_eq!(store.list_alerts().unwrap().len(), 5);
+        let chain = store.verify_alert_chain().unwrap();
+        configure_dashboard_noise_filter(&store).unwrap();
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 2);
+        let paths: HashSet<_> = dashboard["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a["path"].as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            HashSet::from(["/private/tmp/tools/setup.py", "/repo/src/deleted.rs"])
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 5);
+        assert_eq!(store.verify_alert_chain().unwrap(), chain);
+    }
+
+    #[test]
+    fn scratch_directory_unlinks_are_quiet_without_hiding_protected_or_unknown_effects() {
+        let dir =
+            env::temp_dir().join(format!("gensee-directory-cleanup-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        for (index, path, operation, mode, action, result) in [
+            (
+                0,
+                "/private/tmp/claude-502/scratchpad/wt/target/debug/build/serde/out",
+                "delete",
+                0o040755,
+                "auth",
+                "allow",
+            ),
+            (1, "/tmp/task/build", "delete", 0o040755, "notify", "allow"),
+            (2, "/tmp/task/.ssh", "delete", 0o040700, "notify", "allow"),
+            (3, "/repo/src", "delete", 0o040755, "notify", "allow"),
+            (4, "/tmp/task/link", "delete", 0o120755, "notify", "allow"),
+            (5, "/tmp/task/blocked", "delete", 0o040755, "auth", "deny"),
+            (6, "/tmp/task/unknown", "delete", 0, "notify", "allow"),
+            (7, "/tmp/task/moved", "rename", 0o040755, "notify", "allow"),
+            (8, "/tmp/task/unspecified", "delete", 0o040755, "", "allow"),
+        ] {
+            let mut a = alert("high", if result == "deny" { "block" } else { "warn" });
+            a.rule_id = "policy_destructive_file_operation".into();
+            a.path = Some(path.into());
+            a.evidence = Some(
+                json!({"logical_operation":operation,"event_type":if operation == "delete" {"unlink"} else {"rename"},
+                "action":action,"source":"macos-endpoint-security", "actor":{},"decision":{"result":result},"file":{"path":path,"mode":mode}}),
+            );
+            record_endpoint_policy_alert(&store, a, &format!("directory-{index}"), 10_000).unwrap();
+        }
+        let before = store.verify_alert_chain().unwrap();
+        configure_dashboard_noise_filter(&store).unwrap();
+        assert_eq!(
+            store.dashboard_state().unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 9);
+        assert_eq!(store.verify_alert_chain().unwrap(), before);
+    }
+
+    #[test]
+    fn historical_housekeeping_filter_preserves_actor_source_and_block_boundaries() {
+        let dir = env::temp_dir().join(format!(
+            "gensee-housekeeping-dashboard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "Read",
+                json!({"file_path":"/repo/file"}),
+                1,
+            ))
+            .unwrap();
+        let log = format!(
+            "{}/Library/Logs/Claude/gensee-regression.log",
+            env::var("HOME").unwrap()
+        );
+        for (actor, action, source) in [
+            (true, "warn", "/tmp/from.tmp"),
+            (false, "warn", "/tmp/from.tmp"),
+            (true, "block", "/tmp/from.tmp"),
+            (true, "warn", "/etc/passwd"),
+        ] {
+            let mut a = alert("medium", action);
+            a.rule_id = "hook_bypass_file_mutation".into();
+            a.path = Some(if source == "/etc/passwd" {
+                "/tmp/out.json".into()
+            } else {
+                log.clone()
+            });
+            a.evidence = Some(
+                json!({"logical_operation":if source=="/etc/passwd" {"rename"} else {"mutation"},"source":"macos-endpoint-security", "actor":{"team_id":if actor {"Q6L2SF6YDW"} else {"FAKE"},"signing_id":"com.anthropic.claudefordesktop"},"file":{"path":source,"mode":0o100644}}),
+            );
+            store.append_policy_alert(&a).unwrap();
+        }
+        let before = store.verify_alert_chain().unwrap();
+        configure_dashboard_noise_filter(&store).unwrap();
+        let state = store.dashboard_state().unwrap();
+        assert_eq!(state["alerts"].as_array().unwrap().len(), 3);
+        let request = state["requests"][0]["request_id"].as_i64().unwrap();
+        assert_eq!(
+            store.dashboard_request(request).unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 4);
+        assert_eq!(store.verify_alert_chain().unwrap(), before);
+    }
+
+    #[test]
+    fn idless_entity_event_is_exact_on_both_dashboards_and_recovers_input() {
+        let dir = env::temp_dir().join(format!("gensee-idless-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        let mut event = hook_event("Read", json!({"file_path":"/repo/file"}), 1);
+        event.tool_use_id = None;
+        let mut raw: Value = serde_json::from_str(&event.raw_json).unwrap();
+        raw.as_object_mut().unwrap().remove("tool_use_id");
+        event.raw_json = raw.to_string();
+        let mut finding = alert("medium", "ask");
+        finding.rule_id = "policy_credential_content_read".into();
+        finding.tool_use_id = None;
+        store
+            .append_hook_event_with_enrichment(
+                &event,
+                &ObservationEnrichment {
+                    alerts: vec![finding],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let state = store.dashboard_state().unwrap();
+        let row = &state["alerts"][0];
+        let request_id = row["request_id"].as_i64().unwrap();
+        let id = row["alert_id"].as_i64().unwrap();
+        for mut payload in [state, store.dashboard_request(request_id).unwrap()] {
+            approval_memory::annotate_dashboard(&mut payload);
+            assert_eq!(payload["alerts"][0]["approval_context_exact"], true);
+            assert_eq!(payload["alerts"][0]["approval_eligibility"]["read"], true);
+        }
+        assert_eq!(
+            store.approval_context(id).unwrap()["payload"]["tool_input"]["file_path"],
+            "/repo/file"
+        );
+        let mut other = event.clone();
+        other.raw_json = event.raw_json.replace("/repo/file", "/repo/other");
+        store.append_hook_event_evidence_only(&other).unwrap();
+        assert!(
+            store.approval_context(id).is_err(),
+            "ambiguous ID-less capture must fail closed"
+        );
+    }
+
+    #[test]
+    fn observation_scratch_adjustment_is_recorded_and_ignores_display_copy() {
+        let store = EventStore::new(
+            env::temp_dir().join(format!("gensee-observation-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let policy = policy_with(json!({}));
+        let mut enrichment = observation_enrichment(
+            &policy,
+            Some("s1"),
+            None,
+            1,
+            [("delete".into(), "/tmp/gensee-scratch/output.txt".into())],
+            true,
+        );
+        assert!(!enrichment.alerts.is_empty());
+        for alert in &mut enrichment.alerts {
+            assert_eq!(alert.evidence.as_ref().unwrap()["scratch_adjusted"], true);
+            assert!(alert.evidence.as_ref().unwrap()["resolved_path"].is_string());
+            alert.message = "Localized routine message".into();
+            store.append_policy_alert(alert).unwrap();
+        }
+        configure_dashboard_noise_filter(&store).unwrap();
+        assert!(store.dashboard_state().unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn approval_preview_requires_exact_captured_tool_id_and_preceding_event() {
+        let dir = env::temp_dir().join(format!("gensee-approval-context-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "Read",
+                json!({"file_path":"/repo/file"}),
+                1,
+            ))
+            .unwrap();
+        let mut a = alert("medium", "ask");
+        a.rule_id = "policy_credential_content_read".into();
+        a.observed_at_ms = 2;
+        store.append_policy_alert(&a).unwrap();
+        let id = store.dashboard_state().unwrap()["alerts"][0]["alert_id"]
+            .as_i64()
+            .unwrap();
+        let preview = store.approval_context(id).unwrap();
+        assert_eq!(preview["provider"], "cursor");
+        assert_eq!(preview["payload"]["tool_input"]["file_path"], "/repo/file");
+        a.tool_use_id = Some("future-tool".into());
+        store.append_policy_alert(&a).unwrap();
+        let mut future = hook_event("Read", json!({"file_path":"/repo/file"}), 3);
+        future.tool_use_id = Some("future-tool".into());
+        future.raw_json = future.raw_json.replace("\"tool\"", "\"future-tool\"");
+        store.append_hook_event_evidence_only(&future).unwrap();
+        let state = store.dashboard_state().unwrap();
+        let request_id = state["alerts"][0]["request_id"].as_i64().unwrap();
+        for mut payload in [state, store.dashboard_request(request_id).unwrap()] {
+            approval_memory::annotate_dashboard(&mut payload);
+            for alert in payload["alerts"].as_array().unwrap() {
+                let other = alert["alert_id"].as_i64().unwrap();
+                assert_eq!(alert["approval_context_exact"], other == id);
+                if other != id {
+                    assert!(store.approval_context(other).is_err());
+                    assert!(alert["approval_eligibility"].is_null());
+                } else {
+                    assert_eq!(alert["approval_eligibility"]["read"], true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_alert_projection_deduplicates_only_mutation_warnings() {
+        let dir = env::temp_dir().join(format!("gensee-dashboard-dedupe-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "Read",
+                json!({"file_path":"/repo/file"}),
+                1,
+            ))
+            .unwrap();
+        for (rule, action, time) in [
+            ("hook_bypass_file_mutation", "warn", 1),
+            ("hook_bypass_file_mutation", "warn", 2),
+            ("hook_bypass_file_mutation", "block", 20),
+            ("hook_bypass_file_mutation", "warn", 12003),
+            ("policy_other", "warn", 1),
+            ("policy_other", "warn", 2),
+        ] {
+            let mut a = alert("medium", action);
+            a.rule_id = rule.into();
+            a.observed_at_ms = time;
+            store.append_policy_alert(&a).unwrap();
+        }
+        let state = store.dashboard_state().unwrap();
+        let alerts = state["alerts"].as_array().unwrap();
+        assert_eq!(alerts.len(), 5);
+        assert_eq!(alerts.iter().filter(|a| a["action"] == "block").count(), 1);
+        assert_eq!(
+            alerts
+                .iter()
+                .filter(|a| a["rule_id"] == "policy_other")
+                .count(),
+            2
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn lexical_scratch_hook_paths_do_not_hide_protected_symlink_targets() {
+        let dir = env::temp_dir().join(format!("gensee-hook-resolved-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        for resolved in [
+            Some("/Users/test/.ssh/id_rsa"),
+            None,
+            Some("/tmp/ordinary-output"),
+        ] {
+            let mut a = alert("high", "ask");
+            a.rule_id = "policy_write_outside_workspace".into();
+            a.path = Some("/tmp/link".into());
+            a.evidence =
+                Some(json!({"source":"hook","operation":"write","resolved_path":resolved}));
+            store.append_policy_alert(&a).unwrap();
+        }
+        configure_dashboard_noise_filter(&store).unwrap();
+        assert_eq!(
+            store.dashboard_state().unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn legacy_scratch_fallback_requires_recorded_routine_allow_and_no_failed_resolution() {
+        let dir = env::temp_dir().join(format!("gensee-legacy-scratch-{}", uuid::Uuid::new_v4()));
+        let store = EventStore::new(&dir).unwrap();
+        for (action, message, evidence) in [
+            (
+                "allow",
+                "Routine temporary-file activity: write",
+                json!({"source":"hook", "operation":"write"}),
+            ),
+            (
+                "ask",
+                "Write outside workspace",
+                json!({"source":"hook", "operation":"write"}),
+            ),
+            (
+                "allow",
+                "Routine temporary-file activity: write",
+                json!({"source":"hook", "operation":"write", "resolved_path":null}),
+            ),
+            (
+                "allow",
+                "Routine temporary-file activity: write",
+                json!({"source":"hook", "operation":"write", "resolved_path":"/Users/test/.ssh/id_rsa"}),
+            ),
+            (
+                "allow",
+                "Unrelated allow",
+                json!({"source":"hook", "operation":"write"}),
+            ),
+            (
+                "ask",
+                "Unresolved hook with unrelated actor fields",
+                json!({"operation":"write", "actor":{}, "event_type":"write"}),
+            ),
+            (
+                "allow",
+                "New localized message",
+                json!({"source":"hook", "operation":"write", "scratch_adjusted":true}),
+            ),
+            (
+                "allow",
+                "Routine temporary-file activity: write",
+                json!({"source":"hook", "operation":"write", "scratch_adjusted":false}),
+            ),
+            (
+                "allow",
+                "Routine temporary-file activity: write",
+                json!({"source":"hook", "operation":"write", "scratch_adjusted":"true"}),
+            ),
+        ] {
+            let mut a = alert("medium", action);
+            a.message = message.into();
+            a.rule_id = "policy_write_outside_workspace".into();
+            a.path = Some("/private/tmp/ordinary-output.txt".into());
+            a.evidence = Some(evidence);
+            store.append_policy_alert(&a).unwrap();
+        }
+        let chain = store.verify_alert_chain().unwrap();
+        configure_dashboard_noise_filter(&store).unwrap();
+        assert_eq!(
+            store.dashboard_state().unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 9);
+        assert_eq!(store.verify_alert_chain().unwrap(), chain);
+    }
+
+    #[test]
+    fn dashboard_quiets_only_routine_unmatched_mutations() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-dashboard-intent-gap-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "Read",
+                json!({"file_path":"/repo/file"}),
+                1,
+            ))
+            .unwrap();
+        for (path, operation, action) in [
+            ("/repo/src/main.rs", "mutation", "warn"),
+            ("/tmp/gensee-output.txt", "mutation", "warn"),
+            ("/repo/.env", "write", "warn"),
+            ("/elsewhere/config", "write", "warn"),
+            ("/repo/src/main.rs", "delete", "warn"),
+            ("/repo/src/main.rs", "write", "block"),
+        ] {
+            let mut finding = alert("medium", action);
+            finding.rule_id = "hook_bypass_file_mutation".into();
+            finding.path = Some(path.into());
+            finding.evidence = Some(
+                json!({"logical_operation": operation, "event_type":"write", "source":"macos-endpoint-security", "actor":{}, "attribution": {"workspace_root":"/repo"}}),
+            );
+            store.append_policy_alert(&finding).unwrap();
+        }
+        let chain = store.verify_alert_chain().unwrap();
+        configure_dashboard_noise_filter(&store).unwrap();
+        let state = store.dashboard_state().unwrap();
+        assert_eq!(state["alerts"].as_array().unwrap().len(), 4);
+        let id = state["requests"][0]["request_id"].as_i64().unwrap();
+        assert_eq!(
+            store.dashboard_request(id).unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), 6);
+        assert_eq!(store.verify_alert_chain().unwrap(), chain);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dashboard_quiets_historical_scratch_alerts_without_rewriting_evidence() {
+        let dir =
+            std::env::temp_dir().join(format!("gensee-dashboard-scratch-{}", std::process::id()));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "Read",
+                json!({"file_path":"/repo/file"}),
+                1,
+            ))
+            .unwrap();
+        for (rule, path, action) in [
+            (
+                "policy_write_outside_workspace",
+                "/tmp/gensee-scratch/out.txt",
+                "ask",
+            ),
+            (
+                "policy_destructive_file_operation",
+                "/tmp/gensee-scratch/out.txt",
+                "warn",
+            ),
+            ("policy_write_outside_workspace", "/dev/null", "ask"),
+            ("policy_write_outside_workspace", "/tmp/.env", "ask"),
+            (
+                "endpoint_security_event_gap",
+                "/tmp/gensee-scratch/out.txt",
+                "warn",
+            ),
+            (
+                "policy_write_outside_workspace",
+                "/tmp/gensee-scratch/blocked.txt",
+                "block",
+            ),
+        ] {
+            let mut finding = alert("high", action);
+            finding.rule_id = rule.into();
+            finding.path = Some(path.into());
+            store.append_policy_alert(&finding).unwrap();
+        }
+        let before = store.list_alerts().unwrap();
+        let chain_before = store.verify_alert_chain().unwrap();
+        let policy = policy_with(json!({}));
+        store
+            .set_dashboard_noise_filter_versioned(
+                &[
+                    "policy_write_outside_workspace",
+                    "policy_destructive_file_operation",
+                ],
+                "scratch-projection-test-v1",
+                move |rule, path, _, _, _| policy.is_routine_scratch_alert(rule, path),
+            )
+            .unwrap();
+        let dashboard = store.dashboard_state().unwrap();
+        assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 2);
+        assert_eq!(dashboard["requests"][0]["high_risk_alert_count"], 2);
+        let request_id = dashboard["requests"][0]["request_id"].as_i64().unwrap();
+        assert_eq!(
+            store.dashboard_request(request_id).unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(store.list_alerts().unwrap().len(), before.len());
+        assert_eq!(store.verify_alert_chain().unwrap(), chain_before);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

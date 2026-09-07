@@ -40,8 +40,16 @@ with tempfile.TemporaryDirectory(prefix='gensee-ingest-gaps-') as directory:
     with sqlite3.connect(Path(directory) / 'gensee.db') as database:
         rows = database.execute('SELECT rule_id, count(*) FROM alerts GROUP BY rule_id').fetchall()
         assert rows == [('endpoint_security_event_gap', 4)], rows
+        assert database.execute('SELECT count(*) FROM alerts WHERE request_id IS NOT NULL').fetchone()[0] == 0
+        assert database.execute("SELECT count(*) FROM alerts WHERE action != 'allow' OR severity != 'info'").fetchone()[0] == 0
         payload = json.loads(database.execute("SELECT args FROM system_events WHERE type='sensor_gap'").fetchone()[0])
         assert payload['dropped_events'] == 7
         # Revoked-payload privacy is tested against real sensor output in
         # CoworkEndpointScopeTests; this fixture checks durable gap ingestion.
+    dashboard = json.loads(subprocess.run([binary, 'dashboard-state'], env=env,
+                           text=True, capture_output=True, check=True).stdout)
+    assert dashboard['alerts'] == []
+    assert all(request['high_risk_alert_count'] == 0 for request in dashboard['requests'])
+    assert dashboard['summary']['alerts_count'] == 0
+    assert len(dashboard['monitoringGaps']) == 4
     print('Endpoint ingest gap regression passed')

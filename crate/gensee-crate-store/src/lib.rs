@@ -1,3 +1,27 @@
+// Centralize request grouping and legacy prompt recovery across dashboard queries.
+macro_rules! grouped_request_sql {
+    ($last:expr) => { $last };
+    ($first:expr, $($rest:expr),+) => {
+        concat!($first, "SELECT source_id FROM dashboard_request_groups WHERE request_id = ?1 UNION ALL SELECT ?1", grouped_request_sql!($($rest),+))
+    };
+}
+
+macro_rules! recovered_request_prompt_sql {
+    ($prefix:literal) => {
+        concat!(
+            "substr(CASE WHEN ",
+            $prefix,
+            "original_user_prompt = 'Background activity' THEN COALESCE(json_extract(",
+            $prefix,
+            "events, '$.prompt'), ",
+            $prefix,
+            "original_user_prompt) ELSE ",
+            $prefix,
+            "original_user_prompt END, 1, 16384)"
+        )
+    };
+}
+
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
@@ -113,6 +137,27 @@ struct TranscriptTokenUpdate {
     record: TranscriptTokenStateRecord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertKind {
+    Agent,
+    MonitoringHealth,
+}
+impl AlertKind {
+    pub fn for_rule(rule: &str) -> Self {
+        if rule == "endpoint_security_event_gap" {
+            Self::MonitoringHealth
+        } else {
+            Self::Agent
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::MonitoringHealth => "monitoring_health",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyAlert {
     pub session_id: Option<String>,
@@ -124,6 +169,12 @@ pub struct PolicyAlert {
     pub path: Option<String>,
     pub evidence: Option<Value>,
     pub observed_at_ms: u64,
+}
+
+impl PolicyAlert {
+    pub fn kind(&self) -> AlertKind {
+        AlertKind::for_rule(&self.rule_id)
+    }
 }
 
 /// Policy-derived data supplied by an ingestion caller.
@@ -312,11 +363,170 @@ impl EventStore {
         let encryption_key = store_encryption_key(&root)?;
         let sqlite = open_store(&sqlite_config_for_root(&root, encryption_key.as_ref()))
             .map_err(sqlite_error)?;
-        Ok(Self {
+        let store = Self {
             root,
             sqlite: Arc::new(Mutex::new(sqlite)),
             encryption_key,
-        })
+        };
+        store.install_dashboard_sql_functions(None)?;
+        Ok(store)
+    }
+
+    fn install_dashboard_sql_functions(&self, policy_key: Option<&str>) -> io::Result<()> {
+        let db = self.sqlite_store()?;
+        let conn = db.connection();
+        conn.create_scalar_function(
+            "gensee_alert_kind",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                Ok(AlertKind::for_rule(&ctx.get::<String>(0)?)
+                    .as_str()
+                    .to_owned())
+            },
+        )
+        .map_err(sqlite_error_from_rusqlite)?;
+        let key = policy_key.map(str::to_owned);
+        conn.create_scalar_function(
+            "gensee_dashboard_policy_key",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_| Ok(key.clone()),
+        )
+        .map_err(sqlite_error_from_rusqlite)?;
+        Ok(())
+    }
+
+    /// Cache immutable alert classifications across CLI processes. Callers must
+    /// provide a policy/version key and a classifier that performs no disk I/O.
+    pub fn set_dashboard_noise_filter_versioned<F>(
+        &self,
+        candidate_rules: &[&str],
+        policy_key: &str,
+        is_noise: F,
+    ) -> io::Result<()>
+    where
+        F: Fn(&str, &str, &str, &str, &str) -> bool + Send + std::panic::UnwindSafe + 'static,
+    {
+        if policy_key.is_empty() {
+            return Err(io::Error::other("A stable classifier key is required"));
+        }
+        self.install_dashboard_sql_functions(Some(policy_key))?;
+        let db = self.sqlite_store()?;
+        let conn = db.connection();
+        if !candidate_rules.is_empty() {
+            let rules = serde_json::to_string(candidate_rules).map_err(io::Error::other)?;
+            let progress_key = format!("alert-classification:{policy_key}");
+            loop {
+                let needs_work: bool = conn.query_row("SELECT
+                    EXISTS(SELECT 1 FROM alerts WHERE alert_id > COALESCE((SELECT cursor FROM dashboard_projection_progress WHERE name = ?1), 0)
+                        AND rule_id IN (SELECT value FROM json_each(?2)) AND lower(action) NOT IN ('deny', 'block'))
+                    OR COALESCE((SELECT generation FROM dashboard_classifier_generations WHERE policy_key = ?3), -1) != COALESCE((SELECT MAX(generation) FROM dashboard_classifier_generations), 0)",
+                    rusqlite::params![progress_key, rules, policy_key], |r| r.get(0)).map_err(sqlite_error_from_rusqlite)?;
+                if !needs_work {
+                    break;
+                }
+                // Serialize only one bounded batch. Re-read the generation and
+                // cursor under the writer lock: another CLI may have changed
+                // policy while this process was between batches.
+                if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+                    if sqlite_is_busy(&error) {
+                        break;
+                    }
+                    return Err(sqlite_error_from_rusqlite(error));
+                }
+                let saved = (|| -> rusqlite::Result<bool> {
+                    conn.execute("INSERT OR REPLACE INTO dashboard_classifier_generations(policy_key) VALUES (?1)", [policy_key])?;
+                    let prune: bool = conn.query_row(
+                        "SELECT COUNT(*) > 8 FROM dashboard_classifier_generations",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if prune {
+                        // Eight recently used contexts can coexist. Never
+                        // delete another context merely because it differs.
+                        conn.execute("DELETE FROM dashboard_classifier_generations WHERE generation NOT IN
+                            (SELECT generation FROM dashboard_classifier_generations ORDER BY generation DESC LIMIT 8)", [])?;
+                        conn.execute(
+                            "DELETE FROM dashboard_alert_classification WHERE policy_key NOT IN
+                            (SELECT policy_key FROM dashboard_classifier_generations)",
+                            [],
+                        )?;
+                        conn.execute("DELETE FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%'
+                            AND substr(name, 22) NOT IN (SELECT policy_key FROM dashboard_classifier_generations)", [])?;
+                    }
+                    let cursor = conn
+                        .query_row(
+                            "SELECT cursor FROM dashboard_projection_progress WHERE name = ?1",
+                            [&progress_key],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()?
+                        .unwrap_or(0);
+                    let mut query = conn.prepare("SELECT a.alert_id, a.rule_id, COALESCE(a.path, ''),
+                        COALESCE(json_extract(a.evidence, '$.attribution.workspace_root'), ''),
+                        COALESCE(json_extract(a.evidence, '$.logical_operation'), ''),
+                        json_set(COALESCE(a.evidence, '{}'), '$._recorded_action', a.action, '$._recorded_message', a.message)
+                        FROM alerts a WHERE a.alert_id > ?1
+                        AND a.rule_id IN (SELECT value FROM json_each(?2)) AND lower(a.action) NOT IN ('deny', 'block')
+                        ORDER BY a.alert_id LIMIT 2048")?;
+                    let rows = query
+                        .query_map(rusqlite::params![cursor, rules], |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, String>(4)?,
+                                r.get::<_, String>(5)?,
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let next = rows.last().map(|r| r.0);
+                    let mut insert = conn.prepare_cached(
+                        "INSERT INTO dashboard_alert_classification VALUES (?1, ?2, ?3)
+                        ON CONFLICT(alert_id, policy_key) DO UPDATE SET routine = excluded.routine",
+                    )?;
+                    for (id, rule, path, workspace, operation, evidence) in rows {
+                        insert.execute(rusqlite::params![
+                            id,
+                            policy_key,
+                            is_noise(&rule, &path, &workspace, &operation, &evidence)
+                        ])?;
+                    }
+                    if let Some(next) = next {
+                        conn.execute(
+                            "INSERT INTO dashboard_projection_progress VALUES (?1, ?2)
+                            ON CONFLICT(name) DO UPDATE SET cursor = MAX(cursor, excluded.cursor)",
+                            rusqlite::params![progress_key, next],
+                        )?;
+                    }
+                    Ok(next.is_none())
+                })();
+                match saved {
+                    Ok(done) => {
+                        if let Err(error) = conn.execute_batch("COMMIT") {
+                            let _ = conn.execute_batch("ROLLBACK");
+                            if sqlite_is_busy(&error) {
+                                break;
+                            }
+                            return Err(sqlite_error_from_rusqlite(error));
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        if sqlite_is_busy(&error) {
+                            break;
+                        }
+                        return Err(sqlite_error_from_rusqlite(error));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Open a distinct SQLite connection to the same event-store root. Long-running
@@ -661,6 +871,112 @@ impl EventStore {
         db.list_alerts().map_err(sqlite_error)
     }
 
+    /// Session-scoped approvals cannot outlive a recorded session termination.
+    pub fn approval_session_has_ended(&self, session_id: &str) -> io::Result<bool> {
+        Ok(latest_session_by_id(
+            &self.sessions_path(),
+            self.encryption_key.as_ref(),
+            session_id,
+        )?
+        .is_some_and(|session| session.ended_at_ms.is_some()))
+    }
+
+    /// Approval UI requires the exact captured PreToolUse input, never a display summary.
+    pub fn approval_context(&self, alert_id: i64) -> io::Result<Value> {
+        struct Capture {
+            rule: String,
+            path: String,
+            provider: String,
+            session: String,
+            tool_id: Option<String>,
+            timestamp: i64,
+            digest: Option<String>,
+            tool_name: Option<String>,
+            cwd: String,
+        }
+        let Capture {
+            rule,
+            path,
+            provider,
+            session,
+            tool_id,
+            timestamp,
+            digest,
+            tool_name,
+            cwd,
+        } = {
+            let db = self.sqlite_store()?;
+            db.connection()
+                .query_row(
+                    &format!("SELECT a.rule_id, a.path, ae.source, r.session_id, ae.tool_use_id, ae.ts, json_extract(a.evidence, '$.approval_content_digest'), ae.tool_name, ae.cwd
+                 FROM alerts a JOIN requests r ON r.request_id = a.request_id
+                 JOIN agent_events ae ON ae.event_id = {exact}
+                 WHERE a.alert_id = ?1 AND a.action = 'ask'
+                 ORDER BY ae.event_id DESC LIMIT 1", exact = exact_alert_event_sql("a")),
+                    [alert_id],
+                    |r| Ok(Capture { rule: r.get(0)?, path: r.get(1)?, provider: r.get(2)?, session: r.get(3)?,
+                        tool_id: r.get(4)?, timestamp: r.get(5)?, digest: r.get(6)?, tool_name: r.get(7)?, cwd: r.get(8)? }),
+                )
+                .map_err(sqlite_error_from_rusqlite)?
+        };
+        // SQLite stores a display summary of tool input, which cannot authorize
+        // an exact repeat. Recover the original captured input by exact identity.
+        // This bounded scan runs only for a human preview/grant, never on hooks.
+        use std::io::{Seek, SeekFrom};
+        const SCAN_BYTES: u64 = 64 * 1024 * 1024;
+        let mut file = fs::File::open(self.hooks_path())?;
+        let offset = file.metadata()?.len().saturating_sub(SCAN_BYTES);
+        file.seek(SeekFrom::Start(offset))?;
+        let mut reader = BufReader::new(file.take(SCAN_BYTES));
+        if offset > 0 {
+            let mut partial = Vec::new();
+            reader.read_until(b'\n', &mut partial)?;
+        }
+        let mut payload = None;
+        for line in reader.lines() {
+            let line = line?;
+            let decoded = if line.starts_with(JSONL_ENCRYPTED_PREFIX) {
+                let Some(key) = self.encryption_key.as_ref() else {
+                    continue;
+                };
+                let Ok(decoded) = decrypt_jsonl_line(key, &line) else {
+                    continue;
+                };
+                decoded
+            } else {
+                line
+            };
+            let Ok(event) = serde_json::from_str::<AgentHookEvent>(&decoded) else {
+                continue;
+            };
+            if event.provider == provider
+                && event.session_id.as_deref() == Some(&session)
+                && event.tool_use_id == tool_id
+                && event.tool_name == tool_name
+                && event.cwd.as_deref().unwrap_or("") == cwd
+                && event.observed_at_ms == timestamp as u64
+                && event.hook_event_name.as_deref() == Some("PreToolUse")
+            {
+                let mut raw: Value =
+                    serde_json::from_str(&event.raw_json).map_err(io::Error::other)?;
+                raw["session_id"] = json!(session);
+                raw["cwd"] = json!(event.cwd);
+                raw["tool_name"] = json!(event.tool_name);
+                raw["hook_event_name"] = json!("PreToolUse");
+                if payload.as_ref().is_some_and(|previous| previous != &raw) {
+                    return Err(io::Error::other(
+                        "Captured tool identity is ambiguous; retry in your harness.",
+                    ));
+                }
+                payload = Some(raw);
+            }
+        }
+        let payload = payload.ok_or_else(|| io::Error::other("The original tool input is no longer available for approval. Retry the action in your harness."))?;
+        Ok(
+            json!({"rule":rule,"path":path,"provider":provider,"payload":payload,"approval_content_digest":digest}),
+        )
+    }
+
     pub fn has_recent_file_intent(&self, path: &str, observed_at_ms: u64) -> io::Result<bool> {
         let db = self.sqlite_store()?;
         let ts = to_i64(observed_at_ms)?;
@@ -967,6 +1283,15 @@ impl EventStore {
     }
 
     pub fn dashboard_state(&self) -> io::Result<Value> {
+        let timing_start = Instant::now();
+        let timing = |phase: &str| {
+            if std::env::var_os("GENSEE_DASHBOARD_TIMING").is_some() {
+                eprintln!(
+                    "dashboard {phase}: {}ms",
+                    timing_start.elapsed().as_millis()
+                );
+            }
+        };
         // Dashboard refresh is outside the agent authorization path and is a
         // natural opportunity to advance one bounded visibility-rules batch.
         // Failure leaves the previous cached classification usable and will be
@@ -979,8 +1304,11 @@ impl EventStore {
         }
         let db = self.sqlite_store()?;
         let conn = db.connection();
+        let mut groups = DashboardRequestGroups::load(conn)?;
+        timing("groups");
         materialize_dashboard_visible_alerts(conn)?;
-        let alerts = dashboard_alerts_from_relation(
+        timing("visible alerts");
+        let mut alerts = dashboard_alerts_from_relation(
             conn,
             DashboardAlertQuery {
                 relation: "dashboard_visible_alerts",
@@ -992,7 +1320,7 @@ impl EventStore {
                 raw_event_count_expression: "1",
             },
         )?;
-        let agent_events = query_json_rows(
+        let mut agent_events = query_json_rows(
             conn,
             "SELECT event_id, pid, agent_events.request_id, requests.session_id, ts,
                 source, type, cwd, permission_mode, tool_name, tool_input,
@@ -1022,7 +1350,7 @@ impl EventStore {
         let sessions = query_json_rows(
             conn,
             "SELECT s.session_id, s.agent_id, s.first_event_at, s.last_event_at, s.flagged,
-                (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.session_id),
+                (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.session_id AND r.request_id NOT IN (SELECT source_id FROM dashboard_request_groups)),
                 (SELECT COUNT(*) FROM agent_events ae
                    JOIN requests r ON ae.request_id = r.request_id
                   WHERE r.session_id = s.session_id)
@@ -1042,13 +1370,17 @@ impl EventStore {
             },
         )?;
         let requests_sql =
-            "WITH recent_requests AS MATERIALIZED (
+            concat!("WITH recent_roots AS MATERIALIZED (
+               SELECT COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = r.request_id), r.request_id) AS root_id,
+                      MAX(COALESCE(completed_at, created_at, r.request_id)) AS activity
+               FROM requests r GROUP BY root_id ORDER BY activity DESC, root_id DESC LIMIT 100
+             ), recent_requests AS MATERIALIZED (
                SELECT request_id, session_id,
-                      substr(original_user_prompt, 1, 16384) AS original_user_prompt,
+                      ", recovered_request_prompt_sql!(""), " AS original_user_prompt,
                       created_at, completed_at
-               FROM requests
-               ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
-               LIMIT 100
+               FROM requests r
+               WHERE COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = r.request_id), r.request_id)
+                   IN (SELECT root_id FROM recent_roots)
              ),
              event_rollups AS (
                SELECT agent_events.request_id,
@@ -1094,7 +1426,7 @@ impl EventStore {
              LEFT JOIN event_rollups ON event_rollups.request_id = recent_requests.request_id
              LEFT JOIN alert_rollups ON alert_rollups.request_id = recent_requests.request_id
              ORDER BY COALESCE(recent_requests.completed_at, recent_requests.created_at, recent_requests.request_id) DESC,
-                      recent_requests.request_id DESC";
+                      recent_requests.request_id DESC");
         let mut requests = query_json_rows(conn, requests_sql, |row| {
             Ok(json!({
                 "request_id": row.get::<_, i64>(0)?,
@@ -1116,7 +1448,9 @@ impl EventStore {
                 "ignored_file_touch_paths": [],
             }))
         })?;
+        timing("request rollups");
         let request_file_touches = dashboard_request_file_touches(conn)?;
+        timing("file touches");
         for request in &mut requests {
             let request_id = request["request_id"].as_i64().unwrap_or_default();
             let observed_touches = request_file_touches
@@ -1133,6 +1467,32 @@ impl EventStore {
                 .collect::<Vec<_>>());
             request["summary_file_touches"] = json!(touches);
         }
+        timing("native touches");
+        let visible_ids: Vec<_> = requests
+            .iter()
+            .chain(alerts.iter())
+            .filter_map(|row| row["request_id"].as_i64())
+            .collect();
+        groups.load_prompts(conn, &visible_ids)?;
+        requests = groups.merge_requests(requests);
+        for request in &mut requests {
+            let id = request["request_id"].as_i64().unwrap();
+            if groups.children(id).is_empty() {
+                continue;
+            }
+            let (tools, decisions): (i64, i64) = conn.query_row(
+                grouped_request_sql!("SELECT (SELECT COUNT(DISTINCT CASE WHEN type NOT IN ('PostToolUse', 'PostToolUseFailure') THEN COALESCE(tool_use_id, 'event-' || event_id) END)
+                    FROM agent_events WHERE request_id IN (", ")),
+                    (SELECT COUNT(DISTINCT rule_id || '|' || COALESCE(path, '') || '|' || lower(action))
+                    FROM dashboard_visible_alerts WHERE request_id IN (", "))"),
+                [id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sqlite_error_from_rusqlite)?;
+            request["tool_call_count"] = json!(tools);
+            request["decision_count"] = json!(decisions);
+        }
+
+        timing("group rollups");
+        groups.project_events(&mut agent_events);
+        groups.project_events(&mut alerts);
         let artifact_query = "SELECT kind, uri, current_digest, last_seen_at,
                     last_modified_at, last_modified_source,
                     last_modified_session_id, risk_level, risk_rule_id,
@@ -1218,6 +1578,7 @@ impl EventStore {
                 }))
             },
         )?;
+        timing("artifacts and relations");
         let dashboard_summary_sql = "SELECT
                 (SELECT COUNT(*) FROM sessions),
                 (SELECT COUNT(*) FROM requests),
@@ -1254,7 +1615,7 @@ impl EventStore {
         let daily_activity_sql =
             "WITH daily_requests AS (
                 SELECT date(created_at / 1000, 'unixepoch', 'localtime') AS day,
-                       COUNT(*) AS count,
+                       COUNT(DISTINCT COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = requests.request_id), requests.request_id)) AS count,
                        COALESCE(SUM(total_tokens), 0) AS tokens
                 FROM requests
                 WHERE created_at IS NOT NULL
@@ -1390,6 +1751,22 @@ impl EventStore {
             }))
         })?;
         let json_sessions = self.list_sessions()?;
+        // Sensor delivery failures are Gensee health incidents. Project legacy
+        // records separately without rewriting their immutable evidence or
+        // carrying forward the request/tool context attached by older builds.
+        let monitoring_gaps = query_json_rows(
+            conn,
+            "SELECT alert_id, created_at, json_extract(evidence, '$.dropped_events')
+             FROM alerts WHERE gensee_alert_kind(rule_id) = 'monitoring_health'
+             ORDER BY created_at DESC, alert_id DESC LIMIT 100",
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "observedAt": row.get::<_, i64>(1)?,
+                    "missingEvents": row.get::<_, Option<i64>>(2)?,
+                }))
+            },
+        )?;
         Ok(json!({
             "source": "gensee",
             "summary": dashboard_summary,
@@ -1403,6 +1780,7 @@ impl EventStore {
             "dailyActivity": daily_activity,
             "recentActivity": recent_activity,
             "jsonSessions": json_sessions,
+            "monitoringGaps": monitoring_gaps,
         }))
     }
 
@@ -1411,14 +1789,49 @@ impl EventStore {
     /// views must not infer that an older request had no tools merely because
     /// its events fell outside those windows.
     pub fn dashboard_request(&self, request_id: i64) -> io::Result<Value> {
+        let groups = {
+            let db = self.sqlite_store()?;
+            let mut groups = DashboardRequestGroups::load(db.connection())?;
+            groups.load_prompts(db.connection(), &[request_id])?;
+            groups
+        };
+        let root = groups.root(request_id);
+        let mut result = self.dashboard_request_ungrouped(root)?;
+        result["request"]["original_user_prompt"] = json!(groups
+            .prompts
+            .get(&root)
+            .cloned()
+            .unwrap_or_else(|| dashboard_request_prompt(
+                result["request"]["original_user_prompt"].as_str()
+            )));
+        for key in ["agentEvents", "alerts"] {
+            let rows = result[key].as_array_mut().unwrap();
+            groups.project_events(rows);
+            rows.sort_by_key(|r| {
+                (
+                    r["ts"]
+                        .as_i64()
+                        .or_else(|| r["created_at"].as_i64())
+                        .unwrap_or(0),
+                    r["event_id"]
+                        .as_i64()
+                        .or_else(|| r["alert_id"].as_i64())
+                        .unwrap_or(0),
+                )
+            });
+        }
+        Ok(result)
+    }
+
+    fn dashboard_request_ungrouped(&self, request_id: i64) -> io::Result<Value> {
         let db = self.sqlite_store()?;
         let conn = db.connection();
 
         let mut request = conn
             .query_row(
-                "SELECT request_id, session_id, substr(original_user_prompt, 1, 16384), created_at, completed_at
+                grouped_request_sql!(concat!("SELECT request_id, session_id, ", recovered_request_prompt_sql!(""), ", created_at, (SELECT MAX(completed_at) FROM requests WHERE request_id IN ("), "))
                  FROM requests
-                 WHERE request_id = ?1",
+                 WHERE request_id = ?1"),
                 [request_id],
                 |row| {
                     Ok(json!({
@@ -1453,11 +1866,14 @@ impl EventStore {
 
         let agent_events = query_json_rows_with_i64(
             conn,
-            "SELECT event_id, pid, request_id, ts, source, type, cwd,
+            grouped_request_sql!(
+                "SELECT event_id, pid, request_id, ts, source, type, cwd,
                     permission_mode, tool_name, tool_input, tool_response, tool_use_id
              FROM agent_events
-             WHERE request_id = ?1
-             ORDER BY ts, event_id",
+             WHERE request_id IN (",
+                ")
+             ORDER BY ts, event_id"
+            ),
             request_id,
             |row| {
                 Ok(json!({
@@ -1536,6 +1952,7 @@ impl EventStore {
 
         let db = self.sqlite_store()?;
         let conn = db.connection();
+        let _groups = DashboardRequestGroups::load(conn)?;
         let visible_alerts_cte = dashboard_visible_alerts_cte();
         let valid: i64 = conn
             .query_row("SELECT date(?1) = ?1", [day], |row| row.get(0))
@@ -1553,7 +1970,7 @@ impl EventStore {
                (SELECT COUNT(DISTINCT session_id) FROM requests
                  WHERE session_id != 'system'
                    AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1),
-               (SELECT COUNT(*) FROM requests
+               (SELECT COUNT(DISTINCT COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = requests.request_id), requests.request_id)) FROM requests
                  WHERE session_id != 'system'
                    AND date(created_at / 1000, 'unixepoch', 'localtime') = ?1
                    AND (original_user_prompt IS NOT NULL OR completed_at IS NOT NULL
@@ -1637,13 +2054,17 @@ impl EventStore {
 
     pub fn append_policy_alert(&self, alert: &PolicyAlert) -> io::Result<()> {
         self.with_sqlite_transaction(|db| {
-            let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
-            ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
-            let request_id = latest_or_create_request(db, session_id)?;
+            let request_id = if alert.kind() == AlertKind::MonitoringHealth {
+                None
+            } else {
+                let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
+                ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
+                Some(latest_or_create_request(db, session_id)?)
+            };
             insert_alert(
                 db,
                 AlertInput {
-                    request_id: Some(request_id),
+                    request_id,
                     entity: None,
                     severity: &alert.severity,
                     action: &alert.action,
@@ -1658,7 +2079,9 @@ impl EventStore {
                 },
             )?;
             if alert.rule_id == "policy_network_egress" {
-                refresh_request_resource_rates(db, request_id)?;
+                if let Some(request_id) = request_id {
+                    refresh_request_resource_rates(db, request_id)?;
+                }
             }
             Ok(())
         })
@@ -1675,9 +2098,13 @@ impl EventStore {
         window_ms: u64,
     ) -> io::Result<bool> {
         self.with_sqlite_transaction(|db| {
-            let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
-            ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
-            let request_id = latest_or_create_request(db, session_id)?;
+            let request_id = if alert.kind() == AlertKind::MonitoringHealth {
+                None
+            } else {
+                let session_id = alert.session_id.as_deref().unwrap_or(UNKNOWN_SESSION_ID);
+                ensure_session(db, session_id, "policy", alert.observed_at_ms)?;
+                Some(latest_or_create_request(db, session_id)?)
+            };
             let created_at = to_i64(alert.observed_at_ms)?;
             let window = to_i64(window_ms)?;
             let duplicate = db
@@ -1711,7 +2138,7 @@ impl EventStore {
             insert_alert(
                 db,
                 AlertInput {
-                    request_id: Some(request_id),
+                    request_id,
                     entity: None,
                     severity: &alert.severity,
                     action: &alert.action,
@@ -2192,6 +2619,48 @@ impl EventStore {
 
             match event.hook_event_name.as_deref() {
                 Some("UserPromptSubmit") => {
+                    if event.provider == "claude-code"
+                        && prompt.as_deref().is_some_and(is_task_notification)
+                    {
+                        let text = prompt.as_deref().unwrap_or_default();
+                        let origin = notification_origin_request(
+                            db.connection(),
+                            session_id,
+                            text,
+                            to_i64(event.observed_at_ms)?,
+                            i64::MAX,
+                        )?;
+                        let request_id = match origin {
+                            Some(id) => id,
+                            None => {
+                                let current = db
+                                    .latest_request_for_session(session_id)
+                                    .map_err(sqlite_error)?;
+                                if let Some(current) = current.filter(|request| {
+                                    request.original_user_prompt.as_deref() == Some(text)
+                                }) {
+                                    current.request_id
+                                } else {
+                                    let id = db
+                                        .insert_request(&NewRequest {
+                                            session_id: session_id.into(),
+                                            original_user_prompt: Some(text.into()),
+                                            final_response: None,
+                                            events: Some(event.raw_json.clone()),
+                                            file_accessed_rate: 0.0,
+                                            network_rate: 0.0,
+                                        })
+                                        .map_err(sqlite_error)?;
+                                    db.set_request_created_at(id, to_i64(event.observed_at_ms)?)
+                                        .map_err(sqlite_error)?;
+                                    id
+                                }
+                            }
+                        };
+                        db.set_hook_request_context(session_id, request_id)
+                            .map_err(sqlite_error)?;
+                        return Ok(());
+                    }
                     let request_id = db
                         .insert_request(&NewRequest {
                             session_id: session_id.to_string(),
@@ -3682,7 +4151,8 @@ fn merge_evidence(base: Option<Value>, enrichment: Option<Value>) -> Option<Valu
 fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::Result<Vec<Value>> {
     let touches = query_json_rows_with_i64(
         conn,
-        "SELECT CASE
+        grouped_request_sql!(
+            "SELECT CASE
                     WHEN artifacts.uri LIKE 'file://%' THEN substr(artifacts.uri, 8)
                     WHEN artifacts.uri LIKE 'file:%' THEN substr(artifacts.uri, 6)
                     ELSE artifacts.uri
@@ -3697,7 +4167,8 @@ fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::R
                       AND declared_relation.dst_id = artifacts.artifact_id
                       AND declared_relation.relation_type IN
                           ('produced', 'modified', 'deleted')
-                      AND declaring_event.request_id = ?1
+                      AND declaring_event.request_id IN (",
+            ")
                 ) AS intended_and_verified,
                 MAX(system_events.ts) AS last_observed_at,
                 artifact_facts.risk_level,
@@ -3714,16 +4185,19 @@ fn dashboard_file_touches(conn: &rusqlite::Connection, request_id: i64) -> io::R
           AND observed_relation.relation_type IN ('wrote', 'modified', 'deleted')
          JOIN system_events
            ON system_events.event_id = observed_relation.src_id
-          AND system_events.request_id = ?1
+          AND system_events.request_id IN (",
+            ")
           AND system_events.source = 'macos-endpoint-security'
          LEFT JOIN artifact_facts
            ON artifact_facts.current_artifact_id = artifacts.artifact_id
          WHERE request_relation.src_kind = 'request'
-           AND request_relation.src_id = ?1
+           AND request_relation.src_id IN (",
+            ")
            AND request_relation.dst_kind = 'artifact'
            AND request_relation.relation_type IN ('produced', 'modified', 'deleted')
          GROUP BY artifacts.artifact_id, artifacts.uri
-         ORDER BY path",
+         ORDER BY path"
+        ),
         request_id,
         |row| {
             Ok(json!({
@@ -3757,14 +4231,16 @@ fn dashboard_completed_native_file_touches(
 ) -> io::Result<Vec<Value>> {
     let rows = query_json_rows_with_i64(
         conn,
-        "WITH completed_tools AS (
+        grouped_request_sql!(
+            "WITH completed_tools AS (
            SELECT started.tool_input, started.cwd, completed.ts
            FROM agent_events AS started
            JOIN agent_events AS completed
              ON completed.request_id = started.request_id
             AND completed.type = 'PostToolUse'
             AND completed.tool_use_id = started.tool_use_id
-           WHERE started.request_id = ?1
+           WHERE started.request_id IN (",
+            ")
              AND started.type = 'PreToolUse'
              AND json_valid(started.tool_input)
          ),
@@ -3781,7 +4257,8 @@ fn dashboard_completed_native_file_touches(
              ON started.request_id = intent.request_id
             AND started.type = 'PreToolUse'
             AND started.tool_use_id = intent.tool_use_id
-           WHERE intent.request_id = ?1
+           WHERE intent.request_id IN (",
+            ")
              AND intent.type = 'file_intent'
              AND json_valid(intent.tool_input)
          ),
@@ -3808,7 +4285,8 @@ fn dashboard_completed_native_file_touches(
          SELECT path, cwd, MAX(completed_at)
          FROM declared_paths
          WHERE path IS NOT NULL AND path != ''
-         GROUP BY path, cwd",
+         GROUP BY path, cwd"
+        ),
         request_id,
         |row| {
             let raw_path = row.get::<_, String>(0)?;
@@ -3919,15 +4397,17 @@ fn dashboard_request_file_touches(
     )
     .map_err(sqlite_error_from_rusqlite)?;
     let sql = format!(
-        "WITH recent_requests AS MATERIALIZED (
-            SELECT request_id
-            FROM requests
-            ORDER BY COALESCE(completed_at, created_at, request_id) DESC, request_id DESC
-            LIMIT 100
+        "WITH recent_roots AS MATERIALIZED (
+            SELECT COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = r.request_id), r.request_id) AS root_id,
+                   MAX(COALESCE(completed_at, created_at, r.request_id)) AS activity
+            FROM requests r GROUP BY root_id ORDER BY activity DESC, root_id DESC LIMIT 100
+         ), recent_requests AS MATERIALIZED (
+            SELECT r.request_id FROM requests r
+            WHERE COALESCE((SELECT request_id FROM dashboard_request_groups g WHERE g.source_id = r.request_id), r.request_id) IN (SELECT root_id FROM recent_roots)
          ),
          request_artifacts AS MATERIALIZED (
             SELECT request_relation.src_id AS request_id,
-                   artifacts.artifact_id,
+                   artifacts.artifact_id, artifacts.kind AS artifact_kind, artifacts.uri AS artifact_uri,
                    CASE
                      WHEN artifacts.uri LIKE 'file://%' THEN substr(artifacts.uri, 8)
                      WHEN artifacts.uri LIKE 'file:%' THEN substr(artifacts.uri, 6)
@@ -3980,7 +4460,9 @@ fn dashboard_request_file_touches(
              AND system_events.request_id = request_artifacts.request_id
              AND system_events.source = 'macos-endpoint-security'
             LEFT JOIN artifact_facts
-              ON artifact_facts.current_artifact_id = request_artifacts.artifact_id
+              ON artifact_facts.kind = request_artifacts.artifact_kind
+             AND artifact_facts.uri = request_artifacts.artifact_uri
+             AND artifact_facts.current_artifact_id = request_artifacts.artifact_id
             GROUP BY request_artifacts.request_id, request_artifacts.artifact_id,
                      request_artifacts.path
          ),
@@ -4109,8 +4591,11 @@ fn dashboard_ignored_file_touch_paths_with_limits(
 ) -> io::Result<DashboardIgnoredFileTouches> {
     let total_event_count = conn
         .query_row(
-            "SELECT COUNT(*) FROM system_events
-             WHERE request_id = ?1 AND source = 'macos-endpoint-security'",
+            grouped_request_sql!(
+                "SELECT COUNT(*) FROM system_events
+             WHERE request_id IN (",
+                ") AND source = 'macos-endpoint-security'"
+            ),
             [request_id],
             |row| row.get::<_, i64>(0),
         )
@@ -4121,13 +4606,14 @@ fn dashboard_ignored_file_touch_paths_with_limits(
             })
         })?;
     let mut statement = conn
-        .prepare(
+        .prepare(grouped_request_sql!(
             "SELECT pid, ts, source, type, args
              FROM system_events
-             WHERE request_id = ?1 AND source = 'macos-endpoint-security'
+             WHERE request_id IN (",
+            ") AND source = 'macos-endpoint-security'
              ORDER BY ts, event_id
-             LIMIT ?2",
-        )
+             LIMIT ?2"
+        ))
         .map_err(sqlite_error_from_rusqlite)?;
     let rows = statement
         .query_map(
@@ -4486,18 +4972,25 @@ fn dashboard_alert_base_visibility_sql(alias: &str) -> String {
     let path = format!("COALESCE({alias}.path, '')");
     let lower_path = format!("lower({path})");
     format!(
-        "NOT ({alias}.rule_id = 'unmatched_system_effect'
-              AND {alias}.evidence LIKE '%\"source\":\"macos-endpoint-security\"%')
-         AND NOT ({alias}.rule_id = 'hook_bypass_file_mutation' AND (
-              {path} GLOB '/dev/*'
-              OR {lower_path} LIKE '%/library/application support/codex/%'
-              OR {lower_path} LIKE '%/library/application support/claude/%'
-              OR {lower_path} LIKE '%/crashpad/%'
-              OR {lower_path} LIKE '%/diagnosticreports/%'
-              OR {lower_path} LIKE '%/crash reports/%'
-              OR {lower_path} LIKE '%/.codex/sessions/%.jsonl'
-              OR {lower_path} LIKE '%/.claude/projects/%.jsonl'
-         ))"
+        "gensee_alert_kind({alias}.rule_id) != 'monitoring_health'
+         AND (lower({alias}.action) IN ('deny', 'block')
+              OR COALESCE(json_extract({alias}.evidence, '$.decision.result'), '') = 'deny'
+              OR NOT (
+                  ({alias}.rule_id = 'unmatched_system_effect'
+                   AND COALESCE({alias}.evidence, '') LIKE '%\"source\":\"macos-endpoint-security\"%')
+                  OR EXISTS (SELECT 1 FROM dashboard_alert_classification c
+                      WHERE c.alert_id = {alias}.alert_id AND c.policy_key = gensee_dashboard_policy_key() AND c.routine = 1)
+                  OR ({alias}.rule_id = 'hook_bypass_file_mutation' AND (
+                      {path} GLOB '/dev/*'
+                      OR {lower_path} LIKE '%/library/application support/codex/%'
+                      OR {lower_path} LIKE '%/library/application support/claude/%'
+                      OR {lower_path} LIKE '%/crashpad/%'
+                      OR {lower_path} LIKE '%/diagnosticreports/%'
+                      OR {lower_path} LIKE '%/crash reports/%'
+                      OR {lower_path} LIKE '%/.codex/sessions/%.jsonl'
+                      OR {lower_path} LIKE '%/.claude/projects/%.jsonl'
+                  ))
+              ))"
     )
 }
 
@@ -4506,7 +4999,10 @@ fn dashboard_visible_alerts_cte() -> String {
 }
 
 fn dashboard_visible_alerts_cte_for_request() -> String {
-    dashboard_visible_alerts_cte_with_scope(Some("AND alerts.request_id = ?1"))
+    dashboard_visible_alerts_cte_with_scope(Some(grouped_request_sql!(
+        "AND alerts.request_id IN (",
+        ")"
+    )))
 }
 
 fn dashboard_visible_alerts_cte_with_scope(request_scope: Option<&str>) -> String {
@@ -4524,15 +5020,20 @@ fn dashboard_visible_alerts_cte_with_scope(request_scope: Option<&str>) -> Strin
                        ORDER BY alerts.created_at, alerts.alert_id
                    ) AS previous_related_alert_at
             FROM alerts
-            WHERE {base_visibility}
+            WHERE alerts.rule_id = 'hook_bypass_file_mutation' AND {base_visibility}
               {request_scope}
          ),
          visible_alerts AS MATERIALIZED (
             SELECT *
             FROM ranked_dashboard_alerts
-            WHERE rule_id != 'hook_bypass_file_mutation'
+            WHERE lower(action) IN ('block', 'deny')
                OR previous_related_alert_at IS NULL
                OR created_at - previous_related_alert_at > 10000
+            UNION ALL
+            SELECT alerts.*, NULL AS previous_related_alert_at
+            FROM alerts
+            WHERE alerts.rule_id != 'hook_bypass_file_mutation' AND {base_visibility}
+              {request_scope}
          )"
     )
 }
@@ -4593,19 +5094,18 @@ fn dashboard_alerts(
                     WHERE representative_rank = 1
                  )"
             );
-            let mut alerts = dashboard_alerts_from_relation(
+            let alerts = dashboard_alerts_from_relation(
                 conn,
                 DashboardAlertQuery {
                     relation: "request_alerts",
                     request_id,
                     limit,
                     visible_alerts_cte: Some(&grouped_alerts_cte),
-                    include_trigger_context: false,
+                    include_trigger_context: true,
                     include_request_prompt: false,
                     raw_event_count_expression: "alerts.raw_event_count",
                 },
             )?;
-            enrich_dashboard_alert_context(conn, request_id.unwrap(), &mut alerts)?;
             Ok(alerts)
         }
         None => {
@@ -4624,6 +5124,21 @@ fn dashboard_alerts(
             )
         }
     }
+}
+
+fn exact_alert_event_sql(alert: &str) -> String {
+    format!(
+        "COALESCE(
+        (SELECT candidate.event_id FROM agent_events candidate
+         WHERE {alert}.entity_kind = 'agent_event' AND candidate.event_id = {alert}.entity_id
+           AND candidate.request_id = {alert}.request_id AND candidate.type = 'PreToolUse'
+           AND candidate.ts <= {alert}.created_at),
+        (SELECT candidate.event_id FROM agent_events candidate
+         WHERE candidate.request_id = {alert}.request_id AND candidate.type = 'PreToolUse'
+           AND candidate.ts <= {alert}.created_at
+           AND candidate.tool_use_id = json_extract({alert}.evidence, '$.tool_use_id')
+         ORDER BY candidate.ts DESC, candidate.event_id DESC LIMIT 1))"
+    )
 }
 
 struct DashboardAlertQuery<'a> {
@@ -4650,7 +5165,7 @@ fn dashboard_alerts_from_relation(
         raw_event_count_expression,
     } = query;
     let where_clause = request_id
-        .map(|_| "WHERE alerts.request_id = ?1")
+        .map(|_| grouped_request_sql!("WHERE alerts.request_id IN (", ")"))
         .unwrap_or_default();
     let limit_clause = limit
         .map(|value| format!("LIMIT {value}"))
@@ -4659,7 +5174,7 @@ fn dashboard_alerts_from_relation(
         .map(|cte| format!("WITH {cte}"))
         .unwrap_or_default();
     let request_prompt_expression = if include_request_prompt {
-        "substr(requests.original_user_prompt, 1, 16384)"
+        concat!(recovered_request_prompt_sql!("requests."))
     } else {
         "NULL"
     };
@@ -4669,15 +5184,8 @@ fn dashboard_alerts_from_relation(
              trigger_event.tool_input, trigger_event.tool_use_id",
             "LEFT JOIN agent_events AS trigger_event
            ON trigger_event.event_id = COALESCE(
+             alerts.exact_event_id,
              CASE WHEN alerts.entity_kind = 'agent_event' THEN alerts.entity_id END,
-             (
-               SELECT candidate.event_id FROM agent_events AS candidate
-               WHERE candidate.request_id = alerts.request_id
-                 AND candidate.tool_use_id = json_extract(alerts.evidence, '$.tool_use_id')
-               ORDER BY candidate.type = 'PreToolUse' DESC,
-                        candidate.ts DESC, candidate.event_id DESC
-               LIMIT 1
-             ),
              (
                SELECT candidate.event_id FROM agent_events AS candidate
                WHERE candidate.request_id = alerts.request_id
@@ -4698,6 +5206,16 @@ fn dashboard_alerts_from_relation(
     } else {
         ("NULL, NULL, NULL, NULL, NULL", "")
     };
+    let exact_context = if include_trigger_context {
+        "alerts.exact_event_id IS NOT NULL"
+    } else {
+        "0"
+    };
+    let exact_event = if include_trigger_context {
+        exact_alert_event_sql("base")
+    } else {
+        "NULL".into()
+    };
     let sql = format!(
         "{with_clause}
          SELECT alerts.alert_id, alerts.request_id, alerts.entity_kind, alerts.entity_id,
@@ -4706,8 +5224,8 @@ fn dashboard_alerts_from_relation(
                 requests.session_id, {request_prompt_expression},
                 {trigger_event_columns},
                 feedback.human_verdict, feedback.label, feedback.created_at,
-                {raw_event_count_expression}
-         FROM {alert_relation} AS alerts
+                {raw_event_count_expression}, {exact_context}
+         FROM (SELECT base.*, {exact_event} AS exact_event_id FROM {alert_relation} base) AS alerts
          LEFT JOIN requests ON requests.request_id = alerts.request_id
          {trigger_event_join}
          LEFT JOIN human_feedback AS feedback
@@ -4749,121 +5267,13 @@ fn dashboard_alerts_from_relation(
             "feedback_label": row.get::<_, Option<String>>(19)?,
             "feedback_created_at": row.get::<_, Option<i64>>(20)?,
             "raw_event_count": row.get::<_, i64>(21)?,
+            "approval_context_exact": row.get::<_, bool>(22)?,
         }))
     };
     match request_id {
         Some(request_id) => query_json_rows_with_i64(conn, &sql, request_id, mapper),
         None => query_json_rows(conn, &sql, mapper),
     }
-}
-
-#[derive(Clone)]
-struct DashboardAgentEventContext {
-    event_id: i64,
-    ts: i64,
-    source: String,
-    event_type: String,
-    tool_name: Option<String>,
-    tool_input: Option<String>,
-    tool_use_id: Option<String>,
-}
-
-fn enrich_dashboard_alert_context(
-    conn: &rusqlite::Connection,
-    request_id: i64,
-    alerts: &mut [Value],
-) -> io::Result<()> {
-    let mut statement = conn
-        .prepare(
-            "SELECT event_id, ts, source, type, tool_name, tool_input, tool_use_id
-             FROM agent_events
-             WHERE request_id = ?1
-             ORDER BY ts, event_id",
-        )
-        .map_err(sqlite_error_from_rusqlite)?;
-    let rows = statement
-        .query_map([request_id], |row| {
-            Ok(DashboardAgentEventContext {
-                event_id: row.get(0)?,
-                ts: row.get(1)?,
-                source: row.get(2)?,
-                event_type: row.get(3)?,
-                tool_name: row.get(4)?,
-                tool_input: row.get(5)?,
-                tool_use_id: row.get(6)?,
-            })
-        })
-        .map_err(sqlite_error_from_rusqlite)?;
-    let events = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(sqlite_error_from_rusqlite)?;
-    let pre_tool_events = events
-        .iter()
-        .filter(|event| event.event_type == "PreToolUse")
-        .cloned()
-        .collect::<Vec<_>>();
-    let by_id = events
-        .iter()
-        .map(|event| (event.event_id, event.clone()))
-        .collect::<HashMap<_, _>>();
-    let mut by_tool_use_id = HashMap::<String, DashboardAgentEventContext>::new();
-    for event in &events {
-        let Some(tool_use_id) = event.tool_use_id.as_ref() else {
-            continue;
-        };
-        let replace = by_tool_use_id.get(tool_use_id).is_none_or(|existing| {
-            let event_is_pre = event.event_type == "PreToolUse";
-            let existing_is_pre = existing.event_type == "PreToolUse";
-            (event_is_pre, event.ts, event.event_id)
-                > (existing_is_pre, existing.ts, existing.event_id)
-        });
-        if replace {
-            by_tool_use_id.insert(tool_use_id.clone(), event.clone());
-        }
-    }
-
-    for alert in alerts {
-        let created_at = alert["created_at"].as_i64().unwrap_or(i64::MAX);
-        let entity_event = (alert["entity_kind"].as_str() == Some("agent_event"))
-            .then(|| alert["entity_id"].as_i64())
-            .flatten()
-            .and_then(|event_id| by_id.get(&event_id));
-        let evidence_tool_use_id = alert["evidence"]
-            .as_str()
-            .and_then(|evidence| serde_json::from_str::<Value>(evidence).ok())
-            .and_then(|evidence| {
-                evidence
-                    .get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
-        let tool_event = evidence_tool_use_id
-            .as_ref()
-            .and_then(|tool_use_id| by_tool_use_id.get(tool_use_id));
-        let latest_pre_tool = latest_dashboard_event_at_or_before(&pre_tool_events, created_at);
-        let latest_event = latest_dashboard_event_at_or_before(&events, created_at);
-        let Some(context) = entity_event
-            .or(tool_event)
-            .or(latest_pre_tool)
-            .or(latest_event)
-        else {
-            continue;
-        };
-        alert["event_source"] = json!(context.source);
-        alert["event_type"] = json!(context.event_type);
-        alert["tool_name"] = json!(context.tool_name);
-        alert["tool_input"] = json!(context.tool_input);
-        alert["tool_use_id"] = json!(context.tool_use_id);
-    }
-    Ok(())
-}
-
-fn latest_dashboard_event_at_or_before(
-    events: &[DashboardAgentEventContext],
-    timestamp: i64,
-) -> Option<&DashboardAgentEventContext> {
-    let index = events.partition_point(|event| (event.ts, event.event_id) <= (timestamp, i64::MAX));
-    index.checked_sub(1).and_then(|index| events.get(index))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5190,8 +5600,355 @@ fn bounded_transaction_text(value: &str) -> String {
     bounded
 }
 
+/// Follow exact launch IDs, including background tasks launched by another
+/// completion. Never infer a parent merely from temporal proximity.
+fn notification_origin_request(
+    conn: &rusqlite::Connection,
+    session: &str,
+    text: &str,
+    observed_at: i64,
+    before_request: i64,
+) -> io::Result<Option<i64>> {
+    let mut notification = text.to_string();
+    let mut before = before_request;
+    let mut timestamp = observed_at;
+    let mut origin = None;
+    for _ in 0..128 {
+        let Some(tool_id) = notification_field(&notification, "tool-use-id") else {
+            break;
+        };
+        let parent = conn
+            .query_row(
+                concat!(
+                    "SELECT r.request_id,
+                ",
+                    recovered_request_prompt_sql!("r."),
+                    ", r.created_at
+             FROM agent_events ae JOIN requests r ON r.request_id = ae.request_id
+             WHERE r.session_id = ?1 AND ae.tool_use_id = ?2
+               AND ae.source = 'claude-code' AND ae.ts <= ?3 AND r.request_id < ?4
+             ORDER BY ae.ts DESC, ae.event_id DESC LIMIT 1"
+                ),
+                rusqlite::params![session, tool_id, timestamp, before],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error_from_rusqlite)?;
+        let Some((id, prompt, created_at)) = parent else {
+            break;
+        };
+        origin = Some(id);
+        before = id;
+        timestamp = created_at.unwrap_or(timestamp);
+        notification = prompt.unwrap_or_default();
+        if !is_task_notification(&notification) {
+            break;
+        }
+    }
+    Ok(origin)
+}
+
+/// A dashboard-only projection: historical request, event, and alert records
+/// retain their original IDs, including the fields covered by the alert chain.
+struct DashboardRequestGroups {
+    aliases: HashMap<i64, i64>,
+    children_by_root: HashMap<i64, Vec<i64>>,
+    prompts: HashMap<i64, Option<String>>,
+}
+
+impl DashboardRequestGroups {
+    fn load(conn: &rusqlite::Connection) -> io::Result<Self> {
+        // Process immutable historical rows once, in bounded batches. Persist
+        // progress with each batch so another short-lived CLI resumes the scan.
+        loop {
+            let cursor = conn.query_row(
+                "SELECT cursor FROM dashboard_projection_progress WHERE name = 'request-groups-v2'",
+                [], |r| r.get::<_, i64>(0)
+            ).optional().map_err(sqlite_error_from_rusqlite)?.unwrap_or(0);
+            let rows = query_json_rows(
+                conn,
+                &format!(
+                    concat!(
+                        "SELECT request_id, session_id,
+                    ",
+                        recovered_request_prompt_sql!(""),
+                        ", created_at
+                    FROM requests WHERE request_id > {cursor} ORDER BY request_id LIMIT 2048"
+                    ),
+                    cursor = cursor
+                ),
+                |r| {
+                    Ok(json!([
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<i64>>(3)?
+                    ]))
+                },
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut links = Vec::new();
+            for row in &rows {
+                let id = row[0].as_i64().unwrap();
+                if let Some(text) = row[2].as_str().filter(|p| is_task_notification(p)) {
+                    if let Some(origin) = notification_origin_request(
+                        conn,
+                        row[1].as_str().unwrap(),
+                        text,
+                        row[3].as_i64().unwrap_or(i64::MAX),
+                        id,
+                    )? {
+                        links.push((id, origin));
+                    }
+                }
+            }
+            conn.execute_batch("SAVEPOINT request_group_backfill")
+                .map_err(sqlite_error_from_rusqlite)?;
+            let saved = (|| -> rusqlite::Result<()> {
+                for (id, origin) in links {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO dashboard_request_groups VALUES (?1,
+                            COALESCE((SELECT request_id FROM dashboard_request_groups WHERE source_id = ?2), ?2))",
+                        [id, origin],
+                    )?;
+                }
+                conn.execute(
+                    "INSERT INTO dashboard_projection_progress VALUES ('request-groups-v2', ?1)
+                    ON CONFLICT(name) DO UPDATE SET cursor = MAX(cursor, excluded.cursor)",
+                    [rows.last().unwrap()[0].as_i64().unwrap()],
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = saved {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO request_group_backfill; RELEASE request_group_backfill",
+                );
+                if sqlite_is_busy(&error) {
+                    break;
+                }
+                return Err(sqlite_error_from_rusqlite(error));
+            }
+            conn.execute_batch("RELEASE request_group_backfill")
+                .map_err(sqlite_error_from_rusqlite)?;
+        }
+        let mut groups = Self {
+            aliases: HashMap::new(),
+            children_by_root: HashMap::new(),
+            prompts: HashMap::new(),
+        };
+        let mut query = conn
+            .prepare("SELECT source_id, request_id FROM dashboard_request_groups")
+            .map_err(sqlite_error_from_rusqlite)?;
+        for row in query
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(sqlite_error_from_rusqlite)?
+        {
+            let (source, root) = row.map_err(sqlite_error_from_rusqlite)?;
+            groups.aliases.insert(source, root);
+            groups
+                .children_by_root
+                .entry(root)
+                .or_default()
+                .push(source);
+        }
+        Ok(groups)
+    }
+
+    fn load_prompts(&mut self, conn: &rusqlite::Connection, ids: &[i64]) -> io::Result<()> {
+        let roots: BTreeSet<_> = ids.iter().map(|id| self.root(*id)).collect();
+        let mut query = conn
+            .prepare(concat!(
+                "SELECT r.request_id, ",
+                recovered_request_prompt_sql!("r."),
+                " FROM requests r WHERE r.request_id IN (SELECT value FROM json_each(?1))"
+            ))
+            .map_err(sqlite_error_from_rusqlite)?;
+        let rows = query
+            .query_map(
+                [serde_json::to_string(&roots).map_err(io::Error::other)?],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .map_err(sqlite_error_from_rusqlite)?;
+        for row in rows {
+            let (root, prompt) = row.map_err(sqlite_error_from_rusqlite)?;
+            self.prompts
+                .insert(root, dashboard_request_prompt(prompt.as_deref()));
+        }
+        Ok(())
+    }
+
+    fn root(&self, id: i64) -> i64 {
+        self.aliases.get(&id).copied().unwrap_or(id)
+    }
+
+    fn children(&self, root: i64) -> Vec<i64> {
+        let mut children = self
+            .children_by_root
+            .get(&root)
+            .cloned()
+            .unwrap_or_default();
+        children.sort_unstable();
+        children
+    }
+
+    fn project_events(&self, rows: &mut [Value]) {
+        for row in rows {
+            if let Some(id) = row["request_id"].as_i64() {
+                let root = self.root(id);
+                if root != id {
+                    row["original_request_id"] = json!(id);
+                    row["request_id"] = json!(root);
+                }
+                if row
+                    .get("original_user_prompt")
+                    .is_some_and(|value| !value.is_null())
+                {
+                    row["original_user_prompt"] =
+                        json!(self.prompts.get(&root).cloned().unwrap_or_else(|| {
+                            dashboard_request_prompt(row["original_user_prompt"].as_str())
+                        }));
+                }
+            }
+        }
+    }
+
+    fn merge_requests(&self, rows: Vec<Value>) -> Vec<Value> {
+        let mut merged: HashMap<i64, Value> = rows
+            .iter()
+            .filter(|r| {
+                self.root(r["request_id"].as_i64().unwrap()) == r["request_id"].as_i64().unwrap()
+            })
+            .map(|r| (r["request_id"].as_i64().unwrap(), r.clone()))
+            .collect();
+        for row in rows {
+            let id = row["request_id"].as_i64().unwrap();
+            let root = self.root(id);
+            if id == root {
+                continue;
+            }
+            let Some(target) = merged.get_mut(&root) else {
+                continue;
+            };
+            for field in [
+                "tool_call_count",
+                "alert_count",
+                "decision_count",
+                "high_risk_alert_count",
+            ] {
+                target[field] =
+                    json!(target[field].as_i64().unwrap_or(0) + row[field].as_i64().unwrap_or(0));
+            }
+            for (field, ranks) in [
+                (
+                    "strongest_severity",
+                    &["info", "low", "medium", "high", "critical"][..],
+                ),
+                (
+                    "strongest_action",
+                    &["allow", "warn", "ask", "block", "deny"][..],
+                ),
+            ] {
+                if ranks.iter().position(|v| Some(*v) == row[field].as_str())
+                    > ranks
+                        .iter()
+                        .position(|v| Some(*v) == target[field].as_str())
+                {
+                    target[field] = row[field].clone();
+                }
+            }
+            for field in ["summary_file_touch_paths", "summary_file_touches"] {
+                if let Some(items) = row[field].as_array() {
+                    let dest = target[field].as_array_mut().unwrap();
+                    for item in items {
+                        if !dest.contains(item) {
+                            dest.push(item.clone());
+                        }
+                    }
+                }
+            }
+            if row["completed_at"].as_i64() > target["completed_at"].as_i64() {
+                target["completed_at"] = row["completed_at"].clone();
+            }
+        }
+        let mut result: Vec<_> = merged.into_values().collect();
+        for row in &mut result {
+            let id = row["request_id"].as_i64().unwrap();
+            row["original_user_prompt"] = json!(self
+                .prompts
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| dashboard_request_prompt(row["original_user_prompt"].as_str())));
+        }
+        result.sort_by_key(|r| {
+            std::cmp::Reverse((
+                r["completed_at"]
+                    .as_i64()
+                    .or(r["created_at"].as_i64())
+                    .unwrap_or(0),
+                r["request_id"].as_i64().unwrap(),
+            ))
+        });
+        result
+    }
+}
+
+fn notification_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let mut body = text
+        .trim()
+        .strip_prefix("<task-notification>")?
+        .strip_suffix("</task-notification>")?;
+    let mut found = None;
+    while !body.trim().is_empty() {
+        let (tag, rest) = body.trim_start().strip_prefix('<')?.split_once('>')?;
+        if tag.is_empty()
+            || !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return None;
+        }
+        let close = format!("</{tag}>");
+        let (value, rest) = rest.split_once(&close)?;
+        if tag == name {
+            if found.is_some() || value.trim().is_empty() || value.contains(['<', '>']) {
+                return None;
+            }
+            found = Some(value.trim());
+        }
+        body = rest;
+    }
+    found
+}
+
+fn is_task_notification(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("<task-notification>")
+        && text.ends_with("</task-notification>")
+        && notification_field(text, "task-id").is_some()
+        && matches!(
+            notification_field(text, "status"),
+            Some("completed" | "failed" | "killed")
+        )
+}
+
 fn dashboard_request_prompt(value: Option<&str>) -> Option<String> {
     let mut prompt = value?.to_string();
+    if is_task_notification(&prompt) {
+        let summary = notification_field(&prompt, "summary").unwrap_or("Background task completed");
+        let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        return Some(format!(
+            "Unlinked task: {}",
+            summary.chars().take(160).collect::<String>()
+        ));
+    }
     const OPEN: &str = "<in-app-browser-context";
     const CLOSE: &str = "</in-app-browser-context>";
 
@@ -5292,6 +6049,11 @@ fn current_unix_millis() -> io::Result<u64> {
 
 fn sqlite_error(error: gensee_crate_db::sqlite::SqliteError) -> io::Error {
     io::Error::other(error)
+}
+
+fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
+    matches!(error, rusqlite::Error::SqliteFailure(code, _) if matches!(code.code,
+        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }
 
 fn sqlite_error_from_rusqlite(error: rusqlite::Error) -> io::Error {
@@ -5584,6 +6346,10 @@ fn hex_value(byte: u8) -> io::Result<u8> {
         )),
     }
 }
+
+/// Bump when this crate changes historical alert classification semantics or
+/// the evidence supplied to it. See docs/classifier-cache-contract.md.
+pub const CLASSIFIER_CONTRACT_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -6894,6 +7660,253 @@ mod tests {
     }
 
     #[test]
+    fn historical_nested_notifications_group_under_real_request_without_rewriting_evidence() {
+        let dir =
+            std::env::temp_dir().join(format!("gensee-historical-groups-{}", std::process::id()));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"review code"}"#,
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Bash",
+                "launch-a",
+                r#"{"command":"sleep 1"}"#,
+                101,
+            ))
+            .unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"another request"}"#,
+                102,
+            ))
+            .unwrap();
+        // Simulate records captured before notification routing was introduced.
+        let legacy = |tool: &str, ts: i64| {
+            let text = format!("<task-notification><task-id>job-{ts}</task-id><tool-use-id>{tool}</tool-use-id><status>completed</status><summary>done</summary></task-notification>");
+            let db = store.sqlite_store().unwrap();
+            let id = db
+                .insert_request(&NewRequest {
+                    session_id: "s1".into(),
+                    original_user_prompt: Some(text),
+                    final_response: None,
+                    events: None,
+                    file_accessed_rate: 0.0,
+                    network_rate: 0.0,
+                })
+                .unwrap();
+            db.set_request_created_at(id, ts).unwrap();
+            id
+        };
+        let first = legacy("launch-a", 103);
+        store
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Bash",
+                "launch-b",
+                r#"{"command":"sleep 1"}"#,
+                104,
+            ))
+            .unwrap();
+        // An earlier UI version retained the notification only in events.
+        {
+            let db = store.sqlite_store().unwrap();
+            db.connection().execute("UPDATE requests SET events = json_object('prompt', original_user_prompt), original_user_prompt = 'Background activity' WHERE request_id = ?1", [first]).unwrap();
+        }
+        let nested = legacy("launch-b", 105);
+        store
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Read",
+                "read-c",
+                r#"{"file_path":"/repo/a.rs"}"#,
+                106,
+            ))
+            .unwrap();
+        store
+            .append_policy_alert(&PolicyAlert {
+                session_id: Some("s1".into()),
+                tool_use_id: Some("read-c".into()),
+                severity: "high".into(),
+                action: "warn".into(),
+                rule_id: "test-finding".into(),
+                message: "Synthetic risk".into(),
+                path: Some("/repo/a.rs".into()),
+                evidence: None,
+                observed_at_ms: 107,
+            })
+            .unwrap();
+        let chain = store.verify_alert_chain().unwrap();
+        let before = store.list_alerts().unwrap();
+        let state = store.dashboard_state().unwrap();
+        assert_eq!(state["requests"].as_array().unwrap().len(), 2);
+        let root = state["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["request_id"] == 1)
+            .unwrap();
+        assert_eq!(root["original_user_prompt"], "review code");
+        assert_eq!(root["tool_call_count"], 3);
+        assert_eq!(root["alert_count"], 1);
+        assert_eq!(state["alerts"][0]["request_id"], 1);
+        assert_eq!(state["alerts"][0]["original_request_id"], nested);
+        assert_eq!(state["sessions"][0]["req_count"], 2);
+        for id in [1, first, nested] {
+            let detail = store.dashboard_request(id).unwrap();
+            assert_eq!(detail["request"]["request_id"], 1);
+            assert_eq!(detail["agentEvents"].as_array().unwrap().len(), 3);
+            assert_eq!(detail["alerts"].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(
+            store.list_alerts().unwrap()[0].request_id,
+            before[0].request_id
+        );
+        assert_eq!(store.verify_alert_chain().unwrap(), chain);
+        let reopened = EventStore::new(&dir).unwrap();
+        assert_eq!(
+            reopened.dashboard_request(nested).unwrap()["request"]["request_id"],
+            1
+        );
+        // Future completions can also follow a launch stored under a legacy notification.
+        let db = store.sqlite_store().unwrap();
+        let text = "<task-notification><task-id>job</task-id><tool-use-id>launch-b</tool-use-id><status>completed</status></task-notification>";
+        assert_eq!(
+            notification_origin_request(db.connection(), "s1", text, 108, i64::MAX).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            notification_origin_request(db.connection(), "other", text, 108, i64::MAX).unwrap(),
+            None
+        );
+        assert_eq!(
+            notification_origin_request(db.connection(), "s1", text, 99, i64::MAX).unwrap(),
+            None
+        );
+        drop(db);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn notification_routing_ignores_quoted_and_nested_metadata() {
+        let text = "<task-notification><task-id>job</task-id><status>completed</status><summary>quoted <tool-use-id>other</tool-use-id></summary></task-notification>";
+        assert!(is_task_notification(text));
+        assert_eq!(notification_field(text, "tool-use-id"), None);
+        assert!(!is_task_notification(&format!("Explain this: {text}")));
+        assert!(!is_task_notification("<task-notification><summary><task-id>job</task-id><status>completed</status></summary></task-notification>"));
+    }
+
+    #[test]
+    fn task_notifications_resume_the_origin_without_creating_user_requests() {
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-notification-routing-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"first request"}"#,
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Bash",
+                "launch-one",
+                r#"{"command":"sleep 1"}"#,
+                101,
+            ))
+            .unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"second request"}"#,
+                102,
+            ))
+            .unwrap();
+        let text = "<task-notification><task-id>job-1</task-id><tool-use-id>launch-one</tool-use-id><status>completed</status><summary>done</summary></task-notification>";
+        let payload = json!({"prompt": text}).to_string();
+        store
+            .append_hook_event_evidence_only(&hook_event("UserPromptSubmit", &payload, 103))
+            .unwrap();
+        assert_eq!(
+            store
+                .active_request_context("s1")
+                .unwrap()
+                .unwrap()
+                .original_user_prompt
+                .as_deref(),
+            Some("first request")
+        );
+        let reopened = store.independent_connection().unwrap();
+        assert_eq!(
+            reopened
+                .active_request_context("s1")
+                .unwrap()
+                .unwrap()
+                .original_user_prompt
+                .as_deref(),
+            Some("first request")
+        );
+        reopened
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Read",
+                "follow-up",
+                r#"{"file_path":"/repo/a.txt"}"#,
+                104,
+            ))
+            .unwrap();
+        let db = reopened.sqlite_store().unwrap();
+        assert_eq!(
+            db.connection()
+                .query_row("SELECT count(*) FROM requests", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(db.agent_events_for_request(1).unwrap().len(), 2);
+        drop(db);
+        assert_eq!(
+            dashboard_request_prompt(Some(text)).as_deref(),
+            Some("Unlinked task: done")
+        );
+        // A tool ID from another session cannot select its request.
+        let mut unknown = hook_event("UserPromptSubmit", &payload, 105);
+        unknown.session_id = Some("other-session".into());
+        reopened.append_hook_event_evidence_only(&unknown).unwrap();
+        assert_eq!(
+            reopened
+                .active_request_context("other-session")
+                .unwrap()
+                .unwrap()
+                .original_user_prompt
+                .as_deref(),
+            Some(text)
+        );
+        reopened
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"third request"}"#,
+                106,
+            ))
+            .unwrap();
+        assert_eq!(
+            reopened
+                .active_request_context("s1")
+                .unwrap()
+                .unwrap()
+                .original_user_prompt
+                .as_deref(),
+            Some("third request")
+        );
+        assert!(std::fs::read_to_string(store.hooks_path()).is_ok());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn hook_raw_consumers_share_a_lazy_parse() {
         let event = native_tool_event("WebSearch", "search-1", r#"{"query":"test"}"#, 100);
         let parsed = ParsedHookEvent::new(&event);
@@ -8050,39 +9063,378 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_surfaces_endpoint_sequence_gap_alerts() {
+    fn historical_classification_cache_survives_reopen_and_invalidates_on_policy_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!(
+            "gensee-store-classification-cache-{}",
+            std::process::id()
+        ));
+        let store = EventStore::new(&dir).unwrap();
+        let alert = PolicyAlert {
+            session_id: Some("cache-session".into()),
+            tool_use_id: None,
+            severity: "medium".into(),
+            action: "warn".into(),
+            rule_id: "hook_bypass_file_mutation".into(),
+            message: "test".into(),
+            path: Some("/dead-mount/file.txt".into()),
+            evidence: Some(json!({"decision":{"result":"allow"}, "custom_evidence":"preserved"})),
+            observed_at_ms: 1,
+        };
+        store.append_policy_alert(&alert).unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        store
+            .set_dashboard_noise_filter_versioned(
+                &["hook_bypass_file_mutation"],
+                "policy-a",
+                move |_, _, _, _, evidence| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let evidence: Value = serde_json::from_str(evidence).unwrap();
+                    assert_eq!(evidence["decision"]["result"], "allow");
+                    assert_eq!(evidence["custom_evidence"], "preserved");
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // A fully cached call must not even attempt to acquire a writer lock.
+        static BUSY_CALLS: AtomicUsize = AtomicUsize::new(0);
+        BUSY_CALLS.store(0, Ordering::SeqCst);
+        let writer = store.independent_connection().unwrap();
+        let lock = writer.sqlite_store().unwrap();
+        lock.connection().execute_batch("BEGIN IMMEDIATE").unwrap();
+        store
+            .sqlite_store()
+            .unwrap()
+            .connection()
+            .busy_handler(Some(|_| {
+                BUSY_CALLS.fetch_add(1, Ordering::SeqCst);
+                false
+            }))
+            .unwrap();
+        let warm_calls = calls.clone();
+        store
+            .set_dashboard_noise_filter_versioned(
+                &["hook_bypass_file_mutation"],
+                "policy-a",
+                move |_, _, _, _, _| {
+                    warm_calls.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(BUSY_CALLS.load(Ordering::SeqCst), 0);
+        lock.connection().execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        drop(writer);
+        let chain = store.verify_alert_chain().unwrap();
+        drop(store);
+        let reopened = EventStore::new(&dir).unwrap();
+        reopened
+            .set_dashboard_noise_filter_versioned(
+                &["hook_bypass_file_mutation"],
+                "policy-a",
+                |_, _, _, _, _| panic!("cached evidence must not be reclassified"),
+            )
+            .unwrap();
+        assert!(reopened.dashboard_state().unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        reopened
+            .set_dashboard_noise_filter_versioned(
+                &["hook_bypass_file_mutation"],
+                "policy-b",
+                |_, _, _, _, _| false,
+            )
+            .unwrap();
+        assert_eq!(
+            reopened.dashboard_state().unwrap()["alerts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        reopened
+            .set_dashboard_noise_filter_versioned(
+                &["hook_bypass_file_mutation"],
+                "policy-a",
+                |_, _, _, _, _| panic!("switching back must reuse the live policy context"),
+            )
+            .unwrap();
+        assert!(reopened.dashboard_state().unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let db = reopened.sqlite_store().unwrap();
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(DISTINCT policy_key) FROM dashboard_alert_classification",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(db.connection().query_row("SELECT COUNT(*) FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%'", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        drop(db);
+        for generation in 0..9 {
+            reopened
+                .set_dashboard_noise_filter_versioned(
+                    &["hook_bypass_file_mutation"],
+                    &format!("policy-{generation}"),
+                    |_, _, _, _, _| false,
+                )
+                .unwrap();
+        }
+        let db = reopened.sqlite_store().unwrap();
+        assert_eq!(
+            db.connection()
+                .query_row(
+                    "SELECT COUNT(DISTINCT policy_key) FROM dashboard_alert_classification",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            8
+        );
+        assert_eq!(db.connection().query_row("SELECT COUNT(*) FROM dashboard_projection_progress WHERE name LIKE 'alert-classification:%'", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
+        drop(db);
+        let rebuilt = calls.clone();
+        reopened
+            .set_dashboard_noise_filter_versioned(
+                &["hook_bypass_file_mutation"],
+                "policy-a",
+                move |_, _, _, _, _| {
+                    rebuilt.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for generation in 10..20 {
+            reopened
+                .set_dashboard_noise_filter_versioned(
+                    &["hook_bypass_file_mutation"],
+                    &format!("cold-{generation}"),
+                    |_, _, _, _, _| false,
+                )
+                .unwrap();
+            reopened
+                .set_dashboard_noise_filter_versioned(
+                    &["hook_bypass_file_mutation"],
+                    "policy-a",
+                    |_, _, _, _, _| panic!("frequently used policy must survive cold-key churn"),
+                )
+                .unwrap();
+        }
+        assert!(reopened.dashboard_state().unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(reopened.verify_alert_chain().unwrap(), chain);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dashboard_remains_readable_while_projection_writer_is_busy() {
+        let dir = env::temp_dir().join(format!("gensee-busy-projection-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        let make = |time| PolicyAlert {
+            session_id: Some("busy-session".into()),
+            tool_use_id: None,
+            severity: "medium".into(),
+            action: "warn".into(),
+            rule_id: "test-busy".into(),
+            message: "test".into(),
+            path: Some("/tmp/test".into()),
+            evidence: None,
+            observed_at_ms: time,
+        };
+        store.append_policy_alert(&make(1)).unwrap();
+        store
+            .set_dashboard_noise_filter_versioned(&["test-busy"], "busy-policy", |_, _, _, _, _| {
+                true
+            })
+            .unwrap();
+        store.append_policy_alert(&make(2)).unwrap();
+        let writer = store.independent_connection().unwrap();
+        let lock = writer.sqlite_store().unwrap();
+        lock.connection().execute_batch("BEGIN IMMEDIATE").unwrap();
+        store
+            .sqlite_store()
+            .unwrap()
+            .connection()
+            .busy_timeout(std::time::Duration::from_millis(10))
+            .unwrap();
+        store
+            .set_dashboard_noise_filter_versioned(&["test-busy"], "busy-policy", |_, _, _, _, _| {
+                true
+            })
+            .unwrap();
+        let state = store.dashboard_state().unwrap();
+        // Existing classifications work; unclassified evidence stays visible.
+        assert_eq!(state["alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(store.sqlite_store().unwrap().connection().query_row(
+            "SELECT cursor FROM dashboard_projection_progress WHERE name = 'alert-classification:busy-policy'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        lock.connection().execute_batch("ROLLBACK").unwrap();
+        store
+            .set_dashboard_noise_filter_versioned(&["test-busy"], "busy-policy", |_, _, _, _, _| {
+                true
+            })
+            .unwrap();
+        assert!(store.dashboard_state().unwrap()["alerts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn legacy_unlinked_root_recovers_prompt_on_all_dashboard_surfaces() {
+        let dir = env::temp_dir().join(format!("gensee-legacy-prompt-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let store = EventStore::new(&dir).unwrap();
+        store
+            .append_hook_event_evidence_only(&hook_event(
+                "UserPromptSubmit",
+                r#"{"prompt":"review my changes"}"#,
+                100,
+            ))
+            .unwrap();
+        store
+            .append_hook_event_evidence_only(&native_tool_event(
+                "Read",
+                "read1",
+                r#"{"file_path":"/repo/file"}"#,
+                101,
+            ))
+            .unwrap();
+        store
+            .append_policy_alert(&PolicyAlert {
+                session_id: Some("s1".into()),
+                tool_use_id: Some("read1".into()),
+                severity: "high".into(),
+                action: "warn".into(),
+                rule_id: "test-legacy".into(),
+                message: "test".into(),
+                path: None,
+                evidence: None,
+                observed_at_ms: 102,
+            })
+            .unwrap();
+        store.sqlite_store().unwrap().connection().execute("UPDATE requests SET events = json_object('prompt', original_user_prompt), original_user_prompt = 'Background activity' WHERE request_id = 1", []).unwrap();
+        let state = store.dashboard_state().unwrap();
+        assert_eq!(
+            state["requests"][0]["original_user_prompt"],
+            "review my changes"
+        );
+        assert_eq!(
+            state["alerts"][0]["original_user_prompt"],
+            "review my changes"
+        );
+        assert_eq!(
+            store.dashboard_request(1).unwrap()["request"]["original_user_prompt"],
+            "review my changes"
+        );
+    }
+
+    #[test]
+    fn dashboard_separates_monitoring_gaps_from_request_findings() {
         let dir = std::env::temp_dir().join(format!(
             "gensee-store-test-endpoint-gap-dashboard-{}",
             std::process::id()
         ));
         let store = EventStore::new(&dir).unwrap();
+        store.append_hook_event_evidence_only(&hook_event(
+            "UserPromptSubmit",
+            r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/repo","prompt":"review code"}"#,
+            100,
+        )).unwrap();
         let db = store.sqlite_store().unwrap();
-        insert_alert(
-            &db,
-            AlertInput {
-                request_id: None,
-                entity: None,
-                severity: "high",
-                action: "warn",
-                rule_id: "endpoint_security_event_gap",
-                message: "legacy prototype sequence gap",
-                path: None,
-                evidence: None,
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64,
-            },
-        )
-        .unwrap();
+        let request_id: i64 = db
+            .connection()
+            .query_row("SELECT request_id FROM requests LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        // Reproduce legacy records incorrectly attached to a real request.
+        for (rule, count) in [
+            ("endpoint_security_event_gap", Some(2727)),
+            ("endpoint_security_event_gap", None),
+            ("policy_destructive_file_operation", None),
+        ] {
+            insert_alert(
+                &db,
+                AlertInput {
+                    request_id: Some(request_id),
+                    entity: None,
+                    severity: "high",
+                    action: "warn",
+                    rule_id: rule,
+                    message: "legacy evidence",
+                    path: None,
+                    evidence: count.map(|count| json!({"dropped_events": count})),
+                    created_at: 200,
+                },
+            )
+            .unwrap();
+        }
         drop(db);
-
+        let before = store.verify_alert_chain().unwrap();
         let dashboard = store.dashboard_state().unwrap();
         assert_eq!(dashboard["alerts"].as_array().unwrap().len(), 1);
         assert_eq!(dashboard["summary"]["alerts_count"], 1);
-        assert_eq!(dashboard["summary"]["recent_high_alerts"], 1);
         assert_eq!(dashboard["summary"]["high_alerts_count"], 1);
+        assert_eq!(dashboard["requests"][0]["high_risk_alert_count"], 1);
+        let gaps = dashboard["monitoringGaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 2);
+        assert!(gaps.iter().any(|gap| gap["missingEvents"] == 2727));
+        assert!(gaps.iter().any(|gap| gap["missingEvents"].is_null()));
+        assert!(gaps
+            .iter()
+            .all(|gap| gap.get("request_id").is_none() && gap.get("tool_input").is_none()));
+        let detail = store.dashboard_request(request_id).unwrap();
+        assert_eq!(detail["alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["rawAlertCount"], 1);
+        assert_eq!(store.list_alerts().unwrap().len(), 3);
+        assert_eq!(store.verify_alert_chain().unwrap(), before);
 
+        // New health incidents never create a synthetic request or attach to
+        // a caller-provided session, even if the caller supplies stale context.
+        let gap = PolicyAlert {
+            session_id: Some("s1".into()),
+            tool_use_id: Some("old-tool".into()),
+            severity: "info".into(),
+            action: "allow".into(),
+            rule_id: "endpoint_security_event_gap".into(),
+            message: "Gensee monitoring gap".into(),
+            path: None,
+            evidence: Some(json!({"dropped_events": 4})),
+            observed_at_ms: 300,
+        };
+        store
+            .append_endpoint_policy_alert(&gap, "gap-test", 60_000)
+            .unwrap();
+        store.append_policy_alert(&gap).unwrap();
+        let db = store.sqlite_store().unwrap();
+        let unassigned: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM alerts WHERE request_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unassigned, 2);
+        let requests: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(requests, 1);
         fs::remove_dir_all(&dir).ok();
     }
 

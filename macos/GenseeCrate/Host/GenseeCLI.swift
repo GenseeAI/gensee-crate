@@ -14,6 +14,14 @@ enum GenseeCLIError: LocalizedError {
     case commandTimedOut(arguments: [String], seconds: TimeInterval)
     case invalidOutput(String)
 
+    static func userFacingApprovalMessage(_ error: Error) -> String {
+        if case let GenseeCLIError.commandFailed(_, output, _) = error {
+            let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return detail.hasPrefix("gensee: ") ? String(detail.dropFirst(8)) : detail
+        }
+        return error.localizedDescription
+    }
+
     var errorDescription: String? {
         switch self {
         case .executableNotFound:

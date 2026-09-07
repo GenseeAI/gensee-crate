@@ -14,7 +14,14 @@ pub use events::{
 };
 pub use hooks::{AgentHookEvent, FileIntent, ProcessObservation};
 pub use mcp::{parse_mcp_file_intents, McpFileIntent};
-pub use path::{endpoint_security_path_is_known_build_output, normalize_agent_path};
+pub use path::{
+    endpoint_security_path_is_known_build_output, normalize_agent_path, recorded_concrete_path,
+    recorded_scratch_path, resolve_concrete_path, resolve_routine_scratch_path,
+};
 pub use redact::{redact_text, redact_value};
 pub use sessions::AgentSession;
 pub use vscode::{is_vscode_file_tool_name, parse_vscode_file_intents, VscodeFileIntent};
+
+/// Bump when this crate changes historical alert classification semantics or
+/// the evidence supplied to it. See docs/classifier-cache-contract.md.
+pub const CLASSIFIER_CONTRACT_VERSION: u32 = 1;
