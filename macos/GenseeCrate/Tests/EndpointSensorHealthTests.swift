@@ -113,6 +113,28 @@ final class EndpointSensorHealthTests: XCTestCase {
         }
     }
 
+    func testNativeOutageDismissPreservesLossAndDoesNotRearmOngoingOutage() {
+        for kind in ["unavailable", "stalled"] {
+            let start = SuspendingClock.now
+            var tracker = MonitoringGapAlarmTracker()
+            var health = EndpointSensorHealth(connected: true, running: true, configuredMode: "observe")
+            _ = tracker.observe(health, now: start)
+            health.kernelDrops = 100
+            _ = tracker.observe(health, now: start.advanced(by: .seconds(1)))
+            if kind == "unavailable" { health.connected = false }
+            else { health.lastSuccessfulPollAt = start }
+            _ = tracker.observe(health, now: start.advanced(by: .seconds(16)))
+            let outage: MonitoringHealthIncident = kind == "unavailable" ? .unavailable : .stalled
+            XCTAssertEqual(tracker.observe(health, now: start.advanced(by: .seconds(26))), outage)
+            tracker.dismissNotification(kind: kind == "unavailable" ? "stalled" : "unavailable")
+            XCTAssertEqual(tracker.bannerIncident, outage, "Dismiss only the matching outage kind")
+            tracker.dismissNotification(kind: kind)
+            XCTAssertEqual(tracker.bannerIncident, .events(100), "Acknowledging an outage must expose unacknowledged loss")
+            XCTAssertNil(tracker.observe(health, now: start.advanced(by: .seconds(120))), "Dismiss must not reset the outage notification latch")
+            XCTAssertEqual(tracker.bannerIncident, .events(100))
+        }
+    }
+
     func testNativeLossDismissAcknowledgesQueuedCountsWithoutDismissingOutage() {
         let start = SuspendingClock.now
         var tracker = MonitoringGapAlarmTracker()

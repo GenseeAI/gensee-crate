@@ -434,6 +434,9 @@ extension CompletionNotificationCoordinator: UNUserNotificationCenterDelegate {
     ) {
         Task { @MainActor in
             let content = response.notification.request.content
+            // Only an explicit close/Clear All acknowledges an incident.
+            // Banner timeout has no callback; opening the notification below
+            // activates the app without acknowledging the monitoring gap.
             if response.actionIdentifier == UNNotificationDismissActionIdentifier {
                 if content.categoryIdentifier == Self.monitoringCategoryIdentifier,
                    let kind = content.userInfo["monitoring_kind"] as? String {

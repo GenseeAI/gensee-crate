@@ -112,6 +112,9 @@ struct MonitoringGapAlarmTracker {
         if case .events = bannerIncident { setBanner(nil) }
     }
 
+    // Explicit dismissal is shared by both surfaces for every incident kind.
+    // Outage acknowledgement affects only the matching visible outage; it does
+    // not acknowledge independent event loss or reset the outage's alarm latch.
     mutating func dismissNotification(kind: String) {
         switch kind {
         case "events": dismissEventLoss()
